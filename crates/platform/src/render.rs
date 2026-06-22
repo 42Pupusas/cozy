@@ -172,6 +172,16 @@ pub fn blit_cell(
         let row_mask: u8 = glyph.map_or(0xff, |g| g[row as usize]);
         for col in 0..GLYPH_W as u32 {
             let px = px0 + col;
+            // Clip to the buffer's actual bounds. The `px < buf_width` guard is
+            // critical: without it a cell from a STALE wider-geometry snapshot
+            // (one produced before a shrink, still queued when the backbuffer
+            // was already rebuilt narrower) would have px >= buf_width and the
+            // flat `py*buf_width + px` index would silently wrap into the NEXT
+            // row — reordering and swallowing lines mid-drag. A plain
+            // `idx < len` check alone does not catch that horizontal overflow.
+            if px >= buf_width {
+                continue;
+            }
             let bit = (row_mask >> (7 - col)) & 1;
             let pixel = if bit != 0 { fg_px } else { bg_px };
             let idx = (py * buf_width + px) as usize;
@@ -186,9 +196,69 @@ pub fn blit_cell(
 ///
 /// `pixels` is the entire framebuffer (`buf_width × buf_height` u32 words).
 pub fn blit_snapshot(pixels: &mut [u32], buf_width: u32, snap: &DirtySnapshot, theme: &Theme) {
+    // Rows of the glyph grid that fit in this buffer. A stale snapshot from a
+    // taller geometry may carry rows past the bottom; clip them rather than let
+    // them paint into the wrong pixels.
+    let buf_rows = (pixels.len() as u32 / buf_width.max(1)) / GLYPH_H as u32;
     for row in &snap.rows {
+        if u32::from(row.row) >= buf_rows {
+            continue;
+        }
         for (col, cell) in row.cells.iter().enumerate() {
             blit_cell(pixels, buf_width, col as u16, row.row, cell, theme);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grid::{DirtyRow, DirtySnapshot};
+
+    fn cell(ch: char) -> Cell {
+        Cell { ch, attrs: Attrs::default() }
+    }
+
+    #[test]
+    fn stale_wide_snapshot_does_not_bleed_into_next_row() {
+        // Backbuffer sized for a NARROW grid: 2 cells wide, 2 rows tall.
+        let bw = 2 * CELL_W as u32;
+        let bh = 2 * CELL_H as u32;
+        let mut pixels = vec![0u32; (bw * bh) as usize];
+
+        // A STALE snapshot from a wider geometry: row 0 has 5 cells. Without
+        // the px < buf_width clip, cells 2..5 would wrap into row 0's lower
+        // pixel lines / row 1. We assert row 1's cell region stays untouched.
+        let snap = DirtySnapshot {
+            cols: 5,
+            rows: vec![DirtyRow { row: 0, cells: (0..5).map(|_| cell('M')).collect() }],
+        };
+        let theme = Theme::builtin();
+        blit_snapshot(&mut pixels, bw, &snap, &theme);
+
+        // The second glyph row (pixels y in [CELL_H, 2*CELL_H)) must be all
+        // background — nothing from the over-wide row 0 may have leaked there.
+        let bg = theme.bg.to_xrgb8888();
+        for y in CELL_H as u32..bh {
+            for x in 0..bw {
+                let px = pixels[(y * bw + x) as usize];
+                assert_eq!(px, 0, "row 1 pixel ({x},{y}) was painted: {px:#x} (bg={bg:#x})");
+            }
+        }
+    }
+
+    #[test]
+    fn stale_tall_snapshot_row_is_clipped() {
+        // Backbuffer for 2 rows; a stale snapshot references row 3.
+        let bw = 2 * CELL_W as u32;
+        let bh = 2 * CELL_H as u32;
+        let mut pixels = vec![0u32; (bw * bh) as usize];
+        let snap = DirtySnapshot {
+            cols: 2,
+            rows: vec![DirtyRow { row: 3, cells: vec![cell('M'), cell('M')] }],
+        };
+        blit_snapshot(&mut pixels, bw, &snap, &Theme::builtin());
+        // Nothing should have been drawn at all.
+        assert!(pixels.iter().all(|&p| p == 0), "off-bottom row 3 leaked into buffer");
     }
 }

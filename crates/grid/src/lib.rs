@@ -22,7 +22,7 @@ mod screen;
 
 pub use cell::{Attrs, Cell, Color};
 pub use cursor::{Cursor, CursorShape};
-pub use dirty::{DirtyRegion, DirtySnapshot};
+pub use dirty::{DirtyRegion, DirtyRow, DirtySnapshot};
 pub use screen::Screen;
 
 use vt_parser::{CsiAction, Event, OscCmd, SgrAttr, C0};

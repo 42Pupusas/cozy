@@ -370,7 +370,7 @@ impl Reader {
     /// Must run on the thread that will own the rx ring for its whole life — it
     /// arms the multishot recv here so this thread is the ring's sole issuer
     /// (required by `single_issuer`/`defer_taskrun`).
-    pub fn run(mut self, producer: Producer<Event>) -> Result<(), ConnError> {
+    pub fn run(mut self, producer: Producer<Event>, waker: Option<waker::Waker>) -> Result<(), ConnError> {
         // Arm the first multishot recv and the key-repeat timer poll, both from
         // *this* thread so it's the rx ring's sole issuer.
         self.arm_recv()?;
@@ -381,12 +381,14 @@ impl Reader {
             self.ring.submit_and_wait(1).map_err(ConnError::Submit)?;
 
             let mut closed = false;
+            let mut pushed = false;
             while let Some(cqe) = self.ring.complete() {
                 // Route by the user_data we tagged each arm with: the timerfd
                 // poll vs. the socket recv. The timer poll has no buffer/MORE
                 // flags, so we must split on user_data, not on the flags.
                 if cqe.user_data == UD_TIMER {
                     self.absorb_timer_cqe(cqe.result, &producer)?;
+                    pushed = true;
                 } else if self.absorb_recv_cqe(cqe.result, cqe.flags)? {
                     closed = true;
                 }
@@ -401,9 +403,21 @@ impl Reader {
                 if producer.push_block(event).is_err() {
                     return Ok(());
                 }
+                pushed = true;
+            }
+
+            // Wake the UI thread, which polls a shared eventfd rather than
+            // blocking on this ring (it also waits on the dirty-snapshot ring).
+            if pushed {
+                if let Some(w) = &waker {
+                    w.signal();
+                }
             }
 
             if closed {
+                if let Some(w) = &waker {
+                    w.signal();
+                }
                 return Ok(());
             }
         }

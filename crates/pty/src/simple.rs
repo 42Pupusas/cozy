@@ -76,6 +76,13 @@ impl PtySimple {
         Ok(())
     }
 
+    /// The master fd as a plain integer, for poll(2)-based readiness waiting.
+    /// The fd stays owned by this `PtySimple`; callers must only poll it.
+    #[must_use]
+    pub const fn master_fd(&self) -> i32 {
+        self.master_fd.as_i32()
+    }
+
     /// Push a window resize to the child process.
     ///
     /// # Errors

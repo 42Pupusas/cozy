@@ -101,23 +101,33 @@ fn run(cfg: &Config) -> platform::Result<()> {
     let quit_pty    = Arc::clone(&quit);
     let quit_parser = Arc::clone(&quit);
 
+    // ── Cross-thread wakeups (eventfd + poll) ────────────────────────────────
+    // Each thread that waits on more than one source blocks in poll(2) on an
+    // eventfd instead of busy-spinning. `ui_wake` is owned by the window (the
+    // Wayland reader signals it); the parser also signals it after a snapshot.
+    // `pty_wake` lets the UI thread rouse the PTY thread when it queues input.
+    let ui_wake  = platform::Waker::new().expect("create ui waker");
+    let pty_wake = waker::Waker::new().expect("create pty waker");
+    let parser_ui_wake = ui_wake.clone();
+    let ui_pty_wake    = pty_wake.clone();
+
     // ── Spawn PTY thread ────────────────────────────────────────────────────
     let shell = cfg.shell.clone();
     let pty_thread = std::thread::Builder::new()
         .name("pty".into())
-        .spawn(move || pty_thread(shell, pty_out_tx, input_rx, quit_pty))
+        .spawn(move || pty_thread(shell, pty_out_tx, input_rx, pty_wake, quit_pty))
         .expect("spawn pty thread");
 
     // ── Spawn parser + grid thread ──────────────────────────────────────────
     let parser_thread = std::thread::Builder::new()
         .name("parser".into())
         .spawn(move || {
-            parser_thread(COLS, ROWS, pty_out_rx, dirty_tx, resize_rx, quit_parser);
+            parser_thread(COLS, ROWS, pty_out_rx, dirty_tx, resize_rx, parser_ui_wake, quit_parser);
         })
         .expect("spawn parser thread");
 
     // ── UI thread (main thread) ─────────────────────────────────────────────
-    ui_thread(cfg, dirty_rx, input_tx, resize_tx, &quit)?;
+    ui_thread(cfg, dirty_rx, input_tx, resize_tx, ui_wake, ui_pty_wake, &quit)?;
 
     pty_thread.join().ok();
     parser_thread.join().ok();
@@ -134,15 +144,24 @@ fn pty_thread(
     shell:      String,
     pty_out_tx: quetzalcoatl::spsc::Producer<PtyChunk>,
     mut input_rx:   quetzalcoatl::spsc::Consumer<InputMsg>,
+    input_wake: waker::Waker,
     quit:       Arc<AtomicBool>,
 ) {
     let mut pty = match PtySimple::spawn(&shell, &[], COLS, ROWS) {
         Ok(p)  => p,
         Err(e) => { eprintln!("pty: spawn failed: {e:?}"); return; }
     };
+    let master_fd = pty.master_fd();
+    let wake_fd = input_wake.raw_fd();
 
     while !quit.load(Ordering::Relaxed) {
         let mut did_work = false;
+
+        // Drain the wake counter up-front, BEFORE reading the sources. This is
+        // what closes the lost-wakeup race: any input the UI signals after we
+        // read below but before we poll leaves the counter non-zero, so the
+        // poll returns immediately instead of sleeping through it.
+        input_wake.drain();
 
         // Drain all pending input messages first (writes are cheap).
         while let Some(msg) = input_rx.pop() {
@@ -174,10 +193,11 @@ fn pty_thread(
             Ok(None) => {}
         }
 
-        // Idle: sleep briefly instead of busy-spinning a whole core. ~1ms keeps
-        // latency imperceptible while dropping idle CPU to ~0.
+        // Idle: block in poll(2) on BOTH the PTY master fd (level-triggered, so
+        // pending output always re-wakes) and the input-wake eventfd, instead
+        // of busy-spinning. A 100ms cap bounds quit-flag check latency.
         if !did_work {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            let _ = waker::poll_two(master_fd, wake_fd, 100);
         }
     }
 }
@@ -191,6 +211,7 @@ fn parser_thread(
     mut pty_out_rx: quetzalcoatl::spsc::Consumer<PtyChunk>,
     dirty_tx:   quetzalcoatl::spsc::Producer<DirtySnapshot>,
     mut resize_rx: quetzalcoatl::spsc::Consumer<GridResize>,
+    ui_wake:    waker::Waker,
     quit:       Arc<AtomicBool>,
 ) {
     let mut grid   = Grid::new(cols, rows);
@@ -218,6 +239,8 @@ fn parser_thread(
             let snap = grid.take_dirty();
             if !snap.is_empty() {
                 let _ = dirty_tx.push(snap);
+                // Wake the UI thread (it polls an eventfd, not this ring).
+                ui_wake.signal();
             }
         }
 
@@ -232,6 +255,7 @@ fn parser_thread(
                 let snap = grid.take_dirty();
                 if !snap.is_empty() {
                     let _ = dirty_tx.push(snap);
+                    ui_wake.signal();
                 }
             }
             None => break,
@@ -247,9 +271,11 @@ fn ui_thread(
     mut dirty_rx: quetzalcoatl::spsc::Consumer<DirtySnapshot>,
     input_tx: quetzalcoatl::spsc::Producer<InputMsg>,
     resize_tx: quetzalcoatl::spsc::Producer<GridResize>,
+    ui_wake:  platform::Waker,
+    pty_wake: waker::Waker,
     quit:     &AtomicBool,
 ) -> platform::Result<()> {
-    let mut win     = TermWindow::new("terminal", COLS, ROWS)?;
+    let mut win     = TermWindow::new("terminal", COLS, ROWS, ui_wake)?;
     let encoder = Encoder::new();
 
     // Future: use cfg.cursor.blink / blink_rate in the renderer.
@@ -259,6 +285,8 @@ fn ui_thread(
         if quit.load(Ordering::Relaxed) { break; }
 
         let mut did_work = false;
+        // True if we pushed input the PTY thread must be roused for.
+        let mut sent_input = false;
 
         // Push dirty snapshots into the Wayland renderer.
         while let Some(snap) = dirty_rx.pop() {
@@ -273,11 +301,13 @@ fn ui_thread(
                 InputEvent::Close => {
                     quit.store(true, Ordering::Relaxed);
                     let _ = input_tx.push(InputMsg::Quit);
+                    pty_wake.signal();
                     return Ok(());
                 }
                 InputEvent::Resize { cols, rows } => {
                     let _ = input_tx.push(InputMsg::Resize { cols, rows });
                     let _ = resize_tx.push(GridResize { cols, rows });
+                    sent_input = true;
                 }
                 InputEvent::Key { key, state, modifiers } => {
                     use platform::protocol::KeyState as PKeyState;
@@ -296,18 +326,27 @@ fn ui_thread(
                     let mut ibuf = [0u8; 64];
                     if let Some(n) = encoder.encode_key(ikey, kstate, mods, &mut ibuf) {
                         let _ = input_tx.push(InputMsg::Bytes(ibuf[..n].into()));
+                        sent_input = true;
                     }
                 }
             }
         }
 
+        // Rouse the PTY thread once for the whole batch of queued input.
+        if sent_input {
+            pty_wake.signal();
+        }
+
         if !win.tick()? { break; }
 
-        // Idle: yield the core. The Wayland reader thread wakes us via the
-        // event ring; a 1ms idle sleep keeps input latency imperceptible while
-        // dropping idle CPU from 100% (busy-spin) to ~0.
+        // Idle: block in poll(2) on the UI wakeup eventfd instead of
+        // busy-spinning. The Wayland reader signals it after pushing protocol
+        // events; the parser signals it after producing a dirty snapshot. The
+        // 100ms cap bounds quit-flag latency. `win.wait` drains the counter
+        // after waking; any signal that raced in during this iteration's reads
+        // leaves the counter set, so the poll returns at once (no lost wakeup).
         if !did_work {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            win.wait(100);
         }
     }
 

@@ -58,6 +58,7 @@ dependencies = [
  "quetzalcoatl",
  "ququmatz",
  "vt_parser",
+ "waker",
 ]
 
 [[package]]
@@ -106,6 +107,7 @@ dependencies = [
  "pty",
  "quetzalcoatl",
  "vt_parser",
+ "waker",
 ]
 
 [[package]]
@@ -119,3 +121,7 @@ dependencies = [
  "heapless",
  "quetzalcoatl",
 ]
+
+[[package]]
+name = "waker"
+version = "0.1.0"

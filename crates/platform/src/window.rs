@@ -71,6 +71,11 @@ pub struct TermWindow {
     window_tx: WindowSender,
     events: Consumer<Event>,
     reader: Option<std::thread::JoinHandle<Result<()>>>,
+    /// Shared wakeup the reader signals after pushing events; also exposed to
+    /// the app (via [`TermWindow::waker`]) so the parser thread can wake the UI
+    /// loop after producing a dirty snapshot. The UI loop blocks in
+    /// [`TermWindow::wait`] on this eventfd instead of busy-polling.
+    wake: waker::Waker,
 
     #[allow(dead_code)]
     compositor: CompositorId,
@@ -146,8 +151,11 @@ impl Drop for TermWindow {
 
 impl TermWindow {
     /// Open a Wayland terminal window of `cols × rows` cells.
-    /// Open a Wayland terminal window with `cols × rows` cells.
-    pub fn new(title: &str, cols: u16, rows: u16) -> Result<Self> {
+    ///
+    /// `wake` is the shared UI wakeup channel: the Wayland reader signals it
+    /// after pushing events, and the caller hands clones to any other producer
+    /// (e.g. the parser thread) so the UI loop's [`wait`](Self::wait) unblocks.
+    pub fn new(title: &str, cols: u16, rows: u16, wake: waker::Waker) -> Result<Self> {
         let cell_w = render::CELL_W;
         let cell_h = render::CELL_H;
         let width = cols as i32 * cell_w;
@@ -156,10 +164,13 @@ impl TermWindow {
         let (mut sender, reader, repeat_timer) = conn::connect()?;
         let (producer, mut events) =
             RingBuffer::<Event>::new(Capacity::exact(EVENT_RING_CAP)).split();
+        // The reader signals this after pushing events so the UI thread, which
+        // polls instead of blocking on a single ring, wakes.
+        let reader_wake = wake.clone();
         let reader_handle = std::thread::Builder::new()
             .name("terminal-wayland-reader".into())
             .spawn(move || {
-                let r = reader.run(producer).map_err(Error::Conn);
+                let r = reader.run(producer, Some(reader_wake)).map_err(Error::Conn);
                 if let Err(e) = &r {
                     eprintln!("platform: reader error: {e}");
                 }
@@ -206,6 +217,7 @@ impl TermWindow {
             window_tx,
             events,
             reader: Some(reader_handle),
+            wake,
             compositor,
             shm,
             wm_base,
@@ -252,6 +264,25 @@ impl TermWindow {
     /// Pull the next pending input event, if any.
     pub fn next_input(&mut self) -> Option<InputEvent> {
         self.input_queue.pop_front()
+    }
+
+    /// A clone of the UI wakeup channel. Hand this to any thread (e.g. the
+    /// parser) that produces work the UI loop consumes; calling
+    /// [`waker::Waker::signal`] on it wakes a [`wait`](Self::wait)ing UI loop.
+    #[must_use]
+    pub fn waker(&self) -> waker::Waker {
+        self.wake.clone()
+    }
+
+    /// Block until the reader pushes a Wayland event, a signaller wakes us, or
+    /// `timeout_ms` elapses (negative = forever). Drains the wakeup counter
+    /// before returning so the next `wait` parks correctly. The caller must
+    /// drain its rings (events, dirty) *after* this returns — any signal that
+    /// races in between leaves the eventfd counter non-zero, so the following
+    /// `wait` returns immediately rather than sleeping through the work.
+    pub fn wait(&self, timeout_ms: i32) {
+        let _ = self.wake.wait(timeout_ms);
+        self.wake.drain();
     }
 
     /// Process pending Wayland events (non-blocking).

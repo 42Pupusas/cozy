@@ -13,4 +13,5 @@ input        = { path = "../../crates/input" }
 platform     = { path = "../../crates/platform" }
 pty          = { path = "../../crates/pty" }
 vt_parser    = { path = "../../crates/vt_parser" }
+waker        = { path = "../../crates/waker" }
 quetzalcoatl = { workspace = true }

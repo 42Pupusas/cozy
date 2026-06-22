@@ -9,6 +9,10 @@ pub struct Screen {
     /// All rows: `[scrollback rows ... | visible rows]`.
     /// Visible area starts at `buf[scrollback_len..]`.
     buf: Vec<Cell>,
+    /// Per physical row: true if the line continues (soft-wrapped) onto the
+    /// next physical row. Parallel to rows in `buf`; length `total`.
+    /// This is what lets `resize` reflow instead of clip.
+    wrapped: Vec<bool>,
     cols: u16,
     rows: u16,
     /// Maximum scrollback lines (0 for alternate screen).
@@ -26,6 +30,7 @@ impl Screen {
         let total = usize::from(rows) + scrollback_max;
         Self {
             buf: vec![Cell::default(); total * usize::from(cols)],
+            wrapped: vec![false; total],
             cols,
             rows,
             scrollback_max,
@@ -64,6 +69,21 @@ impl Screen {
         self.buf[idx] = cell;
     }
 
+    /// Mark (or clear) the soft-wrap continuation flag for a visible row.
+    pub fn set_wrapped(&mut self, row: u16, wrapped: bool) {
+        let idx = self.scrollback_len + usize::from(row);
+        if idx < self.wrapped.len() {
+            self.wrapped[idx] = wrapped;
+        }
+    }
+
+    /// Whether a visible row soft-wraps onto the next.
+    #[must_use]
+    pub fn is_wrapped(&self, row: u16) -> bool {
+        let idx = self.scrollback_len + usize::from(row);
+        self.wrapped.get(idx).copied().unwrap_or(false)
+    }
+
     /// Erase a rectangular region to blank cells.
     pub fn erase_range(&mut self, col0: u16, row0: u16, col1: u16, row1: u16) {
         for row in row0..=row1.min(self.rows - 1) {
@@ -81,12 +101,19 @@ impl Screen {
         for cell in &mut self.buf[base + c0..=base + c1] {
             *cell = Cell::default();
         }
+        // Erasing through the right margin breaks any soft-wrap continuation.
+        if c1 + 1 >= usize::from(self.cols) {
+            self.set_wrapped(row, false);
+        }
     }
 
     /// Clear entire visible area.
     pub fn clear(&mut self) {
         let start = self.scrollback_len * usize::from(self.cols);
         self.buf[start..].fill(Cell::default());
+        for w in &mut self.wrapped[self.scrollback_len..] {
+            *w = false;
+        }
     }
 
     /// Scroll the region `[top, bot]` up by `n` lines, pulling blank lines at bottom.
@@ -101,25 +128,14 @@ impl Screen {
             return;
         }
 
-        // Push scrolled-off lines to scrollback if room.
+        // Push scrolled-off lines to scrollback if room (top region only).
         if top_i == 0 && self.scrollback_max > 0 {
             let push = n.min(self.scrollback_max - self.scrollback_len);
             if push > 0 {
-                // Prepend scrollback: shift existing scrollback up and copy top visible rows.
-                let sb = self.scrollback_len;
-                let buf_cols = cols;
-                // Rotate: move scrollback down by `push`, then write new lines at [sb..sb+push].
-                // Because the buffer is [scrollback | visible], moving scrollback down means
-                // moving it toward index 0 — scrollback grows toward higher indices in our layout.
-                // New scrollback lines are appended after existing ones.
-                let src = sb * buf_cols;
-                let dst = 0;
-                self.buf.copy_within(dst..src + push * buf_cols, 0);
-                // Actually the simplest layout: scrollback at START, visible after.
-                // scroll_up: copy n rows from visible top into scrollback end.
-                let sb_start = self.scrollback_len * buf_cols;
-                let vis_start = (self.scrollback_len + top_i) * buf_cols; // same as sb_start for top=0
-                self.buf.copy_within(vis_start..vis_start + push * buf_cols, sb_start);
+                // The top `push` visible rows simply become scrollback: they
+                // are already contiguous just below existing scrollback, so we
+                // only need to extend the boundary (their wrapped flags ride
+                // along untouched).
                 self.scrollback_len += push;
             }
         }
@@ -131,11 +147,17 @@ impl Screen {
         let move_rows = (bot_i - top_i + 1).saturating_sub(n);
         if move_rows > 0 {
             self.buf.copy_within(src_start..src_start + move_rows * cols, dst_start);
+            self.wrapped
+                .copy_within(vis_off + top_i + n..vis_off + top_i + n + move_rows, vis_off + top_i);
         }
 
         // Blank the bottom `n` rows.
+        let blank_n = n.min(bot_i - top_i + 1);
         let blank_start = (vis_off + top_i + move_rows) * cols;
-        self.buf[blank_start..blank_start + n.min(bot_i - top_i + 1) * cols].fill(Cell::default());
+        self.buf[blank_start..blank_start + blank_n * cols].fill(Cell::default());
+        for w in &mut self.wrapped[vis_off + top_i + move_rows..vis_off + top_i + move_rows + blank_n] {
+            *w = false;
+        }
     }
 
     /// Scroll the region `[top, bot]` down by `n` lines, pulling blank lines at top.
@@ -155,10 +177,16 @@ impl Screen {
             let src_start = (vis_off + top_i) * cols;
             let dst_start = (vis_off + top_i + n) * cols;
             self.buf.copy_within(src_start..src_start + move_rows * cols, dst_start);
+            self.wrapped
+                .copy_within(vis_off + top_i..vis_off + top_i + move_rows, vis_off + top_i + n);
         }
         // Blank top n rows.
+        let blank_n = n.min(bot_i - top_i + 1);
         let blank_start = (vis_off + top_i) * cols;
-        self.buf[blank_start..blank_start + n.min(bot_i - top_i + 1) * cols].fill(Cell::default());
+        self.buf[blank_start..blank_start + blank_n * cols].fill(Cell::default());
+        for w in &mut self.wrapped[vis_off + top_i..vis_off + top_i + blank_n] {
+            *w = false;
+        }
     }
 
     /// Insert `n` blank lines at `row`, shifting rows in `[row, bot]` down.
@@ -204,57 +232,135 @@ impl Screen {
         self.buf[base + col_i..base + col_i + n_i].fill(Cell::default());
     }
 
-    /// Resize, preserving as much content as possible.
-    /// Resize to `new_cols` x `new_rows`, keeping the *bottom* of the content
-    /// anchored (terminals fill upward from the last row, so the prompt and
-    /// recent output must survive a shrink). `used_rows` is how many visible
-    /// rows actually hold content (cursor row + 1); rows above the kept window
-    /// spill into scrollback. Returns the number of rows shifted up into
-    /// scrollback so the caller can adjust the cursor.
-    pub fn resize(&mut self, new_cols: u16, new_rows: u16, used_rows: u16) -> u16 {
+    /// Resize to `new_cols` x `new_rows`, **reflowing** soft-wrapped lines to
+    /// the new width instead of clipping them.
+    ///
+    /// The whole buffer (scrollback + visible) is split into logical lines by
+    /// following the per-row `wrapped` flags, each logical line is re-broken at
+    /// `new_cols`, and the result is repacked bottom-anchored (overflow spills
+    /// into scrollback). `cursor` is the active cursor in the OLD geometry; the
+    /// returned pair is its position in the NEW geometry.
+    pub fn resize(&mut self, new_cols: u16, new_rows: u16, cursor: (u16, u16)) -> (u16, u16) {
         let old_cols = usize::from(self.cols);
-        let new_cols_u = usize::from(new_cols);
-        let new_rows_u = usize::from(new_rows);
-        let old_rows_u = usize::from(self.rows);
-        let sb = self.scrollback_len;
-        let copy_cols = old_cols.min(new_cols_u);
+        let new_cols_u = usize::from(new_cols).max(1);
+        let new_rows_u = usize::from(new_rows).max(1);
+        let total_old = self.scrollback_len + usize::from(self.rows);
+        let cursor_abs = self.scrollback_len + usize::from(cursor.1);
+        let cursor_col = usize::from(cursor.0);
 
-        // How many visible rows to carry over: the used region, clipped to the
-        // new height. When shrinking below `used`, drop from the TOP (oldest).
-        let used = usize::from(used_rows).clamp(1, old_rows_u);
-        let keep = used.min(new_rows_u);
-        let first_kept = used - keep; // rows above this are pushed to scrollback
+        // 1. Stitch physical rows into logical lines via the wrapped flags,
+        //    recording where the cursor falls.
+        let mut lines: Vec<Vec<Cell>> = Vec::new();
+        let mut cursor_line = 0usize;
+        let mut cursor_offset = 0usize;
+        let mut r = 0usize;
+        while r < total_old {
+            let li = lines.len();
+            let mut cells: Vec<Cell> = Vec::new();
+            loop {
+                let base = r * old_cols;
+                if r == cursor_abs {
+                    cursor_line = li;
+                    cursor_offset = cells.len() + cursor_col;
+                }
+                cells.extend_from_slice(&self.buf[base..base + old_cols]);
+                let cont = self.wrapped.get(r).copied().unwrap_or(false);
+                r += 1;
+                if !cont || r >= total_old {
+                    break;
+                }
+            }
+            // Trim trailing blanks (the unused tail of the logical line).
+            while cells.last() == Some(&Cell::default()) {
+                cells.pop();
+            }
+            lines.push(cells);
+        }
+
+        // 2. Drop trailing empty logical lines, but never above the cursor line.
+        let mut last_keep = cursor_line;
+        for (i, l) in lines.iter().enumerate() {
+            if !l.is_empty() {
+                last_keep = last_keep.max(i);
+            }
+        }
+        lines.truncate(last_keep + 1);
+
+        // 3. Re-break each logical line at the new width.
+        let mut rows_out: Vec<(Vec<Cell>, bool)> = Vec::new();
+        let mut new_cursor_idx = 0usize;
+        let mut new_cursor_col = 0usize;
+        for (li, line) in lines.iter().enumerate() {
+            let pieces = if line.is_empty() {
+                1
+            } else {
+                line.len().div_ceil(new_cols_u)
+            };
+            let base_idx = rows_out.len();
+            for p in 0..pieces {
+                let start = p * new_cols_u;
+                let end = ((p + 1) * new_cols_u).min(line.len());
+                let mut row_cells = vec![Cell::default(); new_cols_u];
+                if start < end {
+                    row_cells[..end - start].copy_from_slice(&line[start..end]);
+                }
+                rows_out.push((row_cells, p + 1 < pieces));
+            }
+            if li == cursor_line {
+                let piece = (cursor_offset / new_cols_u).min(pieces - 1);
+                new_cursor_idx = base_idx + piece;
+                new_cursor_col = (cursor_offset - piece * new_cols_u).min(new_cols_u - 1);
+            }
+        }
+
+        // 4. Repack bottom-anchored: the last `new_rows` go visible, the rest
+        //    into scrollback (capped, dropping the oldest beyond the cap).
+        let m = rows_out.len();
+        let overflow = m.saturating_sub(new_rows_u);
+        let new_sb_len = overflow.min(self.scrollback_max);
+        let dropped = overflow - new_sb_len;
+        let visible_count = m - overflow;
 
         let total = new_rows_u + self.scrollback_max;
         let mut new_buf = vec![Cell::default(); total * new_cols_u];
+        let mut new_wrapped = vec![false; total];
 
-        // Preserve existing scrollback (clipped to new width).
-        for row in 0..sb.min(total.saturating_sub(new_rows_u)) {
-            let src = row * old_cols;
-            let dst = row * new_cols_u;
-            new_buf[dst..dst + copy_cols].copy_from_slice(&self.buf[src..src + copy_cols]);
+        for i in 0..new_sb_len {
+            let (cells, w) = &rows_out[dropped + i];
+            let dst = i * new_cols_u;
+            new_buf[dst..dst + new_cols_u].copy_from_slice(cells);
+            new_wrapped[i] = *w;
         }
-
-        // Copy the kept visible rows, bottom-anchored to the top of the new
-        // visible area.
-        for i in 0..keep {
-            let src = (sb + first_kept + i) * old_cols;
-            let dst = (sb + i) * new_cols_u;
-            new_buf[dst..dst + copy_cols].copy_from_slice(&self.buf[src..src + copy_cols]);
+        for i in 0..visible_count {
+            let (cells, w) = &rows_out[overflow + i];
+            let dst = (new_sb_len + i) * new_cols_u;
+            new_buf[dst..dst + new_cols_u].copy_from_slice(cells);
+            new_wrapped[new_sb_len + i] = *w;
         }
 
         self.buf = new_buf;
+        self.wrapped = new_wrapped;
         self.cols = new_cols;
         self.rows = new_rows;
+        self.scrollback_len = new_sb_len;
         self.scroll_top = 0;
         self.scroll_bot = new_rows.saturating_sub(1);
-        first_kept as u16
+
+        // 5. Map the cursor into the new geometry.
+        let new_row = if new_cursor_idx >= overflow {
+            (new_cursor_idx - overflow) as u16
+        } else {
+            0
+        };
+        (
+            new_cursor_col as u16,
+            new_row.min(new_rows.saturating_sub(1)),
+        )
     }
 
     /// Index of the last visible row that holds any non-blank cell, plus one
     /// (i.e. the number of visible rows actually occupied by content). Returns
-    /// 0 when the visible area is entirely blank. Used to bottom-anchor resize
-    /// without discarding real output.
+    /// 0 when the visible area is entirely blank.
     #[must_use]
     pub fn content_rows(&self) -> u16 {
         let cols = usize::from(self.cols);

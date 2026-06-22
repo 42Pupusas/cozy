@@ -142,8 +142,11 @@ fn pty_thread(
     };
 
     while !quit.load(Ordering::Relaxed) {
+        let mut did_work = false;
+
         // Drain all pending input messages first (writes are cheap).
         while let Some(msg) = input_rx.pop() {
+            did_work = true;
             match msg {
                 InputMsg::Bytes(b)          => { let _ = pty.write(&b); }
                 InputMsg::Resize { cols, rows } => { let _ = pty.resize(cols, rows); }
@@ -165,12 +168,17 @@ fn pty_thread(
             Ok(Some(n)) => {
                 // Best-effort; drop if ring is full (parser thread is behind).
                 let _ = pty_out_tx.push(PtyChunk { buf, len: n });
+                did_work = true;
             }
             // EAGAIN: no data yet — keep looping.
             Ok(None) => {}
         }
 
-        std::thread::yield_now();
+        // Idle: sleep briefly instead of busy-spinning a whole core. ~1ms keeps
+        // latency imperceptible while dropping idle CPU to ~0.
+        if !did_work {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -213,7 +221,10 @@ fn parser_thread(
             }
         }
 
-        std::thread::yield_now();
+        // Idle: sleep instead of spinning. `dirty` doubles as our did-work flag.
+        if !dirty {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -236,13 +247,17 @@ fn ui_thread(
     loop {
         if quit.load(Ordering::Relaxed) { break; }
 
+        let mut did_work = false;
+
         // Push dirty snapshots into the Wayland renderer.
         while let Some(snap) = dirty_rx.pop() {
             win.push_dirty(snap);
+            did_work = true;
         }
 
         // Process window input events.
         while let Some(ev) = win.next_input() {
+            did_work = true;
             match ev {
                 InputEvent::Close => {
                     quit.store(true, Ordering::Relaxed);
@@ -276,6 +291,13 @@ fn ui_thread(
         }
 
         if !win.tick()? { break; }
+
+        // Idle: yield the core. The Wayland reader thread wakes us via the
+        // event ring; a 1ms idle sleep keeps input latency imperceptible while
+        // dropping idle CPU from 100% (busy-spin) to ~0.
+        if !did_work {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     quit.store(true, Ordering::Relaxed);

@@ -66,29 +66,22 @@ impl Grid {
         }
     }
 
-    /// Resize the grid to new dimensions, keeping the bottom of the content
-    /// (prompt + recent output) anchored and clamping the cursor.
+    /// Resize the grid to new dimensions, reflowing soft-wrapped lines to the
+    /// new width (the primary screen) and clamping the cursor.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        // Content fills upward, so the "used" region is everything down to the
-        // last occupied row OR the cursor, whichever is lower — using the cursor
-        // alone drops output below it (and a row-0 cursor would discard the
-        // whole prompt). Primary anchors to the bottom; the alternate screen is
-        // a fixed fullscreen canvas, so it just clips from the top.
-        let used = self
-            .primary
-            .content_rows()
-            .max(self.cursor.row.saturating_add(1));
-        let shifted = self.primary.resize(cols, rows, used);
-        self.alternate.resize(cols, rows, rows);
+        let cur = (self.cursor.col, self.cursor.row);
+        let (new_col, new_row) = self.primary.resize(cols, rows, cur);
+        // The alternate screen is a fixed fullscreen canvas (no scrollback, no
+        // soft-wrap semantics), so it reflows trivially against the same cursor.
+        self.alternate.resize(cols, rows, cur);
 
-        // Re-anchor the cursor: it moves up by however many rows were pushed to
-        // scrollback, then is clamped into the new bounds.
-        self.cursor.row = self
-            .cursor
-            .row
-            .saturating_sub(shifted)
-            .min(rows.saturating_sub(1));
-        self.cursor.col = self.cursor.col.min(cols.saturating_sub(1));
+        if self.alt_active {
+            self.cursor.row = self.cursor.row.min(rows.saturating_sub(1));
+            self.cursor.col = self.cursor.col.min(cols.saturating_sub(1));
+        } else {
+            self.cursor.row = new_row;
+            self.cursor.col = new_col;
+        }
 
         self.dirty = DirtyRegion::new(cols, rows);
         self.dirty.mark_all();
@@ -154,7 +147,9 @@ impl Grid {
         if col + 1 < cols {
             self.cursor.col += 1;
         } else {
-            // Wrap to next line.
+            // Auto-wrap at the right margin: the current line continues onto
+            // the next physical row. Record that so resize can reflow it.
+            self.active_screen_mut().set_wrapped(row, true);
             self.cursor.col = 0;
             self.cursor_down(1, true);
         }
@@ -529,6 +524,43 @@ mod tests {
         g.resize(10, 2);
         assert_eq!(g.screen().get_cell(0, 0).ch, '$');
         assert_eq!(g.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn resize_narrow_reflows_wrapped_line() {
+        // 10 cols: print 15 chars -> auto-wraps to 2 rows (10 + 5).
+        let mut g = Grid::new(10, 5);
+        apply_str(&mut g, b"abcdefghijklmno");
+        assert_eq!(g.screen().get_cell(0, 0).ch, 'a');
+        assert_eq!(g.screen().get_cell(0, 1).ch, 'k');
+        // Narrow to 5 cols: the same logical line re-breaks into 3 rows.
+        g.resize(5, 5);
+        assert_eq!(g.screen().get_cell(0, 0).ch, 'a');
+        assert_eq!(g.screen().get_cell(4, 0).ch, 'e');
+        assert_eq!(g.screen().get_cell(0, 1).ch, 'f');
+        assert_eq!(g.screen().get_cell(0, 2).ch, 'k');
+        assert_eq!(g.screen().get_cell(4, 2).ch, 'o');
+    }
+
+    #[test]
+    fn resize_widen_reflows_back() {
+        // Narrow grid, wrapped line, then widen: characters rejoin one row.
+        let mut g = Grid::new(5, 5);
+        apply_str(&mut g, b"abcdefghij"); // 2 rows of 5
+        g.resize(10, 5);
+        for (i, ch) in (b'a'..=b'j').enumerate() {
+            assert_eq!(g.screen().get_cell(i as u16, 0).ch, ch as char);
+        }
+    }
+
+    #[test]
+    fn resize_hard_newline_not_joined() {
+        // Two separate logical lines (hard newline) must NOT be stitched.
+        let mut g = Grid::new(10, 5);
+        apply_str(&mut g, b"abc\r\ndef");
+        g.resize(20, 5);
+        assert_eq!(g.screen().get_cell(0, 0).ch, 'a');
+        assert_eq!(g.screen().get_cell(0, 1).ch, 'd'); // stays on its own row
     }
 
     #[test]

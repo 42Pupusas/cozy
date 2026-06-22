@@ -591,6 +591,11 @@ pub struct WindowSender {
     pub next_id: u32,
     /// Exclusive end of the pre-allocated id block.
     pub id_end: u32,
+    /// Object ids the server has released (via `wl_display.delete_id`) and that
+    /// we can hand out again. Without this, churny allocators (per-frame
+    /// callbacks, per-resize buffers/pools) would walk `next_id` off the end of
+    /// the block and panic. Recycled ids are reused before `next_id` advances.
+    pub free_ids: Vec<u32>,
 }
 
 // SAFETY: Each clone of WindowSender owns its own mpsc::Producer with its
@@ -608,13 +613,18 @@ impl Clone for WindowSender {
             // distinct pre-allocated block.
             next_id: self.next_id,
             id_end: self.id_end,
+            free_ids: Vec::new(),
         }
     }
 }
 
 impl WindowSender {
-    /// Reserve a fresh object id from this window's pre-allocated block.
+    /// Reserve a fresh object id, reusing a server-released id when available
+    /// and otherwise drawing from this window's pre-allocated block.
     pub fn alloc_id<T: ObjectId>(&mut self) -> T {
+        if let Some(id) = self.free_ids.pop() {
+            return T::from_raw(id);
+        }
         assert!(
             self.next_id < self.id_end,
             "out of pre-allocated object ids"
@@ -622,6 +632,14 @@ impl WindowSender {
         let id = self.next_id;
         self.next_id += 1;
         T::from_raw(id)
+    }
+
+    /// Return an id to the free-list once the server confirms deletion via
+    /// `wl_display.delete_id`. Only ids inside this window's block are recycled.
+    pub fn recycle_id(&mut self, id: u32) {
+        if id < self.id_end {
+            self.free_ids.push(id);
+        }
     }
 
     /// Push a finished Wayland message (no fds) onto the request ring.

@@ -139,6 +139,14 @@ requests! {
     }
 }
 
+requests! {
+    /// `wl_buffer` requests.
+    BufferRequest {
+        /// Destroy the buffer object (its id becomes reusable once the server
+        /// acknowledges with `wl_display.delete_id`).
+        Destroy = 0,
+    }
+}
 events! {
     /// `wl_buffer` events.
     BufferEvent {

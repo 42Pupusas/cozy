@@ -20,8 +20,8 @@ use crate::id::{
 };
 use crate::keymap;
 use crate::protocol::{
-    self as proto, BufferEvent, ButtonState, CallbackEvent, CompositorRequest, DisplayEvent,
-    DisplayRequest,
+    self as proto, BufferEvent, BufferRequest, ButtonState, CallbackEvent, CompositorRequest,
+    DisplayEvent, DisplayRequest,
     Format, Key, KeyState, KeyboardEvent, PointerButton, PointerEvent, PointerRequest,
     RegistryEvent, RegistryRequest, SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest,
     ShmRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent, WmBaseRequest,
@@ -94,6 +94,9 @@ pub struct TermWindow {
 
     frames: [Frame; 2],
     shm_mem: ShmBuffer,
+    /// The shm pool currently backing `frames`. Destroyed and replaced on every
+    /// resize so its old buffers/pool id get recycled via `delete_id`.
+    pool: PoolId,
     /// Persistent full-window backbuffer. Dirty rows are blitted here (it keeps
     /// the complete last-known image), then copied into whichever shm frame is
     /// free on present. Without this, incremental dirty-row blits would only
@@ -114,6 +117,9 @@ pub struct TermWindow {
     frame_cb: Option<CallbackId>,
     lifecycle: Lifecycle,
 
+    /// Latest window size proposed by `xdg_toplevel.configure`, applied once per
+    /// frame so a drag's flood of configures collapses into one resize.
+    pending_resize: Option<(i32, i32)>,
     /// Pending dirty snapshots to blit on the next frame.
     pending_dirty: Vec<grid::DirtySnapshot>,
     /// Pending input events for the caller.
@@ -162,7 +168,7 @@ impl TermWindow {
             .map_err(Error::ReaderSpawn)?;
 
         let (compositor, shm, wm_base, seat) = bind_globals(&mut sender, &mut events)?;
-        let (frames, shm_mem) = create_frames(&mut sender, shm, width, height)?;
+        let (frames, shm_mem, pool) = create_frames(&mut sender, shm, width, height)?;
 
         let surface: SurfaceId = sender.alloc_id();
         sender.request(
@@ -189,7 +195,8 @@ impl TermWindow {
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<crate::conn::WindowRequest>::new(Capacity::exact(64)).split();
         let (id_start, id_end) = sender.alloc_id_block(256);
-        let window_tx = WindowSender { tx: req_tx, next_id: id_start, id_end };
+        let window_tx =
+            WindowSender { tx: req_tx, next_id: id_start, id_end, free_ids: Vec::new() };
 
         let backbuffer = vec![render::DEFAULT_BG_XRGB; (width * height) as usize];
 
@@ -216,6 +223,7 @@ impl TermWindow {
             cursor,
             frames,
             shm_mem,
+            pool,
             backbuffer,
             width,
             height,
@@ -227,6 +235,7 @@ impl TermWindow {
             frame_ready: true,
             frame_cb: None,
             lifecycle: Lifecycle::Unconfigured,
+            pending_resize: None,
             pending_dirty: Vec::new(),
             input_queue: std::collections::VecDeque::new(),
         })
@@ -319,6 +328,14 @@ impl TermWindow {
             return Ok(());
         }
 
+        // wl_display.delete_id — the server confirms an object id is now free;
+        // recycle it so churny allocators (frame callbacks, resize buffers)
+        // don't exhaust the pre-allocated block.
+        if ev.is(DisplayId(1)) && ev.event::<DisplayEvent>() == Some(DisplayEvent::DeleteId) {
+            self.window_tx.recycle_id(ev.arg(0));
+            return Ok(());
+        }
+
         // wl_buffer.release
         if let Some(frame) = self.frames.iter_mut().find(|f| ev.is(f.buffer)) {
             if ev.event::<BufferEvent>() == Some(BufferEvent::Release) {
@@ -366,15 +383,13 @@ impl TermWindow {
 
         // xdg_toplevel.configure (resize)
         if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Configure) {
-            // xdg_toplevel.configure args: (width, height, states[]).
+            // xdg_toplevel.configure args: (width, height, states[]). A drag
+            // emits these dozens of times a second; just record the latest and
+            // coalesce into a single resize per frame (see `apply_pending_resize`).
             let w = ev.arg_i32(0);
             let h = ev.arg_i32(1);
-            if w > 0 && h > 0 && (w, h) != (self.width, self.height) {
-                self.resize(w, h)?;
-                let new_cols = (w / self.cell_w) as u16;
-                let new_rows = (h / self.cell_h) as u16;
-                self.input_queue.push_back(InputEvent::Resize { cols: new_cols, rows: new_rows });
-                self.dirty = true;
+            if w > 0 && h > 0 {
+                self.pending_resize = Some((w, h));
             }
             return Ok(());
         }
@@ -483,10 +498,28 @@ impl TermWindow {
         Ok(())
     }
 
+    /// Apply the most recent pending `configure` size, if any, as a single
+    /// resize. Collapses a drag's flood of configures into one buffer rebuild.
+    fn apply_pending_resize(&mut self) -> Result<()> {
+        let Some((w, h)) = self.pending_resize.take() else {
+            return Ok(());
+        };
+        if (w, h) == (self.width, self.height) {
+            return Ok(());
+        }
+        self.resize(w, h)?;
+        let cols = (w / self.cell_w) as u16;
+        let rows = (h / self.cell_h) as u16;
+        self.input_queue.push_back(InputEvent::Resize { cols, rows });
+        self.dirty = true;
+        Ok(())
+    }
+
     fn maybe_present(&mut self) -> Result<()> {
         if self.lifecycle != Lifecycle::Mapped {
             return Ok(());
         }
+        self.apply_pending_resize()?;
         if !self.dirty || !self.frame_ready {
             return Ok(());
         }
@@ -535,6 +568,16 @@ impl TermWindow {
     }
 
     fn resize(&mut self, w: i32, h: i32) -> Result<()> {
+        // Destroy the old buffers and pool first. The server answers each with
+        // `wl_display.delete_id`, which recycles those ids — without this, every
+        // resize step leaks 3 ids (pool + 2 buffers) until the block is gone.
+        for frame in &self.frames {
+            self.window_tx
+                .request(MessageBuilder::new(frame.buffer, BufferRequest::Destroy));
+        }
+        self.window_tx
+            .request(MessageBuilder::new(self.pool, ShmPoolRequest::Destroy));
+
         self.shm_mem = ShmBuffer::new(w as usize, h as usize, 2)
             .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
         let stride = w * 4;
@@ -569,6 +612,7 @@ impl TermWindow {
             frame.buffer = buffer;
             frame.free = true;
         }
+        self.pool = pool;
         self.width = w;
         self.height = h;
         self.backbuffer = vec![render::DEFAULT_BG_XRGB; (w * h) as usize];
@@ -600,7 +644,7 @@ fn create_frames(
     shm: ShmId,
     width: i32,
     height: i32,
-) -> Result<([Frame; 2], ShmBuffer)> {
+) -> Result<([Frame; 2], ShmBuffer, PoolId)> {
     let shm_mem = ShmBuffer::new(width as usize, height as usize, 2)
         .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
     let stride = width * 4;
@@ -624,7 +668,7 @@ fn create_frames(
         )?;
         slot.buffer = buffer;
     }
-    Ok((frames, shm_mem))
+    Ok((frames, shm_mem, pool))
 }
 
 fn create_cursor(

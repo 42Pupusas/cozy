@@ -2,9 +2,14 @@
 resolver = "2"
 members = [
     "bins/*",
-    # "crates/*",   # uncomment when first crate is added
+    "crates/*",
     # "benches/*",  # uncomment when first bench is added
 ]
+
+[workspace.dependencies]
+ququmatz      = { path = "/home/cuarentaydos/Code/tooling/ququmatz" }
+quetzal-uring = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl-uring" }
+quetzalcoatl  = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl" }
 
 [workspace.lints.clippy]
 # groups

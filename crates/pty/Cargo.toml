@@ -1,0 +1,12 @@
+[package]
+name    = "pty"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+ququmatz      = { workspace = true }
+quetzal-uring = { workspace = true }
+quetzalcoatl  = { workspace = true }

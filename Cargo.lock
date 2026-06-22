@@ -3,5 +3,30 @@
 version = 4
 
 [[package]]
+name = "pty"
+version = "0.1.0"
+dependencies = [
+ "quetzal-uring",
+ "quetzalcoatl",
+ "ququmatz",
+]
+
+[[package]]
+name = "quetzal-uring"
+version = "0.2.0"
+dependencies = [
+ "quetzalcoatl",
+ "ququmatz",
+]
+
+[[package]]
+name = "quetzalcoatl"
+version = "0.13.0"
+
+[[package]]
+name = "ququmatz"
+version = "0.15.0"
+
+[[package]]
 name = "terminal"
 version = "0.1.0"

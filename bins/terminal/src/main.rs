@@ -230,15 +230,16 @@ fn pty_thread(
 
 // ── Parser + grid thread ──────────────────────────────────────────────────────
 
-// Feed one parser message to the grid, returning a pending resize (if any) for
-// the caller to coalesce — only the final dimensions per batch matter.
-fn feed_parser(grid: &mut Grid, parser: &mut Parser, msg: ParserMsg) -> Option<(u16, u16)> {
+// Feed one parser message to the grid, applying it immediately. Order matters:
+// a Resize must take effect before any Data that follows it (the shell's
+// post-SIGWINCH repaint must land on the already-reflowed grid), so resizes are
+// NOT deferred or coalesced across interleaved data.
+fn feed_parser(grid: &mut Grid, parser: &mut Parser, msg: ParserMsg) {
     match msg {
         ParserMsg::Data(chunk) => {
             parser.feed(&chunk.buf[..chunk.len], |ev| grid.apply(&ev));
-            None
         }
-        ParserMsg::Resize { cols, rows } => Some((cols, rows)),
+        ParserMsg::Resize { cols, rows } => grid.resize(cols, rows),
     }
 }
 
@@ -268,16 +269,12 @@ fn parser_thread(
 
     while !quit.load(Ordering::Relaxed) {
         // Block for the next message, then drain whatever else is queued so a
-        // burst is handled in one batch. Resizes coalesce: only the last wins.
+        // burst is handled in one batch — but strictly in arrival order, so a
+        // Resize and the Data that follows it stay correctly sequenced.
         let Some(first) = parser_rx.pop_block() else { break };
-        let mut pending_resize = feed_parser(&mut grid, &mut parser, first);
+        feed_parser(&mut grid, &mut parser, first);
         while let Some(msg) = parser_rx.pop() {
-            if let Some(rz) = feed_parser(&mut grid, &mut parser, msg) {
-                pending_resize = Some(rz);
-            }
-        }
-        if let Some((cols, rows)) = pending_resize {
-            grid.resize(cols, rows);
+            feed_parser(&mut grid, &mut parser, msg);
         }
 
         flush_replies(&mut grid);

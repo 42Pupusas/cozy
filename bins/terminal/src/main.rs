@@ -30,6 +30,7 @@ use input::{Encoder, Key, KeyState, Modifiers};
 use platform::{InputEvent, TermWindow};
 use pty::PtySimple;
 use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc;
 use quetzalcoatl::spsc::RingBuffer;
 use vt_parser::Parser;
 
@@ -40,11 +41,16 @@ const ROWS: u16 = 24;
 /// PTY read buffer size.
 const PTY_BUF: usize = 4096;
 
+// Ring topology (3 rings, one per thread edge of the pty→parser→ui→pty cycle):
+//
+//   parser_in  (ParserMsg)    pty + ui  → parser   MPSC  data chunks + resizes
+//   dirty      (DirtySnapshot) parser   → ui       SPSC  render snapshots
+//   input      (InputMsg)      ui + parser → pty    MPSC  keystrokes + CPR replies
+//
 /// Ring capacities (power-of-two items).
-const RING_PTY_OUT: usize = 64; // PtyChunk slots       pty    → parser
-const RING_DIRTY:   usize = 16; // DirtySnapshot slots  parser → ui
-const RING_INPUT:   usize = 64; // InputMsg slots       ui     → pty
-const RING_RESIZE:  usize = 16; // GridResize slots     ui     → parser
+const RING_PARSER_IN: usize = 64; // ParserMsg slots     pty+ui → parser
+const RING_DIRTY:     usize = 16; // DirtySnapshot slots parser → ui
+const RING_INPUT:     usize = 64; // InputMsg slots      ui+parser → pty
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
@@ -55,20 +61,21 @@ struct PtyChunk {
     len: usize,
 }
 
+/// Messages into the parser/grid thread. Merged onto one MPSC ring: the pty
+/// thread sends shell output (`Data`), the ui thread sends window resizes
+/// (`Resize`) so the grid tracks the new cell extent and reflows.
+#[derive(Clone)]
+enum ParserMsg {
+    Data(PtyChunk),
+    Resize { cols: u16, rows: u16 },
+}
+
 /// Messages from the UI thread to the PTY thread.
 #[derive(Clone)]
 enum InputMsg {
     Bytes(Box<[u8]>),
     Resize { cols: u16, rows: u16 },
     Quit,
-}
-
-/// New grid dimensions, sent from the UI thread to the parser/grid thread on a
-/// window resize so the grid (not just the pty) tracks the new cell extent.
-#[derive(Clone, Copy)]
-struct GridResize {
-    cols: u16,
-    rows: u16,
 }
 
 // ── Entry ──────────────────────────────────────────────────────────────────────
@@ -87,14 +94,20 @@ fn main() {
 
 fn run(cfg: &Config) -> platform::Result<()> {
     // ── Rings ───────────────────────────────────────────────────────────────
-    let (pty_out_tx, pty_out_rx) =
-        RingBuffer::<PtyChunk>::new(Capacity::exact(RING_PTY_OUT)).split();
+    // parser_in is MPSC: the pty thread pushes shell output, the ui thread
+    // pushes resizes. The ring's own park/unpark wakes the parked parser when
+    // either producer pushes — so resizes wake the grid directly (no eventfd).
+    let (parser_data_tx, parser_in_rx) =
+        mpsc::RingBuffer::<ParserMsg>::new(Capacity::exact(RING_PARSER_IN)).split();
+    let parser_resize_tx = parser_data_tx.clone();
     let (dirty_tx, dirty_rx) =
         RingBuffer::<DirtySnapshot>::new(Capacity::exact(RING_DIRTY)).split();
+    // input is MPSC too: the ui thread (keystrokes / resize / quit) and the
+    // parser/grid thread (CPR/DA responses written back to the shell) both feed
+    // the single PTY consumer.
     let (input_tx, input_rx) =
-        RingBuffer::<InputMsg>::new(Capacity::exact(RING_INPUT)).split();
-    let (resize_tx, resize_rx) =
-        RingBuffer::<GridResize>::new(Capacity::exact(RING_RESIZE)).split();
+        mpsc::RingBuffer::<InputMsg>::new(Capacity::exact(RING_INPUT)).split();
+    let reply_tx = input_tx.clone();
 
     // ── Shared quit flag ────────────────────────────────────────────────────
     let quit        = Arc::new(AtomicBool::new(false));
@@ -108,26 +121,30 @@ fn run(cfg: &Config) -> platform::Result<()> {
     // `pty_wake` lets the UI thread rouse the PTY thread when it queues input.
     let ui_wake  = platform::Waker::new().expect("create ui waker");
     let pty_wake = waker::Waker::new().expect("create pty waker");
-    let parser_ui_wake = ui_wake.clone();
-    let ui_pty_wake    = pty_wake.clone();
+    let parser_ui_wake  = ui_wake.clone();
+    let parser_pty_wake = pty_wake.clone();
+    let ui_pty_wake     = pty_wake.clone();
 
     // ── Spawn PTY thread ────────────────────────────────────────────────────
     let shell = cfg.shell.clone();
     let pty_thread = std::thread::Builder::new()
         .name("pty".into())
-        .spawn(move || pty_thread(shell, pty_out_tx, input_rx, pty_wake, quit_pty))
+        .spawn(move || pty_thread(shell, parser_data_tx, input_rx, pty_wake, quit_pty))
         .expect("spawn pty thread");
 
     // ── Spawn parser + grid thread ──────────────────────────────────────────
     let parser_thread = std::thread::Builder::new()
         .name("parser".into())
         .spawn(move || {
-            parser_thread(COLS, ROWS, pty_out_rx, dirty_tx, resize_rx, parser_ui_wake, quit_parser);
+            parser_thread(
+                COLS, ROWS, parser_in_rx, dirty_tx,
+                reply_tx, parser_ui_wake, parser_pty_wake, quit_parser,
+            );
         })
         .expect("spawn parser thread");
 
     // ── UI thread (main thread) ─────────────────────────────────────────────
-    ui_thread(cfg, dirty_rx, input_tx, resize_tx, ui_wake, ui_pty_wake, &quit)?;
+    ui_thread(cfg, dirty_rx, input_tx, parser_resize_tx, ui_wake, ui_pty_wake, &quit)?;
 
     pty_thread.join().ok();
     parser_thread.join().ok();
@@ -142,8 +159,8 @@ fn run(cfg: &Config) -> platform::Result<()> {
 #[allow(clippy::needless_pass_by_value)]
 fn pty_thread(
     shell:      String,
-    pty_out_tx: quetzalcoatl::spsc::Producer<PtyChunk>,
-    mut input_rx:   quetzalcoatl::spsc::Consumer<InputMsg>,
+    parser_tx:  mpsc::Producer<ParserMsg>,
+    mut input_rx:   mpsc::Consumer<InputMsg>,
     input_wake: waker::Waker,
     quit:       Arc<AtomicBool>,
 ) {
@@ -195,7 +212,7 @@ fn pty_thread(
             }
             Ok(Some(n)) => {
                 // Best-effort; drop if ring is full (parser thread is behind).
-                let _ = pty_out_tx.push(PtyChunk { buf, len: n });
+                let _ = parser_tx.push(ParserMsg::Data(PtyChunk { buf, len: n }));
                 did_work = true;
             }
             // EAGAIN: no data yet — keep looping.
@@ -213,61 +230,62 @@ fn pty_thread(
 
 // ── Parser + grid thread ──────────────────────────────────────────────────────
 
-#[allow(clippy::needless_pass_by_value)] // owns ring endpoints; see pty_thread
+// Feed one parser message to the grid, returning a pending resize (if any) for
+// the caller to coalesce — only the final dimensions per batch matter.
+fn feed_parser(grid: &mut Grid, parser: &mut Parser, msg: ParserMsg) -> Option<(u16, u16)> {
+    match msg {
+        ParserMsg::Data(chunk) => {
+            parser.feed(&chunk.buf[..chunk.len], |ev| grid.apply(&ev));
+            None
+        }
+        ParserMsg::Resize { cols, rows } => Some((cols, rows)),
+    }
+}
+
+// owns ring endpoints (see pty_thread); arg count is inherent to a thread entry.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn parser_thread(
     cols:       u16,
     rows:       u16,
-    mut pty_out_rx: quetzalcoatl::spsc::Consumer<PtyChunk>,
+    mut parser_rx: mpsc::Consumer<ParserMsg>,
     dirty_tx:   quetzalcoatl::spsc::Producer<DirtySnapshot>,
-    mut resize_rx: quetzalcoatl::spsc::Consumer<GridResize>,
+    reply_tx:   mpsc::Producer<InputMsg>,
     ui_wake:    waker::Waker,
+    pty_wake:   waker::Waker,
     quit:       Arc<AtomicBool>,
 ) {
     let mut grid   = Grid::new(cols, rows);
     let mut parser = Parser::new();
 
+    // Push any host-bound replies the grid produced (CPR/DA) to the PTY thread.
+    let flush_replies = |grid: &mut Grid| {
+        let replies = grid.take_replies();
+        if !replies.is_empty() {
+            let _ = reply_tx.push(InputMsg::Bytes(replies.into_boxed_slice()));
+            pty_wake.signal();
+        }
+    };
+
     while !quit.load(Ordering::Relaxed) {
-        let mut dirty = false;
-
-        // Apply the latest pending resize (coalesce — only the last matters).
-        let mut new_dims = None;
-        while let Some(rz) = resize_rx.pop() {
-            new_dims = Some(rz);
-        }
-        if let Some(rz) = new_dims {
-            grid.resize(rz.cols, rz.rows);
-            dirty = true;
-        }
-
-        while let Some(chunk) = pty_out_rx.pop() {
-            parser.feed(&chunk.buf[..chunk.len], |ev| { grid.apply(&ev); });
-            dirty = true;
-        }
-
-        if dirty {
-            let snap = grid.take_dirty();
-            if !snap.is_empty() {
-                let _ = dirty_tx.push(snap);
-                // Wake the UI thread (it polls an eventfd, not this ring).
-                ui_wake.signal();
+        // Block for the next message, then drain whatever else is queued so a
+        // burst is handled in one batch. Resizes coalesce: only the last wins.
+        let Some(first) = parser_rx.pop_block() else { break };
+        let mut pending_resize = feed_parser(&mut grid, &mut parser, first);
+        while let Some(msg) = parser_rx.pop() {
+            if let Some(rz) = feed_parser(&mut grid, &mut parser, msg) {
+                pending_resize = Some(rz);
             }
         }
+        if let Some((cols, rows)) = pending_resize {
+            grid.resize(cols, rows);
+        }
 
-        // Block until the PTY produces more output instead of busy-polling. The
-        // PTY is the dominant source; resizes are rare and always followed by
-        // shell repaint output (SIGWINCH → prompt redraw), which wakes us so the
-        // pending `resize_rx` item is picked up on the next iteration. Returns
-        // `None` only when the pty thread drops its producer (shutdown).
-        match pty_out_rx.pop_block() {
-            Some(chunk) => {
-                parser.feed(&chunk.buf[..chunk.len], |ev| { grid.apply(&ev); });
-                let snap = grid.take_dirty();
-                if !snap.is_empty() {
-                    let _ = dirty_tx.push(snap);
-                    ui_wake.signal();
-                }
-            }
-            None => break,
+        flush_replies(&mut grid);
+
+        let snap = grid.take_dirty();
+        if !snap.is_empty() {
+            let _ = dirty_tx.push(snap);
+            ui_wake.signal(); // UI polls an eventfd, not this ring
         }
     }
 }
@@ -278,13 +296,14 @@ fn parser_thread(
 fn ui_thread(
     cfg:      &Config,
     mut dirty_rx: quetzalcoatl::spsc::Consumer<DirtySnapshot>,
-    input_tx: quetzalcoatl::spsc::Producer<InputMsg>,
-    resize_tx: quetzalcoatl::spsc::Producer<GridResize>,
+    input_tx: mpsc::Producer<InputMsg>,
+    resize_tx: mpsc::Producer<ParserMsg>,
     ui_wake:  platform::Waker,
     pty_wake: waker::Waker,
     quit:     &AtomicBool,
 ) -> platform::Result<()> {
-    let mut win     = TermWindow::new("terminal", COLS, ROWS, ui_wake)?;
+    let theme = platform::Theme::from_palette(&cfg.palette);
+    let mut win     = TermWindow::new("terminal", COLS, ROWS, ui_wake, theme)?;
     let encoder = Encoder::new();
 
     // Future: use cfg.cursor.blink / blink_rate in the renderer.
@@ -314,8 +333,11 @@ fn ui_thread(
                     return Ok(());
                 }
                 InputEvent::Resize { cols, rows } => {
+                    // PTY gets the winsize (SIGWINCH); the grid gets the new
+                    // extent to reflow. Pushing to the parser MPSC ring unparks
+                    // the parser directly — no separate wake needed.
                     let _ = input_tx.push(InputMsg::Resize { cols, rows });
-                    let _ = resize_tx.push(GridResize { cols, rows });
+                    let _ = resize_tx.push(ParserMsg::Resize { cols, rows });
                     sent_input = true;
                 }
                 InputEvent::Key { key, state, modifiers } => {

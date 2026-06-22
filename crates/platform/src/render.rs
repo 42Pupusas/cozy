@@ -68,31 +68,74 @@ static PALETTE: [(u8, u8, u8); 256] = {
     t
 };
 
-/// Terminal default fg/bg (matches a dark theme).
+/// Built-in default fg/bg (used when no config theme is supplied).
 const DEFAULT_FG: DrawColor = DrawColor::rgb(0xcc, 0xcc, 0xcc);
 const DEFAULT_BG: DrawColor = DrawColor::rgb(0x1e, 0x1e, 0x2e);
 
-/// Default background as a packed XRGB8888 word — used to clear the backbuffer.
-pub const DEFAULT_BG_XRGB: u32 = DEFAULT_BG.to_xrgb8888();
-
-fn resolve(color: Color, default: DrawColor) -> DrawColor {
-    match color {
-        Color::Default => default,
-        Color::Indexed(n) => {
-            let (r, g, b) = PALETTE[n as usize];
-            DrawColor::rgb(r, g, b)
-        }
-        Color::Rgb(r, g, b) => DrawColor::rgb(r, g, b),
-    }
+/// Resolved color theme: the 16 ANSI colors plus default fg/bg. Indices 16–255
+/// fall through to the static xterm cube. Built from a [`config::Palette`] via
+/// [`Theme::from_palette`], or [`Theme::builtin`] for the hard-coded default.
+#[derive(Clone)]
+pub struct Theme {
+    /// ANSI 0–15 overrides (RGB).
+    ansi: [(u8, u8, u8); 16],
+    fg: DrawColor,
+    bg: DrawColor,
 }
 
-fn effective(attrs: &Attrs) -> (DrawColor, DrawColor) {
-    let fg = resolve(attrs.fg, DEFAULT_FG);
-    let bg = resolve(attrs.bg, DEFAULT_BG);
-    if attrs.inverse {
-        (bg, fg)
-    } else {
-        (fg, bg)
+impl Theme {
+    /// The built-in dark theme (xterm ANSI colors + grey-on-charcoal default).
+    #[must_use]
+    pub fn builtin() -> Self {
+        let mut ansi = [(0u8, 0u8, 0u8); 16];
+        let mut i = 0;
+        while i < 16 {
+            ansi[i] = PALETTE[i];
+            i += 1;
+        }
+        Self { ansi, fg: DEFAULT_FG, bg: DEFAULT_BG }
+    }
+
+    /// Build a theme from a parsed config palette.
+    #[must_use]
+    pub fn from_palette(p: &config::Palette) -> Self {
+        let mut ansi = [(0u8, 0u8, 0u8); 16];
+        for (i, slot) in ansi.iter_mut().enumerate() {
+            let c = p.ansi(i as u8);
+            *slot = (c.r, c.g, c.b);
+        }
+        Self {
+            ansi,
+            fg: DrawColor::rgb(p.foreground.r, p.foreground.g, p.foreground.b),
+            bg: DrawColor::rgb(p.background.r, p.background.g, p.background.b),
+        }
+    }
+
+    /// The theme background as a packed XRGB8888 word (backbuffer clear color).
+    #[must_use]
+    pub fn bg_xrgb(&self) -> u32 {
+        self.bg.to_xrgb8888()
+    }
+
+    fn resolve(&self, color: Color, default: DrawColor) -> DrawColor {
+        match color {
+            Color::Default => default,
+            Color::Indexed(n) if n < 16 => {
+                let (r, g, b) = self.ansi[n as usize];
+                DrawColor::rgb(r, g, b)
+            }
+            Color::Indexed(n) => {
+                let (r, g, b) = PALETTE[n as usize];
+                DrawColor::rgb(r, g, b)
+            }
+            Color::Rgb(r, g, b) => DrawColor::rgb(r, g, b),
+        }
+    }
+
+    fn effective(&self, attrs: &Attrs) -> (DrawColor, DrawColor) {
+        let fg = self.resolve(attrs.fg, self.fg);
+        let bg = self.resolve(attrs.bg, self.bg);
+        if attrs.inverse { (bg, fg) } else { (fg, bg) }
     }
 }
 
@@ -106,8 +149,9 @@ pub fn blit_cell(
     cx: u16,
     cy: u16,
     cell: &Cell,
+    theme: &Theme,
 ) {
-    let (fg, bg) = effective(&cell.attrs);
+    let (fg, bg) = theme.effective(&cell.attrs);
     let fg_px = fg.to_xrgb8888();
     let bg_px = bg.to_xrgb8888();
 
@@ -141,10 +185,10 @@ pub fn blit_cell(
 /// Blit every dirty row in `snap` into the framebuffer.
 ///
 /// `pixels` is the entire framebuffer (`buf_width × buf_height` u32 words).
-pub fn blit_snapshot(pixels: &mut [u32], buf_width: u32, snap: &DirtySnapshot) {
+pub fn blit_snapshot(pixels: &mut [u32], buf_width: u32, snap: &DirtySnapshot, theme: &Theme) {
     for row in &snap.rows {
         for (col, cell) in row.cells.iter().enumerate() {
-            blit_cell(pixels, buf_width, col as u16, row.row, cell);
+            blit_cell(pixels, buf_width, col as u16, row.row, cell, theme);
         }
     }
 }

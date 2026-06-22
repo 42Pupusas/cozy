@@ -49,6 +49,9 @@ pub struct Grid {
     dirty: DirtyRegion,
     /// Saved cursor (DECSC).
     saved_cursor: Option<(u16, u16, Attrs)>,
+    /// Bytes the terminal must write back to the PTY (CPR, DA, etc.).
+    /// Drained by the driver via [`Grid::take_replies`] after each batch.
+    replies: Vec<u8>,
 }
 
 impl Grid {
@@ -63,6 +66,7 @@ impl Grid {
             attrs: Attrs::default(),
             dirty: DirtyRegion::new(cols, rows),
             saved_cursor: None,
+            replies: Vec::new(),
         }
     }
 
@@ -105,6 +109,13 @@ impl Grid {
     pub fn take_dirty(&mut self) -> DirtySnapshot {
         let screen = if self.alt_active { &self.alternate } else { &self.primary };
         self.dirty.take_snapshot(screen)
+    }
+
+    /// Take any pending reply bytes the terminal owes the host (responses to
+    /// CPR/DSR/DA queries). The driver writes these back to the PTY. Empties
+    /// the internal buffer.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.replies)
     }
 
     /// Read-only view of the active screen (for testing / headless render).
@@ -322,8 +333,23 @@ impl Grid {
                     self.apply_sgr(attr);
                 }
             }
-            CsiAction::DeviceStatusReport(5) => {
-                // Status OK — ignored (terminal should respond to host, handled at higher level).
+            CsiAction::DeviceStatusReport(n) => match n {
+                // DSR 5 — "report status": reply OK (CSI 0 n).
+                5 => self.replies.extend_from_slice(b"\x1b[0n"),
+                // DSR 6 — Cursor Position Report: reply CSI row ; col R (1-based).
+                // fish and other shells block on this to track their prompt.
+                6 => {
+                    use std::io::Write as _;
+                    let row = self.cursor.row + 1;
+                    let col = self.cursor.col + 1;
+                    let _ = write!(self.replies, "\x1b[{row};{col}R");
+                }
+                _ => {}
+            },
+            CsiAction::DeviceAttributes(_) => {
+                // DA — Device Attributes. Reply as a VT102 ("\x1b[?6c") so apps
+                // that probe capabilities before drawing get an answer.
+                self.replies.extend_from_slice(b"\x1b[?6c");
             }
             CsiAction::DecSet(mode) | CsiAction::SetMode(mode) => {
                 self.set_mode(*mode, true);
@@ -332,7 +358,7 @@ impl Grid {
                 self.set_mode(*mode, false);
             }
             // Ignore unhandled CSI sequences.
-            _ => {}
+            CsiAction::Unknown { .. } => {}
         }
     }
 

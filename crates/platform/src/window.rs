@@ -107,6 +107,8 @@ pub struct TermWindow {
     /// free on present. Without this, incremental dirty-row blits would only
     /// ever touch one of the two shm frames, leaving the rest black.
     backbuffer: Vec<u32>,
+    /// Resolved color theme (palette + default fg/bg), built from config.
+    theme: render::Theme,
     width: i32,
     height: i32,
     #[allow(dead_code)]
@@ -155,7 +157,13 @@ impl TermWindow {
     /// `wake` is the shared UI wakeup channel: the Wayland reader signals it
     /// after pushing events, and the caller hands clones to any other producer
     /// (e.g. the parser thread) so the UI loop's [`wait`](Self::wait) unblocks.
-    pub fn new(title: &str, cols: u16, rows: u16, wake: waker::Waker) -> Result<Self> {
+    pub fn new(
+        title: &str,
+        cols: u16,
+        rows: u16,
+        wake: waker::Waker,
+        theme: render::Theme,
+    ) -> Result<Self> {
         let cell_w = render::CELL_W;
         let cell_h = render::CELL_H;
         let width = cols as i32 * cell_w;
@@ -209,7 +217,7 @@ impl TermWindow {
         let window_tx =
             WindowSender { tx: req_tx, next_id: id_start, id_end, free_ids: Vec::new() };
 
-        let backbuffer = vec![render::DEFAULT_BG_XRGB; (width * height) as usize];
+        let backbuffer = vec![theme.bg_xrgb(); (width * height) as usize];
 
         Ok(Self {
             sender,
@@ -237,6 +245,7 @@ impl TermWindow {
             shm_mem,
             pool,
             backbuffer,
+            theme,
             width,
             height,
             scale: 1,
@@ -562,8 +571,9 @@ impl TermWindow {
 
         // Blit pending dirty snapshots into the persistent backbuffer, which
         // always holds the full image, then copy it into the free shm frame.
-        for snap in self.pending_dirty.drain(..) {
-            render::blit_snapshot(&mut self.backbuffer, self.width as u32, &snap);
+        let pending = std::mem::take(&mut self.pending_dirty);
+        for snap in &pending {
+            render::blit_snapshot(&mut self.backbuffer, self.width as u32, snap, &self.theme);
         }
         self.shm_mem.pixels(slot).copy_from_slice(&self.backbuffer);
 
@@ -649,7 +659,7 @@ impl TermWindow {
         // previous content so the window doesn't flash blank mid-drag.
         let new_w = w as usize;
         let new_h = h as usize;
-        let mut new_back = vec![render::DEFAULT_BG_XRGB; new_w * new_h];
+        let mut new_back = vec![self.theme.bg_xrgb(); new_w * new_h];
         let old_w = self.width as usize;
         let old_h = self.height as usize;
         let copy_w = old_w.min(new_w);

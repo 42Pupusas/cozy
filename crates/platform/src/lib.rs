@@ -43,5 +43,6 @@ mod render;
 pub mod window;
 
 pub use error::{Error, Result};
+pub use render::Theme;
 pub use waker::Waker;
 pub use window::{InputEvent, TermWindow};

@@ -240,6 +240,7 @@ impl Screen {
     /// `new_cols`, and the result is repacked bottom-anchored (overflow spills
     /// into scrollback). `cursor` is the active cursor in the OLD geometry; the
     /// returned pair is its position in the NEW geometry.
+    #[allow(clippy::too_many_lines)]
     pub fn resize(&mut self, new_cols: u16, new_rows: u16, cursor: (u16, u16)) -> (u16, u16) {
         let old_cols = usize::from(self.cols);
         let new_cols_u = usize::from(new_cols).max(1);
@@ -307,9 +308,21 @@ impl Screen {
                 rows_out.push((row_cells, p + 1 < pieces));
             }
             if li == cursor_line {
-                let piece = (cursor_offset / new_cols_u).min(pieces - 1);
-                new_cursor_idx = base_idx + piece;
-                new_cursor_col = (cursor_offset - piece * new_cols_u).min(new_cols_u - 1);
+                let piece = cursor_offset / new_cols_u;
+                if piece >= pieces {
+                    // The cursor sits one position past the line's content (an
+                    // eager-wrap terminal parks it at the start of a fresh row
+                    // after filling the last column). That row was trimmed as a
+                    // trailing blank, so re-materialize it instead of clamping
+                    // the cursor back onto the final glyph — clamping is what
+                    // made the shell's SIGWINCH repaint clear the wrong rows.
+                    rows_out.push((vec![Cell::default(); new_cols_u], false));
+                    new_cursor_idx = rows_out.len() - 1;
+                    new_cursor_col = cursor_offset - piece * new_cols_u;
+                } else {
+                    new_cursor_idx = base_idx + piece;
+                    new_cursor_col = (cursor_offset - piece * new_cols_u).min(new_cols_u - 1);
+                }
             }
         }
 

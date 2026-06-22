@@ -564,6 +564,43 @@ mod tests {
     }
 
     #[test]
+    fn resize_cursor_at_wrap_boundary() {
+        // Exactly 10 chars at width 10 with cursor pending-wrap at col 10
+        // (i.e. just printed the 10th char, autowrap armed). Narrow to 5: the
+        // logical line is 10 cells -> 2 full rows; the cursor sits at the START
+        // of a notional 3rd row. It must not be clamped onto the end of row 1.
+        let mut g = Grid::new(10, 4);
+        apply_str(&mut g, b"0123456789");
+        // After printing 10 chars in a 10-wide grid, autowrap moved us to row 1
+        // col 0, and marked row 0 wrapped.
+        assert_eq!(g.cursor(), (0, 1));
+        g.resize(5, 4);
+        // 10 cells over width 5 = rows of "01234" / "56789"; cursor was at
+        // logical offset 10 -> start of the next row.
+        assert_eq!(g.screen().get_cell(0, 0).ch, '0');
+        assert_eq!(g.screen().get_cell(0, 1).ch, '5');
+        assert_eq!(g.cursor(), (0, 2));
+    }
+
+    #[test]
+    fn resize_prompt_to_very_small_width() {
+        // A prompt longer than the target width must reflow without dropping or
+        // duplicating cells, cursor following to the tail.
+        let mut g = Grid::new(20, 4);
+        apply_str(&mut g, b"user@host:~/dir$ ");
+        let (cx, _) = g.cursor();
+        assert_eq!(cx, 17);
+        g.resize(4, 6);
+        // 17 chars over width 4: rows "user"|"@hos"|"t:~/"|"dir$"|" " — the
+        // trailing space is char 16, cursor parked just past it. Verify the
+        // reflow split and that the cursor follows to the tail.
+        assert_eq!(g.screen().get_cell(0, 0).ch, 'u');
+        assert_eq!(g.screen().get_cell(0, 1).ch, '@');
+        assert_eq!(g.screen().get_cell(0, 3).ch, 'd');
+        assert_eq!(g.cursor(), (1, 4));
+    }
+
+    #[test]
     fn dirty_snapshot() {
         let mut g = Grid::new(10, 3);
         apply_str(&mut g, b"X");

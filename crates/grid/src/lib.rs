@@ -1,3 +1,6 @@
+#![allow(clippy::missing_const_for_fn, clippy::match_same_arms, clippy::unused_self,
+         clippy::needless_pass_by_ref_mut, clippy::trivially_copy_pass_by_ref,
+         clippy::items_after_test_module, clippy::single_match)]
 //! Terminal screen model.
 //!
 //! Owns the 2-D cell grid, cursor state, scrollback buffer, alternate screen,

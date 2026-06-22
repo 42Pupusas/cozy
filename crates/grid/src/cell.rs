@@ -1,3 +1,4 @@
+#![allow(clippy::struct_excessive_bools)]
 //! Terminal cell and attribute types.
 
 /// A terminal color value.

@@ -1,3 +1,4 @@
+#![allow(clippy::missing_const_for_fn, clippy::manual_range_patterns)]
 //! Terminal event types emitted by the parser.
 
 use crate::params::Params;

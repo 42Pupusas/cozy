@@ -1,3 +1,5 @@
+#![allow(clippy::doc_markdown, clippy::cast_possible_truncation, clippy::cast_sign_loss,
+         clippy::cast_possible_wrap, clippy::missing_const_for_fn, clippy::match_same_arms)]
 //! Pseudoterminal management.
 //!
 //! Spawns a child process under a POSIX pseudoterminal and drives all I/O
@@ -18,9 +20,11 @@
 //! [`Pty::run`] is the blocking event loop. Spawn it on a dedicated thread.
 
 mod error;
+mod simple;
 mod sys;
 
 pub use error::PtyError;
+pub use simple::PtySimple;
 pub use sys::WinSize;
 
 use quetzal_uring::{CqConsumer, SqProducer, UringQueue};

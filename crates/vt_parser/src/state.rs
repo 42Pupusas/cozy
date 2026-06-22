@@ -1,3 +1,7 @@
+#![allow(clippy::cast_possible_truncation, clippy::match_same_arms,
+         clippy::many_single_char_names, clippy::similar_names,
+         clippy::unreadable_literal, clippy::missing_const_for_fn,
+         clippy::option_if_let_else, clippy::manual_split_once)]
 //! VT/ANSI parser state machine.
 //!
 //! Implements the Paul Williams DEC ANSI parser model.

@@ -5,3 +5,10 @@ edition = "2021"
 
 [lints]
 workspace = true
+
+[dependencies]
+grid         = { path = "../../crates/grid" }
+platform     = { path = "../../crates/platform" }
+pty          = { path = "../../crates/pty" }
+vt_parser    = { path = "../../crates/vt_parser" }
+quetzalcoatl = { workspace = true }

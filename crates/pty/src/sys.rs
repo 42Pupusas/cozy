@@ -1,3 +1,7 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap,
+         clippy::missing_const_for_fn, clippy::redundant_closure, clippy::items_after_statements,
+         clippy::single_match_else, clippy::option_if_let_else, clippy::needless_return,
+         clippy::map_identity, clippy::doc_markdown, clippy::unreadable_literal)]
 //! Raw POSIX syscall wrappers for PTY management.
 //!
 //! All unsafe is contained here. Every function documents the invariant

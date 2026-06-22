@@ -36,6 +36,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "platform"
+version = "0.1.0"
+dependencies = [
+ "grid",
+ "quetzalcoatl",
+ "ququmatz",
+ "vt_parser",
+]
+
+[[package]]
 name = "pty"
 version = "0.1.0"
 dependencies = [
@@ -69,6 +79,13 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 [[package]]
 name = "terminal"
 version = "0.1.0"
+dependencies = [
+ "grid",
+ "platform",
+ "pty",
+ "quetzalcoatl",
+ "vt_parser",
+]
 
 [[package]]
 name = "vt_parser"

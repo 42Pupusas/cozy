@@ -1,3 +1,4 @@
+#![allow(clippy::missing_const_for_fn)]
 //! CSI / DCS parameter accumulator.
 //!
 //! Stores up to 16 numeric parameters (semicolon-separated), each up to

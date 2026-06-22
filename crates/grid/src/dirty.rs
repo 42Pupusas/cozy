@@ -1,3 +1,5 @@
+#![allow(clippy::cast_possible_truncation, clippy::missing_const_for_fn,
+         clippy::manual_div_ceil)]
 //! Dirty-region tracker for incremental rendering.
 //!
 //! Tracks which rows have changed since the last [`DirtyRegion::take_snapshot`]

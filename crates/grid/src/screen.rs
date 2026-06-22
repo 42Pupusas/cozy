@@ -1,3 +1,5 @@
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_const_for_fn,
+         clippy::must_use_candidate)]
 //! 2-D cell buffer with scrollback.
 
 use crate::Cell;

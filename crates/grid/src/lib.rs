@@ -52,6 +52,12 @@ pub struct Grid {
     /// Bytes the terminal must write back to the PTY (CPR, DA, etc.).
     /// Drained by the driver via [`Grid::take_replies`] after each batch.
     replies: Vec<u8>,
+    /// Deferred-wrap ("pending wrap" / DEC wrapnext) state. Set when a glyph
+    /// fills the last column: the cursor visually stays put, and the wrap is
+    /// only realized when the *next* printable char arrives. A CR/LF/cursor
+    /// move clears it instead — so a newline ending a full-width line leaves
+    /// that line correctly *unwrapped* (no false stitch on resize).
+    pending_wrap: bool,
 }
 
 impl Grid {
@@ -67,13 +73,19 @@ impl Grid {
             dirty: DirtyRegion::new(cols, rows),
             saved_cursor: None,
             replies: Vec::new(),
+            pending_wrap: false,
         }
     }
 
     /// Resize the grid to new dimensions, reflowing soft-wrapped lines to the
     /// new width (the primary screen) and clamping the cursor.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        let cur = (self.cursor.col, self.cursor.row);
+        // When a deferred wrap is armed the cursor visually rests on the last
+        // column but logically wants the next cell (offset = col + 1). Pass
+        // that logical position so reflow lands the cursor at the start of the
+        // continuation row rather than back on the final glyph.
+        let cur_col = if self.pending_wrap { self.cursor.col + 1 } else { self.cursor.col };
+        let cur = (cur_col, self.cursor.row);
         let (new_col, new_row) = self.primary.resize(cols, rows, cur);
         // The alternate screen is a fixed fullscreen canvas (no scrollback, no
         // soft-wrap semantics), so it reflows trivially against the same cursor.
@@ -149,6 +161,17 @@ impl Grid {
     }
 
     fn print(&mut self, ch: char) {
+        // Realize a deferred wrap from the previous glyph: now that a real
+        // printable char has arrived, the prior line genuinely continues, so
+        // mark it wrapped and move to the start of the next physical row.
+        if self.pending_wrap {
+            let row = self.cursor.row;
+            self.active_screen_mut().set_wrapped(row, true);
+            self.cursor.col = 0;
+            self.cursor_down(1, true);
+            self.pending_wrap = false;
+        }
+
         let col = self.cursor.col;
         let row = self.cursor.row;
         let attrs = self.attrs;
@@ -158,11 +181,10 @@ impl Grid {
         if col + 1 < cols {
             self.cursor.col += 1;
         } else {
-            // Auto-wrap at the right margin: the current line continues onto
-            // the next physical row. Record that so resize can reflow it.
-            self.active_screen_mut().set_wrapped(row, true);
-            self.cursor.col = 0;
-            self.cursor_down(1, true);
+            // Last column filled: defer the wrap. The cursor stays here; a
+            // following glyph realizes the wrap (above), while a CR/LF/cursor
+            // move clears the flag, leaving this line unwrapped.
+            self.pending_wrap = true;
         }
     }
 
@@ -170,20 +192,26 @@ impl Grid {
         match c0 {
             C0::Bell => { /* TODO: notify platform */ }
             C0::Backspace => {
+                self.pending_wrap = false;
                 if self.cursor.col > 0 {
                     self.cursor.col -= 1;
                 }
             }
             C0::Tab => {
                 // Advance to next tabstop (every 8 cols).
+                self.pending_wrap = false;
                 let next = (self.cursor.col / 8 + 1) * 8;
                 let cols = self.active_screen().cols();
                 self.cursor.col = next.min(cols - 1);
             }
             C0::LineFeed => {
+                // A newline after a full-width line: the deferred wrap is
+                // abandoned, so the line stays unwrapped (no false stitch).
+                self.pending_wrap = false;
                 self.cursor_down(1, true);
             }
             C0::CarriageReturn => {
+                self.pending_wrap = false;
                 self.cursor.col = 0;
             }
             C0::ShiftOut | C0::ShiftIn => { /* charset switching — TODO */ }
@@ -212,6 +240,17 @@ impl Grid {
 
     #[allow(clippy::too_many_lines)]
     fn csi(&mut self, action: &CsiAction) {
+        // Any cursor movement or content change abandons a deferred wrap. Pure
+        // attribute changes (SGR) and host queries (DSR/DA) leave it intact so
+        // a color change between the last glyph and the next still wraps.
+        if !matches!(
+            action,
+            CsiAction::Sgr(_)
+                | CsiAction::DeviceStatusReport(_)
+                | CsiAction::DeviceAttributes(_)
+        ) {
+            self.pending_wrap = false;
+        }
         match action {
             CsiAction::CursorUp(n) => {
                 self.cursor.row = self.cursor.row.saturating_sub(*n);
@@ -431,6 +470,10 @@ impl Grid {
     }
 
     fn esc(&mut self, intermediate: Option<u8>, final_byte: u8) {
+        // ESC sequences here (RIS, IND, RI, NEL, cursor save/restore) all move
+        // or reset the cursor; none is a pure attribute change, so abandon any
+        // deferred wrap.
+        self.pending_wrap = false;
         match (intermediate, final_byte) {
             // RIS — reset to initial state
             (None, b'c') => {
@@ -553,6 +596,33 @@ mod tests {
     }
 
     #[test]
+    fn full_line_then_newline_is_not_wrapped() {
+        // A line that exactly fills the width followed by a hard newline must
+        // NOT be marked wrapped — otherwise resize stitches the next line onto
+        // it (the "merges into the top one" bug). Deferred wrap means the
+        // newline arrives before any glyph realizes the wrap.
+        let mut g = Grid::new(10, 4);
+        apply_str(&mut g, b"0123456789\r\nNEXT");
+        assert!(!g.screen().is_wrapped(0), "full line + newline must not wrap");
+        // After resize the two lines must stay separate: NEXT begins at col 0
+        // of its own row, not appended after row 0.
+        g.resize(10, 4);
+        assert_eq!(g.screen().get_cell(0, 1).ch, 'N');
+        assert_eq!(g.screen().get_cell(0, 0).ch, '0');
+    }
+
+    #[test]
+    fn full_line_then_glyph_is_wrapped() {
+        // A line that fills the width and is immediately followed by another
+        // glyph genuinely wraps: the deferred wrap is realized on that glyph.
+        let mut g = Grid::new(10, 4);
+        apply_str(&mut g, b"0123456789X");
+        assert!(g.screen().is_wrapped(0), "full line + glyph must wrap");
+        assert_eq!(g.screen().get_cell(0, 1).ch, 'X');
+        assert_eq!(g.cursor(), (1, 1));
+    }
+
+    #[test]
     fn resize_narrow_reflows_wrapped_line() {
         // 10 cols: print 15 chars -> auto-wraps to 2 rows (10 + 5).
         let mut g = Grid::new(10, 5);
@@ -597,9 +667,9 @@ mod tests {
         // of a notional 3rd row. It must not be clamped onto the end of row 1.
         let mut g = Grid::new(10, 4);
         apply_str(&mut g, b"0123456789");
-        // After printing 10 chars in a 10-wide grid, autowrap moved us to row 1
-        // col 0, and marked row 0 wrapped.
-        assert_eq!(g.cursor(), (0, 1));
+        // Deferred wrap: after printing the 10th char the cursor visually rests
+        // on the last column (9, 0) with the wrap armed but not yet realized.
+        assert_eq!(g.cursor(), (9, 0));
         g.resize(5, 4);
         // 10 cells over width 5 = rows of "01234" / "56789"; cursor was at
         // logical offset 10 -> start of the next row.

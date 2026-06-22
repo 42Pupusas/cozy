@@ -93,6 +93,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "text_layout"
+version = "0.1.0"
+
+[[package]]
 name = "vt_parser"
 version = "0.1.0"
 dependencies = [

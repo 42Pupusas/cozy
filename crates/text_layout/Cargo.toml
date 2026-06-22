@@ -1,0 +1,8 @@
+[package]
+name        = "text_layout"
+version     = "0.1.0"
+edition     = "2021"
+description = "Text segmentation, BiDi, line-breaking, and layout — pure Rust port of pretext (github.com/chenglou/pretext)"
+
+[lints]
+workspace = true

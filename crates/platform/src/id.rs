@@ -75,6 +75,10 @@ object_ids! {
     DmabufId,
     /// `zwp_linux_buffer_params_v1` — temporary object for dmabuf buffer creation.
     DmabufParamsId,
+    /// `zxdg_decoration_manager_v1` — server-side-decoration factory global.
+    DecorationManagerId,
+    /// `zxdg_toplevel_decoration_v1` — per-toplevel decoration object.
+    ToplevelDecorationId,
 }
 
 /// An event serial — echoed back in acks/pongs. Distinct from an object id so

@@ -21,10 +21,11 @@ use crate::id::{
 use crate::keymap;
 use crate::protocol::{
     self as proto, BufferEvent, ButtonState, CallbackEvent, CompositorRequest, DisplayEvent,
-    DisplayRequest, Format, Key, KeyState, KeyboardEvent, PointerButton, PointerEvent,
-    PointerRequest, RegistryEvent, RegistryRequest, SeatCapability, SeatEvent, SeatRequest,
-    ShmPoolRequest, ShmRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent,
-    WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
+    DisplayRequest,
+    Format, Key, KeyState, KeyboardEvent, PointerButton, PointerEvent, PointerRequest,
+    RegistryEvent, RegistryRequest, SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest,
+    ShmRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent, WmBaseRequest,
+    XdgSurfaceEvent, XdgSurfaceRequest,
 };
 use crate::protocol::Modifiers;
 use crate::render;
@@ -93,6 +94,11 @@ pub struct TermWindow {
 
     frames: [Frame; 2],
     shm_mem: ShmBuffer,
+    /// Persistent full-window backbuffer. Dirty rows are blitted here (it keeps
+    /// the complete last-known image), then copied into whichever shm frame is
+    /// free on present. Without this, incremental dirty-row blits would only
+    /// ever touch one of the two shm frames, leaving the rest black.
+    backbuffer: Vec<u32>,
     width: i32,
     height: i32,
     #[allow(dead_code)]
@@ -112,6 +118,24 @@ pub struct TermWindow {
     pending_dirty: Vec<grid::DirtySnapshot>,
     /// Pending input events for the caller.
     input_queue: std::collections::VecDeque<InputEvent>,
+}
+
+impl Drop for TermWindow {
+    /// Tear the window down explicitly so the compositor removes it promptly
+    /// instead of waiting to notice the socket close. Destroy xdg objects
+    /// before the underlying `wl_surface` (xdg-shell requires that order), all
+    /// best-effort — we're shutting down, so errors are irrelevant.
+    fn drop(&mut self) {
+        let _ = self
+            .sender
+            .request(MessageBuilder::new(self.toplevel, ToplevelRequest::Destroy));
+        let _ = self
+            .sender
+            .request(MessageBuilder::new(self.xdg_surface, XdgSurfaceRequest::Destroy));
+        let _ = self
+            .sender
+            .request(MessageBuilder::new(self.surface, SurfaceRequest::Destroy));
+    }
 }
 
 impl TermWindow {
@@ -167,6 +191,8 @@ impl TermWindow {
         let (id_start, id_end) = sender.alloc_id_block(256);
         let window_tx = WindowSender { tx: req_tx, next_id: id_start, id_end };
 
+        let backbuffer = vec![render::DEFAULT_BG_XRGB; (width * height) as usize];
+
         Ok(Self {
             sender,
             request_rx: req_rx,
@@ -190,6 +216,7 @@ impl TermWindow {
             cursor,
             frames,
             shm_mem,
+            backbuffer,
             width,
             height,
             scale: 1,
@@ -339,8 +366,9 @@ impl TermWindow {
 
         // xdg_toplevel.configure (resize)
         if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Configure) {
-            let w = ev.arg_i32(1);
-            let h = ev.arg_i32(2);
+            // xdg_toplevel.configure args: (width, height, states[]).
+            let w = ev.arg_i32(0);
+            let h = ev.arg_i32(1);
             if w > 0 && h > 0 && (w, h) != (self.width, self.height) {
                 self.resize(w, h)?;
                 let new_cols = (w / self.cell_w) as u16;
@@ -410,9 +438,11 @@ impl TermWindow {
                         let physical = Key::from_code(ev.arg(2));
                         let logical = physical.map(keymap::physical_to_logical);
                         let state = KeyState::from_raw(ev.arg(3));
-                        // Start/stop repeat timer.
+                        // Start/stop repeat timer. Modifier keys never repeat.
                         match (logical, state) {
-                            (Some(k), Some(KeyState::Pressed)) => {
+                            (Some(k), Some(KeyState::Pressed))
+                                if !physical.is_some_and(Key::is_modifier) =>
+                            {
                                 self.held_key = Some(k);
                                 let _ = self.repeat_timer.arm(u64::from(self.repeat_delay), u64::from(1000 / self.repeat_rate.max(1)));
                             }
@@ -466,11 +496,12 @@ impl TermWindow {
         let frame = &mut self.frames[slot];
         frame.free = false;
 
-        // Blit pending dirty snapshots into the shm buffer.
-        let pixels = self.shm_mem.pixels(slot);
+        // Blit pending dirty snapshots into the persistent backbuffer, which
+        // always holds the full image, then copy it into the free shm frame.
         for snap in self.pending_dirty.drain(..) {
-            render::blit_snapshot(pixels, self.width as u32, &snap);
+            render::blit_snapshot(&mut self.backbuffer, self.width as u32, &snap);
         }
+        self.shm_mem.pixels(slot).copy_from_slice(&self.backbuffer);
 
         let buf_w = self.width;
         let buf_h = self.height;
@@ -507,16 +538,23 @@ impl TermWindow {
         self.shm_mem = ShmBuffer::new(w as usize, h as usize, 2)
             .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
         let stride = w * 4;
+
+        // Route the whole pool+buffer sequence through the `window_tx` MPSC ring
+        // so it stays correctly ordered with any already-queued present
+        // requests (Attach/Damage/Frame/Commit). `create_pool` carries the shm
+        // fd, so we `dup_fd` it and hand ownership to the ring (the original fd
+        // stays open for our mmap).
         let pool: PoolId = self.window_tx.alloc_id();
-        let msg = MessageBuilder::new(self.shm, ShmRequest::CreatePool)
+        let dup = self
+            .shm_mem
+            .dup_fd()
+            .map_err(|e| Error::Conn(ConnError::Io(e)))?;
+        let pool_msg = MessageBuilder::new(self.shm, ShmRequest::CreatePool)
             .new_id(pool)
             .i32(self.shm_mem.size_bytes() as i32)
             .finish();
-        // Can't clone BorrowedFd; route resize through the request ring differently.
-        // For now, send directly on the sender in resize(). This is called only
-        // from handle_event which runs on the event-loop thread that owns sender.
-        // TODO: route through request ring properly.
-        let _ = msg;
+        self.window_tx.send_with_fds(pool_msg, vec![dup]);
+
         for (i, frame) in self.frames.iter_mut().enumerate() {
             let buffer: BufferId = self.window_tx.alloc_id();
             self.window_tx.request(
@@ -533,6 +571,8 @@ impl TermWindow {
         }
         self.width = w;
         self.height = h;
+        self.backbuffer = vec![render::DEFAULT_BG_XRGB; (w * h) as usize];
+        self.dirty = true;
         Ok(())
     }
 
@@ -633,6 +673,7 @@ fn bind_globals(
     sender.request(
         MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
     )?;
+
     let mut compositor: Option<CompositorId> = None;
     let mut shm: Option<ShmId> = None;
     let mut wm_base: Option<WmBaseId> = None;

@@ -44,6 +44,7 @@ const PTY_BUF: usize = 4096;
 const RING_PTY_OUT: usize = 64; // PtyChunk slots       pty    → parser
 const RING_DIRTY:   usize = 16; // DirtySnapshot slots  parser → ui
 const RING_INPUT:   usize = 64; // InputMsg slots       ui     → pty
+const RING_RESIZE:  usize = 16; // GridResize slots     ui     → parser
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
@@ -60,6 +61,14 @@ enum InputMsg {
     Bytes(Box<[u8]>),
     Resize { cols: u16, rows: u16 },
     Quit,
+}
+
+/// New grid dimensions, sent from the UI thread to the parser/grid thread on a
+/// window resize so the grid (not just the pty) tracks the new cell extent.
+#[derive(Clone, Copy)]
+struct GridResize {
+    cols: u16,
+    rows: u16,
 }
 
 // ── Entry ──────────────────────────────────────────────────────────────────────
@@ -84,6 +93,8 @@ fn run(cfg: &Config) -> platform::Result<()> {
         RingBuffer::<DirtySnapshot>::new(Capacity::exact(RING_DIRTY)).split();
     let (input_tx, input_rx) =
         RingBuffer::<InputMsg>::new(Capacity::exact(RING_INPUT)).split();
+    let (resize_tx, resize_rx) =
+        RingBuffer::<GridResize>::new(Capacity::exact(RING_RESIZE)).split();
 
     // ── Shared quit flag ────────────────────────────────────────────────────
     let quit        = Arc::new(AtomicBool::new(false));
@@ -101,12 +112,12 @@ fn run(cfg: &Config) -> platform::Result<()> {
     let parser_thread = std::thread::Builder::new()
         .name("parser".into())
         .spawn(move || {
-            parser_thread(COLS, ROWS, pty_out_rx, dirty_tx, quit_parser);
+            parser_thread(COLS, ROWS, pty_out_rx, dirty_tx, resize_rx, quit_parser);
         })
         .expect("spawn parser thread");
 
     // ── UI thread (main thread) ─────────────────────────────────────────────
-    ui_thread(cfg, dirty_rx, input_tx, &quit)?;
+    ui_thread(cfg, dirty_rx, input_tx, resize_tx, &quit)?;
 
     pty_thread.join().ok();
     parser_thread.join().ok();
@@ -146,15 +157,17 @@ fn pty_thread(
         // Read from PTY and forward to the parser ring.
         let mut buf = Box::new([0u8; PTY_BUF]);
         match pty.try_read(buf.as_mut()) {
-            Ok(0) | Err(_) => {
-                // Shell exited — signal everyone.
+            Ok(Some(0)) | Err(_) => {
+                // Genuine EOF (shell exited) or a hard I/O error — signal everyone.
                 quit.store(true, Ordering::Relaxed);
                 return;
             }
-            Ok(n) => {
+            Ok(Some(n)) => {
                 // Best-effort; drop if ring is full (parser thread is behind).
                 let _ = pty_out_tx.push(PtyChunk { buf, len: n });
             }
+            // EAGAIN: no data yet — keep looping.
+            Ok(None) => {}
         }
 
         std::thread::yield_now();
@@ -169,6 +182,7 @@ fn parser_thread(
     rows:       u16,
     mut pty_out_rx: quetzalcoatl::spsc::Consumer<PtyChunk>,
     dirty_tx:   quetzalcoatl::spsc::Producer<DirtySnapshot>,
+    mut resize_rx: quetzalcoatl::spsc::Consumer<GridResize>,
     quit:       Arc<AtomicBool>,
 ) {
     let mut grid   = Grid::new(cols, rows);
@@ -176,6 +190,16 @@ fn parser_thread(
 
     while !quit.load(Ordering::Relaxed) {
         let mut dirty = false;
+
+        // Apply the latest pending resize (coalesce — only the last matters).
+        let mut new_dims = None;
+        while let Some(rz) = resize_rx.pop() {
+            new_dims = Some(rz);
+        }
+        if let Some(rz) = new_dims {
+            grid.resize(rz.cols, rz.rows);
+            dirty = true;
+        }
 
         while let Some(chunk) = pty_out_rx.pop() {
             parser.feed(&chunk.buf[..chunk.len], |ev| { grid.apply(&ev); });
@@ -200,6 +224,7 @@ fn ui_thread(
     cfg:      &Config,
     mut dirty_rx: quetzalcoatl::spsc::Consumer<DirtySnapshot>,
     input_tx: quetzalcoatl::spsc::Producer<InputMsg>,
+    resize_tx: quetzalcoatl::spsc::Producer<GridResize>,
     quit:     &AtomicBool,
 ) -> platform::Result<()> {
     let mut win     = TermWindow::new("terminal", COLS, ROWS)?;
@@ -226,6 +251,7 @@ fn ui_thread(
                 }
                 InputEvent::Resize { cols, rows } => {
                     let _ = input_tx.push(InputMsg::Resize { cols, rows });
+                    let _ = resize_tx.push(GridResize { cols, rows });
                 }
                 InputEvent::Key { key, state, modifiers } => {
                     use platform::protocol::KeyState as PKeyState;

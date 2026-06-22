@@ -87,6 +87,7 @@ pub const DISPLAY_ID: u32 = 1;
 requests! {
     /// `wl_display` requests.
     DisplayRequest {
+        Sync = 0,
         GetRegistry = 1,
     }
 }
@@ -126,6 +127,7 @@ requests! {
 requests! {
     /// `wl_surface` requests — a rectangle of pixels the compositor composites.
     SurfaceRequest {
+        Destroy = 0,
         Attach = 1,
         Damage = 2,
         /// Request a one-shot frame-throttling callback (a `wl_callback` whose
@@ -194,6 +196,7 @@ events! {
 requests! {
     /// `xdg_surface` requests — bridges a `wl_surface` to xdg-shell roles.
     XdgSurfaceRequest {
+        Destroy = 0,
         GetToplevel = 1,
         AckConfigure = 4,
     }
@@ -209,8 +212,34 @@ events! {
 requests! {
     /// `xdg_toplevel` requests — a top-level application window.
     ToplevelRequest {
+        Destroy = 0,
         SetTitle = 2,
     }
+}
+
+requests! {
+    /// `zxdg_decoration_manager_v1` requests — the SSD factory.
+    DecorationManagerRequest {
+        /// Create a decoration object for a toplevel, then `set_mode` on it.
+        GetToplevelDecoration = 1,
+    }
+}
+
+requests! {
+    /// `zxdg_toplevel_decoration_v1` requests.
+    ToplevelDecorationRequest {
+        SetMode = 1,
+    }
+}
+
+/// `zxdg_toplevel_decoration_v1` mode values (argument to `set_mode`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DecorationMode {
+    /// Client draws its own decorations.
+    ClientSide = 1,
+    /// Compositor draws the titlebar/border — what we want.
+    ServerSide = 2,
 }
 events! {
     /// `xdg_toplevel` events.
@@ -491,6 +520,22 @@ impl Key {
             _ => None,
         }
     }
+
+    /// Modifier keys (Ctrl/Alt/Shift/Meta) never auto-repeat — holding them
+    /// must not synthesize a stream of key events.
+    pub fn is_modifier(self) -> bool {
+        matches!(
+            self,
+            Key::LCtrl
+                | Key::RCtrl
+                | Key::LAlt
+                | Key::RAlt
+                | Key::LShift
+                | Key::RShift
+                | Key::LMeta
+                | Key::RMeta
+        )
+    }
 }
 
 /// `wl_seat` capability bits (from the `capabilities` event bitmask).
@@ -587,6 +632,10 @@ pub const ZWP_LINUX_DMABUF_V1: Interface = Interface {
     name: "zwp_linux_dmabuf_v1",
     // v3 adds modifier event; v4 adds feedback (we skip for now).
     version: 3,
+};
+pub const ZXDG_DECORATION_MANAGER_V1: Interface = Interface {
+    name: "zxdg_decoration_manager_v1",
+    version: 1,
 };
 
 requests! {

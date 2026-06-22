@@ -24,6 +24,10 @@ const SYS_IOCTL: usize = 16;
 const SYS_OPEN: usize = 2;
 const SYS_SETSID: usize = 112;
 const SYS_DUP2: usize = 33;
+const SYS_KILL: usize = 62;
+
+// Signal numbers
+const SIGHUP: usize = 1;
 
 // ioctl request codes
 const TIOCSWINSZ: usize = 0x5414;
@@ -222,9 +226,41 @@ pub fn forkpty(shell: &str, args: &[&str], win_size: WinSize) -> Result<(RawFd, 
         .chain(std::iter::once(core::ptr::null()))
         .collect();
 
-    // envp: inherit nothing beyond a minimal set — child inherits parent env.
-    // Pass NULL as envp to keep current environment.
-    let envp: *const *const u8 = core::ptr::null();
+    // envp: a raw execve does NOT inherit the parent environment — passing NULL
+    // gives the child an *empty* env (no TERM, no PATH), which makes programs
+    // like `cargo` and `ls` disable colour. So we build the child environment
+    // explicitly: every parent variable, with TERM/COLORTERM guaranteed.
+    //
+    // The `CString`s must outlive the `execve` below; we keep them in `env_cs`
+    // and the pointer array in `envp_ptrs` (both live until function return,
+    // which never happens in the child — it execs or exits). Built *before* the
+    // fork so the child only dereferences already-constructed pointers.
+    let mut have_term = false;
+    let mut have_colorterm = false;
+    let mut env_cs: Vec<CString> = Vec::new();
+    for (k, v) in std::env::vars() {
+        if k == "TERM" {
+            have_term = true;
+        }
+        if k == "COLORTERM" {
+            have_colorterm = true;
+        }
+        if let Ok(cs) = CString::new(format!("{k}={v}")) {
+            env_cs.push(cs);
+        }
+    }
+    if !have_term {
+        env_cs.push(CString::new("TERM=xterm-256color").unwrap());
+    }
+    if !have_colorterm {
+        env_cs.push(CString::new("COLORTERM=truecolor").unwrap());
+    }
+    let envp_ptrs: Vec<*const u8> = env_cs
+        .iter()
+        .map(|cs| cs.as_ptr().cast())
+        .chain(std::iter::once(core::ptr::null()))
+        .collect();
+    let envp: *const *const u8 = envp_ptrs.as_ptr();
 
     // fork via clone(SIGCHLD, 0)
     let pid = unsafe { syscall2(SYS_CLONE, SIGCHLD, 0) };
@@ -376,6 +412,32 @@ pub fn waitpid(pid: i32) -> Result<i32, PtyError> {
     errno_to_err(ret).map_err(PtyError::WaitPid)?;
     // Decode exit status: WEXITSTATUS(status)
     Ok((status >> 8) & 0xff)
+}
+
+/// Send `SIGHUP` to the child process (best effort — used on teardown so the
+/// shell doesn't outlive us as an orphan holding the PTY slave open).
+pub fn hangup(pid: i32) {
+    if pid > 0 {
+        unsafe { syscall2(SYS_KILL, pid as usize, SIGHUP) };
+    }
+}
+
+/// Blocking reap of a specific child (no `WNOHANG`) — call after `hangup` so the
+/// zombie is collected and we don't leak a process-table entry.
+pub fn reap_blocking(pid: i32) {
+    if pid <= 0 {
+        return;
+    }
+    let mut status: i32 = 0;
+    unsafe {
+        syscall4(
+            SYS_WAITPID,
+            pid as usize,
+            core::ptr::addr_of_mut!(status) as usize,
+            0, // blocking
+            0,
+        )
+    };
 }
 
 // ── fd helpers ─────────────────────────────────────────────────────────────

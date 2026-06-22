@@ -12,8 +12,19 @@ use ququmatz::RawFd;
 /// A simple blocking-ish PTY handle for the integration prototype.
 pub struct PtySimple {
     master_fd: RawFd,
-    #[allow(dead_code)]
     child_pid: i32,
+}
+
+impl Drop for PtySimple {
+    /// Tear down cleanly: hang up the child shell, reap it, then close the
+    /// master fd. Without this the shell is orphaned (reparented to init) and
+    /// keeps the PTY slave — and on Wayland the leftover client connection —
+    /// alive, leaving a ghost window after we exit.
+    fn drop(&mut self) {
+        sys::hangup(self.child_pid);
+        sys::reap_blocking(self.child_pid);
+        let _ = sys::close_fd(self.master_fd);
+    }
 }
 
 impl PtySimple {
@@ -28,20 +39,24 @@ impl PtySimple {
         Ok(Self { master_fd, child_pid })
     }
 
-    /// Non-blocking read.  Returns `Ok(0)` when no data is available (EAGAIN).
+    /// Non-blocking read.
+    ///
+    /// Returns `Ok(None)` when no data is available yet (EAGAIN) — this is
+    /// distinct from `Ok(Some(0))`, which signals a genuine EOF (the child has
+    /// closed the slave side, i.e. the shell exited).
     ///
     /// # Errors
     /// Returns [`PtyError`] on real I/O errors.
-    pub fn try_read(&mut self, buf: &mut [u8]) -> Result<usize, PtyError> {
+    pub fn try_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, PtyError> {
         let n = raw_read(self.master_fd, buf);
         // EAGAIN (11) / EWOULDBLOCK (11 on Linux) — no data, not an error.
         if n == -11 {
-            return Ok(0);
+            return Ok(None);
         }
         if n < 0 {
             return Err(PtyError::Exec(-n as i32));
         }
-        Ok(n as usize)
+        Ok(Some(n as usize))
     }
 
     /// Write all bytes to the PTY master fd.

@@ -72,6 +72,9 @@ static PALETTE: [(u8, u8, u8); 256] = {
 const DEFAULT_FG: DrawColor = DrawColor::rgb(0xcc, 0xcc, 0xcc);
 const DEFAULT_BG: DrawColor = DrawColor::rgb(0x1e, 0x1e, 0x2e);
 
+/// Default background as a packed XRGB8888 word — used to clear the backbuffer.
+pub const DEFAULT_BG_XRGB: u32 = DEFAULT_BG.to_xrgb8888();
+
 fn resolve(color: Color, default: DrawColor) -> DrawColor {
     match color {
         Color::Default => default,

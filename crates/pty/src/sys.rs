@@ -1,7 +1,5 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap,
-         clippy::missing_const_for_fn, clippy::redundant_closure, clippy::items_after_statements,
-         clippy::single_match_else, clippy::option_if_let_else, clippy::needless_return,
-         clippy::map_identity, clippy::doc_markdown, clippy::unreadable_literal)]
+// Raw syscall FFI: `as` casts between C int widths are bounded and correct.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 //! Raw POSIX syscall wrappers for PTY management.
 //!
 //! All unsafe is contained here. Every function documents the invariant
@@ -43,7 +41,7 @@ const SIGCHLD: usize = 17;
 
 // signalfd
 const SFD_NONBLOCK: usize = 0o4000;
-const SFD_CLOEXEC: usize = 0o2000000;
+const SFD_CLOEXEC: usize = 0o2_000_000;
 const SIGCHLD_BIT: u64 = 1 << 16; // bit 16 in sigset (SIGCHLD = 17, 0-indexed = 16)
 
 // wait4
@@ -140,7 +138,7 @@ unsafe fn syscall4(nr: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isi
     ret
 }
 
-fn errno_to_err(ret: isize) -> Result<usize, i32> {
+const fn errno_to_err(ret: isize) -> Result<usize, i32> {
     if ret < 0 {
         Err((-ret) as i32)
     } else {
@@ -157,7 +155,7 @@ fn open_ptmx() -> Result<RawFd, PtyError> {
     let flags = O_RDWR | O_NOCTTY | O_CLOEXEC;
     let ret = unsafe { syscall3(SYS_OPEN, path.as_ptr() as usize, flags, 0) };
     errno_to_err(ret)
-        .map(|fd| RawFd::from_raw(fd))
+        .map(RawFd::from_raw)
         .map_err(PtyError::OpenPt)
 }
 
@@ -231,7 +229,7 @@ pub fn forkpty(shell: &str, args: &[&str], win_size: WinSize) -> Result<(RawFd, 
     // fork via clone(SIGCHLD, 0)
     let pid = unsafe { syscall2(SYS_CLONE, SIGCHLD, 0) };
     match errno_to_err(pid) {
-        Err(e) => return Err(PtyError::Fork(e)),
+        Err(e) => Err(PtyError::Fork(e)),
         Ok(0) => {
             // ── child ──────────────────────────────────────────────────
             // Start a new session so the slave PTY becomes the controlling terminal.
@@ -242,14 +240,14 @@ pub fn forkpty(shell: &str, args: &[&str], win_size: WinSize) -> Result<(RawFd, 
             let slave_fd_ret = unsafe {
                 syscall3(SYS_OPEN, slave_path.as_ptr() as usize, flags, 0)
             };
-            let slave_fd = match errno_to_err(slave_fd_ret) {
-                Ok(fd) => fd as i32,
-                Err(_) => {
-                    // Can't report — just exit.
-                    unsafe { syscall1(SYS_CLOSE, master_fd.as_usize()) };
-                    unsafe { syscall1(crate::sys::SYS_EXIT_GROUP, 1) };
-                    unreachable!()
-                }
+            // Post-fork child: an `if let` with a diverging else is clearer
+            // than `map_or_else` with side-effecting closures.
+            #[allow(clippy::option_if_let_else)]
+            let slave_fd = if let Ok(fd) = errno_to_err(slave_fd_ret) { fd as i32 } else {
+                // Can't report — just exit.
+                unsafe { syscall1(SYS_CLOSE, master_fd.as_usize()) };
+                unsafe { syscall1(crate::sys::SYS_EXIT_GROUP, 1) };
+                unreachable!()
             };
 
             // Set the slave as the controlling terminal.
@@ -324,13 +322,14 @@ pub fn get_win_size(master_fd: RawFd) -> Result<WinSize, PtyError> {
 
 /// Block `SIGCHLD` in the calling thread and create a `signalfd` for it.
 ///
-/// The returned fd is readable (via io_uring) whenever a child exits.
+/// The returned fd is readable (via `io_uring`) whenever a child exits.
 pub fn signalfd_for_sigchld() -> Result<RawFd, PtyError> {
+    const SIG_BLOCK: usize = 0;
+
     // Block SIGCHLD so it doesn't interrupt syscalls.
     let mut mask = SigSet([0u64; 1]);
     mask.0[0] |= SIGCHLD_BIT;
 
-    const SIG_BLOCK: usize = 0;
     let ret = unsafe {
         syscall4(
             SYS_SIGPROCMASK,
@@ -354,7 +353,7 @@ pub fn signalfd_for_sigchld() -> Result<RawFd, PtyError> {
         )
     };
     errno_to_err(ret)
-        .map(|fd| RawFd::from_raw(fd))
+        .map(RawFd::from_raw)
         .map_err(PtyError::SignalFd)
 }
 
@@ -384,5 +383,5 @@ pub fn waitpid(pid: i32) -> Result<i32, PtyError> {
 /// Close a raw fd.
 pub fn close_fd(fd: RawFd) -> Result<(), i32> {
     let ret = unsafe { syscall1(SYS_CLOSE, fd.as_usize()) };
-    errno_to_err(ret).map(|_| ()).map_err(|e| e)
+    errno_to_err(ret).map(|_| ())
 }

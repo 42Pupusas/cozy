@@ -70,13 +70,13 @@ fn main() {
         Config::default()
     });
 
-    if let Err(e) = run(cfg) {
+    if let Err(e) = run(&cfg) {
         eprintln!("terminal: {e}");
         std::process::exit(1);
     }
 }
 
-fn run(cfg: Config) -> platform::Result<()> {
+fn run(cfg: &Config) -> platform::Result<()> {
     // ── Rings ───────────────────────────────────────────────────────────────
     let (pty_out_tx, pty_out_rx) =
         RingBuffer::<PtyChunk>::new(Capacity::exact(RING_PTY_OUT)).split();
@@ -106,7 +106,7 @@ fn run(cfg: Config) -> platform::Result<()> {
         .expect("spawn parser thread");
 
     // ── UI thread (main thread) ─────────────────────────────────────────────
-    ui_thread(&cfg, dirty_rx, input_tx, &quit)?;
+    ui_thread(cfg, dirty_rx, input_tx, &quit)?;
 
     pty_thread.join().ok();
     parser_thread.join().ok();
@@ -115,6 +115,10 @@ fn run(cfg: Config) -> platform::Result<()> {
 
 // ── PTY thread ────────────────────────────────────────────────────────────────
 
+// Thread entry points must *own* their ring endpoints and the quit `Arc`: the
+// values are moved into a `'static` closure, and dropping the producer/consumer
+// on thread exit is what closes the ring. Borrowing is structurally impossible.
+#[allow(clippy::needless_pass_by_value)]
 fn pty_thread(
     shell:      String,
     pty_out_tx: quetzalcoatl::spsc::Producer<PtyChunk>,
@@ -159,6 +163,7 @@ fn pty_thread(
 
 // ── Parser + grid thread ──────────────────────────────────────────────────────
 
+#[allow(clippy::needless_pass_by_value)] // owns ring endpoints; see pty_thread
 fn parser_thread(
     cols:       u16,
     rows:       u16,
@@ -190,6 +195,7 @@ fn parser_thread(
 
 // ── UI thread (main thread) ───────────────────────────────────────────────────
 
+#[allow(clippy::needless_pass_by_value)] // owns the input producer; see pty_thread
 fn ui_thread(
     cfg:      &Config,
     mut dirty_rx: quetzalcoatl::spsc::Consumer<DirtySnapshot>,

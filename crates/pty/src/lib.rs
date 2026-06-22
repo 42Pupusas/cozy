@@ -1,5 +1,5 @@
-#![allow(clippy::doc_markdown, clippy::cast_possible_truncation, clippy::cast_sign_loss,
-         clippy::cast_possible_wrap, clippy::missing_const_for_fn, clippy::match_same_arms)]
+// Syscall FFI: `as` casts between C int widths are bounded and correct.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
 //! Pseudoterminal management.
 //!
 //! Spawns a child process under a POSIX pseudoterminal and drives all I/O
@@ -34,10 +34,10 @@ use ququmatz::Sqe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-/// Number of io_uring entries for the PTY queue.
+/// Number of `io_uring` entries for the PTY queue.
 const RING_ENTRIES: u32 = 64;
 
-/// Size of each read buffer submitted to io_uring.
+/// Size of each read buffer submitted to `io_uring`.
 pub const READ_BUF_SIZE: usize = 4096;
 
 /// Capacity of the SPSC chunk ring towards the VT parser.
@@ -81,7 +81,7 @@ pub struct Pty {
     master_fd: ququmatz::RawFd,
     /// PID of the child process.
     child_pid: i32,
-    /// io_uring queue driving all master-fd I/O.
+    /// `io_uring` queue driving all master-fd I/O.
     queue: UringQueue,
     /// SQ producer — for submitting read/write SQEs.
     sq: SqProducer,
@@ -169,7 +169,7 @@ impl Pty {
     ///
     /// # Errors
     ///
-    /// Returns [`PtyError`] on unrecoverable io_uring errors.
+    /// Returns [`PtyError`] on unrecoverable `io_uring` errors.
     pub fn run(mut self, mut write_rx: WriteConsumer) -> Result<i32, PtyError> {
         self.arm_read(self.read_buf_idx)?;
         self.arm_signal()?;
@@ -223,6 +223,9 @@ impl Pty {
                     CqeAction::ReadEof => {
                         got_exit = true;
                     }
+                    // Distinct from `None` semantically (a write CQE was
+                    // reaped) even though both are no-ops here.
+                    #[allow(clippy::match_same_arms)]
                     CqeAction::WriteOk => {
                         // Write completed — nothing to do; next flush_write_ring
                         // will submit more if pending.
@@ -338,7 +341,7 @@ enum CqeAction {
 }
 
 impl CqeAction {
-    fn from_cqe(user_data: u64, result: i32) -> Self {
+    const fn from_cqe(user_data: u64, result: i32) -> Self {
         match user_data {
             tag::READ => {
                 if result > 0 {

@@ -221,9 +221,20 @@ fn parser_thread(
             }
         }
 
-        // Idle: sleep instead of spinning. `dirty` doubles as our did-work flag.
-        if !dirty {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        // Block until the PTY produces more output instead of busy-polling. The
+        // PTY is the dominant source; resizes are rare and always followed by
+        // shell repaint output (SIGWINCH → prompt redraw), which wakes us so the
+        // pending `resize_rx` item is picked up on the next iteration. Returns
+        // `None` only when the pty thread drops its producer (shutdown).
+        match pty_out_rx.pop_block() {
+            Some(chunk) => {
+                parser.feed(&chunk.buf[..chunk.len], |ev| { grid.apply(&ev); });
+                let snap = grid.take_dirty();
+                if !snap.is_empty() {
+                    let _ = dirty_tx.push(snap);
+                }
+            }
+            None => break,
         }
     }
 }

@@ -1,0 +1,11 @@
+[package]
+name    = "vt_parser"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[dependencies]
+quetzalcoatl = { workspace = true }
+heapless      = "0.8"

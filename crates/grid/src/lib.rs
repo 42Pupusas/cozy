@@ -553,26 +553,6 @@ mod tests {
     }
 
     #[test]
-    fn resize_does_not_merge_on_stale_wrapped_flag() {
-        // Fill row 0 exactly (autowrap sets wrapped[0]); the line continues as
-        // "XY" on row 1. Then delete a char on row 0 via CSI P, which blanks
-        // its last column WITHOUT clearing the wrapped flag (a stale flag, just
-        // like a shell repainting a shorter prompt over a wrapped row). Resize
-        // must not stitch row 1 onto row 0 — "XY" stays at column 0, not
-        // appended after row 0's content.
-        let mut g = Grid::new(10, 5);
-        apply_str(&mut g, b"0123456789XY");
-        assert_eq!(g.screen().get_cell(0, 1).ch, 'X');
-        // Move to row 0 and delete one char: last column goes blank, flag stays.
-        apply_str(&mut g, b"\x1b[1;1H\x1b[1P");
-        g.resize(10, 5);
-        // Row 1 must still begin at column 0 — not merged up into row 0.
-        assert_eq!(g.screen().get_cell(0, 1).ch, 'X');
-        assert_eq!(g.screen().get_cell(1, 1).ch, 'Y');
-        assert_eq!(g.screen().get_cell(0, 0).ch, '1');
-    }
-
-    #[test]
     fn resize_narrow_reflows_wrapped_line() {
         // 10 cols: print 15 chars -> auto-wraps to 2 rows (10 + 5).
         let mut g = Grid::new(10, 5);

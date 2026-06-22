@@ -265,14 +265,7 @@ impl Screen {
                     cursor_offset = cells.len() + cursor_col;
                 }
                 cells.extend_from_slice(&self.buf[base..base + old_cols]);
-                // A row only genuinely soft-wraps if its last column is
-                // non-blank: autowrap can't have fired otherwise. This guards
-                // against a stale `wrapped` flag left behind when a previously
-                // wrapped row is overwritten with shorter content (e.g. the
-                // shell repainting a prompt) — without it, resize would merge
-                // that line into the one below.
-                let last_filled = self.buf[base + old_cols - 1] != Cell::default();
-                let cont = self.wrapped.get(r).copied().unwrap_or(false) && last_filled;
+                let cont = self.wrapped.get(r).copied().unwrap_or(false);
                 r += 1;
                 if !cont || r >= total_old {
                     break;

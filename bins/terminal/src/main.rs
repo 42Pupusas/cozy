@@ -163,17 +163,26 @@ fn pty_thread(
         // poll returns immediately instead of sleeping through it.
         input_wake.drain();
 
-        // Drain all pending input messages first (writes are cheap).
+        // Drain all pending input messages first (writes are cheap). Resizes
+        // are COALESCED: an interactive drag fires a storm of configure events,
+        // but the shell only needs one SIGWINCH at the final width. Sending one
+        // per event makes the shell repaint its prompt for widths that no
+        // longer match the grid (which coalesces the same way on its side),
+        // leaving duplicated/merged prompt rows behind. Apply only the last.
+        let mut pending_resize: Option<(u16, u16)> = None;
         while let Some(msg) = input_rx.pop() {
             did_work = true;
             match msg {
                 InputMsg::Bytes(b)          => { let _ = pty.write(&b); }
-                InputMsg::Resize { cols, rows } => { let _ = pty.resize(cols, rows); }
+                InputMsg::Resize { cols, rows } => { pending_resize = Some((cols, rows)); }
                 InputMsg::Quit              => {
                     quit.store(true, Ordering::Relaxed);
                     return;
                 }
             }
+        }
+        if let Some((cols, rows)) = pending_resize {
+            let _ = pty.resize(cols, rows);
         }
 
         // Read from PTY and forward to the parser ring.

@@ -76,31 +76,45 @@ pub struct Cmap<'a> {
 
 impl<'a> Cmap<'a> {
     pub fn parse(ff: &FontFile<'a>) -> Result<Self, ParseError> {
-        let d = ff.require(TAG_CMAP, "cmap")?;
+        let d       = ff.require(TAG_CMAP, "cmap")?;
+        let sub_off = Self::find_subtable(d)?;
+        Ok(Self { data: &d[sub_off..] })
+    }
+
+    /// Wrap an already-located format-4 subtable slice (no directory walk).
+    #[must_use] 
+    pub const fn from_subtable(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    /// Locate the best format-4 subtable within a whole `cmap` table.
+    /// Returns the offset of the subtable relative to the `cmap` table start.
+    ///
+    /// # Errors
+    /// [`ParseError`] if no usable format-4 subtable is present.
+    pub fn find_subtable(d: &[u8]) -> Result<usize, ParseError> {
         let num_tables = u16_at(d, 2).ok_or(ParseError::TooShort)? as usize;
 
         // Walk encoding records looking for a (3,1) or (0,*) format-4 subtable.
         let mut chosen: Option<usize> = None;
         for i in 0..num_tables {
-            let base = 4 + i * 8;
+            let base     = 4 + i * 8;
             let platform = u16_at(d, base).ok_or(ParseError::TooShort)?;
             let encoding = u16_at(d, base + 2).ok_or(ParseError::TooShort)?;
             let offset   = u32_at(d, base + 4).ok_or(ParseError::TooShort)? as usize;
             // Prefer Windows/Unicode BMP (3,1), fallback to Unicode (0,*)
             let format = u16_at(d, offset).ok_or(ParseError::TooShort)?;
-            if format == 4 {
-                if (platform == 3 && encoding == 1) || platform == 0 {
-                    chosen = Some(offset);
-                    if platform == 3 { break; } // best match
-                }
+            if format == 4 && ((platform == 3 && encoding == 1) || platform == 0) {
+                chosen = Some(offset);
+                if platform == 3 { break; } // best match
             }
         }
 
-        let sub_off = chosen.ok_or(ParseError::MissingTable("cmap format 4"))?;
-        Ok(Self { data: &d[sub_off..] })
+        chosen.ok_or(ParseError::MissingTable("cmap format 4"))
     }
 
     /// Map a Unicode scalar to a glyph index (0 = .notdef).
+    #[must_use] 
     pub fn glyph_id(&self, codepoint: u32) -> u16 {
         let d = self.data;
         // format=4, length, language already consumed; seg_count_x2 at offset 6
@@ -121,7 +135,7 @@ impl<'a> Cmap<'a> {
         let mut lo = 0usize;
         let mut hi = seg_count;
         while lo < hi {
-            let mid = (lo + hi) / 2;
+            let mid = usize::midpoint(lo, hi);
             let end = u16_at(d, end_codes_off + mid * 2).unwrap_or(0);
             if cp > end { lo = mid + 1; } else { hi = mid; }
         }
@@ -132,8 +146,8 @@ impl<'a> Cmap<'a> {
 
         let id_range_offset = u16_at(d, id_range_off + lo * 2).unwrap_or(0) as usize;
         if id_range_offset == 0 {
-            let delta = i16_at(d, id_delta_off + lo * 2).unwrap_or(0) as i32;
-            let raw = (cp as i32 + delta) & 0xFFFF;
+            let delta = i32::from(i16_at(d, id_delta_off + lo * 2).unwrap_or(0));
+            let raw = (i32::from(cp) + delta) & 0xFFFF;
             return raw as u16;
         }
 
@@ -145,8 +159,8 @@ impl<'a> Cmap<'a> {
             let idx = glyph_off - glyph_ids_off;
             let raw = u16_at(d, glyph_ids_off + idx).unwrap_or(0);
             if raw == 0 { return 0; }
-            let delta = i16_at(d, id_delta_off + lo * 2).unwrap_or(0) as i32;
-            return ((raw as i32 + delta) & 0xFFFF) as u16;
+            let delta = i32::from(i16_at(d, id_delta_off + lo * 2).unwrap_or(0));
+            return ((i32::from(raw) + delta) & 0xFFFF) as u16;
         }
         0
     }
@@ -165,8 +179,15 @@ impl<'a> Loca<'a> {
         Ok(Self { data: ff.require(TAG_LOCA, "loca")?, format })
     }
 
+    /// Wrap an already-located `loca` table slice.
+    #[must_use] 
+    pub const fn from_bytes(data: &'a [u8], format: i16) -> Self {
+        Self { data, format }
+    }
+
     /// Byte offset + length of glyph `gid` within the `glyf` table.
     /// Returns `None` if the glyph has no outline (empty contour).
+    #[must_use] 
     pub fn glyph_range(&self, gid: u16) -> Option<(usize, usize)> {
         let gid = gid as usize;
         let (start, end) = if self.format == 0 {
@@ -197,7 +218,14 @@ impl<'a> Hmtx<'a> {
         Ok(Self { data: ff.require(TAG_HMTX, "hmtx")?, number_of_hmetrics })
     }
 
+    /// Wrap an already-located `hmtx` table slice.
+    #[must_use] 
+    pub const fn from_bytes(data: &'a [u8], number_of_hmetrics: u16) -> Self {
+        Self { data, number_of_hmetrics }
+    }
+
     /// Advance width and left side bearing for glyph `gid`.
+    #[must_use] 
     pub fn metrics(&self, gid: u16) -> (u16, i16) {
         let gid = gid as usize;
         let n   = self.number_of_hmetrics as usize;

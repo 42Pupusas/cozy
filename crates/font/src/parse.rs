@@ -28,8 +28,8 @@ pub const TAG_POST: usize = 9;
 // reserved slots for CFF/CFF2/etc
 const _TAG_COUNT: usize = 16;
 
-fn tag_index(tag: &[u8; 4]) -> Option<usize> {
-    match tag {
+const fn tag_index(tag: [u8; 4]) -> Option<usize> {
+    match &tag {
         b"cmap" => Some(TAG_CMAP),
         b"glyf" => Some(TAG_GLYF),
         b"head" => Some(TAG_HEAD),
@@ -66,27 +66,28 @@ impl std::error::Error for ParseError {}
 
 // ── Big-endian reads ──────────────────────────────────────────────────────────
 
+#[must_use] 
 pub fn u8_at(data: &[u8], off: usize) -> Option<u8> {
     data.get(off).copied()
 }
 
+#[must_use] 
 pub fn u16_at(data: &[u8], off: usize) -> Option<u16> {
     let b = data.get(off..off + 2)?;
     Some(u16::from_be_bytes([b[0], b[1]]))
 }
 
 pub fn i16_at(data: &[u8], off: usize) -> Option<i16> {
-    u16_at(data, off).map(|v| v as i16)
+    u16_at(data, off).map(u16::cast_signed)
 }
 
+#[must_use] 
 pub fn u32_at(data: &[u8], off: usize) -> Option<u32> {
     let b = data.get(off..off + 4)?;
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-pub fn i32_at(data: &[u8], off: usize) -> Option<i32> {
-    u32_at(data, off).map(|v| v as i32)
-}
+
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
@@ -114,7 +115,7 @@ impl<'a> FontFile<'a> {
             let tag: [u8; 4] = data[base..base + 4].try_into().unwrap();
             let offset = u32_at(data, base + 8).ok_or(ParseError::TooShort)? as usize;
             let length = u32_at(data, base + 12).ok_or(ParseError::TooShort)? as usize;
-            if let Some(idx) = tag_index(&tag) {
+            if let Some(idx) = tag_index(tag) {
                 tables[idx] = Some(TableRecord { offset, length });
             }
         }
@@ -122,6 +123,7 @@ impl<'a> FontFile<'a> {
         Ok(Self { data, tables })
     }
 
+    #[must_use] 
     pub fn table(&self, idx: usize) -> Option<&'a [u8]> {
         let r = self.tables[idx]?;
         self.data.get(r.offset..r.offset + r.length)

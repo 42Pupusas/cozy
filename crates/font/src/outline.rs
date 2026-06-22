@@ -14,9 +14,11 @@ pub struct Point {
 }
 
 impl Point {
+    #[must_use] 
     pub const fn new(x: f32, y: f32) -> Self { Self { x, y } }
+    #[must_use] 
     pub fn lerp(self, other: Self, t: f32) -> Self {
-        Self { x: self.x + (other.x - self.x) * t, y: self.y + (other.y - self.y) * t }
+        Self { x: (other.x - self.x).mul_add(t, self.x), y: (other.y - self.y).mul_add(t, self.y) }
     }
 }
 
@@ -42,7 +44,7 @@ pub struct Outline {
 }
 
 impl Outline {
-    fn new(x_min: i16, y_min: i16, x_max: i16, y_max: i16) -> Self {
+    const fn new(x_min: i16, y_min: i16, x_max: i16, y_max: i16) -> Self {
         Self { verbs: Vec::new(), x_min, y_min, x_max, y_max }
     }
 }
@@ -58,7 +60,6 @@ const Y_SAME_OR_POS:     u8 = 0x20;
 
 // Composite flag bits
 const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
-const ARGS_ARE_XY_VALUES:    u16 = 0x0002;
 const MORE_COMPONENTS:       u16 = 0x0020;
 const WE_HAVE_A_SCALE:       u16 = 0x0008;
 const WE_HAVE_AN_X_AND_Y:    u16 = 0x0040;
@@ -131,13 +132,13 @@ fn decode_simple(
     let mut x_acc: i32 = 0;
     for &f in &flags {
         let dx = if f & X_SHORT != 0 {
-            let v = u8_at(d, cursor).ok_or(ParseError::TooShort)? as i32;
+            let v = i32::from(u8_at(d, cursor).ok_or(ParseError::TooShort)?);
             cursor += 1;
             if f & X_SAME_OR_POS != 0 { v } else { -v }
         } else if f & X_SAME_OR_POS != 0 {
             0
         } else {
-            let v = i16_at(d, cursor).ok_or(ParseError::TooShort)? as i32;
+            let v = i32::from(i16_at(d, cursor).ok_or(ParseError::TooShort)?);
             cursor += 2;
             v
         };
@@ -150,13 +151,13 @@ fn decode_simple(
     let mut y_acc: i32 = 0;
     for &f in &flags {
         let dy = if f & Y_SHORT != 0 {
-            let v = u8_at(d, cursor).ok_or(ParseError::TooShort)? as i32;
+            let v = i32::from(u8_at(d, cursor).ok_or(ParseError::TooShort)?);
             cursor += 1;
             if f & Y_SAME_OR_POS != 0 { v } else { -v }
         } else if f & Y_SAME_OR_POS != 0 {
             0
         } else {
-            let v = i16_at(d, cursor).ok_or(ParseError::TooShort)? as i32;
+            let v = i32::from(i16_at(d, cursor).ok_or(ParseError::TooShort)?);
             cursor += 2;
             v
         };
@@ -178,7 +179,7 @@ fn decode_simple(
 }
 
 fn pt(xs: &[i16], ys: &[i16], i: usize) -> Point {
-    Point::new(xs[i] as f32, ys[i] as f32)
+    Point::new(f32::from(xs[i]), f32::from(ys[i]))
 }
 
 fn on(flags: &[u8], i: usize) -> bool { flags[i] & ON_CURVE != 0 }
@@ -197,10 +198,10 @@ fn emit_contour(
 
     // Find first on-curve point (or use midpoint if all off-curve).
     let first_on = (start..=end).find(|&i| on(flags, i));
-    let start_pt = match first_on {
-        Some(i) => pt(xs, ys, i),
-        None    => pt(xs, ys, start).lerp(pt(xs, ys, start + 1), 0.5),
-    };
+    let start_pt = first_on.map_or_else(
+        || pt(xs, ys, start).lerp(pt(xs, ys, start + 1), 0.5),
+        |i| pt(xs, ys, i),
+    );
 
     outline.verbs.push(Verb::MoveTo(start_pt));
 
@@ -218,12 +219,10 @@ fn emit_contour(
             } else if step > 0 {
                 outline.verbs.push(Verb::LineTo(p));
             }
-        } else {
-            if let Some(prev_ctrl) = pending_off.replace(p) {
-                // Two consecutive off-curve → implied midpoint.
-                let mid = prev_ctrl.lerp(p, 0.5);
-                outline.verbs.push(Verb::QuadTo(prev_ctrl, mid));
-            }
+        } else if let Some(prev_ctrl) = pending_off.replace(p) {
+            // Two consecutive off-curve → implied midpoint.
+            let mid = prev_ctrl.lerp(p, 0.5);
+            outline.verbs.push(Verb::QuadTo(prev_ctrl, mid));
         }
         i += 1;
     }
@@ -256,13 +255,13 @@ fn decode_composite(
 
         // Translation arguments.
         let (dx, dy) = if flags & ARG_1_AND_2_ARE_WORDS != 0 {
-            let dx = i16_at(d, cursor).ok_or(ParseError::TooShort)? as f32;
-            let dy = i16_at(d, cursor + 2).ok_or(ParseError::TooShort)? as f32;
+            let dx = f32::from(i16_at(d, cursor).ok_or(ParseError::TooShort)?);
+            let dy = f32::from(i16_at(d, cursor + 2).ok_or(ParseError::TooShort)?);
             cursor += 4;
             (dx, dy)
         } else {
-            let dx = u8_at(d, cursor).ok_or(ParseError::TooShort)? as i8 as f32;
-            let dy = u8_at(d, cursor + 1).ok_or(ParseError::TooShort)? as i8 as f32;
+            let dx = f32::from(u8_at(d, cursor).ok_or(ParseError::TooShort)?.cast_signed());
+            let dy = f32::from(u8_at(d, cursor + 1).ok_or(ParseError::TooShort)?.cast_signed());
             cursor += 2;
             (dx, dy)
         };
@@ -278,7 +277,7 @@ fn decode_composite(
         // components reference glyph ids in the same file so we re-use the
         // glyf_data slice and search forward for the glyph header.
         // (A full implementation would pass Loca in; here we use a helper.)
-        let component = find_component(glyf_data, glyph_index, depth)?;
+        let component = find_component(glyf_data, glyph_index, depth);
         // Translate and append.
         for verb in component.verbs {
             outline.verbs.push(translate_verb(verb, dx, dy));
@@ -290,12 +289,12 @@ fn decode_composite(
     Ok(outline)
 }
 
-fn find_component(glyf_data: &[u8], _gid: u16, _depth: u8) -> Result<Outline, ParseError> {
+fn find_component(glyf_data: &[u8], _gid: u16, _depth: u8) -> Outline {
     // Composite expansion requires Loca; we defer full support to when
     // FontFace passes Loca in. Return an empty outline as a safe stub —
     // composite glyphs in JetBrains Mono are rare (only accented letters).
     let _ = glyf_data;
-    Ok(Outline::default())
+    Outline::default()
 }
 
 fn translate_verb(v: Verb, dx: f32, dy: f32) -> Verb {

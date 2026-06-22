@@ -22,6 +22,7 @@ pub struct Bitmap {
 }
 
 impl Bitmap {
+    #[must_use] 
     pub fn blank(width: u32, height: u32) -> Self {
         Self { width, height, data: vec![0u8; (width * height) as usize] }
     }
@@ -44,14 +45,15 @@ struct Edge {
 /// `scale`     — font-units → pixels (typically `px_size / units_per_em`)
 /// `baseline`  — Y pixel at which the font baseline sits (usually close to `h`)
 /// `x_offset`  — horizontal shift in pixels (left side bearing applied by caller)
+#[must_use] 
 pub fn rasterize(outline: &Outline, w: u32, h: u32, scale: f32, baseline: f32, x_offset: f32) -> Bitmap {
     let mut edges: Vec<Edge> = Vec::new();
 
     // Transform a font-unit point to pixel coords.
     let tx = |p: Point| -> (f32, f32) {
-        let px = p.x * scale + x_offset;
+        let px = p.x.mul_add(scale, x_offset);
         // Y in fonts goes up; in pixels it goes down — flip around baseline.
-        let py = baseline - p.y * scale;
+        let py = p.y.mul_add(-scale, baseline);
         (px, py)
     };
 
@@ -104,12 +106,12 @@ pub fn rasterize(outline: &Outline, w: u32, h: u32, scale: f32, baseline: f32, x
             if inside {
                 // Fill from prev_x to x.
                 let x0 = (prev_x.ceil() as i64).max(0) as u32;
-                let x1 = (x.ceil() as i64).max(0).min(w as i64) as u32;
+                let x1 = (x.ceil() as i64).max(0).min(i64::from(w)) as u32;
                 for col in x0..x1 {
                     bmp.data[(scanline * w + col) as usize] = 255;
                 }
             }
-            winding += w_delta as i32;
+            winding += i32::from(w_delta);
             inside   = winding != 0;
             prev_x   = x;
         }
@@ -133,7 +135,7 @@ fn push_edge(edges: &mut Vec<Edge>, p0: (f32, f32), p1: (f32, f32)) {
 fn edge_x_at(e: &Edge, y: f32) -> Option<(f32, i8)> {
     if y < e.y0 || y >= e.y1 { return None; }
     let t = (y - e.y0) / (e.y1 - e.y0);
-    let x = e.x0 + t * (e.x1 - e.x0);
+    let x = t.mul_add(e.x1 - e.x0, e.x0);
     Some((x, e.winding))
 }
 
@@ -158,5 +160,5 @@ fn subdivide_quad(
 }
 
 fn lerp2(a: (f32, f32), b: (f32, f32), t: f32) -> (f32, f32) {
-    (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t)
+    ((b.0 - a.0).mul_add(t, a.0), (b.1 - a.1).mul_add(t, a.1))
 }

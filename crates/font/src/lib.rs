@@ -8,19 +8,19 @@
 //! 5. [`atlas`]   — pack rendered glyphs into a 2-D texture atlas
 //! 6. [`face`]    — public [`FontFace`] API tying everything together
 
+// Glyph rasterization is inherently float↔int pixel math; these casts are
+// bounded by atlas/bitmap dimensions and are correct by construction.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    dead_code,          // many table fields reserved for later use
-    unused_variables,   // scale/ascender used in future raster integration
+    clippy::cast_precision_loss
 )]
 
-mod atlas;
-mod outline;
-mod parse;
-mod raster;
-mod tables;
+pub mod atlas;
+pub mod outline;
+pub mod parse;
+pub mod raster;
+pub mod tables;
 
 pub mod face;
 mod tests;

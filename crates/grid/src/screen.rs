@@ -251,6 +251,22 @@ impl Screen {
         first_kept as u16
     }
 
+    /// Index of the last visible row that holds any non-blank cell, plus one
+    /// (i.e. the number of visible rows actually occupied by content). Returns
+    /// 0 when the visible area is entirely blank. Used to bottom-anchor resize
+    /// without discarding real output.
+    #[must_use]
+    pub fn content_rows(&self) -> u16 {
+        let cols = usize::from(self.cols);
+        for row in (0..usize::from(self.rows)).rev() {
+            let start = (self.scrollback_len + row) * cols;
+            if self.buf[start..start + cols].iter().any(|c| *c != Cell::default()) {
+                return row as u16 + 1;
+            }
+        }
+        0
+    }
+
     // ── private ───────────────────────────────────────────────────────────
 
     fn visible_row_start(&self, row: u16) -> usize {

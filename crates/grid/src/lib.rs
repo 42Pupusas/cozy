@@ -70,9 +70,14 @@ impl Grid {
     /// (prompt + recent output) anchored and clamping the cursor.
     pub fn resize(&mut self, cols: u16, rows: u16) {
         // Content fills upward, so the "used" region is everything down to the
-        // cursor row inclusive. Primary anchors to the bottom; the alternate
-        // screen is a fixed fullscreen canvas, so it just clips from the top.
-        let used = self.cursor.row.saturating_add(1);
+        // last occupied row OR the cursor, whichever is lower — using the cursor
+        // alone drops output below it (and a row-0 cursor would discard the
+        // whole prompt). Primary anchors to the bottom; the alternate screen is
+        // a fixed fullscreen canvas, so it just clips from the top.
+        let used = self
+            .primary
+            .content_rows()
+            .max(self.cursor.row.saturating_add(1));
         let shifted = self.primary.resize(cols, rows, used);
         self.alternate.resize(cols, rows, rows);
 
@@ -498,6 +503,32 @@ mod tests {
         assert_eq!(g.screen().get_cell(1, 0).ch, 'B');
         assert_eq!(g.screen().get_cell(0, 1).ch, 'C');
         assert_eq!(g.screen().get_cell(1, 1).ch, 'D');
+    }
+
+    #[test]
+    fn resize_shrink_keeps_bottom_content() {
+        // 5 rows, cursor ends on the last row (typical: prompt at bottom).
+        let mut g = Grid::new(10, 5);
+        apply_str(&mut g, b"L0\r\nL1\r\nL2\r\nL3\r\nL4");
+        assert_eq!(g.cursor(), (2, 4));
+        // Shrink to 3 rows: should keep L2,L3,L4 (the bottom), not L0,L1,L2.
+        g.resize(10, 3);
+        assert_eq!(g.screen().get_cell(0, 0).ch, 'L');
+        assert_eq!(g.screen().get_cell(1, 0).ch, '2');
+        assert_eq!(g.screen().get_cell(1, 2).ch, '4');
+        assert_eq!(g.cursor(), (2, 2));
+    }
+
+    #[test]
+    fn resize_shrink_keeps_prompt_when_cursor_low() {
+        // Single prompt line at the top, cursor right after it (row 0). A naive
+        // used=cursor.row+1 would keep only blank bottom rows and erase this.
+        let mut g = Grid::new(10, 5);
+        apply_str(&mut g, b"$ ");
+        assert_eq!(g.cursor(), (2, 0));
+        g.resize(10, 2);
+        assert_eq!(g.screen().get_cell(0, 0).ch, '$');
+        assert_eq!(g.cursor(), (2, 0));
     }
 
     #[test]

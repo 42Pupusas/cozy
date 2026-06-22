@@ -72,8 +72,8 @@ impl Encoder {
     pub fn encode_mouse(&self, ev: MouseEvent, buf: &mut [u8]) -> Option<usize> {
         match self.mouse_mode {
             MouseMode::Off => None,
-            MouseMode::Sgr => self.encode_mouse_sgr(ev, buf),
-            _ => self.encode_mouse_x10(ev, buf),
+            MouseMode::Sgr => Some(encode_mouse_sgr(ev, buf)),
+            _ => Some(self.encode_mouse_x10(ev, buf)),
         }
     }
 
@@ -84,12 +84,12 @@ impl Encoder {
         if mods.ctrl() {
             if let Key::Char(c) = key {
                 if let Some(byte) = ctrl_byte(c) {
-                    return write1(buf, byte);
+                    return Some(write1(buf, byte));
                 }
             }
         }
 
-        match key {
+        Some(match key {
             // ── Printable characters ──────────────────────────────────────
             Key::Char(c) => {
                 // Alt prefixes with ESC.
@@ -101,7 +101,7 @@ impl Encoder {
                 let s = encode_char(c, mods.shift(), mods.caps());
                 let src = s.as_bytes();
                 buf[n..n + src.len()].copy_from_slice(src);
-                Some(n + src.len())
+                n + src.len()
             }
 
             // ── Enter / Backspace / Tab / Esc ────────────────────────────
@@ -157,42 +157,39 @@ impl Encoder {
             }
 
             // ── Function keys ────────────────────────────────────────────
-            Key::F(n) => encode_fkey(buf, n, mods),
+            Key::F(n) => encode_fkey(buf, n, mods)?,
 
-            // ── KpEnter ──────────────────────────────────────────────────
-            Key::KpEnter => {
-                if self.app_keypad { writeb(buf, b"\x1bOM") }
-                else { write1(buf, b'\r') }
+            // ── Keypad cluster ────────────────────────────────────────────
+            Key::KpEnter | Key::KpUp | Key::KpDown | Key::KpRight | Key::KpLeft
+            | Key::KpHome | Key::KpEnd | Key::KpPageUp | Key::KpPageDown
+            | Key::KpBegin | Key::KpInsert | Key::KpDelete | Key::KpChar(_) => {
+                return self.encode_keypad(key, buf);
             }
 
-            // ── Keypad arrows / nav ───────────────────────────────────────
+            // Modifier-only keys silently produce nothing in legacy mode.
+            Key::Shift | Key::Ctrl | Key::Alt | Key::Super
+            | Key::CapsLock | Key::NumLock | Key::ScrollLock | Key::Menu => return None,
+        })
+    }
+
+    /// Encode the numeric-keypad keys, honouring application-keypad mode.
+    fn encode_keypad(&self, key: Key, buf: &mut [u8]) -> Option<usize> {
+        let app = self.app_keypad;
+        Some(match key {
+            Key::KpEnter => if app { writeb(buf, b"\x1bOM") } else { write1(buf, b'\r') },
             Key::KpUp    => self.kp_arrow(buf, b'A'),
             Key::KpDown  => self.kp_arrow(buf, b'B'),
             Key::KpRight => self.kp_arrow(buf, b'C'),
             Key::KpLeft  => self.kp_arrow(buf, b'D'),
-            Key::KpHome  => {
-                if self.app_keypad { writeb(buf, b"\x1bOw") } else { writeb(buf, b"\x1b[H") }
-            }
-            Key::KpEnd   => {
-                if self.app_keypad { writeb(buf, b"\x1bOq") } else { writeb(buf, b"\x1b[F") }
-            }
-            Key::KpPageUp => {
-                if self.app_keypad { writeb(buf, b"\x1bOy") } else { writeb(buf, b"\x1b[5~") }
-            }
-            Key::KpPageDown => {
-                if self.app_keypad { writeb(buf, b"\x1bOs") } else { writeb(buf, b"\x1b[6~") }
-            }
-            Key::KpBegin => {
-                if self.app_keypad { writeb(buf, b"\x1bOu") } else { writeb(buf, b"\x1b[E") }
-            }
-            Key::KpInsert => {
-                if self.app_keypad { writeb(buf, b"\x1bOp") } else { writeb(buf, b"\x1b[2~") }
-            }
-            Key::KpDelete => {
-                if self.app_keypad { writeb(buf, b"\x1bOn") } else { writeb(buf, b"\x1b[3~") }
-            }
+            Key::KpHome     => if app { writeb(buf, b"\x1bOw") } else { writeb(buf, b"\x1b[H") },
+            Key::KpEnd      => if app { writeb(buf, b"\x1bOq") } else { writeb(buf, b"\x1b[F") },
+            Key::KpPageUp   => if app { writeb(buf, b"\x1bOy") } else { writeb(buf, b"\x1b[5~") },
+            Key::KpPageDown => if app { writeb(buf, b"\x1bOs") } else { writeb(buf, b"\x1b[6~") },
+            Key::KpBegin    => if app { writeb(buf, b"\x1bOu") } else { writeb(buf, b"\x1b[E") },
+            Key::KpInsert   => if app { writeb(buf, b"\x1bOp") } else { writeb(buf, b"\x1b[2~") },
+            Key::KpDelete   => if app { writeb(buf, b"\x1bOn") } else { writeb(buf, b"\x1b[3~") },
             Key::KpChar(c) => {
-                if self.app_keypad {
+                if app {
                     let code: u8 = match c {
                         '0' => b'p', '1' => b'q', '2' => b'r', '3' => b's',
                         '4' => b't', '5' => b'u', '6' => b'v', '7' => b'w',
@@ -200,63 +197,43 @@ impl Encoder {
                         '-' => b'm', '*' => b'j', '/' => b'o',
                         _   => return None,
                     };
-                    write2(buf, b'\x1b', code.wrapping_add(b'O'.wrapping_sub(b'O')))
-                        .map(|_| {
-                            buf[0] = b'\x1b';
-                            buf[1] = b'O';
-                            buf[2] = code;
-                            3
-                        })
+                    buf[0] = b'\x1b';
+                    buf[1] = b'O';
+                    buf[2] = code;
+                    3
                 } else {
                     let mut tmp = [0u8; 4];
                     let n = c.encode_utf8(&mut tmp).len();
                     buf[..n].copy_from_slice(&tmp[..n]);
-                    Some(n)
+                    n
                 }
             }
-
-            // Modifier-only keys silently produce nothing in legacy mode.
-            Key::Shift | Key::Ctrl | Key::Alt | Key::Super
-            | Key::CapsLock | Key::NumLock | Key::ScrollLock | Key::Menu => None,
-        }
+            _ => return None,
+        })
     }
 
     /// Arrow key — respects app-cursor mode and modifier CSI.
-    fn arrow(&self, buf: &mut [u8], letter: u8, mods: Modifiers) -> Option<usize> {
+    fn arrow(&self, buf: &mut [u8], letter: u8, mods: Modifiers) -> usize {
         if mods.any_active() {
             // `CSI 1 ; <mod> A/B/C/D`
             csi_mod(buf, b"1", mods, letter)
-        } else if self.app_cursor {
-            // `SS3 A/B/C/D`
-            buf[0] = b'\x1b';
-            buf[1] = b'O';
-            buf[2] = letter;
-            Some(3)
         } else {
+            // `SS3 A/B/C/D` in app-cursor mode, else `CSI A/B/C/D`.
+            let intro = if self.app_cursor { b'O' } else { b'[' };
             buf[0] = b'\x1b';
-            buf[1] = b'[';
+            buf[1] = intro;
             buf[2] = letter;
-            Some(3)
+            3
         }
     }
 
-    fn kp_arrow(&self, buf: &mut [u8], letter: u8) -> Option<usize> {
-        if self.app_keypad {
-            buf[0] = b'\x1b';
-            buf[1] = b'O';
-            buf[2] = letter;
-            Some(3)
-        } else if self.app_cursor {
-            buf[0] = b'\x1b';
-            buf[1] = b'O';
-            buf[2] = letter;
-            Some(3)
-        } else {
-            buf[0] = b'\x1b';
-            buf[1] = b'[';
-            buf[2] = letter;
-            Some(3)
-        }
+    fn kp_arrow(&self, buf: &mut [u8], letter: u8) -> usize {
+        // App-keypad and app-cursor both select SS3; default is CSI.
+        let intro = if self.app_keypad || self.app_cursor { b'O' } else { b'[' };
+        buf[0] = b'\x1b';
+        buf[1] = intro;
+        buf[2] = letter;
+        3
     }
 
     // ── xterm modifyOtherKeys ─────────────────────────────────────────────────
@@ -276,31 +253,32 @@ impl Encoder {
             _ => return self.encode_legacy(key, mods, buf),
         };
         let mod_param = mods.kitty_param().unwrap_or(1);
-        write_fmt_csi(buf, 27, mod_param, codepoint)
+        Some(write_fmt_csi(buf, 27, mod_param, codepoint))
     }
 
     // ── Kitty protocol ────────────────────────────────────────────────────────
 
+    #[allow(clippy::unused_self)] // method form keeps the encoder API uniform
     fn encode_kitty(&self, key: Key, state: KeyState, mods: Modifiers, buf: &mut [u8]) -> Option<usize> {
-        // Kitty: `CSI codepoint ; modifier : event_type u`
-        // event_type: 1=press 2=repeat 3=release (omitted when 1 and no flags)
-        let codepoint: u32 = kitty_codepoint(key)?;
+        // Kitty: `CSI <num> ; <modifier> : <event_type> <terminator>`
+        // event_type: 1=press 2=repeat 3=release.
         let mod_param = mods.kitty_param().unwrap_or(1);
         let event_type: u8 = match state {
             KeyState::Pressed  => 1,
             KeyState::Repeated => 2,
             KeyState::Released => 3,
         };
-        // Minimal form: `CSI u` when codepoint < 128, no mods, press.
-        if codepoint < 128 && mod_param == 1 && event_type == 1 {
-            // Still use CSI u form for unambiguity.
-        }
-        write_kitty(buf, codepoint, mod_param, event_type)
+        let (number, terminator) = match kitty_key(key)? {
+            KittyKey::Unicode(cp) => (cp, b'u'),
+            KittyKey::Tilde(n)    => (n, b'~'),
+            KittyKey::Letter(l)   => (1, l),
+        };
+        Some(write_kitty(buf, number, mod_param, event_type, terminator))
     }
 
     // ── Mouse encoding ────────────────────────────────────────────────────────
 
-    fn encode_mouse_x10(&self, ev: MouseEvent, buf: &mut [u8]) -> Option<usize> {
+    fn encode_mouse_x10(&self, ev: MouseEvent, buf: &mut [u8]) -> usize {
         // X10: `CSI M <btn+32> <col+32> <row+32>`
         // Normal/ButtonMotion/AnyEvent all use same encoding, differing only
         // in release: button code = 3.
@@ -322,24 +300,22 @@ impl Encoder {
         buf[3] = btn.saturating_add(32);
         buf[4] = col.saturating_add(32);
         buf[5] = row.saturating_add(32);
-        Some(6)
+        6
     }
 
-    fn encode_mouse_sgr(&self, ev: MouseEvent, buf: &mut [u8]) -> Option<usize> {
-        // SGR: `CSI < btn ; col ; row M/m`
-        let mut btn = u16::from(ev.button.x10_code());
-        if ev.mods.shift() { btn |= 0x04; }
-        if ev.mods.alt()   { btn |= 0x08; }
-        if ev.mods.ctrl()  { btn |= 0x10; }
-        let final_byte: u8 = match ev.state {
-            ButtonState::Pressed  => b'M',
-            ButtonState::Released => b'm',
-        };
-        let col = ev.col + 1;
-        let row = ev.row + 1;
-        // Format: ESC [ < btn ; col ; row M/m
-        write_sgr_mouse(buf, btn, col, row, final_byte)
-    }
+}
+
+/// SGR mouse encoding (`CSI < btn ; col ; row M/m`) — independent of encoder state.
+fn encode_mouse_sgr(ev: MouseEvent, buf: &mut [u8]) -> usize {
+    let mut btn = u16::from(ev.button.x10_code());
+    if ev.mods.shift() { btn |= 0x04; }
+    if ev.mods.alt()   { btn |= 0x08; }
+    if ev.mods.ctrl()  { btn |= 0x10; }
+    let final_byte: u8 = match ev.state {
+        ButtonState::Pressed  => b'M',
+        ButtonState::Released => b'm',
+    };
+    write_sgr_mouse(buf, btn, ev.col + 1, ev.row + 1, final_byte)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -349,25 +325,21 @@ const fn ctrl_byte(c: char) -> Option<u8> {
     match c {
         'a'..='z' => Some(c as u8 - b'a' + 1),
         'A'..='Z' => Some(c as u8 - b'A' + 1),
-        '@' | ' ' => Some(0),
-        '['        => Some(27),
-        '\\'       => Some(28),
-        ']'        => Some(29),
-        '^'        => Some(30),
-        '_'        => Some(31),
-        '2'        => Some(0),   // Ctrl+2 = NUL
-        '3'        => Some(27),  // Ctrl+3 = ESC
-        '4'        => Some(28),  // Ctrl+4 = FS
-        '5'        => Some(29),  // Ctrl+5 = GS
-        '6'        => Some(30),  // Ctrl+6 = RS
-        '7'        => Some(31),  // Ctrl+7 = US
-        '8'        => Some(127), // Ctrl+8 = DEL
-        _          => None,
+        // `@`/space and the digit aliases collapse to the same C0 codes
+        // (Ctrl+2 = NUL, Ctrl+3 = ESC, … Ctrl+7 = US, Ctrl+8 = DEL).
+        '@' | ' ' | '2' => Some(0),
+        '[' | '3'       => Some(27),
+        '\\' | '4'      => Some(28),
+        ']' | '5'       => Some(29),
+        '^' | '6'       => Some(30),
+        '_' | '7'       => Some(31),
+        '8'             => Some(127),
+        _               => None,
     }
 }
 
 /// Encode a character respecting shift and caps-lock.
-fn encode_char(c: char, shift: bool, caps: bool) -> &'static str {
+const fn encode_char(c: char, shift: bool, caps: bool) -> &'static str {
     // For the ASCII range we pre-compute via lookup; fallback is just the char.
     // We return a &'static str from a small table to avoid heap allocation.
     if shift || caps {
@@ -391,8 +363,9 @@ const fn unshifted_char(c: char) -> &'static str {
         '6' => "6", '7' => "7", '8' => "8", '9' => "9", '0' => "0",
         '-' => "-", '=' => "=", '[' => "[", ']' => "]", '\\' => "\\",
         ';' => ";", '\'' => "'", '`' => "`", ',' => ",", '.' => ".", '/' => "/",
-        ' ' => " ",
-        _   => " ", // fallback — caller should use Key::Char directly for non-ASCII
+        // Space and any non-ASCII fall back to a single space; callers should
+        // use Key::Char directly for real non-ASCII text.
+        _   => " ",
     }
 }
 
@@ -408,38 +381,69 @@ const fn shifted_char(c: char) -> &'static str {
         '6' => "^", '7' => "&", '8' => "*", '9' => "(", '0' => ")",
         '-' => "_", '=' => "+", '[' => "{", ']' => "}", '\\' => "|",
         ';' => ":", '\'' => "\"", '`' => "~", ',' => "<", '.' => ">", '/' => "?",
-        ' ' => " ",
         _   => " ",
     }
 }
 
-/// Kitty codepoint for a key.  Returns `None` for unknowns.
-fn kitty_codepoint(key: Key) -> Option<u32> {
+/// How a key is encoded in the kitty protocol.
+///
+/// Per the kitty spec, functional keys that have a legacy representation keep
+/// using it (number + `~`, or `1` + a letter), while keys with no legacy form
+/// use a Private-Use-Area codepoint terminated by `u`.
+enum KittyKey {
+    /// `CSI <num> ; <mod> : <evt> u` — codepoint keys (text + PUA functionals).
+    Unicode(u32),
+    /// `CSI <num> ; <mod> : <evt> ~` — tilde-form functionals (Insert, PgUp…).
+    Tilde(u32),
+    /// `CSI 1 ; <mod> : <evt> <letter>` — letter-form functionals (arrows…).
+    Letter(u8),
+}
+
+/// Classify a key for kitty encoding.  Returns `None` for keys with no mapping.
+const fn kitty_key(key: Key) -> Option<KittyKey> {
+    use KittyKey::{Letter, Tilde, Unicode};
     Some(match key {
-        Key::Char(c)  => c as u32,
-        Key::Enter    => 13,
-        Key::Backspace => 127,
-        Key::Tab      => 9,
-        Key::Esc      => 27,
-        Key::Delete   => 57361,
-        Key::Insert   => 57348,
-        Key::Up       => 57352,
-        Key::Down     => 57353,
-        Key::Left     => 57350,
-        Key::Right    => 57351,
-        Key::Home     => 57354,
-        Key::End      => 57355,
-        Key::PageUp   => 57358,
-        Key::PageDown => 57359,
-        Key::F(n)     => 57363 + u32::from(n) - 1,
-        Key::KpEnter  => 57372,
-        Key::Shift    => 57441,
-        Key::Ctrl     => 57442,
-        Key::Alt      => 57443,
-        Key::Super    => 57444,
-        Key::CapsLock => 57358,
-        Key::NumLock  => 57360,
-        _             => return None,
+        Key::Char(c)   => Unicode(c as u32),
+        Key::Enter     => Unicode(13),
+        Key::Backspace => Unicode(127),
+        Key::Tab       => Unicode(9),
+        Key::Esc       => Unicode(27),
+        // Legacy tilde-form functional keys.
+        Key::Insert    => Tilde(2),
+        Key::Delete    => Tilde(3),
+        Key::PageUp    => Tilde(5),
+        Key::PageDown  => Tilde(6),
+        // Legacy letter-form functional keys.
+        Key::Up        => Letter(b'A'),
+        Key::Down      => Letter(b'B'),
+        Key::Right     => Letter(b'C'),
+        Key::Left      => Letter(b'D'),
+        Key::Home      => Letter(b'H'),
+        Key::End       => Letter(b'F'),
+        // F1–F4 use letter forms; F5+ use tilde forms with their legacy numbers.
+        Key::F(1)      => Letter(b'P'),
+        Key::F(2)      => Letter(b'Q'),
+        Key::F(3)      => Tilde(13),
+        Key::F(4)      => Letter(b'S'),
+        Key::F(5)      => Tilde(15),
+        Key::F(6)      => Tilde(17),
+        Key::F(7)      => Tilde(18),
+        Key::F(8)      => Tilde(19),
+        Key::F(9)      => Tilde(20),
+        Key::F(10)     => Tilde(21),
+        Key::F(11)     => Tilde(23),
+        Key::F(12)     => Tilde(24),
+        // Keys with no legacy form — canonical PUA codepoints (kitty spec).
+        Key::KpEnter   => Unicode(57414),
+        Key::CapsLock  => Unicode(57358),
+        Key::ScrollLock => Unicode(57359),
+        Key::NumLock   => Unicode(57360),
+        Key::Menu      => Unicode(57363),
+        Key::Shift     => Unicode(57441),
+        Key::Ctrl      => Unicode(57442),
+        Key::Alt       => Unicode(57443),
+        Key::Super     => Unicode(57444),
+        _              => return None,
     })
 }
 
@@ -447,14 +451,14 @@ fn kitty_codepoint(key: Key) -> Option<u32> {
 fn encode_fkey(buf: &mut [u8], n: u8, mods: Modifiers) -> Option<usize> {
     // F1–F4 without mods → SS3 P/Q/R/S; with mods → CSI 1 ; <mod> P/Q/R/S
     // F5–F12 → CSI tilde with numeric codes; with mods → CSI num ; mod ~
-    match n {
+    Some(match n {
         1..=4 => {
             let letter = b'P' + n - 1;
             if mods.any_active() {
                 csi_mod(buf, b"1", mods, letter)
             } else {
                 buf[0] = b'\x1b'; buf[1] = b'O'; buf[2] = letter;
-                Some(3)
+                3
             }
         }
         5 => fkey_tilde(buf, b"15", mods),
@@ -465,35 +469,27 @@ fn encode_fkey(buf: &mut [u8], n: u8, mods: Modifiers) -> Option<usize> {
         10 => fkey_tilde(buf, b"21", mods),
         11 => fkey_tilde(buf, b"23", mods),
         12 => fkey_tilde(buf, b"24", mods),
-        _ => None,
-    }
+        _ => return None,
+    })
 }
 
 /// `CSI <num> [; <mod>] ~`
-fn fkey_tilde(buf: &mut [u8], num: &[u8], mods: Modifiers) -> Option<usize> {
+fn fkey_tilde(buf: &mut [u8], num: &[u8], mods: Modifiers) -> usize {
+    let mut n = 0;
+    buf[n] = b'\x1b'; n += 1;
+    buf[n] = b'[';     n += 1;
+    buf[n..n + num.len()].copy_from_slice(num); n += num.len();
     if mods.any_active() {
         let mod_param = mods.kitty_param().unwrap_or(1);
-        // ESC [ <num> ; <mod> ~
-        let mut n = 0;
-        buf[n] = b'\x1b'; n += 1;
-        buf[n] = b'[';     n += 1;
-        buf[n..n + num.len()].copy_from_slice(num); n += num.len();
-        buf[n] = b';';     n += 1;
+        buf[n] = b';'; n += 1;
         n += write_u8_dec(&mut buf[n..], mod_param);
-        buf[n] = b'~';     n += 1;
-        Some(n)
-    } else {
-        let mut n = 0;
-        buf[n] = b'\x1b'; n += 1;
-        buf[n] = b'[';     n += 1;
-        buf[n..n + num.len()].copy_from_slice(num); n += num.len();
-        buf[n] = b'~';     n += 1;
-        Some(n)
     }
+    buf[n] = b'~'; n += 1;
+    n
 }
 
 /// `CSI <ps> ; <mod> <final>` — for arrows, Home, End.
-fn csi_mod(buf: &mut [u8], ps: &[u8], mods: Modifiers, final_byte: u8) -> Option<usize> {
+fn csi_mod(buf: &mut [u8], ps: &[u8], mods: Modifiers, final_byte: u8) -> usize {
     let mod_param = mods.kitty_param().unwrap_or(1);
     let mut n = 0;
     buf[n] = b'\x1b'; n += 1;
@@ -502,11 +498,11 @@ fn csi_mod(buf: &mut [u8], ps: &[u8], mods: Modifiers, final_byte: u8) -> Option
     buf[n] = b';';     n += 1;
     n += write_u8_dec(&mut buf[n..], mod_param);
     buf[n] = final_byte; n += 1;
-    Some(n)
+    n
 }
 
 /// `CSI 27 ; <mod> ; <codepoint> ~`
-fn write_fmt_csi(buf: &mut [u8], _ps1: u32, mod_param: u8, codepoint: u32) -> Option<usize> {
+fn write_fmt_csi(buf: &mut [u8], _ps1: u32, mod_param: u8, codepoint: u32) -> usize {
     let mut n = 0;
     buf[n] = b'\x1b'; n += 1;
     buf[n] = b'[';     n += 1;
@@ -516,25 +512,25 @@ fn write_fmt_csi(buf: &mut [u8], _ps1: u32, mod_param: u8, codepoint: u32) -> Op
     buf[n] = b';'; n += 1;
     n += write_u32_dec(&mut buf[n..], codepoint);
     buf[n] = b'~'; n += 1;
-    Some(n)
+    n
 }
 
-/// Kitty: `CSI <codepoint> ; <mod> : <event> u`
-fn write_kitty(buf: &mut [u8], codepoint: u32, mod_param: u8, event_type: u8) -> Option<usize> {
+/// Kitty: `CSI <number> ; <mod> : <event> <terminator>`
+fn write_kitty(buf: &mut [u8], number: u32, mod_param: u8, event_type: u8, terminator: u8) -> usize {
     let mut n = 0;
     buf[n] = b'\x1b'; n += 1;
     buf[n] = b'[';     n += 1;
-    n += write_u32_dec(&mut buf[n..], codepoint);
+    n += write_u32_dec(&mut buf[n..], number);
     buf[n] = b';'; n += 1;
     n += write_u8_dec(&mut buf[n..], mod_param);
     buf[n] = b':'; n += 1;
     n += write_u8_dec(&mut buf[n..], event_type);
-    buf[n] = b'u'; n += 1;
-    Some(n)
+    buf[n] = terminator; n += 1;
+    n
 }
 
 /// SGR mouse: `CSI < <btn> ; <col> ; <row> M/m`
-fn write_sgr_mouse(buf: &mut [u8], btn: u16, col: u16, row: u16, final_byte: u8) -> Option<usize> {
+fn write_sgr_mouse(buf: &mut [u8], btn: u16, col: u16, row: u16, final_byte: u8) -> usize {
     let mut n = 0;
     buf[n] = b'\x1b'; n += 1;
     buf[n] = b'[';     n += 1;
@@ -545,22 +541,17 @@ fn write_sgr_mouse(buf: &mut [u8], btn: u16, col: u16, row: u16, final_byte: u8)
     buf[n] = b';'; n += 1;
     n += write_u16_dec(&mut buf[n..], row);
     buf[n] = final_byte; n += 1;
-    Some(n)
+    n
 }
 
-fn write1(buf: &mut [u8], b: u8) -> Option<usize> {
+fn write1(buf: &mut [u8], b: u8) -> usize {
     buf[0] = b;
-    Some(1)
+    1
 }
 
-fn write2(buf: &mut [u8], a: u8, b: u8) -> Option<usize> {
-    buf[0] = a; buf[1] = b;
-    Some(2)
-}
-
-fn writeb(buf: &mut [u8], s: &[u8]) -> Option<usize> {
+fn writeb(buf: &mut [u8], s: &[u8]) -> usize {
     buf[..s.len()].copy_from_slice(s);
-    Some(s.len())
+    s.len()
 }
 
 /// Write a `u8` as decimal digits, returns number of bytes written.
@@ -718,6 +709,24 @@ mod tests {
         let n = e.encode_key(Key::Char('a'), KeyState::Pressed, Modifiers::NONE, &mut b).unwrap();
         // CSI 97 ; 1 : 1 u
         assert_eq!(&b[..n], b"\x1b[97;1:1u");
+    }
+
+    #[test]
+    fn kitty_functional_keys_use_correct_terminators() {
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        // Letter-form functionals: CSI 1 ; <mod> : <evt> <letter>
+        assert_eq!(encode(&e, Key::Up,   Modifiers::NONE), b"\x1b[1;1:1A");
+        assert_eq!(encode(&e, Key::Home, Modifiers::NONE), b"\x1b[1;1:1H");
+        // Tilde-form functionals keep their legacy numbers (no PUA aliasing).
+        assert_eq!(encode(&e, Key::Insert,   Modifiers::NONE), b"\x1b[2;1:1~");
+        assert_eq!(encode(&e, Key::Delete,   Modifiers::NONE), b"\x1b[3;1:1~");
+        assert_eq!(encode(&e, Key::PageUp,   Modifiers::NONE), b"\x1b[5;1:1~");
+        assert_eq!(encode(&e, Key::PageDown, Modifiers::NONE), b"\x1b[6;1:1~");
+        // PUA-only keys keep the `u` terminator with their canonical codepoints.
+        assert_eq!(encode(&e, Key::CapsLock,   Modifiers::NONE), b"\x1b[57358;1:1u");
+        assert_eq!(encode(&e, Key::ScrollLock, Modifiers::NONE), b"\x1b[57359;1:1u");
+        assert_eq!(encode(&e, Key::NumLock,    Modifiers::NONE), b"\x1b[57360;1:1u");
     }
 
     #[test]

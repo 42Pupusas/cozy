@@ -30,7 +30,7 @@ impl Modifiers {
     /// legacy mode). Returns `None` when no modifiers are active.
     #[must_use]
     pub const fn kitty_param(self) -> Option<u8> {
-        let bits = (self.0 & 0x0f); // shift/alt/ctrl/super only
+        let bits = self.0 & 0x0f; // shift/alt/ctrl/super only
         if bits == 0 { None } else { Some(bits + 1) }
     }
 

@@ -9,6 +9,7 @@ use crate::line_break::compute_breaks;
 
 /// Parameters for a layout call.
 #[derive(Copy, Clone, Debug)]
+#[derive(Default)]
 pub struct LayoutParams {
     /// Maximum line width in cells.  `0` = unlimited (single line).
     pub max_width: usize,
@@ -16,11 +17,6 @@ pub struct LayoutParams {
     pub direction: Option<Direction>,
 }
 
-impl Default for LayoutParams {
-    fn default() -> Self {
-        Self { max_width: 0, direction: None }
-    }
-}
 
 /// A single laid-out line.
 #[derive(Clone, Debug)]
@@ -41,7 +37,7 @@ pub struct LayoutLine<'a> {
 /// mandatory breaks (newlines) will have `width == 0` if they are empty;
 /// the last line always appears even if empty.
 #[must_use]
-pub fn layout<'a>(text: &'a str, params: LayoutParams) -> Vec<LayoutLine<'a>> {
+pub fn layout(text: &str, params: LayoutParams) -> Vec<LayoutLine<'_>> {
     let dir = params.direction.unwrap_or_else(|| paragraph_direction(text));
     let segments = segment(text);
     let breaks   = compute_breaks(&segments, params.max_width);

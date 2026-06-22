@@ -60,7 +60,7 @@ pub fn segment_width(s: &str) -> usize {
 
 // ── Zero-width ranges (UAX #11 + Unicode General Category Mn/Me/Cf) ──────────
 
-fn is_zero_width(cp: u32) -> bool {
+const fn is_zero_width(cp: u32) -> bool {
     // Variation selectors, tags, ZWJ, ZWNJ, BOM, soft-hyphen …
     matches!(cp,
         // Combining diacritical marks.
@@ -126,7 +126,7 @@ fn is_zero_width(cp: u32) -> bool {
 
 // ── Wide (2-cell) ranges (UAX #11 W + F) ─────────────────────────────────────
 
-fn is_wide(cp: u32) -> bool {
+const fn is_wide(cp: u32) -> bool {
     matches!(cp,
         // CJK Unified Ideographs and extensions.
         0x1100..=0x115f |   // Hangul Jamo — leading consonants

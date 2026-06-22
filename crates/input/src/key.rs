@@ -18,25 +18,25 @@ impl Modifiers {
     pub const CAPS:    Self = Self(0b0001_0000);
     pub const NUM:     Self = Self(0b0010_0000);
 
-    #[inline] #[must_use] pub fn shift(self) -> bool  { self.0 & 0x01 != 0 }
-    #[inline] #[must_use] pub fn alt(self) -> bool    { self.0 & 0x02 != 0 }
-    #[inline] #[must_use] pub fn ctrl(self) -> bool   { self.0 & 0x04 != 0 }
-    #[inline] #[must_use] pub fn sup(self) -> bool    { self.0 & 0x08 != 0 }
-    #[inline] #[must_use] pub fn caps(self) -> bool   { self.0 & 0x10 != 0 }
-    #[inline] #[must_use] pub fn num(self) -> bool    { self.0 & 0x20 != 0 }
+    #[inline] #[must_use] pub const fn shift(self) -> bool  { self.0 & 0x01 != 0 }
+    #[inline] #[must_use] pub const fn alt(self) -> bool    { self.0 & 0x02 != 0 }
+    #[inline] #[must_use] pub const fn ctrl(self) -> bool   { self.0 & 0x04 != 0 }
+    #[inline] #[must_use] pub const fn sup(self) -> bool    { self.0 & 0x08 != 0 }
+    #[inline] #[must_use] pub const fn caps(self) -> bool   { self.0 & 0x10 != 0 }
+    #[inline] #[must_use] pub const fn num(self) -> bool    { self.0 & 0x20 != 0 }
 
     /// The Kitty/xterm modifier parameter: `shift+1`, `alt+2`, `ctrl+4`,
     /// `super+8` — value is `(bitset + 1)` so 1 = no modifiers (omitted in
     /// legacy mode). Returns `None` when no modifiers are active.
     #[must_use]
-    pub fn kitty_param(self) -> Option<u8> {
-        let bits = (self.0 & 0x0f) as u8; // shift/alt/ctrl/super only
+    pub const fn kitty_param(self) -> Option<u8> {
+        let bits = (self.0 & 0x0f); // shift/alt/ctrl/super only
         if bits == 0 { None } else { Some(bits + 1) }
     }
 
     /// Whether any of shift/alt/ctrl/super is set.
     #[inline] #[must_use]
-    pub fn any_active(self) -> bool { self.0 & 0x0f != 0 }
+    pub const fn any_active(self) -> bool { self.0 & 0x0f != 0 }
 }
 
 impl core::ops::BitOr for Modifiers {
@@ -112,7 +112,7 @@ pub enum Key {
 impl Key {
     /// True if this key produces no output in legacy VT mode (modifier-only keys).
     #[must_use]
-    pub fn is_modifier_only(self) -> bool {
+    pub const fn is_modifier_only(self) -> bool {
         matches!(
             self,
             Self::Shift

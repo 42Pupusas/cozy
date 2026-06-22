@@ -54,7 +54,7 @@ mod tests;
 
 pub use color::Color;
 
-use extract::Extractor;
+use extract as ex;
 use shelby::parse_document;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -158,7 +158,7 @@ impl Default for Palette {
 impl Palette {
     /// Return the color for ANSI index 0–15.
     #[must_use]
-    pub fn ansi(&self, idx: u8) -> Color {
+    pub const fn ansi(&self, idx: u8) -> Color {
         match idx {
             0  => self.black,
             1  => self.red,
@@ -293,32 +293,27 @@ impl Config {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
         let table = parse_document(bytes)?;
         let mut cfg = Self::default();
-        let x = Extractor::new(bytes);
-
         // [general]
-        if let Some(general) = x.table(&table, "general") {
-            if let Some(s) = x.str(general, "shell")      { cfg.shell      = s.to_owned(); }
-            if let Some(s) = x.str(general, "term")       { cfg.term       = s.to_owned(); }
-            if let Some(n) = x.int(general, "scrollback")? { cfg.scrollback = n as usize; }
+        if let Some(general) = ex::table(&table, "general") {
+            if let Some(s) = ex::str(general, "shell")  { s.clone_into(&mut cfg.shell); }
+            if let Some(s) = ex::str(general, "term")   { s.clone_into(&mut cfg.term); }
+            // Scrollback fits comfortably in u32; clamp the validated range to usize.
+            if let Some(n) = ex::int_range(general, "scrollback", "general.scrollback", 0, 1_000_000, "must be between 0 and 1000000")? {
+                cfg.scrollback = usize::try_from(n).unwrap_or(0);
+            }
         }
 
         // [font]
-        if let Some(font) = x.table(&table, "font") {
-            if let Some(s) = x.str(font, "path") { cfg.font.path = Some(s.to_owned()); }
-            if let Some(n) = x.int(font, "size")? {
-                if n < 1 || n > 256 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "font.size",
-                        reason: "must be between 1 and 256",
-                    });
-                }
-                cfg.font.size = n as u32;
+        if let Some(font) = ex::table(&table, "font") {
+            if let Some(s) = ex::str(font, "path") { cfg.font.path = Some(s.to_owned()); }
+            if let Some(n) = ex::int_range(font, "size", "font.size", 1, 256, "must be between 1 and 256")? {
+                cfg.font.size = u32::try_from(n).unwrap_or(cfg.font.size);
             }
         }
 
         // [cursor]
-        if let Some(cursor) = x.table(&table, "cursor") {
-            if let Some(s) = x.str(cursor, "style") {
+        if let Some(cursor) = ex::table(&table, "cursor") {
+            if let Some(s) = ex::str(cursor, "style") {
                 cfg.cursor.style = match s {
                     "block"     => CursorStyle::Block,
                     "beam"      => CursorStyle::Beam,
@@ -329,15 +324,17 @@ impl Config {
                     }),
                 };
             }
-            if let Some(b) = x.bool(cursor, "blink")       { cfg.cursor.blink      = b; }
-            if let Some(n) = x.int(cursor, "blink_rate")?   { cfg.cursor.blink_rate = n as u32; }
+            if let Some(b) = ex::bool(cursor, "blink") { cfg.cursor.blink = b; }
+            if let Some(n) = ex::int_range(cursor, "blink_rate", "cursor.blink_rate", 0, 60_000, "must be between 0 and 60000")? {
+                cfg.cursor.blink_rate = u32::try_from(n).unwrap_or(cfg.cursor.blink_rate);
+            }
         }
 
         // [colors]
-        if let Some(colors) = x.table(&table, "colors") {
+        if let Some(colors) = ex::table(&table, "colors") {
             macro_rules! color_field {
                 ($field:ident, $key:literal) => {
-                    if let Some(s) = x.str(colors, $key) {
+                    if let Some(s) = ex::str(colors, $key) {
                         cfg.palette.$field = Color::parse_hex(s).ok_or(
                             ConfigError::InvalidValue { field: $key, reason: "invalid #rrggbb hex color" }
                         )?;
@@ -365,7 +362,7 @@ impl Config {
         }
 
         // [keybinds]
-        if let Some(keybinds) = x.table(&table, "keybinds") {
+        if let Some(keybinds) = ex::table(&table, "keybinds") {
             for (chord, val) in keybinds.iter() {
                 if let shelby::Value::String(action_str) = val {
                     let action = match action_str.as_ref() {
@@ -387,11 +384,9 @@ impl Config {
 }
 
 fn xdg_config_path() -> std::path::PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
+    let base = std::env::var("XDG_CONFIG_HOME").map_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
             std::path::PathBuf::from(home).join(".config")
-        });
+        }, std::path::PathBuf::from);
     base.join("terminal").join("config.toml")
 }

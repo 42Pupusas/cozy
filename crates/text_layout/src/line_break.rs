@@ -91,7 +91,7 @@ pub fn compute_breaks<'a>(segments: &'a [Segment<'a>], max_width: usize) -> Vec<
                     } else {
                         // Non-whitespace opportunity (CJK) that overflows →
                         // roll back to the last opportunity or force-break here.
-                        let (end, next, w) = rollback_or_here(&last_opportunity, i, line_width);
+                        let (end, next, w) = rollback_or_here(last_opportunity.as_ref(), i, line_width);
                         lines.push(LineBreak { start_segment: line_start, end_segment: end, width: w });
                         line_start       = next;
                         line_width       = 0;
@@ -128,7 +128,7 @@ pub fn compute_breaks<'a>(segments: &'a [Segment<'a>], max_width: usize) -> Vec<
             BreakKind::Prohibited => {
                 if !unlimited && line_width > 0 && line_width + seg.width > max_width {
                     // Roll back to the last opportunity, or force-break before here.
-                    let (end, next, w) = rollback_or_here(&last_opportunity, i, line_width);
+                    let (end, next, w) = rollback_or_here(last_opportunity.as_ref(), i, line_width);
                     lines.push(LineBreak { start_segment: line_start, end_segment: end, width: w });
                     line_start       = next;
                     line_width       = 0;
@@ -154,8 +154,8 @@ pub fn compute_breaks<'a>(segments: &'a [Segment<'a>], max_width: usize) -> Vec<
 
 /// Roll back to `last_opportunity` if set, or force-break immediately before `i`.
 #[inline]
-fn rollback_or_here(
-    last_opportunity: &Option<Opportunity>,
+const fn rollback_or_here(
+    last_opportunity: Option<&Opportunity>,
     i:                usize,
     line_width:       usize,
 ) -> (usize, usize, usize) {

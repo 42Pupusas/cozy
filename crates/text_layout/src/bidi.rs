@@ -30,7 +30,7 @@ pub enum Direction {
 
 /// Determine the BiDi class of a Unicode scalar (P2/P3 strong-type test).
 #[must_use]
-pub fn bidi_class(c: char) -> BidiClass {
+pub const fn bidi_class(c: char) -> BidiClass {
     let cp = c as u32;
     if is_strong_rtl(cp) {
         BidiClass::R
@@ -64,7 +64,7 @@ pub fn is_ltr_only(text: &str) -> bool {
 
 // ── Strong RTL ranges (Unicode categories R and AL) ───────────────────────────
 
-fn is_strong_rtl(cp: u32) -> bool {
+const fn is_strong_rtl(cp: u32) -> bool {
     matches!(cp,
         // Hebrew block.
         0x05be | 0x05c0 | 0x05c3 | 0x05c6 |
@@ -107,7 +107,7 @@ fn is_strong_rtl(cp: u32) -> bool {
 
 // ── Strong LTR ranges ─────────────────────────────────────────────────────────
 
-fn is_strong_ltr(cp: u32) -> bool {
+const fn is_strong_ltr(cp: u32) -> bool {
     matches!(cp,
         // Basic Latin letters only (digits/punctuation are weak/neutral).
         0x0041..=0x005a | 0x0061..=0x007a |

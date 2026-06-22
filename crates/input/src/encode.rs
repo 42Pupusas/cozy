@@ -327,7 +327,7 @@ impl Encoder {
 
     fn encode_mouse_sgr(&self, ev: MouseEvent, buf: &mut [u8]) -> Option<usize> {
         // SGR: `CSI < btn ; col ; row M/m`
-        let mut btn = ev.button.x10_code() as u16;
+        let mut btn = u16::from(ev.button.x10_code());
         if ev.mods.shift() { btn |= 0x04; }
         if ev.mods.alt()   { btn |= 0x08; }
         if ev.mods.ctrl()  { btn |= 0x10; }
@@ -345,7 +345,7 @@ impl Encoder {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Ctrl+letter → C0 byte (a=1 … z=26, space=0, @=0, [=27, \=28, ]=29, ^=30, _=31).
-fn ctrl_byte(c: char) -> Option<u8> {
+const fn ctrl_byte(c: char) -> Option<u8> {
     match c {
         'a'..='z' => Some(c as u8 - b'a' + 1),
         'A'..='Z' => Some(c as u8 - b'A' + 1),
@@ -377,7 +377,7 @@ fn encode_char(c: char, shift: bool, caps: bool) -> &'static str {
     }
 }
 
-fn unshifted_char(c: char) -> &'static str {
+const fn unshifted_char(c: char) -> &'static str {
     // Most chars are their own unshifted form; we just need them as &str.
     // For ASCII printable we return static slices.
     match c {
@@ -396,7 +396,7 @@ fn unshifted_char(c: char) -> &'static str {
     }
 }
 
-fn shifted_char(c: char) -> &'static str {
+const fn shifted_char(c: char) -> &'static str {
     match c {
         'a' => "A", 'b' => "B", 'c' => "C", 'd' => "D", 'e' => "E",
         'f' => "F", 'g' => "G", 'h' => "H", 'i' => "I", 'j' => "J",

@@ -17,7 +17,7 @@ pub enum MouseButton {
 impl MouseButton {
     /// Raw X10 button code (before modifier bits are OR'd in).
     #[must_use]
-    pub fn x10_code(self) -> u8 {
+    pub const fn x10_code(self) -> u8 {
         match self {
             Self::Left         => 0,
             Self::Middle       => 1,

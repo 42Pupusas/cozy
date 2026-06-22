@@ -58,7 +58,7 @@ pub fn segment(text: &str) -> Vec<Segment<'_>> {
         // ── Newline → mandatory break ────────────────────────────────────
         if c == '\n' {
             segments.push(Segment {
-                text:         &text[i..i + 1],
+                text:         &text[i..=i],
                 width:        0,
                 break_before: BreakKind::Mandatory,
                 direction:    Direction::Ltr,
@@ -159,7 +159,7 @@ fn first_char(s: &str) -> char {
 }
 
 /// True if `c` is a CJK / wide ideograph (each is an independent break point).
-fn is_cjk(c: char) -> bool {
+const fn is_cjk(c: char) -> bool {
     let cp = c as u32;
     matches!(cp,
         0x1100..=0x115f |   // Hangul leading consonants
@@ -176,7 +176,7 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
-fn bidi_dir(c: char) -> Direction {
+const fn bidi_dir(c: char) -> Direction {
     match bidi_class(c) {
         BidiClass::R => Direction::Rtl,
         _ => Direction::Ltr,

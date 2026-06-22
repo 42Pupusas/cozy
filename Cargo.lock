@@ -9,6 +9,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
+name = "config"
+version = "0.1.0"
+dependencies = [
+ "shelby",
+]
+
+[[package]]
 name = "grid"
 version = "0.1.0"
 dependencies = [
@@ -73,6 +80,10 @@ version = "0.13.0"
 [[package]]
 name = "ququmatz"
 version = "0.15.0"
+
+[[package]]
+name = "shelby"
+version = "0.1.0"
 
 [[package]]
 name = "stable_deref_trait"

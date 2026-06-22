@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "bins/*",
+    # "crates/*",   # uncomment when first crate is added
+    # "benches/*",  # uncomment when first bench is added
+]
+
+[workspace.lints.clippy]
+# groups
+pedantic = { level = "warn", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+perf     = { level = "warn", priority = -1 }
+style    = { level = "warn", priority = -1 }
+
+# doc-related allowances
+missing_docs_in_private_items = "allow"
+missing_errors_doc            = "allow"
+missing_panics_doc            = "allow"

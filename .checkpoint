@@ -1,0 +1,6 @@
+<checkpoint>
+- Workspace scaffolded at /home/cuarentaydos/Code/forfun/terminal/; root Cargo.toml has pedantic/nursery/perf/style lints, doc lints allowed; bins/terminal is stub binary.
+- Confirmed GUI scaffold lives at /home/cuarentaydos/Code/forfun/paint (uses ququmatz for io_uring + quetzalcoatl for SPSC/MPSC, raw Wayland wire protocol, no external deps); no tommy/config crate found yet.
+- Planned crates: pty, parser, grid, font, renderer, platform (paint), input, config.
+- Next step: create crates/pty — safe wrapper around forkpty/posix_openpt syscalls, zero deps, just unsafe libc FFI.
+</checkpoint>

@@ -205,21 +205,41 @@ impl Screen {
     }
 
     /// Resize, preserving as much content as possible.
-    pub fn resize(&mut self, new_cols: u16, new_rows: u16) {
+    /// Resize to `new_cols` x `new_rows`, keeping the *bottom* of the content
+    /// anchored (terminals fill upward from the last row, so the prompt and
+    /// recent output must survive a shrink). `used_rows` is how many visible
+    /// rows actually hold content (cursor row + 1); rows above the kept window
+    /// spill into scrollback. Returns the number of rows shifted up into
+    /// scrollback so the caller can adjust the cursor.
+    pub fn resize(&mut self, new_cols: u16, new_rows: u16, used_rows: u16) -> u16 {
         let old_cols = usize::from(self.cols);
-        let old_rows = usize::from(self.rows);
         let new_cols_u = usize::from(new_cols);
         let new_rows_u = usize::from(new_rows);
+        let old_rows_u = usize::from(self.rows);
         let sb = self.scrollback_len;
+        let copy_cols = old_cols.min(new_cols_u);
+
+        // How many visible rows to carry over: the used region, clipped to the
+        // new height. When shrinking below `used`, drop from the TOP (oldest).
+        let used = usize::from(used_rows).clamp(1, old_rows_u);
+        let keep = used.min(new_rows_u);
+        let first_kept = used - keep; // rows above this are pushed to scrollback
+
         let total = new_rows_u + self.scrollback_max;
         let mut new_buf = vec![Cell::default(); total * new_cols_u];
 
-        // Copy visible area, clipped to new dimensions.
-        let copy_rows = old_rows.min(new_rows_u);
-        let copy_cols = old_cols.min(new_cols_u);
-        for row in 0..copy_rows {
-            let src = (sb + row) * old_cols;
-            let dst = (sb + row) * new_cols_u;
+        // Preserve existing scrollback (clipped to new width).
+        for row in 0..sb.min(total.saturating_sub(new_rows_u)) {
+            let src = row * old_cols;
+            let dst = row * new_cols_u;
+            new_buf[dst..dst + copy_cols].copy_from_slice(&self.buf[src..src + copy_cols]);
+        }
+
+        // Copy the kept visible rows, bottom-anchored to the top of the new
+        // visible area.
+        for i in 0..keep {
+            let src = (sb + first_kept + i) * old_cols;
+            let dst = (sb + i) * new_cols_u;
             new_buf[dst..dst + copy_cols].copy_from_slice(&self.buf[src..src + copy_cols]);
         }
 
@@ -228,6 +248,7 @@ impl Screen {
         self.rows = new_rows;
         self.scroll_top = 0;
         self.scroll_bot = new_rows.saturating_sub(1);
+        first_kept as u16
     }
 
     // ── private ───────────────────────────────────────────────────────────

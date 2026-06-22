@@ -300,17 +300,25 @@ impl TermWindow {
     // ── private ───────────────────────────────────────────────────────────
 
     fn handle_event(&mut self, ev: Event) -> Result<()> {
-        // wl_display.error
+        // wl_display events arrive as raw bytes (the reader routes object 1 to
+        // `Bytes`). Handle error (fatal) and delete_id (id recycling) here.
         if let Event::Bytes(ref bytes) = ev {
             let (mut wire, _) = WireEvent::parse(bytes).ok_or(Error::ReaderStopped)?;
-            if wire.object_id == DisplayId(1).raw()
-                && DisplayEvent::from_opcode(wire.opcode) == Some(DisplayEvent::Error)
-            {
-                return Err(Error::Protocol {
-                    object: wire.u32(),
-                    code: wire.u32(),
-                    message: wire.string(),
-                });
+            if wire.object_id == DisplayId(1).raw() {
+                match DisplayEvent::from_opcode(wire.opcode) {
+                    Some(DisplayEvent::Error) => {
+                        return Err(Error::Protocol {
+                            object: wire.u32(),
+                            code: wire.u32(),
+                            message: wire.string(),
+                        });
+                    }
+                    Some(DisplayEvent::DeleteId) => {
+                        self.window_tx.recycle_id(wire.u32());
+                        return Ok(());
+                    }
+                    None => {}
+                }
             }
             // Registry global (during setup - already handled, ignore here).
             return Ok(());
@@ -325,14 +333,6 @@ impl TermWindow {
                     modifiers: self.modifiers,
                 });
             }
-            return Ok(());
-        }
-
-        // wl_display.delete_id — the server confirms an object id is now free;
-        // recycle it so churny allocators (frame callbacks, resize buffers)
-        // don't exhaust the pre-allocated block.
-        if ev.is(DisplayId(1)) && ev.event::<DisplayEvent>() == Some(DisplayEvent::DeleteId) {
-            self.window_tx.recycle_id(ev.arg(0));
             return Ok(());
         }
 
@@ -612,11 +612,33 @@ impl TermWindow {
             frame.buffer = buffer;
             frame.free = true;
         }
+        // Carry the old image into the new backbuffer (top-left aligned) instead
+        // of clearing to background. The grid reflow + full snapshot arrives a
+        // round-trip later via the parser thread; until then we keep showing the
+        // previous content so the window doesn't flash blank mid-drag.
+        let new_w = w as usize;
+        let new_h = h as usize;
+        let mut new_back = vec![render::DEFAULT_BG_XRGB; new_w * new_h];
+        let old_w = self.width as usize;
+        let old_h = self.height as usize;
+        let copy_w = old_w.min(new_w);
+        let copy_h = old_h.min(new_h);
+        for row in 0..copy_h {
+            let src = &self.backbuffer[row * old_w..row * old_w + copy_w];
+            new_back[row * new_w..row * new_w + copy_w].copy_from_slice(src);
+        }
+        self.backbuffer = new_back;
+
         self.pool = pool;
         self.width = w;
         self.height = h;
-        self.backbuffer = vec![render::DEFAULT_BG_XRGB; (w * h) as usize];
         self.dirty = true;
+        // Both buffers are brand-new and free, and any in-flight frame callback
+        // referred to the now-destroyed surface contents. Force the next
+        // present to fire immediately so we never leave the surface showing a
+        // detached/blank buffer (the cause of resize flashing).
+        self.frame_ready = true;
+        self.frame_cb = None;
         Ok(())
     }
 

@@ -66,10 +66,25 @@ impl Grid {
         }
     }
 
-    /// Resize the grid to new dimensions, reflowing content.
+    /// Resize the grid to new dimensions, keeping the bottom of the content
+    /// (prompt + recent output) anchored and clamping the cursor.
     pub fn resize(&mut self, cols: u16, rows: u16) {
-        self.primary.resize(cols, rows);
-        self.alternate.resize(cols, rows);
+        // Content fills upward, so the "used" region is everything down to the
+        // cursor row inclusive. Primary anchors to the bottom; the alternate
+        // screen is a fixed fullscreen canvas, so it just clips from the top.
+        let used = self.cursor.row.saturating_add(1);
+        let shifted = self.primary.resize(cols, rows, used);
+        self.alternate.resize(cols, rows, rows);
+
+        // Re-anchor the cursor: it moves up by however many rows were pushed to
+        // scrollback, then is clamped into the new bounds.
+        self.cursor.row = self
+            .cursor
+            .row
+            .saturating_sub(shifted)
+            .min(rows.saturating_sub(1));
+        self.cursor.col = self.cursor.col.min(cols.saturating_sub(1));
+
         self.dirty = DirtyRegion::new(cols, rows);
         self.dirty.mark_all();
     }

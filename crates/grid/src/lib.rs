@@ -80,6 +80,10 @@ impl Grid {
     /// Resize the grid to new dimensions, reflowing soft-wrapped lines to the
     /// new width (the primary screen) and clamping the cursor.
     pub fn resize(&mut self, cols: u16, rows: u16) {
+        // Clamp to at least 1x1: a compositor can send a 0-cell configure when
+        // dragged to nothing, and a zero stride overflows every `cols - 1`.
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         // When a deferred wrap is armed the cursor visually rests on the last
         // column but logically wants the next cell (offset = col + 1). Pass
         // that logical position so reflow lands the cursor at the start of the
@@ -567,6 +571,23 @@ mod tests {
         assert_eq!(g.screen().get_cell(1, 0).ch, 'B');
         assert_eq!(g.screen().get_cell(0, 1).ch, 'C');
         assert_eq!(g.screen().get_cell(1, 1).ch, 'D');
+    }
+
+    #[test]
+    fn resize_to_zero_does_not_panic() {
+        // A compositor can send a 0-cell configure when dragged to nothing.
+        // Clamp to 1x1 instead of overflowing on `cols - 1`.
+        let mut g = Grid::new(10, 5);
+        apply_str(&mut g, b"hello\r\nworld");
+        g.resize(0, 0);
+        assert_eq!(g.screen().cols(), 1);
+        assert_eq!(g.screen().rows(), 1);
+        // A subsequent erase (which does `cols - 1`) must not overflow.
+        apply_str(&mut g, b"\x1b[2K");
+        // And growing back works.
+        g.resize(10, 5);
+        assert_eq!(g.screen().cols(), 10);
+        assert_eq!(g.screen().rows(), 5);
     }
 
     #[test]

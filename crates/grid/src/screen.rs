@@ -353,11 +353,14 @@ impl Screen {
 
         self.buf = new_buf;
         self.wrapped = new_wrapped;
-        self.cols = new_cols;
-        self.rows = new_rows;
+        // Store the CLAMPED dimensions (>= 1): the buffer was allocated with
+        // new_cols_u/new_rows_u, and a 0 here would desync the stride and
+        // overflow every `cols - 1` / `rows - 1` elsewhere.
+        self.cols = new_cols_u as u16;
+        self.rows = new_rows_u as u16;
         self.scrollback_len = new_sb_len;
         self.scroll_top = 0;
-        self.scroll_bot = new_rows.saturating_sub(1);
+        self.scroll_bot = self.rows.saturating_sub(1);
 
         // 5. Map the cursor into the new geometry.
         let new_row = if new_cursor_idx >= overflow {

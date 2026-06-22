@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 grid         = { path = "../../crates/grid" }
+input        = { path = "../../crates/input" }
 platform     = { path = "../../crates/platform" }
 pty          = { path = "../../crates/pty" }
 vt_parser    = { path = "../../crates/vt_parser" }

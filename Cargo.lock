@@ -36,6 +36,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "input"
+version = "0.1.0"
+
+[[package]]
 name = "platform"
 version = "0.1.0"
 dependencies = [
@@ -81,6 +85,7 @@ name = "terminal"
 version = "0.1.0"
 dependencies = [
  "grid",
+ "input",
  "platform",
  "pty",
  "quetzalcoatl",

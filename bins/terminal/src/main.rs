@@ -1,9 +1,10 @@
 //! `terminal` — entry point.
 //!
-//! M4 integration: single-thread prototype wiring PTY + `vt_parser` + grid +
-//! Wayland window together.  Full multi-thread ring topology comes in M5.
+//! M5 integration: PTY + vt_parser + grid + Wayland window wired through
+//! `crates/input` for full VT / Kitty keyboard and mouse encoding.
 
 use grid::Grid;
+use input::{Encoder, Key, KeyState, Modifiers};
 use platform::{InputEvent, Result, TermWindow};
 use pty::PtySimple;
 use vt_parser::Parser;
@@ -30,9 +31,10 @@ fn run() -> Result<()> {
             std::io::Error::other(format!("pty: {e:?}")),
         )))?;
 
-    // 3. Grid + VT parser.
-    let mut grid = Grid::new(COLS, ROWS);
-    let mut parser = Parser::new();
+    // 3. Grid + VT parser + input encoder.
+    let mut grid    = Grid::new(COLS, ROWS);
+    let mut parser  = Parser::new();
+    let mut encoder = Encoder::new();
 
     // 4. Event loop.
     loop {
@@ -42,7 +44,11 @@ fn run() -> Result<()> {
             match pty.try_read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    parser.feed(&buf[..n], |ev| grid.apply(&ev));
+                    parser.feed(&buf[..n], |ev| {
+                        // Sync encoder state from VT events that change input mode.
+                        sync_encoder(&mut encoder, &ev);
+                        grid.apply(&ev);
+                    });
                 }
             }
         }
@@ -62,14 +68,25 @@ fn run() -> Result<()> {
                     let _ = pty.resize(cols, rows);
                 }
                 InputEvent::Key { key, state, modifiers } => {
-                    use platform::protocol::KeyState;
-                    if state != Some(KeyState::Pressed) {
+                    use platform::protocol::KeyState as PKeyState;
+                    let kstate = match state {
+                        Some(PKeyState::Pressed)  => KeyState::Pressed,
+                        Some(PKeyState::Released) => KeyState::Released,
+                        None                      => continue,
+                    };
+                    // Only encode press/repeat in legacy mode.
+                    if kstate == KeyState::Released
+                        && encoder.keyboard_mode == input::KeyboardMode::Legacy
+                    {
                         continue;
                     }
-                    let shift = modifiers.depressed & 1 != 0 || modifiers.locked != 0;
-                    let ctrl  = modifiers.depressed & 4 != 0;
-                    if let Some(bytes) = key_to_bytes(key, shift, ctrl) {
-                        let _ = pty.write(bytes);
+
+                    let mods = platform_mods(modifiers);
+                    let Some(ikey) = platform_key(key) else { continue };
+
+                    let mut ibuf = [0u8; 64];
+                    if let Some(n) = encoder.encode_key(ikey, kstate, mods, &mut ibuf) {
+                        let _ = pty.write(&ibuf[..n]);
                     }
                 }
             }
@@ -84,97 +101,107 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-/// Minimal US-QWERTY key → VT byte sequence.  Full encoding in M5 (`crates/input`).
-fn key_to_bytes(
-    key: Option<platform::protocol::Key>,
-    shift: bool,
-    ctrl: bool,
-) -> Option<&'static [u8]> {
-    use platform::protocol::Key;
-    Some(match key? {
-        // Control sequences.
-        Key::Enter     => b"\r",
-        Key::Backspace => b"\x7f",
-        Key::Esc       => b"\x1b",
-        Key::Tab       => b"\t",
-        Key::Delete    => b"\x1b[3~",
-        Key::Home      => b"\x1b[H",
-        Key::End       => b"\x1b[F",
-        Key::PageUp    => b"\x1b[5~",
-        Key::PageDown  => b"\x1b[6~",
-        Key::Up        => b"\x1b[A",
-        Key::Down      => b"\x1b[B",
-        Key::Right     => b"\x1b[C",
-        Key::Left      => b"\x1b[D",
-        Key::Insert    => b"\x1b[2~",
-        Key::F1        => b"\x1bOP",
-        Key::F2        => b"\x1bOQ",
-        Key::F3        => b"\x1bOR",
-        Key::F4        => b"\x1bOS",
-        Key::F5        => b"\x1b[15~",
-        Key::F6        => b"\x1b[17~",
-        Key::F7        => b"\x1b[18~",
-        Key::F8        => b"\x1b[19~",
-        Key::F9        => b"\x1b[20~",
-        Key::F10       => b"\x1b[21~",
-        Key::F11       => b"\x1b[23~",
-        Key::F12       => b"\x1b[24~",
+/// Translate `platform::protocol::Modifiers` (raw XKB bitmask) → `input::Modifiers`.
+fn platform_mods(m: platform::protocol::Modifiers) -> Modifiers {
+    let any = m.depressed | m.latched | m.locked;
+    let mut out = Modifiers::NONE;
+    if any & 0x01 != 0 { out = out | Modifiers::SHIFT; }
+    if any & 0x04 != 0 { out = out | Modifiers::CTRL; }
+    if any & 0x08 != 0 { out = out | Modifiers::ALT; }
+    if any & 0x40 != 0 { out = out | Modifiers::SUPER; }
+    if m.locked & 0x02 != 0 { out = out | Modifiers::CAPS; }
+    out
+}
 
-        // Letter keys — ctrl overrides shift.
-        Key::A => if ctrl { b"\x01" } else if shift { b"A" } else { b"a" },
-        Key::B => if ctrl { b"\x02" } else if shift { b"B" } else { b"b" },
-        Key::C => if ctrl { b"\x03" } else if shift { b"C" } else { b"c" },
-        Key::D => if ctrl { b"\x04" } else if shift { b"D" } else { b"d" },
-        Key::E => if ctrl { b"\x05" } else if shift { b"E" } else { b"e" },
-        Key::F => if ctrl { b"\x06" } else if shift { b"F" } else { b"f" },
-        Key::G => if ctrl { b"\x07" } else if shift { b"G" } else { b"g" },
-        Key::H => if ctrl { b"\x08" } else if shift { b"H" } else { b"h" },
-        Key::I => if ctrl { b"\x09" } else if shift { b"I" } else { b"i" },
-        Key::J => if ctrl { b"\x0a" } else if shift { b"J" } else { b"j" },
-        Key::K => if ctrl { b"\x0b" } else if shift { b"K" } else { b"k" },
-        Key::L => if ctrl { b"\x0c" } else if shift { b"L" } else { b"l" },
-        Key::M => if ctrl { b"\x0d" } else if shift { b"M" } else { b"m" },
-        Key::N => if ctrl { b"\x0e" } else if shift { b"N" } else { b"n" },
-        Key::O => if ctrl { b"\x0f" } else if shift { b"O" } else { b"o" },
-        Key::P => if ctrl { b"\x10" } else if shift { b"P" } else { b"p" },
-        Key::Q => if ctrl { b"\x11" } else if shift { b"Q" } else { b"q" },
-        Key::R => if ctrl { b"\x12" } else if shift { b"R" } else { b"r" },
-        Key::S => if ctrl { b"\x13" } else if shift { b"S" } else { b"s" },
-        Key::T => if ctrl { b"\x14" } else if shift { b"T" } else { b"t" },
-        Key::U => if ctrl { b"\x15" } else if shift { b"U" } else { b"u" },
-        Key::V => if ctrl { b"\x16" } else if shift { b"V" } else { b"v" },
-        Key::W => if ctrl { b"\x17" } else if shift { b"W" } else { b"w" },
-        Key::X => if ctrl { b"\x18" } else if shift { b"X" } else { b"x" },
-        Key::Y => if ctrl { b"\x19" } else if shift { b"Y" } else { b"y" },
-        Key::Z => if ctrl { b"\x1a" } else if shift { b"Z" } else { b"z" },
+/// Map `platform::protocol::Key` (evdev codes) → `input::Key` (semantic).
+#[allow(clippy::too_many_lines)]
+fn platform_key(k: Option<platform::protocol::Key>) -> Option<Key> {
+    use platform::protocol::Key as PK;
+    Some(match k? {
+        PK::A => Key::Char('a'), PK::B => Key::Char('b'), PK::C => Key::Char('c'),
+        PK::D => Key::Char('d'), PK::E => Key::Char('e'), PK::F => Key::Char('f'),
+        PK::G => Key::Char('g'), PK::H => Key::Char('h'), PK::I => Key::Char('i'),
+        PK::J => Key::Char('j'), PK::K => Key::Char('k'), PK::L => Key::Char('l'),
+        PK::M => Key::Char('m'), PK::N => Key::Char('n'), PK::O => Key::Char('o'),
+        PK::P => Key::Char('p'), PK::Q => Key::Char('q'), PK::R => Key::Char('r'),
+        PK::S => Key::Char('s'), PK::T => Key::Char('t'), PK::U => Key::Char('u'),
+        PK::V => Key::Char('v'), PK::W => Key::Char('w'), PK::X => Key::Char('x'),
+        PK::Y => Key::Char('y'), PK::Z => Key::Char('z'),
 
-        // Number row (unshifted — shifted symbols skipped for now).
-        Key::N1 => if shift { b"!" } else { b"1" },
-        Key::N2 => if shift { b"@" } else { b"2" },
-        Key::N3 => if shift { b"#" } else { b"3" },
-        Key::N4 => if shift { b"$" } else { b"4" },
-        Key::N5 => if shift { b"%" } else { b"5" },
-        Key::N6 => if shift { b"^" } else { b"6" },
-        Key::N7 => if shift { b"&" } else { b"7" },
-        Key::N8 => if shift { b"*" } else { b"8" },
-        Key::N9 => if shift { b"(" } else { b"9" },
-        Key::N0 => if shift { b")" } else { b"0" },
+        PK::N1 => Key::Char('1'), PK::N2 => Key::Char('2'), PK::N3 => Key::Char('3'),
+        PK::N4 => Key::Char('4'), PK::N5 => Key::Char('5'), PK::N6 => Key::Char('6'),
+        PK::N7 => Key::Char('7'), PK::N8 => Key::Char('8'), PK::N9 => Key::Char('9'),
+        PK::N0 => Key::Char('0'),
 
-        Key::Minus       => if shift { b"_" } else { b"-" },
-        Key::Equal       => if shift { b"+" } else { b"=" },
-        Key::LBracket    => if shift { b"{" } else { b"[" },
-        Key::RBracket    => if shift { b"}" } else { b"]" },
-        Key::Backslash   => if shift { b"|" } else { b"\\" },
-        Key::Semicolon   => if shift { b":" } else { b";" },
-        Key::Apostrophe  => if shift { b"\"" } else { b"'" },
-        Key::Backtick    => if shift { b"~" } else { b"`" },
-        Key::Comma       => if shift { b"<" } else { b"," },
-        Key::Dot         => if shift { b">" } else { b"." },
-        Key::Slash       => if shift { b"?" } else { b"/" },
-        Key::Space       => b" ",
+        PK::Minus      => Key::Char('-'),
+        PK::Equal      => Key::Char('='),
+        PK::LBracket   => Key::Char('['),
+        PK::RBracket   => Key::Char(']'),
+        PK::Backslash  => Key::Char('\\'),
+        PK::Semicolon  => Key::Char(';'),
+        PK::Apostrophe => Key::Char('\''),
+        PK::Backtick   => Key::Char('`'),
+        PK::Comma      => Key::Char(','),
+        PK::Dot        => Key::Char('.'),
+        PK::Slash      => Key::Char('/'),
+        PK::Space      => Key::Char(' '),
 
-        // Modifiers produce no bytes.
-        Key::LShift | Key::RShift | Key::LCtrl | Key::RCtrl |
-        Key::LAlt | Key::RAlt | Key::LMeta | Key::RMeta | Key::CapsLock => return None,
+        PK::Enter     => Key::Enter,
+        PK::Backspace => Key::Backspace,
+        PK::Tab       => Key::Tab,
+        PK::Esc       => Key::Esc,
+        PK::Delete    => Key::Delete,
+        PK::Insert    => Key::Insert,
+
+        PK::Up    => Key::Up,
+        PK::Down  => Key::Down,
+        PK::Left  => Key::Left,
+        PK::Right => Key::Right,
+        PK::Home  => Key::Home,
+        PK::End   => Key::End,
+        PK::PageUp   => Key::PageUp,
+        PK::PageDown => Key::PageDown,
+
+        PK::F1  => Key::F(1),  PK::F2  => Key::F(2),
+        PK::F3  => Key::F(3),  PK::F4  => Key::F(4),
+        PK::F5  => Key::F(5),  PK::F6  => Key::F(6),
+        PK::F7  => Key::F(7),  PK::F8  => Key::F(8),
+        PK::F9  => Key::F(9),  PK::F10 => Key::F(10),
+        PK::F11 => Key::F(11), PK::F12 => Key::F(12),
+
+        PK::LShift | PK::RShift => Key::Shift,
+        PK::LCtrl  | PK::RCtrl  => Key::Ctrl,
+        PK::LAlt   | PK::RAlt   => Key::Alt,
+        PK::LMeta  | PK::RMeta  => Key::Super,
+        PK::CapsLock             => Key::CapsLock,
     })
+}
+
+/// Sync encoder state from VT events (app-cursor, app-keypad, mouse mode).
+fn sync_encoder(enc: &mut Encoder, ev: &vt_parser::Event) {
+    use vt_parser::{CsiAction, Event};
+    let Event::Csi(csi) = ev else { return };
+    match *csi {
+        CsiAction::DecSet(mode) => apply_dec(enc, mode, true),
+        CsiAction::DecRst(mode) => apply_dec(enc, mode, false),
+        // SM/RM mode 1 = application keypad.
+        CsiAction::SetMode(1)   => enc.app_keypad = true,
+        CsiAction::ResetMode(1) => enc.app_keypad = false,
+        _ => {}
+    }
+}
+
+/// Apply a DEC private mode set/reset to the encoder.
+fn apply_dec(enc: &mut Encoder, mode: u16, set: bool) {
+    match mode {
+        // DECCKM — application cursor keys.
+        1    => enc.app_cursor = set,
+        // Mouse tracking modes.
+        9    => enc.mouse_mode = if set { input::MouseMode::X10 }          else { input::MouseMode::Off },
+        1000 => enc.mouse_mode = if set { input::MouseMode::Normal }       else { input::MouseMode::Off },
+        1002 => enc.mouse_mode = if set { input::MouseMode::ButtonMotion } else { input::MouseMode::Off },
+        1003 => enc.mouse_mode = if set { input::MouseMode::AnyEvent }     else { input::MouseMode::Off },
+        1006 => enc.mouse_mode = if set { input::MouseMode::Sgr }          else { input::MouseMode::Off },
+        _    => {}
+    }
 }

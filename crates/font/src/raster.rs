@@ -38,6 +38,37 @@ struct Edge {
     winding: i8,
 }
 
+impl Edge {
+    /// Build an edge from `p0`→`p1`, normalizing so `y0 < y1` and recording
+    /// winding direction. Returns `None` for horizontal segments (they never
+    /// contribute a scanline crossing).
+    ///
+    /// Was a free `push_edge(edges: &mut Vec<Edge>, ..)` function that both
+    /// built an `Edge` and pushed it; split so construction is a plain
+    /// `Edge::new` and the caller decides whether/where to push.
+    fn new(p0: (f32, f32), p1: (f32, f32)) -> Option<Self> {
+        if (p0.1 - p1.1).abs() < 1e-6 { return None; } // horizontal — skip
+        let (winding, (x0, y0), (x1, y1)) = if p0.1 < p1.1 {
+            (-1i8, p0, p1) // going down in screen coords
+        } else {
+            (1i8, p1, p0)  // going up
+        };
+        Some(Self { x0, y0, x1, y1, winding })
+    }
+
+    /// The X coordinate (and winding delta) where this edge crosses
+    /// scanline `y`, or `None` if it doesn't cross at that height.
+    ///
+    /// Was a free `edge_x_at(e: &Edge, y: f32)` function -- moved onto
+    /// `Edge` as the type being queried.
+    fn x_at(&self, y: f32) -> Option<(f32, i8)> {
+        if y < self.y0 || y >= self.y1 { return None; }
+        let t = (y - self.y0) / (self.y1 - self.y0);
+        let x = t.mul_add(self.x1 - self.x0, self.x0);
+        Some((x, self.winding))
+    }
+}
+
 // ── Public entry ──────────────────────────────────────────────────────────────
 
 impl Outline {
@@ -76,7 +107,7 @@ impl Outline {
                 }
                 Verb::LineTo(p) => {
                     let (px, py) = tx(p);
-                    push_edge(&mut edges, current, (px, py));
+                    edges.extend(Edge::new(current, (px, py)));
                     current = (px, py);
                 }
                 Verb::QuadTo(ctrl, end) => {
@@ -87,7 +118,7 @@ impl Outline {
                     current = (ex, ey);
                 }
                 Verb::Close => {
-                    push_edge(&mut edges, current, contour_start);
+                    edges.extend(Edge::new(current, contour_start));
                     current = contour_start;
                 }
             }
@@ -100,7 +131,7 @@ impl Outline {
 
             // Collect X intersections on this scanline with non-zero winding.
             let mut crossings: Vec<(f32, i8)> = edges.iter()
-                .filter_map(|e| edge_x_at(e, y))
+                .filter_map(|e| e.x_at(y))
                 .collect();
 
             crossings.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
@@ -130,23 +161,6 @@ impl Outline {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-fn push_edge(edges: &mut Vec<Edge>, p0: (f32, f32), p1: (f32, f32)) {
-    if (p0.1 - p1.1).abs() < 1e-6 { return; } // horizontal — skip
-    let (winding, (x0, y0), (x1, y1)) = if p0.1 < p1.1 {
-        (-1i8, p0, p1) // going down in screen coords
-    } else {
-        (1i8, p1, p0)  // going up
-    };
-    edges.push(Edge { x0, y0, x1, y1, winding });
-}
-
-fn edge_x_at(e: &Edge, y: f32) -> Option<(f32, i8)> {
-    if y < e.y0 || y >= e.y1 { return None; }
-    let t = (y - e.y0) / (e.y1 - e.y0);
-    let x = t.mul_add(e.x1 - e.x0, e.x0);
-    Some((x, e.winding))
-}
-
 /// Recursively subdivide a quadratic Bézier into line segments.
 fn subdivide_quad(
     edges:   &mut Vec<Edge>,
@@ -156,7 +170,7 @@ fn subdivide_quad(
     depth:   u8,
 ) {
     if depth == 0 {
-        push_edge(edges, p0, p1);
+        edges.extend(Edge::new(p0, p1));
         return;
     }
     // De Casteljau midpoint split.

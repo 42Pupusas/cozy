@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 
 use crate::atlas::{Atlas, GlyphEntry};
-use crate::outline::decode_glyph;
 use crate::parse::{FontFile, ParseError};
 use crate::raster::Bitmap;
 use crate::tables::{Cmap, Head, Hhea, Hmtx, Loca, Maxp};
@@ -186,7 +185,7 @@ impl FontFace {
         // Get the glyph outline.
         let outline = loca.glyph_range(gid).map_or_else(
             crate::outline::Outline::default,
-            |(off, len)| decode_glyph(self.glyf(), off, len, 0).unwrap_or_default(),
+            |(off, len)| crate::outline::Outline::decode(self.glyf(), off, len, 0).unwrap_or_default(),
         );
 
         // Compute pixel-space bounding box from font-unit bbox.

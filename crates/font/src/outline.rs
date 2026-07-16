@@ -47,6 +47,37 @@ impl Outline {
     const fn new(x_min: i16, y_min: i16, x_max: i16, y_max: i16) -> Self {
         Self { verbs: Vec::new(), x_min, y_min, x_max, y_max }
     }
+
+    /// Decode the outline for glyph `gid` from the `glyf` table bytes.
+    /// `glyf_data` is the entire `glyf` table; the glyph itself lives at
+    /// `glyf_data[glyph_off..glyph_off + glyph_len]`.
+    ///
+    /// Was a free `decode_glyph(glyf_data, ..)` function -- moved onto
+    /// `Outline` since it's the type being produced, mirroring the
+    /// `T::parse(bytes)` convention used by the sibling `tables` module.
+    pub fn decode(
+        glyf_data: &[u8],
+        glyph_off: usize,
+        glyph_len: usize,
+        depth: u8,
+    ) -> Result<Self, ParseError> {
+        if depth > 8 { return Ok(Self::default()); } // guard infinite recursion
+
+        let d = &glyf_data[glyph_off..glyph_off + glyph_len];
+        if d.len() < 10 { return Ok(Self::default()); }
+
+        let num_contours = d.i16_at(0).ok_or(ParseError::TooShort)?;
+        let x_min = d.i16_at(2).ok_or(ParseError::TooShort)?;
+        let y_min = d.i16_at(4).ok_or(ParseError::TooShort)?;
+        let x_max = d.i16_at(6).ok_or(ParseError::TooShort)?;
+        let y_max = d.i16_at(8).ok_or(ParseError::TooShort)?;
+
+        if num_contours >= 0 {
+            decode_simple(d, num_contours as usize, x_min, y_min, x_max, y_max)
+        } else {
+            decode_composite(glyf_data, d, depth, x_min, y_min, x_max, y_max)
+        }
+    }
 }
 
 // ── Flag bits ─────────────────────────────────────────────────────────────────
@@ -67,32 +98,6 @@ const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Decode the outline for glyph `gid` from the `glyf` table bytes.
-/// `glyf_data` is the entire `glyf` table; `loca` is used to locate components
-/// during composite expansion.
-pub fn decode_glyph(
-    glyf_data: &[u8],
-    glyph_off: usize,
-    glyph_len: usize,
-    depth: u8,
-) -> Result<Outline, ParseError> {
-    if depth > 8 { return Ok(Outline::default()); } // guard infinite recursion
-
-    let d = &glyf_data[glyph_off..glyph_off + glyph_len];
-    if d.len() < 10 { return Ok(Outline::default()); }
-
-    let num_contours = d.i16_at(0).ok_or(ParseError::TooShort)?;
-    let x_min = d.i16_at(2).ok_or(ParseError::TooShort)?;
-    let y_min = d.i16_at(4).ok_or(ParseError::TooShort)?;
-    let x_max = d.i16_at(6).ok_or(ParseError::TooShort)?;
-    let y_max = d.i16_at(8).ok_or(ParseError::TooShort)?;
-
-    if num_contours >= 0 {
-        decode_simple(d, num_contours as usize, x_min, y_min, x_max, y_max)
-    } else {
-        decode_composite(glyf_data, d, depth, x_min, y_min, x_max, y_max)
-    }
-}
 
 // ── Simple glyph ─────────────────────────────────────────────────────────────
 
@@ -171,7 +176,7 @@ fn decode_simple(
 
     for c in 0..num_contours {
         let end = d.u16_at(end_pts_off + c * 2).ok_or(ParseError::TooShort)? as usize;
-        emit_contour(&mut outline, &flags, &xs, &ys, pt_idx, end);
+        outline.emit_contour(&flags, &xs, &ys, pt_idx, end);
         pt_idx = end + 1;
     }
 
@@ -184,56 +189,59 @@ fn pt(xs: &[i16], ys: &[i16], i: usize) -> Point {
 
 fn on(flags: &[u8], i: usize) -> bool { flags[i] & ON_CURVE != 0 }
 
-/// Emit TrueType quadratic contour verbs, handling implied on-curve midpoints.
-fn emit_contour(
-    outline: &mut Outline,
-    flags:   &[u8],
-    xs:      &[i16],
-    ys:      &[i16],
-    start:   usize,
-    end:     usize,
-) {
-    let count = end - start + 1;
-    if count == 0 { return; }
+impl Outline {
+    /// Emit TrueType quadratic contour verbs onto `self`, handling implied
+    /// on-curve midpoints.
+    ///
+    /// Was a free `emit_contour(outline: &mut Outline, ..)` function --
+    /// moved onto `Outline` since it only ever mutates one.
+    fn emit_contour(
+        &mut self,
+        flags: &[u8],
+        xs:    &[i16],
+        ys:    &[i16],
+        start: usize,
+        end:   usize,
+    ) {
+        let count = end - start + 1;
+        if count == 0 { return; }
 
-    // Find first on-curve point (or use midpoint if all off-curve).
-    let first_on = (start..=end).find(|&i| on(flags, i));
-    let start_pt = first_on.map_or_else(
-        || pt(xs, ys, start).lerp(pt(xs, ys, start + 1), 0.5),
-        |i| pt(xs, ys, i),
-    );
+        // Find first on-curve point (or use midpoint if all off-curve).
+        let first_on = (start..=end).find(|&i| on(flags, i));
+        let start_pt = first_on.map_or_else(
+            || pt(xs, ys, start).lerp(pt(xs, ys, start + 1), 0.5),
+            |i| pt(xs, ys, i),
+        );
 
-    outline.verbs.push(Verb::MoveTo(start_pt));
+        self.verbs.push(Verb::MoveTo(start_pt));
 
-    // Walk the contour.
-    let mut i = start;
-    let mut pending_off: Option<Point> = None;
-    let rotation_start = first_on.unwrap_or(start);
+        // Walk the contour.
+        let mut pending_off: Option<Point> = None;
+        let rotation_start = first_on.unwrap_or(start);
 
-    for step in 0..count {
-        let idx = start + (rotation_start - start + step) % count;
-        let p = pt(xs, ys, idx);
-        if on(flags, idx) {
-            if let Some(ctrl) = pending_off.take() {
-                outline.verbs.push(Verb::QuadTo(ctrl, p));
-            } else if step > 0 {
-                outline.verbs.push(Verb::LineTo(p));
+        for step in 0..count {
+            let idx = start + (rotation_start - start + step) % count;
+            let p = pt(xs, ys, idx);
+            if on(flags, idx) {
+                if let Some(ctrl) = pending_off.take() {
+                    self.verbs.push(Verb::QuadTo(ctrl, p));
+                } else if step > 0 {
+                    self.verbs.push(Verb::LineTo(p));
+                }
+            } else if let Some(prev_ctrl) = pending_off.replace(p) {
+                // Two consecutive off-curve → implied midpoint.
+                let mid = prev_ctrl.lerp(p, 0.5);
+                self.verbs.push(Verb::QuadTo(prev_ctrl, mid));
             }
-        } else if let Some(prev_ctrl) = pending_off.replace(p) {
-            // Two consecutive off-curve → implied midpoint.
-            let mid = prev_ctrl.lerp(p, 0.5);
-            outline.verbs.push(Verb::QuadTo(prev_ctrl, mid));
         }
-        i += 1;
+        // Close: flush any remaining off-curve.
+        if let Some(ctrl) = pending_off {
+            self.verbs.push(Verb::QuadTo(ctrl, start_pt));
+        } else {
+            self.verbs.push(Verb::LineTo(start_pt));
+        }
+        self.verbs.push(Verb::Close);
     }
-    // Close: flush any remaining off-curve.
-    if let Some(ctrl) = pending_off {
-        outline.verbs.push(Verb::QuadTo(ctrl, start_pt));
-    } else {
-        outline.verbs.push(Verb::LineTo(start_pt));
-    }
-    outline.verbs.push(Verb::Close);
-    let _ = i;
 }
 
 // ── Composite glyph ───────────────────────────────────────────────────────────
@@ -280,7 +288,7 @@ fn decode_composite(
         let component = find_component(glyf_data, glyph_index, depth);
         // Translate and append.
         for verb in component.verbs {
-            outline.verbs.push(translate_verb(verb, dx, dy));
+            outline.verbs.push(verb.translate(dx, dy));
         }
 
         if flags & MORE_COMPONENTS == 0 { break; }
@@ -297,14 +305,21 @@ fn find_component(glyf_data: &[u8], _gid: u16, _depth: u8) -> Outline {
     Outline::default()
 }
 
-fn translate_verb(v: Verb, dx: f32, dy: f32) -> Verb {
-    match v {
-        Verb::MoveTo(p)     => Verb::MoveTo(Point::new(p.x + dx, p.y + dy)),
-        Verb::LineTo(p)     => Verb::LineTo(Point::new(p.x + dx, p.y + dy)),
-        Verb::QuadTo(c, p)  => Verb::QuadTo(
-            Point::new(c.x + dx, c.y + dy),
-            Point::new(p.x + dx, p.y + dy),
-        ),
-        Verb::Close => Verb::Close,
+impl Verb {
+    /// Translate this verb's point(s) by `(dx, dy)`.
+    ///
+    /// Was a free `translate_verb(v: Verb, ..)` function -- moved onto
+    /// `Verb` as the value being consumed and produced.
+    #[must_use]
+    fn translate(self, dx: f32, dy: f32) -> Self {
+        match self {
+            Self::MoveTo(p)    => Self::MoveTo(Point::new(p.x + dx, p.y + dy)),
+            Self::LineTo(p)    => Self::LineTo(Point::new(p.x + dx, p.y + dy)),
+            Self::QuadTo(c, p) => Self::QuadTo(
+                Point::new(c.x + dx, c.y + dy),
+                Point::new(p.x + dx, p.y + dy),
+            ),
+            Self::Close => Self::Close,
+        }
     }
 }

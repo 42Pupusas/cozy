@@ -251,7 +251,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            shell:      default_shell(),
+            shell:      Self::default_shell(),
             term:       "xterm-256color".to_owned(),
             scrollback: 10_000,
             font:       FontConfig::default(),
@@ -262,20 +262,39 @@ impl Default for Config {
     }
 }
 
-fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())
-}
-
 // ── Public API ────────────────────────────────────────────────────────────────
 
 impl Config {
+    /// The shell to spawn when no config file (or no `general.shell` key)
+    /// overrides it: `$SHELL`, falling back to `/bin/sh`.
+    ///
+    /// Was a free `default_shell()` function -- moved onto `Config` since
+    /// it only ever feeds `Config::default()`.
+    fn default_shell() -> String {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())
+    }
+
+    /// The standard XDG config file path:
+    /// `$XDG_CONFIG_HOME/terminal/config.toml` or
+    /// `~/.config/terminal/config.toml`.
+    ///
+    /// Was a free `xdg_config_path()` function -- moved onto `Config` since
+    /// it only ever feeds `Config::load()`.
+    fn xdg_config_path() -> std::path::PathBuf {
+        let base = std::env::var("XDG_CONFIG_HOME").map_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
+                std::path::PathBuf::from(home).join(".config")
+            }, std::path::PathBuf::from);
+        base.join("terminal").join("config.toml")
+    }
+
     /// Load config from the standard XDG location:
     /// `$XDG_CONFIG_HOME/terminal/config.toml` or
     /// `~/.config/terminal/config.toml`.
     ///
     /// Returns `Ok(Config::default())` if no file exists yet.
     pub fn load() -> Result<Self, ConfigError> {
-        let path = xdg_config_path();
+        let path = Self::xdg_config_path();
         match std::fs::read(&path) {
             Ok(bytes) => Self::from_bytes(&bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -383,10 +402,4 @@ impl Config {
     }
 }
 
-fn xdg_config_path() -> std::path::PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME").map_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());
-            std::path::PathBuf::from(home).join(".config")
-        }, std::path::PathBuf::from);
-    base.join("terminal").join("config.toml")
-}
+

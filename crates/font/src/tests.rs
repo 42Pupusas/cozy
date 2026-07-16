@@ -132,7 +132,7 @@ fn outline_m_has_verbs() {
     let glyf  = ff.table(crate::parse::TAG_GLYF).unwrap();
     let gid   = cmap.glyph_id('M' as u32);
     let (off, len) = loca.glyph_range(gid).unwrap();
-    let outline = crate::outline::decode_glyph(glyf, off, len, 0).unwrap();
+    let outline = crate::outline::Outline::decode(glyf, off, len, 0).unwrap();
     assert!(!outline.verbs.is_empty(), "outline for 'M' has no verbs");
 }
 
@@ -163,7 +163,7 @@ fn raster_m_produces_nonzero_pixels() {
     let scale    = PX / head.units_per_em as f32;
     let gid      = cmap.glyph_id('M' as u32);
     let (off, len) = loca.glyph_range(gid).unwrap();
-    let outline  = crate::outline::decode_glyph(glyf, off, len, 0).unwrap();
+    let outline  = crate::outline::Outline::decode(glyf, off, len, 0).unwrap();
 
     let ascender = hhea.ascender as f32 * scale;
     let w = 16u32;
@@ -185,7 +185,7 @@ fn raster_bitmap_correct_size() {
     let scale = PX / head.units_per_em as f32;
     let gid   = cmap.glyph_id('M' as u32);
     let (off, len) = loca.glyph_range(gid).unwrap();
-    let outline = crate::outline::decode_glyph(glyf, off, len, 0).unwrap();
+    let outline = crate::outline::Outline::decode(glyf, off, len, 0).unwrap();
     let bmp = outline.rasterize(16, 20, scale, 16.0, 0.0);
     assert_eq!(bmp.data.len(), (16 * 20) as usize);
 }
@@ -231,7 +231,7 @@ fn atlas_packs_without_overflow() {
                 continue;
             }
         };
-        let outline = crate::outline::decode_glyph(glyf, off, len, 0).unwrap();
+        let outline = crate::outline::Outline::decode(glyf, off, len, 0).unwrap();
         let px_y_max = outline.y_max as f32 * scale;
         let px_y_min = outline.y_min as f32 * scale;
         let px_x_max = outline.x_max as f32 * scale;

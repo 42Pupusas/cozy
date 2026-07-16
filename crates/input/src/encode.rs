@@ -32,6 +32,73 @@ pub struct Encoder {
     pub kitty_flags:      u8,
 }
 
+// ── Output cursor ────────────────────────────────────────────────────────────
+
+/// A write cursor over a caller-supplied `&mut [u8]`.
+///
+/// Every VT sequence builder in this module used to be a free function
+/// threading `buf: &mut [u8]` plus a hand-rolled running offset (`n`, `n +=
+/// ...`) through every call — the exact shape a small stateful writer exists
+/// to replace. `SeqWriter` owns that offset once; every write is a method
+/// that advances it, and [`SeqWriter::len`] replaces the old "return the
+/// final `n`" convention.
+struct SeqWriter<'a> {
+    buf: &'a mut [u8],
+    n:   usize,
+}
+
+impl<'a> SeqWriter<'a> {
+    const fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, n: 0 }
+    }
+
+    /// Bytes written so far — the return value every old free function
+    /// produced by hand.
+    const fn len(&self) -> usize {
+        self.n
+    }
+
+    fn byte(&mut self, b: u8) -> &mut Self {
+        self.buf[self.n] = b;
+        self.n += 1;
+        self
+    }
+
+    fn bytes(&mut self, s: &[u8]) -> &mut Self {
+        self.buf[self.n..self.n + s.len()].copy_from_slice(s);
+        self.n += s.len();
+        self
+    }
+
+    /// `ESC` — used to prefix almost every escape sequence below.
+    fn esc(&mut self) -> &mut Self {
+        self.byte(b'\x1b')
+    }
+
+    /// `ESC [` — CSI, the common introducer for cursor/functional keys.
+    fn csi(&mut self) -> &mut Self {
+        self.esc().byte(b'[')
+    }
+
+    /// Decimal digits of `v`, no leading zeros (`0` itself writes `"0"`).
+    fn dec(&mut self, mut v: u32) -> &mut Self {
+        if v == 0 {
+            return self.byte(b'0');
+        }
+        let mut tmp = [0u8; 10];
+        let mut len = 0;
+        while v > 0 {
+            tmp[len] = b'0' + (v % 10) as u8;
+            len += 1;
+            v /= 10;
+        }
+        for i in 0..len {
+            self.byte(tmp[len - 1 - i]);
+        }
+        self
+    }
+}
+
 impl Encoder {
     #[must_use]
     pub fn new() -> Self {
@@ -72,7 +139,7 @@ impl Encoder {
     pub fn encode_mouse(&self, ev: MouseEvent, buf: &mut [u8]) -> Option<usize> {
         match self.mouse_mode {
             MouseMode::Off => None,
-            MouseMode::Sgr => Some(encode_mouse_sgr(ev, buf)),
+            MouseMode::Sgr => Some(Self::encode_mouse_sgr(ev, buf)),
             _ => Some(self.encode_mouse_x10(ev, buf)),
         }
     }
@@ -85,39 +152,40 @@ impl Encoder {
             && let Key::Char(c) = key
             && let Some(byte) = ctrl_byte(c)
         {
-            return Some(write1(buf, byte));
+            let mut w = SeqWriter::new(buf);
+            w.byte(byte);
+            return Some(w.len());
         }
 
         Some(match key {
             // ── Printable characters ──────────────────────────────────────
             Key::Char(c) => {
+                let mut w = SeqWriter::new(buf);
                 // Alt prefixes with ESC.
-                let mut n = 0;
                 if mods.alt() {
-                    buf[n] = b'\x1b';
-                    n += 1;
+                    w.esc();
                 }
-                let s = encode_char(c, mods.shift(), mods.caps());
-                let src = s.as_bytes();
-                buf[n..n + src.len()].copy_from_slice(src);
-                n + src.len()
+                w.bytes(encode_char(c, mods.shift(), mods.caps()).as_bytes());
+                w.len()
             }
 
             // ── Enter / Backspace / Tab / Esc ────────────────────────────
-            Key::Enter     => write1(buf, b'\r'),
-            Key::Backspace => write1(buf, b'\x7f'),
+            Key::Enter     => { let mut w = SeqWriter::new(buf); w.byte(b'\r'); w.len() }
+            Key::Backspace => { let mut w = SeqWriter::new(buf); w.byte(b'\x7f'); w.len() }
             Key::Tab       => {
+                let mut w = SeqWriter::new(buf);
                 if mods.shift() {
-                    writeb(buf, b"\x1b[Z")
+                    w.bytes(b"\x1b[Z");
                 } else {
-                    write1(buf, b'\t')
+                    w.byte(b'\t');
                 }
+                w.len()
             }
-            Key::Esc       => write1(buf, b'\x1b'),
+            Key::Esc       => { let mut w = SeqWriter::new(buf); w.esc(); w.len() }
 
             // ── Delete / Insert ──────────────────────────────────────────
-            Key::Delete => writeb(buf, b"\x1b[3~"),
-            Key::Insert => writeb(buf, b"\x1b[2~"),
+            Key::Delete => { let mut w = SeqWriter::new(buf); w.bytes(b"\x1b[3~"); w.len() }
+            Key::Insert => { let mut w = SeqWriter::new(buf); w.bytes(b"\x1b[2~"); w.len() }
 
             // ── Arrows ───────────────────────────────────────────────────
             Key::Up    => self.arrow(buf, b'A', mods),
@@ -127,32 +195,38 @@ impl Encoder {
 
             // ── Home / End ───────────────────────────────────────────────
             Key::Home => {
+                let mut w = SeqWriter::new(buf);
                 if mods.any_active() {
-                    csi_mod(buf, b"1", mods, b'H')
+                    w.csi_mod(b"1", mods, b'H');
                 } else if self.app_cursor {
-                    writeb(buf, b"\x1bOH")
+                    w.bytes(b"\x1bOH");
                 } else {
-                    writeb(buf, b"\x1b[H")
+                    w.bytes(b"\x1b[H");
                 }
+                w.len()
             }
             Key::End => {
+                let mut w = SeqWriter::new(buf);
                 if mods.any_active() {
-                    csi_mod(buf, b"4", mods, b'~')
+                    w.csi_mod(b"4", mods, b'~');
                 } else if self.app_cursor {
-                    writeb(buf, b"\x1bOF")
+                    w.bytes(b"\x1bOF");
                 } else {
-                    writeb(buf, b"\x1b[F")
+                    w.bytes(b"\x1b[F");
                 }
+                w.len()
             }
 
             // ── Page keys ────────────────────────────────────────────────
             Key::PageUp   => {
-                if mods.any_active() { csi_mod(buf, b"5", mods, b'~') }
-                else { writeb(buf, b"\x1b[5~") }
+                let mut w = SeqWriter::new(buf);
+                if mods.any_active() { w.csi_mod(b"5", mods, b'~'); } else { w.bytes(b"\x1b[5~"); }
+                w.len()
             }
             Key::PageDown => {
-                if mods.any_active() { csi_mod(buf, b"6", mods, b'~') }
-                else { writeb(buf, b"\x1b[6~") }
+                let mut w = SeqWriter::new(buf);
+                if mods.any_active() { w.csi_mod(b"6", mods, b'~'); } else { w.bytes(b"\x1b[6~"); }
+                w.len()
             }
 
             // ── Function keys ────────────────────────────────────────────
@@ -175,19 +249,24 @@ impl Encoder {
     fn encode_keypad(&self, key: Key, buf: &mut [u8]) -> Option<usize> {
         let app = self.app_keypad;
         Some(match key {
-            Key::KpEnter => if app { writeb(buf, b"\x1bOM") } else { write1(buf, b'\r') },
+            Key::KpEnter => {
+                let mut w = SeqWriter::new(buf);
+                if app { w.bytes(b"\x1bOM"); } else { w.byte(b'\r'); }
+                w.len()
+            }
             Key::KpUp    => self.kp_arrow(buf, b'A'),
             Key::KpDown  => self.kp_arrow(buf, b'B'),
             Key::KpRight => self.kp_arrow(buf, b'C'),
             Key::KpLeft  => self.kp_arrow(buf, b'D'),
-            Key::KpHome     => if app { writeb(buf, b"\x1bOw") } else { writeb(buf, b"\x1b[H") },
-            Key::KpEnd      => if app { writeb(buf, b"\x1bOq") } else { writeb(buf, b"\x1b[F") },
-            Key::KpPageUp   => if app { writeb(buf, b"\x1bOy") } else { writeb(buf, b"\x1b[5~") },
-            Key::KpPageDown => if app { writeb(buf, b"\x1bOs") } else { writeb(buf, b"\x1b[6~") },
-            Key::KpBegin    => if app { writeb(buf, b"\x1bOu") } else { writeb(buf, b"\x1b[E") },
-            Key::KpInsert   => if app { writeb(buf, b"\x1bOp") } else { writeb(buf, b"\x1b[2~") },
-            Key::KpDelete   => if app { writeb(buf, b"\x1bOn") } else { writeb(buf, b"\x1b[3~") },
+            Key::KpHome     => Self::kp_or(buf, app, b"\x1bOw", b"\x1b[H"),
+            Key::KpEnd      => Self::kp_or(buf, app, b"\x1bOq", b"\x1b[F"),
+            Key::KpPageUp   => Self::kp_or(buf, app, b"\x1bOy", b"\x1b[5~"),
+            Key::KpPageDown => Self::kp_or(buf, app, b"\x1bOs", b"\x1b[6~"),
+            Key::KpBegin    => Self::kp_or(buf, app, b"\x1bOu", b"\x1b[E"),
+            Key::KpInsert   => Self::kp_or(buf, app, b"\x1bOp", b"\x1b[2~"),
+            Key::KpDelete   => Self::kp_or(buf, app, b"\x1bOn", b"\x1b[3~"),
             Key::KpChar(c) => {
+                let mut w = SeqWriter::new(buf);
                 if app {
                     let code: u8 = match c {
                         '0' => b'p', '1' => b'q', '2' => b'r', '3' => b's',
@@ -196,43 +275,46 @@ impl Encoder {
                         '-' => b'm', '*' => b'j', '/' => b'o',
                         _   => return None,
                     };
-                    buf[0] = b'\x1b';
-                    buf[1] = b'O';
-                    buf[2] = code;
-                    3
+                    w.esc().byte(b'O').byte(code);
                 } else {
                     let mut tmp = [0u8; 4];
-                    let n = c.encode_utf8(&mut tmp).len();
-                    buf[..n].copy_from_slice(&tmp[..n]);
-                    n
+                    let src = c.encode_utf8(&mut tmp).as_bytes();
+                    w.bytes(src);
                 }
+                w.len()
             }
             _ => return None,
         })
     }
 
+    /// Write `app_bytes` if `app` else `plain_bytes`; shared by the keypad's
+    /// many "app-keypad selects one literal sequence, else another" arms.
+    fn kp_or(buf: &mut [u8], app: bool, app_bytes: &[u8], plain_bytes: &[u8]) -> usize {
+        let mut w = SeqWriter::new(buf);
+        w.bytes(if app { app_bytes } else { plain_bytes });
+        w.len()
+    }
+
     /// Arrow key — respects app-cursor mode and modifier CSI.
     fn arrow(&self, buf: &mut [u8], letter: u8, mods: Modifiers) -> usize {
+        let mut w = SeqWriter::new(buf);
         if mods.any_active() {
             // `CSI 1 ; <mod> A/B/C/D`
-            csi_mod(buf, b"1", mods, letter)
+            w.csi_mod(b"1", mods, letter);
         } else {
             // `SS3 A/B/C/D` in app-cursor mode, else `CSI A/B/C/D`.
             let intro = if self.app_cursor { b'O' } else { b'[' };
-            buf[0] = b'\x1b';
-            buf[1] = intro;
-            buf[2] = letter;
-            3
+            w.esc().byte(intro).byte(letter);
         }
+        w.len()
     }
 
     fn kp_arrow(&self, buf: &mut [u8], letter: u8) -> usize {
         // App-keypad and app-cursor both select SS3; default is CSI.
         let intro = if self.app_keypad || self.app_cursor { b'O' } else { b'[' };
-        buf[0] = b'\x1b';
-        buf[1] = intro;
-        buf[2] = letter;
-        3
+        let mut w = SeqWriter::new(buf);
+        w.esc().byte(intro).byte(letter);
+        w.len()
     }
 
     // ── xterm modifyOtherKeys ─────────────────────────────────────────────────
@@ -252,7 +334,9 @@ impl Encoder {
             _ => return self.encode_legacy(key, mods, buf),
         };
         let mod_param = mods.kitty_param().unwrap_or(1);
-        Some(write_fmt_csi(buf, 27, mod_param, codepoint))
+        let mut w = SeqWriter::new(buf);
+        w.csi().bytes(b"27").byte(b';').dec(u32::from(mod_param)).byte(b';').dec(codepoint).byte(b'~');
+        Some(w.len())
     }
 
     // ── Kitty protocol ────────────────────────────────────────────────────────
@@ -272,7 +356,9 @@ impl Encoder {
             KittyKey::Tilde(n)    => (n, b'~'),
             KittyKey::Letter(l)   => (1, l),
         };
-        Some(write_kitty(buf, number, mod_param, event_type, terminator))
+        let mut w = SeqWriter::new(buf);
+        w.csi().dec(number).byte(b';').dec(u32::from(mod_param)).byte(b':').dec(u32::from(event_type)).byte(terminator);
+        Some(w.len())
     }
 
     // ── Mouse encoding ────────────────────────────────────────────────────────
@@ -293,28 +379,54 @@ impl Encoder {
         // Clamp to 223 (max encodable in 1 byte + 32).
         let col = (ev.col + 1).min(223) as u8;
         let row = (ev.row + 1).min(223) as u8;
-        buf[0] = b'\x1b';
-        buf[1] = b'[';
-        buf[2] = b'M';
-        buf[3] = btn.saturating_add(32);
-        buf[4] = col.saturating_add(32);
-        buf[5] = row.saturating_add(32);
-        6
+        let mut w = SeqWriter::new(buf);
+        w.csi().byte(b'M')
+            .byte(btn.saturating_add(32))
+            .byte(col.saturating_add(32))
+            .byte(row.saturating_add(32));
+        w.len()
     }
 
+    /// SGR mouse encoding (`CSI < btn ; col ; row M/m`) — independent of
+    /// encoder state, so it takes no `&self`.
+    fn encode_mouse_sgr(ev: MouseEvent, buf: &mut [u8]) -> usize {
+        let mut btn = u16::from(ev.button.x10_code());
+        if ev.mods.shift() { btn |= 0x04; }
+        if ev.mods.alt()   { btn |= 0x08; }
+        if ev.mods.ctrl()  { btn |= 0x10; }
+        let final_byte: u8 = match ev.state {
+            ButtonState::Pressed  => b'M',
+            ButtonState::Released => b'm',
+        };
+        let mut w = SeqWriter::new(buf);
+        w.csi().byte(b'<')
+            .dec(u32::from(btn)).byte(b';')
+            .dec(u32::from(ev.col + 1)).byte(b';')
+            .dec(u32::from(ev.row + 1)).byte(final_byte);
+        w.len()
+    }
 }
 
-/// SGR mouse encoding (`CSI < btn ; col ; row M/m`) — independent of encoder state.
-fn encode_mouse_sgr(ev: MouseEvent, buf: &mut [u8]) -> usize {
-    let mut btn = u16::from(ev.button.x10_code());
-    if ev.mods.shift() { btn |= 0x04; }
-    if ev.mods.alt()   { btn |= 0x08; }
-    if ev.mods.ctrl()  { btn |= 0x10; }
-    let final_byte: u8 = match ev.state {
-        ButtonState::Pressed  => b'M',
-        ButtonState::Released => b'm',
-    };
-    write_sgr_mouse(buf, btn, ev.col + 1, ev.row + 1, final_byte)
+// ── SeqWriter: sequence-shaped helpers ──────────────────────────────────────
+//
+// These build on the primitive `byte`/`bytes`/`esc`/`csi`/`dec` methods above
+// and encode a specific VT sequence shape shared by several keys.
+impl SeqWriter<'_> {
+    /// `CSI <ps> ; <mod> <final>` — for arrows, Home, End, page keys.
+    fn csi_mod(&mut self, ps: &[u8], mods: Modifiers, final_byte: u8) -> &mut Self {
+        let mod_param = mods.kitty_param().unwrap_or(1);
+        self.csi().bytes(ps).byte(b';').dec(u32::from(mod_param)).byte(final_byte)
+    }
+
+    /// `CSI <num> [; <mod>] ~`
+    fn fkey_tilde(&mut self, num: &[u8], mods: Modifiers) -> &mut Self {
+        self.csi().bytes(num);
+        if mods.any_active() {
+            let mod_param = mods.kitty_param().unwrap_or(1);
+            self.byte(b';').dec(u32::from(mod_param));
+        }
+        self.byte(b'~')
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -450,137 +562,27 @@ const fn kitty_key(key: Key) -> Option<KittyKey> {
 fn encode_fkey(buf: &mut [u8], n: u8, mods: Modifiers) -> Option<usize> {
     // F1–F4 without mods → SS3 P/Q/R/S; with mods → CSI 1 ; <mod> P/Q/R/S
     // F5–F12 → CSI tilde with numeric codes; with mods → CSI num ; mod ~
-    Some(match n {
+    let mut w = SeqWriter::new(buf);
+    match n {
         1..=4 => {
             let letter = b'P' + n - 1;
             if mods.any_active() {
-                csi_mod(buf, b"1", mods, letter)
+                w.csi_mod(b"1", mods, letter);
             } else {
-                buf[0] = b'\x1b'; buf[1] = b'O'; buf[2] = letter;
-                3
+                w.esc().byte(b'O').byte(letter);
             }
         }
-        5 => fkey_tilde(buf, b"15", mods),
-        6 => fkey_tilde(buf, b"17", mods),
-        7 => fkey_tilde(buf, b"18", mods),
-        8 => fkey_tilde(buf, b"19", mods),
-        9 => fkey_tilde(buf, b"20", mods),
-        10 => fkey_tilde(buf, b"21", mods),
-        11 => fkey_tilde(buf, b"23", mods),
-        12 => fkey_tilde(buf, b"24", mods),
+        5  => { w.fkey_tilde(b"15", mods); }
+        6  => { w.fkey_tilde(b"17", mods); }
+        7  => { w.fkey_tilde(b"18", mods); }
+        8  => { w.fkey_tilde(b"19", mods); }
+        9  => { w.fkey_tilde(b"20", mods); }
+        10 => { w.fkey_tilde(b"21", mods); }
+        11 => { w.fkey_tilde(b"23", mods); }
+        12 => { w.fkey_tilde(b"24", mods); }
         _ => return None,
-    })
-}
-
-/// `CSI <num> [; <mod>] ~`
-fn fkey_tilde(buf: &mut [u8], num: &[u8], mods: Modifiers) -> usize {
-    let mut n = 0;
-    buf[n] = b'\x1b'; n += 1;
-    buf[n] = b'[';     n += 1;
-    buf[n..n + num.len()].copy_from_slice(num); n += num.len();
-    if mods.any_active() {
-        let mod_param = mods.kitty_param().unwrap_or(1);
-        buf[n] = b';'; n += 1;
-        n += write_u8_dec(&mut buf[n..], mod_param);
     }
-    buf[n] = b'~'; n += 1;
-    n
-}
-
-/// `CSI <ps> ; <mod> <final>` — for arrows, Home, End.
-fn csi_mod(buf: &mut [u8], ps: &[u8], mods: Modifiers, final_byte: u8) -> usize {
-    let mod_param = mods.kitty_param().unwrap_or(1);
-    let mut n = 0;
-    buf[n] = b'\x1b'; n += 1;
-    buf[n] = b'[';     n += 1;
-    buf[n..n + ps.len()].copy_from_slice(ps); n += ps.len();
-    buf[n] = b';';     n += 1;
-    n += write_u8_dec(&mut buf[n..], mod_param);
-    buf[n] = final_byte; n += 1;
-    n
-}
-
-/// `CSI 27 ; <mod> ; <codepoint> ~`
-fn write_fmt_csi(buf: &mut [u8], _ps1: u32, mod_param: u8, codepoint: u32) -> usize {
-    let mut n = 0;
-    buf[n] = b'\x1b'; n += 1;
-    buf[n] = b'[';     n += 1;
-    buf[n] = b'2'; buf[n+1] = b'7'; n += 2;
-    buf[n] = b';'; n += 1;
-    n += write_u8_dec(&mut buf[n..], mod_param);
-    buf[n] = b';'; n += 1;
-    n += write_u32_dec(&mut buf[n..], codepoint);
-    buf[n] = b'~'; n += 1;
-    n
-}
-
-/// Kitty: `CSI <number> ; <mod> : <event> <terminator>`
-fn write_kitty(buf: &mut [u8], number: u32, mod_param: u8, event_type: u8, terminator: u8) -> usize {
-    let mut n = 0;
-    buf[n] = b'\x1b'; n += 1;
-    buf[n] = b'[';     n += 1;
-    n += write_u32_dec(&mut buf[n..], number);
-    buf[n] = b';'; n += 1;
-    n += write_u8_dec(&mut buf[n..], mod_param);
-    buf[n] = b':'; n += 1;
-    n += write_u8_dec(&mut buf[n..], event_type);
-    buf[n] = terminator; n += 1;
-    n
-}
-
-/// SGR mouse: `CSI < <btn> ; <col> ; <row> M/m`
-fn write_sgr_mouse(buf: &mut [u8], btn: u16, col: u16, row: u16, final_byte: u8) -> usize {
-    let mut n = 0;
-    buf[n] = b'\x1b'; n += 1;
-    buf[n] = b'[';     n += 1;
-    buf[n] = b'<';     n += 1;
-    n += write_u16_dec(&mut buf[n..], btn);
-    buf[n] = b';'; n += 1;
-    n += write_u16_dec(&mut buf[n..], col);
-    buf[n] = b';'; n += 1;
-    n += write_u16_dec(&mut buf[n..], row);
-    buf[n] = final_byte; n += 1;
-    n
-}
-
-fn write1(buf: &mut [u8], b: u8) -> usize {
-    buf[0] = b;
-    1
-}
-
-fn writeb(buf: &mut [u8], s: &[u8]) -> usize {
-    buf[..s.len()].copy_from_slice(s);
-    s.len()
-}
-
-/// Write a `u8` as decimal digits, returns number of bytes written.
-fn write_u8_dec(buf: &mut [u8], mut v: u8) -> usize {
-    if v == 0 { buf[0] = b'0'; return 1; }
-    let mut tmp = [0u8; 3];
-    let mut len = 0;
-    while v > 0 { tmp[len] = b'0' + v % 10; len += 1; v /= 10; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
-    len
-}
-
-/// Write a `u16` as decimal digits.
-fn write_u16_dec(buf: &mut [u8], mut v: u16) -> usize {
-    if v == 0 { buf[0] = b'0'; return 1; }
-    let mut tmp = [0u8; 5];
-    let mut len = 0;
-    while v > 0 { tmp[len] = b'0' + (v % 10) as u8; len += 1; v /= 10; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
-    len
-}
-
-/// Write a `u32` as decimal digits.
-fn write_u32_dec(buf: &mut [u8], mut v: u32) -> usize {
-    if v == 0 { buf[0] = b'0'; return 1; }
-    let mut tmp = [0u8; 10];
-    let mut len = 0;
-    while v > 0 { tmp[len] = b'0' + (v % 10) as u8; len += 1; v /= 10; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
-    len
+    Some(w.len())
 }
 
 #[cfg(test)]

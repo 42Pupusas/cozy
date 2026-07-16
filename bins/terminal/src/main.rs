@@ -67,7 +67,14 @@ struct PtyChunk {
 #[derive(Clone)]
 enum ParserMsg {
     Data(PtyChunk),
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    /// Scroll the viewport by `delta` lines (positive = up into scrollback).
+    Scroll {
+        delta: i32,
+    },
 }
 
 /// Messages from the UI thread to the PTY thread.
@@ -154,6 +161,7 @@ fn run(cfg: &Config) -> platform::Result<()> {
         cfg,
         dirty_rx,
         input_tx,
+        parser_resize_tx.clone(),
         parser_resize_tx,
         ui_wake,
         ui_pty_wake,
@@ -261,6 +269,7 @@ fn feed_parser(grid: &mut Grid, parser: &mut Parser, msg: ParserMsg) {
             parser.feed(&chunk.buf[..chunk.len], |ev| grid.apply(&ev));
         }
         ParserMsg::Resize { cols, rows } => grid.resize(cols, rows),
+        ParserMsg::Scroll { delta } => grid.scroll_viewport(delta),
     }
 }
 
@@ -312,20 +321,30 @@ fn parser_thread(
 
 // ── UI thread (main thread) ───────────────────────────────────────────────────
 
-#[allow(clippy::needless_pass_by_value)] // owns the input producer; see pty_thread
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)] // owns producers
 fn ui_thread(
     cfg: &Config,
     mut dirty_rx: quetzalcoatl::spsc::Consumer<DirtySnapshot>,
     input_tx: mpsc::Producer<InputMsg>,
     resize_tx: mpsc::Producer<ParserMsg>,
+    scroll_tx: mpsc::Producer<ParserMsg>,
     ui_wake: platform::Waker,
     pty_wake: waker::Waker,
     quit: &AtomicBool,
 ) -> platform::Result<()> {
     let theme = platform::Theme::from_palette(&cfg.palette);
-    let renderer = platform::Renderer::new(theme, &cfg.font).with_opacity(cfg.window.opacity);
-    let mut win = TermWindow::new("terminal", COLS, ROWS, ui_wake, renderer)?;
+    let font = cfg.font.clone();
+    let opacity = cfg.window.opacity;
+    // TermWindow reads the output scale and calls this closure to rasterize
+    // the font at native density (HiDPI-aware).
+    let mut win = TermWindow::new("terminal", COLS, ROWS, ui_wake, move |scale| {
+        platform::Renderer::with_scale(theme, &font, scale).with_opacity(opacity)
+    })?;
     let encoder = Encoder::new();
+
+    // Track the grid's current row count for page-scroll sizing (updated on
+    // resize). Seeded from the startup dimensions.
+    let mut grid_rows = ROWS;
 
     // Future: use cfg.cursor.blink / blink_rate in the renderer.
     let _ = (&cfg.cursor.blink, &cfg.cursor.blink_rate);
@@ -356,12 +375,19 @@ fn ui_thread(
                     return Ok(());
                 }
                 InputEvent::Resize { cols, rows } => {
+                    grid_rows = rows;
                     // PTY gets the winsize (SIGWINCH); the grid gets the new
                     // extent to reflow. Pushing to the parser MPSC ring unparks
                     // the parser directly — no separate wake needed.
                     let _ = input_tx.push(InputMsg::Resize { cols, rows });
                     let _ = resize_tx.push(ParserMsg::Resize { cols, rows });
                     sent_input = true;
+                }
+                InputEvent::Scroll { lines } => {
+                    // Mouse wheel scrolls the grid viewport (into scrollback),
+                    // not the shell. Route to the parser thread, which owns the
+                    // grid and re-renders the moved viewport.
+                    let _ = scroll_tx.push(ParserMsg::Scroll { delta: lines });
                 }
                 InputEvent::Key {
                     key,
@@ -383,6 +409,23 @@ fn ui_thread(
                     let Some(ikey) = platform_key(key) else {
                         continue;
                     };
+                    // Shift+PgUp/PgDn scroll the grid viewport by a page,
+                    // instead of sending the escape to the shell (bare
+                    // PgUp/PgDn still go to the shell for history search).
+                    if kstate == KeyState::Pressed && mods.shift() {
+                        let page = i32::from(grid_rows);
+                        match ikey {
+                            Key::PageUp => {
+                                let _ = scroll_tx.push(ParserMsg::Scroll { delta: page });
+                                continue;
+                            }
+                            Key::PageDown => {
+                                let _ = scroll_tx.push(ParserMsg::Scroll { delta: -page });
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     let mut ibuf = [0u8; 64];
                     if let Some(n) = encoder.encode_key(ikey, kstate, mods, &mut ibuf) {
                         let _ = input_tx.push(InputMsg::Bytes(ibuf[..n].into()));

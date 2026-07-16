@@ -79,6 +79,8 @@ object_ids! {
     DecorationManagerId,
     /// `zxdg_toplevel_decoration_v1` — per-toplevel decoration object.
     ToplevelDecorationId,
+    /// `wl_output` — a physical/logical display, advertising its scale factor.
+    OutputId,
 }
 
 /// An event serial — echoed back in acks/pongs. Distinct from an object id so

@@ -1,4 +1,4 @@
-#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 //! Software terminal renderer: blit grid cells into a `u32` pixel buffer.
 //!
 //! Two glyph sources are supported, chosen at startup by [`Renderer::new`]:
@@ -214,9 +214,19 @@ pub struct Renderer {
     theme: Theme,
     glyphs: GlyphSource,
     /// Resolved terminal cell size in pixels — `8×16` for the bitmap
-    /// fallback, or derived from the loaded face's metrics.
+    /// fallback, or derived from the loaded face's metrics. Already includes
+    /// `output_scale` (i.e. these are physical/buffer pixels, not logical
+    /// ones), so callers never need to multiply by scale again.
     cell_w: i32,
     cell_h: i32,
+    /// The Wayland output's integer buffer scale this renderer was built for
+    /// (1 = standard DPI, 2 = HiDPI @2x, ...). The font was rasterized at
+    /// `font_cfg.px_size() * output_scale` so glyphs are crisp at the
+    /// display's native pixel density instead of being upscaled/blurred by
+    /// the compositor. See `TermWindow::new`, which reads this from the
+    /// bound `wl_output` and both passes it here and calls
+    /// `wl_surface.set_buffer_scale` with the same value.
+    output_scale: i32,
     /// Alpha applied to *pure background* pixels (no glyph coverage), `0–255`.
     /// `255` (the default) means fully opaque, and every packed pixel is then
     /// byte-identical to the pre-transparency `to_xrgb8888()` output — this
@@ -237,6 +247,7 @@ impl Renderer {
             glyphs: GlyphSource::Bitmap,
             cell_w: GLYPH_W,
             cell_h: GLYPH_H,
+            output_scale: 1,
             bg_alpha: 255,
         }
     }
@@ -262,14 +273,46 @@ impl Renderer {
     /// Build a renderer from config: tries to load `font_cfg.path` at
     /// `font_cfg.size` pixels; falls back to the embedded bitmap font (with a
     /// diagnostic on stderr) if no path is configured or loading fails.
+    ///
+    /// Equivalent to `Self::with_scale(theme, font_cfg, 1)` — kept as the
+    /// zero-argument entry point for callers (tests, anything not talking to
+    /// a real scaled Wayland output) that don't care about HiDPI.
     #[must_use]
     pub fn new(theme: Theme, font_cfg: &config::FontConfig) -> Self {
+        Self::with_scale(theme, font_cfg, 1)
+    }
+
+    /// Build a renderer from config, rasterizing the font at
+    /// `font_cfg.px_size() * output_scale` physical pixels instead of the
+    /// naive logical size.
+    ///
+    /// Without this, a window on a HiDPI/scaled Wayland output (`wl_output`
+    /// advertising `scale > 1`) would render its buffer at 1x and rely on
+    /// the *compositor* to upscale it to fill the physical pixels -- which
+    /// is exactly what a bilinear upscale of anti-aliased glyph edges looks
+    /// like: soft/fuzzy text, most visible on a font with fine strokes (the
+    /// symptom that surfaced switching Inconsolata -> Noto Sans Mono). The
+    /// caller (`TermWindow::new`) matches this by calling
+    /// `wl_surface.set_buffer_scale(output_scale)`, which tells the
+    /// compositor our buffer is already at native density and needs no
+    /// resampling; `cell_w`/`cell_h` here come out already in physical
+    /// pixels so the window-sizing math downstream doesn't need to know
+    /// about scale at all.
+    #[must_use]
+    pub fn with_scale(theme: Theme, font_cfg: &config::FontConfig, output_scale: i32) -> Self {
+        let output_scale = output_scale.max(1);
         let Some(path) = &font_cfg.path else {
-            return Self::builtin(theme);
+            let mut r = Self::builtin(theme);
+            r.output_scale = output_scale;
+            r.cell_w *= output_scale;
+            r.cell_h *= output_scale;
+            return r;
         };
         // font.size is a point size (like Alacritty); convert to pixels at
-        // the standard 96 DPI so a given point size matches other terminals.
-        let px_size = font_cfg.px_size();
+        // the standard 96 DPI, then scale up to the output's physical pixel
+        // density so a given point size renders crisp (not upscaled) at
+        // whatever HiDPI factor the display uses.
+        let px_size = font_cfg.px_size() * output_scale as f32;
         match font::FontFace::load(path, px_size) {
             Ok(face) => {
                 let cell_w = face.cell_width.round().max(1.0) as i32;
@@ -279,6 +322,7 @@ impl Renderer {
                     glyphs: GlyphSource::Face(Box::new(GlyphCache::new(face))),
                     cell_w,
                     cell_h,
+                    output_scale,
                     bg_alpha: 255,
                 }
             }
@@ -286,9 +330,20 @@ impl Renderer {
                 eprintln!(
                     "platform: failed to load font {path:?}: {e} — falling back to embedded bitmap font"
                 );
-                Self::builtin(theme)
+                let mut r = Self::builtin(theme);
+                r.output_scale = output_scale;
+                r.cell_w *= output_scale;
+                r.cell_h *= output_scale;
+                r
             }
         }
+    }
+
+    /// The Wayland output buffer scale this renderer was built for (see
+    /// [`Self::with_scale`]). `1` for [`Self::new`]/[`Self::builtin`].
+    #[must_use]
+    pub const fn output_scale(&self) -> i32 {
+        self.output_scale
     }
 
     /// Terminal cell width in pixels.
@@ -653,6 +708,34 @@ mod tests {
             pixels.iter().all(|&p| p == 0),
             "off-bottom row 3 leaked into buffer"
         );
+    }
+
+    #[test]
+    fn builtin_scales_cell_size_by_output_scale() {
+        // The bitmap fallback path must also scale, not just the TTF path --
+        // a HiDPI output with no configured font still shouldn't render a
+        // blurry 1x bitmap upscaled by the compositor.
+        let r = Renderer::with_scale(Theme::builtin(), &config::FontConfig::default(), 2);
+        assert_eq!(r.cell_w(), GLYPH_W * 2);
+        assert_eq!(r.cell_h(), GLYPH_H * 2);
+        assert_eq!(r.output_scale(), 2);
+    }
+
+    #[test]
+    fn with_scale_one_matches_new() {
+        let a = Renderer::new(Theme::builtin(), &config::FontConfig::default());
+        let b = Renderer::with_scale(Theme::builtin(), &config::FontConfig::default(), 1);
+        assert_eq!(a.cell_w(), b.cell_w());
+        assert_eq!(a.cell_h(), b.cell_h());
+        assert_eq!(a.output_scale(), 1);
+    }
+
+    #[test]
+    fn with_scale_clamps_zero_and_negative_to_one() {
+        let r = Renderer::with_scale(Theme::builtin(), &config::FontConfig::default(), 0);
+        assert_eq!(r.output_scale(), 1);
+        let r = Renderer::with_scale(Theme::builtin(), &config::FontConfig::default(), -3);
+        assert_eq!(r.output_scale(), 1);
     }
 
     #[test]

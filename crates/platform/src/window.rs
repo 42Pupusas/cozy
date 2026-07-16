@@ -23,14 +23,14 @@ use crate::draw::Point;
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::id::{
-    BufferId, CallbackId, CompositorId, DisplayId, KeyboardId, ObjectId, PointerId, PoolId,
-    RegistryId, SeatId, ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
+    BufferId, CallbackId, CompositorId, DisplayId, KeyboardId, ObjectId, OutputId, PointerId,
+    PoolId, RegistryId, SeatId, ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
 };
 use crate::keymap;
 use crate::protocol::Modifiers;
 use crate::protocol::{
     self as proto, BufferEvent, BufferRequest, ButtonState, CallbackEvent, CompositorRequest,
-    DisplayEvent, DisplayRequest, Format, Key, KeyState, KeyboardEvent, PointerButton,
+    DisplayEvent, DisplayRequest, Format, Key, KeyState, KeyboardEvent, OutputEvent, PointerButton,
     PointerEvent, PointerRequest, RegistryEvent, RegistryRequest, SeatCapability, SeatEvent,
     SeatRequest, ShmPoolRequest, ShmRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest,
     WmBaseEvent, WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
@@ -58,6 +58,11 @@ pub enum InputEvent {
     Resize {
         cols: u16,
         rows: u16,
+    },
+    /// Mouse-wheel scroll, in lines (positive = scroll up/away, into history;
+    /// negative = scroll down/toward, toward the prompt).
+    Scroll {
+        lines: i32,
     },
 }
 
@@ -174,10 +179,17 @@ pub struct TermWindow {
     renderer: render::Renderer,
     width: i32,
     height: i32,
-    #[allow(dead_code)]
+    /// The `wl_output`-advertised buffer scale this window opened at (1 =
+    /// normal DPI, 2 = HiDPI @2x, ...). Fixed for the window's lifetime
+    /// (Wayland has no live output-scale-change event we handle -- a
+    /// runtime DPI change would need a fresh `wl_surface.enter`/output
+    /// lookup we don't do). Used to convert `xdg_toplevel.configure`'s
+    /// logical-pixel width/height into the physical pixels our shm buffers
+    /// are sized in; see the `Configure` handler.
     scale: i32,
 
-    /// Cell dimensions in pixels.
+    /// Cell dimensions in pixels (physical -- already multiplied by `scale`;
+    /// see [`render::Renderer::with_scale`]).
     cell_w: i32,
     cell_h: i32,
 
@@ -221,18 +233,23 @@ impl TermWindow {
     /// `wake` is the shared UI wakeup channel: the Wayland reader signals it
     /// after pushing events, and the caller hands clones to any other producer
     /// (e.g. the parser thread) so the UI loop's [`wait`](Self::wait) unblocks.
+    ///
+    /// `build_renderer` receives the bound `wl_output`'s integer buffer scale
+    /// (1 if the compositor advertised none, or advertised no output at all)
+    /// and must return a [`render::Renderer`] built at that scale -- normally
+    /// `|scale| render::Renderer::with_scale(theme, font_cfg, scale)`. The
+    /// renderer can't be built before this because it needs the scale to
+    /// rasterize the font at native pixel density (see
+    /// [`render::Renderer::with_scale`]); learning the scale, in turn,
+    /// requires an open connection with `wl_output` bound, which is exactly
+    /// the setup this function does.
     pub fn new(
         title: &str,
         cols: u16,
         rows: u16,
         wake: waker::Waker,
-        renderer: render::Renderer,
+        build_renderer: impl FnOnce(i32) -> render::Renderer,
     ) -> Result<Self> {
-        let cell_w = renderer.cell_w();
-        let cell_h = renderer.cell_h();
-        let width = cols as i32 * cell_w;
-        let height = rows as i32 * cell_h;
-
         let (mut sender, reader, repeat_timer) = Conn::connect()?;
         let (producer, mut events) =
             RingBuffer::<Event>::new(Capacity::exact(EVENT_RING_CAP)).split();
@@ -250,7 +267,27 @@ impl TermWindow {
             })
             .map_err(Error::ReaderSpawn)?;
 
-        let (compositor, shm, wm_base, seat) = Registry::discover(&mut sender, &mut events)?;
+        let (compositor, shm, wm_base, seat, output) =
+            Registry::discover(&mut sender, &mut events)?;
+        // Ask the compositor what buffer scale this output actually wants
+        // (1 = normal DPI, 2 = HiDPI @2x, ...) *before* building the renderer,
+        // so the font rasterizes at native pixel density instead of being
+        // upscaled/blurred later by the compositor scaling our 1x buffer up
+        // to fill the physical pixels. No output bound (rare, but some
+        // headless/nested compositors don't advertise one at startup) means
+        // we can't ask, so fall back to scale 1 -- the pre-HiDPI-support
+        // behavior, not a regression.
+        let scale = match output {
+            Some(o) => Registry::output_scale(&mut sender, &mut events, o),
+            None => 1,
+        };
+        let renderer = build_renderer(scale);
+
+        let cell_w = renderer.cell_w();
+        let cell_h = renderer.cell_h();
+        let width = cols as i32 * cell_w;
+        let height = rows as i32 * cell_h;
+
         // A translucent window (window.opacity < 1.0) needs per-pixel alpha
         // (Argb8888); an opaque one keeps the cheaper Xrgb8888 the compositor
         // doesn't have to blend -- zero behavior change for the common case.
@@ -266,7 +303,10 @@ impl TermWindow {
         sender.request(
             MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
         )?;
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::SetBufferScale).i32(1))?;
+        // Tell the compositor our buffer is already at `scale`x native
+        // density -- matches the physical pixels the font was rasterized at
+        // above, so it composites us 1:1 with no resampling blur.
+        sender.request(MessageBuilder::new(surface, SurfaceRequest::SetBufferScale).i32(scale))?;
 
         let xdg_surface: XdgSurfaceId = sender.alloc_id();
         sender.request(
@@ -329,7 +369,7 @@ impl TermWindow {
             renderer,
             width,
             height,
-            scale: 1,
+            scale,
             cell_w,
             cell_h,
             pointer_pos: Point::new(0, 0),
@@ -506,11 +546,18 @@ impl TermWindow {
 
         // xdg_toplevel.configure (resize)
         if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Configure) {
-            // xdg_toplevel.configure args: (width, height, states[]). A drag
-            // emits these dozens of times a second; just record the latest and
-            // coalesce into a single resize per frame (see `apply_pending_resize`).
-            let w = ev.arg_i32(0);
-            let h = ev.arg_i32(1);
+            // xdg_toplevel.configure args: (width, height, states[]), in
+            // *logical* (surface-local) coordinates -- xdg-shell sizes are
+            // always pre-scale, regardless of our `wl_surface.buffer_scale`.
+            // Our shm buffers are physical pixels (`scale`x the logical
+            // size), so this must be scaled up before it's usable as a
+            // buffer/backbuffer dimension -- see `apply_pending_resize`, the
+            // only reader of `pending_resize`, which now receives already-
+            // scaled physical pixels and no longer needs to know about scale
+            // itself. A drag emits these dozens of times a second; just
+            // record the latest and coalesce into a single resize per frame.
+            let w = ev.arg_i32(0) * self.scale;
+            let h = ev.arg_i32(1) * self.scale;
             if w > 0 && h > 0 {
                 self.pending_resize = Some((w, h));
             }
@@ -561,6 +608,25 @@ impl TermWindow {
                         let state = ButtonState::from_raw(ev.arg(3));
                         // Right-click paste etc. handled by crates/input (M5).
                         let _ = (button, state);
+                    }
+                    Some(PointerEvent::Axis) => {
+                        // Axis args: (time, axis, value). axis 0 = vertical.
+                        // value is wl_fixed (24.8): positive = wheel down
+                        // (content moves down = view scrolls DOWN toward the
+                        // prompt); negative = wheel up (into history).
+                        let axis = ev.arg(1);
+                        let value = ev.fixed(2);
+                        if axis == 0 {
+                            // Convert the scroll magnitude to whole lines. A
+                            // typical wheel detent is 15 (|value| ~ 15.0); map
+                            // each such step to 3 lines, like most terminals.
+                            let px = value.to_pixels().abs();
+                            let steps = ((px + 7) / 15).max(1);
+                            let lines = steps * 3;
+                            let signed = if value.0 < 0 { lines } else { -lines };
+                            self.input_queue
+                                .push_back(InputEvent::Scroll { lines: signed });
+                        }
                     }
                     _ => {}
                 }
@@ -807,14 +873,18 @@ impl TermWindow {
 struct Registry;
 
 impl Registry {
-    /// Bind the four globals every window needs off the wire.
+    /// Bind the globals every window needs off the wire, including (if the
+    /// compositor advertises one) the first `wl_output` -- so
+    /// [`Self::output_scale`] can read its buffer scale before we size any
+    /// buffers. `wl_output` is optional: some setups advertise none at
+    /// startup, in which case the caller falls back to scale 1.
     ///
     /// Was a free `bind_globals(sender, events)` function -- moved onto
     /// `Registry` as its entry point.
     fn discover(
         sender: &mut Sender,
         events: &mut Consumer<Event>,
-    ) -> Result<(CompositorId, ShmId, WmBaseId, SeatId)> {
+    ) -> Result<(CompositorId, ShmId, WmBaseId, SeatId, Option<OutputId>)> {
         let registry: RegistryId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
@@ -824,7 +894,12 @@ impl Registry {
         let mut shm: Option<ShmId> = None;
         let mut wm_base: Option<WmBaseId> = None;
         let mut seat: Option<SeatId> = None;
+        let mut output: Option<OutputId> = None;
 
+        // A registry burst is unbounded and unordered -- there is no event
+        // that says "no more globals", so we can only wait for the globals we
+        // actually require (`wl_output` isn't one; see `sync_roundtrip`
+        // below for how we still give it a chance to appear).
         while compositor.is_none() || shm.is_none() || wm_base.is_none() || seat.is_none() {
             let event = events.pop_block().ok_or(Error::ReaderStopped)?;
             let Event::Bytes(bytes) = event else { continue };
@@ -865,6 +940,10 @@ impl Registry {
                         let v = proto::WL_SEAT.version.min(version);
                         seat = Some(Self::bind(sender, registry, name, &interface, v)?);
                     }
+                    s if s == proto::WL_OUTPUT.name && output.is_none() => {
+                        let v = proto::WL_OUTPUT.version.min(version);
+                        output = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
                     _ => {}
                 }
             }
@@ -874,7 +953,59 @@ impl Registry {
             shm.ok_or(Error::ReaderStopped)?,
             wm_base.ok_or(Error::ReaderStopped)?,
             seat.ok_or(Error::ReaderStopped)?,
+            output,
         ))
+    }
+
+    /// Read `output`'s advertised buffer scale via `wl_display.sync`: send a
+    /// `wl_display.sync` request (which the server answers with a
+    /// `wl_callback.done` only after every request queued before it has been
+    /// fully processed and every event that follows from them has been sent),
+    /// and collect `wl_output.scale` events until that `done` arrives.
+    ///
+    /// This guarantees we've seen every `scale` event the compositor is ever
+    /// going to send for this output before we act on it -- unlike blocking
+    /// on the very first event, which could race ahead of `scale` if the
+    /// compositor happens to send `geometry`/`mode` first. Returns `1` (no
+    /// scaling) if the output never reports a scale (some compositors only
+    /// send it when it's non-default) or times out.
+    fn output_scale(sender: &mut Sender, events: &mut Consumer<Event>, output: OutputId) -> i32 {
+        let cb: CallbackId = sender.alloc_id();
+        if sender
+            .request(MessageBuilder::new(DisplayId(1), DisplayRequest::Sync).new_id(cb))
+            .is_err()
+        {
+            return 1;
+        }
+
+        let mut scale = 1i32;
+        loop {
+            let Some(event) = events.pop_block() else {
+                return scale;
+            };
+            match event {
+                Event::Bytes(bytes) => {
+                    let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
+                        continue;
+                    };
+                    if ev.object_id == output.raw()
+                        && OutputEvent::from_opcode(ev.opcode) == Some(OutputEvent::Scale)
+                    {
+                        scale = ev.i32();
+                    }
+                }
+                Event::Wire {
+                    object_id, opcode, ..
+                } => {
+                    if object_id == cb.raw()
+                        && CallbackEvent::from_opcode(opcode) == Some(CallbackEvent::Done)
+                    {
+                        return scale;
+                    }
+                }
+                Event::Repeat => {}
+            }
+        }
     }
 
     /// Bind one global by name/interface/version off the registry.

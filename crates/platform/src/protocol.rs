@@ -259,6 +259,25 @@ events! {
     }
 }
 
+events! {
+    /// `wl_output` events. We only care about `scale` (HiDPI/fractional-ish
+    /// integer scale factor) — `geometry`/`mode`/`done`/`name`/`description`
+    /// are transcribed for completeness but unused.
+    OutputEvent {
+        /// Physical geometry: position, physical size, subpixel layout, make,
+        /// model, transform.
+        Geometry = 0,
+        /// A display mode (resolution/refresh); may fire multiple times.
+        Mode = 1,
+        /// Marks the end of a burst of `geometry`/`mode`/`scale` events sent
+        /// atomically (so a reader can wait for `done` before acting).
+        Done = 2,
+        /// Integer buffer scale factor this output expects (1 = normal,
+        /// 2 = HiDPI @ 2x, ...). This is the one we actually read.
+        Scale = 3,
+    }
+}
+
 requests! {
     /// `wl_seat` requests — an input-device group (pointer/keyboard/touch).
     /// Touch (`get_touch` = 2) comes when we add that device.
@@ -699,6 +718,11 @@ pub const ZWP_LINUX_DMABUF_V1: Interface = Interface {
 pub const ZXDG_DECORATION_MANAGER_V1: Interface = Interface {
     name: "zxdg_decoration_manager_v1",
     version: 1,
+};
+pub const WL_OUTPUT: Interface = Interface {
+    name: "wl_output",
+    // v2 adds `done`/`scale` events, which is the whole reason we bind this.
+    version: 2,
 };
 
 requests! {

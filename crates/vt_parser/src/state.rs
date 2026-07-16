@@ -7,7 +7,7 @@
 //! Implements the Paul Williams DEC ANSI parser model.
 //! Reference: <https://vt100.net/emu/dec_ansi_parser>
 
-use crate::event::{CsiAction, OscCmd, SgrAttr, C0};
+use crate::event::{CsiAction, OscCmd, SgrAttr, SgrAttrs, C0};
 use crate::params::Params;
 use crate::Event;
 
@@ -71,7 +71,9 @@ impl Parser {
     /// Feed a slice of bytes, invoking `callback` for each event produced.
     ///
     /// This is the primary hot-path entry point. A single byte can produce
-    /// at most one event.
+    /// at most one event. Events borrow from the parser's internal buffers
+    /// (see [`Event`]), so each must be fully handled inside `callback`
+    /// before the next byte is processed.
     pub fn feed(&mut self, bytes: &[u8], mut callback: impl FnMut(Event)) {
         for &b in bytes {
             if let Some(ev) = self.advance(b) {
@@ -85,7 +87,7 @@ impl Parser {
     /// Returns `Some(Event)` when a complete sequence has been recognised,
     /// or `None` when more bytes are needed.
     #[inline]
-    pub fn advance(&mut self, byte: u8) -> Option<Event> {
+    pub fn advance(&mut self, byte: u8) -> Option<Event<'_>> {
         // ── Anywhere transitions (C1 controls, CAN, SUB, ESC) ────────────
         match byte {
             // CAN (0x18) and SUB (0x1A) abort any in-progress sequence.
@@ -141,7 +143,7 @@ impl Parser {
 
     // ── Ground ────────────────────────────────────────────────────────────
 
-    fn ground(&mut self, byte: u8) -> Option<Event> {
+    fn ground(&mut self, byte: u8) -> Option<Event<'static>> {
         match byte {
             // C0 controls
             0x00..=0x1F => Some(Event::Control(C0::from_byte(byte))),
@@ -172,7 +174,7 @@ impl Parser {
 
     // ── UTF-8 continuation ────────────────────────────────────────────────
 
-    fn utf8_continue(&mut self, byte: u8, remaining: u8, acc: u32, total: u8) -> Option<Event> {
+    fn utf8_continue(&mut self, byte: u8, remaining: u8, acc: u32, total: u8) -> Option<Event<'static>> {
         if byte & 0xC0 != 0x80 {
             // Not a continuation byte — replacement character, restart.
             self.state = State::Ground;
@@ -198,7 +200,7 @@ impl Parser {
 
     // ── ESC ───────────────────────────────────────────────────────────────
 
-    fn escape(&mut self, byte: u8) -> Option<Event> {
+    fn escape(&mut self, byte: u8) -> Option<Event<'static>> {
         match byte {
             // Intermediates (space through /)
             0x20..=0x2F => {
@@ -242,7 +244,7 @@ impl Parser {
         }
     }
 
-    fn escape_intermediate(&mut self, byte: u8) -> Option<Event> {
+    fn escape_intermediate(&mut self, byte: u8) -> Option<Event<'static>> {
         match byte {
             0x30..=0x7E => {
                 self.state = State::Ground;
@@ -265,7 +267,7 @@ impl Parser {
 
     // ── CSI ───────────────────────────────────────────────────────────────
 
-    fn csi_entry(&mut self, byte: u8) -> Option<Event> {
+    fn csi_entry(&mut self, byte: u8) -> Option<Event<'static>> {
         match byte {
             // Intermediates
             0x20..=0x2F => {
@@ -303,7 +305,7 @@ impl Parser {
         }
     }
 
-    fn csi_param(&mut self, byte: u8) -> Option<Event> {
+    fn csi_param(&mut self, byte: u8) -> Option<Event<'static>> {
         match byte {
             b'0'..=b'9' => {
                 self.params.push_digit(byte);
@@ -331,7 +333,7 @@ impl Parser {
         }
     }
 
-    fn csi_intermediate(&mut self, byte: u8) -> Option<Event> {
+    fn csi_intermediate(&mut self, byte: u8) -> Option<Event<'static>> {
         match byte {
             0x40..=0x7E => {
                 self.state = State::Ground;
@@ -345,7 +347,7 @@ impl Parser {
         }
     }
 
-    fn dispatch_csi(&mut self, final_byte: u8) -> Event {
+    fn dispatch_csi(&mut self, final_byte: u8) -> Event<'static> {
         let p = &self.params;
         let inter = self.intermediate;
 
@@ -422,12 +424,12 @@ impl Parser {
         Event::Csi(action)
     }
 
-    fn decode_sgr(&self) -> heapless::Vec<SgrAttr, 16> {
-        let mut attrs: heapless::Vec<SgrAttr, 16> = heapless::Vec::new();
+    fn decode_sgr(&self) -> SgrAttrs {
+        let mut attrs = SgrAttrs::EMPTY;
         let p = &self.params;
 
         if p.is_empty() {
-            let _ = attrs.push(SgrAttr::Reset);
+            attrs.push(SgrAttr::Reset);
             return attrs;
         }
 
@@ -497,7 +499,7 @@ impl Parser {
                     continue;
                 }
             };
-            let _ = attrs.push(attr);
+            attrs.push(attr);
             i += 1;
         }
         attrs
@@ -505,20 +507,18 @@ impl Parser {
 
     // ── OSC ───────────────────────────────────────────────────────────────
 
-    fn osc_string(&mut self, byte: u8) -> Option<Event> {
+    fn osc_string(&mut self, byte: u8) -> Option<Event<'_>> {
         match byte {
             // BEL terminates OSC (xterm extension).
             0x07 => {
-                let ev = self.dispatch_osc();
                 self.state = State::Ground;
-                Some(ev)
+                Some(self.dispatch_osc())
             }
             // ST (ESC \) terminates OSC — ESC was already consumed by
             // the anywhere rule; we see the `\` here.
             0x9C | b'\\' => {
-                let ev = self.dispatch_osc();
                 self.state = State::Ground;
-                Some(ev)
+                Some(self.dispatch_osc())
             }
             // Accumulate OSC data.
             _ => {
@@ -531,7 +531,7 @@ impl Parser {
         }
     }
 
-    fn dispatch_osc(&self) -> Event {
+    fn dispatch_osc(&self) -> Event<'_> {
         let data = &self.osc_buf[..self.osc_len];
 
         // Find the ';' separator between Ps and Pt.
@@ -546,33 +546,24 @@ impl Parser {
             .iter()
             .fold(0u8, |acc, &b| acc.saturating_mul(10).saturating_add(b - b'0'));
 
-        let pt = core::str::from_utf8(pt_bytes).unwrap_or("");
+        // Truncation is inherent to osc_buf's fixed OSC_BUF_MAX capacity —
+        // no separate copy/allocation needed; these &str slices borrow
+        // straight out of the parser's own stack buffer. A split may have
+        // landed mid-codepoint (buffer cut a multi-byte UTF-8 sequence), so
+        // fall back to the longest valid-UTF-8 prefix rather than losing
+        // the whole string.
+        let pt = core::str::from_utf8(pt_bytes).unwrap_or_else(|e| {
+            core::str::from_utf8(&pt_bytes[..e.valid_up_to()]).unwrap_or("")
+        });
 
         let cmd = match ps {
-            0 | 2 => {
-                let mut title = heapless::String::<256>::new();
-                for ch in pt.chars().take(256) {
-                    let _ = title.push(ch);
-                }
-                OscCmd::SetTitle(title)
-            }
+            0 | 2 => OscCmd::SetTitle(pt),
             8 => {
                 // OSC 8 ; params ; uri BEL — hyperlink.
-                let mut uri = heapless::String::<256>::new();
-                // pt may be "params;uri" — skip to second ';'.
-                let uri_str = pt.splitn(2, ';').nth(1).unwrap_or(pt);
-                for ch in uri_str.chars().take(256) {
-                    let _ = uri.push(ch);
-                }
+                let uri = pt.splitn(2, ';').nth(1).unwrap_or(pt);
                 OscCmd::Hyperlink { uri }
             }
-            _ => {
-                let mut data_s = heapless::String::<256>::new();
-                for ch in pt.chars().take(256) {
-                    let _ = data_s.push(ch);
-                }
-                OscCmd::Unknown { ps, data: data_s }
-            }
+            _ => OscCmd::Unknown { ps, data: pt },
         };
 
         Event::Osc(cmd)
@@ -580,7 +571,7 @@ impl Parser {
 
     // ── DCS / SOS / PM / APC ─────────────────────────────────────────────
 
-    fn dcs_or_sos(&mut self, byte: u8) -> Option<Event> {
+    fn dcs_or_sos(&mut self, byte: u8) -> Option<Event<'static>> {
         // ST (0x9C) or ESC \ terminates these sequences.
         if byte == 0x9C || byte == b'\\' {
             self.state = State::Ground;
@@ -612,100 +603,141 @@ impl Default for Parser {
 mod tests {
     use super::*;
 
-    fn parse_all(bytes: &[u8]) -> Vec<Event> {
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        p.feed(bytes, |ev| events.push(ev));
-        events
-    }
+    // Events now borrow from the parser's internal buffers (OSC text), so
+    // tests assert inline inside the `feed` callback — mirroring how real
+    // consumers (crates/grid's `Grid::apply`) are required to use them,
+    // rather than collecting into an owned `Vec<Event>`.
 
     #[test]
     fn ascii_text() {
-        let events = parse_all(b"hello");
-        assert_eq!(
-            events,
-            vec![
-                Event::Print('h'),
-                Event::Print('e'),
-                Event::Print('l'),
-                Event::Print('l'),
-                Event::Print('o'),
-            ]
-        );
+        let mut p = Parser::new();
+        let mut seen = Vec::new();
+        p.feed(b"hello", |ev| {
+            if let Event::Print(c) = ev {
+                seen.push(c);
+            }
+        });
+        assert_eq!(seen, vec!['h', 'e', 'l', 'l', 'o']);
     }
 
     #[test]
     fn cursor_up() {
-        let events = parse_all(b"\x1b[3A");
-        assert_eq!(events, vec![Event::Csi(CsiAction::CursorUp(3))]);
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[3A", |ev| {
+            assert_eq!(ev, Event::Csi(CsiAction::CursorUp(3)));
+            count += 1;
+        });
+        assert_eq!(count, 1);
     }
 
     #[test]
     fn cursor_position_default() {
-        let events = parse_all(b"\x1b[H");
-        assert_eq!(
-            events,
-            vec![Event::Csi(CsiAction::CursorPosition { row: 1, col: 1 })]
-        );
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[H", |ev| {
+            assert_eq!(ev, Event::Csi(CsiAction::CursorPosition { row: 1, col: 1 }));
+            count += 1;
+        });
+        assert_eq!(count, 1);
     }
 
     #[test]
     fn sgr_bold_fg_red() {
-        let events = parse_all(b"\x1b[1;31m");
-        if let Some(Event::Csi(CsiAction::Sgr(attrs))) = events.first() {
-            assert!(attrs.contains(&SgrAttr::Bold));
-            assert!(attrs.contains(&SgrAttr::FgStandard(1)));
-        } else {
-            panic!("expected SGR event, got {events:?}");
-        }
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[1;31m", |ev| {
+            if let Event::Csi(CsiAction::Sgr(attrs)) = ev {
+                assert!(attrs.contains(&SgrAttr::Bold));
+                assert!(attrs.contains(&SgrAttr::FgStandard(1)));
+                count += 1;
+            } else {
+                panic!("expected SGR event, got {ev:?}");
+            }
+        });
+        assert_eq!(count, 1);
     }
 
     #[test]
     fn sgr_reset_empty() {
-        let events = parse_all(b"\x1b[m");
-        if let Some(Event::Csi(CsiAction::Sgr(attrs))) = events.first() {
-            assert!(attrs.contains(&SgrAttr::Reset));
-        } else {
-            panic!("expected SGR reset, got {events:?}");
-        }
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[m", |ev| {
+            if let Event::Csi(CsiAction::Sgr(attrs)) = ev {
+                assert!(attrs.contains(&SgrAttr::Reset));
+                count += 1;
+            } else {
+                panic!("expected SGR reset, got {ev:?}");
+            }
+        });
+        assert_eq!(count, 1);
     }
 
     #[test]
     fn osc_title() {
-        let events = parse_all(b"\x1b]2;My Terminal\x07");
-        assert!(matches!(
-            events.first(),
-            Some(Event::Osc(OscCmd::SetTitle(_)))
-        ));
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b]2;My Terminal\x07", |ev| {
+            assert!(matches!(ev, Event::Osc(OscCmd::SetTitle("My Terminal"))));
+            count += 1;
+        });
+        assert_eq!(count, 1);
     }
 
     #[test]
     fn erase_display() {
-        let events = parse_all(b"\x1b[2J");
-        assert_eq!(events, vec![Event::Csi(CsiAction::EraseDisplay(2))]);
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[2J", |ev| {
+            assert_eq!(ev, Event::Csi(CsiAction::EraseDisplay(2)));
+            count += 1;
+        });
+        assert_eq!(count, 1);
     }
 
     #[test]
     fn dec_set() {
-        let events = parse_all(b"\x1b[?25h");
-        assert_eq!(events, vec![Event::Csi(CsiAction::DecSet(25))]);
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[?25h", |ev| {
+            assert_eq!(ev, Event::Csi(CsiAction::DecSet(25)));
+            count += 1;
+        });
+        assert_eq!(count, 1);
     }
 
     #[test]
     fn utf8_two_byte() {
-        let events = parse_all("é".as_bytes());
-        assert_eq!(events, vec![Event::Print('é')]);
+        let mut p = Parser::new();
+        let mut seen = Vec::new();
+        p.feed("é".as_bytes(), |ev| {
+            if let Event::Print(c) = ev {
+                seen.push(c);
+            }
+        });
+        assert_eq!(seen, vec!['é']);
     }
 
     #[test]
     fn utf8_emoji() {
-        let events = parse_all("🦀".as_bytes());
-        assert_eq!(events, vec![Event::Print('🦀')]);
+        let mut p = Parser::new();
+        let mut seen = Vec::new();
+        p.feed("🦀".as_bytes(), |ev| {
+            if let Event::Print(c) = ev {
+                seen.push(c);
+            }
+        });
+        assert_eq!(seen, vec!['🦀']);
     }
 
     #[test]
     fn c0_bell() {
-        let events = parse_all(b"\x07");
-        assert_eq!(events, vec![Event::Control(C0::Bell)]);
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x07", |ev| {
+            assert_eq!(ev, Event::Control(C0::Bell));
+            count += 1;
+        });
+        assert_eq!(count, 1);
     }
 }

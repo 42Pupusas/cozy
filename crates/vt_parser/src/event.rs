@@ -3,6 +3,10 @@
 
 use crate::params::Params;
 
+/// Maximum number of SGR attributes tracked in one `CSI … m` sequence.
+/// Fixed-size stack array — no heap allocation on the hot path.
+pub const MAX_SGR_ATTRS: usize = 16;
+
 /// C0 control character (0x00–0x1F, excluding ESC).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C0 {
@@ -79,6 +83,56 @@ pub enum SgrAttr {
     BgRgb(u8, u8, u8),
 }
 
+/// Fixed-capacity stack buffer of decoded SGR attributes for one `CSI … m`.
+///
+/// Overflow (more than [`MAX_SGR_ATTRS`] attrs in one sequence — pathological
+/// input) silently drops the extras rather than growing the heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SgrAttrs {
+    buf: [SgrAttr; MAX_SGR_ATTRS],
+    len: usize,
+}
+
+impl SgrAttrs {
+    pub(crate) const EMPTY: Self = Self {
+        buf: [SgrAttr::Reset; MAX_SGR_ATTRS],
+        len: 0,
+    };
+
+    pub(crate) fn push(&mut self, attr: SgrAttr) {
+        if self.len < MAX_SGR_ATTRS {
+            self.buf[self.len] = attr;
+            self.len += 1;
+        }
+    }
+
+    /// Attributes accumulated so far, in sequence order.
+    #[must_use]
+    pub fn as_slice(&self) -> &[SgrAttr] {
+        &self.buf[..self.len]
+    }
+
+    /// Iterate over the attributes.
+    pub fn iter(&self) -> impl Iterator<Item = &SgrAttr> {
+        self.as_slice().iter()
+    }
+
+    /// True if the given attribute was seen in this sequence.
+    #[must_use]
+    pub fn contains(&self, attr: &SgrAttr) -> bool {
+        self.as_slice().contains(attr)
+    }
+}
+
+impl<'a> IntoIterator for &'a SgrAttrs {
+    type Item = &'a SgrAttr;
+    type IntoIter = std::slice::Iter<'a, SgrAttr>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
 /// Parsed CSI action (the final byte of a CSI sequence determines the action).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CsiAction {
@@ -117,7 +171,7 @@ pub enum CsiAction {
     /// HVP — horizontal vertical position (f, alias of CUP).
     HorizVertPos { row: u16, col: u16 },
     /// SGR — select graphic rendition (m).
-    Sgr(heapless::Vec<SgrAttr, 16>),
+    Sgr(SgrAttrs),
     /// DSR — device status report (n).
     DeviceStatusReport(u8),
     /// DECSTBM — set top and bottom margins (r).
@@ -139,23 +193,28 @@ pub enum CsiAction {
 }
 
 /// Parsed OSC command.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OscCmd {
+///
+/// Text payloads borrow from the parser's internal OSC accumulation buffer,
+/// so an `OscCmd` (and the `Event` wrapping it) must be consumed before the
+/// next byte is fed to the parser — exactly what the `Parser::feed` callback
+/// shape guarantees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OscCmd<'a> {
     /// OSC 0 / 2 — set window title.
-    SetTitle(heapless::String<256>),
+    SetTitle(&'a str),
     /// OSC 4 — set color.
-    SetColor { index: u8, spec: heapless::String<32> },
+    SetColor { index: u8, spec: &'a str },
     /// OSC 8 — hyperlink.
-    Hyperlink {
-        uri: heapless::String<256>,
-    },
+    Hyperlink { uri: &'a str },
     /// Unrecognised OSC.
-    Unknown { ps: u8, data: heapless::String<256> },
+    Unknown { ps: u8, data: &'a str },
 }
 
-/// A terminal event emitted by the parser.
+/// A terminal event emitted by the parser. Borrows from the parser's
+/// internal buffers (see [`OscCmd`]), so it's only valid for the duration of
+/// the [`Parser::feed`] callback that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event {
+pub enum Event<'a> {
     /// A printable Unicode character (or a multi-byte sequence decoded to char).
     Print(char),
     /// C0 control character.
@@ -165,7 +224,7 @@ pub enum Event {
     /// A fully parsed CSI sequence.
     Csi(CsiAction),
     /// A fully parsed OSC sequence.
-    Osc(OscCmd),
+    Osc(OscCmd<'a>),
     /// DCS / APC / PM / SOS — ignored for now, emitted as raw bytes.
     Dcs,
     /// Parser encountered data it doesn't handle; bytes were consumed cleanly.

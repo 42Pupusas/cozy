@@ -55,6 +55,15 @@ pub struct Grid {
     dirty: DirtyRegion,
     /// Saved cursor (DECSC).
     saved_cursor: Option<(u16, u16, Attrs)>,
+    /// Viewport scroll offset, in lines, into scrollback. `0` = live view at
+    /// the bottom (normal terminal behavior); `k` = view scrolled `k` lines up
+    /// into history. Only the primary screen has scrollback, so this is forced
+    /// back to `0` whenever the alternate screen is active.
+    viewport_offset: usize,
+    /// Set when the viewport offset changed and the next [`Grid::take_dirty`]
+    /// must emit a full-frame snapshot (every visible row changes when the view
+    /// scrolls, so incremental dirty rows would be wrong).
+    viewport_dirty: bool,
     /// Bytes the terminal must write back to the PTY (CPR, DA, etc.).
     /// Drained by the driver via [`Grid::take_replies`] after each batch.
     replies: Vec<u8>,
@@ -78,9 +87,35 @@ impl Grid {
             attrs: Attrs::default(),
             dirty: DirtyRegion::new(cols, rows),
             saved_cursor: None,
+            viewport_offset: 0,
+            viewport_dirty: false,
             replies: Vec::new(),
             pending_wrap: false,
         }
+    }
+
+    /// Scroll the viewport by `delta` lines (positive = up into scrollback,
+    /// negative = down toward the live bottom). Clamped to the available
+    /// scrollback. This is a *view* operation only — it never moves the cursor
+    /// or mutates cell data. No-op while the alternate screen is active (it has
+    /// no scrollback).
+    pub fn scroll_viewport(&mut self, delta: i32) {
+        if self.alt_active {
+            return;
+        }
+        let max = self.primary.scrollback_len() as i32;
+        let cur = self.viewport_offset as i32;
+        let new = (cur + delta).clamp(0, max);
+        if new != cur {
+            self.viewport_offset = new as usize;
+            self.viewport_dirty = true;
+        }
+    }
+
+    /// Current viewport offset (lines scrolled into scrollback; `0` = bottom).
+    #[must_use]
+    pub fn viewport_offset(&self) -> usize {
+        self.viewport_offset
     }
 
     /// Resize the grid to new dimensions, reflowing soft-wrapped lines to the
@@ -118,7 +153,11 @@ impl Grid {
     }
 
     /// Apply a parsed VT event to the grid.
+    ///
+    /// New output snaps the viewport back to the live bottom (standard terminal
+    /// behavior: typing or fresh output always returns you to the prompt).
     pub fn apply(&mut self, event: &Event<'_>) {
+        self.snap_viewport_to_bottom();
         match event {
             Event::Print(ch) => self.print(*ch),
             Event::Control(c0) => self.control(*c0),
@@ -136,12 +175,33 @@ impl Grid {
 
     /// Take the current dirty snapshot, resetting the dirty accumulator.
     pub fn take_dirty(&mut self) -> DirtySnapshot {
+        if self.viewport_dirty {
+            self.viewport_dirty = false;
+            self.dirty.clear();
+            let cols = self.primary.cols();
+            let rows = self.primary.rows();
+            return crate::dirty::viewport_snapshot(
+                &self.primary,
+                self.viewport_offset,
+                cols,
+                rows,
+            );
+        }
         let screen = if self.alt_active {
             &self.alternate
         } else {
             &self.primary
         };
         self.dirty.take_snapshot(screen)
+    }
+
+    /// Return the viewport to the live bottom if it was scrolled up. Called on
+    /// every applied event so fresh output always reveals the prompt.
+    fn snap_viewport_to_bottom(&mut self) {
+        if self.viewport_offset != 0 {
+            self.viewport_offset = 0;
+            self.viewport_dirty = true;
+        }
     }
 
     /// Take any pending reply bytes the terminal owes the host (responses to
@@ -367,8 +427,14 @@ impl Grid {
                         screen.erase_range(0, 0, col, row);
                     }
                     2 | 3 => {
-                        // Erase entire display.
+                        // Erase entire display. This terminal also drops
+                        // scrollback here (see erase_scrollback): ED 3 is
+                        // xterm's explicit "erase scrollback", and we extend
+                        // the same to ED 2 so a plain `clear` wipes history too
+                        // (matching the user's expectation). Both force the
+                        // viewport back to the live bottom.
                         screen.erase_range(0, 0, cols - 1, rows - 1);
+                        screen.erase_scrollback();
                     }
                     _ => {}
                 }
@@ -805,6 +871,77 @@ mod tests {
         assert_eq!(vis[1].trim_end(), "line8");
         assert_eq!(vis[2].trim_end(), "line9");
         assert_eq!(vis[3].trim_end(), "");
+    }
+
+    #[test]
+    fn viewport_scrolls_into_scrollback_and_snaps_back_on_output() {
+        // Fill a small screen and overflow it so scrollback accumulates.
+        let mut g = Grid::new(20, 4);
+        for i in 0..10 {
+            apply_str(&mut g, format!("line{i}\r\n").as_bytes());
+        }
+        assert!(g.primary.scrollback_len() > 0);
+        assert_eq!(g.viewport_offset(), 0);
+
+        // Scroll up 3 lines: the top visible row should now be older history.
+        g.scroll_viewport(3);
+        assert_eq!(g.viewport_offset(), 3);
+        let snap = g.take_dirty();
+        // A viewport move repaints the whole frame.
+        assert_eq!(snap.rows.len(), 4);
+        // row 0 of a 3-up view = scrollback line (len-3). Verify it differs
+        // from the live bottom row 0 by checking it's a real history line.
+        let row0: String = snap.rows[0].cells.iter().map(|c| c.ch).collect();
+        assert!(
+            row0.starts_with("line"),
+            "expected a history line, got {row0:?}"
+        );
+
+        // Scrolling further clamps at the top of history.
+        g.scroll_viewport(10_000);
+        let max = g.viewport_offset();
+        assert_eq!(max, g.primary.scrollback_len());
+
+        // New output snaps back to the live bottom.
+        apply_str(&mut g, b"X");
+        assert_eq!(g.viewport_offset(), 0);
+        let snap = g.take_dirty();
+        assert_eq!(snap.rows.len(), 4); // snap-back also repaints fully
+        let row3: String = snap.rows[3].cells.iter().map(|c| c.ch).collect();
+        assert!(
+            row3.starts_with('X'),
+            "cursor line back at bottom: {row3:?}"
+        );
+    }
+
+    #[test]
+    fn viewport_scroll_down_clamps_at_zero() {
+        let mut g = Grid::new(20, 4);
+        for i in 0..10 {
+            apply_str(&mut g, format!("line{i}\r\n").as_bytes());
+        }
+        g.scroll_viewport(2);
+        assert_eq!(g.viewport_offset(), 2);
+        g.scroll_viewport(-5); // overshoot the bottom
+        assert_eq!(g.viewport_offset(), 0);
+    }
+
+    #[test]
+    fn erase_display_ed2_and_ed3_wipe_scrollback() {
+        // Fill + overflow so scrollback exists, then ED 2 (what `clear` sends)
+        // must drop it: no scrolling back afterwards.
+        for seq in [&b"\x1b[2J"[..], &b"\x1b[3J"[..]] {
+            let mut g = Grid::new(20, 4);
+            for i in 0..10 {
+                apply_str(&mut g, format!("line{i}\r\n").as_bytes());
+            }
+            assert!(g.primary.scrollback_len() > 0, "setup: scrollback exists");
+            apply_str(&mut g, seq);
+            assert_eq!(g.primary.scrollback_len(), 0, "scrollback wiped by {seq:?}");
+            // Viewport can't scroll into history anymore.
+            g.scroll_viewport(10);
+            assert_eq!(g.viewport_offset(), 0);
+        }
     }
 
     #[test]

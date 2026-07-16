@@ -91,6 +91,33 @@ impl DirtyRegion {
             cols: self.cols,
         }
     }
+
+    /// Reset the tracker without emitting any rows (a clean, empty snapshot).
+    pub(crate) fn clear(&mut self) {
+        for w in &mut self.words {
+            *w = 0;
+        }
+    }
+}
+
+/// Build a full-frame snapshot of the whole visible screen through a viewport
+/// offset (`0` = live view at the bottom; `k` = scrolled `k` lines into
+/// scrollback). Used when the viewport moves: every row's content changes, so
+/// the renderer needs a complete repaint rather than incremental dirty rows.
+pub(crate) fn viewport_snapshot(
+    screen: &Screen,
+    viewport_offset: usize,
+    cols: u16,
+    rows: u16,
+) -> DirtySnapshot {
+    let mut out = Vec::with_capacity(usize::from(rows));
+    for row in 0..rows {
+        let cells: Vec<Cell> = (0..cols)
+            .map(|col| screen.get_viewport_cell(col, row, viewport_offset))
+            .collect();
+        out.push(DirtyRow { row, cells });
+    }
+    DirtySnapshot { rows: out, cols }
 }
 
 /// A row of cells that needs to be redrawn.

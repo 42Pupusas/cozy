@@ -67,6 +67,32 @@ impl Screen {
         self.buf[self.visible_idx(col, row)]
     }
 
+    /// Number of scrollback lines currently stored above the visible area.
+    #[must_use]
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback_len
+    }
+
+    /// Get a cell `(col, row)` as seen through a viewport offset.
+    ///
+    /// `viewport_offset == 0` is the live view (the bottom of the buffer).
+    /// `viewport_offset == k` scrolls the whole view up `k` lines into
+    /// scrollback: physical row 0 shows scrollback line
+    /// `scrollback_len - k`. Rows above the top of history read as blank.
+    #[must_use]
+    pub fn get_viewport_cell(&self, col: u16, row: u16, viewport_offset: usize) -> Cell {
+        // Index into the linear [scrollback | visible] buffer by row.
+        // `abs_row` is the absolute physical row: the view's row 0 sits at
+        // absolute row `scrollback_len - viewport_offset`.
+        let sb = self.scrollback_len as i64;
+        let abs_row = sb - viewport_offset as i64 + i64::from(row);
+        if abs_row < 0 {
+            return Cell::default();
+        }
+        let idx = abs_row as usize * usize::from(self.cols) + usize::from(col);
+        self.buf.get(idx).copied().unwrap_or_default()
+    }
+
     /// Set the cell at `(col, row)` in the visible area.
     pub fn set_cell(&mut self, col: u16, row: u16, cell: Cell) {
         let idx = self.visible_idx(col, row);
@@ -127,6 +153,33 @@ impl Screen {
         for w in &mut self.wrapped[self.scrollback_len..] {
             *w = false;
         }
+    }
+
+    /// Discard all scrollback history. The visible area keeps its content and
+    /// stays in place; the stored rows above it are simply forgotten (the
+    /// visible rows are copied down over the scrollback region). Used by the
+    /// ED 3 (`CSI 3 J`) "erase scrollback" sequence — and, per this terminal's
+    /// chosen behavior, by ED 2 / `clear` as well.
+    pub fn erase_scrollback(&mut self) {
+        if self.scrollback_len == 0 {
+            return;
+        }
+        let cols = usize::from(self.cols);
+        let sb = self.scrollback_len;
+        let vis_cells = usize::from(self.rows) * cols;
+        // Move the visible block down to the front of the buffer.
+        self.buf.copy_within(sb * cols..sb * cols + vis_cells, 0);
+        self.wrapped.copy_within(sb..sb + usize::from(self.rows), 0);
+        // Blank the now-stale region after the visible block (old scrollback
+        // tail + the fixed scrollback_max capacity region may hold leftovers).
+        let tail = vis_cells;
+        let cap = (usize::from(self.rows) + self.scrollback_max) * cols;
+        let buf_len = self.buf.len();
+        self.buf[tail..cap.min(buf_len)].fill(Cell::default());
+        for w in &mut self.wrapped[usize::from(self.rows)..] {
+            *w = false;
+        }
+        self.scrollback_len = 0;
     }
 
     /// Scroll the region `[top, bot]` up by `n` lines, pulling blank lines at

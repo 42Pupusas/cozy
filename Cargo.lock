@@ -46,6 +46,7 @@ dependencies = [
  "quetzal-uring",
  "quetzalcoatl",
  "ququmatz",
+ "waker",
 ]
 
 [[package]]

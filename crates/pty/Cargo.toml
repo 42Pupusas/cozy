@@ -10,3 +10,6 @@ workspace = true
 ququmatz      = { workspace = true }
 quetzal-uring = { workspace = true }
 quetzalcoatl  = { workspace = true }
+
+[dev-dependencies]
+waker = { path = "../waker" }

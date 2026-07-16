@@ -17,11 +17,26 @@
 //!    ├── child  → execs the shell (slave fd = stdin/stdout/stderr)
 //!    └── parent → master fd registered with quetzal-uring UringQueue
 //!                     │
-//!                     ├── read SQEs  → CQEs → SPSC ring → vt_parser
-//!                     └── write SQEs ← SPSC ring ← input encoder
+//!                     ├── read SQE   (master fd)  → CQE → `on_output` callback
+//!                     ├── write SQE  (master fd)  ← bytes from `next_input`
+//!                     ├── read SQE   (signalfd)   → SIGCHLD → child reaped
+//!                     └── read SQE   (wake eventfd) → drain `next_input`
 //! ```
 //!
-//! [`Pty::run`] is the blocking event loop. Spawn it on a dedicated thread.
+//! [`Pty::run`] is the blocking event loop: it parks in `io_uring_enter`
+//! until *any* of the four sources completes — no `poll(2)`, no
+//! busy-spinning, no auxiliary wait primitive. Spawn it on a dedicated
+//! thread.
+//!
+//! The caller owns the message transport: `run` pulls input via a
+//! `next_input` closure and hands PTY output to an `on_output` closure, so
+//! this crate stays agnostic of whichever ring buffers the application
+//! wires between its threads. Producers must signal the wake eventfd
+//! (passed to [`Pty::spawn`]) after queueing input; the armed eventfd read
+//! SQE completes and the loop drains.
+//!
+//! [`PtySimple`] (plain non-blocking syscalls) is retained for tests and as
+//! a reference implementation.
 
 mod error;
 mod simple;
@@ -32,9 +47,8 @@ pub use simple::PtySimple;
 pub use sys::{ChildPid, CloseFd, PtyIoctl, RawPty, WaitStatus, WinSize};
 
 use quetzal_uring::{CqConsumer, SqProducer, UringQueue};
-use quetzalcoatl::capacity::Capacity;
-use quetzalcoatl::spsc::RingBuffer as SpscRing;
 use ququmatz::Sqe;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -44,78 +58,94 @@ const RING_ENTRIES: u32 = 64;
 /// Size of each read buffer submitted to `io_uring`.
 pub const READ_BUF_SIZE: usize = 4096;
 
-/// Capacity of the SPSC chunk ring towards the VT parser.
-const CHUNK_RING_CAP: usize = 256;
-
-/// Capacity of the write-byte ring from the input encoder.
-const WRITE_RING_CAP: usize = CHUNK_RING_CAP * READ_BUF_SIZE;
+/// Size of the (single) in-flight write buffer.
+const WRITE_BUF_SIZE: usize = 4096;
 
 /// `user_data` tags for CQE dispatch.
 mod tag {
     pub const READ: u64 = 1;
     pub const WRITE: u64 = 2;
     pub const SIGNAL: u64 = 3;
+    pub const WAKE: u64 = 4;
 }
 
-/// A fixed-size byte chunk produced by a PTY read.
-#[derive(Clone, Copy)]
-pub struct ByteChunk {
-    /// Raw bytes from the PTY master fd.
-    pub buf: [u8; READ_BUF_SIZE],
-    /// Number of valid bytes in `buf`.
-    pub len: usize,
+/// One message from the application into the PTY event loop.
+///
+/// The `next_input` closure handed to [`Pty::run`] translates whatever the
+/// application's own ring carries into this shape.
+pub enum PtyInput {
+    /// Raw bytes to write to the PTY master (keystrokes, paste, replies).
+    Bytes(Box<[u8]>),
+    /// Push a new window size to the child (`TIOCSWINSZ` → SIGWINCH).
+    Resize(WinSize),
+    /// Stop the event loop and tear the child down.
+    Quit,
 }
-
-/// The consumer half of the byte-chunk SPSC ring.  Hand to the VT parser thread.
-pub type ChunkConsumer = quetzalcoatl::spsc::Consumer<ByteChunk>;
-
-/// The producer half of the write-bytes SPSC ring.  Hand to the input encoder.
-pub type WriteProducer = quetzalcoatl::spsc::Producer<u8>;
-
-/// The consumer half of the write-bytes SPSC ring (PTY thread side).
-type WriteConsumer = quetzalcoatl::spsc::Consumer<u8>;
 
 /// Owned pseudoterminal handle.
 ///
 /// Created by [`Pty::spawn`]. Drive I/O by calling [`Pty::run`] on a
-/// dedicated thread; write to the PTY by pushing bytes onto the
-/// [`WriteProducer`] returned alongside it.
+/// dedicated thread.
 pub struct Pty {
-    /// Master fd of the pseudoterminal.
-    master_fd: ququmatz::RawFd,
-    /// PID of the child process.
-    child_pid: ChildPid,
     /// `io_uring` queue driving all master-fd I/O.
+    ///
+    /// Declared before the I/O buffers below so the ring (and any still
+    /// in-flight kernel ops) is torn down first on drop — the kernel
+    /// quiesces pending SQEs when the ring fd closes, before the buffers
+    /// they point into are freed.
     queue: UringQueue,
     /// SQ producer — for submitting read/write SQEs.
     sq: SqProducer,
     /// CQ consumer — drained in the event loop.
     cq: CqConsumer,
-    /// Read buffers (ping-pong: one in flight, one being read from).
-    read_bufs: Box<[[u8; READ_BUF_SIZE]; 2]>,
-    /// Which read buffer index is currently submitted.
-    read_buf_idx: usize,
-    /// SPSC producer: PTY bytes → VT parser.
-    chunk_producer: quetzalcoatl::spsc::Producer<ByteChunk>,
+    /// Master fd of the pseudoterminal.
+    master_fd: ququmatz::RawFd,
+    /// PID of the child process.
+    child_pid: ChildPid,
+    /// Read buffer. Exactly one master-fd read SQE is in flight at a time,
+    /// re-armed only after its CQE is consumed, so a single stable buffer
+    /// suffices (heap-allocated: its address survives `Pty` being moved
+    /// onto the event-loop thread).
+    read_buf: Box<[u8; READ_BUF_SIZE]>,
+    /// Write buffer for the (single) in-flight write SQE. Writes are
+    /// serialized — one SQE at a time — because concurrent writes to the
+    /// same fd carry no ordering guarantee and terminal input bytes must
+    /// stay strictly ordered.
+    write_buf: Box<[u8; WRITE_BUF_SIZE]>,
+    /// Valid length of the in-flight write.
+    write_len: usize,
+    /// Whether a write SQE is currently in flight.
+    write_in_flight: bool,
+    /// Bytes queued behind the in-flight write.
+    pending_write: VecDeque<u8>,
     /// `signalfd` fd for SIGCHLD.
     signal_fd: ququmatz::RawFd,
-    /// Stable buffer the kernel writes `signalfd_siginfo` into. Owned by
-    /// `Pty` (not leaked per-call) since only one signal read is ever
-    /// in-flight at a time; the heap allocation's address doesn't move even
-    /// when `Pty` itself is moved (e.g. onto its dedicated thread).
+    /// Stable buffer the kernel writes `signalfd_siginfo` into.
     signal_buf: Box<[u8; 128]>,
-    /// Set by the caller to request a graceful shutdown.
+    /// Wake eventfd (owned by the caller — NOT closed on teardown). A read
+    /// SQE stays armed on it; producers signal it after queueing input.
+    wake_fd: ququmatz::RawFd,
+    /// Stable 8-byte buffer for the eventfd counter read. Reading the
+    /// counter also resets it, so the read SQE doubles as the drain.
+    wake_buf: Box<[u8; 8]>,
+    /// Set by the caller (or another thread) to request a graceful shutdown.
     shutdown: Arc<AtomicBool>,
 }
 
 impl Pty {
     /// Spawn a shell under a new pseudoterminal.
     ///
-    /// Returns:
-    /// - The [`Pty`] event-loop handle.
-    /// - [`ChunkConsumer`] — hand to the VT parser thread.
-    /// - [`WriteProducer`] — hand to the input encoder thread.
-    /// - [`Arc<AtomicBool>`] — set to `true` to request shutdown.
+    /// `wake_fd` is a caller-owned eventfd: signal it after queueing input
+    /// so the event loop wakes and drains `next_input`. It is polled via an
+    /// armed read SQE and is **not** closed by this type.
+    ///
+    /// `shutdown` is checked once per loop iteration; set it *and* signal
+    /// `wake_fd` to stop the loop from another thread.
+    ///
+    /// SIGCHLD is blocked on the calling thread and routed to a `signalfd`.
+    /// For reliable delivery the signal should be blocked on **every**
+    /// thread — call [`RawPty::block_sigchld`] on the main thread before
+    /// spawning any others, so the mask is inherited.
     ///
     /// # Errors
     ///
@@ -124,52 +154,37 @@ impl Pty {
         shell: &str,
         args: &[&str],
         win_size: WinSize,
-    ) -> Result<
-        (
-            Self,
-            ChunkConsumer,
-            WriteProducer,
-            Arc<AtomicBool>,
-            WriteConsumer,
-        ),
-        PtyError,
-    > {
+        wake_fd: i32,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self, PtyError> {
         let (master_fd, child_pid) = sys::RawPty::fork(shell, args, win_size)?;
         let signal_fd = sys::RawPty::signalfd_for_sigchld()?;
 
         let (queue, sq, cq) = UringQueue::new(RING_ENTRIES).map_err(PtyError::UringSetup)?;
 
-        let (chunk_tx, chunk_rx) =
-            SpscRing::<ByteChunk>::new(Capacity::exact(CHUNK_RING_CAP)).split();
-        let (write_tx, write_rx) = SpscRing::<u8>::new(Capacity::exact(WRITE_RING_CAP)).split();
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let pty = Self {
-            master_fd,
-            child_pid,
+        Ok(Self {
             queue,
             sq,
             cq,
-            read_bufs: Box::new([[0u8; READ_BUF_SIZE]; 2]),
-            read_buf_idx: 0,
-            chunk_producer: chunk_tx,
+            master_fd,
+            child_pid,
+            read_buf: Box::new([0u8; READ_BUF_SIZE]),
+            write_buf: Box::new([0u8; WRITE_BUF_SIZE]),
+            write_len: 0,
+            write_in_flight: false,
+            pending_write: VecDeque::new(),
             signal_fd,
             signal_buf: Box::new([0u8; 128]),
-            shutdown: Arc::clone(&shutdown),
-        };
-
-        // write_rx is the consumer half of the write ring; run() takes it
-        // as a separate argument (not stored on Pty) because run() takes
-        // self by value and needs &mut write_rx each loop iteration. The
-        // caller must pass it straight through to Pty::run on whichever
-        // thread drives the event loop.
-        Ok((pty, chunk_rx, write_tx, shutdown, write_rx))
+            wake_fd: ququmatz::RawFd::from_raw(wake_fd as usize),
+            wake_buf: Box::new([0u8; 8]),
+            shutdown,
+        })
     }
 
     /// Resize the terminal window.
     ///
-    /// Safe to call from any thread at any time.
+    /// Safe to call from any thread at any time (it's a plain ioctl); the
+    /// event loop also applies [`PtyInput::Resize`] messages itself.
     ///
     /// # Errors
     ///
@@ -179,130 +194,227 @@ impl Pty {
     }
 
     /// Run the PTY I/O event loop. **Blocks the calling thread until the
-    /// child exits or the shutdown flag is set.**
+    /// child exits, `next_input` yields [`PtyInput::Quit`], or the shutdown
+    /// flag is set (plus a wake signal).**
     ///
-    /// `write_rx` is the consumer side of the write ring; bytes pushed
-    /// by the input encoder are batched and submitted as write SQEs.
+    /// `next_input` is polled to exhaustion after every wakeup; resizes are
+    /// coalesced within a drain (only the last is applied) so an
+    /// interactive resize drag doesn't storm the shell with `SIGWINCH`es.
     ///
-    /// Returns the child's exit code on success.
+    /// `on_output` receives each chunk of PTY output, at most
+    /// [`READ_BUF_SIZE`] bytes per call, in order.
+    ///
+    /// Returns the child's exit code on success (0 when the loop was
+    /// stopped before the child exited).
     ///
     /// # Errors
     ///
     /// Returns [`PtyError`] on unrecoverable `io_uring` errors.
-    pub fn run(mut self, mut write_rx: WriteConsumer) -> Result<i32, PtyError> {
-        self.arm_read(self.read_buf_idx)?;
+    pub fn run<I, O>(mut self, mut next_input: I, mut on_output: O) -> Result<i32, PtyError>
+    where
+        I: FnMut() -> Option<PtyInput>,
+        O: FnMut(&[u8]),
+    {
+        self.arm_read()?;
         self.arm_signal()?;
+        self.arm_wake()?;
 
         let mut exit_code: i32 = 0;
+        // Whether the child has already been reaped via SIGCHLD (skip the
+        // hangup+reap teardown path in that case).
+        let mut reaped = false;
+        // Whether the loop stopped because the master fd hit EOF/EIO (the
+        // child exited of its own accord, vs. a caller-requested shutdown).
+        let mut got_eof = false;
+
+        // Drain any input queued before the loop started (the producer may
+        // have signalled the eventfd before our wake SQE was armed).
+        let mut quit_requested = self.drain_input(&mut next_input);
+        self.flush_write()?;
 
         'event_loop: loop {
-            // Flush any pending writes from the input encoder.
-            self.drain_write_ring(&mut write_rx)?;
+            if quit_requested || self.shutdown.load(Ordering::Acquire) {
+                break 'event_loop;
+            }
 
-            // Block until at least one CQE is ready.
+            // Park in the kernel until at least one CQE is ready.
             self.queue
                 .submit_and_wait(1)
                 .map_err(PtyError::UringEnter)?;
 
-            // Process all ready CQEs.
-            let mut got_exit = false;
-            let cq = &self.cq;
-
-            // Collect results — we can't borrow self mutably inside the closure,
-            // so accumulate actions first and apply them after. Unbounded
-            // (not a fixed-size array): a burst of completions must never be
-            // silently truncated and lose a read re-arm.
+            // Collect completions first — we can't borrow self mutably
+            // inside the drain closure. Unbounded Vec: a burst of
+            // completions must never be truncated and lose a re-arm.
             let mut actions: Vec<CqeAction> = Vec::new();
-
+            let cq = &self.cq;
             cq.drain(|cqe| {
                 actions.push(CqeAction::from_cqe(cqe.user_data, cqe.result));
             });
 
+            let mut got_exit = false;
             for action in &actions {
-                match action {
+                match *action {
                     CqeAction::ReadOk(len) => {
-                        let idx = self.read_buf_idx;
-                        let len = *len;
-
-                        // Build chunk and push onto the SPSC ring.
-                        let mut chunk = ByteChunk {
-                            buf: [0u8; READ_BUF_SIZE],
-                            len,
-                        };
-                        chunk.buf[..len].copy_from_slice(&self.read_bufs[idx][..len]);
-                        // Best-effort: if the ring is full the parser is lagging; drop.
-                        let _ = self.chunk_producer.push(chunk);
-
-                        // Flip buffer and rearm the read.
-                        self.read_buf_idx = 1 - idx;
-                        self.arm_read(self.read_buf_idx)?;
+                        on_output(&self.read_buf[..len]);
+                        self.arm_read()?;
                     }
                     CqeAction::ReadEof => {
+                        // EOF or EIO on the master fd: the child closed the
+                        // slave side (it exited or is exiting). The SIGCHLD
+                        // completion — possibly in this same batch, possibly
+                        // not yet delivered — carries the actual exit code;
+                        // the post-loop reap below covers the race where the
+                        // EOF CQE wins.
+                        got_eof = true;
                         got_exit = true;
                     }
-                    // Distinct from `None` semantically (a write CQE was
-                    // reaped) even though both are no-ops here.
-                    #[allow(clippy::match_same_arms)]
-                    CqeAction::WriteOk => {
-                        // Write completed — nothing to do; next flush_write_ring
-                        // will submit more if pending.
+                    CqeAction::WriteDone(result) => {
+                        self.complete_write(result);
                     }
-                    CqeAction::Signal => {
-                        match self.child_pid.wait_nohang() {
-                            Ok(sys::WaitStatus::Exited(code)) => {
-                                exit_code = code;
-                                got_exit = true;
-                            }
-                            Ok(sys::WaitStatus::Signaled(sig)) => {
-                                // Killed by a signal: no POSIX exit code:
-                                // report the shell convention (128 + signum)
-                                // rather than silently claiming success.
-                                exit_code = 128 + sig;
-                                got_exit = true;
-                            }
-                            Ok(sys::WaitStatus::StillRunning) => {
-                                // Spurious SIGCHLD wakeup (e.g. the child
-                                // was stopped/continued, not exited) --
-                                // nothing to reap yet, keep going.
-                            }
-                            Err(_) => {
-                                // wait4 failed: treat as exited so we don't
-                                // spin forever re-arming a signalfd that
-                                // can no longer tell us anything, but don't
-                                // claim a fabricated success code either.
-                                exit_code = -1;
-                                got_exit = true;
-                            }
+                    CqeAction::Signal => match self.child_pid.wait_nohang() {
+                        Ok(sys::WaitStatus::Exited(code)) => {
+                            exit_code = code;
+                            reaped = true;
+                            got_exit = true;
                         }
-                        // Rearm the signalfd read for future signals, unless
-                        // we're already tearing down.
-                        if !got_exit {
+                        Ok(sys::WaitStatus::Signaled(sig)) => {
+                            // Killed by a signal: report the shell
+                            // convention (128 + signum).
+                            exit_code = 128 + sig;
+                            reaped = true;
+                            got_exit = true;
+                        }
+                        Ok(sys::WaitStatus::StillRunning) => {
+                            // Spurious SIGCHLD (stop/continue) — re-arm.
                             self.arm_signal()?;
                         }
+                        Err(_) => {
+                            // wait4 failed: treat as exited so we don't spin
+                            // re-arming a signalfd that can't tell us
+                            // anything, but don't fabricate a success code.
+                            exit_code = -1;
+                            got_exit = true;
+                        }
+                    },
+                    CqeAction::Wake => {
+                        // Re-arm FIRST, then drain below: any signal that
+                        // lands after the drain finds the counter watched by
+                        // an armed SQE, so no wakeup is ever lost.
+                        self.arm_wake()?;
                     }
                     CqeAction::None => {}
                 }
             }
 
-            if got_exit || self.shutdown.load(Ordering::Acquire) {
+            if got_exit {
                 break 'event_loop;
             }
+
+            // Drain queued input once per wakeup (not just on Wake CQEs:
+            // it's cheap and closes any drain-vs-signal race) and kick the
+            // write path.
+            quit_requested = self.drain_input(&mut next_input);
+            self.flush_write()?;
         }
 
-        self.cleanup();
+        // The master fd can report EOF before the SIGCHLD completion is
+        // seen — the child is exiting either way, so reap it synchronously
+        // and recover the real exit code instead of returning a bogus 0.
+        if got_eof && !reaped {
+            match self.child_pid.reap_blocking_status() {
+                Some(sys::WaitStatus::Exited(code)) => exit_code = code,
+                Some(sys::WaitStatus::Signaled(sig)) => exit_code = 128 + sig,
+                // StillRunning can't come from a blocking wait4; None means
+                // wait4 failed (e.g. already reaped by a racing SIGCHLD
+                // handler) — keep whatever code we have.
+                Some(sys::WaitStatus::StillRunning) | None => {}
+            }
+            reaped = true;
+        }
+
+        self.cleanup(reaped);
         Ok(exit_code)
     }
 
     // ── private helpers ────────────────────────────────────────────────────
 
-    fn arm_read(&self, idx: usize) -> Result<(), PtyError> {
-        // SAFETY: read_bufs lives for the lifetime of Pty; the buf pointer is
-        // valid until the next arm_read call which only happens after the CQE
-        // for this slot arrives (ping-pong invariant).
+    /// Pop everything `next_input` has, buffering bytes and coalescing
+    /// resizes (only the last one is applied — an interactive drag fires a
+    /// storm of configures but the shell only needs one SIGWINCH at the
+    /// final size). Returns `true` if a [`PtyInput::Quit`] was seen.
+    fn drain_input<I: FnMut() -> Option<PtyInput>>(&mut self, next_input: &mut I) -> bool {
+        let mut pending_resize: Option<WinSize> = None;
+        let mut quit = false;
+        while let Some(msg) = next_input() {
+            match msg {
+                PtyInput::Bytes(b) => self.pending_write.extend(b.iter().copied()),
+                PtyInput::Resize(ws) => pending_resize = Some(ws),
+                PtyInput::Quit => quit = true,
+            }
+        }
+        if let Some(ws) = pending_resize {
+            let _ = self.master_fd.set_win_size(ws);
+        }
+        quit
+    }
+
+    /// Submit the next write SQE if none is in flight and bytes are pending.
+    fn flush_write(&mut self) -> Result<(), PtyError> {
+        if self.write_in_flight || self.pending_write.is_empty() {
+            return Ok(());
+        }
+        let mut len = 0usize;
+        while len < WRITE_BUF_SIZE {
+            match self.pending_write.pop_front() {
+                Some(b) => {
+                    self.write_buf[len] = b;
+                    len += 1;
+                }
+                None => break,
+            }
+        }
+        self.write_len = len;
+        self.write_in_flight = true;
+        // SAFETY: write_buf is a stable heap allocation owned by self; it is
+        // only rewritten after the WriteDone CQE for this SQE is consumed
+        // (single-write-in-flight invariant via write_in_flight).
+        let sqe = unsafe {
+            Sqe::write_ptr(
+                self.master_fd,
+                self.write_buf.as_ptr(),
+                len as u32,
+                u64::MAX,
+            )
+        }
+        .user_data(tag::WRITE);
+        self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
+        self.queue.submit().map_err(PtyError::UringEnter)
+    }
+
+    /// Handle a write CQE: requeue the unwritten tail of a short write (in
+    /// front of anything still pending, preserving byte order) or drop the
+    /// buffer on error (an errored master-fd write means the child is gone —
+    /// requeueing would spin forever on EIO).
+    fn complete_write(&mut self, result: i32) {
+        if result >= 0 {
+            let written = result as usize;
+            if written < self.write_len {
+                for i in (written..self.write_len).rev() {
+                    self.pending_write.push_front(self.write_buf[i]);
+                }
+            }
+        }
+        self.write_in_flight = false;
+    }
+
+    fn arm_read(&self) -> Result<(), PtyError> {
+        // SAFETY: read_buf is a stable heap allocation owned by self, valid
+        // until the next arm_read — which only happens after this SQE's CQE
+        // is consumed (single-read-in-flight invariant).
         let sqe = unsafe {
             Sqe::read_ptr(
                 self.master_fd,
-                self.read_bufs[idx].as_ptr().cast_mut(),
+                self.read_buf.as_ptr().cast_mut(),
                 READ_BUF_SIZE as u32,
                 u64::MAX,
             )
@@ -313,13 +425,9 @@ impl Pty {
     }
 
     fn arm_signal(&self) -> Result<(), PtyError> {
-        // One signal read is ever in-flight at a time (single PTY thread),
-        // so the persistent `signal_buf` field is safe to reuse rather than
-        // leaking a fresh 128-byte allocation on every SIGCHLD (which would
-        // otherwise leak for the entire process lifetime).
         // SAFETY: signal_buf's heap allocation outlives this call (owned by
-        // Pty, which outlives the loop in `run`); no other read is ever
-        // in-flight against it concurrently.
+        // Pty, which outlives the loop in `run`); only one signal read is
+        // ever in flight against it.
         let sqe = unsafe {
             Sqe::read_ptr(
                 self.signal_fd,
@@ -333,46 +441,30 @@ impl Pty {
         self.queue.submit().map_err(PtyError::UringEnter)
     }
 
-    fn drain_write_ring(&self, rx: &mut WriteConsumer) -> Result<(), PtyError> {
-        // Drain bytes from the ring into a stack buffer, then submit one write SQE.
-        let mut buf = [0u8; READ_BUF_SIZE];
-        let mut len = 0usize;
-        while len < READ_BUF_SIZE {
-            match rx.pop() {
-                Some(b) => {
-                    buf[len] = b;
-                    len += 1;
-                }
-                None => break,
-            }
-        }
-        if len == 0 {
-            return Ok(());
-        }
-        // SAFETY: buf is valid for the duration of this call; the SQE is
-        // submitted synchronously and submit_and_wait in the caller ensures
-        // the write completes before buf goes out of scope. However, because
-        // buf is stack-allocated and submit() is non-blocking, the kernel may
-        // read from it after we return.
-        //
-        // Fix: we copy into a heap allocation for writes.
-        let write_buf: Box<[u8]> = buf[..len].to_vec().into_boxed_slice();
+    fn arm_wake(&self) -> Result<(), PtyError> {
+        // Reading an eventfd returns the counter AND resets it to zero, so
+        // this armed read both wakes the loop and drains the count — several
+        // coalesced signals cost one CQE.
+        // SAFETY: wake_buf is a stable heap allocation owned by self; only
+        // one wake read is ever in flight (re-armed after its CQE).
         let sqe =
-            unsafe { Sqe::write_ptr(self.master_fd, write_buf.as_ptr(), len as u32, u64::MAX) }
-                .user_data(tag::WRITE);
-        // Keep write_buf alive until the CQE arrives. We leak it here and
-        // reclaim it in the WriteOk handler via the user_data pointer.
-        // For simplicity at M1 we just forget it (bounded leak: max 4 KiB
-        // per write, reclaimed at process exit). TODO M7: slab allocator.
-        std::mem::forget(write_buf);
+            unsafe { Sqe::read_ptr(self.wake_fd, self.wake_buf.as_ptr().cast_mut(), 8, u64::MAX) }
+                .user_data(tag::WAKE);
         self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
         self.queue.submit().map_err(PtyError::UringEnter)
     }
 
-    fn cleanup(&self) {
+    fn cleanup(&self, reaped: bool) {
         self.queue.close();
+        if !reaped {
+            // Shutdown requested before the child exited: hang up the shell
+            // and reap it so it isn't orphaned holding the PTY slave open.
+            self.child_pid.hangup();
+            self.child_pid.reap_blocking();
+        }
         let _ = self.master_fd.close();
         let _ = self.signal_fd.close();
+        // wake_fd is caller-owned (their eventfd/Waker) — never closed here.
     }
 }
 
@@ -382,9 +474,13 @@ impl Pty {
 enum CqeAction {
     None,
     ReadOk(usize),
+    /// Master-fd read returned 0 (EOF) or an error (typically EIO once the
+    /// child exits and the slave side closes) — both mean "child gone".
     ReadEof,
-    WriteOk,
+    /// Write CQE with its raw result (bytes written, or negative errno).
+    WriteDone(i32),
     Signal,
+    Wake,
 }
 
 impl CqeAction {
@@ -397,8 +493,9 @@ impl CqeAction {
                     Self::ReadEof
                 }
             }
-            tag::WRITE => Self::WriteOk,
+            tag::WRITE => Self::WriteDone(result),
             tag::SIGNAL => Self::Signal,
+            tag::WAKE => Self::Wake,
             _ => Self::None,
         }
     }

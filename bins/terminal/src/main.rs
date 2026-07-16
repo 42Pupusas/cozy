@@ -28,7 +28,7 @@ use config::Config;
 use grid::{DirtySnapshot, Grid};
 use input::{Encoder, Key, KeyState, Modifiers};
 use platform::{InputEvent, TermWindow};
-use pty::PtySimple;
+use pty::{Pty, PtyInput, WinSize};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc;
 use quetzalcoatl::spsc::RingBuffer;
@@ -100,6 +100,13 @@ fn main() {
 }
 
 fn run(cfg: &Config) -> platform::Result<()> {
+    // Block SIGCHLD before any thread exists so every thread inherits the
+    // mask — the PTY thread's signalfd only sees *blocked* signals, and an
+    // unblocked SIGCHLD delivered to some other thread would be lost.
+    if let Err(e) = pty::RawPty::block_sigchld() {
+        eprintln!("terminal: sigprocmask failed: {e} — child exit may not be detected");
+    }
+
     // ── Rings ───────────────────────────────────────────────────────────────
     // parser_in is MPSC: the pty thread pushes shell output, the ui thread
     // pushes resizes. The ring's own park/unpark wakes the parked parser when
@@ -195,75 +202,64 @@ fn pty_thread(
     input_wake: waker::Waker,
     quit: Arc<AtomicBool>,
 ) {
-    let mut pty = match PtySimple::spawn(&shell, &[], COLS, ROWS) {
+    // All PTY I/O goes through io_uring: the master fd, the SIGCHLD
+    // signalfd, and the input-wake eventfd each keep one read SQE armed, and
+    // the loop parks in io_uring_enter until any of them completes — no
+    // poll(2), no 100ms tick. The UI/parser threads signal `input_wake`
+    // after pushing to `input_rx`, which completes the eventfd SQE.
+    let win = WinSize {
+        rows: ROWS,
+        cols: COLS,
+        xpixel: 0,
+        ypixel: 0,
+    };
+    let pty = match Pty::spawn(&shell, &[], win, input_wake.raw_fd(), Arc::clone(&quit)) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("pty: spawn failed: {e:?}");
+            eprintln!("pty: spawn failed: {e}");
+            quit.store(true, Ordering::Relaxed);
             return;
         }
     };
-    let master_fd = pty.master_fd();
-    let wake_fd = input_wake.raw_fd();
 
-    while !quit.load(Ordering::Relaxed) {
-        let mut did_work = false;
-
-        // Drain the wake counter up-front, BEFORE reading the sources. This is
-        // what closes the lost-wakeup race: any input the UI signals after we
-        // read below but before we poll leaves the counter non-zero, so the
-        // poll returns immediately instead of sleeping through it.
-        input_wake.drain();
-
-        // Drain all pending input messages first (writes are cheap). Resizes
-        // are COALESCED: an interactive drag fires a storm of configure events,
-        // but the shell only needs one SIGWINCH at the final width. Sending one
-        // per event makes the shell repaint its prompt for widths that no
-        // longer match the grid (which coalesces the same way on its side),
-        // leaving duplicated/merged prompt rows behind. Apply only the last.
-        let mut pending_resize: Option<(u16, u16)> = None;
-        while let Some(msg) = input_rx.pop() {
-            did_work = true;
-            match msg {
-                InputMsg::Bytes(b) => {
-                    let _ = pty.write(&b);
-                }
-                InputMsg::Resize { cols, rows } => {
-                    pending_resize = Some((cols, rows));
-                }
-                InputMsg::Quit => {
-                    quit.store(true, Ordering::Relaxed);
-                    return;
-                }
+    // Adapter: our MPSC ring messages → PtyInput. Quit also raises the
+    // shared flag so the parser/UI threads stop too.
+    let quit_in = Arc::clone(&quit);
+    let next_input = move || {
+        input_rx.pop().map(|msg| match msg {
+            InputMsg::Bytes(b) => PtyInput::Bytes(b),
+            InputMsg::Resize { cols, rows } => PtyInput::Resize(WinSize {
+                rows,
+                cols,
+                xpixel: 0,
+                ypixel: 0,
+            }),
+            InputMsg::Quit => {
+                quit_in.store(true, Ordering::Relaxed);
+                PtyInput::Quit
             }
-        }
-        if let Some((cols, rows)) = pending_resize {
-            let _ = pty.resize(cols, rows);
-        }
+        })
+    };
 
-        // Read from PTY and forward to the parser ring.
-        let mut buf = Box::new([0u8; PTY_BUF]);
-        match pty.try_read(buf.as_mut()) {
-            Ok(Some(0)) | Err(_) => {
-                // Genuine EOF (shell exited) or a hard I/O error — signal everyone.
-                quit.store(true, Ordering::Relaxed);
-                return;
-            }
-            Ok(Some(n)) => {
-                // Best-effort; drop if ring is full (parser thread is behind).
-                let _ = parser_tx.push(ParserMsg::Data(PtyChunk { buf, len: n }));
-                did_work = true;
-            }
-            // EAGAIN: no data yet — keep looping.
-            Ok(None) => {}
+    // Adapter: PTY output chunks → parser ring. Best-effort push: if the
+    // ring is full the parser is lagging; drop the chunk.
+    let on_output = move |bytes: &[u8]| {
+        for part in bytes.chunks(PTY_BUF) {
+            let mut buf = Box::new([0u8; PTY_BUF]);
+            buf[..part.len()].copy_from_slice(part);
+            let _ = parser_tx.push(ParserMsg::Data(PtyChunk {
+                buf,
+                len: part.len(),
+            }));
         }
+    };
 
-        // Idle: block in poll(2) on BOTH the PTY master fd (level-triggered, so
-        // pending output always re-wakes) and the input-wake eventfd, instead
-        // of busy-spinning. A 100ms cap bounds quit-flag check latency.
-        if !did_work {
-            let _ = waker::Poller::two(master_fd, wake_fd).poll_two(100);
-        }
+    match pty.run(next_input, on_output) {
+        Ok(_code) => {}
+        Err(e) => eprintln!("pty: event loop failed: {e}"),
     }
+    // Shell exited (or loop errored) — signal everyone to shut down.
+    quit.store(true, Ordering::Relaxed);
 }
 
 // ── Parser + grid thread ──────────────────────────────────────────────────────

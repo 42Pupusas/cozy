@@ -453,11 +453,22 @@ impl ChildPid {
     /// Blocking reap (no `WNOHANG`) — call after [`ChildPid::hangup`] so the
     /// zombie is collected and we don't leak a process-table entry.
     pub fn reap_blocking(self) {
+        let _ = self.reap_blocking_status();
+    }
+
+    /// Blocking reap that reports how the child ended.
+    ///
+    /// Used by the EOF path of the `io_uring` event loop: the master fd can
+    /// report EOF/EIO *before* the SIGCHLD completion is seen, and the exit
+    /// code must not be lost in that race. Returns `None` if `wait4` failed
+    /// or the pid is invalid.
+    #[must_use]
+    pub fn reap_blocking_status(self) -> Option<WaitStatus> {
         if self.0 <= 0 {
-            return;
+            return None;
         }
         let mut status: i32 = 0;
-        unsafe {
+        let ret = unsafe {
             Syscall::Wait4.invoke4(
                 self.0 as usize,
                 core::ptr::addr_of_mut!(status) as usize,
@@ -465,6 +476,9 @@ impl ChildPid {
                 0,
             )
         };
+        ret.into_errno_result()
+            .ok()
+            .map(|_| WaitStatus::from_raw(status))
     }
 
     /// Non-blocking reap (`WNOHANG`).
@@ -704,14 +718,19 @@ impl RawPty {
         }
     }
 
-    /// Block `SIGCHLD` in the calling thread and create a `signalfd` for it.
+    /// Block `SIGCHLD` in the calling thread.
     ///
-    /// The returned fd is readable (via `io_uring`) whenever a child exits.
-    pub fn signalfd_for_sigchld() -> Result<RawFd, PtyError> {
-        // Block SIGCHLD so it doesn't interrupt syscalls.
+    /// A `signalfd` only sees signals that are *blocked* — an unblocked
+    /// SIGCHLD delivered to any other thread is consumed by the default
+    /// disposition and never reaches the fd. The signal mask is inherited
+    /// across `thread::spawn`, so call this on the **main thread before
+    /// spawning any others** to cover the whole process.
+    ///
+    /// # Errors
+    /// Returns [`PtyError::SigMask`] if `sigprocmask` fails.
+    pub fn block_sigchld() -> Result<(), PtyError> {
         let mut mask = SigSet::empty();
         mask.insert(Signal::Chld);
-
         let ret = unsafe {
             Syscall::SigProcMask.invoke4(
                 SigProcMaskHow::Block as usize,
@@ -720,7 +739,20 @@ impl RawPty {
                 8, // sigsetsz
             )
         };
-        ret.into_errno_result().map_err(PtyError::SigMask)?;
+        ret.into_errno_result()
+            .map(|_| ())
+            .map_err(PtyError::SigMask)
+    }
+
+    /// Block `SIGCHLD` in the calling thread and create a `signalfd` for it.
+    ///
+    /// The returned fd is readable (via `io_uring`) whenever a child exits.
+    pub fn signalfd_for_sigchld() -> Result<RawFd, PtyError> {
+        // Block SIGCHLD (on this thread at minimum; see `block_sigchld`)
+        // so it is queued to the fd instead of interrupting syscalls.
+        Self::block_sigchld()?;
+        let mut mask = SigSet::empty();
+        mask.insert(Signal::Chld);
 
         // Create the signalfd.
         let flags = SignalFdFlags::NONBLOCK | SignalFdFlags::CLOEXEC;

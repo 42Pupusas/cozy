@@ -786,6 +786,28 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_keeps_lines_contiguous_no_blank_gap() {
+        // Regression test for the "blank line appears between every line after
+        // the screen first fills" bug: scroll_up used to drop a visible row
+        // each scroll, leaving a gap. Fill a small screen, then keep feeding
+        // lines; every content row must sit immediately below the previous
+        // with NO blank row in between.
+        let mut g = Grid::new(20, 4);
+        for i in 0..10 {
+            let line = format!("line{i}\r\n");
+            apply_str(&mut g, line.as_bytes());
+        }
+        // The last 3 lines are visible, contiguous, on rows 0..=2; row 3 is the
+        // fresh cursor line (legitimately blank).
+        let text = format!("{g}");
+        let vis: Vec<&str> = text.lines().collect();
+        assert_eq!(vis[0].trim_end(), "line7");
+        assert_eq!(vis[1].trim_end(), "line8");
+        assert_eq!(vis[2].trim_end(), "line9");
+        assert_eq!(vis[3].trim_end(), "");
+    }
+
+    #[test]
     fn dirty_snapshot() {
         let mut g = Grid::new(10, 3);
         apply_str(&mut g, b"X");

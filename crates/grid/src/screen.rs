@@ -156,41 +156,74 @@ impl Screen {
         if n == 0 || top_i >= bot_i {
             return;
         }
+        // Never scroll by more than the region height.
+        let n = n.min(bot_i - top_i);
 
-        // Push scrolled-off lines to scrollback if room (top region only).
-        if push_scrollback && top_i == 0 && self.scrollback_max > 0 {
-            let push = n.min(self.scrollback_max - self.scrollback_len);
-            if push > 0 {
-                // The top `push` visible rows simply become scrollback: they
-                // are already contiguous just below existing scrollback, so we
-                // only need to extend the boundary (their wrapped flags ride
-                // along untouched).
-                self.scrollback_len += push;
+        // How many scrolled-off lines genuinely enter scrollback. Only a
+        // top-region (top_i == 0) scroll on the primary screen (scrollback_max
+        // > 0) pushes history; DL and the alternate screen pass push_scrollback
+        // == false and never grow history.
+        let push = if push_scrollback && top_i == 0 && self.scrollback_max > 0 {
+            n.min(self.scrollback_max - self.scrollback_len)
+        } else {
+            0
+        };
+
+        let vis_rows = bot_i - top_i + 1;
+        let keep = vis_rows - n;
+        let base = self.scrollback_len;
+
+        if push > 0 {
+            // Rebuild the [scrollback | visible-region] window explicitly. It
+            // currently occupies [0 .. base + vis_rows):
+            //   [ S(0..base) | v0 v1 ... v(vis_rows-1) ]
+            // Scrolling up by `n` moves the top `n` visible rows into scrollback
+            // and pulls `n` blank rows in at the bottom:
+            //   [ S(0..base) v0..v(n-1) | v(n)..v(vis_rows-1) B..B ]
+            // then scrollback is capped at scrollback_max by dropping its OLDEST
+            // rows from the front.
+            let region_start = base * cols;
+            let region_end = (base + vis_rows) * cols;
+
+            // New scrollback = old scrollback + the n scrolled-off visible rows.
+            let mut cells: Vec<Cell> = Vec::with_capacity((base + vis_rows) * cols);
+            let mut wrap: Vec<bool> = Vec::with_capacity(base + vis_rows);
+            cells.extend_from_slice(&self.buf[0..base * cols]); // old scrollback
+            wrap.extend_from_slice(&self.wrapped[0..base]);
+            cells.extend_from_slice(&self.buf[region_start..region_start + n * cols]); // scrolled off
+            wrap.extend_from_slice(&self.wrapped[base..base + n]);
+            // New visible = surviving rows + n blanks.
+            cells.extend_from_slice(&self.buf[region_start + n * cols..region_end]);
+            wrap.extend_from_slice(&self.wrapped[base + n..base + vis_rows]);
+            cells.resize(cells.len() + n * cols, Cell::default());
+            wrap.resize(wrap.len() + n, false);
+
+            // Cap scrollback: drop the oldest rows that overflow scrollback_max.
+            let new_base = (base + n).min(self.scrollback_max);
+            let drop_rows = (base + n) - new_base;
+
+            let src_off = drop_rows * cols;
+            let out_rows = cells.len() / cols - drop_rows;
+            self.buf[..out_rows * cols].copy_from_slice(&cells[src_off..]);
+            self.wrapped[..out_rows].copy_from_slice(&wrap[drop_rows..]);
+            self.scrollback_len = new_base;
+        } else {
+            // No scrollback involvement: shift the surviving rows up within the
+            // region in place, then blank the bottom n rows.
+            let region_top = base + top_i;
+            if keep > 0 {
+                self.buf.copy_within(
+                    (region_top + n) * cols..(region_top + n + keep) * cols,
+                    region_top * cols,
+                );
+                self.wrapped
+                    .copy_within(region_top + n..region_top + n + keep, region_top);
             }
-        }
-
-        // Shift visible rows up within [top, bot].
-        let vis_off = self.scrollback_len;
-        let src_start = (vis_off + top_i + n) * cols;
-        let dst_start = (vis_off + top_i) * cols;
-        let move_rows = (bot_i - top_i + 1).saturating_sub(n);
-        if move_rows > 0 {
-            self.buf
-                .copy_within(src_start..src_start + move_rows * cols, dst_start);
-            self.wrapped.copy_within(
-                vis_off + top_i + n..vis_off + top_i + n + move_rows,
-                vis_off + top_i,
-            );
-        }
-
-        // Blank the bottom `n` rows.
-        let blank_n = n.min(bot_i - top_i + 1);
-        let blank_start = (vis_off + top_i + move_rows) * cols;
-        self.buf[blank_start..blank_start + blank_n * cols].fill(Cell::default());
-        for w in
-            &mut self.wrapped[vis_off + top_i + move_rows..vis_off + top_i + move_rows + blank_n]
-        {
-            *w = false;
+            let blank_start = (region_top + keep) * cols;
+            self.buf[blank_start..blank_start + n * cols].fill(Cell::default());
+            for w in &mut self.wrapped[region_top + keep..region_top + keep + n] {
+                *w = false;
+            }
         }
     }
 
@@ -484,5 +517,55 @@ impl Screen {
 
     fn visible_idx(&self, col: u16, row: u16) -> usize {
         self.visible_row_start(row) + usize::from(col)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fill_row(s: &mut Screen, row: u16, ch: char) {
+        for c in 0..s.cols() {
+            s.set_cell(
+                c,
+                row,
+                Cell {
+                    ch,
+                    ..Cell::default()
+                },
+            );
+        }
+    }
+
+    fn row_char(s: &Screen, row: u16) -> char {
+        s.get_cell(0, row).ch
+    }
+
+    #[test]
+    fn scroll_up_rotates_visible_window_over_scrollback() {
+        // cols=2 rows=3, scrollback_max=4.
+        let mut s = Screen::new(2, 3, 4);
+        fill_row(&mut s, 0, 'a');
+        fill_row(&mut s, 1, 'b');
+        fill_row(&mut s, 2, 'c');
+
+        // Scroll once: 'a' -> scrollback, visible becomes [b, c, blank].
+        s.scroll_up(1, 0, 2);
+        assert_eq!(row_char(&s, 0), 'b');
+        assert_eq!(row_char(&s, 1), 'c');
+        assert_eq!(row_char(&s, 2), ' ');
+
+        // Fill bottom and scroll again: 'b' -> scrollback, visible [c, d, blank].
+        fill_row(&mut s, 2, 'd');
+        s.scroll_up(1, 0, 2);
+        assert_eq!(row_char(&s, 0), 'c', "c must survive, not be lost");
+        assert_eq!(row_char(&s, 1), 'd');
+        assert_eq!(row_char(&s, 2), ' ');
+
+        fill_row(&mut s, 2, 'e');
+        s.scroll_up(1, 0, 2);
+        assert_eq!(row_char(&s, 0), 'd');
+        assert_eq!(row_char(&s, 1), 'e');
+        assert_eq!(row_char(&s, 2), ' ');
     }
 }

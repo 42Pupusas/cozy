@@ -66,28 +66,43 @@ impl std::error::Error for ParseError {}
 
 // ── Big-endian reads ──────────────────────────────────────────────────────────
 
-#[must_use] 
-pub fn u8_at(data: &[u8], off: usize) -> Option<u8> {
-    data.get(off).copied()
+/// Big-endian scalar reads off a raw byte slice.
+///
+/// Methods on `&[u8]` instead of free functions that all took `data: &[u8]`
+/// as their first argument — every TTF/OTF table walk in this crate wants
+/// `slice.u16_at(off)`, not a namespaced helper repeating "reads from a
+/// slice" at each call site.
+#[must_use]
+pub trait ByteSliceExt {
+    /// Read a `u8` at `off`, or `None` if out of range.
+    fn u8_at(&self, off: usize) -> Option<u8>;
+    /// Read a big-endian `u16` at `off`, or `None` if out of range.
+    fn u16_at(&self, off: usize) -> Option<u16>;
+    /// Read a big-endian `i16` at `off`, or `None` if out of range.
+    fn i16_at(&self, off: usize) -> Option<i16>;
+    /// Read a big-endian `u32` at `off`, or `None` if out of range.
+    fn u32_at(&self, off: usize) -> Option<u32>;
 }
 
-#[must_use] 
-pub fn u16_at(data: &[u8], off: usize) -> Option<u16> {
-    let b = data.get(off..off + 2)?;
-    Some(u16::from_be_bytes([b[0], b[1]]))
+impl ByteSliceExt for [u8] {
+    fn u8_at(&self, off: usize) -> Option<u8> {
+        self.get(off).copied()
+    }
+
+    fn u16_at(&self, off: usize) -> Option<u16> {
+        let b = self.get(off..off + 2)?;
+        Some(u16::from_be_bytes([b[0], b[1]]))
+    }
+
+    fn i16_at(&self, off: usize) -> Option<i16> {
+        self.u16_at(off).map(u16::cast_signed)
+    }
+
+    fn u32_at(&self, off: usize) -> Option<u32> {
+        let b = self.get(off..off + 4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
 }
-
-pub fn i16_at(data: &[u8], off: usize) -> Option<i16> {
-    u16_at(data, off).map(u16::cast_signed)
-}
-
-#[must_use] 
-pub fn u32_at(data: &[u8], off: usize) -> Option<u32> {
-    let b = data.get(off..off + 4)?;
-    Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-}
-
-
 
 // ── Parser ────────────────────────────────────────────────────────────────────
 
@@ -99,12 +114,12 @@ impl<'a> FontFile<'a> {
         }
 
         // sfnt version: 0x00010000 = TrueType, 0x4F54544F = 'OTTO' (CFF)
-        let sfnt = u32_at(data, 0).ok_or(ParseError::TooShort)?;
+        let sfnt = data.u32_at(0).ok_or(ParseError::TooShort)?;
         if sfnt != 0x0001_0000 && sfnt != 0x4F54_544F {
             return Err(ParseError::BadSfntVersion);
         }
 
-        let num_tables = u16_at(data, 4).ok_or(ParseError::TooShort)? as usize;
+        let num_tables = data.u16_at(4).ok_or(ParseError::TooShort)? as usize;
         if data.len() < 12 + num_tables * 16 {
             return Err(ParseError::TooShort);
         }
@@ -113,8 +128,8 @@ impl<'a> FontFile<'a> {
         for i in 0..num_tables {
             let base = 12 + i * 16;
             let tag: [u8; 4] = data[base..base + 4].try_into().unwrap();
-            let offset = u32_at(data, base + 8).ok_or(ParseError::TooShort)? as usize;
-            let length = u32_at(data, base + 12).ok_or(ParseError::TooShort)? as usize;
+            let offset = data.u32_at(base + 8).ok_or(ParseError::TooShort)? as usize;
+            let length = data.u32_at(base + 12).ok_or(ParseError::TooShort)? as usize;
             if let Some(idx) = tag_index(tag) {
                 tables[idx] = Some(TableRecord { offset, length });
             }

@@ -1,7 +1,7 @@
 //! Decoded TTF table structs: head, hhea, maxp, cmap (fmt 4), loca, hmtx.
 
 use crate::parse::{
-    ParseError, i16_at, u16_at, u32_at,
+    ByteSliceExt, ParseError,
     TAG_CMAP, TAG_HEAD, TAG_HHEA, TAG_HMTX, TAG_LOCA, TAG_MAXP,
 };
 use crate::parse::FontFile;
@@ -21,12 +21,12 @@ impl Head {
     pub fn parse(ff: &FontFile<'_>) -> Result<Self, ParseError> {
         let d = ff.require(TAG_HEAD, "head")?;
         Ok(Self {
-            units_per_em:        u16_at(d, 18).ok_or(ParseError::TooShort)?,
-            index_to_loc_format: i16_at(d, 50).ok_or(ParseError::TooShort)?,
-            x_min:               i16_at(d, 36).ok_or(ParseError::TooShort)?,
-            y_min:               i16_at(d, 38).ok_or(ParseError::TooShort)?,
-            x_max:               i16_at(d, 40).ok_or(ParseError::TooShort)?,
-            y_max:               i16_at(d, 42).ok_or(ParseError::TooShort)?,
+            units_per_em:        d.u16_at(18).ok_or(ParseError::TooShort)?,
+            index_to_loc_format: d.i16_at(50).ok_or(ParseError::TooShort)?,
+            x_min:               d.i16_at(36).ok_or(ParseError::TooShort)?,
+            y_min:               d.i16_at(38).ok_or(ParseError::TooShort)?,
+            x_max:               d.i16_at(40).ok_or(ParseError::TooShort)?,
+            y_max:               d.i16_at(42).ok_or(ParseError::TooShort)?,
         })
     }
 }
@@ -44,10 +44,10 @@ impl Hhea {
     pub fn parse(ff: &FontFile<'_>) -> Result<Self, ParseError> {
         let d = ff.require(TAG_HHEA, "hhea")?;
         Ok(Self {
-            ascender:            i16_at(d, 4).ok_or(ParseError::TooShort)?,
-            descender:           i16_at(d, 6).ok_or(ParseError::TooShort)?,
-            line_gap:            i16_at(d, 8).ok_or(ParseError::TooShort)?,
-            number_of_hmetrics:  u16_at(d, 34).ok_or(ParseError::TooShort)?,
+            ascender:            d.i16_at(4).ok_or(ParseError::TooShort)?,
+            descender:           d.i16_at(6).ok_or(ParseError::TooShort)?,
+            line_gap:            d.i16_at(8).ok_or(ParseError::TooShort)?,
+            number_of_hmetrics:  d.u16_at(34).ok_or(ParseError::TooShort)?,
         })
     }
 }
@@ -62,7 +62,7 @@ impl Maxp {
     pub fn parse(ff: &FontFile<'_>) -> Result<Self, ParseError> {
         let d = ff.require(TAG_MAXP, "maxp")?;
         Ok(Self {
-            num_glyphs: u16_at(d, 4).ok_or(ParseError::TooShort)?,
+            num_glyphs: d.u16_at(4).ok_or(ParseError::TooShort)?,
         })
     }
 }
@@ -93,17 +93,17 @@ impl<'a> Cmap<'a> {
     /// # Errors
     /// [`ParseError`] if no usable format-4 subtable is present.
     pub fn find_subtable(d: &[u8]) -> Result<usize, ParseError> {
-        let num_tables = u16_at(d, 2).ok_or(ParseError::TooShort)? as usize;
+        let num_tables = d.u16_at(2).ok_or(ParseError::TooShort)? as usize;
 
         // Walk encoding records looking for a (3,1) or (0,*) format-4 subtable.
         let mut chosen: Option<usize> = None;
         for i in 0..num_tables {
             let base     = 4 + i * 8;
-            let platform = u16_at(d, base).ok_or(ParseError::TooShort)?;
-            let encoding = u16_at(d, base + 2).ok_or(ParseError::TooShort)?;
-            let offset   = u32_at(d, base + 4).ok_or(ParseError::TooShort)? as usize;
+            let platform = d.u16_at(base).ok_or(ParseError::TooShort)?;
+            let encoding = d.u16_at(base + 2).ok_or(ParseError::TooShort)?;
+            let offset   = d.u32_at(base + 4).ok_or(ParseError::TooShort)? as usize;
             // Prefer Windows/Unicode BMP (3,1), fallback to Unicode (0,*)
-            let format = u16_at(d, offset).ok_or(ParseError::TooShort)?;
+            let format = d.u16_at(offset).ok_or(ParseError::TooShort)?;
             if format == 4 && ((platform == 3 && encoding == 1) || platform == 0) {
                 chosen = Some(offset);
                 if platform == 3 { break; } // best match
@@ -118,7 +118,7 @@ impl<'a> Cmap<'a> {
     pub fn glyph_id(&self, codepoint: u32) -> u16 {
         let d = self.data;
         // format=4, length, language already consumed; seg_count_x2 at offset 6
-        let seg_count = match u16_at(d, 6) {
+        let seg_count = match d.u16_at(6) {
             Some(v) => (v / 2) as usize,
             None    => return 0,
         };
@@ -136,17 +136,17 @@ impl<'a> Cmap<'a> {
         let mut hi = seg_count;
         while lo < hi {
             let mid = usize::midpoint(lo, hi);
-            let end = u16_at(d, end_codes_off + mid * 2).unwrap_or(0);
+            let end = d.u16_at(end_codes_off + mid * 2).unwrap_or(0);
             if cp > end { lo = mid + 1; } else { hi = mid; }
         }
         if lo >= seg_count { return 0; }
 
-        let start = u16_at(d, start_codes_off + lo * 2).unwrap_or(0xFFFF);
+        let start = d.u16_at(start_codes_off + lo * 2).unwrap_or(0xFFFF);
         if cp < start { return 0; }
 
-        let id_range_offset = u16_at(d, id_range_off + lo * 2).unwrap_or(0) as usize;
+        let id_range_offset = d.u16_at(id_range_off + lo * 2).unwrap_or(0) as usize;
         if id_range_offset == 0 {
-            let delta = i32::from(i16_at(d, id_delta_off + lo * 2).unwrap_or(0));
+            let delta = i32::from(d.i16_at(id_delta_off + lo * 2).unwrap_or(0));
             let raw = (i32::from(cp) + delta) & 0xFFFF;
             return raw as u16;
         }
@@ -157,9 +157,9 @@ impl<'a> Cmap<'a> {
         let glyph_off = glyph_off.saturating_sub(0); // relative to subtable start
         if glyph_off >= glyph_ids_off {
             let idx = glyph_off - glyph_ids_off;
-            let raw = u16_at(d, glyph_ids_off + idx).unwrap_or(0);
+            let raw = d.u16_at(glyph_ids_off + idx).unwrap_or(0);
             if raw == 0 { return 0; }
-            let delta = i32::from(i16_at(d, id_delta_off + lo * 2).unwrap_or(0));
+            let delta = i32::from(d.i16_at(id_delta_off + lo * 2).unwrap_or(0));
             return ((i32::from(raw) + delta) & 0xFFFF) as u16;
         }
         0
@@ -192,13 +192,13 @@ impl<'a> Loca<'a> {
         let gid = gid as usize;
         let (start, end) = if self.format == 0 {
             // Short format: 16-bit values, multiply by 2.
-            let s = u16_at(self.data, gid * 2)? as usize * 2;
-            let e = u16_at(self.data, (gid + 1) * 2)? as usize * 2;
+            let s = self.data.u16_at(gid * 2)? as usize * 2;
+            let e = self.data.u16_at((gid + 1) * 2)? as usize * 2;
             (s, e)
         } else {
             // Long format: 32-bit values.
-            let s = u32_at(self.data, gid * 4)? as usize;
-            let e = u32_at(self.data, (gid + 1) * 4)? as usize;
+            let s = self.data.u32_at(gid * 4)? as usize;
+            let e = self.data.u32_at((gid + 1) * 4)? as usize;
             (s, e)
         };
         if start == end { None } else { Some((start, end - start)) }
@@ -231,14 +231,14 @@ impl<'a> Hmtx<'a> {
         let n   = self.number_of_hmetrics as usize;
         if gid < n {
             let base    = gid * 4;
-            let advance = u16_at(self.data, base).unwrap_or(0);
-            let lsb     = i16_at(self.data, base + 2).unwrap_or(0);
+            let advance = self.data.u16_at(base).unwrap_or(0);
+            let lsb     = self.data.i16_at(base + 2).unwrap_or(0);
             (advance, lsb)
         } else {
             // Monospaced tail: advance repeats, only lsb changes.
-            let advance = u16_at(self.data, (n - 1) * 4).unwrap_or(0);
+            let advance = self.data.u16_at((n - 1) * 4).unwrap_or(0);
             let lsb_off = n * 4 + (gid - n) * 2;
-            let lsb     = i16_at(self.data, lsb_off).unwrap_or(0);
+            let lsb     = self.data.i16_at(lsb_off).unwrap_or(0);
             (advance, lsb)
         }
     }

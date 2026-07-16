@@ -3,7 +3,7 @@
 //! Produces a flat list of [`Verb`]s (move/line/curve/close) from the raw
 //! glyph bytecode. Composite glyphs are recursively expanded.
 
-use crate::parse::{i16_at, u16_at, u8_at, ParseError};
+use crate::parse::{ByteSliceExt, ParseError};
 
 // ── Geometry ──────────────────────────────────────────────────────────────────
 
@@ -81,11 +81,11 @@ pub fn decode_glyph(
     let d = &glyf_data[glyph_off..glyph_off + glyph_len];
     if d.len() < 10 { return Ok(Outline::default()); }
 
-    let num_contours = i16_at(d, 0).ok_or(ParseError::TooShort)?;
-    let x_min = i16_at(d, 2).ok_or(ParseError::TooShort)?;
-    let y_min = i16_at(d, 4).ok_or(ParseError::TooShort)?;
-    let x_max = i16_at(d, 6).ok_or(ParseError::TooShort)?;
-    let y_max = i16_at(d, 8).ok_or(ParseError::TooShort)?;
+    let num_contours = d.i16_at(0).ok_or(ParseError::TooShort)?;
+    let x_min = d.i16_at(2).ok_or(ParseError::TooShort)?;
+    let y_min = d.i16_at(4).ok_or(ParseError::TooShort)?;
+    let x_max = d.i16_at(6).ok_or(ParseError::TooShort)?;
+    let y_max = d.i16_at(8).ok_or(ParseError::TooShort)?;
 
     if num_contours >= 0 {
         decode_simple(d, num_contours as usize, x_min, y_min, x_max, y_max)
@@ -105,21 +105,21 @@ fn decode_simple(
 
     // End-point indices of each contour (relative to 0).
     let end_pts_off = 10usize;
-    let total_pts   = u16_at(d, end_pts_off + (num_contours - 1) * 2)
+    let total_pts   = d.u16_at(end_pts_off + (num_contours - 1) * 2)
         .ok_or(ParseError::TooShort)? as usize + 1;
 
     let instruction_len_off = end_pts_off + num_contours * 2;
-    let instruction_len = u16_at(d, instruction_len_off).ok_or(ParseError::TooShort)? as usize;
+    let instruction_len = d.u16_at(instruction_len_off).ok_or(ParseError::TooShort)? as usize;
 
     let mut cursor = instruction_len_off + 2 + instruction_len;
 
     // ── Flags ──────────────────────────────────────────────────────────────
     let mut flags = Vec::with_capacity(total_pts);
     while flags.len() < total_pts {
-        let f = u8_at(d, cursor).ok_or(ParseError::TooShort)?;
+        let f = d.u8_at(cursor).ok_or(ParseError::TooShort)?;
         cursor += 1;
         let repeat = if f & REPEAT != 0 {
-            let n = u8_at(d, cursor).ok_or(ParseError::TooShort)?;
+            let n = d.u8_at(cursor).ok_or(ParseError::TooShort)?;
             cursor += 1;
             n as usize
         } else { 0 };
@@ -132,13 +132,13 @@ fn decode_simple(
     let mut x_acc: i32 = 0;
     for &f in &flags {
         let dx = if f & X_SHORT != 0 {
-            let v = i32::from(u8_at(d, cursor).ok_or(ParseError::TooShort)?);
+            let v = i32::from(d.u8_at(cursor).ok_or(ParseError::TooShort)?);
             cursor += 1;
             if f & X_SAME_OR_POS != 0 { v } else { -v }
         } else if f & X_SAME_OR_POS != 0 {
             0
         } else {
-            let v = i32::from(i16_at(d, cursor).ok_or(ParseError::TooShort)?);
+            let v = i32::from(d.i16_at(cursor).ok_or(ParseError::TooShort)?);
             cursor += 2;
             v
         };
@@ -151,13 +151,13 @@ fn decode_simple(
     let mut y_acc: i32 = 0;
     for &f in &flags {
         let dy = if f & Y_SHORT != 0 {
-            let v = i32::from(u8_at(d, cursor).ok_or(ParseError::TooShort)?);
+            let v = i32::from(d.u8_at(cursor).ok_or(ParseError::TooShort)?);
             cursor += 1;
             if f & Y_SAME_OR_POS != 0 { v } else { -v }
         } else if f & Y_SAME_OR_POS != 0 {
             0
         } else {
-            let v = i32::from(i16_at(d, cursor).ok_or(ParseError::TooShort)?);
+            let v = i32::from(d.i16_at(cursor).ok_or(ParseError::TooShort)?);
             cursor += 2;
             v
         };
@@ -170,7 +170,7 @@ fn decode_simple(
     let mut pt_idx = 0usize;
 
     for c in 0..num_contours {
-        let end = u16_at(d, end_pts_off + c * 2).ok_or(ParseError::TooShort)? as usize;
+        let end = d.u16_at(end_pts_off + c * 2).ok_or(ParseError::TooShort)? as usize;
         emit_contour(&mut outline, &flags, &xs, &ys, pt_idx, end);
         pt_idx = end + 1;
     }
@@ -248,20 +248,20 @@ fn decode_composite(
     let mut cursor  = 10usize;
 
     loop {
-        let flags = u16_at(d, cursor).ok_or(ParseError::TooShort)?;
+        let flags = d.u16_at(cursor).ok_or(ParseError::TooShort)?;
         cursor += 2;
-        let glyph_index = u16_at(d, cursor).ok_or(ParseError::TooShort)?;
+        let glyph_index = d.u16_at(cursor).ok_or(ParseError::TooShort)?;
         cursor += 2;
 
         // Translation arguments.
         let (dx, dy) = if flags & ARG_1_AND_2_ARE_WORDS != 0 {
-            let dx = f32::from(i16_at(d, cursor).ok_or(ParseError::TooShort)?);
-            let dy = f32::from(i16_at(d, cursor + 2).ok_or(ParseError::TooShort)?);
+            let dx = f32::from(d.i16_at(cursor).ok_or(ParseError::TooShort)?);
+            let dy = f32::from(d.i16_at(cursor + 2).ok_or(ParseError::TooShort)?);
             cursor += 4;
             (dx, dy)
         } else {
-            let dx = f32::from(u8_at(d, cursor).ok_or(ParseError::TooShort)?.cast_signed());
-            let dy = f32::from(u8_at(d, cursor + 1).ok_or(ParseError::TooShort)?.cast_signed());
+            let dx = f32::from(d.u8_at(cursor).ok_or(ParseError::TooShort)?.cast_signed());
+            let dy = f32::from(d.u8_at(cursor + 1).ok_or(ParseError::TooShort)?.cast_signed());
             cursor += 2;
             (dx, dy)
         };

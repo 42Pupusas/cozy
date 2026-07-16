@@ -30,8 +30,9 @@
 
 pub mod analysis;
 pub mod bidi;
+mod codepoint;
+pub mod layout;
 pub mod line_break;
 pub mod measurement;
-pub mod layout;
 
 pub use layout::{LayoutLine, LayoutParams, Layouter};

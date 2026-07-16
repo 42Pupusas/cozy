@@ -8,7 +8,7 @@
 //! the browser.  We implement a compact UAX #29 word-break state machine
 //! instead — no external dependencies.
 
-use crate::bidi::{bidi_class, BidiClass, Direction};
+use crate::bidi::{BidiClass, Direction, bidi_class};
 use crate::measurement::SegmentCellWidth;
 
 /// How the line-breaker may handle the break opportunity **before** this segment.
@@ -26,10 +26,10 @@ pub enum BreakKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Segment<'a> {
     /// The text slice (into the original input — zero copy).
-    pub text:      &'a str,
+    pub text: &'a str,
     /// Cell width (UAX #11) — pre-computed so the line-breaker never calls
     /// back into measurement.
-    pub width:     usize,
+    pub width: usize,
     /// How the line-breaker may treat the break point before this segment.
     pub break_before: BreakKind,
     /// Resolved paragraph direction for this segment.
@@ -66,10 +66,10 @@ impl Segmenter {
             // ── Newline → mandatory break ────────────────────────────────
             if c == '\n' {
                 segments.push(Segment {
-                    text:         &text[i..=i],
-                    width:        0,
+                    text: &text[i..=i],
+                    width: 0,
                     break_before: BreakKind::Mandatory,
-                    direction:    Direction::Ltr,
+                    direction: Direction::Ltr,
                 });
                 i += 1;
                 continue;
@@ -78,12 +78,16 @@ impl Segmenter {
             // ── Carriage return (skip or treat as newline) ───────────────
             if c == '\r' {
                 // Consume \r\n as one mandatory break, or lone \r.
-                let end = if bytes.get(i + 1) == Some(&b'\n') { i + 2 } else { i + 1 };
+                let end = if bytes.get(i + 1) == Some(&b'\n') {
+                    i + 2
+                } else {
+                    i + 1
+                };
                 segments.push(Segment {
-                    text:         &text[i..end],
-                    width:        0,
+                    text: &text[i..end],
+                    width: 0,
                     break_before: BreakKind::Mandatory,
-                    direction:    Direction::Ltr,
+                    direction: Direction::Ltr,
                 });
                 i = end;
                 continue;
@@ -101,10 +105,10 @@ impl Segmenter {
                 }
                 let slice = &text[start..i];
                 segments.push(Segment {
-                    text:         slice,
-                    width:        slice.segment_width(),
+                    text: slice,
+                    width: slice.segment_width(),
                     break_before: BreakKind::Opportunity,
-                    direction:    Direction::Ltr,
+                    direction: Direction::Ltr,
                 });
                 continue;
             }
@@ -113,10 +117,10 @@ impl Segmenter {
             if c.is_cjk() {
                 let len = c.len_utf8();
                 segments.push(Segment {
-                    text:         &text[i..i + len],
-                    width:        2,
+                    text: &text[i..i + len],
+                    width: 2,
                     break_before: BreakKind::Opportunity,
-                    direction:    c.bidi_dir(),
+                    direction: c.bidi_dir(),
                 });
                 i += len;
                 continue;
@@ -147,10 +151,10 @@ impl Segmenter {
                     }
                 };
                 segments.push(Segment {
-                    text:         slice,
-                    width:        slice.segment_width(),
+                    text: slice,
+                    width: slice.segment_width(),
                     break_before,
-                    direction:    slice.paragraph_dir(),
+                    direction: slice.paragraph_dir(),
                 });
             }
         }

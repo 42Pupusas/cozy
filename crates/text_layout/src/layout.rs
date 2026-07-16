@@ -20,13 +20,13 @@ pub struct LayoutParams {
 #[derive(Clone, Debug)]
 pub struct LayoutLine<'a> {
     /// The original text slice that makes up this line (may span multiple segments).
-    pub text:      &'a str,
+    pub text: &'a str,
     /// Total cell width of the line.
-    pub width:     usize,
+    pub width: usize,
     /// Resolved base direction for this line.
     pub direction: Direction,
     /// 0-based line index.
-    pub index:     usize,
+    pub index: usize,
 }
 
 /// Stateless orchestrator tying [`Segmenter`], [`crate::bidi`], and
@@ -44,9 +44,11 @@ impl Layouter {
     /// the last line always appears even if empty.
     #[must_use]
     pub fn layout(text: &str, params: LayoutParams) -> Vec<LayoutLine<'_>> {
-        let dir = params.direction.unwrap_or_else(|| text.paragraph_direction());
+        let dir = params
+            .direction
+            .unwrap_or_else(|| text.paragraph_direction());
         let segments = Segmenter::segment(text);
-        let breaks   = LineBreaker::compute_breaks(&segments, params.max_width);
+        let breaks = LineBreaker::compute_breaks(&segments, params.max_width);
 
         let mut lines = Vec::with_capacity(breaks.len());
 
@@ -57,10 +59,10 @@ impl Layouter {
                 ""
             } else {
                 let first = segments[lb.start_segment].text;
-                let last  = segments[lb.end_segment - 1].text;
+                let last = segments[lb.end_segment - 1].text;
                 // Safety: both are subslices of `text`; the range between them is valid UTF-8.
                 let start = first.as_ptr() as usize - text.as_ptr() as usize;
-                let end   = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
+                let end = last.as_ptr() as usize - text.as_ptr() as usize + last.len();
                 &text[start..end]
             };
 
@@ -72,10 +74,10 @@ impl Layouter {
             };
 
             lines.push(LayoutLine {
-                text:      slice,
-                width:     lb.width,
+                text: slice,
+                width: lb.width,
                 direction: line_dir,
-                index:     idx,
+                index: idx,
             });
         }
 
@@ -88,10 +90,16 @@ mod tests {
     use super::*;
 
     fn lay(text: &str, max_width: usize) -> Vec<String> {
-        Layouter::layout(text, LayoutParams { max_width, direction: None })
-            .into_iter()
-            .map(|l| l.text.to_owned())
-            .collect()
+        Layouter::layout(
+            text,
+            LayoutParams {
+                max_width,
+                direction: None,
+            },
+        )
+        .into_iter()
+        .map(|l| l.text.to_owned())
+        .collect()
     }
 
     #[test]
@@ -136,7 +144,10 @@ mod tests {
     fn direction_override() {
         let lines = Layouter::layout(
             "hello",
-            LayoutParams { max_width: 0, direction: Some(Direction::Rtl) },
+            LayoutParams {
+                max_width: 0,
+                direction: Some(Direction::Rtl),
+            },
         );
         assert_eq!(lines[0].direction, Direction::Rtl);
     }

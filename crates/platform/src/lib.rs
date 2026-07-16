@@ -61,6 +61,7 @@ pub mod keymap;
 pub mod protocol;
 pub mod sys;
 pub mod wire;
+pub mod xcursor;
 
 mod render;
 pub mod window;

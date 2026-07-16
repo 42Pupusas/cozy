@@ -1,10 +1,11 @@
-//! Hardware cursor support: a left-arrow pointer rendered into a shared-memory
-//! buffer, attached to a dedicated `wl_surface`, and activated via
-//! `wl_pointer.set_cursor`.
+//! Hardware cursor support: the system's real pointer image (loaded from the
+//! user's Xcursor theme, matching every other app on their desktop) rendered
+//! into a shared-memory buffer, attached to a dedicated `wl_surface`, and
+//! activated via `wl_pointer.set_cursor`.
 //!
-//! For now only one cursor shape exists — the classic X "left_ptr" at 16×16
-//! pixels with the hotspot at its tip. As we add more shapes (move, resize,
-//! text, …) the surface remains the same; we just attach a different buffer.
+//! If no system theme can be found or decoded (headless test box, unusual
+//! setup, etc.) we fall back to a small hand-drawn "left_ptr" bitmap so the
+//! cursor is never simply invisible.
 
 use crate::conn::{ConnError, Sender};
 use crate::draw::Color;
@@ -13,14 +14,10 @@ use crate::id::{BufferId, CompositorId, ShmId, SurfaceId};
 use crate::protocol::{CompositorRequest, Format, ShmPoolRequest, ShmRequest, SurfaceRequest};
 use crate::sys::ShmBuffer;
 use crate::wire::MessageBuilder;
+use crate::xcursor::{self, CursorImage};
 
-/// Width and height of the cursor image, in pixels.
-pub const CURSOR_SIZE: i32 = 16;
-
-/// Hotspot offset (pixels from top-left) of the left-arrow cursor — the pixel
-/// that the compositor aligns with the physical pointer position.
-pub const HOTSPOT_X: i32 = 2;
-pub const HOTSPOT_Y: i32 = 2;
+/// Width and height of the built-in fallback cursor bitmap, in pixels.
+pub const FALLBACK_SIZE: i32 = 16;
 
 /// Pixel-layout tag for the bitmap below: 0 → transparent, 1 → black outline,
 /// 2 → white fill.
@@ -29,7 +26,7 @@ const B: u8 = 1;
 const W: u8 = 2;
 
 /// The X "left_ptr" cursor at 16×16, as a flat row-major array of pixel tags.
-/// Converted to ARGB8888 at runtime by [`Cursor::write_left_ptr`].
+/// Used only when no real system cursor theme could be loaded.
 const LEFT_PTR_BITMAP: &[u8] = &[
     T, T, T, T, B, B, B, B, T, T, T, T, T, T, T, T, //  0
     T, T, T, T, B, W, W, B, T, T, T, T, T, T, T, T, //  1
@@ -53,28 +50,49 @@ const LEFT_PTR_BITMAP: &[u8] = &[
 pub struct Cursor {
     /// The cursor's dedicated `wl_surface`.
     pub surface: SurfaceId,
-    /// The buffer currently attached to the cursor surface (holds the
-    /// left-arrow pixels). Held for lifetime — never read after setup.
+    /// The buffer currently attached to the cursor surface.
     #[allow(dead_code)]
     pub buffer: BufferId,
     /// Backing shared memory for the cursor buffer — must stay mapped while the
     /// compositor may read it.
     #[allow(dead_code)] // held for the mmap lifetime
     pub shm: ShmBuffer,
+    /// Hotspot the compositor should align with the physical pointer
+    /// position, in the cursor image's own pixel space.
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
 }
 
 impl Cursor {
-    /// Set up the cursor surface: allocate its shm buffer, paint the
-    /// left-arrow bitmap into it, and attach + commit the Wayland surface.
-    ///
-    /// Was a free `create_cursor(sender, shm, compositor)` function in
-    /// `window.rs` -- it builds nothing but a `Cursor`, so it belongs as a
-    /// constructor on the type it returns, the same shape as
-    /// `RawPty::fork`/`File::open` elsewhere in this codebase.
-    pub fn create(sender: &mut Sender, shm: ShmId, compositor: CompositorId) -> Result<Self> {
-        let cs = CURSOR_SIZE as usize;
-        let mut cshm = ShmBuffer::new(cs, cs, 1).map_err(|e| Error::Conn(ConnError::Sys(e)))?;
-        Self::write_left_ptr(cshm.pixels(0));
+    /// Set up the cursor surface: try to load the user's real system cursor
+    /// theme at `scale`x density, falling back to the built-in bitmap if
+    /// none is found; paint it into an shm buffer; attach + commit the
+    /// Wayland surface.
+    pub fn create(
+        sender: &mut Sender,
+        shm: ShmId,
+        compositor: CompositorId,
+        scale: i32,
+    ) -> Result<Self> {
+        let image = xcursor::load_system_pointer(scale);
+        let (width, height, hotspot_x, hotspot_y) = match &image {
+            Some(img) => (
+                img.width as i32,
+                img.height as i32,
+                img.hotspot_x as i32,
+                img.hotspot_y as i32,
+            ),
+            None => (FALLBACK_SIZE, FALLBACK_SIZE, 2, 2),
+        };
+
+        let w = width.max(1) as usize;
+        let h = height.max(1) as usize;
+        let mut cshm = ShmBuffer::new(w, h, 1).map_err(|e| Error::Conn(ConnError::Sys(e)))?;
+        match &image {
+            Some(img) => Self::write_image(cshm.pixels(0), img),
+            None => Self::write_left_ptr(cshm.pixels(0)),
+        }
+
         let cursor_pool: crate::id::PoolId = sender.alloc_id();
         let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
             .new_id(cursor_pool)
@@ -91,9 +109,9 @@ impl Cursor {
             MessageBuilder::new(cursor_pool, ShmPoolRequest::CreateBuffer)
                 .new_id(cursor_buffer)
                 .i32(0)
-                .i32(CURSOR_SIZE)
-                .i32(CURSOR_SIZE)
-                .i32(CURSOR_SIZE * 4)
+                .i32(width)
+                .i32(height)
+                .i32(width * 4)
                 .u32(Format::Argb8888.code()),
         )?;
         sender.request(
@@ -107,16 +125,20 @@ impl Cursor {
             surface: cursor_surface,
             buffer: cursor_buffer,
             shm: cshm,
+            hotspot_x,
+            hotspot_y,
         })
     }
 
-    /// Write the left-arrow cursor into `pixels`, which must be at least
-    /// `CURSOR_SIZE × CURSOR_SIZE` elements. Fills every pixel — call on a
-    /// zero-initialized or don't-care buffer.
-    ///
-    /// Was a free `write_left_ptr(pixels)` function -- moved onto `Cursor`
-    /// since it's the type-specific image data (`LEFT_PTR_BITMAP`) being
-    /// rasterized, alongside its sibling constructor `create`.
+    /// Copy a decoded Xcursor image's premultiplied ARGB8888 pixels straight
+    /// into the shm buffer — same pixel format, no conversion needed.
+    fn write_image(pixels: &mut [u32], img: &CursorImage) {
+        let n = pixels.len().min(img.pixels.len());
+        pixels[..n].copy_from_slice(&img.pixels[..n]);
+    }
+
+    /// Write the fallback left-arrow cursor into `pixels`, which must be at
+    /// least `FALLBACK_SIZE × FALLBACK_SIZE` elements.
     fn write_left_ptr(pixels: &mut [u32]) {
         let black = Color::BLACK.to_argb8888();
         let white = Color::WHITE.to_argb8888();

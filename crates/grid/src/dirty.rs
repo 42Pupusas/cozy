@@ -94,6 +94,8 @@ impl DirtyRegion {
             cols: self.cols,
             cursor: CursorInfo::default(),
             cursor_changed: false,
+            content_delta: 0,
+            viewport_offset: None,
         }
     }
 
@@ -127,6 +129,8 @@ pub(crate) fn viewport_snapshot(
         cols,
         cursor: CursorInfo::default(),
         cursor_changed: false,
+        content_delta: 0,
+        viewport_offset: Some(viewport_offset.min(u16::MAX as usize) as u16),
     }
 }
 
@@ -169,6 +173,18 @@ pub struct DirtySnapshot {
     /// renderer detect "the cursor moved but no cell changed" so it still
     /// repaints (and animates) even when `rows` is empty.
     pub cursor_changed: bool,
+    /// Net lines the primary screen's content scrolled up since the last
+    /// snapshot (new output pushing lines into scrollback). The renderer
+    /// shifts its selection and cell mirror up by this so a highlight stays
+    /// glued to the *text*, not the viewport position, as output streams in.
+    /// `0` on the alternate screen and on full-frame (viewport) snapshots.
+    pub content_delta: u16,
+    /// `Some(k)` when this is a full-frame viewport snapshot (the view is
+    /// scrolled `k` lines into scrollback); `None` for a normal live-bottom
+    /// snapshot. Lets the renderer shift its selection/mirror with the text
+    /// as the user wheel-scrolls through history — the content is fixed but
+    /// the view window moves, the opposite transform of `content_delta`.
+    pub viewport_offset: Option<u16>,
 }
 
 impl DirtySnapshot {
@@ -176,6 +192,6 @@ impl DirtySnapshot {
     /// either -- i.e. there is genuinely nothing new for the renderer to do.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && !self.cursor_changed
+        self.rows.is_empty() && !self.cursor_changed && self.content_delta == 0
     }
 }

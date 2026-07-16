@@ -236,6 +236,11 @@ pub struct TermWindow {
     cell_mirror: Vec<Vec<grid::Cell>>,
     /// Active mouse-drag selection, in viewport cell coords `(col, row)`.
     selection: Option<((u16, u16), (u16, u16))>,
+    /// Current viewport offset (lines scrolled into scrollback; 0 = live
+    /// bottom). Tracked so a wheel-scroll shifts the selection with the text:
+    /// the content is fixed but the view window moves, so a selection at
+    /// viewport row R must move by the offset change to stay on its text.
+    view_offset: i32,
     /// Set when a `data_source.send` just arrived; the next `Event::Fd` is the
     /// pipe to write our clipboard text into.
     awaiting_send_fd: bool,
@@ -387,7 +392,7 @@ impl TermWindow {
         sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetTitle).string(title))?;
         sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
 
-        let cursor = cursor::Cursor::create(&mut sender, shm, compositor).ok();
+        let cursor = cursor::Cursor::create(&mut sender, shm, compositor, scale).ok();
 
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<crate::conn::WindowRequest>::new(Capacity::exact(64)).split();
@@ -468,6 +473,7 @@ impl TermWindow {
             clipboard_offer: None,
             cell_mirror: Vec::new(),
             selection: None,
+            view_offset: 0,
             awaiting_send_fd: false,
             paste_tx,
             paste_rx,
@@ -484,6 +490,37 @@ impl TermWindow {
     /// Queue a dirty snapshot to be blitted on the next frame.
     pub fn push_dirty(&mut self, snap: grid::DirtySnapshot) {
         if !snap.is_empty() {
+            // Wheel-scroll of the viewport: the content is fixed but the view
+            // window moved. Shift the selection by the offset change so it
+            // stays on its text, and reset the mirror (a full-frame snapshot
+            // repaints every visible row below).
+            if let Some(new_off) = snap.viewport_offset {
+                let new_off = i32::from(new_off);
+                let delta = new_off - self.view_offset;
+                self.view_offset = new_off;
+                if delta != 0 {
+                    self.shift_selection_for_scroll(delta);
+                }
+                self.cell_mirror.clear();
+            } else if self.view_offset != 0 {
+                // A live-bottom snapshot while we thought we were scrolled —
+                // output snapped the view back to the bottom without a
+                // viewport frame. Resync so the next wheel-scroll shifts
+                // from the right base.
+                self.view_offset = 0;
+            }
+            // Content scrolled up: shift the selection and cell mirror up by
+            // the same amount so the highlight stays glued to the *text*,
+            // not the viewport position, as new output streams in. Rows that
+            // scrolled off the top drop out of the selection.
+            let delta = i32::from(snap.content_delta);
+            if delta > 0 {
+                self.shift_selection_for_scroll(delta);
+                if !self.cell_mirror.is_empty() {
+                    let d = (delta as usize).min(self.cell_mirror.len());
+                    self.cell_mirror.drain(..d);
+                }
+            }
             // Keep the cell mirror in sync so selection/highlight/extraction
             // always reflect the latest drawn content.
             for row in &snap.rows {
@@ -506,6 +543,34 @@ impl TermWindow {
     /// Pull the next pending input event, if any.
     pub fn next_input(&mut self) -> Option<InputEvent> {
         self.input_queue.pop_front()
+    }
+
+    /// Shift the active selection up by `delta` rows to follow content that
+    /// scrolled off the top (new output pushed lines into scrollback). Rows
+    /// that scrolled away are dropped; if the whole selection scrolled off,
+    /// it's cleared. This keeps a highlight glued to its text as output
+    /// streams in, instead of stranding it on the viewport position.
+    fn shift_selection_for_scroll(&mut self, delta: i32) {
+        let Some(((ac, ar), (bc, br))) = self.selection else {
+            return;
+        };
+        let shift = |row: u16| -> Option<u16> {
+            let r = i32::from(row) - delta;
+            if r < 0 { None } else { Some(r as u16) }
+        };
+        match (shift(ar), shift(br)) {
+            (Some(nar), Some(nbr)) => {
+                self.selection = Some(((ac, nar), (bc, nbr)));
+                self.dirty = true;
+            }
+            // One end scrolled off: the selection is gone entirely (it spanned
+            // rows that are no longer on screen in a way we can't faithfully
+            // re-anchor), so clear it rather than show a wrong range.
+            _ => {
+                self.selection = None;
+                self.dirty = true;
+            }
+        }
     }
 
     /// The grid cell under the pointer, in viewport coordinates, or `(0,0)`
@@ -902,8 +967,8 @@ impl TermWindow {
                                 MessageBuilder::new(pointer, PointerRequest::SetCursor)
                                     .u32(ev.serial(0).raw())
                                     .object(cursor.surface)
-                                    .i32(cursor::HOTSPOT_X)
-                                    .i32(cursor::HOTSPOT_Y),
+                                    .i32(cursor.hotspot_x)
+                                    .i32(cursor.hotspot_y),
                             );
                         }
                     }

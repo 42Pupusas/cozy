@@ -121,6 +121,13 @@ fn run(cfg: &Config) -> platform::Result<()> {
     let quit_pty = Arc::clone(&quit);
     let quit_parser = Arc::clone(&quit);
 
+    // Bracketed-paste mode (DECSET 2004) is set by the app on the parser
+    // thread (which owns the grid) but read on the UI thread (which writes
+    // clipboard paste to the PTY). Published via a shared atomic.
+    let bracketed_paste = Arc::new(AtomicBool::new(false));
+    let bracketed_paste_parser = Arc::clone(&bracketed_paste);
+    let bracketed_paste_ui = Arc::clone(&bracketed_paste);
+
     // ── Cross-thread wakeups (eventfd + poll) ────────────────────────────────
     // Each thread that waits on more than one source blocks in poll(2) on an
     // eventfd instead of busy-spinning. `ui_wake` is owned by the window (the
@@ -151,6 +158,7 @@ fn run(cfg: &Config) -> platform::Result<()> {
                 reply_tx,
                 parser_ui_wake,
                 parser_pty_wake,
+                bracketed_paste_parser,
                 quit_parser,
             );
         })
@@ -165,6 +173,7 @@ fn run(cfg: &Config) -> platform::Result<()> {
         parser_resize_tx,
         ui_wake,
         ui_pty_wake,
+        &bracketed_paste_ui,
         &quit,
     )?;
 
@@ -283,6 +292,7 @@ fn parser_thread(
     reply_tx: mpsc::Producer<InputMsg>,
     ui_wake: waker::Waker,
     pty_wake: waker::Waker,
+    bracketed_paste: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
 ) {
     let mut grid = Grid::new(cols, rows);
@@ -311,6 +321,10 @@ fn parser_thread(
 
         flush_replies(&mut grid);
 
+        // Publish bracketed-paste mode for the UI thread (it wraps clipboard
+        // paste in the 200~/201~ markers when the app asked for it).
+        bracketed_paste.store(grid.bracketed_paste(), Ordering::Relaxed);
+
         let snap = grid.take_dirty();
         if !snap.is_empty() {
             let _ = dirty_tx.push(snap);
@@ -330,6 +344,7 @@ fn ui_thread(
     scroll_tx: mpsc::Producer<ParserMsg>,
     ui_wake: platform::Waker,
     pty_wake: waker::Waker,
+    bracketed_paste: &AtomicBool,
     quit: &AtomicBool,
 ) -> platform::Result<()> {
     let theme = platform::Theme::from_palette(&cfg.palette);
@@ -399,8 +414,20 @@ fn ui_thread(
                 }
                 InputEvent::Paste(bytes) => {
                     // Clipboard contents from another client: write to the PTY
-                    // so the shell/app receives them as typed input.
-                    let _ = input_tx.push(InputMsg::Bytes(bytes.into_boxed_slice()));
+                    // so the shell/app receives them as input. When the app
+                    // enabled bracketed paste (DECSET 2004), wrap in the
+                    // 200~/201~ markers so pasted newlines are treated as text,
+                    // not as typed Enter (fish/zsh/neovim rely on this).
+                    let data = if bracketed_paste.load(Ordering::Relaxed) {
+                        let mut wrapped = Vec::with_capacity(bytes.len() + 12);
+                        wrapped.extend_from_slice(b"\x1b[200~");
+                        wrapped.extend_from_slice(&bytes);
+                        wrapped.extend_from_slice(b"\x1b[201~");
+                        wrapped
+                    } else {
+                        bytes
+                    };
+                    let _ = input_tx.push(InputMsg::Bytes(data.into_boxed_slice()));
                     sent_input = true;
                 }
                 InputEvent::Key {

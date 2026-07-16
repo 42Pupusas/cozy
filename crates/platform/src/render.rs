@@ -829,6 +829,8 @@ mod tests {
             }],
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
+            content_delta: 0,
+            viewport_offset: None,
         };
         let theme = Theme::builtin();
         let bg = theme.bg_xrgb();
@@ -863,6 +865,8 @@ mod tests {
             }],
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
+            content_delta: 0,
+            viewport_offset: None,
         };
         let mut renderer = Renderer::builtin(Theme::builtin());
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);

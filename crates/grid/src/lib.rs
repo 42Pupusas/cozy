@@ -49,6 +49,11 @@ pub struct Grid {
     alternate: Screen,
     /// True while the alternate screen is active.
     alt_active: bool,
+    /// Bracketed paste mode (DECSET 2004). When enabled by the application,
+    /// clipboard paste is wrapped in ESC[200~ … ESC[201~ so the app can tell
+    /// pasted newlines apart from typed Enter (fish/zsh/neovim rely on this to
+    /// not execute multi-line pastes).
+    bracketed_paste: bool,
     /// Current cursor attributes (color, shape).
     cursor: Cursor,
     /// Accumulated SGR attributes for new cells.
@@ -66,6 +71,11 @@ pub struct Grid {
     /// must emit a full-frame snapshot (every visible row changes when the view
     /// scrolls, so incremental dirty rows would be wrong).
     viewport_dirty: bool,
+    /// Lines the primary screen's content scrolled up since the last
+    /// [`Grid::take_dirty`] snapshot (new output pushing lines into
+    /// scrollback). Emitted on the snapshot so the renderer can shift its
+    /// selection/mirror to keep highlights glued to the text, then reset.
+    content_delta: u16,
     /// Bytes the terminal must write back to the PTY (CPR, DA, etc.).
     /// Drained by the driver via [`Grid::take_replies`] after each batch.
     replies: Vec<u8>,
@@ -90,12 +100,14 @@ impl Grid {
             primary: Screen::new(cols, rows, SCROLLBACK_MAX),
             alternate: Screen::new(cols, rows, 0),
             alt_active: false,
+            bracketed_paste: false,
             cursor: Cursor::default(),
             attrs: Attrs::default(),
             dirty: DirtyRegion::new(cols, rows),
             saved_cursor: None,
             viewport_offset: 0,
             viewport_dirty: false,
+            content_delta: 0,
             replies: Vec::new(),
             pending_wrap: false,
             last_cursor: CursorInfo::default(),
@@ -220,6 +232,11 @@ impl Grid {
                 crate::dirty::viewport_snapshot(&self.primary, self.viewport_offset, cols, rows);
             snap.cursor = cur;
             snap.cursor_changed = cursor_changed;
+            // A viewport move is a full-frame repaint in *view* coordinates —
+            // the content didn't scroll, so the selection/mirror must NOT be
+            // shifted. content_delta stays 0 here.
+            snap.content_delta = 0;
+            self.content_delta = 0;
             return snap;
         }
         let screen = if self.alt_active {
@@ -230,6 +247,9 @@ impl Grid {
         let mut snap = self.dirty.take_snapshot(screen);
         snap.cursor = cur;
         snap.cursor_changed = cursor_changed;
+        snap.content_delta = self.content_delta;
+        snap.viewport_offset = None;
+        self.content_delta = 0;
         snap
     }
 
@@ -394,7 +414,8 @@ impl Grid {
         if self.cursor.row + n > bot {
             if scroll {
                 let scroll_lines = (self.cursor.row + n).saturating_sub(bot);
-                self.active_screen_mut().scroll_up(scroll_lines, top, bot);
+                let d = self.active_screen_mut().scroll_up(scroll_lines, top, bot);
+                self.content_delta = self.content_delta.saturating_add(d);
                 self.dirty.mark_rows(top, bot);
                 self.cursor.row = bot;
             } else {
@@ -522,7 +543,8 @@ impl Grid {
             }
             CsiAction::ScrollUp(n) => {
                 let (top, bot) = self.active_screen().scroll_region();
-                self.active_screen_mut().scroll_up(*n, top, bot);
+                let d = self.active_screen_mut().scroll_up(*n, top, bot);
+                self.content_delta = self.content_delta.saturating_add(d);
                 self.dirty.mark_rows(top, bot);
             }
             CsiAction::ScrollDown(n) => {
@@ -608,6 +630,9 @@ impl Grid {
         match mode {
             // DECTEM — cursor visibility
             25 => self.cursor.visible = enable,
+            // Bracketed paste — the app wants pasted text wrapped in
+            // ESC[200~ … ESC[201~ (read by the driver when pasting).
+            2004 => self.bracketed_paste = enable,
             // DECALTBUF / smcup (1049)
             1049 | 47 | 1047 => {
                 if enable && !self.alt_active {
@@ -629,6 +654,13 @@ impl Grid {
             }
             _ => {}
         }
+    }
+
+    /// Whether the application has enabled bracketed paste (DECSET 2004).
+    /// Read by the driver when wrapping clipboard paste in ESC[200~ … ESC[201~.
+    #[must_use]
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
     }
 
     fn osc(&mut self, cmd: &OscCmd) {
@@ -699,6 +731,32 @@ mod tests {
     }
 
     const CJK_ZHONG: &str = "\u{4e2d}"; // '中' (Chinese for "middle") — 2 cells wide
+
+    #[test]
+    fn bracketed_paste_mode_tracked() {
+        let mut g = Grid::new(10, 3);
+        assert!(!g.bracketed_paste());
+        apply_str(&mut g, b"\x1b[?2004h"); // DECSET 2004 — enable
+        assert!(g.bracketed_paste());
+        apply_str(&mut g, b"\x1b[?2004l"); // DECRST 2004 — disable
+        assert!(!g.bracketed_paste());
+    }
+
+    #[test]
+    fn take_dirty_reports_content_scroll_delta() {
+        // Fill a 3-row screen, then push 2 more lines so 2 scroll into
+        // scrollback. The next dirty snapshot must report content_delta == 2
+        // so the renderer can shift its selection to follow the text.
+        let mut g = Grid::new(10, 3);
+        apply_str(&mut g, b"l0\r\nl1\r\nl2\r\n");
+        let _ = g.take_dirty(); // drain the fill
+        apply_str(&mut g, b"l3\r\nl4\r\n"); // 2 more lines -> 2 scroll off top
+        let snap = g.take_dirty();
+        assert_eq!(snap.content_delta, 2);
+        // Delta resets after being reported.
+        let snap2 = g.take_dirty();
+        assert_eq!(snap2.content_delta, 0);
+    }
 
     #[test]
     fn print_text() {

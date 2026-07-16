@@ -202,8 +202,12 @@ impl Screen {
     /// (linefeed past the last row, or an explicit `CSI Ps S` Scroll Up).
     /// Lines that scroll off the top are pushed into scrollback (primary
     /// screen only, and only when the region starts at row 0).
-    pub fn scroll_up(&mut self, n: u16, top: u16, bot: u16) {
-        self.scroll_up_impl(n, top, bot, true);
+    ///
+    /// Returns the number of lines that entered scrollback — the net upward
+    /// shift of on-screen content, which the grid uses to keep selections
+    /// glued to their text.
+    pub fn scroll_up(&mut self, n: u16, top: u16, bot: u16) -> u16 {
+        self.scroll_up_impl(n, top, bot, true)
     }
 
     /// Delete `n` lines at `row` (DL, `CSI Ps M`): pulls lines below up into
@@ -215,14 +219,14 @@ impl Screen {
         self.scroll_up_impl(n, row, bot, false);
     }
 
-    fn scroll_up_impl(&mut self, n: u16, top: u16, bot: u16, push_scrollback: bool) {
+    fn scroll_up_impl(&mut self, n: u16, top: u16, bot: u16, push_scrollback: bool) -> u16 {
         let cols = usize::from(self.cols);
         let n = usize::from(n);
         let top_i = usize::from(top);
         let bot_i = usize::from(bot);
 
         if n == 0 || top_i >= bot_i {
-            return;
+            return 0;
         }
         // Never scroll by more than the region height.
         let n = n.min(bot_i - top_i);
@@ -292,6 +296,18 @@ impl Screen {
             for w in &mut self.wrapped[region_top + keep..region_top + keep + n] {
                 *w = false;
             }
+        }
+
+        // Net upward shift of on-screen content: the rows that scrolled off
+        // the top into history. For a genuine top-region scroll that's simply
+        // `n` — the whole visible region moved up by n rows, regardless of
+        // whether the scrollback buffer had room to retain them (push) or had
+        // to drop the oldest (drop_rows). DL/IL never touch scrollback and so
+        // correctly report 0.
+        if push_scrollback && top_i == 0 && self.scrollback_max > 0 {
+            n.min(u16::MAX as usize) as u16
+        } else {
+            0
         }
     }
 

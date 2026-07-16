@@ -151,9 +151,9 @@ pub fn connect() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
 
     // Connect once (on the tx ring — any ring works, the socket is shared).
     let path_bytes = path.as_os_str().as_encoded_bytes();
-    let (addr, addr_len) = sys::sockaddr_un(path_bytes);
+    let addr = sys::SockAddrUn::new(path_bytes);
     // SAFETY: `addr` outlives the blocking submit below.
-    let cqe = run_one(&mut ring_tx, Sqe::connect(sock, &addr[..addr_len as usize]))?;
+    let cqe = run_one(&mut ring_tx, Sqe::connect(sock, addr.as_bytes()))?;
     if cqe < 0 {
         return Err(ConnError::Connect(io::Error::from_raw_os_error(-cqe)));
     }
@@ -166,7 +166,7 @@ pub fn connect() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
     // Persistent recv header: no name, control region wide enough for a
     // SCM_RIGHTS cmsg of up to MAX_FDS fds. Buffer-select supplies the data
     // buffer from the pool, so the iov stays empty.
-    let recv_controllen = sys::recv_control_len(MAX_FDS) as u32;
+    let recv_controllen = sys::IncomingControl::reserve_len(MAX_FDS) as u32;
     let mut recv_hdr = Box::new(MsgHdr::default());
     recv_hdr.msg_namelen = RECV_NAMELEN;
     recv_hdr.msg_controllen = recv_controllen as usize;
@@ -457,7 +457,7 @@ impl Reader {
         if result < 0 {
             return Err(ConnError::Io(io::Error::from_raw_os_error(-result)));
         }
-        sys::drain_timerfd(self.timer_fd.as_i32());
+        RepeatTimer::drain_fd(self.timer_fd.as_i32());
         // Best-effort: if the consumer dropped, the main loop is ending anyway.
         let _ = producer.push_block(Event::Repeat);
         self.arm_timer_poll()
@@ -486,7 +486,7 @@ impl Reader {
                 // from wl_keyboard.keymap — the only fd-bearing event we get).
                 // We don't parse the XKB keymap, so we just take ownership; they
                 // close when the Reader drops. Retained, not used, by design.
-                let mut fds = sys::fds_from_control(parts.control);
+                let mut fds = sys::IncomingControl::fds(parts.control);
                 self.pending_fds.append(&mut fds);
             }
             self.pool.recycle_and_commit(buf_id);

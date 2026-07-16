@@ -222,41 +222,55 @@ impl OutgoingMessage {
     }
 }
 
-/// The fixed control-region width we reserve on every multishot recvmsg, sized
-/// to hold one SCM_RIGHTS cmsg carrying up to `max_fds` descriptors. This is the
-/// `msg_controllen` we set on the persistent recv `MsgHdr` — and thus the width
-/// of the control region inside each provided buffer.
-pub fn recv_control_len(max_fds: usize) -> usize {
-    cmsg_align(CMSG_HDR_LEN + std::mem::size_of::<RawFd>() * max_fds)
-}
+/// The received counterpart to [`OutgoingMessage`]: reading SCM_RIGHTS
+/// ancillary data back out of a control (cmsg) region the kernel wrote.
+///
+/// A zero-sized namespace rather than free functions at module scope -- same
+/// reasoning as `pty::sys::RawPty`: there's no fd/message value in hand yet
+/// to attach these to (they parse one), so the idiomatic home is an
+/// associated function on a type that names the concept, not a bare
+/// module-level fn.
+pub struct IncomingControl;
 
-/// Parse SCM_RIGHTS file descriptors out of a received control (cmsg) region,
-/// taking ownership of each. `control` is the control slice the kernel wrote —
-/// e.g. `RecvmsgParts::control` from a multishot recvmsg buffer.
-pub fn fds_from_control(control: &[u8]) -> Vec<OwnedFd> {
-    use std::os::fd::FromRawFd;
-    let mut fds = Vec::new();
-    if control.len() >= CMSG_HDR_LEN {
-        // SAFETY: a control region of at least CMSG_HDR_LEN bytes holds a valid
-        // cmsghdr; we read its fields and, if SCM_RIGHTS, the fd payload behind
-        // it (bounded by cmsg_len, which the kernel set).
-        unsafe {
-            let cmsg = control.as_ptr() as *const CmsgHdr;
-            if (*cmsg).cmsg_level == SOL_SOCKET
-                && (*cmsg).cmsg_type == SCM_RIGHTS
-                && (*cmsg).cmsg_len >= CMSG_HDR_LEN
-                && (*cmsg).cmsg_len <= control.len()
-            {
-                let payload = (*cmsg).cmsg_len - CMSG_HDR_LEN;
-                let count = payload / std::mem::size_of::<RawFd>();
-                let data = control.as_ptr().add(CMSG_HDR_LEN) as *const RawFd;
-                for i in 0..count {
-                    fds.push(OwnedFd::from_raw_fd(data.add(i).read()));
+impl IncomingControl {
+    /// The fixed control-region width to reserve on every multishot recvmsg,
+    /// sized to hold one SCM_RIGHTS cmsg carrying up to `max_fds`
+    /// descriptors. This is the `msg_controllen` set on the persistent recv
+    /// `MsgHdr` -- and thus the width of the control region inside each
+    /// provided buffer.
+    pub fn reserve_len(max_fds: usize) -> usize {
+        cmsg_align(CMSG_HDR_LEN + std::mem::size_of::<RawFd>() * max_fds)
+    }
+
+    /// Parse SCM_RIGHTS file descriptors out of a received control (cmsg)
+    /// region, taking ownership of each. `control` is the control slice the
+    /// kernel wrote -- e.g. `RecvmsgParts::control` from a multishot recvmsg
+    /// buffer.
+    pub fn fds(control: &[u8]) -> Vec<OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let mut fds = Vec::new();
+        if control.len() >= CMSG_HDR_LEN {
+            // SAFETY: a control region of at least CMSG_HDR_LEN bytes holds a
+            // valid cmsghdr; we read its fields and, if SCM_RIGHTS, the fd
+            // payload behind it (bounded by cmsg_len, which the kernel set).
+            unsafe {
+                let cmsg = control.as_ptr() as *const CmsgHdr;
+                if (*cmsg).cmsg_level == SOL_SOCKET
+                    && (*cmsg).cmsg_type == SCM_RIGHTS
+                    && (*cmsg).cmsg_len >= CMSG_HDR_LEN
+                    && (*cmsg).cmsg_len <= control.len()
+                {
+                    let payload = (*cmsg).cmsg_len - CMSG_HDR_LEN;
+                    let count = payload / std::mem::size_of::<RawFd>();
+                    let data = control.as_ptr().add(CMSG_HDR_LEN) as *const RawFd;
+                    for i in 0..count {
+                        fds.push(OwnedFd::from_raw_fd(data.add(i).read()));
+                    }
                 }
             }
         }
+        fds
     }
-    fds
 }
 
 // --- AF_UNIX address ------------------------------------------------------
@@ -264,21 +278,42 @@ pub fn fds_from_control(control: &[u8]) -> Vec<OwnedFd> {
 /// `AF_UNIX` (Linux constant).
 pub const AF_UNIX: i32 = 1;
 
-/// Build the bytes of a `struct sockaddr_un` for `path`, plus its valid length.
+/// A `struct sockaddr_un` built for `connect(2)`: `sa_family` (u16,
+/// host-endian) followed by the NUL-terminated path in `sun_path` (108
+/// bytes).
 ///
-/// Layout: `sa_family` (u16, host-endian) followed by the NUL-terminated path
-/// in `sun_path` (108 bytes). The returned length is `offsetof(sun_path) +
-/// strlen(path) + 1`, which is what `connect` expects for a pathname socket.
-pub fn sockaddr_un(path: &[u8]) -> (Vec<u8>, u32) {
+/// A real value type (built once, read via [`SockAddrUn::as_bytes`]) rather
+/// than a `(Vec<u8>, u32)` tuple handed back from a free function -- the
+/// pairing of "these bytes" with "this many of them are valid" is exactly
+/// what a struct communicates and a tuple doesn't.
+pub struct SockAddrUn {
+    buf: Vec<u8>,
+    len: u32,
+}
+
+impl SockAddrUn {
     const SUN_PATH_LEN: usize = 108;
     const FAMILY_LEN: usize = 2;
-    let mut buf = vec![0u8; FAMILY_LEN + SUN_PATH_LEN];
-    buf[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
-    let n = path.len().min(SUN_PATH_LEN - 1);
-    buf[FAMILY_LEN..FAMILY_LEN + n].copy_from_slice(&path[..n]);
-    // NUL terminator is already there (buf zero-initialised).
-    let addr_len = (FAMILY_LEN + n + 1) as u32;
-    (buf, addr_len)
+
+    /// Build the address for `path`.
+    ///
+    /// The valid length is `offsetof(sun_path) + strlen(path) + 1` (the NUL
+    /// terminator), which is what `connect` expects for a pathname socket.
+    pub fn new(path: &[u8]) -> Self {
+        let mut buf = vec![0u8; Self::FAMILY_LEN + Self::SUN_PATH_LEN];
+        buf[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+        let n = path.len().min(Self::SUN_PATH_LEN - 1);
+        buf[Self::FAMILY_LEN..Self::FAMILY_LEN + n].copy_from_slice(&path[..n]);
+        // NUL terminator is already there (buf zero-initialised).
+        let len = (Self::FAMILY_LEN + n + 1) as u32;
+        Self { buf, len }
+    }
+
+    /// The valid `sockaddr_un` bytes (i.e. `buf[..len]`), ready for
+    /// `connect(2)`.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
 }
 
 // --- shared-memory pixel buffer ------------------------------------------
@@ -457,20 +492,26 @@ impl RepeatTimer {
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
-}
 
-/// Drain a timerfd's pending expiration count, clearing its level-triggered
-/// readiness so a re-armed poll won't immediately re-fire. The count itself is
-/// discarded — one readiness edge should yield one repeat regardless of how many
-/// expiries piled up (we don't want to fast-forward the box if the loop stalled
-/// briefly). Called from the reader thread, which polls the fd; it borrows only
-/// the raw integer, never the owning [`RepeatTimer`].
-pub fn drain_timerfd(fd: RawFd) {
-    let mut buf = [0u8; 8];
-    // SAFETY: reading up to 8 bytes into a local 8-byte buffer from a valid fd.
-    // A timerfd read yields exactly a u64 count or EAGAIN; we ignore both.
-    unsafe {
-        read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+    /// Drain a timerfd's pending expiration count, clearing its
+    /// level-triggered readiness so a re-armed poll won't immediately
+    /// re-fire. The count itself is discarded -- one readiness edge should
+    /// yield one repeat regardless of how many expiries piled up (we don't
+    /// want to fast-forward the box if the loop stalled briefly).
+    ///
+    /// An associated function taking a bare `fd`, not a `&self` method: the
+    /// reader thread polls only the raw integer (it never owns the
+    /// [`RepeatTimer`], which stays on the main thread), so there's no
+    /// `Self` to call this on -- same split as the socket fd, which is
+    /// likewise shared as a raw handle across the two threads.
+    pub fn drain_fd(fd: RawFd) {
+        let mut buf = [0u8; 8];
+        // SAFETY: reading up to 8 bytes into a local 8-byte buffer from a
+        // valid fd. A timerfd read yields exactly a u64 count or EAGAIN; we
+        // ignore both.
+        unsafe {
+            read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+        }
     }
 }
 

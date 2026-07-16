@@ -268,6 +268,22 @@ impl FontFace {
         RasterizedGlyph { metrics, bitmap }
     }
 
+    /// Combine a font's (fractional) ascender with a glyph's (fractional)
+    /// baseline-to-top bearing into the single pixel offset from the cell's
+    /// top row down to the glyph bitmap's top row, rounding **once**.
+    ///
+    /// This must not be done as `ascender.round() - bearing_y.round()`: each
+    /// glyph's `bearing_y` has its own fractional part, so rounding it
+    /// separately from the (shared, but also fractional) ascender makes
+    /// every glyph's baseline independently jitter by up to a pixel relative
+    /// to its neighbors — the general "baseline looks a little off" bug.
+    /// Rounding the combined offset once keeps every glyph's baseline
+    /// pinned to the exact same cell-relative row.
+    #[must_use]
+    pub fn cell_bearing_y(ascender: f32, bearing_y: f32) -> i32 {
+        (ascender - bearing_y).round() as i32
+    }
+
     /// Build a [`Atlas`] pre-populated with the printable ASCII glyphs (0x20–0x7E)
     /// plus a handful of box-drawing characters. This covers 99 % of terminal output.
     ///
@@ -284,15 +300,10 @@ impl FontFace {
 
         for cp in codepoints {
             let g = self.do_rasterize(cp);
-            // Round (not truncate) fractional pixel metrics before casting --
-            // truncation biases every glyph downward/leftward by up to a
-            // pixel depending on its particular fractional bearing, which
-            // visibly misaligns glyphs with descenders (g, p, y, q, j) whose
-            // bearing_y fraction differs from ascender-only glyphs.
             let entry = atlas.insert(
                 &g.bitmap,
                 g.metrics.bearing_x.round() as i32,
-                g.metrics.bearing_y.round() as i32,
+                Self::cell_bearing_y(self.line.ascender, g.metrics.bearing_y),
                 g.metrics.advance.round() as i32,
             );
             if let Some(e) = entry {

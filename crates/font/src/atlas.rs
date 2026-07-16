@@ -14,7 +14,20 @@ pub struct GlyphEntry {
     pub height: u32,
     /// Horizontal offset from pen position to the left edge of the bitmap.
     pub bearing_x: i32,
-    /// Vertical offset from baseline to the top edge of the bitmap.
+    /// Vertical offset from the cell's top (the face's rounded ascender row)
+    /// down to the glyph bitmap's top edge.
+    ///
+    /// Deliberately *not* "distance from baseline to bitmap top" (which is
+    /// what the rasterizer / `GlyphMetrics` calls `bearing_y`): that
+    /// quantity and the face's ascender are each fractional, and rounding
+    /// them to pixels *separately* before subtracting at blit time made
+    /// every glyph jitter its baseline by up to a pixel independently of its
+    /// neighbors (each glyph's fractional part rounds differently) — the
+    /// "baseline looks a little off for most characters" bug. Callers must
+    /// compute this as a single `(ascender - bearing_y).round()`, once, so
+    /// the whole glyph moves as an atomic unit relative to the shared
+    /// cell-top origin instead of two independently-rounded pieces fighting
+    /// each other.
     pub bearing_y: i32,
     /// How far to advance the pen after this glyph.
     pub advance: i32,

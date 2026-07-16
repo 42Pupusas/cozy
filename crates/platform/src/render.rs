@@ -185,14 +185,10 @@ impl GlyphCache {
         // `self.face` and `self.atlas` are disjoint fields, so this doesn't
         // fight the borrow checker despite the mutable + immutable overlap.
         let g = self.face.rasterize(codepoint);
-        // Round (not truncate) -- see the matching comment in
-        // `FontFace::build_ascii_atlas`; truncating here reproduces the same
-        // per-glyph vertical/horizontal jitter for any codepoint rasterized
-        // lazily (i.e. everything outside the pre-seeded ASCII atlas).
         let entry = self.atlas.insert(
             &g.bitmap,
             g.metrics.bearing_x.round() as i32,
-            g.metrics.bearing_y.round() as i32,
+            font::FontFace::cell_bearing_y(self.ascender, g.metrics.bearing_y),
             g.metrics.advance.round() as i32,
         );
         if let Some(e) = entry {
@@ -490,9 +486,15 @@ impl Renderer {
             return; // blank glyph (space etc.) — background is enough.
         }
 
-        let baseline_y = py0 as i64 + cache.ascender.round() as i64;
+        // `entry.bearing_y` is already the fully-resolved, single-rounded
+        // offset from the cell's top row to the glyph bitmap's top row (see
+        // `FontFace::cell_bearing_y`) -- it is *not* a baseline-relative
+        // value, so it must not be combined with a separately-rounded
+        // ascender here. Do not reintroduce `cache.ascender.round() -
+        // bearing_y`; that was the double-rounding bug that made every
+        // glyph's baseline jitter independently by up to a pixel.
         let glyph_x0 = px0 as i64 + i64::from(entry.bearing_x);
-        let glyph_y0 = baseline_y - i64::from(entry.bearing_y);
+        let glyph_y0 = py0 as i64 + i64::from(entry.bearing_y);
 
         let pixels = canvas.pixels_mut();
         for row in 0..entry.height {

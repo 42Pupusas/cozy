@@ -496,15 +496,22 @@ impl TermWindow {
     pub fn push_dirty(&mut self, snap: grid::DirtySnapshot) {
         if !snap.is_empty() {
             // Wheel-scroll of the viewport: the content is fixed but the view
-            // window moved. Shift the selection by the offset change so it
-            // stays on its text, and reset the mirror (a full-frame snapshot
-            // repaints every visible row below).
+            // window moved. Scrolling UP into history (offset grows) makes the
+            // text appear to move DOWN, so the selection moves down too —
+            // the opposite sign of a content scroll. Reset the mirror (a
+            // full-frame snapshot repaints every visible row below).
             if let Some(new_off) = snap.viewport_offset {
                 let new_off = i32::from(new_off);
-                let delta = new_off - self.view_offset;
+                // Distinguish a genuine user wheel-scroll from an output-driven
+                // snap back to the bottom (offset -> 0 with new content). Only
+                // the former shifts the selection with the text; the latter is
+                // just the view jumping home, so the selection keeps its rows
+                // (the content-scroll branch below shifts it for the output).
+                let is_snap_to_bottom = new_off == 0 && snap.content_delta > 0;
+                let view_delta = new_off - self.view_offset;
                 self.view_offset = new_off;
-                if delta != 0 {
-                    self.shift_selection_for_scroll(delta);
+                if view_delta != 0 && !is_snap_to_bottom {
+                    self.shift_selection(view_delta);
                 }
                 self.cell_mirror.clear();
             } else if self.view_offset != 0 {
@@ -514,13 +521,13 @@ impl TermWindow {
                 // from the right base.
                 self.view_offset = 0;
             }
-            // Content scrolled up: shift the selection and cell mirror up by
-            // the same amount so the highlight stays glued to the *text*,
-            // not the viewport position, as new output streams in. Rows that
-            // scrolled off the top drop out of the selection.
+            // Content scrolled up (new output pushed lines into scrollback):
+            // the text physically moved up, so the selection moves up too.
+            // Rows that scrolled off the top simply go negative (text is now
+            // in scrollback) — the selection stays anchored to it.
             let delta = i32::from(snap.content_delta);
             if delta > 0 {
-                self.shift_selection_for_scroll(delta);
+                self.shift_selection(-delta);
                 if !self.cell_mirror.is_empty() {
                     let d = (delta as usize).min(self.cell_mirror.len());
                     self.cell_mirror.drain(..d);
@@ -550,17 +557,31 @@ impl TermWindow {
         self.input_queue.pop_front()
     }
 
-    /// Shift the active selection vertically by `delta` rows to follow its
-    /// text as the screen scrolls (positive `delta` = content scrolled up,
-    /// selection rows move up; negative = viewport scrolled into history,
-    /// selection rows move down). Rows may go negative — that just means the
-    /// selected text is currently above the visible area; the selection stays
-    /// anchored and reappears when you scroll back. Never clears.
-    fn shift_selection_for_scroll(&mut self, delta: i32) {
+    /// Shift+click range extension: keep the selection's anchor fixed and move
+    /// the head to `cell`, so repeated shift+clicks (or a shift+click then a
+    /// drag) keep growing/shrinking the same range. The anchor is the end
+    /// that was *not* most recently moved — we track that as the first tuple
+    /// element, and always replace the second.
+    fn extend_selection(&mut self, cell: (u16, i32)) {
+        if let Some((anchor, _head)) = self.selection {
+            self.selection = Some((anchor, cell));
+        } else {
+            self.selection = Some((cell, cell));
+        }
+        self.dirty = true;
+    }
+
+    /// Add `d` to both selection row endpoints (signed; rows may go negative
+    /// = the selected text is currently above the visible area, still
+    /// anchored). Used with opposite signs for the two scroll kinds:
+    ///   • content scroll  → text moved up   → `shift_selection(-delta)`
+    ///   • viewport scroll → text appears to move down → `shift_selection(+delta)`
+    /// Never clears — the selection stays glued to its text.
+    fn shift_selection(&mut self, d: i32) {
         let Some(((ac, ar), (bc, br))) = self.selection else {
             return;
         };
-        self.selection = Some(((ac, ar - delta), (bc, br - delta)));
+        self.selection = Some(((ac, ar + d), (bc, br + d)));
         self.dirty = true;
     }
 
@@ -991,7 +1012,21 @@ impl TermWindow {
                         match (button, state) {
                             (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
                                 self.left_held = true;
-                                if self.selection.is_some() {
+                                let shift = (self.modifiers.depressed
+                                    | self.modifiers.latched
+                                    | self.modifiers.locked)
+                                    & 0x01
+                                    != 0;
+                                let (cc, cr) = self.pointer_cell();
+                                let cell = (cc, i32::from(cr));
+                                if shift && self.selection.is_some() {
+                                    // Shift+click extends the existing
+                                    // selection from its anchor to the clicked
+                                    // cell (kitty/xterm range-extension),
+                                    // merging rather than clearing.
+                                    self.extend_selection(cell);
+                                    self.drag_moved = true;
+                                } else if self.selection.is_some() {
                                     // A press while a selection is visible is
                                     // a dismiss-click: clear it and don't
                                     // start a new one. The user starts a fresh
@@ -1003,8 +1038,6 @@ impl TermWindow {
                                     // pointer cell; whether it becomes a real
                                     // selection or a no-op click is decided by
                                     // whether the pointer moves before release.
-                                    let (cc, cr) = self.pointer_cell();
-                                    let cell = (cc, i32::from(cr));
                                     self.selection = Some((cell, cell));
                                     self.drag_moved = false;
                                 }

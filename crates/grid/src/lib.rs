@@ -232,10 +232,12 @@ impl Grid {
                 crate::dirty::viewport_snapshot(&self.primary, self.viewport_offset, cols, rows);
             snap.cursor = cur;
             snap.cursor_changed = cursor_changed;
-            // A viewport move is a full-frame repaint in *view* coordinates —
-            // the content didn't scroll, so the selection/mirror must NOT be
-            // shifted. content_delta stays 0 here.
-            snap.content_delta = 0;
+            // Keep the accumulated content_delta so the renderer can tell an
+            // output-driven snap-to-bottom (offset -> 0 WITH new content,
+            // which must NOT shift the selection by the view delta) from a
+            // genuine user wheel-scroll (which must). For a pure wheel-scroll
+            // there's no content delta, so this is 0 there anyway.
+            snap.content_delta = self.content_delta;
             self.content_delta = 0;
             return snap;
         }

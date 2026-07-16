@@ -466,23 +466,7 @@ impl ChildPid {
         if reaped_pid == 0 {
             return Ok(WaitStatus::StillRunning);
         }
-        Ok(decode_wait_status(status))
-    }
-}
-
-/// Decode a raw `wait4(2)` status word (glibc's `<bits/waitstatus.h>` layout)
-/// into a [`WaitStatus`]. Pulled out of [`ChildPid::wait_nohang`] as a pure
-/// function so the WIFEXITED/WEXITSTATUS/WTERMSIG bit math is unit-testable
-/// without forking a real child.
-const fn decode_wait_status(status: i32) -> WaitStatus {
-    // WIFEXITED(status): low 7 bits of status are 0 for a normal exit.
-    #[allow(clippy::verbose_bit_mask)] // & 0x7f reads as WIFEXITED's mask, not a power-of-two check
-    if status & 0x7f == 0 {
-        // WEXITSTATUS(status)
-        WaitStatus::Exited((status >> 8) & 0xff)
-    } else {
-        // WTERMSIG(status)
-        WaitStatus::Signaled(status & 0x7f)
+        Ok(WaitStatus::from_raw(status))
     }
 }
 
@@ -495,6 +479,29 @@ pub enum WaitStatus {
     Exited(i32),
     /// The child was killed by this signal number.
     Signaled(i32),
+}
+
+impl WaitStatus {
+    /// Decode a raw `wait4(2)` status word (glibc's `<bits/waitstatus.h>`
+    /// layout) into a [`WaitStatus`]. Only ever reports `Exited`/`Signaled`
+    /// -- `StillRunning` is `wait_nohang`'s own reading of a zero `wait4`
+    /// return, not something the status word itself encodes.
+    ///
+    /// Was a free `decode_wait_status(status: i32)` function -- it builds
+    /// nothing but a `WaitStatus`, so it belongs as a constructor on the
+    /// type it returns (same shape as `ChildPid::wait_nohang`, which is now
+    /// its only caller).
+    const fn from_raw(status: i32) -> Self {
+        // WIFEXITED(status): low 7 bits of status are 0 for a normal exit.
+        #[allow(clippy::verbose_bit_mask)] // & 0x7f reads as WIFEXITED's mask, not a power-of-two check
+        if status & 0x7f == 0 {
+            // WEXITSTATUS(status)
+            Self::Exited((status >> 8) & 0xff)
+        } else {
+            // WTERMSIG(status)
+            Self::Signaled(status & 0x7f)
+        }
+    }
 }
 
 // ── PTY open/fork ──────────────────────────────────────────────────────────
@@ -707,41 +714,41 @@ impl RawPty {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenFlags, SigSet, Signal, WaitStatus, decode_wait_status, errno_to_err};
+    use super::{OpenFlags, SigSet, Signal, WaitStatus, errno_to_err};
 
     #[test]
     fn wait_status_normal_exit_zero() {
-        assert_eq!(decode_wait_status(0), WaitStatus::Exited(0));
+        assert_eq!(WaitStatus::from_raw(0), WaitStatus::Exited(0));
     }
 
     #[test]
     fn wait_status_normal_exit_nonzero() {
-        assert_eq!(decode_wait_status(42 << 8), WaitStatus::Exited(42));
+        assert_eq!(WaitStatus::from_raw(42 << 8), WaitStatus::Exited(42));
     }
 
     #[test]
     fn wait_status_exit_code_255() {
-        assert_eq!(decode_wait_status(255 << 8), WaitStatus::Exited(255));
+        assert_eq!(WaitStatus::from_raw(255 << 8), WaitStatus::Exited(255));
     }
 
     #[test]
     fn wait_status_killed_by_sigkill() {
-        assert_eq!(decode_wait_status(9), WaitStatus::Signaled(9));
+        assert_eq!(WaitStatus::from_raw(9), WaitStatus::Signaled(9));
     }
 
     #[test]
     fn wait_status_killed_by_sigsegv() {
-        assert_eq!(decode_wait_status(11), WaitStatus::Signaled(11));
+        assert_eq!(WaitStatus::from_raw(11), WaitStatus::Signaled(11));
     }
 
     #[test]
     fn wait_status_high_bits_ignored_for_signal_number() {
-        assert_eq!(decode_wait_status(0x80 | 11), WaitStatus::Signaled(11));
+        assert_eq!(WaitStatus::from_raw(0x80 | 11), WaitStatus::Signaled(11));
     }
 
     #[test]
     fn wait_status_exit_status_masked_to_8_bits() {
-        assert_eq!(decode_wait_status(0x1FF00), WaitStatus::Exited(0xFF));
+        assert_eq!(WaitStatus::from_raw(0x1FF00), WaitStatus::Exited(0xFF));
     }
 
     #[test]

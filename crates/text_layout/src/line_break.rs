@@ -32,6 +32,27 @@ struct Opportunity {
     width: usize,
 }
 
+impl Opportunity {
+    /// Resolve a break: roll back to `self` if a recorded opportunity
+    /// exists, or force-break immediately before `i` otherwise.
+    ///
+    /// Was a free `rollback_or_here(last_opportunity: Option<&Opportunity>, i, line_width)`
+    /// function -- its first argument is the type it's a method of (through
+    /// `Option::map_or_else`), so it belongs beside `Opportunity` rather
+    /// than floating at module scope.
+    #[inline]
+    const fn rollback_or_here(
+        last_opportunity: Option<&Self>,
+        i: usize,
+        line_width: usize,
+    ) -> (usize, usize, usize) {
+        match last_opportunity {
+            Some(op) => (op.line_end, op.next_start, op.width),
+            None => (i, i, line_width),
+        }
+    }
+}
+
 /// Stateless greedy line-breaking walk.
 ///
 /// A struct (rather than a bare function) so the operation reads as
@@ -105,7 +126,7 @@ impl LineBreaker {
                             // Non-whitespace opportunity (CJK) that overflows →
                             // roll back to the last opportunity or force-break here.
                             let (end, next, w) =
-                                rollback_or_here(last_opportunity.as_ref(), i, line_width);
+                                Opportunity::rollback_or_here(last_opportunity.as_ref(), i, line_width);
                             lines.push(LineBreak {
                                 start_segment: line_start,
                                 end_segment: end,
@@ -147,7 +168,7 @@ impl LineBreaker {
                     if !unlimited && line_width > 0 && line_width + seg.width > max_width {
                         // Roll back to the last opportunity, or force-break before here.
                         let (end, next, w) =
-                            rollback_or_here(last_opportunity.as_ref(), i, line_width);
+                            Opportunity::rollback_or_here(last_opportunity.as_ref(), i, line_width);
                         lines.push(LineBreak {
                             start_segment: line_start,
                             end_segment: end,
@@ -176,18 +197,6 @@ impl LineBreaker {
     }
 }
 
-/// Roll back to `last_opportunity` if set, or force-break immediately before `i`.
-#[inline]
-const fn rollback_or_here(
-    last_opportunity: Option<&Opportunity>,
-    i: usize,
-    line_width: usize,
-) -> (usize, usize, usize) {
-    match last_opportunity {
-        Some(op) => (op.line_end, op.next_start, op.width),
-        None => (i, i, line_width),
-    }
-}
 
 /// True if every byte of a segment's text is an ASCII space or tab.
 ///

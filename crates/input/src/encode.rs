@@ -157,7 +157,7 @@ impl Encoder {
             return Some(w.len());
         }
 
-        if is_legacy_editing_key(key) {
+        if key.is_legacy_editing_cluster() {
             return self.encode_legacy_editing(key, mods, buf);
         }
 
@@ -215,7 +215,7 @@ impl Encoder {
             | Key::ScrollLock
             | Key::Menu => return None,
 
-            // Handled by the `is_legacy_editing_key` early-return above.
+            // Handled by the `Key::is_legacy_editing_cluster` early-return above.
             Key::Enter
             | Key::Backspace
             | Key::Tab
@@ -536,24 +536,6 @@ impl SeqWriter<'_> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// True for the keys handled by [`Encoder::encode_legacy_editing`] --
-/// Enter/Backspace/Tab/Esc/Delete/Insert/Home/End/PageUp/PageDown.
-const fn is_legacy_editing_key(key: Key) -> bool {
-    matches!(
-        key,
-        Key::Enter
-            | Key::Backspace
-            | Key::Tab
-            | Key::Esc
-            | Key::Delete
-            | Key::Insert
-            | Key::Home
-            | Key::End
-            | Key::PageUp
-            | Key::PageDown
-    )
-}
 
 /// Ctrl+letter → C0 byte (a=1 … z=26, space=0, @=0, [=27, \=28, ]=29, ^=30, _=31).
 const fn ctrl_byte(c: char) -> Option<u8> {

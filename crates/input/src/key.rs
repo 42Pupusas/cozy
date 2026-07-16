@@ -154,4 +154,28 @@ impl Key {
                 | Self::Menu
         )
     }
+
+    /// True for the "editing cluster" keys handled together by
+    /// `Encoder::encode_legacy_editing`: Enter/Backspace/Tab/Esc/Delete/
+    /// Insert/Home/End/PageUp/PageDown.
+    ///
+    /// Was a free `is_legacy_editing_key(key)` function in `encode.rs` --
+    /// moved beside its sibling `is_modifier_only` since both are simple
+    /// `matches!` classifications of `Self`.
+    #[must_use]
+    pub const fn is_legacy_editing_cluster(self) -> bool {
+        matches!(
+            self,
+            Self::Enter
+                | Self::Backspace
+                | Self::Tab
+                | Self::Esc
+                | Self::Delete
+                | Self::Insert
+                | Self::Home
+                | Self::End
+                | Self::PageUp
+                | Self::PageDown
+        )
+    }
 }

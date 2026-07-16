@@ -81,12 +81,11 @@ impl Encoder {
 
     fn encode_legacy(&self, key: Key, mods: Modifiers, buf: &mut [u8]) -> Option<usize> {
         // Ctrl+letter → C0 control codes.
-        if mods.ctrl() {
-            if let Key::Char(c) = key {
-                if let Some(byte) = ctrl_byte(c) {
-                    return Some(write1(buf, byte));
-                }
-            }
+        if mods.ctrl()
+            && let Key::Char(c) = key
+            && let Some(byte) = ctrl_byte(c)
+        {
+            return Some(write1(buf, byte));
         }
 
         Some(match key {

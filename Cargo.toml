@@ -6,6 +6,9 @@ members = [
     # "benches/*",  # uncomment when first bench is added
 ]
 
+[workspace.package]
+edition = "2024"
+
 [workspace.dependencies]
 ququmatz      = { path = "/home/cuarentaydos/Code/tooling/ququmatz" }
 quetzal-uring = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl-uring" }

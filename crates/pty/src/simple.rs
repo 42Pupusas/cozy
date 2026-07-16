@@ -126,30 +126,36 @@ fn raw_write(fd: RawFd, buf: &[u8]) -> isize {
 #[inline]
 unsafe fn syscall2(nr: usize, a0: usize, a1: usize) -> isize {
     let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        inlateout("rax") nr as isize => ret,
-        in("rdi") a0,
-        in("rsi") a1,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack)
-    );
+    // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") nr as isize => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
     ret
 }
 
 #[inline]
 unsafe fn syscall3(nr: usize, a0: usize, a1: usize, a2: usize) -> isize {
     let ret: isize;
-    core::arch::asm!(
-        "syscall",
-        inlateout("rax") nr as isize => ret,
-        in("rdi") a0,
-        in("rsi") a1,
-        in("rdx") a2,
-        lateout("rcx") _,
-        lateout("r11") _,
-        options(nostack)
-    );
+    // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") nr as isize => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
     ret
 }

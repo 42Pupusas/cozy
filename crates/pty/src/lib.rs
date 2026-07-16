@@ -95,6 +95,11 @@ pub struct Pty {
     chunk_producer: quetzalcoatl::spsc::Producer<ByteChunk>,
     /// `signalfd` fd for SIGCHLD.
     signal_fd: ququmatz::RawFd,
+    /// Stable buffer the kernel writes `signalfd_siginfo` into. Owned by
+    /// `Pty` (not leaked per-call) since only one signal read is ever
+    /// in-flight at a time; the heap allocation's address doesn't move even
+    /// when `Pty` itself is moved (e.g. onto its dedicated thread).
+    signal_buf: Box<[u8; 128]>,
     /// Set by the caller to request a graceful shutdown.
     shutdown: Arc<AtomicBool>,
 }
@@ -115,7 +120,7 @@ impl Pty {
         shell: &str,
         args: &[&str],
         win_size: WinSize,
-    ) -> Result<(Self, ChunkConsumer, WriteProducer, Arc<AtomicBool>), PtyError> {
+    ) -> Result<(Self, ChunkConsumer, WriteProducer, Arc<AtomicBool>, WriteConsumer), PtyError> {
         let (master_fd, child_pid) = sys::RawPty::fork(shell, args, win_size)?;
         let signal_fd = sys::RawPty::signalfd_for_sigchld()?;
 
@@ -138,14 +143,16 @@ impl Pty {
             read_buf_idx: 0,
             chunk_producer: chunk_tx,
             signal_fd,
+            signal_buf: Box::new([0u8; 128]),
             shutdown: Arc::clone(&shutdown),
         };
 
-        // write_rx is moved into run(); return write_tx to the caller.
-        // We thread write_rx through the return so the caller can hand it
-        // to Pty::run on their chosen thread.
-        let _ = write_rx; // suppressed: caller must pass to run()
-        Ok((pty, chunk_rx, write_tx, shutdown))
+        // write_rx is the consumer half of the write ring; run() takes it
+        // as a separate argument (not stored on Pty) because run() takes
+        // self by value and needs &mut write_rx each loop iteration. The
+        // caller must pass it straight through to Pty::run on whichever
+        // thread drives the event loop.
+        Ok((pty, chunk_rx, write_tx, shutdown, write_rx))
     }
 
     /// Resize the terminal window.
@@ -190,18 +197,16 @@ impl Pty {
             let cq = &self.cq;
 
             // Collect results — we can't borrow self mutably inside the closure,
-            // so accumulate actions into a small fixed-size stack buffer.
-            let mut actions: [CqeAction; 8] = [CqeAction::None; 8];
-            let mut n_actions = 0usize;
+            // so accumulate actions first and apply them after. Unbounded
+            // (not a fixed-size array): a burst of completions must never be
+            // silently truncated and lose a read re-arm.
+            let mut actions: Vec<CqeAction> = Vec::new();
 
             cq.drain(|cqe| {
-                if n_actions < actions.len() {
-                    actions[n_actions] = CqeAction::from_cqe(cqe.user_data, cqe.result);
-                    n_actions += 1;
-                }
+                actions.push(CqeAction::from_cqe(cqe.user_data, cqe.result));
             });
 
-            for action in &actions[..n_actions] {
+            for action in &actions {
                 match action {
                     CqeAction::ReadOk(len) => {
                         let idx = self.read_buf_idx;
@@ -236,11 +241,11 @@ impl Pty {
                                 exit_code = code;
                                 got_exit = true;
                             }
-                            Ok(sys::WaitStatus::Signaled(_)) => {
+                            Ok(sys::WaitStatus::Signaled(sig)) => {
                                 // Killed by a signal: no POSIX exit code:
                                 // report the shell convention (128 + signum)
                                 // rather than silently claiming success.
-                                exit_code = 128;
+                                exit_code = 128 + sig;
                                 got_exit = true;
                             }
                             Ok(sys::WaitStatus::StillRunning) => {
@@ -296,13 +301,17 @@ impl Pty {
     }
 
     fn arm_signal(&self) -> Result<(), PtyError> {
-        // One signal read is ever in-flight at a time (single PTY thread).
-        // Leak a heap buffer so the kernel has a stable address to write into.
-        // 128 bytes == sizeof(signalfd_siginfo) on Linux.
-        let buf: &'static mut [u8; 128] = Box::leak(Box::new([0u8; 128]));
-        let sqe =
-            unsafe { Sqe::read_ptr(self.signal_fd, buf.as_mut_ptr(), 128, u64::MAX) }
-                .user_data(tag::SIGNAL);
+        // One signal read is ever in-flight at a time (single PTY thread),
+        // so the persistent `signal_buf` field is safe to reuse rather than
+        // leaking a fresh 128-byte allocation on every SIGCHLD (which would
+        // otherwise leak for the entire process lifetime).
+        // SAFETY: signal_buf's heap allocation outlives this call (owned by
+        // Pty, which outlives the loop in `run`); no other read is ever
+        // in-flight against it concurrently.
+        let sqe = unsafe {
+            Sqe::read_ptr(self.signal_fd, self.signal_buf.as_ptr().cast_mut(), 128, u64::MAX)
+        }
+        .user_data(tag::SIGNAL);
         self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
         self.queue.submit().map_err(PtyError::UringEnter)
     }

@@ -89,6 +89,72 @@ impl From<SysError> for ConnError {
     }
 }
 
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+    use std::error::Error as _;
+
+    fn io_err(msg: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, msg.to_string())
+    }
+
+    #[test]
+    fn display_messages_for_every_variant() {
+        assert_eq!(
+            ConnError::Env("WAYLAND_DISPLAY").to_string(),
+            "environment variable WAYLAND_DISPLAY is not set"
+        );
+        assert_eq!(ConnError::NoCompletion.to_string(), "io_uring returned no completion after wait");
+        assert_eq!(ConnError::Closed.to_string(), "the compositor closed the connection");
+        assert_eq!(
+            ConnError::Connect(io_err("refused")).to_string(),
+            "connect to compositor failed: refused"
+        );
+        assert_eq!(ConnError::Io(io_err("broken pipe")).to_string(), "socket I/O failed: broken pipe");
+    }
+
+    #[test]
+    fn display_delegates_to_inner_ququmatz_error() {
+        let inner = ququmatz::Error::Syscall(ququmatz::Errno::EAGAIN);
+        assert_eq!(ConnError::Setup(inner).to_string(), format!("io_uring setup failed: {inner}"));
+        assert_eq!(
+            ConnError::Register(inner).to_string(),
+            format!("provided-buffer registration failed: {inner}")
+        );
+        assert_eq!(ConnError::Submit(inner).to_string(), format!("io_uring submit/wait failed: {inner}"));
+    }
+
+    #[test]
+    fn display_delegates_to_inner_sys_error() {
+        let inner = SysError::Socket(io_err("nope"));
+        let msg = inner.to_string();
+        assert_eq!(ConnError::Sys(inner).to_string(), msg);
+    }
+
+    #[test]
+    fn source_present_only_for_wrapped_errors() {
+        assert!(ConnError::Env("X").source().is_none());
+        assert!(ConnError::NoCompletion.source().is_none());
+        assert!(ConnError::Closed.source().is_none());
+
+        assert!(ConnError::Connect(io_err("x")).source().is_some());
+        assert!(ConnError::Io(io_err("x")).source().is_some());
+
+        let inner = ququmatz::Error::Syscall(ququmatz::Errno::EAGAIN);
+        assert!(ConnError::Setup(inner).source().is_some());
+        assert!(ConnError::Register(inner).source().is_some());
+        assert!(ConnError::Submit(inner).source().is_some());
+
+        assert!(ConnError::Sys(SysError::Memfd(io_err("x"))).source().is_some());
+    }
+
+    #[test]
+    fn from_sys_error_wraps_as_sys_variant() {
+        let e: ConnError = SysError::Mmap(io_err("x")).into();
+        assert!(matches!(e, ConnError::Sys(SysError::Mmap(_))));
+    }
+}
+
 /// io_uring submission-queue depth (per ring).
 const RING_ENTRIES: u32 = 16;
 
@@ -132,7 +198,18 @@ const UD_TIMER: u64 = 1;
 /// the [`Sender`] and [`RepeatTimer`] (main thread) and the [`Reader`] (its own
 /// thread). The reader polls the timer's fd; the [`RepeatTimer`] that owns it
 /// stays on the main thread, which arms/disarms it as keys are held/released.
-pub fn connect() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
+pub struct Conn;
+
+impl Conn {
+    /// See module-level [`connect`] docs — this is the same operation as a
+    /// constructor on a marker type, so callers spell it `Conn::connect()`
+    /// rather than a bare top-level `connect()`.
+    pub fn connect() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
+        connect_impl()
+    }
+}
+
+fn connect_impl() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or(ConnError::Env("XDG_RUNTIME_DIR"))?;
     let display = std::env::var_os("WAYLAND_DISPLAY")
         .unwrap_or_else(|| std::ffi::OsString::from("wayland-0"));
@@ -141,19 +218,19 @@ pub fn connect() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
 
     // AF_UNIX stream socket (ququmatz's typed Socket is IPv4-only, so we make
     // the fd ourselves and adopt it).
-    let sock_owned = make_unix_socket()?;
+    let sock_owned = Sender::make_unix_socket()?;
     let sock = RawFd::from_raw(sock_owned.as_raw_fd() as usize);
 
     // Two rings on the same fd: the send ring (main thread) and the recv ring
     // (reader thread). They're built differently — see the build_* functions.
-    let mut ring_tx = build_tx_ring()?;
-    let mut ring_rx = build_rx_ring()?;
+    let mut ring_tx = Sender::build_tx_ring()?;
+    let mut ring_rx = Reader::build_rx_ring()?;
 
     // Connect once (on the tx ring — any ring works, the socket is shared).
     let path_bytes = path.as_os_str().as_encoded_bytes();
     let addr = sys::SockAddrUn::new(path_bytes);
     // SAFETY: `addr` outlives the blocking submit below.
-    let cqe = run_one(&mut ring_tx, Sqe::connect(sock, addr.as_bytes()))?;
+    let cqe = Sender::run_one(&mut ring_tx, Sqe::connect(sock, addr.as_bytes()))?;
     if cqe < 0 {
         return Err(ConnError::Connect(io::Error::from_raw_os_error(-cqe)));
     }
@@ -202,30 +279,7 @@ pub fn connect() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
     Ok((sender, reader, timer))
 }
 
-/// Build the **send** ring. It's only ever touched by the main thread, so the
-/// `single_issuer` + `defer_taskrun` optimizations apply cleanly.
-fn build_tx_ring() -> Result<IoUring, ConnError> {
-    IoUring::builder(RING_ENTRIES)
-        .single_issuer()
-        .defer_taskrun()
-        .clamp()
-        .cq_entries(RING_CQ_ENTRIES)
-        .build()
-        .map_err(ConnError::Setup)
-}
 
-/// Build the **recv** ring. We register its buffer pool from the main thread in
-/// `connect()` but submit/wait from the reader thread, so we must NOT use
-/// `single_issuer` — that flag binds the ring to the first task to touch it
-/// (registration included) and the reader's later submit would fail `-EEXIST`.
-/// We keep the oversized CQ for multishot-burst headroom.
-fn build_rx_ring() -> Result<IoUring, ConnError> {
-    IoUring::builder(RING_ENTRIES)
-        .clamp()
-        .cq_entries(RING_CQ_ENTRIES)
-        .build()
-        .map_err(ConnError::Setup)
-}
 
 // ---------------------------------------------------------------------------
 // Sender — the send half, on the main thread.
@@ -266,6 +320,49 @@ impl std::os::fd::AsFd for Sender {
 }
 
 impl Sender {
+    /// Build the **send** ring. It's only ever touched by the main thread, so
+    /// the `single_issuer` + `defer_taskrun` optimizations apply cleanly.
+    ///
+    /// Was a free `build_tx_ring()` function -- moved onto `Sender` since it
+    /// builds the ring `Sender` owns.
+    fn build_tx_ring() -> Result<IoUring, ConnError> {
+        IoUring::builder(RING_ENTRIES)
+            .single_issuer()
+            .defer_taskrun()
+            .clamp()
+            .cq_entries(RING_CQ_ENTRIES)
+            .build()
+            .map_err(ConnError::Setup)
+    }
+
+    /// Submit one SQE, wait, return the raw CQE result. Used only during
+    /// connect, before any multishot recv is armed.
+    ///
+    /// Was a free `run_one(ring, sqe)` function -- moved onto `Sender` since
+    /// callers only ever pass the send ring here.
+    fn run_one(ring: &mut IoUring, sqe: Sqe) -> Result<i32, ConnError> {
+        ring.push(sqe).map_err(ConnError::Submit)?;
+        ring.submit_and_wait(1).map_err(ConnError::Submit)?;
+        let cqe = ring.complete().ok_or(ConnError::NoCompletion)?;
+        Ok(cqe.result)
+    }
+
+    /// Create an `AF_UNIX`, `SOCK_STREAM` socket and wrap it in an `OwnedFd`.
+    ///
+    /// Was a free `make_unix_socket()` function -- moved onto `Sender` since
+    /// it produces the socket `Sender` (and `Reader`) share ownership of.
+    fn make_unix_socket() -> Result<OwnedFd, ConnError> {
+        use std::os::fd::FromRawFd;
+        const SOCK_STREAM: i32 = 1;
+        // SAFETY: standard socket(2) call; we adopt the returned fd as owned.
+        let fd = unsafe { libc_socket(sys::AF_UNIX, SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(ConnError::Sys(SysError::Socket(io::Error::last_os_error())));
+        }
+        // SAFETY: socket() returned a fresh owned fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
     /// Reserve a fresh object id for an object we're about to create, typed as
     /// whichever [`ObjectId`] the call site asks for:
     /// `let s: SurfaceId = sender.alloc_id();`.
@@ -364,6 +461,23 @@ pub struct Reader {
 unsafe impl Send for Reader {}
 
 impl Reader {
+    /// Build the **recv** ring. We register its buffer pool from the main
+    /// thread in `connect()` but submit/wait from the reader thread, so we
+    /// must NOT use `single_issuer` — that flag binds the ring to the first
+    /// task to touch it (registration included) and the reader's later
+    /// submit would fail `-EEXIST`. We keep the oversized CQ for
+    /// multishot-burst headroom.
+    ///
+    /// Was a free `build_rx_ring()` function -- moved onto `Reader` since it
+    /// builds the ring `Reader` owns.
+    fn build_rx_ring() -> Result<IoUring, ConnError> {
+        IoUring::builder(RING_ENTRIES)
+            .clamp()
+            .cq_entries(RING_CQ_ENTRIES)
+            .build()
+            .map_err(ConnError::Setup)
+    }
+
     /// Run the receive loop until the connection closes or `producer`'s consumer
     /// is dropped. Each whole Wayland message becomes one pushed [`Event`].
     ///
@@ -520,28 +634,6 @@ impl CqeFlagsExt for CqeFlags {
     }
 }
 
-/// Submit one SQE, wait, return the raw CQE result. Used only during connect,
-/// before any multishot recv is armed.
-fn run_one(ring: &mut IoUring, sqe: Sqe) -> Result<i32, ConnError> {
-    ring.push(sqe).map_err(ConnError::Submit)?;
-    ring.submit_and_wait(1).map_err(ConnError::Submit)?;
-    let cqe = ring.complete().ok_or(ConnError::NoCompletion)?;
-    Ok(cqe.result)
-}
-
-/// Create an `AF_UNIX`, `SOCK_STREAM` socket and wrap it in an `OwnedFd`.
-fn make_unix_socket() -> Result<OwnedFd, ConnError> {
-    use std::os::fd::FromRawFd;
-    const SOCK_STREAM: i32 = 1;
-    // SAFETY: standard socket(2) call; we adopt the returned fd as owned.
-    let fd = unsafe { libc_socket(sys::AF_UNIX, SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(ConnError::Sys(SysError::Socket(io::Error::last_os_error())));
-    }
-    // SAFETY: socket() returned a fresh owned fd.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
 unsafe extern "C" {
     #[link_name = "socket"]
     fn libc_socket(domain: i32, ty: i32, protocol: i32) -> i32;
@@ -668,18 +760,21 @@ impl WindowSender {
 /// Drain all pending [`WindowRequest`]s from the MPSC ring and execute them on
 /// `sender`. Called by the event loop each tick, *before* waiting for events, so
 /// queued requests hit the wire before the compositor's next response.
-pub fn drain_requests(
-    rx: &mut mpsc::Consumer<WindowRequest>,
-    sender: &mut Sender,
-) -> Result<(), ConnError> {
-    while let Some(req) = rx.pop() {
-        match req {
-            WindowRequest::Send(msg) => sender.send(msg)?,
-            WindowRequest::SendWithFds { msg, fds } => {
-                let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
-                sender.send_with_fds(msg, &borrowed)?;
+impl Sender {
+    /// Drain all pending [`WindowRequest`]s from `rx` and execute them on
+    /// `self`. Called by the event loop each tick, before waiting for
+    /// events, so queued requests hit the wire before the compositor's next
+    /// response.
+    pub fn drain_requests(&mut self, rx: &mut mpsc::Consumer<WindowRequest>) -> Result<(), ConnError> {
+        while let Some(req) = rx.pop() {
+            match req {
+                WindowRequest::Send(msg) => self.send(msg)?,
+                WindowRequest::SendWithFds { msg, fds } => {
+                    let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
+                    self.send_with_fds(msg, &borrowed)?;
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
 }

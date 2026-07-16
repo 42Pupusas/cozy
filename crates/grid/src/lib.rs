@@ -165,7 +165,7 @@ impl Grid {
     }
 
     fn print(&mut self, ch: char) {
-        let width = text_layout::measurement::cell_width(ch);
+        let width = { use text_layout::measurement::CellWidth as _; ch.cell_width() };
         if width == 0 {
             self.combine_onto_previous();
             return;
@@ -288,11 +288,11 @@ impl Grid {
             }
             CsiAction::CursorDown(n) => {
                 let rows = self.active_screen().rows();
-                self.cursor.row = (self.cursor.row + n).min(rows - 1);
+                self.cursor.row = self.cursor.row.saturating_add(*n).min(rows - 1);
             }
             CsiAction::CursorForward(n) => {
                 let cols = self.active_screen().cols();
-                self.cursor.col = (self.cursor.col + n).min(cols - 1);
+                self.cursor.col = self.cursor.col.saturating_add(*n).min(cols - 1);
             }
             CsiAction::CursorBack(n) => {
                 self.cursor.col = self.cursor.col.saturating_sub(*n);
@@ -300,7 +300,7 @@ impl Grid {
             CsiAction::CursorNextLine(n) => {
                 self.cursor.col = 0;
                 let rows = self.active_screen().rows();
-                self.cursor.row = (self.cursor.row + n).min(rows - 1);
+                self.cursor.row = self.cursor.row.saturating_add(*n).min(rows - 1);
             }
             CsiAction::CursorPrevLine(n) => {
                 self.cursor.col = 0;
@@ -376,7 +376,7 @@ impl Grid {
             CsiAction::EraseChars(n) => {
                 let (col, row) = (self.cursor.col, self.cursor.row);
                 let cols = self.active_screen().cols();
-                let end = (col + n).min(cols);
+                let end = col.saturating_add(*n).min(cols);
                 self.active_screen_mut().erase_line_range(row, col, end - 1);
                 self.dirty.mark_row(row);
             }

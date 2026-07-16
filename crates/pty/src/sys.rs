@@ -462,15 +462,23 @@ impl ChildPid {
         if reaped_pid == 0 {
             return Ok(WaitStatus::StillRunning);
         }
-        // WIFEXITED(status): low 7 bits of status are 0 for a normal exit.
-        #[allow(clippy::verbose_bit_mask)] // & 0x7f reads as WIFEXITED's mask, not a power-of-two check
-        if status & 0x7f == 0 {
-            // WEXITSTATUS(status)
-            Ok(WaitStatus::Exited((status >> 8) & 0xff))
-        } else {
-            // WTERMSIG(status)
-            Ok(WaitStatus::Signaled(status & 0x7f))
-        }
+        Ok(decode_wait_status(status))
+    }
+}
+
+/// Decode a raw `wait4(2)` status word (glibc's `<bits/waitstatus.h>` layout)
+/// into a [`WaitStatus`]. Pulled out of [`ChildPid::wait_nohang`] as a pure
+/// function so the WIFEXITED/WEXITSTATUS/WTERMSIG bit math is unit-testable
+/// without forking a real child.
+const fn decode_wait_status(status: i32) -> WaitStatus {
+    // WIFEXITED(status): low 7 bits of status are 0 for a normal exit.
+    #[allow(clippy::verbose_bit_mask)] // & 0x7f reads as WIFEXITED's mask, not a power-of-two check
+    if status & 0x7f == 0 {
+        // WEXITSTATUS(status)
+        WaitStatus::Exited((status >> 8) & 0xff)
+    } else {
+        // WTERMSIG(status)
+        WaitStatus::Signaled(status & 0x7f)
     }
 }
 
@@ -694,5 +702,106 @@ impl RawPty {
         errno_to_err(ret)
             .map(RawFd::from_raw)
             .map_err(PtyError::SignalFd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_wait_status, errno_to_err, OpenFlags, Signal, SigSet, WaitStatus};
+
+    #[test]
+    fn wait_status_normal_exit_zero() {
+        assert_eq!(decode_wait_status(0), WaitStatus::Exited(0));
+    }
+
+    #[test]
+    fn wait_status_normal_exit_nonzero() {
+        assert_eq!(decode_wait_status(42 << 8), WaitStatus::Exited(42));
+    }
+
+    #[test]
+    fn wait_status_exit_code_255() {
+        assert_eq!(decode_wait_status(255 << 8), WaitStatus::Exited(255));
+    }
+
+    #[test]
+    fn wait_status_killed_by_sigkill() {
+        assert_eq!(decode_wait_status(9), WaitStatus::Signaled(9));
+    }
+
+    #[test]
+    fn wait_status_killed_by_sigsegv() {
+        assert_eq!(decode_wait_status(11), WaitStatus::Signaled(11));
+    }
+
+    #[test]
+    fn wait_status_high_bits_ignored_for_signal_number() {
+        assert_eq!(decode_wait_status(0x80 | 11), WaitStatus::Signaled(11));
+    }
+
+    #[test]
+    fn wait_status_exit_status_masked_to_8_bits() {
+        assert_eq!(decode_wait_status(0x1FF00), WaitStatus::Exited(0xFF));
+    }
+
+    #[test]
+    fn open_flags_or_combines_bits() {
+        let combined = OpenFlags::RDWR | OpenFlags::NOCTTY | OpenFlags::CLOEXEC;
+        assert_eq!(
+            combined.bits(),
+            OpenFlags::RDWR.bits() | OpenFlags::NOCTTY.bits() | OpenFlags::CLOEXEC.bits()
+        );
+    }
+
+    #[test]
+    fn open_flags_single_flag_roundtrips() {
+        assert_eq!(OpenFlags::NONBLOCK.bits(), 0o4000);
+    }
+
+    #[test]
+    fn sigset_empty_has_no_bits() {
+        assert_eq!(SigSet::empty().0[0], 0);
+    }
+
+    #[test]
+    fn sigset_insert_chld_sets_correct_bit() {
+        let mut set = SigSet::empty();
+        set.insert(Signal::Chld);
+        assert_eq!(set.0[0], 1u64 << 16);
+    }
+
+    #[test]
+    fn sigset_insert_hup_sets_correct_bit() {
+        let mut set = SigSet::empty();
+        set.insert(Signal::Hup);
+        assert_eq!(set.0[0], 1u64);
+    }
+
+    #[test]
+    fn sigset_insert_multiple_signals_ors_bits() {
+        let mut set = SigSet::empty();
+        set.insert(Signal::Hup);
+        set.insert(Signal::Chld);
+        assert_eq!(set.0[0], 1u64 | (1u64 << 16));
+    }
+
+    #[test]
+    fn errno_to_err_positive_is_ok() {
+        assert_eq!(errno_to_err(42), Ok(42));
+    }
+
+    #[test]
+    fn errno_to_err_zero_is_ok() {
+        assert_eq!(errno_to_err(0), Ok(0));
+    }
+
+    #[test]
+    fn errno_to_err_negative_becomes_positive_errno() {
+        assert_eq!(errno_to_err(-11), Err(11));
+    }
+
+    #[test]
+    fn errno_to_err_negative_one() {
+        assert_eq!(errno_to_err(-1), Err(1));
     }
 }

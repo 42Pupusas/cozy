@@ -9,7 +9,7 @@ use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc;
 use quetzalcoatl::spsc::{Consumer, RingBuffer};
 
-use crate::conn::{self, ConnError, Sender, WindowSender, drain_requests};
+use crate::conn::{Conn, ConnError, Sender, WindowSender};
 use crate::cursor;
 use crate::draw::Point;
 use crate::error::{Error, Result};
@@ -58,6 +58,45 @@ enum Lifecycle {
 struct Frame {
     buffer: BufferId,
     free: bool,
+}
+
+impl Frame {
+    /// Allocate a double-buffered shm pool and the two [`Frame`] buffers
+    /// backed by it.
+    ///
+    /// Was a free `create_frames(sender, shm, width, height)` function --
+    /// moved onto `Frame` since it constructs the array of them.
+    fn create_pair(
+        sender: &mut Sender,
+        shm: ShmId,
+        width: i32,
+        height: i32,
+    ) -> Result<([Self; 2], ShmBuffer, PoolId)> {
+        let shm_mem = ShmBuffer::new(width as usize, height as usize, 2)
+            .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
+        let stride = width * 4;
+        let pool: PoolId = sender.alloc_id();
+        let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
+            .new_id(pool)
+            .i32(shm_mem.size_bytes() as i32)
+            .finish();
+        sender.send_with_fds(msg, &[shm_mem.fd()])?;
+        let mut frames = [Self { buffer: BufferId(0), free: true }; 2];
+        for (i, slot) in frames.iter_mut().enumerate() {
+            let buffer: BufferId = sender.alloc_id();
+            sender.request(
+                MessageBuilder::new(pool, ShmPoolRequest::CreateBuffer)
+                    .new_id(buffer)
+                    .i32(shm_mem.frame_offset(i) as i32)
+                    .i32(width)
+                    .i32(height)
+                    .i32(stride)
+                    .u32(Format::Xrgb8888.code()),
+            )?;
+            slot.buffer = buffer;
+        }
+        Ok((frames, shm_mem, pool))
+    }
 }
 
 /// A Wayland window that renders a terminal grid using a software framebuffer.
@@ -169,7 +208,7 @@ impl TermWindow {
         let width = cols as i32 * cell_w;
         let height = rows as i32 * cell_h;
 
-        let (mut sender, reader, repeat_timer) = conn::connect()?;
+        let (mut sender, reader, repeat_timer) = Conn::connect()?;
         let (producer, mut events) =
             RingBuffer::<Event>::new(Capacity::exact(EVENT_RING_CAP)).split();
         // The reader signals this after pushing events so the UI thread, which
@@ -186,8 +225,8 @@ impl TermWindow {
             })
             .map_err(Error::ReaderSpawn)?;
 
-        let (compositor, shm, wm_base, seat) = bind_globals(&mut sender, &mut events)?;
-        let (frames, shm_mem, pool) = create_frames(&mut sender, shm, width, height)?;
+        let (compositor, shm, wm_base, seat) = Registry::discover(&mut sender, &mut events)?;
+        let (frames, shm_mem, pool) = Frame::create_pair(&mut sender, shm, width, height)?;
 
         let surface: SurfaceId = sender.alloc_id();
         sender.request(
@@ -300,7 +339,7 @@ impl TermWindow {
         if self.lifecycle == Lifecycle::Closing {
             return Ok(false);
         }
-        drain_requests(&mut self.request_rx, &mut self.sender)
+        self.sender.drain_requests(&mut self.request_rx)
             .map_err(Error::Conn)?;
 
         // Drain all queued events non-blocking.
@@ -320,7 +359,7 @@ impl TermWindow {
         if self.lifecycle == Lifecycle::Closing {
             return Ok(false);
         }
-        drain_requests(&mut self.request_rx, &mut self.sender)
+        self.sender.drain_requests(&mut self.request_rx)
             .map_err(Error::Conn)?;
 
         let Some(first) = self.events.pop_block() else {
@@ -491,7 +530,7 @@ impl TermWindow {
                 match ev.event::<KeyboardEvent>() {
                     Some(KeyboardEvent::Key) => {
                         let physical = Key::from_code(ev.arg(2));
-                        let logical = physical.map(keymap::physical_to_logical);
+                        let logical = physical.map(keymap::PhysicalKey::to_logical);
                         let state = KeyState::from_raw(ev.arg(3));
                         // Start/stop repeat timer. Modifier keys never repeat.
                         match (logical, state) {
@@ -718,118 +757,99 @@ impl TermWindow {
 
 // ── helpers copied from paint/app.rs ─────────────────────────────────────────
 
-fn create_frames(
-    sender: &mut Sender,
-    shm: ShmId,
-    width: i32,
-    height: i32,
-) -> Result<([Frame; 2], ShmBuffer, PoolId)> {
-    let shm_mem = ShmBuffer::new(width as usize, height as usize, 2)
-        .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
-    let stride = width * 4;
-    let pool: PoolId = sender.alloc_id();
-    let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
-        .new_id(pool)
-        .i32(shm_mem.size_bytes() as i32)
-        .finish();
-    sender.send_with_fds(msg, &[shm_mem.fd()])?;
-    let mut frames = [Frame { buffer: BufferId(0), free: true }; 2];
-    for (i, slot) in frames.iter_mut().enumerate() {
-        let buffer: BufferId = sender.alloc_id();
+struct Registry;
+
+impl Registry {
+    /// Bind the four globals every window needs off the wire.
+    ///
+    /// Was a free `bind_globals(sender, events)` function -- moved onto
+    /// `Registry` as its entry point.
+    fn discover(
+        sender: &mut Sender,
+        events: &mut Consumer<Event>,
+    ) -> Result<(CompositorId, ShmId, WmBaseId, SeatId)> {
+        let registry: RegistryId = sender.alloc_id();
         sender.request(
-            MessageBuilder::new(pool, ShmPoolRequest::CreateBuffer)
-                .new_id(buffer)
-                .i32(shm_mem.frame_offset(i) as i32)
-                .i32(width)
-                .i32(height)
-                .i32(stride)
-                .u32(Format::Xrgb8888.code()),
-        )?;
-        slot.buffer = buffer;
-    }
-    Ok((frames, shm_mem, pool))
-}
-
-fn bind_globals(
-    sender: &mut Sender,
-    events: &mut Consumer<Event>,
-) -> Result<(CompositorId, ShmId, WmBaseId, SeatId)> {
-    let registry: RegistryId = sender.alloc_id();
-    sender.request(
         MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
-    )?;
+        )?;
 
-    let mut compositor: Option<CompositorId> = None;
-    let mut shm: Option<ShmId> = None;
-    let mut wm_base: Option<WmBaseId> = None;
-    let mut seat: Option<SeatId> = None;
+        let mut compositor: Option<CompositorId> = None;
+        let mut shm: Option<ShmId> = None;
+        let mut wm_base: Option<WmBaseId> = None;
+        let mut seat: Option<SeatId> = None;
 
-    while compositor.is_none() || shm.is_none() || wm_base.is_none() || seat.is_none() {
-        let event = events.pop_block().ok_or(Error::ReaderStopped)?;
-        let Event::Bytes(bytes) = event else { continue };
-        let Some((mut ev, _)) = WireEvent::parse(&bytes) else { continue };
+        while compositor.is_none() || shm.is_none() || wm_base.is_none() || seat.is_none() {
+            let event = events.pop_block().ok_or(Error::ReaderStopped)?;
+            let Event::Bytes(bytes) = event else { continue };
+            let Some((mut ev, _)) = WireEvent::parse(&bytes) else { continue };
 
-        if ev.object_id == DisplayId(1).raw()
-            && DisplayEvent::from_opcode(ev.opcode) == Some(DisplayEvent::Error)
-        {
-            return Err(Error::Protocol {
-                object: ev.u32(),
-                code: ev.u32(),
-                message: ev.string(),
-            });
-        }
+            if ev.object_id == DisplayId(1).raw()
+                && DisplayEvent::from_opcode(ev.opcode) == Some(DisplayEvent::Error)
+            {
+                return Err(Error::Protocol {
+                    object: ev.u32(),
+                    code: ev.u32(),
+                    message: ev.string(),
+                });
+            }
 
-        if ev.object_id == registry.raw()
-            && RegistryEvent::from_opcode(ev.opcode) == Some(RegistryEvent::Global)
-        {
-            let name = ev.u32();
-            let interface = ev.string();
-            let version = ev.u32();
-            match interface.as_str() {
-                s if s == proto::WL_COMPOSITOR.name && compositor.is_none() => {
-                    let v = proto::WL_COMPOSITOR.version.min(version);
-                    compositor = Some(bind(sender, registry, name, &interface, v)?);
+            if ev.object_id == registry.raw()
+                && RegistryEvent::from_opcode(ev.opcode) == Some(RegistryEvent::Global)
+            {
+                let name = ev.u32();
+                let interface = ev.string();
+                let version = ev.u32();
+                match interface.as_str() {
+                    s if s == proto::WL_COMPOSITOR.name && compositor.is_none() => {
+                        let v = proto::WL_COMPOSITOR.version.min(version);
+                        compositor = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
+                    s if s == proto::WL_SHM.name && shm.is_none() => {
+                        let v = proto::WL_SHM.version.min(version);
+                        shm = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
+                    s if s == proto::XDG_WM_BASE.name && wm_base.is_none() => {
+                        let v = proto::XDG_WM_BASE.version.min(version);
+                        wm_base = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
+                    s if s == proto::WL_SEAT.name && seat.is_none() => {
+                        let v = proto::WL_SEAT.version.min(version);
+                        seat = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
+                    _ => {}
                 }
-                s if s == proto::WL_SHM.name && shm.is_none() => {
-                    let v = proto::WL_SHM.version.min(version);
-                    shm = Some(bind(sender, registry, name, &interface, v)?);
-                }
-                s if s == proto::XDG_WM_BASE.name && wm_base.is_none() => {
-                    let v = proto::XDG_WM_BASE.version.min(version);
-                    wm_base = Some(bind(sender, registry, name, &interface, v)?);
-                }
-                s if s == proto::WL_SEAT.name && seat.is_none() => {
-                    let v = proto::WL_SEAT.version.min(version);
-                    seat = Some(bind(sender, registry, name, &interface, v)?);
-                }
-                _ => {}
             }
         }
+        Ok((
+            compositor.ok_or(Error::ReaderStopped)?,
+            shm.ok_or(Error::ReaderStopped)?,
+            wm_base.ok_or(Error::ReaderStopped)?,
+            seat.ok_or(Error::ReaderStopped)?,
+        ))
     }
-    Ok((
-        compositor.ok_or(Error::ReaderStopped)?,
-        shm.ok_or(Error::ReaderStopped)?,
-        wm_base.ok_or(Error::ReaderStopped)?,
-        seat.ok_or(Error::ReaderStopped)?,
-    ))
-}
 
-fn bind<T: ObjectId>(
-    sender: &mut Sender,
-    registry: RegistryId,
-    name: u32,
-    interface: &str,
-    version: u32,
-) -> Result<T> {
-    let new_obj: T = sender.alloc_id();
-    sender.request(
-        MessageBuilder::new(registry, RegistryRequest::Bind)
-            .u32(name)
-            .string(interface)
-            .u32(version)
-            .new_id(new_obj),
-    )?;
-    Ok(new_obj)
+    /// Bind one global by name/interface/version off the registry.
+    ///
+    /// Was a free `bind(sender, registry, name, interface, version)`
+    /// function -- moved onto `Registry` alongside `discover`, its only
+    /// caller.
+    fn bind<T: ObjectId>(
+        sender: &mut Sender,
+        registry: RegistryId,
+        name: u32,
+        interface: &str,
+        version: u32,
+    ) -> Result<T> {
+        let new_obj: T = sender.alloc_id();
+        sender.request(
+            MessageBuilder::new(registry, RegistryRequest::Bind)
+                .u32(name)
+                .string(interface)
+                .u32(version)
+                .new_id(new_obj),
+        )?;
+        Ok(new_obj)
+    }
 }
 
 

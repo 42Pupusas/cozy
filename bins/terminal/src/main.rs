@@ -223,7 +223,7 @@ fn pty_thread(
         // pending output always re-wakes) and the input-wake eventfd, instead
         // of busy-spinning. A 100ms cap bounds quit-flag check latency.
         if !did_work {
-            let _ = waker::poll_two(master_fd, wake_fd, 100);
+            let _ = waker::Poller::two(master_fd, wake_fd).poll_two(100);
         }
     }
 }
@@ -442,4 +442,169 @@ fn platform_key(k: Option<platform::protocol::Key>) -> Option<Key> {
         PK::LMeta  | PK::RMeta  => Key::Super,
         PK::CapsLock             => Key::CapsLock,
     })
+}
+
+#[cfg(test)]
+mod key_translation_tests {
+    use super::*;
+    use platform::protocol::Key as PK;
+
+    #[test]
+    fn platform_key_none_input_gives_none() {
+        assert_eq!(platform_key(None), None);
+    }
+
+    #[test]
+    fn platform_key_every_letter_maps_to_its_own_lowercase_char() {
+        let pairs = [
+            (PK::A, 'a'), (PK::B, 'b'), (PK::C, 'c'), (PK::D, 'd'), (PK::E, 'e'),
+            (PK::F, 'f'), (PK::G, 'g'), (PK::H, 'h'), (PK::I, 'i'), (PK::J, 'j'),
+            (PK::K, 'k'), (PK::L, 'l'), (PK::M, 'm'), (PK::N, 'n'), (PK::O, 'o'),
+            (PK::P, 'p'), (PK::Q, 'q'), (PK::R, 'r'), (PK::S, 's'), (PK::T, 't'),
+            (PK::U, 'u'), (PK::V, 'v'), (PK::W, 'w'), (PK::X, 'x'), (PK::Y, 'y'),
+            (PK::Z, 'z'),
+        ];
+        for (k, c) in pairs {
+            assert_eq!(platform_key(Some(k)), Some(Key::Char(c)), "{k:?} -> {c:?}");
+        }
+    }
+
+    #[test]
+    fn platform_key_every_digit_maps_to_its_own_char() {
+        let pairs = [
+            (PK::N0, '0'), (PK::N1, '1'), (PK::N2, '2'), (PK::N3, '3'), (PK::N4, '4'),
+            (PK::N5, '5'), (PK::N6, '6'), (PK::N7, '7'), (PK::N8, '8'), (PK::N9, '9'),
+        ];
+        for (k, c) in pairs {
+            assert_eq!(platform_key(Some(k)), Some(Key::Char(c)), "{k:?} -> {c:?}");
+        }
+    }
+
+    #[test]
+    fn platform_key_punctuation_and_space() {
+        let pairs = [
+            (PK::Minus, '-'), (PK::Equal, '='), (PK::LBracket, '['), (PK::RBracket, ']'),
+            (PK::Backslash, '\\'), (PK::Semicolon, ';'), (PK::Apostrophe, '\''),
+            (PK::Backtick, '`'), (PK::Comma, ','), (PK::Dot, '.'), (PK::Slash, '/'),
+            (PK::Space, ' '),
+        ];
+        for (k, c) in pairs {
+            assert_eq!(platform_key(Some(k)), Some(Key::Char(c)), "{k:?} -> {c:?}");
+        }
+    }
+
+    #[test]
+    fn platform_key_named_keys() {
+        assert_eq!(platform_key(Some(PK::Enter)), Some(Key::Enter));
+        assert_eq!(platform_key(Some(PK::Backspace)), Some(Key::Backspace));
+        assert_eq!(platform_key(Some(PK::Tab)), Some(Key::Tab));
+        assert_eq!(platform_key(Some(PK::Esc)), Some(Key::Esc));
+        assert_eq!(platform_key(Some(PK::Delete)), Some(Key::Delete));
+        assert_eq!(platform_key(Some(PK::Insert)), Some(Key::Insert));
+    }
+
+    #[test]
+    fn platform_key_navigation_cluster() {
+        assert_eq!(platform_key(Some(PK::Up)), Some(Key::Up));
+        assert_eq!(platform_key(Some(PK::Down)), Some(Key::Down));
+        assert_eq!(platform_key(Some(PK::Left)), Some(Key::Left));
+        assert_eq!(platform_key(Some(PK::Right)), Some(Key::Right));
+        assert_eq!(platform_key(Some(PK::Home)), Some(Key::Home));
+        assert_eq!(platform_key(Some(PK::End)), Some(Key::End));
+        assert_eq!(platform_key(Some(PK::PageUp)), Some(Key::PageUp));
+        assert_eq!(platform_key(Some(PK::PageDown)), Some(Key::PageDown));
+    }
+
+    #[test]
+    fn platform_key_function_keys_1_through_12() {
+        let pairs = [
+            (PK::F1, 1), (PK::F2, 2), (PK::F3, 3), (PK::F4, 4),
+            (PK::F5, 5), (PK::F6, 6), (PK::F7, 7), (PK::F8, 8),
+            (PK::F9, 9), (PK::F10, 10), (PK::F11, 11), (PK::F12, 12),
+        ];
+        for (k, n) in pairs {
+            assert_eq!(platform_key(Some(k)), Some(Key::F(n)), "{k:?} -> F({n})");
+        }
+    }
+
+    #[test]
+    fn platform_key_modifier_keys_collapse_left_and_right_variants() {
+        assert_eq!(platform_key(Some(PK::LShift)), Some(Key::Shift));
+        assert_eq!(platform_key(Some(PK::RShift)), Some(Key::Shift));
+        assert_eq!(platform_key(Some(PK::LCtrl)), Some(Key::Ctrl));
+        assert_eq!(platform_key(Some(PK::RCtrl)), Some(Key::Ctrl));
+        assert_eq!(platform_key(Some(PK::LAlt)), Some(Key::Alt));
+        assert_eq!(platform_key(Some(PK::RAlt)), Some(Key::Alt));
+        assert_eq!(platform_key(Some(PK::LMeta)), Some(Key::Super));
+        assert_eq!(platform_key(Some(PK::RMeta)), Some(Key::Super));
+        assert_eq!(platform_key(Some(PK::CapsLock)), Some(Key::CapsLock));
+    }
+
+    #[test]
+    fn platform_mods_none_when_nothing_set() {
+        let m = platform::protocol::Modifiers::default();
+        assert_eq!(platform_mods(m), Modifiers::NONE);
+    }
+
+    #[test]
+    fn platform_mods_shift_from_depressed_bit() {
+        let m = platform::protocol::Modifiers { depressed: 0x01, ..Default::default() };
+        assert_eq!(platform_mods(m), Modifiers::SHIFT);
+    }
+
+    #[test]
+    fn platform_mods_ctrl_from_latched_bit() {
+        let m = platform::protocol::Modifiers { latched: 0x04, ..Default::default() };
+        assert_eq!(platform_mods(m), Modifiers::CTRL);
+    }
+
+    #[test]
+    fn platform_mods_alt_from_locked_bit() {
+        let m = platform::protocol::Modifiers { locked: 0x08, ..Default::default() };
+        assert_eq!(platform_mods(m), Modifiers::ALT);
+    }
+
+    #[test]
+    fn platform_mods_super_bit() {
+        let m = platform::protocol::Modifiers { depressed: 0x40, ..Default::default() };
+        assert_eq!(platform_mods(m), Modifiers::SUPER);
+    }
+
+    #[test]
+    fn platform_mods_caps_lock_only_from_locked_not_depressed_or_latched() {
+        // Caps Lock is special-cased to only count when *locked* (bit 0x02),
+        // matching XKB's modifier semantics -- depressed/latched 0x02 must
+        // NOT produce CAPS.
+        let locked = platform::protocol::Modifiers { locked: 0x02, ..Default::default() };
+        assert_eq!(platform_mods(locked), Modifiers::CAPS);
+
+        let depressed = platform::protocol::Modifiers { depressed: 0x02, ..Default::default() };
+        assert_eq!(platform_mods(depressed), Modifiers::NONE);
+
+        let latched = platform::protocol::Modifiers { latched: 0x02, ..Default::default() };
+        assert_eq!(platform_mods(latched), Modifiers::NONE);
+    }
+
+    #[test]
+    fn platform_mods_all_bits_combine() {
+        let m = platform::protocol::Modifiers {
+            depressed: 0x01 | 0x04 | 0x08 | 0x40,
+            latched: 0,
+            locked: 0x02,
+            group: 0,
+        };
+        let out = platform_mods(m);
+        assert_eq!(
+            out,
+            Modifiers::SHIFT | Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER | Modifiers::CAPS
+        );
+    }
+
+    #[test]
+    fn platform_mods_union_of_depressed_latched_locked_for_same_bit() {
+        // Shift set only in latched (not depressed) must still register --
+        // we track the union of all three fields, not just depressed.
+        let m = platform::protocol::Modifiers { latched: 0x01, ..Default::default() };
+        assert_eq!(platform_mods(m), Modifiers::SHIFT);
+    }
 }

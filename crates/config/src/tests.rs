@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{Action, Color, Config, CursorStyle};
+use crate::{Action, Color, Config, ConfigError, CursorStyle};
 
 fn parse(toml: &str) -> Config {
     Config::from_bytes(toml.as_bytes()).expect("parse failed")
@@ -114,6 +114,51 @@ fn colors_ansi_palette() {
 }
 
 #[test]
+fn colors_ansi_palette_all_16_indices_match_named_fields() {
+    let cfg = parse(concat!(
+        "[colors]\n",
+        "black = \"#000001\"\nred = \"#000002\"\ngreen = \"#000003\"\nyellow = \"#000004\"\n",
+        "blue = \"#000005\"\nmagenta = \"#000006\"\ncyan = \"#000007\"\nwhite = \"#000008\"\n",
+        "bright_black = \"#000009\"\nbright_red = \"#00000a\"\nbright_green = \"#00000b\"\n",
+        "bright_yellow = \"#00000c\"\nbright_blue = \"#00000d\"\nbright_magenta = \"#00000e\"\n",
+        "bright_cyan = \"#00000f\"\nbright_white = \"#000010\"\n",
+    ));
+    let p = &cfg.palette;
+    assert_eq!(p.ansi(0), p.black);
+    assert_eq!(p.ansi(1), p.red);
+    assert_eq!(p.ansi(2), p.green);
+    assert_eq!(p.ansi(3), p.yellow);
+    assert_eq!(p.ansi(4), p.blue);
+    assert_eq!(p.ansi(5), p.magenta);
+    assert_eq!(p.ansi(6), p.cyan);
+    assert_eq!(p.ansi(7), p.white);
+    assert_eq!(p.ansi(8), p.bright_black);
+    assert_eq!(p.ansi(9), p.bright_red);
+    assert_eq!(p.ansi(10), p.bright_green);
+    assert_eq!(p.ansi(11), p.bright_yellow);
+    assert_eq!(p.ansi(12), p.bright_blue);
+    assert_eq!(p.ansi(13), p.bright_magenta);
+    assert_eq!(p.ansi(14), p.bright_cyan);
+    assert_eq!(p.ansi(15), p.bright_white);
+    // All 16 are distinct given distinct config values, confirming each
+    // index truly reads its own field rather than aliasing a neighbor.
+    let all: Vec<Color> = (0..16).map(|i| p.ansi(i)).collect();
+    for i in 0..all.len() {
+        for j in (i + 1)..all.len() {
+            assert_ne!(all[i], all[j], "ansi({i}) and ansi({j}) collided");
+        }
+    }
+}
+
+#[test]
+fn colors_ansi_palette_out_of_range_index_falls_back_to_foreground() {
+    let cfg = parse("[colors]\nforeground = \"#123456\"\n");
+    for idx in [16u8, 17, 100, 255] {
+        assert_eq!(cfg.palette.ansi(idx), cfg.palette.foreground, "idx {idx}");
+    }
+}
+
+#[test]
 fn color_bad_hex() {
     let e = fail("[colors]\nforeground = \"zzz\"\n");
     assert!(e.contains("rrggbb") || e.contains("foreground"), "got: {e}");
@@ -200,4 +245,36 @@ fn full_document() {
     assert_eq!(cfg.cursor.blink_rate, 400);
     assert_eq!(cfg.palette.red, Color::from_rgb(0xab, 0x46, 0x42));
     assert_eq!(cfg.keybinds.len(), 2);
+}
+
+// ── ConfigError ───────────────────────────────────────────────────────────
+
+#[test]
+fn config_error_display_io() {
+    let inner = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+    let e = ConfigError::Io(inner);
+    assert_eq!(e.to_string(), "io error: no such file");
+}
+
+#[test]
+fn config_error_display_invalid_value() {
+    let e = ConfigError::InvalidValue { field: "font.size", reason: "must be > 0" };
+    assert_eq!(e.to_string(), "invalid value for `font.size`: must be > 0");
+}
+
+#[test]
+fn config_error_source_present_for_io_and_toml_only() {
+    use std::error::Error as _;
+    let io_err = ConfigError::Io(std::io::Error::new(std::io::ErrorKind::Other, "x"));
+    assert!(io_err.source().is_some());
+
+    let invalid = ConfigError::InvalidValue { field: "x", reason: "y" };
+    assert!(invalid.source().is_none());
+}
+
+#[test]
+fn config_error_from_io_error() {
+    let inner = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+    let e: ConfigError = inner.into();
+    assert!(matches!(e, ConfigError::Io(_)));
 }

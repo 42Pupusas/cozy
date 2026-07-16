@@ -515,4 +515,108 @@ impl RepeatTimer {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    fn io_err(msg: &str) -> io::Error {
+        io::Error::new(io::ErrorKind::Other, msg.to_string())
+    }
+
+    #[test]
+    fn sys_error_display_messages() {
+        assert_eq!(SysError::Socket(io_err("x")).to_string(), "socket() failed: x");
+        assert_eq!(SysError::Memfd(io_err("x")).to_string(), "memfd_create() failed: x");
+        assert_eq!(SysError::Ftruncate(io_err("x")).to_string(), "ftruncate() failed: x");
+        assert_eq!(SysError::Mmap(io_err("x")).to_string(), "mmap() failed: x");
+        assert_eq!(
+            SysError::TimerfdCreate(io_err("x")).to_string(),
+            "timerfd_create() failed: x"
+        );
+        assert_eq!(SysError::TimerfdSet(io_err("x")).to_string(), "timerfd_settime() failed: x");
+    }
+
+    #[test]
+    fn sys_error_source_is_always_the_inner_io_error() {
+        use std::error::Error as _;
+        let e = SysError::Socket(io_err("boom"));
+        assert!(e.source().is_some());
+        assert_eq!(e.source().unwrap().to_string(), "boom");
+    }
+
+    #[test]
+    fn incoming_control_fds_empty_control_region_yields_no_fds() {
+        assert!(IncomingControl::fds(&[]).is_empty());
+        assert!(IncomingControl::fds(&[0u8; 4]).is_empty());
+    }
+
+    #[test]
+    fn incoming_control_fds_roundtrips_through_outgoing_message() {
+        // Build a real SCM_RIGHTS control buffer via `OutgoingMessage` (the
+        // send side) using stdin's fd (always valid in a test process), then
+        // parse it back with `IncomingControl::fds` (the receive side) and
+        // confirm we get exactly one fd out.
+        let stdin = std::io::stdin();
+        let fd = stdin.as_fd();
+        let mut msg = OutgoingMessage::new(b"hello", &[fd]);
+        let hdr = msg.header();
+        assert!(!hdr.msg_control.is_null());
+        // Reconstruct the control region as a byte slice the way a received
+        // cmsg buffer would look.
+        let control =
+            unsafe { std::slice::from_raw_parts(hdr.msg_control as *const u8, hdr.msg_controllen) };
+        let fds = IncomingControl::fds(control);
+        assert_eq!(fds.len(), 1);
+    }
+
+    #[test]
+    fn incoming_control_fds_reserve_len_grows_with_max_fds() {
+        let one = IncomingControl::reserve_len(1);
+        let many = IncomingControl::reserve_len(16);
+        // Alignment can make adjacent fd counts collide on the same rounded
+        // word boundary, so compare a small count against a much larger one
+        // to guarantee a real difference.
+        assert!(many > one);
+        // Always at least big enough for the cmsg header itself.
+        assert!(one >= CMSG_HDR_LEN);
+        assert_eq!(IncomingControl::reserve_len(0), cmsg_align(CMSG_HDR_LEN));
+    }
+
+    #[test]
+    fn incoming_control_fds_rejects_truncated_cmsg_len() {
+        // A header claiming a cmsg_len larger than the actual control slice
+        // must be treated as absent, not read out of bounds.
+        let mut buf = vec![0u8; CMSG_HDR_LEN];
+        unsafe {
+            let cmsg = buf.as_mut_ptr() as *mut CmsgHdr;
+            (*cmsg).cmsg_len = 9999; // way past buf.len()
+            (*cmsg).cmsg_level = SOL_SOCKET;
+            (*cmsg).cmsg_type = SCM_RIGHTS;
+        }
+        assert!(IncomingControl::fds(&buf).is_empty());
+    }
+
+    #[test]
+    fn incoming_control_fds_ignores_non_scm_rights_cmsg() {
+        let mut buf = vec![0u8; CMSG_HDR_LEN + 8];
+        unsafe {
+            let cmsg = buf.as_mut_ptr() as *mut CmsgHdr;
+            (*cmsg).cmsg_len = CMSG_HDR_LEN + 8;
+            (*cmsg).cmsg_level = SOL_SOCKET;
+            (*cmsg).cmsg_type = 99; // not SCM_RIGHTS
+        }
+        assert!(IncomingControl::fds(&buf).is_empty());
+    }
+
+    #[test]
+    fn cmsg_align_rounds_up_to_word_size() {
+        let word = std::mem::size_of::<size_t>();
+        assert_eq!(cmsg_align(0), 0);
+        assert_eq!(cmsg_align(1), word);
+        assert_eq!(cmsg_align(word), word);
+        assert_eq!(cmsg_align(word + 1), word * 2);
+    }
+}
+
 use std::os::fd::AsFd;

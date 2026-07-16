@@ -11,9 +11,14 @@ const MAX_PARAMS: usize = 16;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Params {
     buf: [u16; MAX_PARAMS],
+    /// Number of parameter slots seen so far (including empty ones created
+    /// by a `;` separator). This is what callers see via `len()`/`get_or`.
     len: usize,
-    /// True if the current parameter was explicitly set (vs. defaulted).
-    has_value: bool,
+    /// Index of the slot currently receiving digits (or that would receive
+    /// them next). Distinct from `len` so that a leading/embedded empty
+    /// field (e.g. the row in `CSI ;5H`) doesn't get overwritten by the
+    /// digits of the *next* field.
+    cur: usize,
 }
 
 impl Params {
@@ -21,7 +26,7 @@ impl Params {
         Self {
             buf: [0; MAX_PARAMS],
             len: 0,
-            has_value: false,
+            cur: 0,
         }
     }
 
@@ -29,27 +34,27 @@ impl Params {
     pub(crate) fn clear(&mut self) {
         self.buf = [0; MAX_PARAMS];
         self.len = 0;
-        self.has_value = false;
+        self.cur = 0;
     }
 
     /// Feed a digit character into the current parameter.
     pub(crate) fn push_digit(&mut self, digit: u8) {
-        if self.len == 0 {
-            self.len = 1;
+        if self.len <= self.cur {
+            self.len = self.cur + 1;
         }
-        let idx = self.len - 1;
-        self.buf[idx] = self.buf[idx]
+        self.buf[self.cur] = self.buf[self.cur]
             .saturating_mul(10)
             .saturating_add(u16::from(digit - b'0'));
-        self.has_value = true;
     }
 
     /// Terminate the current parameter and start a new one.
     pub(crate) fn next_param(&mut self) {
-        if self.len < MAX_PARAMS {
-            self.len += 1;
+        if self.cur + 1 < MAX_PARAMS {
+            self.cur += 1;
         }
-        self.has_value = false;
+        if self.len <= self.cur {
+            self.len = self.cur + 1;
+        }
     }
 
     /// Number of parameters accumulated.

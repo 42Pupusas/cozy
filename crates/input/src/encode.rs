@@ -165,7 +165,9 @@ impl Encoder {
                 if mods.alt() {
                     w.esc();
                 }
-                w.bytes(encode_char(c, mods.shift(), mods.caps()).as_bytes());
+                let mut tmp = [0u8; 4];
+                let src = c.encode_terminal(mods.shift(), mods.caps(), &mut tmp);
+                w.bytes(src);
                 w.len()
             }
 
@@ -230,7 +232,7 @@ impl Encoder {
             }
 
             // ── Function keys ────────────────────────────────────────────
-            Key::F(n) => encode_fkey(buf, n, mods)?,
+            Key::F(n) => { let mut w = SeqWriter::new(buf); w.fkey(n, mods)?; w.len() }
 
             // ── Keypad cluster ────────────────────────────────────────────
             Key::KpEnter | Key::KpUp | Key::KpDown | Key::KpRight | Key::KpLeft
@@ -449,52 +451,50 @@ const fn ctrl_byte(c: char) -> Option<u8> {
     }
 }
 
-/// Encode a character respecting shift and caps-lock.
-const fn encode_char(c: char, shift: bool, caps: bool) -> &'static str {
-    // For the ASCII range we pre-compute via lookup; fallback is just the char.
-    // We return a &'static str from a small table to avoid heap allocation.
-    if shift || caps {
-        shifted_char(c)
-    } else {
-        unshifted_char(c)
+/// Encode a character respecting shift and caps-lock, writing UTF-8 bytes
+/// into `tmp` (>= 4 bytes) and returning the written slice.
+///
+/// ASCII letters and the standard US-QWERTY punctuation row have an
+/// explicit shifted form (1 -> !, a -> A, ...). Anything else -- accented
+/// letters, CJK, emoji, or any other Unicode scalar the platform layer
+/// hands us via Key::Char -- is passed through as its own UTF-8 encoding
+/// rather than collapsed to a placeholder space, so IME/compose input and
+/// clipboard paste-as-keys round-trip correctly.
+trait EncodeTerminalChar {
+    fn encode_terminal(self, shift: bool, caps: bool, tmp: &mut [u8; 4]) -> &[u8];
+}
+
+impl EncodeTerminalChar for char {
+    fn encode_terminal(self, shift: bool, caps: bool, tmp: &mut [u8; 4]) -> &[u8] {
+        if shift || caps {
+            if let Some(s) = shifted_ascii(self) {
+                tmp[0] = s;
+                return &tmp[..1];
+            }
+        } else if self.is_ascii() {
+            tmp[0] = self as u8;
+            return &tmp[..1];
+        }
+        let s = self.encode_utf8(tmp);
+        let len = s.len();
+        &tmp[..len]
     }
 }
 
-const fn unshifted_char(c: char) -> &'static str {
-    // Most chars are their own unshifted form; we just need them as &str.
-    // For ASCII printable we return static slices.
-    match c {
-        'a' => "a", 'b' => "b", 'c' => "c", 'd' => "d", 'e' => "e",
-        'f' => "f", 'g' => "g", 'h' => "h", 'i' => "i", 'j' => "j",
-        'k' => "k", 'l' => "l", 'm' => "m", 'n' => "n", 'o' => "o",
-        'p' => "p", 'q' => "q", 'r' => "r", 's' => "s", 't' => "t",
-        'u' => "u", 'v' => "v", 'w' => "w", 'x' => "x", 'y' => "y",
-        'z' => "z",
-        '1' => "1", '2' => "2", '3' => "3", '4' => "4", '5' => "5",
-        '6' => "6", '7' => "7", '8' => "8", '9' => "9", '0' => "0",
-        '-' => "-", '=' => "=", '[' => "[", ']' => "]", '\\' => "\\",
-        ';' => ";", '\'' => "'", '`' => "`", ',' => ",", '.' => ".", '/' => "/",
-        // Space and any non-ASCII fall back to a single space; callers should
-        // use Key::Char directly for real non-ASCII text.
-        _   => " ",
-    }
+/// The shifted form of a US-QWERTY key. Returns `None` for characters with
+/// no conventional shifted form (caller falls through to the char's own
+/// encoding).
+const fn shifted_ascii(c: char) -> Option<u8> {
+    Some(match c {
+        'a'..='z' => c as u8 - b'a' + b'A',
+        '1' => b'!', '2' => b'@', '3' => b'#', '4' => b'$', '5' => b'%',
+        '6' => b'^', '7' => b'&', '8' => b'*', '9' => b'(', '0' => b')',
+        '-' => b'_', '=' => b'+', '[' => b'{', ']' => b'}', '\\' => b'|',
+        ';' => b':', '\'' => b'"', '`' => b'~', ',' => b'<', '.' => b'>', '/' => b'?',
+        _   => return None,
+    })
 }
 
-const fn shifted_char(c: char) -> &'static str {
-    match c {
-        'a' => "A", 'b' => "B", 'c' => "C", 'd' => "D", 'e' => "E",
-        'f' => "F", 'g' => "G", 'h' => "H", 'i' => "I", 'j' => "J",
-        'k' => "K", 'l' => "L", 'm' => "M", 'n' => "N", 'o' => "O",
-        'p' => "P", 'q' => "Q", 'r' => "R", 's' => "S", 't' => "T",
-        'u' => "U", 'v' => "V", 'w' => "W", 'x' => "X", 'y' => "Y",
-        'z' => "Z",
-        '1' => "!", '2' => "@", '3' => "#", '4' => "$", '5' => "%",
-        '6' => "^", '7' => "&", '8' => "*", '9' => "(", '0' => ")",
-        '-' => "_", '=' => "+", '[' => "{", ']' => "}", '\\' => "|",
-        ';' => ":", '\'' => "\"", '`' => "~", ',' => "<", '.' => ">", '/' => "?",
-        _   => " ",
-    }
-}
 
 /// How a key is encoded in the kitty protocol.
 ///
@@ -558,31 +558,36 @@ const fn kitty_key(key: Key) -> Option<KittyKey> {
     })
 }
 
-/// Encode a function key sequence, with modifier support.
-fn encode_fkey(buf: &mut [u8], n: u8, mods: Modifiers) -> Option<usize> {
-    // F1–F4 without mods → SS3 P/Q/R/S; with mods → CSI 1 ; <mod> P/Q/R/S
-    // F5–F12 → CSI tilde with numeric codes; with mods → CSI num ; mod ~
-    let mut w = SeqWriter::new(buf);
-    match n {
-        1..=4 => {
-            let letter = b'P' + n - 1;
-            if mods.any_active() {
-                w.csi_mod(b"1", mods, letter);
-            } else {
-                w.esc().byte(b'O').byte(letter);
+impl SeqWriter<'_> {
+    /// Encode a function key sequence, with modifier support.
+    ///
+    /// Was a free `encode_fkey(buf, n, mods)` function -- moved onto
+    /// `SeqWriter` alongside its sibling `csi_mod`/`fkey_tilde` sequence
+    /// builders, since it just composes them.
+    fn fkey(&mut self, n: u8, mods: Modifiers) -> Option<&mut Self> {
+        // F1–F4 without mods → SS3 P/Q/R/S; with mods → CSI 1 ; <mod> P/Q/R/S
+        // F5–F12 → CSI tilde with numeric codes; with mods → CSI num ; mod ~
+        match n {
+            1..=4 => {
+                let letter = b'P' + n - 1;
+                if mods.any_active() {
+                    self.csi_mod(b"1", mods, letter);
+                } else {
+                    self.esc().byte(b'O').byte(letter);
+                }
             }
+            5  => { self.fkey_tilde(b"15", mods); }
+            6  => { self.fkey_tilde(b"17", mods); }
+            7  => { self.fkey_tilde(b"18", mods); }
+            8  => { self.fkey_tilde(b"19", mods); }
+            9  => { self.fkey_tilde(b"20", mods); }
+            10 => { self.fkey_tilde(b"21", mods); }
+            11 => { self.fkey_tilde(b"23", mods); }
+            12 => { self.fkey_tilde(b"24", mods); }
+            _ => return None,
         }
-        5  => { w.fkey_tilde(b"15", mods); }
-        6  => { w.fkey_tilde(b"17", mods); }
-        7  => { w.fkey_tilde(b"18", mods); }
-        8  => { w.fkey_tilde(b"19", mods); }
-        9  => { w.fkey_tilde(b"20", mods); }
-        10 => { w.fkey_tilde(b"21", mods); }
-        11 => { w.fkey_tilde(b"23", mods); }
-        12 => { w.fkey_tilde(b"24", mods); }
-        _ => return None,
+        Some(self)
     }
-    Some(w.len())
 }
 
 #[cfg(test)]
@@ -759,5 +764,265 @@ mod tests {
         assert_eq!(encode(&e, Key::Char('1'), Modifiers::SHIFT), b"!");
         assert_eq!(encode(&e, Key::Char('2'), Modifiers::SHIFT), b"@");
         assert_eq!(encode(&e, Key::Char('6'), Modifiers::SHIFT), b"^");
+    }
+
+    // ── Keypad (encode_keypad) ──────────────────────────────────────────
+
+    #[test]
+    fn kp_enter_plain_is_cr_app_is_ss3_m() {
+        let e = enc();
+        assert_eq!(encode(&e, Key::KpEnter, Modifiers::NONE), b"\r");
+        let mut app = enc();
+        app.app_keypad = true;
+        assert_eq!(encode(&app, Key::KpEnter, Modifiers::NONE), b"\x1bOM");
+    }
+
+    #[test]
+    fn kp_arrows_plain_csi_app_ss3() {
+        let e = enc();
+        assert_eq!(encode(&e, Key::KpUp,    Modifiers::NONE), b"\x1b[A");
+        assert_eq!(encode(&e, Key::KpDown,  Modifiers::NONE), b"\x1b[B");
+        assert_eq!(encode(&e, Key::KpRight, Modifiers::NONE), b"\x1b[C");
+        assert_eq!(encode(&e, Key::KpLeft,  Modifiers::NONE), b"\x1b[D");
+
+        let mut app = enc();
+        app.app_keypad = true;
+        assert_eq!(encode(&app, Key::KpUp,    Modifiers::NONE), b"\x1bOA");
+        assert_eq!(encode(&app, Key::KpDown,  Modifiers::NONE), b"\x1bOB");
+        assert_eq!(encode(&app, Key::KpRight, Modifiers::NONE), b"\x1bOC");
+        assert_eq!(encode(&app, Key::KpLeft,  Modifiers::NONE), b"\x1bOD");
+    }
+
+    #[test]
+    fn kp_arrows_also_go_ss3_under_plain_app_cursor_without_app_keypad() {
+        // kp_arrow follows *either* app_keypad or app_cursor -- app_cursor
+        // alone (app_keypad false) must still select SS3.
+        let mut e = enc();
+        e.app_cursor = true;
+        assert_eq!(encode(&e, Key::KpUp, Modifiers::NONE), b"\x1bOA");
+    }
+
+    #[test]
+    fn kp_navigation_cluster_plain_vs_app() {
+        let e = enc();
+        assert_eq!(encode(&e, Key::KpHome,     Modifiers::NONE), b"\x1b[H");
+        assert_eq!(encode(&e, Key::KpEnd,      Modifiers::NONE), b"\x1b[F");
+        assert_eq!(encode(&e, Key::KpPageUp,   Modifiers::NONE), b"\x1b[5~");
+        assert_eq!(encode(&e, Key::KpPageDown, Modifiers::NONE), b"\x1b[6~");
+        assert_eq!(encode(&e, Key::KpBegin,    Modifiers::NONE), b"\x1b[E");
+        assert_eq!(encode(&e, Key::KpInsert,   Modifiers::NONE), b"\x1b[2~");
+        assert_eq!(encode(&e, Key::KpDelete,   Modifiers::NONE), b"\x1b[3~");
+
+        let mut app = enc();
+        app.app_keypad = true;
+        assert_eq!(encode(&app, Key::KpHome,     Modifiers::NONE), b"\x1bOw");
+        assert_eq!(encode(&app, Key::KpEnd,      Modifiers::NONE), b"\x1bOq");
+        assert_eq!(encode(&app, Key::KpPageUp,   Modifiers::NONE), b"\x1bOy");
+        assert_eq!(encode(&app, Key::KpPageDown, Modifiers::NONE), b"\x1bOs");
+        assert_eq!(encode(&app, Key::KpBegin,    Modifiers::NONE), b"\x1bOu");
+        assert_eq!(encode(&app, Key::KpInsert,   Modifiers::NONE), b"\x1bOp");
+        assert_eq!(encode(&app, Key::KpDelete,   Modifiers::NONE), b"\x1bOn");
+    }
+
+    #[test]
+    fn kp_char_digits_plain_pass_through_literally() {
+        let e = enc();
+        for c in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] {
+            let mut b = buf();
+            let n = e.encode_key(Key::KpChar(c), KeyState::Pressed, Modifiers::NONE, &mut b).unwrap();
+            assert_eq!(&b[..n], c.to_string().as_bytes(), "digit {c}");
+        }
+    }
+
+    #[test]
+    fn kp_char_operators_plain_pass_through_literally() {
+        let e = enc();
+        for c in ['.', '+', '-', '*', '/'] {
+            let mut b = buf();
+            let n = e.encode_key(Key::KpChar(c), KeyState::Pressed, Modifiers::NONE, &mut b).unwrap();
+            assert_eq!(&b[..n], c.to_string().as_bytes(), "operator {c}");
+        }
+    }
+
+    #[test]
+    fn kp_char_digits_app_keypad_use_ss3_codes() {
+        let mut e = enc();
+        e.app_keypad = true;
+        let pairs = [
+            ('0', b'p'), ('1', b'q'), ('2', b'r'), ('3', b's'), ('4', b't'),
+            ('5', b'u'), ('6', b'v'), ('7', b'w'), ('8', b'x'), ('9', b'y'),
+        ];
+        for (c, code) in pairs {
+            let mut b = buf();
+            let n = e.encode_key(Key::KpChar(c), KeyState::Pressed, Modifiers::NONE, &mut b).unwrap();
+            assert_eq!(&b[..n], [b'\x1b', b'O', code], "digit {c}");
+        }
+    }
+
+    #[test]
+    fn kp_char_operators_app_keypad_use_ss3_codes() {
+        let mut e = enc();
+        e.app_keypad = true;
+        let pairs = [('.', b'n'), ('+', b'l'), ('-', b'm'), ('*', b'j'), ('/', b'o')];
+        for (c, code) in pairs {
+            let mut b = buf();
+            let n = e.encode_key(Key::KpChar(c), KeyState::Pressed, Modifiers::NONE, &mut b).unwrap();
+            assert_eq!(&b[..n], [b'\x1b', b'O', code], "operator {c}");
+        }
+    }
+
+    #[test]
+    fn kp_char_unrecognised_char_in_app_keypad_produces_none() {
+        // Any char not in the 0-9/./+/-/*// table falls through to None when
+        // app_keypad is on (there is no SS3 code for it).
+        let mut e = enc();
+        e.app_keypad = true;
+        let mut b = buf();
+        let r = e.encode_key(Key::KpChar('x'), KeyState::Pressed, Modifiers::NONE, &mut b);
+        assert!(r.is_none());
+    }
+
+    // ── kitty_key / encode_kitty coverage ────
+
+    fn kitty(e: &Encoder, key: Key, state: KeyState, mods: Modifiers) -> Vec<u8> {
+        let mut b = buf();
+        let n = e.encode_key(key, state, mods, &mut b).unwrap_or(0);
+        b[..n].to_vec()
+    }
+
+    #[test]
+    fn kitty_unmapped_key_produces_none() {
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        let mut b = buf();
+        let r = e.encode_key(Key::KpUp, KeyState::Pressed, Modifiers::NONE, &mut b);
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn kitty_navigation_letter_form_keys() {
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        assert_eq!(kitty(&e, Key::Up,    KeyState::Pressed, Modifiers::NONE), b"\x1b[1;1:1A");
+        assert_eq!(kitty(&e, Key::Down,  KeyState::Pressed, Modifiers::NONE), b"\x1b[1;1:1B");
+        assert_eq!(kitty(&e, Key::Right, KeyState::Pressed, Modifiers::NONE), b"\x1b[1;1:1C");
+        assert_eq!(kitty(&e, Key::Left,  KeyState::Pressed, Modifiers::NONE), b"\x1b[1;1:1D");
+        assert_eq!(kitty(&e, Key::Home,  KeyState::Pressed, Modifiers::NONE), b"\x1b[1;1:1H");
+        assert_eq!(kitty(&e, Key::End,   KeyState::Pressed, Modifiers::NONE), b"\x1b[1;1:1F");
+    }
+
+    #[test]
+    fn kitty_tilde_form_keys() {
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        assert_eq!(kitty(&e, Key::Insert,   KeyState::Pressed, Modifiers::NONE), b"\x1b[2;1:1~");
+        assert_eq!(kitty(&e, Key::Delete,   KeyState::Pressed, Modifiers::NONE), b"\x1b[3;1:1~");
+        assert_eq!(kitty(&e, Key::PageUp,   KeyState::Pressed, Modifiers::NONE), b"\x1b[5;1:1~");
+        assert_eq!(kitty(&e, Key::PageDown, KeyState::Pressed, Modifiers::NONE), b"\x1b[6;1:1~");
+    }
+
+    #[test]
+    fn kitty_function_keys_f1_through_f12() {
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        assert_eq!(kitty(&e, Key::F(1), KeyState::Pressed, Modifiers::NONE), b"\x1b[1;1:1P");
+        assert_eq!(kitty(&e, Key::F(2), KeyState::Pressed, Modifiers::NONE), b"\x1b[1;1:1Q");
+        assert_eq!(kitty(&e, Key::F(3), KeyState::Pressed, Modifiers::NONE), b"\x1b[13;1:1~");
+        assert_eq!(kitty(&e, Key::F(4), KeyState::Pressed, Modifiers::NONE), b"\x1b[1;1:1S");
+        assert_eq!(kitty(&e, Key::F(5), KeyState::Pressed, Modifiers::NONE), b"\x1b[15;1:1~");
+        assert_eq!(kitty(&e, Key::F(6), KeyState::Pressed, Modifiers::NONE), b"\x1b[17;1:1~");
+        assert_eq!(kitty(&e, Key::F(7), KeyState::Pressed, Modifiers::NONE), b"\x1b[18;1:1~");
+        assert_eq!(kitty(&e, Key::F(8), KeyState::Pressed, Modifiers::NONE), b"\x1b[19;1:1~");
+        assert_eq!(kitty(&e, Key::F(9), KeyState::Pressed, Modifiers::NONE), b"\x1b[20;1:1~");
+        assert_eq!(kitty(&e, Key::F(10), KeyState::Pressed, Modifiers::NONE), b"\x1b[21;1:1~");
+        assert_eq!(kitty(&e, Key::F(11), KeyState::Pressed, Modifiers::NONE), b"\x1b[23;1:1~");
+        assert_eq!(kitty(&e, Key::F(12), KeyState::Pressed, Modifiers::NONE), b"\x1b[24;1:1~");
+    }
+
+    #[test]
+    fn kitty_special_pua_only_keys() {
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        assert_eq!(kitty(&e, Key::KpEnter, KeyState::Pressed, Modifiers::NONE), b"\x1b[57414;1:1u");
+        assert_eq!(kitty(&e, Key::ScrollLock, KeyState::Pressed, Modifiers::NONE), b"\x1b[57359;1:1u");
+        assert_eq!(kitty(&e, Key::NumLock, KeyState::Pressed, Modifiers::NONE), b"\x1b[57360;1:1u");
+        assert_eq!(kitty(&e, Key::Menu, KeyState::Pressed, Modifiers::NONE), b"\x1b[57363;1:1u");
+    }
+
+    #[test]
+    fn kitty_bare_modifier_keys_report_their_own_pua_codepoints() {
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        assert_eq!(kitty(&e, Key::Shift, KeyState::Pressed, Modifiers::NONE), b"\x1b[57441;1:1u");
+        assert_eq!(kitty(&e, Key::Ctrl,  KeyState::Pressed, Modifiers::NONE), b"\x1b[57442;1:1u");
+        assert_eq!(kitty(&e, Key::Alt,   KeyState::Pressed, Modifiers::NONE), b"\x1b[57443;1:1u");
+        assert_eq!(kitty(&e, Key::Super, KeyState::Pressed, Modifiers::NONE), b"\x1b[57444;1:1u");
+    }
+
+    #[test]
+    fn kitty_control_chars_use_their_c0_codepoint() {
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        assert_eq!(kitty(&e, Key::Enter,     KeyState::Pressed, Modifiers::NONE), b"\x1b[13;1:1u");
+        assert_eq!(kitty(&e, Key::Backspace, KeyState::Pressed, Modifiers::NONE), b"\x1b[127;1:1u");
+        assert_eq!(kitty(&e, Key::Tab,       KeyState::Pressed, Modifiers::NONE), b"\x1b[9;1:1u");
+        assert_eq!(kitty(&e, Key::Esc,       KeyState::Pressed, Modifiers::NONE), b"\x1b[27;1:1u");
+    }
+
+    #[test]
+    fn kitty_repeat_state_reports_event_type_2_uniformly() {
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        assert_eq!(kitty(&e, Key::Char('a'), KeyState::Repeated, Modifiers::NONE), b"\x1b[97;1:2u");
+        assert_eq!(kitty(&e, Key::Up, KeyState::Repeated, Modifiers::NONE), b"\x1b[1;1:2A");
+    }
+
+    // ── ctrl_byte / shifted_ascii aliasing coverage ──
+
+    #[test]
+    fn ctrl_digit_aliases_match_symbol_aliases() {
+        let e = enc();
+        assert_eq!(encode(&e, Key::Char('2'), Modifiers::CTRL), encode(&e, Key::Char('@'), Modifiers::CTRL));
+        assert_eq!(encode(&e, Key::Char('2'), Modifiers::CTRL), encode(&e, Key::Char(' '), Modifiers::CTRL));
+        assert_eq!(encode(&e, Key::Char('3'), Modifiers::CTRL), encode(&e, Key::Char('['), Modifiers::CTRL));
+        assert_eq!(encode(&e, Key::Char('4'), Modifiers::CTRL), encode(&e, Key::Char('\\'), Modifiers::CTRL));
+        assert_eq!(encode(&e, Key::Char('5'), Modifiers::CTRL), encode(&e, Key::Char(']'), Modifiers::CTRL));
+        assert_eq!(encode(&e, Key::Char('6'), Modifiers::CTRL), encode(&e, Key::Char('^'), Modifiers::CTRL));
+        assert_eq!(encode(&e, Key::Char('7'), Modifiers::CTRL), encode(&e, Key::Char('_'), Modifiers::CTRL));
+        assert_eq!(encode(&e, Key::Char('8'), Modifiers::CTRL), vec![127]);
+    }
+
+    #[test]
+    fn ctrl_unmapped_char_falls_through_to_plain_encoding() {
+        let e = enc();
+        assert_eq!(encode(&e, Key::Char('9'), Modifiers::CTRL), b"9");
+    }
+
+    #[test]
+    fn shifted_ascii_full_punctuation_row() {
+        let e = enc();
+        let pairs = [
+            ('-', '_'), ('=', '+'), ('[', '{'), (']', '}'), ('\\', '|'),
+            (';', ':'), ('\'', '"'), ('`', '~'), (',', '<'), ('.', '>'), ('/', '?'),
+        ];
+        for (base, shifted) in pairs {
+            assert_eq!(
+                encode(&e, Key::Char(base), Modifiers::SHIFT),
+                shifted.to_string().as_bytes(),
+                "{base} shifted"
+            );
+        }
+    }
+
+    #[test]
+    fn kp_char_non_ascii_plain_passes_through_utf8() {
+        // encode_keypad's plain-mode branch just forwards the char's own
+        // UTF-8 bytes, same machinery as encode_char -- verify it isn't
+        // secretly ASCII-only.
+        let e = enc();
+        let c = 'é';
+        let mut b = buf();
+        let n = e.encode_key(Key::KpChar(c), KeyState::Pressed, Modifiers::NONE, &mut b).unwrap();
+        assert_eq!(&b[..n], c.to_string().as_bytes());
     }
 }

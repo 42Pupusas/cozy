@@ -41,6 +41,19 @@ fn parse_too_short_returns_error() {
     assert_eq!(result.unwrap_err(), ParseError::TooShort);
 }
 
+#[test]
+fn parse_error_display_messages() {
+    assert_eq!(ParseError::TooShort.to_string(), "font data too short");
+    assert_eq!(
+        ParseError::BadSfntVersion.to_string(),
+        "not a TTF/OTF file (bad sfnt version)"
+    );
+    assert_eq!(
+        ParseError::MissingTable("head").to_string(),
+        "required table missing: head"
+    );
+}
+
 // ── tables ────────────────────────────────────────────────────────────────────
 
 #[test]

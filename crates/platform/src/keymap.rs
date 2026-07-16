@@ -33,10 +33,18 @@
 
 use crate::protocol::Key;
 
-/// Placeholder: maps a physical evdev keycode to itself. When XKB is
-/// integrated, this will look up the keycode in the compiled keymap and return
-/// a logical keysym.
-pub fn physical_to_logical(key: Key) -> Key {
-    // Stub: physical-only. Replace with xkb_state_key_get_one_sym().
-    key
+/// Extends [`Key`] with physical→logical keymap resolution, as a method
+/// instead of a free `physical_to_logical(key)` function.
+pub trait PhysicalKey {
+    /// Map this physical evdev keycode to its logical keysym. When XKB is
+    /// integrated, this will look up the keycode in the compiled keymap and
+    /// return a logical keysym.
+    fn to_logical(self) -> Self;
+}
+
+impl PhysicalKey for Key {
+    fn to_logical(self) -> Self {
+        // Stub: physical-only. Replace with xkb_state_key_get_one_sym().
+        self
+    }
 }

@@ -542,9 +542,15 @@ impl Parser {
             (data, &b""[..])
         };
 
-        let ps: u8 = ps_bytes
-            .iter()
-            .fold(0u8, |acc, &b| acc.saturating_mul(10).saturating_add(b - b'0'));
+        let ps: u8 = ps_bytes.iter().fold(0u8, |acc, &b| {
+            if b.is_ascii_digit() {
+                acc.saturating_mul(10).saturating_add(b - b'0')
+            } else {
+                // Non-numeric Ps is malformed; ignore the byte rather than
+                // underflowing on `b - b'0'`.
+                acc
+            }
+        });
 
         // Truncation is inherent to osc_buf's fixed OSC_BUF_MAX capacity —
         // no separate copy/allocation needed; these &str slices borrow

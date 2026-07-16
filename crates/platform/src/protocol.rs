@@ -734,3 +734,124 @@ pub mod drm_format {
 /// `DRM_FORMAT_MOD_LINEAR` — no tiling/compression.
 pub const DRM_FORMAT_MOD_LINEAR_HI: u32 = 0;
 pub const DRM_FORMAT_MOD_LINEAR_LO: u32 = 0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every evdev code `Key::from_code` is documented to recognise. Kept as
+    /// an explicit list (rather than re-deriving it from the enum) so the
+    /// test independently double-checks the match arms actually cover what
+    /// the doc comment/enum promises.
+    const VALID_KEY_CODES: &[u32] = &[
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+        49, 50, 51, 52, 53, 54, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88, 97,
+        100, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 125, 126,
+    ];
+
+    #[test]
+    fn key_from_code_recognises_every_documented_code_and_roundtrips() {
+        for &code in VALID_KEY_CODES {
+            let key = Key::from_code(code)
+                .unwrap_or_else(|| panic!("code {code} should decode to a Key"));
+            assert_eq!(key as u32, code, "Key discriminant must equal its evdev code");
+        }
+    }
+
+    #[test]
+    fn key_from_code_rejects_unknown_codes() {
+        // A sampling of codes that fall in the gaps of the evdev keyboard
+        // range (KP keys, media keys, codes past the last-known F12) plus
+        // the two boundary sentinels 0 and u32::MAX.
+        for code in [0, 55, 69, 86, 89, 96, 98, 99, 101, 112, 124, 127, 200, 1000, u32::MAX] {
+            assert_eq!(Key::from_code(code), None, "code {code} should not decode");
+        }
+    }
+
+    #[test]
+    fn key_from_code_covers_every_code_in_0_to_200_consistently() {
+        // Exhaustive sweep of the low range: anything not in our explicit
+        // valid-code list must come back None, and anything in it must
+        // roundtrip. Catches accidental extra/missing match arms in one shot.
+        for code in 0..=200u32 {
+            let expected_some = VALID_KEY_CODES.contains(&code);
+            assert_eq!(
+                Key::from_code(code).is_some(),
+                expected_some,
+                "code {code} disagreed with expected validity"
+            );
+        }
+    }
+
+    #[test]
+    fn key_is_modifier_true_only_for_the_eight_modifier_keys() {
+        let modifiers = [
+            Key::LCtrl,
+            Key::RCtrl,
+            Key::LAlt,
+            Key::RAlt,
+            Key::LShift,
+            Key::RShift,
+            Key::LMeta,
+            Key::RMeta,
+        ];
+        for &k in &modifiers {
+            assert!(k.is_modifier(), "{k:?} should be a modifier");
+        }
+        // A representative sample of non-modifier keys.
+        for &k in &[Key::A, Key::Enter, Key::Space, Key::F1, Key::Up, Key::Esc] {
+            assert!(!k.is_modifier(), "{k:?} should not be a modifier");
+        }
+    }
+
+    #[test]
+    fn pointer_button_from_code_known_and_unknown() {
+        assert_eq!(PointerButton::from_code(0x110), Some(PointerButton::Left));
+        assert_eq!(PointerButton::from_code(0x111), Some(PointerButton::Right));
+        assert_eq!(PointerButton::from_code(0x112), Some(PointerButton::Middle));
+        assert_eq!(PointerButton::from_code(0x113), None);
+        assert_eq!(PointerButton::from_code(0), None);
+    }
+
+    #[test]
+    fn button_state_from_raw_known_and_unknown() {
+        assert_eq!(ButtonState::from_raw(0), Some(ButtonState::Released));
+        assert_eq!(ButtonState::from_raw(1), Some(ButtonState::Pressed));
+        assert_eq!(ButtonState::from_raw(2), None);
+    }
+
+    #[test]
+    fn key_state_from_raw_known_and_unknown() {
+        assert_eq!(KeyState::from_raw(0), Some(KeyState::Released));
+        assert_eq!(KeyState::from_raw(1), Some(KeyState::Pressed));
+        assert_eq!(KeyState::from_raw(2), None);
+    }
+
+    #[test]
+    fn seat_capability_in_mask_checks_individual_bits() {
+        let mask = SeatCapability::Pointer as u32 | SeatCapability::Touch as u32;
+        assert!(SeatCapability::Pointer.in_mask(mask));
+        assert!(!SeatCapability::Keyboard.in_mask(mask));
+        assert!(SeatCapability::Touch.in_mask(mask));
+        assert!(!SeatCapability::Pointer.in_mask(0));
+    }
+
+    #[test]
+    fn fixed_to_pixels_truncates_toward_zero() {
+        assert_eq!(Fixed(256).to_pixels(), 1);
+        assert_eq!(Fixed(0).to_pixels(), 0);
+        assert_eq!(Fixed(255).to_pixels(), 0);
+        assert_eq!(Fixed(-256).to_pixels(), -1);
+        // Truncation, not floor: -1 pixel worth minus a fraction still
+        // truncates toward zero under integer division.
+        assert_eq!(Fixed(-255).to_pixels(), 0);
+        assert_eq!(Fixed(1024).to_pixels(), 4);
+    }
+
+    #[test]
+    fn format_code_matches_wire_value() {
+        assert_eq!(Format::Argb8888.code(), 0);
+        assert_eq!(Format::Xrgb8888.code(), 1);
+    }
+}

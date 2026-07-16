@@ -67,6 +67,44 @@ impl Edge {
         let x = t.mul_add(self.x1 - self.x0, self.x0);
         Some((x, self.winding))
     }
+
+    /// Recursively subdivide a quadratic Bézier into line-segment edges,
+    /// pushing them onto `edges`.
+    ///
+    /// Was a free `subdivide_quad(edges, ..)` function -- moved onto `Edge`
+    /// since it's the type being produced and pushed.
+    fn subdivide_quad(
+        edges: &mut Vec<Self>,
+        p0:    (f32, f32),
+        ctrl:  (f32, f32),
+        p1:    (f32, f32),
+        depth: u8,
+    ) {
+        if depth == 0 {
+            edges.extend(Self::new(p0, p1));
+            return;
+        }
+        // De Casteljau midpoint split.
+        let m0 = p0.lerp2(ctrl, 0.5);
+        let m1 = ctrl.lerp2(p1, 0.5);
+        let mid = m0.lerp2(m1, 0.5);
+        Self::subdivide_quad(edges, p0, m0, mid, depth - 1);
+        Self::subdivide_quad(edges, mid, m1, p1, depth - 1);
+    }
+}
+
+/// Extends the `(f32, f32)` pixel-coordinate pair with linear interpolation,
+/// as a method instead of a free `lerp2(a, b, t)` function -- mirrors
+/// [`crate::outline::Point::lerp`] for the raw-tuple form used during
+/// rasterization.
+trait Lerp2 {
+    fn lerp2(self, other: Self, t: f32) -> Self;
+}
+
+impl Lerp2 for (f32, f32) {
+    fn lerp2(self, other: Self, t: f32) -> Self {
+        ((other.0 - self.0).mul_add(t, self.0), (other.1 - self.1).mul_add(t, self.1))
+    }
 }
 
 // ── Public entry ──────────────────────────────────────────────────────────────
@@ -114,7 +152,7 @@ impl Outline {
                     let (cx, cy) = tx(ctrl);
                     let (ex, ey) = tx(end);
                     // Subdivide into ~8 segments — sufficient for pixel-scale glyphs.
-                    subdivide_quad(&mut edges, current, (cx, cy), (ex, ey), 3);
+                    Edge::subdivide_quad(&mut edges, current, (cx, cy), (ex, ey), 3);
                     current = (ex, ey);
                 }
                 Verb::Close => {
@@ -157,30 +195,4 @@ impl Outline {
 
         bmp
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Recursively subdivide a quadratic Bézier into line segments.
-fn subdivide_quad(
-    edges:   &mut Vec<Edge>,
-    p0:      (f32, f32),
-    ctrl:    (f32, f32),
-    p1:      (f32, f32),
-    depth:   u8,
-) {
-    if depth == 0 {
-        edges.extend(Edge::new(p0, p1));
-        return;
-    }
-    // De Casteljau midpoint split.
-    let m0 = lerp2(p0, ctrl, 0.5);
-    let m1 = lerp2(ctrl, p1, 0.5);
-    let mid = lerp2(m0, m1, 0.5);
-    subdivide_quad(edges, p0, m0, mid, depth - 1);
-    subdivide_quad(edges, mid, m1, p1, depth - 1);
-}
-
-fn lerp2(a: (f32, f32), b: (f32, f32), t: f32) -> (f32, f32) {
-    ((b.0 - a.0).mul_add(t, a.0), (b.1 - a.1).mul_add(t, a.1))
 }

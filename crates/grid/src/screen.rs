@@ -125,9 +125,25 @@ impl Screen {
         }
     }
 
-    /// Scroll the region `[top, bot]` up by `n` lines, pulling blank lines at bottom.
-    /// Lines that scroll off the top are pushed into scrollback (primary screen only).
+    /// Scroll the region `[top, bot]` up by `n` lines, pulling blank lines at
+    /// bottom, for a genuine "content advanced past the bottom margin" event
+    /// (linefeed past the last row, or an explicit `CSI Ps S` Scroll Up).
+    /// Lines that scroll off the top are pushed into scrollback (primary
+    /// screen only, and only when the region starts at row 0).
     pub fn scroll_up(&mut self, n: u16, top: u16, bot: u16) {
+        self.scroll_up_impl(n, top, bot, true);
+    }
+
+    /// Delete `n` lines at `row` (DL, `CSI Ps M`): pulls lines below up into
+    /// the gap. Unlike a genuine scroll, DL is a line-editing operation, not
+    /// output advancing past a margin -- the deleted lines must simply
+    /// disappear, never get appended to scrollback (xterm/VTE/kitty all
+    /// agree DL/IL never touch history).
+    pub fn delete_lines_no_scrollback(&mut self, row: u16, n: u16, bot: u16) {
+        self.scroll_up_impl(n, row, bot, false);
+    }
+
+    fn scroll_up_impl(&mut self, n: u16, top: u16, bot: u16, push_scrollback: bool) {
         let cols = usize::from(self.cols);
         let n = usize::from(n);
         let top_i = usize::from(top);
@@ -138,7 +154,7 @@ impl Screen {
         }
 
         // Push scrolled-off lines to scrollback if room (top region only).
-        if top_i == 0 && self.scrollback_max > 0 {
+        if push_scrollback && top_i == 0 && self.scrollback_max > 0 {
             let push = n.min(self.scrollback_max - self.scrollback_len);
             if push > 0 {
                 // The top `push` visible rows simply become scrollback: they
@@ -203,9 +219,11 @@ impl Screen {
         self.scroll_down(n, row, bot);
     }
 
-    /// Delete `n` lines at `row`, pulling lines up from below.
+    /// Delete `n` lines at `row`, pulling lines up from below. A
+    /// line-editing operation (DL), not a scroll -- must never push into
+    /// scrollback, unlike `scroll_up`.
     pub fn delete_lines(&mut self, row: u16, n: u16, bot: u16) {
-        self.scroll_up(n, row, bot);
+        self.delete_lines_no_scrollback(row, n, bot);
     }
 
     /// Delete `n` characters at `(col, row)`, shifting right chars left.

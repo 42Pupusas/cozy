@@ -29,7 +29,7 @@ const B: u8 = 1;
 const W: u8 = 2;
 
 /// The X "left_ptr" cursor at 16×16, as a flat row-major array of pixel tags.
-/// Converted to ARGB8888 at runtime by [`write_into`].
+/// Converted to ARGB8888 at runtime by [`Cursor::write_left_ptr`].
 const LEFT_PTR_BITMAP: &[u8] = &[
     T, T, T, T, B, B, B, B, T, T, T, T, T, T, T, T, //  0
     T, T, T, T, B, W, W, B, T, T, T, T, T, T, T, T, //  1
@@ -48,22 +48,6 @@ const LEFT_PTR_BITMAP: &[u8] = &[
     B, B, B, B, B, T, T, T, T, T, T, T, T, T, T, T, // 14
     T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, T, // 15
 ];
-
-/// Write the left-arrow cursor into `pixels`, which must be at least
-/// `CURSOR_SIZE × CURSOR_SIZE` elements. Fills every pixel — call on a
-/// zero-initialized or don't-care buffer.
-fn write_left_ptr(pixels: &mut [u32]) {
-    let black = Color::BLACK.to_argb8888();
-    let white = Color::WHITE.to_argb8888();
-
-    for (i, &tag) in LEFT_PTR_BITMAP.iter().enumerate() {
-        pixels[i] = match tag {
-            B => black,
-            W => white,
-            _ => 0, // transparent
-        };
-    }
-}
 
 /// Everything the `Window` needs to keep alive for the cursor to work.
 pub struct Cursor {
@@ -90,7 +74,7 @@ impl Cursor {
     pub fn create(sender: &mut Sender, shm: ShmId, compositor: CompositorId) -> Result<Self> {
         let cs = CURSOR_SIZE as usize;
         let mut cshm = ShmBuffer::new(cs, cs, 1).map_err(|e| Error::Conn(ConnError::Sys(e)))?;
-        write_left_ptr(cshm.pixels(0));
+        Self::write_left_ptr(cshm.pixels(0));
         let cursor_pool: crate::id::PoolId = sender.alloc_id();
         let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
             .new_id(cursor_pool)
@@ -119,5 +103,25 @@ impl Cursor {
         )?;
         sender.request(MessageBuilder::new(cursor_surface, SurfaceRequest::Commit))?;
         Ok(Self { surface: cursor_surface, buffer: cursor_buffer, shm: cshm })
+    }
+
+    /// Write the left-arrow cursor into `pixels`, which must be at least
+    /// `CURSOR_SIZE × CURSOR_SIZE` elements. Fills every pixel — call on a
+    /// zero-initialized or don't-care buffer.
+    ///
+    /// Was a free `write_left_ptr(pixels)` function -- moved onto `Cursor`
+    /// since it's the type-specific image data (`LEFT_PTR_BITMAP`) being
+    /// rasterized, alongside its sibling constructor `create`.
+    fn write_left_ptr(pixels: &mut [u32]) {
+        let black = Color::BLACK.to_argb8888();
+        let white = Color::WHITE.to_argb8888();
+
+        for (i, &tag) in LEFT_PTR_BITMAP.iter().enumerate() {
+            pixels[i] = match tag {
+                B => black,
+                W => white,
+                _ => 0, // transparent
+            };
+        }
     }
 }

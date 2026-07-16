@@ -73,123 +73,99 @@ impl Outline {
         let y_max = d.i16_at(8).ok_or(ParseError::TooShort)?;
 
         if num_contours >= 0 {
-            decode_simple(d, num_contours as usize, x_min, y_min, x_max, y_max)
+            Self::decode_simple(d, num_contours as usize, x_min, y_min, x_max, y_max)
         } else {
-            decode_composite(glyf_data, d, depth, x_min, y_min, x_max, y_max)
+            Self::decode_composite(glyf_data, d, depth, x_min, y_min, x_max, y_max)
         }
     }
-}
 
-// ── Flag bits ─────────────────────────────────────────────────────────────────
+    /// Decode a simple (non-composite) glyph's contours.
+    ///
+    /// Was a free `decode_simple(d, ..)` function -- moved onto `Outline`
+    /// alongside its sibling `decode`/`decode_composite`.
+    fn decode_simple(
+        d:           &[u8],
+        num_contours: usize,
+        x_min: i16, y_min: i16, x_max: i16, y_max: i16,
+    ) -> Result<Self, ParseError> {
+        if num_contours == 0 { return Ok(Self::default()); }
 
-const ON_CURVE:          u8 = 0x01;
-const X_SHORT:           u8 = 0x02;
-const Y_SHORT:           u8 = 0x04;
-const REPEAT:            u8 = 0x08;
-const X_SAME_OR_POS:     u8 = 0x10;
-const Y_SAME_OR_POS:     u8 = 0x20;
+        // End-point indices of each contour (relative to 0).
+        let end_pts_off = 10usize;
+        let total_pts   = d.u16_at(end_pts_off + (num_contours - 1) * 2)
+            .ok_or(ParseError::TooShort)? as usize + 1;
 
-// Composite flag bits
-const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
-const MORE_COMPONENTS:       u16 = 0x0020;
-const WE_HAVE_A_SCALE:       u16 = 0x0008;
-const WE_HAVE_AN_X_AND_Y:    u16 = 0x0040;
-const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
+        let instruction_len_off = end_pts_off + num_contours * 2;
+        let instruction_len = d.u16_at(instruction_len_off).ok_or(ParseError::TooShort)? as usize;
 
-// ── Public entry point ────────────────────────────────────────────────────────
+        let mut cursor = instruction_len_off + 2 + instruction_len;
 
-
-// ── Simple glyph ─────────────────────────────────────────────────────────────
-
-fn decode_simple(
-    d:           &[u8],
-    num_contours: usize,
-    x_min: i16, y_min: i16, x_max: i16, y_max: i16,
-) -> Result<Outline, ParseError> {
-    if num_contours == 0 { return Ok(Outline::default()); }
-
-    // End-point indices of each contour (relative to 0).
-    let end_pts_off = 10usize;
-    let total_pts   = d.u16_at(end_pts_off + (num_contours - 1) * 2)
-        .ok_or(ParseError::TooShort)? as usize + 1;
-
-    let instruction_len_off = end_pts_off + num_contours * 2;
-    let instruction_len = d.u16_at(instruction_len_off).ok_or(ParseError::TooShort)? as usize;
-
-    let mut cursor = instruction_len_off + 2 + instruction_len;
-
-    // ── Flags ──────────────────────────────────────────────────────────────
-    let mut flags = Vec::with_capacity(total_pts);
-    while flags.len() < total_pts {
-        let f = d.u8_at(cursor).ok_or(ParseError::TooShort)?;
-        cursor += 1;
-        let repeat = if f & REPEAT != 0 {
-            let n = d.u8_at(cursor).ok_or(ParseError::TooShort)?;
+        // ── Flags ──────────────────────────────────────────────────────────
+        let mut flags = Vec::with_capacity(total_pts);
+        while flags.len() < total_pts {
+            let f = d.u8_at(cursor).ok_or(ParseError::TooShort)?;
             cursor += 1;
-            n as usize
-        } else { 0 };
-        flags.push(f);
-        for _ in 0..repeat { flags.push(f); }
+            let repeat = if f & REPEAT != 0 {
+                let n = d.u8_at(cursor).ok_or(ParseError::TooShort)?;
+                cursor += 1;
+                n as usize
+            } else { 0 };
+            flags.push(f);
+            for _ in 0..repeat { flags.push(f); }
+        }
+
+        // ── X coordinates ─────────────────────────────────────────────────
+        let mut xs = Vec::with_capacity(total_pts);
+        let mut x_acc: i32 = 0;
+        for &f in &flags {
+            let dx = if f & X_SHORT != 0 {
+                let v = i32::from(d.u8_at(cursor).ok_or(ParseError::TooShort)?);
+                cursor += 1;
+                if f & X_SAME_OR_POS != 0 { v } else { -v }
+            } else if f & X_SAME_OR_POS != 0 {
+                0
+            } else {
+                let v = i32::from(d.i16_at(cursor).ok_or(ParseError::TooShort)?);
+                cursor += 2;
+                v
+            };
+            x_acc += dx;
+            xs.push(x_acc as i16);
+        }
+
+        // ── Y coordinates ─────────────────────────────────────────────────
+        let mut ys = Vec::with_capacity(total_pts);
+        let mut y_acc: i32 = 0;
+        for &f in &flags {
+            let dy = if f & Y_SHORT != 0 {
+                let v = i32::from(d.u8_at(cursor).ok_or(ParseError::TooShort)?);
+                cursor += 1;
+                if f & Y_SAME_OR_POS != 0 { v } else { -v }
+            } else if f & Y_SAME_OR_POS != 0 {
+                0
+            } else {
+                let v = i32::from(d.i16_at(cursor).ok_or(ParseError::TooShort)?);
+                cursor += 2;
+                v
+            };
+            y_acc += dy;
+            ys.push(y_acc as i16);
+        }
+
+        // ── Build verbs ───────────────────────────────────────────────────
+        let mut outline = Self::new(x_min, y_min, x_max, y_max);
+        let points = GlyphPoints { xs: &xs, ys: &ys };
+        let mut pt_idx = 0usize;
+
+        for c in 0..num_contours {
+            let end = d.u16_at(end_pts_off + c * 2).ok_or(ParseError::TooShort)? as usize;
+            outline.emit_contour(&flags, &points, pt_idx, end);
+            pt_idx = end + 1;
+        }
+
+        Ok(outline)
     }
 
-    // ── X coordinates ─────────────────────────────────────────────────────
-    let mut xs = Vec::with_capacity(total_pts);
-    let mut x_acc: i32 = 0;
-    for &f in &flags {
-        let dx = if f & X_SHORT != 0 {
-            let v = i32::from(d.u8_at(cursor).ok_or(ParseError::TooShort)?);
-            cursor += 1;
-            if f & X_SAME_OR_POS != 0 { v } else { -v }
-        } else if f & X_SAME_OR_POS != 0 {
-            0
-        } else {
-            let v = i32::from(d.i16_at(cursor).ok_or(ParseError::TooShort)?);
-            cursor += 2;
-            v
-        };
-        x_acc += dx;
-        xs.push(x_acc as i16);
-    }
-
-    // ── Y coordinates ─────────────────────────────────────────────────────
-    let mut ys = Vec::with_capacity(total_pts);
-    let mut y_acc: i32 = 0;
-    for &f in &flags {
-        let dy = if f & Y_SHORT != 0 {
-            let v = i32::from(d.u8_at(cursor).ok_or(ParseError::TooShort)?);
-            cursor += 1;
-            if f & Y_SAME_OR_POS != 0 { v } else { -v }
-        } else if f & Y_SAME_OR_POS != 0 {
-            0
-        } else {
-            let v = i32::from(d.i16_at(cursor).ok_or(ParseError::TooShort)?);
-            cursor += 2;
-            v
-        };
-        y_acc += dy;
-        ys.push(y_acc as i16);
-    }
-
-    // ── Build verbs ───────────────────────────────────────────────────────
-    let mut outline = Outline::new(x_min, y_min, x_max, y_max);
-    let mut pt_idx = 0usize;
-
-    for c in 0..num_contours {
-        let end = d.u16_at(end_pts_off + c * 2).ok_or(ParseError::TooShort)? as usize;
-        outline.emit_contour(&flags, &xs, &ys, pt_idx, end);
-        pt_idx = end + 1;
-    }
-
-    Ok(outline)
-}
-
-fn pt(xs: &[i16], ys: &[i16], i: usize) -> Point {
-    Point::new(f32::from(xs[i]), f32::from(ys[i]))
-}
-
-fn on(flags: &[u8], i: usize) -> bool { flags[i] & ON_CURVE != 0 }
-
-impl Outline {
     /// Emit TrueType quadratic contour verbs onto `self`, handling implied
     /// on-curve midpoints.
     ///
@@ -197,20 +173,19 @@ impl Outline {
     /// moved onto `Outline` since it only ever mutates one.
     fn emit_contour(
         &mut self,
-        flags: &[u8],
-        xs:    &[i16],
-        ys:    &[i16],
-        start: usize,
-        end:   usize,
+        flags:  &[u8],
+        points: &GlyphPoints<'_>,
+        start:  usize,
+        end:    usize,
     ) {
         let count = end - start + 1;
         if count == 0 { return; }
 
         // Find first on-curve point (or use midpoint if all off-curve).
-        let first_on = (start..=end).find(|&i| on(flags, i));
+        let first_on = (start..=end).find(|&i| flags.is_on_curve(i));
         let start_pt = first_on.map_or_else(
-            || pt(xs, ys, start).lerp(pt(xs, ys, start + 1), 0.5),
-            |i| pt(xs, ys, i),
+            || points.point(start).lerp(points.point(start + 1), 0.5),
+            |i| points.point(i),
         );
 
         self.verbs.push(Verb::MoveTo(start_pt));
@@ -221,8 +196,8 @@ impl Outline {
 
         for step in 0..count {
             let idx = start + (rotation_start - start + step) % count;
-            let p = pt(xs, ys, idx);
-            if on(flags, idx) {
+            let p = points.point(idx);
+            if flags.is_on_curve(idx) {
                 if let Some(ctrl) = pending_off.take() {
                     self.verbs.push(Verb::QuadTo(ctrl, p));
                 } else if step > 0 {
@@ -242,67 +217,114 @@ impl Outline {
         }
         self.verbs.push(Verb::Close);
     }
-}
 
-// ── Composite glyph ───────────────────────────────────────────────────────────
+    /// Decode a composite glyph by recursively expanding + translating its
+    /// component glyphs.
+    ///
+    /// Was a free `decode_composite(glyf_data, ..)` function -- moved onto
+    /// `Outline` alongside its sibling `decode`/`decode_simple`.
+    fn decode_composite(
+        glyf_data: &[u8],
+        d:         &[u8],
+        depth:     u8,
+        x_min: i16, y_min: i16, x_max: i16, y_max: i16,
+    ) -> Result<Self, ParseError> {
+        let mut outline = Self::new(x_min, y_min, x_max, y_max);
+        let mut cursor  = 10usize;
 
-fn decode_composite(
-    glyf_data: &[u8],
-    d:         &[u8],
-    depth:     u8,
-    x_min: i16, y_min: i16, x_max: i16, y_max: i16,
-) -> Result<Outline, ParseError> {
-    let mut outline = Outline::new(x_min, y_min, x_max, y_max);
-    let mut cursor  = 10usize;
-
-    loop {
-        let flags = d.u16_at(cursor).ok_or(ParseError::TooShort)?;
-        cursor += 2;
-        let glyph_index = d.u16_at(cursor).ok_or(ParseError::TooShort)?;
-        cursor += 2;
-
-        // Translation arguments.
-        let (dx, dy) = if flags & ARG_1_AND_2_ARE_WORDS != 0 {
-            let dx = f32::from(d.i16_at(cursor).ok_or(ParseError::TooShort)?);
-            let dy = f32::from(d.i16_at(cursor + 2).ok_or(ParseError::TooShort)?);
-            cursor += 4;
-            (dx, dy)
-        } else {
-            let dx = f32::from(d.u8_at(cursor).ok_or(ParseError::TooShort)?.cast_signed());
-            let dy = f32::from(d.u8_at(cursor + 1).ok_or(ParseError::TooShort)?.cast_signed());
+        loop {
+            let flags = d.u16_at(cursor).ok_or(ParseError::TooShort)?;
             cursor += 2;
-            (dx, dy)
-        };
+            let glyph_index = d.u16_at(cursor).ok_or(ParseError::TooShort)?;
+            cursor += 2;
 
-        // Skip scale/2x2 (we apply only translation for now — sufficient for
-        // the terminal use-case where we load a single upright monospace font).
-        if flags & WE_HAVE_A_SCALE != 0     { cursor += 2; }
-        else if flags & WE_HAVE_AN_X_AND_Y != 0 { cursor += 4; }
-        else if flags & WE_HAVE_A_TWO_BY_TWO != 0 { cursor += 8; }
+            // Translation arguments.
+            let (dx, dy) = if flags & ARG_1_AND_2_ARE_WORDS != 0 {
+                let dx = f32::from(d.i16_at(cursor).ok_or(ParseError::TooShort)?);
+                let dy = f32::from(d.i16_at(cursor + 2).ok_or(ParseError::TooShort)?);
+                cursor += 4;
+                (dx, dy)
+            } else {
+                let dx = f32::from(d.u8_at(cursor).ok_or(ParseError::TooShort)?.cast_signed());
+                let dy = f32::from(d.u8_at(cursor + 1).ok_or(ParseError::TooShort)?.cast_signed());
+                cursor += 2;
+                (dx, dy)
+            };
 
-        // Recursively decode the component glyph.
-        // We need loca to find it — locate via glyf table bounds heuristic:
-        // components reference glyph ids in the same file so we re-use the
-        // glyf_data slice and search forward for the glyph header.
-        // (A full implementation would pass Loca in; here we use a helper.)
-        let component = find_component(glyf_data, glyph_index, depth);
-        // Translate and append.
-        for verb in component.verbs {
-            outline.verbs.push(verb.translate(dx, dy));
+            // Skip scale/2x2 (we apply only translation for now — sufficient for
+            // the terminal use-case where we load a single upright monospace font).
+            if flags & WE_HAVE_A_SCALE != 0     { cursor += 2; }
+            else if flags & WE_HAVE_AN_X_AND_Y != 0 { cursor += 4; }
+            else if flags & WE_HAVE_A_TWO_BY_TWO != 0 { cursor += 8; }
+
+            // Recursively decode the component glyph.
+            // We need loca to find it — locate via glyf table bounds heuristic:
+            // components reference glyph ids in the same file so we re-use the
+            // glyf_data slice and search forward for the glyph header.
+            // (A full implementation would pass Loca in; here we use a helper.)
+            let component = Self::find_component(glyf_data, glyph_index, depth);
+            // Translate and append.
+            for verb in component.verbs {
+                outline.verbs.push(verb.translate(dx, dy));
+            }
+
+            if flags & MORE_COMPONENTS == 0 { break; }
         }
 
-        if flags & MORE_COMPONENTS == 0 { break; }
+        Ok(outline)
     }
 
-    Ok(outline)
+    /// Resolve a composite glyph's referenced component by id.
+    ///
+    /// Was a free `find_component(glyf_data, ..)` function -- moved onto
+    /// `Outline` since it produces one.
+    fn find_component(glyf_data: &[u8], _gid: u16, _depth: u8) -> Self {
+        // Composite expansion requires Loca; we defer full support to when
+        // FontFace passes Loca in. Return an empty outline as a safe stub —
+        // composite glyphs in JetBrains Mono are rare (only accented letters).
+        let _ = glyf_data;
+        Self::default()
+    }
 }
 
-fn find_component(glyf_data: &[u8], _gid: u16, _depth: u8) -> Outline {
-    // Composite expansion requires Loca; we defer full support to when
-    // FontFace passes Loca in. Return an empty outline as a safe stub —
-    // composite glyphs in JetBrains Mono are rare (only accented letters).
-    let _ = glyf_data;
-    Outline::default()
+// ── Flag bits ─────────────────────────────────────────────────────────────────
+
+const ON_CURVE:          u8 = 0x01;
+const X_SHORT:           u8 = 0x02;
+const Y_SHORT:           u8 = 0x04;
+const REPEAT:            u8 = 0x08;
+const X_SAME_OR_POS:     u8 = 0x10;
+const Y_SAME_OR_POS:     u8 = 0x20;
+
+// Composite flag bits
+const ARG_1_AND_2_ARE_WORDS: u16 = 0x0001;
+const MORE_COMPONENTS:       u16 = 0x0020;
+const WE_HAVE_A_SCALE:       u16 = 0x0008;
+const WE_HAVE_AN_X_AND_Y:    u16 = 0x0040;
+const WE_HAVE_A_TWO_BY_TWO: u16 = 0x0080;
+
+/// Parallel x/y coordinate arrays for a simple glyph's points, bundled so
+/// point lookup reads as a method call instead of a free `pt(xs, ys, i)`
+/// function.
+struct GlyphPoints<'a> {
+    xs: &'a [i16],
+    ys: &'a [i16],
+}
+
+impl GlyphPoints<'_> {
+    fn point(&self, i: usize) -> Point {
+        Point::new(f32::from(self.xs[i]), f32::from(self.ys[i]))
+    }
+}
+
+/// Extends glyph outline flag bytes with on-curve testing, as a method
+/// instead of a free `on(flags, i)` function.
+trait FlagsExt {
+    fn is_on_curve(&self, i: usize) -> bool;
+}
+
+impl FlagsExt for [u8] {
+    fn is_on_curve(&self, i: usize) -> bool { self[i] & ON_CURVE != 0 }
 }
 
 impl Verb {

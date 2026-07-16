@@ -7,7 +7,7 @@
 //! *and* a ring, or two rings — can't use that. They poll.
 //!
 //! A [`Waker`] wraps a counting `eventfd`. Producers call [`Waker::signal`]
-//! after publishing to a ring; the waiting thread parks in [`poll_two`] /
+//! after publishing to a ring; the waiting thread parks in [`Poller::poll_two`] /
 //! [`Waker::wait`] on the eventfd's fd (alongside any other fd) and wakes.
 //!
 //! Because an eventfd is a *counter*, the classic lost-wakeup race is closed
@@ -51,7 +51,7 @@ impl Waker {
         Ok(Self { fd: Arc::new(fd) })
     }
 
-    /// Raw fd to hand to [`poll_two`] / `poll(2)`.
+    /// Raw fd to hand to [`Poller`] / `poll(2)`.
     #[must_use]
     pub fn raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
@@ -84,7 +84,7 @@ impl Waker {
     /// non-negative). Returns `true` if the eventfd became readable.
     #[must_use]
     pub fn wait(&self, timeout_ms: i32) -> bool {
-        poll_one(self.fd.as_raw_fd(), timeout_ms)
+        Poller::one(self.fd.as_raw_fd()).poll(timeout_ms)
     }
 }
 
@@ -96,36 +96,73 @@ struct PollFd {
     revents: i16,
 }
 
-/// Block until either `a` or `b` is readable.
+/// A small `poll(2)` wrapper over one or two raw file descriptors.
 ///
-/// `timeout_ms` negative = wait forever. Returns `(a_ready, b_ready)`. A
-/// failed/`EINTR` poll reports `(false, false)` so the caller just re-checks
-/// its sources and loops.
-#[must_use]
-pub fn poll_two(a: RawFd, b: RawFd, timeout_ms: i32) -> (bool, bool) {
-    let mut fds = [
-        PollFd { fd: a, events: POLLIN, revents: 0 },
-        PollFd { fd: b, events: POLLIN, revents: 0 },
-    ];
-    // SAFETY: pointer + len describe a valid 2-element pollfd array we own.
-    let rc = unsafe { poll(fds.as_mut_ptr(), 2, timeout_ms) };
-    if rc <= 0 {
-        return (false, false);
-    }
-    (
-        fds[0].revents & POLLIN != 0,
-        fds[1].revents & POLLIN != 0,
-    )
+/// Replaces the free functions `poll_one(fd, timeout)` / `poll_two(a, b,
+/// timeout)` with a struct that owns the fd set being waited on, so the
+/// operation reads as `Poller::two(a, b).poll(timeout_ms)`.
+pub struct Poller {
+    fds: [PollFd; 2],
+    len: usize,
 }
 
-/// Block until `fd` is readable or `timeout_ms` elapses. Returns whether it
-/// became readable.
-#[must_use]
-pub fn poll_one(fd: RawFd, timeout_ms: i32) -> bool {
-    let mut fds = [PollFd { fd, events: POLLIN, revents: 0 }];
-    // SAFETY: single-element pollfd array we own.
-    let rc = unsafe { poll(fds.as_mut_ptr(), 1, timeout_ms) };
-    rc > 0 && fds[0].revents & POLLIN != 0
+impl Poller {
+    /// Wait on a single fd.
+    #[must_use]
+    pub const fn one(fd: RawFd) -> Self {
+        Self {
+            fds: [
+                PollFd { fd, events: POLLIN, revents: 0 },
+                PollFd { fd: -1, events: 0, revents: 0 },
+            ],
+            len: 1,
+        }
+    }
+
+    /// Wait on two fds at once.
+    #[must_use]
+    pub const fn two(a: RawFd, b: RawFd) -> Self {
+        Self {
+            fds: [
+                PollFd { fd: a, events: POLLIN, revents: 0 },
+                PollFd { fd: b, events: POLLIN, revents: 0 },
+            ],
+            len: 2,
+        }
+    }
+
+    /// Block until this poller's single fd is readable, or `timeout_ms`
+    /// elapses. Returns whether it became readable.
+    ///
+    /// # Panics
+    /// Panics if called on a [`Self::two`] poller — use
+    /// [`poll_two`](Self::poll_two) there.
+    #[must_use]
+    pub fn poll(&mut self, timeout_ms: i32) -> bool {
+        assert!(self.len == 1, "Poller::poll is for single-fd pollers; use poll_two");
+        // SAFETY: pointer + len describe a valid pollfd we own.
+        let rc = unsafe { poll(self.fds.as_mut_ptr(), 1, timeout_ms) };
+        rc > 0 && self.fds[0].revents & POLLIN != 0
+    }
+
+    /// Block until either watched fd is readable.
+    ///
+    /// `timeout_ms` negative = wait forever. Returns `(a_ready, b_ready)`. A
+    /// failed/`EINTR` poll reports `(false, false)` so the caller just
+    /// re-checks its sources and loops.
+    #[must_use]
+    pub fn poll_two(&mut self, timeout_ms: i32) -> (bool, bool) {
+        assert!(self.len == 2, "Poller::poll_two is for two-fd pollers; use poll");
+        // SAFETY: pointer + len describe a valid 2-element pollfd array we own.
+        let rc = unsafe { poll(self.fds.as_mut_ptr(), 2, timeout_ms) };
+        if rc <= 0 {
+            return (false, false);
+        }
+        (
+            self.fds[0].revents & POLLIN != 0,
+            self.fds[1].revents & POLLIN != 0,
+        )
+    }
 }
 
 unsafe extern "C" {
@@ -170,7 +207,7 @@ mod tests {
         let a = Waker::new().unwrap();
         let b = Waker::new().unwrap();
         b.signal();
-        let (ra, rb) = poll_two(a.raw_fd(), b.raw_fd(), 1000);
+        let (ra, rb) = Poller::two(a.raw_fd(), b.raw_fd()).poll_two(1000);
         assert!(!ra);
         assert!(rb);
     }

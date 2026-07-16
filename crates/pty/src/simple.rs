@@ -50,7 +50,10 @@ impl PtySimple {
     pub fn try_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, PtyError> {
         let n = self.master_fd.raw_read(buf);
         // EAGAIN (11) / EWOULDBLOCK (11 on Linux) — no data, not an error.
-        if n == -11 {
+        // EINTR (4) — interrupted by a signal (e.g. SIGWINCH) before any
+        // data was transferred; treat it like no-data-yet rather than a
+        // real I/O failure.
+        if n == -11 || n == -4 {
             return Ok(None);
         }
         if n < 0 {

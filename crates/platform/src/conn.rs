@@ -657,15 +657,37 @@ impl WindowSender {
     }
 
     /// Push a finished Wayland message (no fds) onto the request ring.
+    ///
+    /// Non-blocking `push`, not `push_block`: producer and consumer both run
+    /// on the event-loop thread (this is called from `handle_event`, drained
+    /// by `drain_requests` on the same thread just before the next `wait`),
+    /// so blocking here would deadlock waiting for a drain that can't happen
+    /// until we return.
+    ///
+    /// A drop can mean two different things and we can't tell them apart
+    /// from here: the consumer dropped (event loop exited, window closing —
+    /// harmless) or the 64-slot ring is transiently full (would silently
+    /// desync the Wayland protocol state — a real bug). Since we can't
+    /// distinguish them, report the possibility rather than swallow it
+    /// outright; a well-behaved event loop drains every tick so this should
+    /// never actually fire outside shutdown.
     pub fn send(&self, msg: Vec<u8>) {
-        // If the consumer has dropped (event loop exited), the message is
-        // silently dropped — the window is closing anyway.
-        let _ = self.tx.push(WindowRequest::Send(msg));
+        if self.tx.push(WindowRequest::Send(msg)).is_err() {
+            eprintln!(
+                "platform: window request ring full or consumer gone; dropped a Wayland message"
+            );
+        }
     }
 
     /// Push a finished Wayland message with ancillary file descriptors.
+    /// See [`WindowSender::send`] for why this drops (not blocks) on a full
+    /// ring, and why we still report it.
     pub fn send_with_fds(&self, msg: Vec<u8>, fds: Vec<OwnedFd>) {
-        let _ = self.tx.push(WindowRequest::SendWithFds { msg, fds });
+        if self.tx.push(WindowRequest::SendWithFds { msg, fds }).is_err() {
+            eprintln!(
+                "platform: window request ring full or consumer gone; dropped a Wayland message with fds"
+            );
+        }
     }
 
     /// Convenience: build → finish → send.

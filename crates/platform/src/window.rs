@@ -499,11 +499,24 @@ impl TermWindow {
                                 if !physical.is_some_and(Key::is_modifier) =>
                             {
                                 self.held_key = Some(k);
-                                let _ = self.repeat_timer.arm(u64::from(self.repeat_delay), u64::from(1000 / self.repeat_rate.max(1)));
+                                // A failed arm means this key just won't
+                                // auto-repeat -- annoying but not fatal, so
+                                // we don't abort the event loop over it. But
+                                // silence here previously meant "held_key is
+                                // set but the timer never fires", which is a
+                                // real (if rare) bug worth seeing in logs.
+                                if let Err(e) = self.repeat_timer.arm(
+                                    u64::from(self.repeat_delay),
+                                    u64::from(1000 / self.repeat_rate.max(1)),
+                                ) {
+                                    eprintln!("platform: failed to arm key-repeat timer: {e}");
+                                }
                             }
                             (Some(k), Some(KeyState::Released)) if self.held_key == Some(k) => {
                                 self.held_key = None;
-                                let _ = self.repeat_timer.disarm();
+                                if let Err(e) = self.repeat_timer.disarm() {
+                                    eprintln!("platform: failed to disarm key-repeat timer: {e}");
+                                }
                             }
                             _ => {}
                         }
@@ -519,7 +532,9 @@ impl TermWindow {
                     }
                     Some(KeyboardEvent::Leave) => {
                         self.held_key = None;
-                        let _ = self.repeat_timer.disarm();
+                        if let Err(e) = self.repeat_timer.disarm() {
+                            eprintln!("platform: failed to disarm key-repeat timer: {e}");
+                        }
                     }
                     Some(KeyboardEvent::Modifiers) => {
                         self.modifiers = Modifiers {

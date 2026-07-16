@@ -1,15 +1,21 @@
-#![allow(clippy::cast_possible_truncation, clippy::match_same_arms,
-         clippy::many_single_char_names, clippy::similar_names,
-         clippy::unreadable_literal, clippy::missing_const_for_fn,
-         clippy::option_if_let_else, clippy::manual_split_once)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::match_same_arms,
+    clippy::many_single_char_names,
+    clippy::similar_names,
+    clippy::unreadable_literal,
+    clippy::missing_const_for_fn,
+    clippy::option_if_let_else,
+    clippy::manual_split_once
+)]
 //! VT/ANSI parser state machine.
 //!
 //! Implements the Paul Williams DEC ANSI parser model.
 //! Reference: <https://vt100.net/emu/dec_ansi_parser>
 
-use crate::event::{CsiAction, OscCmd, SgrAttr, SgrAttrs, C0};
-use crate::params::Params;
 use crate::Event;
+use crate::event::{C0, CsiAction, OscCmd, SgrAttr, SgrAttrs};
+use crate::params::Params;
 
 /// DEC ANSI parser states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -174,7 +180,13 @@ impl Parser {
 
     // ── UTF-8 continuation ────────────────────────────────────────────────
 
-    fn utf8_continue(&mut self, byte: u8, remaining: u8, acc: u32, total: u8) -> Option<Event<'static>> {
+    fn utf8_continue(
+        &mut self,
+        byte: u8,
+        remaining: u8,
+        acc: u32,
+        total: u8,
+    ) -> Option<Event<'static>> {
         if byte & 0xC0 != 0x80 {
             // Not a continuation byte — replacement character, restart.
             self.state = State::Ground;
@@ -455,42 +467,38 @@ impl Parser {
                 28 => SgrAttr::NoInvisible,
                 29 => SgrAttr::NoStrikethrough,
                 30..=37 => SgrAttr::FgStandard((val - 30) as u8),
-                38 => {
-                    match p.get_raw(i + 1) {
-                        5 => {
-                            let idx = p.get_raw(i + 2) as u8;
-                            i += 2;
-                            SgrAttr::Fg256(idx)
-                        }
-                        2 => {
-                            let r = p.get_raw(i + 2) as u8;
-                            let g = p.get_raw(i + 3) as u8;
-                            let b = p.get_raw(i + 4) as u8;
-                            i += 4;
-                            SgrAttr::FgRgb(r, g, b)
-                        }
-                        _ => SgrAttr::FgDefault,
+                38 => match p.get_raw(i + 1) {
+                    5 => {
+                        let idx = p.get_raw(i + 2) as u8;
+                        i += 2;
+                        SgrAttr::Fg256(idx)
                     }
-                }
+                    2 => {
+                        let r = p.get_raw(i + 2) as u8;
+                        let g = p.get_raw(i + 3) as u8;
+                        let b = p.get_raw(i + 4) as u8;
+                        i += 4;
+                        SgrAttr::FgRgb(r, g, b)
+                    }
+                    _ => SgrAttr::FgDefault,
+                },
                 39 => SgrAttr::FgDefault,
                 40..=47 => SgrAttr::BgStandard((val - 40) as u8),
-                48 => {
-                    match p.get_raw(i + 1) {
-                        5 => {
-                            let idx = p.get_raw(i + 2) as u8;
-                            i += 2;
-                            SgrAttr::Bg256(idx)
-                        }
-                        2 => {
-                            let r = p.get_raw(i + 2) as u8;
-                            let g = p.get_raw(i + 3) as u8;
-                            let b = p.get_raw(i + 4) as u8;
-                            i += 4;
-                            SgrAttr::BgRgb(r, g, b)
-                        }
-                        _ => SgrAttr::BgDefault,
+                48 => match p.get_raw(i + 1) {
+                    5 => {
+                        let idx = p.get_raw(i + 2) as u8;
+                        i += 2;
+                        SgrAttr::Bg256(idx)
                     }
-                }
+                    2 => {
+                        let r = p.get_raw(i + 2) as u8;
+                        let g = p.get_raw(i + 3) as u8;
+                        let b = p.get_raw(i + 4) as u8;
+                        i += 4;
+                        SgrAttr::BgRgb(r, g, b)
+                    }
+                    _ => SgrAttr::BgDefault,
+                },
                 49 => SgrAttr::BgDefault,
                 90..=97 => SgrAttr::FgStandard((val - 90 + 8) as u8),
                 100..=107 => SgrAttr::BgStandard((val - 100 + 8) as u8),
@@ -558,9 +566,8 @@ impl Parser {
         // landed mid-codepoint (buffer cut a multi-byte UTF-8 sequence), so
         // fall back to the longest valid-UTF-8 prefix rather than losing
         // the whole string.
-        let pt = core::str::from_utf8(pt_bytes).unwrap_or_else(|e| {
-            core::str::from_utf8(&pt_bytes[..e.valid_up_to()]).unwrap_or("")
-        });
+        let pt = core::str::from_utf8(pt_bytes)
+            .unwrap_or_else(|e| core::str::from_utf8(&pt_bytes[..e.valid_up_to()]).unwrap_or(""));
 
         let cmd = match ps {
             0 | 2 => OscCmd::SetTitle(pt),

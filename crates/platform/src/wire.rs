@@ -1,5 +1,10 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss,
-         clippy::use_self, clippy::must_use_candidate, clippy::doc_markdown)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::use_self,
+    clippy::must_use_candidate,
+    clippy::doc_markdown
+)]
 //! The Wayland wire format: how requests and events are encoded as bytes.
 //!
 //! Every Wayland message, in either direction, is:

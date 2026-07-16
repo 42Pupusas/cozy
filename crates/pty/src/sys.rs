@@ -1,5 +1,9 @@
 // Raw syscall FFI: `as` casts between C int widths are bounded and correct.
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 //! Raw POSIX syscall wrappers for PTY management.
 //!
 //! All unsafe is contained here. Every function documents the invariant
@@ -608,11 +612,7 @@ impl RawPty {
 
                 // Open the slave PTY.
                 let slave_fd_ret = unsafe {
-                    Syscall::Open.invoke3(
-                        slave_path.as_ptr() as usize,
-                        OpenFlags::RDWR.bits(),
-                        0,
-                    )
+                    Syscall::Open.invoke3(slave_path.as_ptr() as usize, OpenFlags::RDWR.bits(), 0)
                 };
                 // Post-fork child: an `if let` with a diverging else is
                 // clearer than `map_or_else` with side-effecting closures.
@@ -707,7 +707,7 @@ impl RawPty {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_wait_status, errno_to_err, OpenFlags, Signal, SigSet, WaitStatus};
+    use super::{OpenFlags, SigSet, Signal, WaitStatus, decode_wait_status, errno_to_err};
 
     #[test]
     fn wait_status_normal_exit_zero() {

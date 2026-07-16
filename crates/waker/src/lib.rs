@@ -1,4 +1,8 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 //! A tiny cross-thread wakeup primitive built on `eventfd(2)` + `poll(2)`.
 //!
 //! The lock-free SPSC rings (`quetzalcoatl`) block via `std::thread::park`,
@@ -75,9 +79,7 @@ impl Waker {
         // SAFETY: reading up to 8 bytes into a u64; EAGAIN (already drained) is
         // ignored. Loop in case several signals coalesced — one read clears the
         // whole accumulated count, but a fresh signal mid-read just re-arms.
-        unsafe {
-            while read(self.fd.as_raw_fd(), std::ptr::addr_of_mut!(buf).cast(), 8) == 8 {}
-        }
+        unsafe { while read(self.fd.as_raw_fd(), std::ptr::addr_of_mut!(buf).cast(), 8) == 8 {} }
     }
 
     /// Block until this waker is signalled (or `timeout_ms` elapses, if
@@ -112,8 +114,16 @@ impl Poller {
     pub const fn one(fd: RawFd) -> Self {
         Self {
             fds: [
-                PollFd { fd, events: POLLIN, revents: 0 },
-                PollFd { fd: -1, events: 0, revents: 0 },
+                PollFd {
+                    fd,
+                    events: POLLIN,
+                    revents: 0,
+                },
+                PollFd {
+                    fd: -1,
+                    events: 0,
+                    revents: 0,
+                },
             ],
             len: 1,
         }
@@ -124,8 +134,16 @@ impl Poller {
     pub const fn two(a: RawFd, b: RawFd) -> Self {
         Self {
             fds: [
-                PollFd { fd: a, events: POLLIN, revents: 0 },
-                PollFd { fd: b, events: POLLIN, revents: 0 },
+                PollFd {
+                    fd: a,
+                    events: POLLIN,
+                    revents: 0,
+                },
+                PollFd {
+                    fd: b,
+                    events: POLLIN,
+                    revents: 0,
+                },
             ],
             len: 2,
         }
@@ -139,7 +157,10 @@ impl Poller {
     /// [`poll_two`](Self::poll_two) there.
     #[must_use]
     pub fn poll(&mut self, timeout_ms: i32) -> bool {
-        assert!(self.len == 1, "Poller::poll is for single-fd pollers; use poll_two");
+        assert!(
+            self.len == 1,
+            "Poller::poll is for single-fd pollers; use poll_two"
+        );
         // SAFETY: pointer + len describe a valid pollfd we own.
         let rc = unsafe { poll(self.fds.as_mut_ptr(), 1, timeout_ms) };
         rc > 0 && self.fds[0].revents & POLLIN != 0
@@ -152,7 +173,10 @@ impl Poller {
     /// re-checks its sources and loops.
     #[must_use]
     pub fn poll_two(&mut self, timeout_ms: i32) -> (bool, bool) {
-        assert!(self.len == 2, "Poller::poll_two is for two-fd pollers; use poll");
+        assert!(
+            self.len == 2,
+            "Poller::poll_two is for two-fd pollers; use poll"
+        );
         // SAFETY: pointer + len describe a valid 2-element pollfd array we own.
         let rc = unsafe { poll(self.fds.as_mut_ptr(), 2, timeout_ms) };
         if rc <= 0 {

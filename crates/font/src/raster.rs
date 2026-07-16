@@ -15,16 +15,20 @@ use crate::outline::{Outline, Point, Verb};
 /// An 8-bit alpha-channel glyph bitmap (top-left origin).
 #[derive(Debug, Clone)]
 pub struct Bitmap {
-    pub width:  u32,
+    pub width: u32,
     pub height: u32,
     /// Row-major, 1 byte per pixel — 0 = transparent, 255 = fully covered.
-    pub data:   Vec<u8>,
+    pub data: Vec<u8>,
 }
 
 impl Bitmap {
-    #[must_use] 
+    #[must_use]
     pub fn blank(width: u32, height: u32) -> Self {
-        Self { width, height, data: vec![0u8; (width * height) as usize] }
+        Self {
+            width,
+            height,
+            data: vec![0u8; (width * height) as usize],
+        }
     }
 }
 
@@ -32,8 +36,10 @@ impl Bitmap {
 
 #[derive(Debug, Clone, Copy)]
 struct Edge {
-    x0: f32, y0: f32,
-    x1: f32, y1: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
     /// +1 going up, -1 going down (in screen coords where Y increases down).
     winding: i8,
 }
@@ -47,13 +53,21 @@ impl Edge {
     /// built an `Edge` and pushed it; split so construction is a plain
     /// `Edge::new` and the caller decides whether/where to push.
     fn new(p0: (f32, f32), p1: (f32, f32)) -> Option<Self> {
-        if (p0.1 - p1.1).abs() < 1e-6 { return None; } // horizontal — skip
+        if (p0.1 - p1.1).abs() < 1e-6 {
+            return None;
+        } // horizontal — skip
         let (winding, (x0, y0), (x1, y1)) = if p0.1 < p1.1 {
             (-1i8, p0, p1) // going down in screen coords
         } else {
-            (1i8, p1, p0)  // going up
+            (1i8, p1, p0) // going up
         };
-        Some(Self { x0, y0, x1, y1, winding })
+        Some(Self {
+            x0,
+            y0,
+            x1,
+            y1,
+            winding,
+        })
     }
 
     /// The X coordinate (and winding delta) where this edge crosses
@@ -62,7 +76,9 @@ impl Edge {
     /// Was a free `edge_x_at(e: &Edge, y: f32)` function -- moved onto
     /// `Edge` as the type being queried.
     fn x_at(&self, y: f32) -> Option<(f32, i8)> {
-        if y < self.y0 || y >= self.y1 { return None; }
+        if y < self.y0 || y >= self.y1 {
+            return None;
+        }
         let t = (y - self.y0) / (self.y1 - self.y0);
         let x = t.mul_add(self.x1 - self.x0, self.x0);
         Some((x, self.winding))
@@ -75,9 +91,9 @@ impl Edge {
     /// since it's the type being produced and pushed.
     fn subdivide_quad(
         edges: &mut Vec<Self>,
-        p0:    (f32, f32),
-        ctrl:  (f32, f32),
-        p1:    (f32, f32),
+        p0: (f32, f32),
+        ctrl: (f32, f32),
+        p1: (f32, f32),
         depth: u8,
     ) {
         if depth == 0 {
@@ -103,7 +119,10 @@ trait Lerp2 {
 
 impl Lerp2 for (f32, f32) {
     fn lerp2(self, other: Self, t: f32) -> Self {
-        ((other.0 - self.0).mul_add(t, self.0), (other.1 - self.1).mul_add(t, self.1))
+        (
+            (other.0 - self.0).mul_add(t, self.0),
+            (other.1 - self.1).mul_add(t, self.1),
+        )
     }
 }
 
@@ -121,7 +140,7 @@ impl Outline {
     /// also disambiguates by name from `FontFace::rasterize` (`outline.rasterize(..)`
     /// vs `face.rasterize(codepoint)`) instead of both being called `rasterize`
     /// at different scopes.
-    #[must_use] 
+    #[must_use]
     pub fn rasterize(&self, w: u32, h: u32, scale: f32, baseline: f32, x_offset: f32) -> Bitmap {
         let mut edges: Vec<Edge> = Vec::new();
 
@@ -168,15 +187,13 @@ impl Outline {
             let y = scanline as f32 + 0.5; // sample at center of pixel row
 
             // Collect X intersections on this scanline with non-zero winding.
-            let mut crossings: Vec<(f32, i8)> = edges.iter()
-                .filter_map(|e| e.x_at(y))
-                .collect();
+            let mut crossings: Vec<(f32, i8)> = edges.iter().filter_map(|e| e.x_at(y)).collect();
 
             crossings.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
             let mut winding = 0i32;
-            let mut prev_x  = 0.0f32;
-            let mut inside   = false;
+            let mut prev_x = 0.0f32;
+            let mut inside = false;
 
             for (x, w_delta) in crossings {
                 if inside {
@@ -188,8 +205,8 @@ impl Outline {
                     }
                 }
                 winding += i32::from(w_delta);
-                inside   = winding != 0;
-                prev_x   = x;
+                inside = winding != 0;
+                prev_x = x;
             }
         }
 

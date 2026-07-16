@@ -1,5 +1,9 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::missing_const_for_fn,
-         clippy::must_use_candidate)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::missing_const_for_fn,
+    clippy::must_use_candidate
+)]
 //! 2-D cell buffer with scrollback.
 
 use crate::Cell;
@@ -171,16 +175,21 @@ impl Screen {
         let dst_start = (vis_off + top_i) * cols;
         let move_rows = (bot_i - top_i + 1).saturating_sub(n);
         if move_rows > 0 {
-            self.buf.copy_within(src_start..src_start + move_rows * cols, dst_start);
-            self.wrapped
-                .copy_within(vis_off + top_i + n..vis_off + top_i + n + move_rows, vis_off + top_i);
+            self.buf
+                .copy_within(src_start..src_start + move_rows * cols, dst_start);
+            self.wrapped.copy_within(
+                vis_off + top_i + n..vis_off + top_i + n + move_rows,
+                vis_off + top_i,
+            );
         }
 
         // Blank the bottom `n` rows.
         let blank_n = n.min(bot_i - top_i + 1);
         let blank_start = (vis_off + top_i + move_rows) * cols;
         self.buf[blank_start..blank_start + blank_n * cols].fill(Cell::default());
-        for w in &mut self.wrapped[vis_off + top_i + move_rows..vis_off + top_i + move_rows + blank_n] {
+        for w in
+            &mut self.wrapped[vis_off + top_i + move_rows..vis_off + top_i + move_rows + blank_n]
+        {
             *w = false;
         }
     }
@@ -201,9 +210,12 @@ impl Screen {
         if move_rows > 0 {
             let src_start = (vis_off + top_i) * cols;
             let dst_start = (vis_off + top_i + n) * cols;
-            self.buf.copy_within(src_start..src_start + move_rows * cols, dst_start);
-            self.wrapped
-                .copy_within(vis_off + top_i..vis_off + top_i + move_rows, vis_off + top_i + n);
+            self.buf
+                .copy_within(src_start..src_start + move_rows * cols, dst_start);
+            self.wrapped.copy_within(
+                vis_off + top_i..vis_off + top_i + move_rows,
+                vis_off + top_i + n,
+            );
         }
         // Blank top n rows.
         let blank_n = n.min(bot_i - top_i + 1);
@@ -253,10 +265,8 @@ impl Screen {
         let n_i = usize::from(n).min(cols - col_i);
         let move_len = cols - col_i - n_i;
         if move_len > 0 {
-            self.buf.copy_within(
-                base + col_i..base + col_i + move_len,
-                base + col_i + n_i,
-            );
+            self.buf
+                .copy_within(base + col_i..base + col_i + move_len, base + col_i + n_i);
         }
         self.buf[base + col_i..base + col_i + n_i].fill(Cell::default());
         self.sanitize_wide_pairs(row);
@@ -456,7 +466,10 @@ impl Screen {
         let cols = usize::from(self.cols);
         for row in (0..usize::from(self.rows)).rev() {
             let start = (self.scrollback_len + row) * cols;
-            if self.buf[start..start + cols].iter().any(|c| *c != Cell::default()) {
+            if self.buf[start..start + cols]
+                .iter()
+                .any(|c| *c != Cell::default())
+            {
                 return row as u16 + 1;
             }
         }

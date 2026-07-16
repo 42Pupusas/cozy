@@ -70,7 +70,10 @@ impl<'t> TableExt<'t> for Table<'t> {
             None => Ok(None),
             Some(Value::Integer(n)) if (lo..=hi).contains(n) => Ok(Some(*n)),
             Some(Value::Integer(_)) => Err(ConfigError::InvalidValue { field, reason }),
-            Some(_) => Err(ConfigError::InvalidValue { field, reason: "expected integer" }),
+            Some(_) => Err(ConfigError::InvalidValue {
+                field,
+                reason: "expected integer",
+            }),
         }
     }
 }

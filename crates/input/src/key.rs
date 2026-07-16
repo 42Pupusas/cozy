@@ -10,20 +10,44 @@
 pub struct Modifiers(pub u8);
 
 impl Modifiers {
-    pub const NONE:    Self = Self(0b0000_0000);
-    pub const SHIFT:   Self = Self(0b0000_0001);
-    pub const ALT:     Self = Self(0b0000_0010);
-    pub const CTRL:    Self = Self(0b0000_0100);
-    pub const SUPER:   Self = Self(0b0000_1000);
-    pub const CAPS:    Self = Self(0b0001_0000);
-    pub const NUM:     Self = Self(0b0010_0000);
+    pub const NONE: Self = Self(0b0000_0000);
+    pub const SHIFT: Self = Self(0b0000_0001);
+    pub const ALT: Self = Self(0b0000_0010);
+    pub const CTRL: Self = Self(0b0000_0100);
+    pub const SUPER: Self = Self(0b0000_1000);
+    pub const CAPS: Self = Self(0b0001_0000);
+    pub const NUM: Self = Self(0b0010_0000);
 
-    #[inline] #[must_use] pub const fn shift(self) -> bool  { self.0 & 0x01 != 0 }
-    #[inline] #[must_use] pub const fn alt(self) -> bool    { self.0 & 0x02 != 0 }
-    #[inline] #[must_use] pub const fn ctrl(self) -> bool   { self.0 & 0x04 != 0 }
-    #[inline] #[must_use] pub const fn sup(self) -> bool    { self.0 & 0x08 != 0 }
-    #[inline] #[must_use] pub const fn caps(self) -> bool   { self.0 & 0x10 != 0 }
-    #[inline] #[must_use] pub const fn num(self) -> bool    { self.0 & 0x20 != 0 }
+    #[inline]
+    #[must_use]
+    pub const fn shift(self) -> bool {
+        self.0 & 0x01 != 0
+    }
+    #[inline]
+    #[must_use]
+    pub const fn alt(self) -> bool {
+        self.0 & 0x02 != 0
+    }
+    #[inline]
+    #[must_use]
+    pub const fn ctrl(self) -> bool {
+        self.0 & 0x04 != 0
+    }
+    #[inline]
+    #[must_use]
+    pub const fn sup(self) -> bool {
+        self.0 & 0x08 != 0
+    }
+    #[inline]
+    #[must_use]
+    pub const fn caps(self) -> bool {
+        self.0 & 0x10 != 0
+    }
+    #[inline]
+    #[must_use]
+    pub const fn num(self) -> bool {
+        self.0 & 0x20 != 0
+    }
 
     /// The Kitty/xterm modifier parameter: `shift+1`, `alt+2`, `ctrl+4`,
     /// `super+8` — value is `(bitset + 1)` so 1 = no modifiers (omitted in
@@ -35,13 +59,18 @@ impl Modifiers {
     }
 
     /// Whether any of shift/alt/ctrl/super is set.
-    #[inline] #[must_use]
-    pub const fn any_active(self) -> bool { self.0 & 0x0f != 0 }
+    #[inline]
+    #[must_use]
+    pub const fn any_active(self) -> bool {
+        self.0 & 0x0f != 0
+    }
 }
 
 impl core::ops::BitOr for Modifiers {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 
 /// Whether a key was pressed or released (or repeated — the OS auto-repeat).

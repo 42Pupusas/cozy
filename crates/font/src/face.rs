@@ -13,22 +13,22 @@ use crate::tables::{Cmap, Head, Hhea, Hmtx, Loca, Maxp};
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphMetrics {
     /// Horizontal advance in pixels.
-    pub advance:   f32,
+    pub advance: f32,
     /// Left side bearing in pixels.
     pub bearing_x: f32,
     /// Distance from baseline to top of glyph bitmap, in pixels.
     pub bearing_y: f32,
     /// Glyph bitmap width in pixels.
-    pub width:     f32,
+    pub width: f32,
     /// Glyph bitmap height in pixels.
-    pub height:    f32,
+    pub height: f32,
 }
 
 /// A fully rasterized glyph (bitmap + metrics, not yet in an atlas).
 #[derive(Debug, Clone)]
 pub struct RasterizedGlyph {
     pub metrics: GlyphMetrics,
-    pub bitmap:  Bitmap,
+    pub bitmap: Bitmap,
 }
 
 // ── Font metrics (layout) ─────────────────────────────────────────────────────
@@ -37,11 +37,11 @@ pub struct RasterizedGlyph {
 #[derive(Debug, Clone, Copy)]
 pub struct LineMetrics {
     /// Distance from baseline to top of line box.
-    pub ascender:  f32,
+    pub ascender: f32,
     /// Distance from baseline to bottom of line box (negative = below).
     pub descender: f32,
     /// Recommended gap between lines.
-    pub line_gap:  f32,
+    pub line_gap: f32,
     /// Full cell height = ascender - descender + `line_gap`.
     pub cell_height: f32,
 }
@@ -55,12 +55,12 @@ struct TableSpans {
     /// `(offset, len)` of the chosen cmap format-4 subtable.
     cmap_sub: (usize, usize),
     /// `(offset, len)` of the `loca` table.
-    loca:     (usize, usize),
+    loca: (usize, usize),
     /// `(offset, len)` of the `hmtx` table.
-    hmtx:     (usize, usize),
+    hmtx: (usize, usize),
     /// `(offset, len)` of the `glyf` table.
-    glyf:     (usize, usize),
-    loca_format:        i16,
+    glyf: (usize, usize),
+    loca_format: i16,
     number_of_hmetrics: u16,
 }
 
@@ -70,14 +70,14 @@ struct TableSpans {
 /// wrap in a `Mutex` if you need to share across threads (we don't in this
 /// single-renderer-thread design).
 pub struct FontFace {
-    data:          Vec<u8>,
-    scale:         f32, // font-units → pixels
-    units_per_em:  u16,
-    spans:         TableSpans,
-    pub line:      LineMetrics,
+    data: Vec<u8>,
+    scale: f32, // font-units → pixels
+    units_per_em: u16,
+    spans: TableSpans,
+    pub line: LineMetrics,
     /// Advance width of the reference glyph ('M'), used as cell width.
     pub cell_width: f32,
-    cache:         HashMap<u32, RasterizedGlyph>,
+    cache: HashMap<u32, RasterizedGlyph>,
 }
 
 impl FontFace {
@@ -95,40 +95,44 @@ impl FontFace {
     /// # Errors
     /// Returns [`ParseError`] on malformed font data.
     pub fn from_bytes(data: Vec<u8>, px_size: f32) -> Result<Self, ParseError> {
-        let ff   = FontFile::parse(&data)?;
+        let ff = FontFile::parse(&data)?;
         let head = Head::parse(&ff)?;
         let hhea = Hhea::parse(&ff)?;
         Maxp::parse(&ff)?; // validate maxp / num_glyphs is present
 
         let scale = px_size / f32::from(head.units_per_em);
 
-        let ascender    = f32::from(hhea.ascender)  * scale;
-        let descender   = f32::from(hhea.descender) * scale;
-        let line_gap    = f32::from(hhea.line_gap)  * scale;
+        let ascender = f32::from(hhea.ascender) * scale;
+        let descender = f32::from(hhea.descender) * scale;
+        let line_gap = f32::from(hhea.line_gap) * scale;
         let cell_height = ascender - descender + line_gap;
 
         // Resolve table byte-spans once. `require` validates each table exists.
         let cmap_whole = ff.require(crate::parse::TAG_CMAP, "cmap")?;
-        let cmap_off   = Cmap::find_subtable(cmap_whole)?;
-        let cmap_rec   = ff.tables[crate::parse::TAG_CMAP].ok_or(ParseError::MissingTable("cmap"))?;
-        let loca_rec   = ff.tables[crate::parse::TAG_LOCA].ok_or(ParseError::MissingTable("loca"))?;
-        let hmtx_rec   = ff.tables[crate::parse::TAG_HMTX].ok_or(ParseError::MissingTable("hmtx"))?;
-        let glyf_rec   = ff.tables[crate::parse::TAG_GLYF].ok_or(ParseError::MissingTable("glyf"))?;
+        let cmap_off = Cmap::find_subtable(cmap_whole)?;
+        let cmap_rec = ff.tables[crate::parse::TAG_CMAP].ok_or(ParseError::MissingTable("cmap"))?;
+        let loca_rec = ff.tables[crate::parse::TAG_LOCA].ok_or(ParseError::MissingTable("loca"))?;
+        let hmtx_rec = ff.tables[crate::parse::TAG_HMTX].ok_or(ParseError::MissingTable("hmtx"))?;
+        let glyf_rec = ff.tables[crate::parse::TAG_GLYF].ok_or(ParseError::MissingTable("glyf"))?;
 
         let spans = TableSpans {
             cmap_sub: (cmap_rec.offset + cmap_off, cmap_rec.length - cmap_off),
-            loca:     (loca_rec.offset, loca_rec.length),
-            hmtx:     (hmtx_rec.offset, hmtx_rec.length),
-            glyf:     (glyf_rec.offset, glyf_rec.length),
-            loca_format:        head.index_to_loc_format,
+            loca: (loca_rec.offset, loca_rec.length),
+            hmtx: (hmtx_rec.offset, hmtx_rec.length),
+            glyf: (glyf_rec.offset, glyf_rec.length),
+            loca_format: head.index_to_loc_format,
             number_of_hmetrics: hhea.number_of_hmetrics,
         };
 
         // Cell width = advance of glyph 'M' (or fallback to glyph 0).
-        let cmap       = Cmap::from_subtable(&data[spans.cmap_sub.0..spans.cmap_sub.0 + spans.cmap_sub.1]);
-        let hmtx       = Hmtx::from_bytes(&data[spans.hmtx.0..spans.hmtx.0 + spans.hmtx.1], spans.number_of_hmetrics);
-        let m_gid      = cmap.glyph_id('M' as u32);
-        let (adv, _)   = hmtx.metrics(m_gid);
+        let cmap =
+            Cmap::from_subtable(&data[spans.cmap_sub.0..spans.cmap_sub.0 + spans.cmap_sub.1]);
+        let hmtx = Hmtx::from_bytes(
+            &data[spans.hmtx.0..spans.hmtx.0 + spans.hmtx.1],
+            spans.number_of_hmetrics,
+        );
+        let m_gid = cmap.glyph_id('M' as u32);
+        let (adv, _) = hmtx.metrics(m_gid);
         let cell_width = f32::from(adv) * scale;
 
         Ok(Self {
@@ -136,7 +140,12 @@ impl FontFace {
             scale,
             units_per_em: head.units_per_em,
             spans,
-            line: LineMetrics { ascender, descender, line_gap, cell_height },
+            line: LineMetrics {
+                ascender,
+                descender,
+                line_gap,
+                cell_height,
+            },
             cell_width,
             cache: HashMap::new(),
         })
@@ -179,20 +188,21 @@ impl FontFace {
 
         let scale = self.scale;
 
-        let advance   = f32::from(adv_raw) * scale;
+        let advance = f32::from(adv_raw) * scale;
         let bearing_x = f32::from(lsb_raw) * scale;
 
         // Get the glyph outline.
-        let outline = loca.glyph_range(gid).map_or_else(
-            crate::outline::Outline::default,
-            |(off, len)| crate::outline::Outline::decode(self.glyf(), off, len, 0).unwrap_or_default(),
-        );
+        let outline =
+            loca.glyph_range(gid)
+                .map_or_else(crate::outline::Outline::default, |(off, len)| {
+                    crate::outline::Outline::decode(self.glyf(), off, len, 0).unwrap_or_default()
+                });
 
         // Compute pixel-space bounding box from font-unit bbox.
-        let top    = f32::from(outline.y_max) * scale;
+        let top = f32::from(outline.y_max) * scale;
         let bottom = f32::from(outline.y_min) * scale;
-        let right  = f32::from(outline.x_max) * scale;
-        let left   = f32::from(outline.x_min) * scale;
+        let right = f32::from(outline.x_max) * scale;
+        let left = f32::from(outline.x_min) * scale;
 
         let bmp_w = ((right - left).ceil() as u32).max(1);
         let bmp_h = ((top - bottom).ceil() as u32).max(1);
@@ -211,7 +221,7 @@ impl FontFace {
             advance,
             bearing_x,
             bearing_y,
-            width:  bitmap.width  as f32,
+            width: bitmap.width as f32,
             height: bitmap.height as f32,
         };
 
@@ -224,7 +234,7 @@ impl FontFace {
     /// Returns `(atlas, glyph_map)` where `glyph_map` maps codepoint → [`GlyphEntry`].
     pub fn build_ascii_atlas(&mut self, atlas_size: u32) -> (Atlas, HashMap<u32, GlyphEntry>) {
         let mut atlas = Atlas::new(atlas_size, atlas_size);
-        let mut map   = HashMap::new();
+        let mut map = HashMap::new();
 
         // Printable ASCII + common box-drawing block.
         let codepoints: Vec<u32> = (0x20u32..=0x7E)
@@ -238,7 +248,7 @@ impl FontFace {
                 &g.bitmap,
                 g.metrics.bearing_x as i32,
                 g.metrics.bearing_y as i32,
-                g.metrics.advance   as i32,
+                g.metrics.advance as i32,
             );
             if let Some(e) = entry {
                 map.insert(cp, e);
@@ -250,9 +260,13 @@ impl FontFace {
 
     /// Scale factor: font units → pixels.
     #[must_use]
-    pub const fn scale(&self) -> f32 { self.scale }
+    pub const fn scale(&self) -> f32 {
+        self.scale
+    }
 
     /// Font units per em.
     #[must_use]
-    pub const fn units_per_em(&self) -> u16 { self.units_per_em }
+    pub const fn units_per_em(&self) -> u16 {
+        self.units_per_em
+    }
 }

@@ -19,12 +19,12 @@ impl MouseButton {
     #[must_use]
     pub const fn x10_code(self) -> u8 {
         match self {
-            Self::Left         => 0,
-            Self::Middle       => 1,
-            Self::Right        => 2,
-            Self::WheelUp      => 64,
-            Self::WheelDown    => 65,
-            Self::Extended(n)  => 128 + n,
+            Self::Left => 0,
+            Self::Middle => 1,
+            Self::Right => 2,
+            Self::WheelUp => 64,
+            Self::WheelDown => 65,
+            Self::Extended(n) => 128 + n,
         }
     }
 }
@@ -40,13 +40,13 @@ pub enum ButtonState {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct MouseEvent {
     pub button: MouseButton,
-    pub state:  ButtonState,
+    pub state: ButtonState,
     /// Column of the cell the pointer is over (0-based).
-    pub col:    u16,
+    pub col: u16,
     /// Row of the cell the pointer is over (0-based).
-    pub row:    u16,
+    pub row: u16,
     /// Active modifiers at the time of the event.
-    pub mods:   crate::key::Modifiers,
+    pub mods: crate::key::Modifiers,
 }
 
 /// Which mouse-reporting mode is active (negotiated by the running application).

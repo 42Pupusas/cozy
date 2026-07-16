@@ -1,6 +1,12 @@
-#![allow(clippy::missing_const_for_fn, clippy::match_same_arms, clippy::unused_self,
-         clippy::needless_pass_by_ref_mut, clippy::trivially_copy_pass_by_ref,
-         clippy::items_after_test_module, clippy::single_match)]
+#![allow(
+    clippy::missing_const_for_fn,
+    clippy::match_same_arms,
+    clippy::unused_self,
+    clippy::needless_pass_by_ref_mut,
+    clippy::trivially_copy_pass_by_ref,
+    clippy::items_after_test_module,
+    clippy::single_match
+)]
 //! Terminal screen model.
 //!
 //! Owns the 2-D cell grid, cursor state, scrollback buffer, alternate screen,
@@ -25,7 +31,7 @@ pub use cursor::{Cursor, CursorShape};
 pub use dirty::{DirtyRegion, DirtyRow, DirtySnapshot};
 pub use screen::Screen;
 
-use vt_parser::{CsiAction, Event, OscCmd, SgrAttr, C0};
+use vt_parser::{C0, CsiAction, Event, OscCmd, SgrAttr};
 
 /// Scrollback limit (lines above the visible area).
 pub const SCROLLBACK_MAX: usize = 10_000;
@@ -88,7 +94,11 @@ impl Grid {
         // column but logically wants the next cell (offset = col + 1). Pass
         // that logical position so reflow lands the cursor at the start of the
         // continuation row rather than back on the final glyph.
-        let cur_col = if self.pending_wrap { self.cursor.col + 1 } else { self.cursor.col };
+        let cur_col = if self.pending_wrap {
+            self.cursor.col + 1
+        } else {
+            self.cursor.col
+        };
         let cur = (cur_col, self.cursor.row);
         let (new_col, new_row) = self.primary.resize(cols, rows, cur);
         // The alternate screen is a fixed fullscreen canvas (no scrollback, no
@@ -114,7 +124,10 @@ impl Grid {
             Event::Control(c0) => self.control(*c0),
             Event::Csi(action) => self.csi(action),
             Event::Osc(cmd) => self.osc(cmd),
-            Event::Esc { intermediate, final_byte } => {
+            Event::Esc {
+                intermediate,
+                final_byte,
+            } => {
                 self.esc(*intermediate, *final_byte);
             }
             Event::Dcs | Event::Ignored => {}
@@ -123,7 +136,11 @@ impl Grid {
 
     /// Take the current dirty snapshot, resetting the dirty accumulator.
     pub fn take_dirty(&mut self) -> DirtySnapshot {
-        let screen = if self.alt_active { &self.alternate } else { &self.primary };
+        let screen = if self.alt_active {
+            &self.alternate
+        } else {
+            &self.primary
+        };
         self.dirty.take_snapshot(screen)
     }
 
@@ -165,7 +182,10 @@ impl Grid {
     }
 
     fn print(&mut self, ch: char) {
-        let width = { use text_layout::measurement::CellWidth as _; ch.cell_width() };
+        let width = {
+            use text_layout::measurement::CellWidth as _;
+            ch.cell_width()
+        };
         if width == 0 {
             self.combine_onto_previous();
             return;
@@ -194,12 +214,30 @@ impl Grid {
         let row = self.cursor.row;
         let attrs = self.attrs;
         let is_wide = width == 2;
-        self.active_screen_mut().set_cell(col, row, Cell { ch, attrs, wide: is_wide, spacer: false });
+        self.active_screen_mut().set_cell(
+            col,
+            row,
+            Cell {
+                ch,
+                attrs,
+                wide: is_wide,
+                spacer: false,
+            },
+        );
         self.dirty.mark(col, row);
         let cols = self.active_screen().cols();
 
         if is_wide && col + 1 < cols {
-            self.active_screen_mut().set_cell(col + 1, row, Cell { ch: ' ', attrs, wide: false, spacer: true });
+            self.active_screen_mut().set_cell(
+                col + 1,
+                row,
+                Cell {
+                    ch: ' ',
+                    attrs,
+                    wide: false,
+                    spacer: true,
+                },
+            );
             self.dirty.mark(col + 1, row);
         }
 
@@ -276,9 +314,7 @@ impl Grid {
         // a color change between the last glyph and the next still wraps.
         if !matches!(
             action,
-            CsiAction::Sgr(_)
-                | CsiAction::DeviceStatusReport(_)
-                | CsiAction::DeviceAttributes(_)
+            CsiAction::Sgr(_) | CsiAction::DeviceStatusReport(_) | CsiAction::DeviceAttributes(_)
         ) {
             self.pending_wrap = false;
         }
@@ -653,7 +689,10 @@ mod tests {
         // newline arrives before any glyph realizes the wrap.
         let mut g = Grid::new(10, 4);
         apply_str(&mut g, b"0123456789\r\nNEXT");
-        assert!(!g.screen().is_wrapped(0), "full line + newline must not wrap");
+        assert!(
+            !g.screen().is_wrapped(0),
+            "full line + newline must not wrap"
+        );
         // After resize the two lines must stay separate: NEXT begins at col 0
         // of its own row, not appended after row 0.
         g.resize(10, 4);
@@ -779,7 +818,10 @@ mod tests {
         let s = format!("a{CJK_ZHONG}b");
         apply_str(&mut g, s.as_bytes());
         assert_eq!(g.screen().get_cell(0, 0).ch, 'a');
-        assert_eq!(g.screen().get_cell(1, 0).ch, CJK_ZHONG.chars().next().unwrap());
+        assert_eq!(
+            g.screen().get_cell(1, 0).ch,
+            CJK_ZHONG.chars().next().unwrap()
+        );
         assert!(g.screen().get_cell(2, 0).spacer);
         assert_eq!(g.screen().get_cell(3, 0).ch, 'b');
         assert_eq!(g.cursor(), (4, 0));
@@ -794,7 +836,10 @@ mod tests {
         apply_str(&mut g, s.as_bytes());
         assert_eq!(g.screen().get_cell(4, 0).ch, ' ');
         assert!(g.screen().is_wrapped(0));
-        assert_eq!(g.screen().get_cell(0, 1).ch, CJK_ZHONG.chars().next().unwrap());
+        assert_eq!(
+            g.screen().get_cell(0, 1).ch,
+            CJK_ZHONG.chars().next().unwrap()
+        );
         assert!(g.screen().get_cell(1, 1).spacer);
         assert_eq!(g.cursor(), (2, 1));
     }
@@ -829,7 +874,10 @@ mod tests {
             for col in 0..g.screen().cols() {
                 let c = g.screen().get_cell(col, row);
                 if c.wide {
-                    assert!(col + 1 < g.screen().cols(), "wide cell at last column with no room for spacer");
+                    assert!(
+                        col + 1 < g.screen().cols(),
+                        "wide cell at last column with no room for spacer"
+                    );
                     assert!(g.screen().get_cell(col + 1, row).spacer);
                 }
                 if c.spacer {

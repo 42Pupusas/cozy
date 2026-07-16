@@ -67,7 +67,10 @@ fn utf8_surrogate_is_replaced() {
 #[test]
 fn csi_param_overflow_no_panic() {
     let mut p = Parser::new();
-    p.feed(b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20m", |_| {});
+    p.feed(
+        b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20m",
+        |_| {},
+    );
 }
 
 /// Param value overflow (u16 saturation) must not panic.

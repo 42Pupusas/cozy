@@ -23,7 +23,7 @@ pub const TAG_HMTX: usize = 4;
 pub const TAG_LOCA: usize = 5;
 pub const TAG_MAXP: usize = 6;
 pub const TAG_NAME: usize = 7;
-pub const TAG_OS2:  usize = 8;
+pub const TAG_OS2: usize = 8;
 pub const TAG_POST: usize = 9;
 // reserved slots for CFF/CFF2/etc
 const _TAG_COUNT: usize = 16;
@@ -55,9 +55,9 @@ pub enum ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooShort         => write!(f, "font data too short"),
-            Self::BadSfntVersion   => write!(f, "not a TTF/OTF file (bad sfnt version)"),
-            Self::MissingTable(t)  => write!(f, "required table missing: {t}"),
+            Self::TooShort => write!(f, "font data too short"),
+            Self::BadSfntVersion => write!(f, "not a TTF/OTF file (bad sfnt version)"),
+            Self::MissingTable(t) => write!(f, "required table missing: {t}"),
         }
     }
 }
@@ -138,7 +138,7 @@ impl<'a> FontFile<'a> {
         Ok(Self { data, tables })
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn table(&self, idx: usize) -> Option<&'a [u8]> {
         let r = self.tables[idx]?;
         self.data.get(r.offset..r.offset + r.length)

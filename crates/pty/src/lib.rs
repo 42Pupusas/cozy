@@ -1,5 +1,9 @@
 // Syscall FFI: `as` casts between C int widths are bounded and correct.
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 //! Pseudoterminal management.
 //!
 //! Spawns a child process under a POSIX pseudoterminal and drives all I/O
@@ -31,8 +35,8 @@ use quetzal_uring::{CqConsumer, SqProducer, UringQueue};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::spsc::RingBuffer as SpscRing;
 use ququmatz::Sqe;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Number of `io_uring` entries for the PTY queue.
 const RING_ENTRIES: u32 = 64;
@@ -120,7 +124,16 @@ impl Pty {
         shell: &str,
         args: &[&str],
         win_size: WinSize,
-    ) -> Result<(Self, ChunkConsumer, WriteProducer, Arc<AtomicBool>, WriteConsumer), PtyError> {
+    ) -> Result<
+        (
+            Self,
+            ChunkConsumer,
+            WriteProducer,
+            Arc<AtomicBool>,
+            WriteConsumer,
+        ),
+        PtyError,
+    > {
         let (master_fd, child_pid) = sys::RawPty::fork(shell, args, win_size)?;
         let signal_fd = sys::RawPty::signalfd_for_sigchld()?;
 
@@ -128,8 +141,7 @@ impl Pty {
 
         let (chunk_tx, chunk_rx) =
             SpscRing::<ByteChunk>::new(Capacity::exact(CHUNK_RING_CAP)).split();
-        let (write_tx, write_rx) =
-            SpscRing::<u8>::new(Capacity::exact(WRITE_RING_CAP)).split();
+        let (write_tx, write_rx) = SpscRing::<u8>::new(Capacity::exact(WRITE_RING_CAP)).split();
 
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -309,7 +321,12 @@ impl Pty {
         // Pty, which outlives the loop in `run`); no other read is ever
         // in-flight against it concurrently.
         let sqe = unsafe {
-            Sqe::read_ptr(self.signal_fd, self.signal_buf.as_ptr().cast_mut(), 128, u64::MAX)
+            Sqe::read_ptr(
+                self.signal_fd,
+                self.signal_buf.as_ptr().cast_mut(),
+                128,
+                u64::MAX,
+            )
         }
         .user_data(tag::SIGNAL);
         self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
@@ -340,15 +357,9 @@ impl Pty {
         //
         // Fix: we copy into a heap allocation for writes.
         let write_buf: Box<[u8]> = buf[..len].to_vec().into_boxed_slice();
-        let sqe = unsafe {
-            Sqe::write_ptr(
-                self.master_fd,
-                write_buf.as_ptr(),
-                len as u32,
-                u64::MAX,
-            )
-        }
-        .user_data(tag::WRITE);
+        let sqe =
+            unsafe { Sqe::write_ptr(self.master_fd, write_buf.as_ptr(), len as u32, u64::MAX) }
+                .user_data(tag::WRITE);
         // Keep write_buf alive until the CQE arrives. We leak it here and
         // reclaim it in the WriteOk handler via the user_data pointer.
         // For simplicity at M1 we just forget it (bounded leak: max 4 KiB

@@ -1,4 +1,8 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 //! The Wayland connection, split across two threads by direction.
 //!
 //! All I/O to the compositor goes through io_uring (via `ququmatz`), over a
@@ -104,24 +108,39 @@ mod error_tests {
             ConnError::Env("WAYLAND_DISPLAY").to_string(),
             "environment variable WAYLAND_DISPLAY is not set"
         );
-        assert_eq!(ConnError::NoCompletion.to_string(), "io_uring returned no completion after wait");
-        assert_eq!(ConnError::Closed.to_string(), "the compositor closed the connection");
+        assert_eq!(
+            ConnError::NoCompletion.to_string(),
+            "io_uring returned no completion after wait"
+        );
+        assert_eq!(
+            ConnError::Closed.to_string(),
+            "the compositor closed the connection"
+        );
         assert_eq!(
             ConnError::Connect(io_err("refused")).to_string(),
             "connect to compositor failed: refused"
         );
-        assert_eq!(ConnError::Io(io_err("broken pipe")).to_string(), "socket I/O failed: broken pipe");
+        assert_eq!(
+            ConnError::Io(io_err("broken pipe")).to_string(),
+            "socket I/O failed: broken pipe"
+        );
     }
 
     #[test]
     fn display_delegates_to_inner_ququmatz_error() {
         let inner = ququmatz::Error::Syscall(ququmatz::Errno::EAGAIN);
-        assert_eq!(ConnError::Setup(inner).to_string(), format!("io_uring setup failed: {inner}"));
+        assert_eq!(
+            ConnError::Setup(inner).to_string(),
+            format!("io_uring setup failed: {inner}")
+        );
         assert_eq!(
             ConnError::Register(inner).to_string(),
             format!("provided-buffer registration failed: {inner}")
         );
-        assert_eq!(ConnError::Submit(inner).to_string(), format!("io_uring submit/wait failed: {inner}"));
+        assert_eq!(
+            ConnError::Submit(inner).to_string(),
+            format!("io_uring submit/wait failed: {inner}")
+        );
     }
 
     #[test]
@@ -145,7 +164,11 @@ mod error_tests {
         assert!(ConnError::Register(inner).source().is_some());
         assert!(ConnError::Submit(inner).source().is_some());
 
-        assert!(ConnError::Sys(SysError::Memfd(io_err("x"))).source().is_some());
+        assert!(
+            ConnError::Sys(SysError::Memfd(io_err("x")))
+                .source()
+                .is_some()
+        );
     }
 
     #[test]
@@ -278,8 +301,6 @@ fn connect_impl() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
 
     Ok((sender, reader, timer))
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Sender — the send half, on the main thread.
@@ -484,7 +505,11 @@ impl Reader {
     /// Must run on the thread that will own the rx ring for its whole life — it
     /// arms the multishot recv here so this thread is the ring's sole issuer
     /// (required by `single_issuer`/`defer_taskrun`).
-    pub fn run(mut self, producer: Producer<Event>, waker: Option<waker::Waker>) -> Result<(), ConnError> {
+    pub fn run(
+        mut self,
+        producer: Producer<Event>,
+        waker: Option<waker::Waker>,
+    ) -> Result<(), ConnError> {
         // Arm the first multishot recv and the key-repeat timer poll, both from
         // *this* thread so it's the rx ring's sole issuer.
         self.arm_recv()?;
@@ -744,7 +769,11 @@ impl WindowSender {
     /// See [`WindowSender::send`] for why this drops (not blocks) on a full
     /// ring, and why we still report it.
     pub fn send_with_fds(&self, msg: Vec<u8>, fds: Vec<OwnedFd>) {
-        if self.tx.push(WindowRequest::SendWithFds { msg, fds }).is_err() {
+        if self
+            .tx
+            .push(WindowRequest::SendWithFds { msg, fds })
+            .is_err()
+        {
             eprintln!(
                 "platform: window request ring full or consumer gone; dropped a Wayland message with fds"
             );
@@ -765,7 +794,10 @@ impl Sender {
     /// `self`. Called by the event loop each tick, before waiting for
     /// events, so queued requests hit the wire before the compositor's next
     /// response.
-    pub fn drain_requests(&mut self, rx: &mut mpsc::Consumer<WindowRequest>) -> Result<(), ConnError> {
+    pub fn drain_requests(
+        &mut self,
+        rx: &mut mpsc::Consumer<WindowRequest>,
+    ) -> Result<(), ConnError> {
         while let Some(req) = rx.pop() {
             match req {
                 WindowRequest::Send(msg) => self.send(msg)?,

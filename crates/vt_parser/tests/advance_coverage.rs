@@ -181,7 +181,11 @@ fn escape_intermediate_accepts_multiple_intermediates_then_final() {
     let mut p = Parser::new();
     let mut got = None;
     p.feed(b"\x1b #8", |ev| {
-        if let Event::Esc { intermediate, final_byte } = ev {
+        if let Event::Esc {
+            intermediate,
+            final_byte,
+        } = ev
+        {
             got = Some((intermediate, final_byte));
         }
     });

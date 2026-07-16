@@ -93,7 +93,11 @@ impl Theme {
             ansi[i] = PALETTE[i];
             i += 1;
         }
-        Self { ansi, fg: DEFAULT_FG, bg: DEFAULT_BG }
+        Self {
+            ansi,
+            fg: DEFAULT_FG,
+            bg: DEFAULT_BG,
+        }
     }
 
     /// Build a theme from a parsed config palette.
@@ -196,7 +200,11 @@ impl Canvas<'_> {
                 // Only the first GLYPH_W columns carry the (ASCII) bitmap; a wide
                 // cell's second half is background-only until a real font with
                 // CJK/emoji glyphs replaces the embedded bitmap.
-                let bit = if col < GLYPH_W as u32 { (row_mask >> (7 - col)) & 1 } else { 0 };
+                let bit = if col < GLYPH_W as u32 {
+                    (row_mask >> (7 - col)) & 1
+                } else {
+                    0
+                };
                 let pixel = if bit != 0 { fg_px } else { bg_px };
                 let idx = (py * buf_width + px) as usize;
                 if idx < pixels.len() {
@@ -230,7 +238,12 @@ mod tests {
     use grid::{DirtyRow, DirtySnapshot};
 
     fn cell(ch: char) -> Cell {
-        Cell { ch, attrs: Attrs::default(), wide: false, spacer: false }
+        Cell {
+            ch,
+            attrs: Attrs::default(),
+            wide: false,
+            spacer: false,
+        }
     }
 
     #[test]
@@ -245,7 +258,10 @@ mod tests {
         // pixel lines / row 1. We assert row 1's cell region stays untouched.
         let snap = DirtySnapshot {
             cols: 5,
-            rows: vec![DirtyRow { row: 0, cells: (0..5).map(|_| cell('M')).collect() }],
+            rows: vec![DirtyRow {
+                row: 0,
+                cells: (0..5).map(|_| cell('M')).collect(),
+            }],
         };
         let theme = Theme::builtin();
         Canvas::new(&mut pixels, bw as i32, bh as i32).blit_snapshot(&snap, &theme);
@@ -256,7 +272,10 @@ mod tests {
         for y in CELL_H as u32..bh {
             for x in 0..bw {
                 let px = pixels[(y * bw + x) as usize];
-                assert_eq!(px, 0, "row 1 pixel ({x},{y}) was painted: {px:#x} (bg={bg:#x})");
+                assert_eq!(
+                    px, 0,
+                    "row 1 pixel ({x},{y}) was painted: {px:#x} (bg={bg:#x})"
+                );
             }
         }
     }
@@ -269,10 +288,16 @@ mod tests {
         let mut pixels = vec![0u32; (bw * bh) as usize];
         let snap = DirtySnapshot {
             cols: 2,
-            rows: vec![DirtyRow { row: 3, cells: vec![cell('M'), cell('M')] }],
+            rows: vec![DirtyRow {
+                row: 3,
+                cells: vec![cell('M'), cell('M')],
+            }],
         };
         Canvas::new(&mut pixels, bw as i32, bh as i32).blit_snapshot(&snap, &Theme::builtin());
         // Nothing should have been drawn at all.
-        assert!(pixels.iter().all(|&p| p == 0), "off-bottom row 3 leaked into buffer");
+        assert!(
+            pixels.iter().all(|&p| p == 0),
+            "off-bottom row 3 leaked into buffer"
+        );
     }
 }

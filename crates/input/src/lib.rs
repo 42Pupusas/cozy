@@ -35,10 +35,10 @@
     clippy::module_name_repetitions
 )]
 
+pub mod encode;
 pub mod key;
 pub mod mouse;
-pub mod encode;
 
+pub use encode::{Encoder, KeyboardMode};
 pub use key::{Key, KeyState, Modifiers};
 pub use mouse::{MouseButton, MouseEvent, MouseMode};
-pub use encode::{KeyboardMode, Encoder};

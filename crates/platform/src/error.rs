@@ -26,8 +26,15 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Conn(e) => write!(f, "{e}"),
-            Error::Protocol { object, code, message } => {
-                write!(f, "wayland protocol error on object {object} (code {code}): {message}")
+            Error::Protocol {
+                object,
+                code,
+                message,
+            } => {
+                write!(
+                    f,
+                    "wayland protocol error on object {object} (code {code}): {message}"
+                )
             }
             Error::ReaderStopped => write!(f, "reader thread stopped unexpectedly"),
             Error::ReaderPanicked => write!(f, "reader thread panicked"),
@@ -66,13 +73,23 @@ mod tests {
 
     #[test]
     fn display_protocol_error_includes_all_fields() {
-        let e = Error::Protocol { object: 7, code: 2, message: "oops".into() };
-        assert_eq!(e.to_string(), "wayland protocol error on object 7 (code 2): oops");
+        let e = Error::Protocol {
+            object: 7,
+            code: 2,
+            message: "oops".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "wayland protocol error on object 7 (code 2): oops"
+        );
     }
 
     #[test]
     fn display_reader_variants_have_fixed_messages() {
-        assert_eq!(Error::ReaderStopped.to_string(), "reader thread stopped unexpectedly");
+        assert_eq!(
+            Error::ReaderStopped.to_string(),
+            "reader thread stopped unexpectedly"
+        );
         assert_eq!(Error::ReaderPanicked.to_string(), "reader thread panicked");
     }
 
@@ -95,11 +112,21 @@ mod tests {
     fn source_present_only_for_conn_and_reader_spawn() {
         use std::error::Error as _;
         assert!(Error::Conn(ConnError::Closed).source().is_some());
-        assert!(Error::ReaderSpawn(io::Error::new(io::ErrorKind::Other, "x")).source().is_some());
+        assert!(
+            Error::ReaderSpawn(io::Error::new(io::ErrorKind::Other, "x"))
+                .source()
+                .is_some()
+        );
         assert!(Error::ReaderStopped.source().is_none());
         assert!(Error::ReaderPanicked.source().is_none());
         assert!(
-            Error::Protocol { object: 0, code: 0, message: String::new() }.source().is_none()
+            Error::Protocol {
+                object: 0,
+                code: 0,
+                message: String::new()
+            }
+            .source()
+            .is_none()
         );
     }
 

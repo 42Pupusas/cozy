@@ -222,7 +222,10 @@ fn insert_line_shifts_content_down_and_clears_new_row() {
     let s = g.screen();
     let row0: String = (0..4).map(|c| s.get_cell(c, 0).ch).collect();
     let row1: String = (0..4).map(|c| s.get_cell(c, 1).ch).collect();
-    assert_eq!(row0, "    ", "inserted row must be blanked (space-filled), not left with old content");
+    assert_eq!(
+        row0, "    ",
+        "inserted row must be blanked (space-filled), not left with old content"
+    );
     assert_eq!(row1, "row0");
 }
 
@@ -230,7 +233,10 @@ fn insert_line_shifts_content_down_and_clears_new_row() {
 #[test]
 fn delete_line_shifts_content_up_and_clears_bottom_row() {
     let mut g = Grid::new(10, 3);
-    feed(&mut g, b"\x1b[1;1Hrow0\x1b[2;1Hrow1\x1b[3;1Hrow2\x1b[1;1H\x1b[M");
+    feed(
+        &mut g,
+        b"\x1b[1;1Hrow0\x1b[2;1Hrow1\x1b[3;1Hrow2\x1b[1;1H\x1b[M",
+    );
     let s = g.screen();
     let row0: String = (0..4).map(|c| s.get_cell(c, 0).ch).collect();
     let row2: String = (0..4).map(|c| s.get_cell(c, 2).ch).collect();
@@ -245,7 +251,10 @@ fn delete_line_shifts_content_up_and_clears_bottom_row() {
 #[test]
 fn delete_line_at_top_does_not_pollute_scrollback() {
     let mut g = Grid::new(10, 3);
-    feed(&mut g, b"\x1b[1;1Hrow0\x1b[2;1Hrow1\x1b[3;1Hrow2\x1b[1;1H\x1b[M\x1b[M\x1b[M");
+    feed(
+        &mut g,
+        b"\x1b[1;1Hrow0\x1b[2;1Hrow1\x1b[3;1Hrow2\x1b[1;1H\x1b[M\x1b[M\x1b[M",
+    );
     // After deleting all 3 rows one at a time from the top, the screen must
     // simply be blank -- writing directly to the last row must land there
     // untouched by any scrollback-push side effect from the DLs above.
@@ -283,10 +292,16 @@ fn insert_chars_shifts_right_and_blanks_gap() {
 fn insert_line_at_region_bottom_does_not_leak_past_region() {
     let mut g = Grid::new(10, 6);
     // Region rows 1..4 restricted to just 0..3 (1-based 1;4).
-    feed(&mut g, b"\x1b[1;4r\x1b[1;1Hr0\x1b[2;1Hr1\x1b[3;1Hr2\x1b[5;1Hkeep\x1b[3;1H\x1b[L");
+    feed(
+        &mut g,
+        b"\x1b[1;4r\x1b[1;1Hr0\x1b[2;1Hr1\x1b[3;1Hr2\x1b[5;1Hkeep\x1b[3;1H\x1b[L",
+    );
     let s = g.screen();
     let row4: String = (0..4).map(|c| s.get_cell(c, 4).ch).collect();
-    assert_eq!(row4, "keep", "content below the scroll region must be untouched");
+    assert_eq!(
+        row4, "keep",
+        "content below the scroll region must be untouched"
+    );
 }
 
 /// DCH with n larger than remaining columns must clamp cleanly (no

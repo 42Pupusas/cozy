@@ -8,29 +8,29 @@ use crate::raster::Bitmap;
 /// UV region of a glyph within the atlas texture (pixel coordinates).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GlyphEntry {
-    pub x:      u32,
-    pub y:      u32,
-    pub width:  u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
     pub height: u32,
     /// Horizontal offset from pen position to the left edge of the bitmap.
     pub bearing_x: i32,
     /// Vertical offset from baseline to the top edge of the bitmap.
     pub bearing_y: i32,
     /// How far to advance the pen after this glyph.
-    pub advance:   i32,
+    pub advance: i32,
 }
 
 /// A 2-D glyph texture atlas (single 8-bit alpha channel).
 pub struct Atlas {
-    pub width:   u32,
-    pub height:  u32,
+    pub width: u32,
+    pub height: u32,
     /// Row-major, 1 byte per pixel.
-    pub data:    Vec<u8>,
+    pub data: Vec<u8>,
 
     // Shelf packing state.
-    shelf_x:     u32,
-    shelf_y:     u32,
-    shelf_h:     u32,
+    shelf_x: u32,
+    shelf_y: u32,
+    shelf_h: u32,
 }
 
 impl Atlas {
@@ -40,7 +40,7 @@ impl Atlas {
         Self {
             width,
             height,
-            data:    vec![0u8; (width * height) as usize],
+            data: vec![0u8; (width * height) as usize],
             shelf_x: 0,
             shelf_y: 0,
             shelf_h: 0,
@@ -52,10 +52,10 @@ impl Atlas {
     /// atlas is full.
     pub fn insert(
         &mut self,
-        bmp:       &Bitmap,
+        bmp: &Bitmap,
         bearing_x: i32,
         bearing_y: i32,
-        advance:   i32,
+        advance: i32,
     ) -> Option<GlyphEntry> {
         let w = bmp.width;
         let h = bmp.height;
@@ -63,8 +63,13 @@ impl Atlas {
         if w == 0 || h == 0 {
             // Blank glyph (space, NUL…) — record metrics but no pixels.
             return Some(GlyphEntry {
-                x: 0, y: 0, width: 0, height: 0,
-                bearing_x, bearing_y, advance,
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+                bearing_x,
+                bearing_y,
+                advance,
             });
         }
 
@@ -95,8 +100,16 @@ impl Atlas {
         }
 
         self.shelf_x += padded_w;
-        self.shelf_h  = self.shelf_h.max(padded_h);
+        self.shelf_h = self.shelf_h.max(padded_h);
 
-        Some(GlyphEntry { x: gx, y: gy, width: w, height: h, bearing_x, bearing_y, advance })
+        Some(GlyphEntry {
+            x: gx,
+            y: gy,
+            width: w,
+            height: h,
+            bearing_x,
+            bearing_y,
+            advance,
+        })
     }
 }

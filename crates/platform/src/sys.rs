@@ -1,4 +1,8 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 //! The thin layer of raw syscalls and libc FFI we cannot avoid.
 //!
 //! With io_uring (via `ququmatz`) carrying all socket I/O, what's left here is:
@@ -526,15 +530,27 @@ mod tests {
 
     #[test]
     fn sys_error_display_messages() {
-        assert_eq!(SysError::Socket(io_err("x")).to_string(), "socket() failed: x");
-        assert_eq!(SysError::Memfd(io_err("x")).to_string(), "memfd_create() failed: x");
-        assert_eq!(SysError::Ftruncate(io_err("x")).to_string(), "ftruncate() failed: x");
+        assert_eq!(
+            SysError::Socket(io_err("x")).to_string(),
+            "socket() failed: x"
+        );
+        assert_eq!(
+            SysError::Memfd(io_err("x")).to_string(),
+            "memfd_create() failed: x"
+        );
+        assert_eq!(
+            SysError::Ftruncate(io_err("x")).to_string(),
+            "ftruncate() failed: x"
+        );
         assert_eq!(SysError::Mmap(io_err("x")).to_string(), "mmap() failed: x");
         assert_eq!(
             SysError::TimerfdCreate(io_err("x")).to_string(),
             "timerfd_create() failed: x"
         );
-        assert_eq!(SysError::TimerfdSet(io_err("x")).to_string(), "timerfd_settime() failed: x");
+        assert_eq!(
+            SysError::TimerfdSet(io_err("x")).to_string(),
+            "timerfd_settime() failed: x"
+        );
     }
 
     #[test]

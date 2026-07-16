@@ -1,13 +1,16 @@
-#![allow(clippy::cast_possible_truncation, clippy::missing_const_for_fn,
-         clippy::manual_div_ceil)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::missing_const_for_fn,
+    clippy::manual_div_ceil
+)]
 //! Dirty-region tracker for incremental rendering.
 //!
 //! Tracks which rows have changed since the last [`DirtyRegion::take_snapshot`]
 //! call. The renderer thread receives a [`DirtySnapshot`] and only redraws
 //! the affected rows.
 
-use crate::screen::Screen;
 use crate::Cell;
+use crate::screen::Screen;
 
 /// Tracks dirty (modified) rows since the last snapshot.
 pub struct DirtyRegion {
@@ -83,7 +86,10 @@ impl DirtyRegion {
         for w in &mut self.words {
             *w = 0;
         }
-        DirtySnapshot { rows, cols: self.cols }
+        DirtySnapshot {
+            rows,
+            cols: self.cols,
+        }
     }
 }
 

@@ -403,38 +403,93 @@ impl KeyState {
 pub enum Key {
     // Row 1: number row
     Backtick = 41,
-    N1 = 2, N2 = 3, N3 = 4, N4 = 5, N5 = 6,
-    N6 = 7, N7 = 8, N8 = 9, N9 = 10, N0 = 11,
-    Minus = 12, Equal = 13, Backspace = 14,
+    N1 = 2,
+    N2 = 3,
+    N3 = 4,
+    N4 = 5,
+    N5 = 6,
+    N6 = 7,
+    N7 = 8,
+    N8 = 9,
+    N9 = 10,
+    N0 = 11,
+    Minus = 12,
+    Equal = 13,
+    Backspace = 14,
     // Row 2: QWERTY
     Tab = 15,
-    Q = 16, W = 17, E = 18, R = 19, T = 20,
-    Y = 21, U = 22, I = 23, O = 24, P = 25,
-    LBracket = 26, RBracket = 27, Backslash = 43,
+    Q = 16,
+    W = 17,
+    E = 18,
+    R = 19,
+    T = 20,
+    Y = 21,
+    U = 22,
+    I = 23,
+    O = 24,
+    P = 25,
+    LBracket = 26,
+    RBracket = 27,
+    Backslash = 43,
     // Row 3: home row
     CapsLock = 58,
-    A = 30, S = 31, D = 32, F = 33, G = 34,
-    H = 35, J = 36, K = 37, L = 38,
-    Semicolon = 39, Apostrophe = 40,
+    A = 30,
+    S = 31,
+    D = 32,
+    F = 33,
+    G = 34,
+    H = 35,
+    J = 36,
+    K = 37,
+    L = 38,
+    Semicolon = 39,
+    Apostrophe = 40,
     Enter = 28,
     // Row 4: bottom row
     LShift = 42,
-    Z = 44, X = 45, C = 46, V = 47, B = 48,
-    N = 49, M = 50,
-    Comma = 51, Dot = 52, Slash = 53,
+    Z = 44,
+    X = 45,
+    C = 46,
+    V = 47,
+    B = 48,
+    N = 49,
+    M = 50,
+    Comma = 51,
+    Dot = 52,
+    Slash = 53,
     RShift = 54,
     // Modifiers / special
-    LCtrl = 29, LMeta = 125, LAlt = 56,
+    LCtrl = 29,
+    LMeta = 125,
+    LAlt = 56,
     Space = 57,
-    RAlt = 100, RMeta = 126, RCtrl = 97,
+    RAlt = 100,
+    RMeta = 126,
+    RCtrl = 97,
     // Navigation cluster
     Esc = 1,
-    F1 = 59, F2 = 60, F3 = 61, F4 = 62,
-    F5 = 63, F6 = 64, F7 = 65, F8 = 66,
-    F9 = 67, F10 = 68, F11 = 87, F12 = 88,
-    Insert = 110, Delete = 111, Home = 102, End = 107,
-    PageUp = 104, PageDown = 109,
-    Up = 103, Down = 108, Left = 105, Right = 106,
+    F1 = 59,
+    F2 = 60,
+    F3 = 61,
+    F4 = 62,
+    F5 = 63,
+    F6 = 64,
+    F7 = 65,
+    F8 = 66,
+    F9 = 67,
+    F10 = 68,
+    F11 = 87,
+    F12 = 88,
+    Insert = 110,
+    Delete = 111,
+    Home = 102,
+    End = 107,
+    PageUp = 104,
+    PageDown = 109,
+    Up = 103,
+    Down = 108,
+    Left = 105,
+    Right = 106,
 }
 
 impl Key {
@@ -755,7 +810,10 @@ mod tests {
         for &code in VALID_KEY_CODES {
             let key = Key::from_code(code)
                 .unwrap_or_else(|| panic!("code {code} should decode to a Key"));
-            assert_eq!(key as u32, code, "Key discriminant must equal its evdev code");
+            assert_eq!(
+                key as u32, code,
+                "Key discriminant must equal its evdev code"
+            );
         }
     }
 
@@ -764,7 +822,23 @@ mod tests {
         // A sampling of codes that fall in the gaps of the evdev keyboard
         // range (KP keys, media keys, codes past the last-known F12) plus
         // the two boundary sentinels 0 and u32::MAX.
-        for code in [0, 55, 69, 86, 89, 96, 98, 99, 101, 112, 124, 127, 200, 1000, u32::MAX] {
+        for code in [
+            0,
+            55,
+            69,
+            86,
+            89,
+            96,
+            98,
+            99,
+            101,
+            112,
+            124,
+            127,
+            200,
+            1000,
+            u32::MAX,
+        ] {
             assert_eq!(Key::from_code(code), None, "code {code} should not decode");
         }
     }

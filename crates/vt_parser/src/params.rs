@@ -84,11 +84,7 @@ impl Params {
     /// Get parameter `i` raw (0 if missing — use for params where 0 is valid).
     #[must_use]
     pub fn get_raw(&self, i: usize) -> u16 {
-        if i < self.len {
-            self.buf[i]
-        } else {
-            0
-        }
+        if i < self.len { self.buf[i] } else { 0 }
     }
 
     /// Iterate over raw parameter values.

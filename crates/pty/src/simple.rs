@@ -1,4 +1,8 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
 //! A dead-simple synchronous PTY wrapper for the M4 integration prototype.
 //!
 //! Uses raw `read(2)` / `write(2)` syscalls (non-blocking) instead of
@@ -33,10 +37,18 @@ impl PtySimple {
     /// # Errors
     /// Returns [`PtyError`] if any syscall fails.
     pub fn spawn(shell: &str, args: &[&str], cols: u16, rows: u16) -> Result<Self, PtyError> {
-        let win = WinSize { rows, cols, xpixel: 0, ypixel: 0 };
+        let win = WinSize {
+            rows,
+            cols,
+            xpixel: 0,
+            ypixel: 0,
+        };
         let (master_fd, child_pid) = RawPty::fork(shell, args, win)?;
         master_fd.set_nonblock()?;
-        Ok(Self { master_fd, child_pid })
+        Ok(Self {
+            master_fd,
+            child_pid,
+        })
     }
 
     /// Non-blocking read.
@@ -71,7 +83,11 @@ impl PtySimple {
         while offset < data.len() {
             let n = self.master_fd.raw_write(&data[offset..]);
             if n <= 0 {
-                let errno = if n < 0 { -n as i32 } else { 5 /* EIO */ };
+                let errno = if n < 0 {
+                    -n as i32
+                } else {
+                    5 /* EIO */
+                };
                 return Err(PtyError::Exec(errno));
             }
             offset += n as usize;
@@ -91,7 +107,12 @@ impl PtySimple {
     /// # Errors
     /// Returns [`PtyError`] if the ioctl fails.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
-        let win = WinSize { rows, cols, xpixel: 0, ypixel: 0 };
+        let win = WinSize {
+            rows,
+            cols,
+            xpixel: 0,
+            ypixel: 0,
+        };
         self.master_fd.set_win_size(win)
     }
 }

@@ -83,7 +83,8 @@ impl Cursor {
         sender.send_with_fds(msg, &[cshm.fd()])?;
         let cursor_surface: SurfaceId = sender.alloc_id();
         sender.request(
-            MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(cursor_surface),
+            MessageBuilder::new(compositor, CompositorRequest::CreateSurface)
+                .new_id(cursor_surface),
         )?;
         let cursor_buffer: BufferId = sender.alloc_id();
         sender.request(
@@ -102,7 +103,11 @@ impl Cursor {
                 .i32(0),
         )?;
         sender.request(MessageBuilder::new(cursor_surface, SurfaceRequest::Commit))?;
-        Ok(Self { surface: cursor_surface, buffer: cursor_buffer, shm: cshm })
+        Ok(Self {
+            surface: cursor_surface,
+            buffer: cursor_buffer,
+            shm: cshm,
+        })
     }
 
     /// Write the left-arrow cursor into `pixels`, which must be at least

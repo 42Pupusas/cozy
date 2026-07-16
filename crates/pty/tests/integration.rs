@@ -31,8 +31,8 @@ fn read_until(pty: &mut PtySimple, deadline: Duration) -> Vec<u8> {
 
 #[test]
 fn spawn_echo_roundtrip() {
-    let mut pty = PtySimple::spawn("/bin/sh", &["-c", "echo hello_pty"], 80, 24)
-        .expect("spawn /bin/sh");
+    let mut pty =
+        PtySimple::spawn("/bin/sh", &["-c", "echo hello_pty"], 80, 24).expect("spawn /bin/sh");
     let out = read_until(&mut pty, Duration::from_secs(3));
     let text = String::from_utf8_lossy(&out);
     assert!(text.contains("hello_pty"), "got: {text:?}");
@@ -69,7 +69,8 @@ fn nonexistent_shell_returns_err_not_panic() {
 #[test]
 fn resize_after_spawn_does_not_panic() {
     let pty = PtySimple::spawn("/bin/sh", &["-c", "sleep 1"], 80, 24).expect("spawn");
-    pty.resize(120, 40).expect("resize should succeed while child is alive");
+    pty.resize(120, 40)
+        .expect("resize should succeed while child is alive");
 }
 
 #[test]
@@ -106,6 +107,9 @@ fn many_small_writes_are_all_delivered() {
     let out = read_until(&mut pty, Duration::from_secs(3));
     let text = String::from_utf8_lossy(&out);
     for i in 0..20 {
-        assert!(text.contains(&format!("line{i}")), "missing line{i} in {text:?}");
+        assert!(
+            text.contains(&format!("line{i}")),
+            "missing line{i} in {text:?}"
+        );
     }
 }

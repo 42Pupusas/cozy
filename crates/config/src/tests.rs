@@ -7,9 +7,7 @@ fn parse(toml: &str) -> Config {
 }
 
 fn fail(toml: &str) -> String {
-    Config::from_bytes(toml.as_bytes())
-        .unwrap_err()
-        .to_string()
+    Config::from_bytes(toml.as_bytes()).unwrap_err().to_string()
 }
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
@@ -30,11 +28,9 @@ fn empty_doc_gives_defaults() {
 
 #[test]
 fn general_shell_and_term() {
-    let cfg = parse(
-        "[general]\nshell = \"/usr/bin/zsh\"\nterm  = \"xterm-kitty\"\n",
-    );
+    let cfg = parse("[general]\nshell = \"/usr/bin/zsh\"\nterm  = \"xterm-kitty\"\n");
     assert_eq!(cfg.shell, "/usr/bin/zsh");
-    assert_eq!(cfg.term,  "xterm-kitty");
+    assert_eq!(cfg.term, "xterm-kitty");
 }
 
 #[test]
@@ -47,9 +43,7 @@ fn general_scrollback_zero() {
 
 #[test]
 fn font_path_and_size() {
-    let cfg = parse(
-        "[font]\npath = \"/usr/share/fonts/TTF/Hack-Regular.ttf\"\nsize = 18\n",
-    );
+    let cfg = parse("[font]\npath = \"/usr/share/fonts/TTF/Hack-Regular.ttf\"\nsize = 18\n");
     assert_eq!(
         cfg.font.path.as_deref(),
         Some("/usr/share/fonts/TTF/Hack-Regular.ttf")
@@ -73,9 +67,7 @@ fn font_size_upper_bound() {
 
 #[test]
 fn cursor_beam_no_blink() {
-    let cfg = parse(
-        "[cursor]\nstyle = \"beam\"\nblink = false\nblink_rate = 250\n",
-    );
+    let cfg = parse("[cursor]\nstyle = \"beam\"\nblink = false\nblink_rate = 250\n");
     assert_eq!(cfg.cursor.style, CursorStyle::Beam);
     assert!(!cfg.cursor.blink);
     assert_eq!(cfg.cursor.blink_rate, 250);
@@ -97,18 +89,14 @@ fn cursor_bad_style() {
 
 #[test]
 fn colors_foreground_background() {
-    let cfg = parse(
-        "[colors]\nforeground = \"#ffffff\"\nbackground = \"#000000\"\n",
-    );
+    let cfg = parse("[colors]\nforeground = \"#ffffff\"\nbackground = \"#000000\"\n");
     assert_eq!(cfg.palette.foreground, Color::from_rgb(0xff, 0xff, 0xff));
     assert_eq!(cfg.palette.background, Color::from_rgb(0x00, 0x00, 0x00));
 }
 
 #[test]
 fn colors_ansi_palette() {
-    let cfg = parse(
-        "[colors]\nred = \"#ff0000\"\nbright_red = \"#ff5555\"\n",
-    );
+    let cfg = parse("[colors]\nred = \"#ff0000\"\nbright_red = \"#ff5555\"\n");
     assert_eq!(cfg.palette.ansi(1), Color::from_rgb(0xff, 0x00, 0x00));
     assert_eq!(cfg.palette.ansi(9), Color::from_rgb(0xff, 0x55, 0x55));
 }
@@ -205,7 +193,8 @@ fn keybinds_send_raw() {
     assert_eq!(cfg.keybinds[0].chord, "Alt+F4");
     assert!(
         matches!(&cfg.keybinds[0].action, Action::Send(s) if s.contains('\x1b')),
-        "got: {:?}", cfg.keybinds[0].action
+        "got: {:?}",
+        cfg.keybinds[0].action
     );
 }
 
@@ -238,9 +227,9 @@ fn full_document() {
         "\"Ctrl+Shift+V\" = \"paste\"\n",
     ));
 
-    assert_eq!(cfg.shell,      "/bin/fish");
+    assert_eq!(cfg.shell, "/bin/fish");
     assert_eq!(cfg.scrollback, 50_000);
-    assert_eq!(cfg.font.size,  16);
+    assert_eq!(cfg.font.size, 16);
     assert_eq!(cfg.cursor.style, CursorStyle::Beam);
     assert_eq!(cfg.cursor.blink_rate, 400);
     assert_eq!(cfg.palette.red, Color::from_rgb(0xab, 0x46, 0x42));
@@ -258,7 +247,10 @@ fn config_error_display_io() {
 
 #[test]
 fn config_error_display_invalid_value() {
-    let e = ConfigError::InvalidValue { field: "font.size", reason: "must be > 0" };
+    let e = ConfigError::InvalidValue {
+        field: "font.size",
+        reason: "must be > 0",
+    };
     assert_eq!(e.to_string(), "invalid value for `font.size`: must be > 0");
 }
 
@@ -268,7 +260,10 @@ fn config_error_source_present_for_io_and_toml_only() {
     let io_err = ConfigError::Io(std::io::Error::new(std::io::ErrorKind::Other, "x"));
     assert!(io_err.source().is_some());
 
-    let invalid = ConfigError::InvalidValue { field: "x", reason: "y" };
+    let invalid = ConfigError::InvalidValue {
+        field: "x",
+        reason: "y",
+    };
     assert!(invalid.source().is_none());
 }
 

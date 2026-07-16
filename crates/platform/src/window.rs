@@ -1,6 +1,14 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_possible_wrap,
-         clippy::cast_lossless, clippy::option_if_let_else, clippy::too_many_lines,
-         clippy::needless_pass_by_value, clippy::collapsible_if, clippy::unnecessary_wraps)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::cast_lossless,
+    clippy::option_if_let_else,
+    clippy::too_many_lines,
+    clippy::needless_pass_by_value,
+    clippy::collapsible_if,
+    clippy::unnecessary_wraps
+)]
 //! Terminal window: open a Wayland window and render grid cells via software
 //! framebuffer.  Adapted from paint's `app.rs` — all UI / demo logic replaced
 //! with grid-cell blitting.
@@ -19,15 +27,14 @@ use crate::id::{
     RegistryId, SeatId, ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
 };
 use crate::keymap;
+use crate::protocol::Modifiers;
 use crate::protocol::{
     self as proto, BufferEvent, BufferRequest, ButtonState, CallbackEvent, CompositorRequest,
-    DisplayEvent, DisplayRequest,
-    Format, Key, KeyState, KeyboardEvent, PointerButton, PointerEvent, PointerRequest,
-    RegistryEvent, RegistryRequest, SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest,
-    ShmRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent, WmBaseRequest,
-    XdgSurfaceEvent, XdgSurfaceRequest,
+    DisplayEvent, DisplayRequest, Format, Key, KeyState, KeyboardEvent, PointerButton,
+    PointerEvent, PointerRequest, RegistryEvent, RegistryRequest, SeatCapability, SeatEvent,
+    SeatRequest, ShmPoolRequest, ShmRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest,
+    WmBaseEvent, WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
 };
-use crate::protocol::Modifiers;
 use crate::render;
 use crate::sys::{RepeatTimer, ShmBuffer};
 use crate::wire::{Event as WireEvent, MessageBuilder};
@@ -42,9 +49,16 @@ const DEFAULT_REPEAT_DELAY: u32 = 600;
 /// Produced by [`TermWindow`] for the caller to encode into PTY bytes (M5).
 #[derive(Clone, Debug)]
 pub enum InputEvent {
-    Key { key: Option<Key>, state: Option<KeyState>, modifiers: Modifiers },
+    Key {
+        key: Option<Key>,
+        state: Option<KeyState>,
+        modifiers: Modifiers,
+    },
     Close,
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -81,7 +95,10 @@ impl Frame {
             .i32(shm_mem.size_bytes() as i32)
             .finish();
         sender.send_with_fds(msg, &[shm_mem.fd()])?;
-        let mut frames = [Self { buffer: BufferId(0), free: true }; 2];
+        let mut frames = [Self {
+            buffer: BufferId(0),
+            free: true,
+        }; 2];
         for (i, slot) in frames.iter_mut().enumerate() {
             let buffer: BufferId = sender.alloc_id();
             sender.request(
@@ -181,9 +198,10 @@ impl Drop for TermWindow {
         let _ = self
             .sender
             .request(MessageBuilder::new(self.toplevel, ToplevelRequest::Destroy));
-        let _ = self
-            .sender
-            .request(MessageBuilder::new(self.xdg_surface, XdgSurfaceRequest::Destroy));
+        let _ = self.sender.request(MessageBuilder::new(
+            self.xdg_surface,
+            XdgSurfaceRequest::Destroy,
+        ));
         let _ = self
             .sender
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Destroy));
@@ -253,8 +271,12 @@ impl TermWindow {
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<crate::conn::WindowRequest>::new(Capacity::exact(64)).split();
         let (id_start, id_end) = sender.alloc_id_block(256);
-        let window_tx =
-            WindowSender { tx: req_tx, next_id: id_start, id_end, free_ids: Vec::new() };
+        let window_tx = WindowSender {
+            tx: req_tx,
+            next_id: id_start,
+            id_end,
+            free_ids: Vec::new(),
+        };
 
         let backbuffer = vec![theme.bg_xrgb(); (width * height) as usize];
 
@@ -339,7 +361,8 @@ impl TermWindow {
         if self.lifecycle == Lifecycle::Closing {
             return Ok(false);
         }
-        self.sender.drain_requests(&mut self.request_rx)
+        self.sender
+            .drain_requests(&mut self.request_rx)
             .map_err(Error::Conn)?;
 
         // Drain all queued events non-blocking.
@@ -359,7 +382,8 @@ impl TermWindow {
         if self.lifecycle == Lifecycle::Closing {
             return Ok(false);
         }
-        self.sender.drain_requests(&mut self.request_rx)
+        self.sender
+            .drain_requests(&mut self.request_rx)
             .map_err(Error::Conn)?;
 
         let Some(first) = self.events.pop_block() else {
@@ -604,7 +628,8 @@ impl TermWindow {
         self.resize(w, h)?;
         let cols = (w / self.cell_w) as u16;
         let rows = (h / self.cell_h) as u16;
-        self.input_queue.push_back(InputEvent::Resize { cols, rows });
+        self.input_queue
+            .push_back(InputEvent::Resize { cols, rows });
         self.dirty = true;
         Ok(())
     }
@@ -651,11 +676,11 @@ impl TermWindow {
                 .i32(buf_h),
         );
         let cb: CallbackId = self.window_tx.alloc_id();
-        self.window_tx.request(
-            MessageBuilder::new(self.surface, SurfaceRequest::Frame).new_id(cb),
-        );
+        self.window_tx
+            .request(MessageBuilder::new(self.surface, SurfaceRequest::Frame).new_id(cb));
         self.frame_cb = Some(cb);
-        self.window_tx.request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
+        self.window_tx
+            .request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
 
         self.frame_ready = false;
         self.dirty = false;
@@ -770,7 +795,7 @@ impl Registry {
     ) -> Result<(CompositorId, ShmId, WmBaseId, SeatId)> {
         let registry: RegistryId = sender.alloc_id();
         sender.request(
-        MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
+            MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
         )?;
 
         let mut compositor: Option<CompositorId> = None;
@@ -781,7 +806,9 @@ impl Registry {
         while compositor.is_none() || shm.is_none() || wm_base.is_none() || seat.is_none() {
             let event = events.pop_block().ok_or(Error::ReaderStopped)?;
             let Event::Bytes(bytes) = event else { continue };
-            let Some((mut ev, _)) = WireEvent::parse(&bytes) else { continue };
+            let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
+                continue;
+            };
 
             if ev.object_id == DisplayId(1).raw()
                 && DisplayEvent::from_opcode(ev.opcode) == Some(DisplayEvent::Error)
@@ -851,5 +878,3 @@ impl Registry {
         Ok(new_obj)
     }
 }
-
-

@@ -27,6 +27,6 @@ mod event;
 mod params;
 mod state;
 
-pub use event::{CsiAction, C0, Event, OscCmd, SgrAttr, SgrAttrs};
+pub use event::{C0, CsiAction, Event, OscCmd, SgrAttr, SgrAttrs};
 pub use params::Params;
 pub use state::Parser;

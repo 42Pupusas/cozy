@@ -1,10 +1,30 @@
 //! Decoded TTF table structs: head, hhea, maxp, cmap (fmt 4), loca, hmtx.
 
-use crate::parse::{
-    ByteSliceExt, ParseError,
-    TAG_CMAP, TAG_HEAD, TAG_HHEA, TAG_HMTX, TAG_LOCA, TAG_MAXP,
-};
 use crate::parse::FontFile;
+use crate::parse::{
+    ByteSliceExt, ParseError, TAG_CMAP, TAG_HEAD, TAG_HHEA, TAG_HMTX, TAG_LOCA, TAG_MAXP,
+};
+
+/// A glyph index into the font's `glyf`/`hmtx`/`loca` tables (`0` = `.notdef`).
+///
+/// Newtyped so it can't be silently confused with any other `u16` floating
+/// around this module (`number_of_hmetrics`, table lengths, Unicode BMP
+/// scalars truncated to 16 bits, …) -- [`Cmap::glyph_id`] is the only way to
+/// produce one, and [`Loca::glyph_range`] / [`Hmtx::metrics`] /
+/// [`crate::outline::Outline::decode`] are the only things that consume one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GlyphId(pub u16);
+
+impl GlyphId {
+    /// `.notdef` -- the glyph shown for codepoints missing from the font.
+    pub const NOTDEF: Self = Self(0);
+}
+
+impl std::fmt::Display for GlyphId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 // ── head ─────────────────────────────────────────────────────────────────────
 
@@ -21,12 +41,12 @@ impl Head {
     pub fn parse(ff: &FontFile<'_>) -> Result<Self, ParseError> {
         let d = ff.require(TAG_HEAD, "head")?;
         Ok(Self {
-            units_per_em:        d.u16_at(18).ok_or(ParseError::TooShort)?,
+            units_per_em: d.u16_at(18).ok_or(ParseError::TooShort)?,
             index_to_loc_format: d.i16_at(50).ok_or(ParseError::TooShort)?,
-            x_min:               d.i16_at(36).ok_or(ParseError::TooShort)?,
-            y_min:               d.i16_at(38).ok_or(ParseError::TooShort)?,
-            x_max:               d.i16_at(40).ok_or(ParseError::TooShort)?,
-            y_max:               d.i16_at(42).ok_or(ParseError::TooShort)?,
+            x_min: d.i16_at(36).ok_or(ParseError::TooShort)?,
+            y_min: d.i16_at(38).ok_or(ParseError::TooShort)?,
+            x_max: d.i16_at(40).ok_or(ParseError::TooShort)?,
+            y_max: d.i16_at(42).ok_or(ParseError::TooShort)?,
         })
     }
 }
@@ -34,9 +54,9 @@ impl Head {
 // ── hhea ─────────────────────────────────────────────────────────────────────
 
 pub struct Hhea {
-    pub ascender:          i16,
-    pub descender:         i16,
-    pub line_gap:          i16,
+    pub ascender: i16,
+    pub descender: i16,
+    pub line_gap: i16,
     pub number_of_hmetrics: u16,
 }
 
@@ -44,10 +64,10 @@ impl Hhea {
     pub fn parse(ff: &FontFile<'_>) -> Result<Self, ParseError> {
         let d = ff.require(TAG_HHEA, "hhea")?;
         Ok(Self {
-            ascender:            d.i16_at(4).ok_or(ParseError::TooShort)?,
-            descender:           d.i16_at(6).ok_or(ParseError::TooShort)?,
-            line_gap:            d.i16_at(8).ok_or(ParseError::TooShort)?,
-            number_of_hmetrics:  d.u16_at(34).ok_or(ParseError::TooShort)?,
+            ascender: d.i16_at(4).ok_or(ParseError::TooShort)?,
+            descender: d.i16_at(6).ok_or(ParseError::TooShort)?,
+            line_gap: d.i16_at(8).ok_or(ParseError::TooShort)?,
+            number_of_hmetrics: d.u16_at(34).ok_or(ParseError::TooShort)?,
         })
     }
 }
@@ -76,13 +96,15 @@ pub struct Cmap<'a> {
 
 impl<'a> Cmap<'a> {
     pub fn parse(ff: &FontFile<'a>) -> Result<Self, ParseError> {
-        let d       = ff.require(TAG_CMAP, "cmap")?;
+        let d = ff.require(TAG_CMAP, "cmap")?;
         let sub_off = Self::find_subtable(d)?;
-        Ok(Self { data: &d[sub_off..] })
+        Ok(Self {
+            data: &d[sub_off..],
+        })
     }
 
     /// Wrap an already-located format-4 subtable slice (no directory walk).
-    #[must_use] 
+    #[must_use]
     pub const fn from_subtable(data: &'a [u8]) -> Self {
         Self { data }
     }
@@ -98,36 +120,38 @@ impl<'a> Cmap<'a> {
         // Walk encoding records looking for a (3,1) or (0,*) format-4 subtable.
         let mut chosen: Option<usize> = None;
         for i in 0..num_tables {
-            let base     = 4 + i * 8;
+            let base = 4 + i * 8;
             let platform = d.u16_at(base).ok_or(ParseError::TooShort)?;
             let encoding = d.u16_at(base + 2).ok_or(ParseError::TooShort)?;
-            let offset   = d.u32_at(base + 4).ok_or(ParseError::TooShort)? as usize;
+            let offset = d.u32_at(base + 4).ok_or(ParseError::TooShort)? as usize;
             // Prefer Windows/Unicode BMP (3,1), fallback to Unicode (0,*)
             let format = d.u16_at(offset).ok_or(ParseError::TooShort)?;
             if format == 4 && ((platform == 3 && encoding == 1) || platform == 0) {
                 chosen = Some(offset);
-                if platform == 3 { break; } // best match
+                if platform == 3 {
+                    break;
+                } // best match
             }
         }
 
         chosen.ok_or(ParseError::MissingTable("cmap format 4"))
     }
 
-    /// Map a Unicode scalar to a glyph index (0 = .notdef).
-    #[must_use] 
-    pub fn glyph_id(&self, codepoint: u32) -> u16 {
+    /// Map a Unicode scalar to a glyph index (`GlyphId::NOTDEF` if unmapped).
+    #[must_use]
+    pub fn glyph_id(&self, codepoint: u32) -> GlyphId {
         let d = self.data;
         // format=4, length, language already consumed; seg_count_x2 at offset 6
         let seg_count = match d.u16_at(6) {
             Some(v) => (v / 2) as usize,
-            None    => return 0,
+            None => return GlyphId::NOTDEF,
         };
 
-        let end_codes_off   = 14;
+        let end_codes_off = 14;
         let start_codes_off = 14 + seg_count * 2 + 2; // skip reservedPad
-        let id_delta_off    = start_codes_off + seg_count * 2;
-        let id_range_off    = id_delta_off    + seg_count * 2;
-        let glyph_ids_off   = id_range_off    + seg_count * 2;
+        let id_delta_off = start_codes_off + seg_count * 2;
+        let id_range_off = id_delta_off + seg_count * 2;
+        let glyph_ids_off = id_range_off + seg_count * 2;
 
         let cp = codepoint as u16;
 
@@ -137,18 +161,26 @@ impl<'a> Cmap<'a> {
         while lo < hi {
             let mid = usize::midpoint(lo, hi);
             let end = d.u16_at(end_codes_off + mid * 2).unwrap_or(0);
-            if cp > end { lo = mid + 1; } else { hi = mid; }
+            if cp > end {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-        if lo >= seg_count { return 0; }
+        if lo >= seg_count {
+            return GlyphId::NOTDEF;
+        }
 
         let start = d.u16_at(start_codes_off + lo * 2).unwrap_or(0xFFFF);
-        if cp < start { return 0; }
+        if cp < start {
+            return GlyphId::NOTDEF;
+        }
 
         let id_range_offset = d.u16_at(id_range_off + lo * 2).unwrap_or(0) as usize;
         if id_range_offset == 0 {
             let delta = i32::from(d.i16_at(id_delta_off + lo * 2).unwrap_or(0));
             let raw = (i32::from(cp) + delta) & 0xFFFF;
-            return raw as u16;
+            return GlyphId(raw as u16);
         }
 
         // id_range_offset is relative to its own position in the table.
@@ -158,11 +190,13 @@ impl<'a> Cmap<'a> {
         if glyph_off >= glyph_ids_off {
             let idx = glyph_off - glyph_ids_off;
             let raw = d.u16_at(glyph_ids_off + idx).unwrap_or(0);
-            if raw == 0 { return 0; }
+            if raw == 0 {
+                return GlyphId::NOTDEF;
+            }
             let delta = i32::from(d.i16_at(id_delta_off + lo * 2).unwrap_or(0));
-            return ((i32::from(raw) + delta) & 0xFFFF) as u16;
+            return GlyphId(((i32::from(raw) + delta) & 0xFFFF) as u16);
         }
-        0
+        GlyphId::NOTDEF
     }
 }
 
@@ -170,26 +204,29 @@ impl<'a> Cmap<'a> {
 
 /// Glyph offset table — short (format 0) or long (format 1).
 pub struct Loca<'a> {
-    data:   &'a [u8],
+    data: &'a [u8],
     format: i16,
 }
 
 impl<'a> Loca<'a> {
     pub fn parse(ff: &FontFile<'a>, format: i16) -> Result<Self, ParseError> {
-        Ok(Self { data: ff.require(TAG_LOCA, "loca")?, format })
+        Ok(Self {
+            data: ff.require(TAG_LOCA, "loca")?,
+            format,
+        })
     }
 
     /// Wrap an already-located `loca` table slice.
-    #[must_use] 
+    #[must_use]
     pub const fn from_bytes(data: &'a [u8], format: i16) -> Self {
         Self { data, format }
     }
 
     /// Byte offset + length of glyph `gid` within the `glyf` table.
     /// Returns `None` if the glyph has no outline (empty contour).
-    #[must_use] 
-    pub fn glyph_range(&self, gid: u16) -> Option<(usize, usize)> {
-        let gid = gid as usize;
+    #[must_use]
+    pub fn glyph_range(&self, gid: GlyphId) -> Option<(usize, usize)> {
+        let gid = gid.0 as usize;
         let (start, end) = if self.format == 0 {
             // Short format: 16-bit values, multiply by 2.
             let s = self.data.u16_at(gid * 2)? as usize * 2;
@@ -201,7 +238,11 @@ impl<'a> Loca<'a> {
             let e = self.data.u32_at((gid + 1) * 4)? as usize;
             (s, e)
         };
-        if start == end { None } else { Some((start, end - start)) }
+        if start == end {
+            None
+        } else {
+            Some((start, end - start))
+        }
     }
 }
 
@@ -209,36 +250,42 @@ impl<'a> Loca<'a> {
 
 /// Horizontal metrics table.
 pub struct Hmtx<'a> {
-    data:               &'a [u8],
+    data: &'a [u8],
     number_of_hmetrics: u16,
 }
 
 impl<'a> Hmtx<'a> {
     pub fn parse(ff: &FontFile<'a>, number_of_hmetrics: u16) -> Result<Self, ParseError> {
-        Ok(Self { data: ff.require(TAG_HMTX, "hmtx")?, number_of_hmetrics })
+        Ok(Self {
+            data: ff.require(TAG_HMTX, "hmtx")?,
+            number_of_hmetrics,
+        })
     }
 
     /// Wrap an already-located `hmtx` table slice.
-    #[must_use] 
+    #[must_use]
     pub const fn from_bytes(data: &'a [u8], number_of_hmetrics: u16) -> Self {
-        Self { data, number_of_hmetrics }
+        Self {
+            data,
+            number_of_hmetrics,
+        }
     }
 
     /// Advance width and left side bearing for glyph `gid`.
-    #[must_use] 
-    pub fn metrics(&self, gid: u16) -> (u16, i16) {
-        let gid = gid as usize;
-        let n   = self.number_of_hmetrics as usize;
+    #[must_use]
+    pub fn metrics(&self, gid: GlyphId) -> (u16, i16) {
+        let gid = gid.0 as usize;
+        let n = self.number_of_hmetrics as usize;
         if gid < n {
-            let base    = gid * 4;
+            let base = gid * 4;
             let advance = self.data.u16_at(base).unwrap_or(0);
-            let lsb     = self.data.i16_at(base + 2).unwrap_or(0);
+            let lsb = self.data.i16_at(base + 2).unwrap_or(0);
             (advance, lsb)
         } else {
             // Monospaced tail: advance repeats, only lsb changes.
             let advance = self.data.u16_at((n - 1) * 4).unwrap_or(0);
             let lsb_off = n * 4 + (gid - n) * 2;
-            let lsb     = self.data.i16_at(lsb_off).unwrap_or(0);
+            let lsb = self.data.i16_at(lsb_off).unwrap_or(0);
             (advance, lsb)
         }
     }

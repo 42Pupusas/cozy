@@ -8,7 +8,7 @@ use crate::{
 };
 
 const JBM: &str = "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf";
-const PX:  f32  = 16.0;
+const PX: f32 = 16.0;
 
 fn load_bytes() -> Vec<u8> {
     std::fs::read(JBM).expect("JetBrains Mono not found — install fonts-jetbrains-mono")
@@ -19,7 +19,7 @@ fn load_bytes() -> Vec<u8> {
 #[test]
 fn parse_offset_table() {
     let data = load_bytes();
-    let ff   = FontFile::parse(&data).unwrap();
+    let ff = FontFile::parse(&data).unwrap();
     // Required tables must be present.
     assert!(ff.table(crate::parse::TAG_HEAD).is_some(), "head missing");
     assert!(ff.table(crate::parse::TAG_HHEA).is_some(), "hhea missing");
@@ -59,26 +59,29 @@ fn parse_error_display_messages() {
 #[test]
 fn head_units_per_em_sane() {
     let data = load_bytes();
-    let ff   = FontFile::parse(&data).unwrap();
+    let ff = FontFile::parse(&data).unwrap();
     let head = Head::parse(&ff).unwrap();
     // Common values: 1000 (PostScript) or 2048 (TrueType)
-    assert!(head.units_per_em >= 512 && head.units_per_em <= 4096,
-        "units_per_em = {}", head.units_per_em);
+    assert!(
+        head.units_per_em >= 512 && head.units_per_em <= 4096,
+        "units_per_em = {}",
+        head.units_per_em
+    );
 }
 
 #[test]
 fn hhea_ascender_positive_descender_negative() {
     let data = load_bytes();
-    let ff   = FontFile::parse(&data).unwrap();
+    let ff = FontFile::parse(&data).unwrap();
     let hhea = Hhea::parse(&ff).unwrap();
-    assert!(hhea.ascender  > 0, "ascender = {}", hhea.ascender);
+    assert!(hhea.ascender > 0, "ascender = {}", hhea.ascender);
     assert!(hhea.descender < 0, "descender = {}", hhea.descender);
 }
 
 #[test]
 fn maxp_num_glyphs_nonzero() {
     let data = load_bytes();
-    let ff   = FontFile::parse(&data).unwrap();
+    let ff = FontFile::parse(&data).unwrap();
     let maxp = Maxp::parse(&ff).unwrap();
     assert!(maxp.num_glyphs > 100, "num_glyphs = {}", maxp.num_glyphs);
 }
@@ -86,20 +89,23 @@ fn maxp_num_glyphs_nonzero() {
 #[test]
 fn cmap_ascii_maps_correctly() {
     let data = load_bytes();
-    let ff   = FontFile::parse(&data).unwrap();
+    let ff = FontFile::parse(&data).unwrap();
     let cmap = Cmap::parse(&ff).unwrap();
 
     // Glyph 0 is .notdef — codepoints in [0x21, 0x7E] must map to non-zero.
     for cp in 0x21u32..=0x7E {
         let gid = cmap.glyph_id(cp);
-        assert!(gid != 0, "codepoint U+{cp:04X} maps to .notdef");
+        assert!(
+            gid != crate::tables::GlyphId::NOTDEF,
+            "codepoint U+{cp:04X} maps to .notdef"
+        );
     }
 }
 
 #[test]
 fn cmap_notdef_for_unmapped() {
     let data = load_bytes();
-    let ff   = FontFile::parse(&data).unwrap();
+    let ff = FontFile::parse(&data).unwrap();
     let cmap = Cmap::parse(&ff).unwrap();
     // U+E000 private use — almost certainly unmapped in JBM.
     // We just check this doesn't panic.
@@ -109,11 +115,11 @@ fn cmap_notdef_for_unmapped() {
 #[test]
 fn hmtx_advance_nonzero_for_m() {
     let data = load_bytes();
-    let ff   = FontFile::parse(&data).unwrap();
+    let ff = FontFile::parse(&data).unwrap();
     let hhea = Hhea::parse(&ff).unwrap();
     let hmtx = Hmtx::parse(&ff, hhea.number_of_hmetrics).unwrap();
     let cmap = Cmap::parse(&ff).unwrap();
-    let gid  = cmap.glyph_id('M' as u32);
+    let gid = cmap.glyph_id('M' as u32);
     let (adv, _) = hmtx.metrics(gid);
     assert!(adv > 0, "advance of 'M' = {adv}");
 }
@@ -121,11 +127,11 @@ fn hmtx_advance_nonzero_for_m() {
 #[test]
 fn loca_gives_range_for_m() {
     let data = load_bytes();
-    let ff   = FontFile::parse(&data).unwrap();
+    let ff = FontFile::parse(&data).unwrap();
     let head = Head::parse(&ff).unwrap();
     let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
     let cmap = Cmap::parse(&ff).unwrap();
-    let gid  = cmap.glyph_id('M' as u32);
+    let gid = cmap.glyph_id('M' as u32);
     let range = loca.glyph_range(gid);
     assert!(range.is_some(), "loca range for 'M' (gid {gid}) is None");
     let (off, len) = range.unwrap();
@@ -137,13 +143,13 @@ fn loca_gives_range_for_m() {
 
 #[test]
 fn outline_m_has_verbs() {
-    let data  = load_bytes();
-    let ff    = FontFile::parse(&data).unwrap();
-    let head  = Head::parse(&ff).unwrap();
-    let loca  = Loca::parse(&ff, head.index_to_loc_format).unwrap();
-    let cmap  = Cmap::parse(&ff).unwrap();
-    let glyf  = ff.table(crate::parse::TAG_GLYF).unwrap();
-    let gid   = cmap.glyph_id('M' as u32);
+    let data = load_bytes();
+    let ff = FontFile::parse(&data).unwrap();
+    let head = Head::parse(&ff).unwrap();
+    let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
+    let cmap = Cmap::parse(&ff).unwrap();
+    let glyf = ff.table(crate::parse::TAG_GLYF).unwrap();
+    let gid = cmap.glyph_id('M' as u32);
     let (off, len) = loca.glyph_range(gid).unwrap();
     let outline = crate::outline::Outline::decode(glyf, off, len, 0).unwrap();
     assert!(!outline.verbs.is_empty(), "outline for 'M' has no verbs");
@@ -151,32 +157,35 @@ fn outline_m_has_verbs() {
 
 #[test]
 fn outline_space_is_empty() {
-    let data  = load_bytes();
-    let ff    = FontFile::parse(&data).unwrap();
-    let head  = Head::parse(&ff).unwrap();
-    let loca  = Loca::parse(&ff, head.index_to_loc_format).unwrap();
-    let cmap  = Cmap::parse(&ff).unwrap();
-    let gid   = cmap.glyph_id(' ' as u32);
+    let data = load_bytes();
+    let ff = FontFile::parse(&data).unwrap();
+    let head = Head::parse(&ff).unwrap();
+    let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
+    let cmap = Cmap::parse(&ff).unwrap();
+    let gid = cmap.glyph_id(' ' as u32);
     // Space has no outline — loca range is None.
-    assert!(loca.glyph_range(gid).is_none(), "space should have no outline");
+    assert!(
+        loca.glyph_range(gid).is_none(),
+        "space should have no outline"
+    );
 }
 
 // ── raster ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn raster_m_produces_nonzero_pixels() {
-    let data  = load_bytes();
-    let ff    = FontFile::parse(&data).unwrap();
-    let head  = Head::parse(&ff).unwrap();
-    let hhea  = Hhea::parse(&ff).unwrap();
-    let loca  = Loca::parse(&ff, head.index_to_loc_format).unwrap();
-    let cmap  = Cmap::parse(&ff).unwrap();
-    let glyf  = ff.table(crate::parse::TAG_GLYF).unwrap();
+    let data = load_bytes();
+    let ff = FontFile::parse(&data).unwrap();
+    let head = Head::parse(&ff).unwrap();
+    let hhea = Hhea::parse(&ff).unwrap();
+    let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
+    let cmap = Cmap::parse(&ff).unwrap();
+    let glyf = ff.table(crate::parse::TAG_GLYF).unwrap();
 
-    let scale    = PX / head.units_per_em as f32;
-    let gid      = cmap.glyph_id('M' as u32);
+    let scale = PX / head.units_per_em as f32;
+    let gid = cmap.glyph_id('M' as u32);
     let (off, len) = loca.glyph_range(gid).unwrap();
-    let outline  = crate::outline::Outline::decode(glyf, off, len, 0).unwrap();
+    let outline = crate::outline::Outline::decode(glyf, off, len, 0).unwrap();
 
     let ascender = hhea.ascender as f32 * scale;
     let w = 16u32;
@@ -189,14 +198,14 @@ fn raster_m_produces_nonzero_pixels() {
 
 #[test]
 fn raster_bitmap_correct_size() {
-    let data  = load_bytes();
-    let ff    = FontFile::parse(&data).unwrap();
-    let head  = Head::parse(&ff).unwrap();
-    let loca  = Loca::parse(&ff, head.index_to_loc_format).unwrap();
-    let cmap  = Cmap::parse(&ff).unwrap();
-    let glyf  = ff.table(crate::parse::TAG_GLYF).unwrap();
+    let data = load_bytes();
+    let ff = FontFile::parse(&data).unwrap();
+    let head = Head::parse(&ff).unwrap();
+    let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
+    let cmap = Cmap::parse(&ff).unwrap();
+    let glyf = ff.table(crate::parse::TAG_GLYF).unwrap();
     let scale = PX / head.units_per_em as f32;
-    let gid   = cmap.glyph_id('M' as u32);
+    let gid = cmap.glyph_id('M' as u32);
     let (off, len) = loca.glyph_range(gid).unwrap();
     let outline = crate::outline::Outline::decode(glyf, off, len, 0).unwrap();
     let bmp = outline.rasterize(16, 20, scale, 16.0, 0.0);
@@ -210,21 +219,21 @@ fn atlas_inserts_blank_glyph_as_zero_size() {
     let mut atlas = Atlas::new(256, 256);
     let blank = crate::raster::Bitmap::blank(0, 0);
     let entry = atlas.insert(&blank, 0, 0, 500).unwrap();
-    assert_eq!(entry.width,  0);
+    assert_eq!(entry.width, 0);
     assert_eq!(entry.height, 0);
     assert_eq!(entry.advance, 500);
 }
 
 #[test]
 fn atlas_packs_without_overflow() {
-    let data  = load_bytes();
-    let ff    = FontFile::parse(&data).unwrap();
-    let head  = Head::parse(&ff).unwrap();
-    let loca  = Loca::parse(&ff, head.index_to_loc_format).unwrap();
-    let cmap  = Cmap::parse(&ff).unwrap();
-    let glyf  = ff.table(crate::parse::TAG_GLYF).unwrap();
-    let hhea  = Hhea::parse(&ff).unwrap();
-    let hmtx  = Hmtx::parse(&ff, hhea.number_of_hmetrics).unwrap();
+    let data = load_bytes();
+    let ff = FontFile::parse(&data).unwrap();
+    let head = Head::parse(&ff).unwrap();
+    let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
+    let cmap = Cmap::parse(&ff).unwrap();
+    let glyf = ff.table(crate::parse::TAG_GLYF).unwrap();
+    let hhea = Hhea::parse(&ff).unwrap();
+    let hmtx = Hmtx::parse(&ff, hhea.number_of_hmetrics).unwrap();
     let scale = PX / head.units_per_em as f32;
     let ascender = hhea.ascender as f32 * scale;
 
@@ -236,7 +245,7 @@ fn atlas_packs_without_overflow() {
         let (adv_raw, lsb_raw) = hmtx.metrics(gid);
         let (off, len) = match loca.glyph_range(gid) {
             Some(r) => r,
-            None    => {
+            None => {
                 // blank glyph (space)
                 let bmp = crate::raster::Bitmap::blank(0, 0);
                 atlas.insert(&bmp, 0, 0, (adv_raw as f32 * scale) as i32);
@@ -252,7 +261,12 @@ fn atlas_packs_without_overflow() {
         let w = ((px_x_max - px_x_min).ceil() as u32).max(1);
         let h = ((px_y_max - px_y_min).ceil() as u32).max(1);
         let bmp = outline.rasterize(w, h, scale, ascender, -px_x_min);
-        atlas.insert(&bmp, lsb_raw as i32, (px_y_max) as i32, (adv_raw as f32 * scale) as i32);
+        atlas.insert(
+            &bmp,
+            lsb_raw as i32,
+            (px_y_max) as i32,
+            (adv_raw as f32 * scale) as i32,
+        );
         packed += 1;
     }
 
@@ -265,9 +279,21 @@ fn atlas_packs_without_overflow() {
 #[test]
 fn fontface_loads_and_has_sane_metrics() {
     let face = FontFace::load(JBM, PX).unwrap();
-    assert!(face.line.ascender  > 0.0,  "ascender = {}",  face.line.ascender);
-    assert!(face.line.descender < 0.0,  "descender = {}", face.line.descender);
-    assert!(face.line.cell_height > PX * 0.8, "cell_height = {}", face.line.cell_height);
+    assert!(
+        face.line.ascender > 0.0,
+        "ascender = {}",
+        face.line.ascender
+    );
+    assert!(
+        face.line.descender < 0.0,
+        "descender = {}",
+        face.line.descender
+    );
+    assert!(
+        face.line.cell_height > PX * 0.8,
+        "cell_height = {}",
+        face.line.cell_height
+    );
     assert!(face.cell_width > 0.0, "cell_width = {}", face.cell_width);
 }
 
@@ -298,5 +324,8 @@ fn fontface_build_ascii_atlas() {
     }
     // Atlas data should be non-trivially populated.
     let nonzero = atlas.data.iter().filter(|&&v| v > 0).count();
-    assert!(nonzero > 100, "atlas appears empty: only {nonzero} non-zero pixels");
+    assert!(
+        nonzero > 100,
+        "atlas appears empty: only {nonzero} non-zero pixels"
+    );
 }

@@ -56,10 +56,22 @@ mod tests {
         assert_eq!(PtyError::OpenPt(2).to_string(), "openpt failed: errno 2");
         assert_eq!(PtyError::Fork(12).to_string(), "fork failed: errno 12");
         assert_eq!(PtyError::Exec(2).to_string(), "exec failed: errno 2");
-        assert_eq!(PtyError::WinSize(25).to_string(), "winsize ioctl failed: errno 25");
-        assert_eq!(PtyError::SignalFd(9).to_string(), "signalfd failed: errno 9");
-        assert_eq!(PtyError::SigMask(22).to_string(), "sigprocmask failed: errno 22");
-        assert_eq!(PtyError::WaitPid(10).to_string(), "waitpid failed: errno 10");
+        assert_eq!(
+            PtyError::WinSize(25).to_string(),
+            "winsize ioctl failed: errno 25"
+        );
+        assert_eq!(
+            PtyError::SignalFd(9).to_string(),
+            "signalfd failed: errno 9"
+        );
+        assert_eq!(
+            PtyError::SigMask(22).to_string(),
+            "sigprocmask failed: errno 22"
+        );
+        assert_eq!(
+            PtyError::WaitPid(10).to_string(),
+            "waitpid failed: errno 10"
+        );
     }
 
     #[test]

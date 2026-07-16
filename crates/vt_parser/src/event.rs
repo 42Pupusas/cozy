@@ -220,7 +220,10 @@ pub enum Event<'a> {
     /// C0 control character.
     Control(C0),
     /// ESC followed by a single character (ESC `c` etc.).
-    Esc { intermediate: Option<u8>, final_byte: u8 },
+    Esc {
+        intermediate: Option<u8>,
+        final_byte: u8,
+    },
     /// A fully parsed CSI sequence.
     Csi(CsiAction),
     /// A fully parsed OSC sequence.

@@ -10,6 +10,7 @@ workspace = true
 grid         = { path = "../grid" }
 vt_parser    = { path = "../vt_parser" }
 config       = { path = "../config" }
+font         = { path = "../font" }
 waker        = { path = "../waker" }
 quetzalcoatl = { workspace = true }
 ququmatz     = { workspace = true }

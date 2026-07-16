@@ -113,3 +113,54 @@ fn many_small_writes_are_all_delivered() {
         );
     }
 }
+
+#[test]
+fn args_are_passed_through_to_the_child() {
+    let mut pty =
+        PtySimple::spawn("/bin/echo", &["arg-one", "arg-two"], 80, 24).expect("spawn /bin/echo");
+    let out = read_until(&mut pty, Duration::from_secs(3));
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("arg-one") && text.contains("arg-two"),
+        "got: {text:?}"
+    );
+}
+
+#[test]
+fn term_env_var_is_always_set_in_child() {
+    // The child must always end up with a non-empty TERM (falling back to
+    // xterm-256color when the parent env lacks one) -- shells that see no
+    // TERM at all often misbehave (no colour, wrong termcap).
+    let cmd = "if [ -z \"$TERM\" ]; then echo TERM_EMPTY; else echo TERM_OK; fi";
+    let mut pty = PtySimple::spawn("/bin/sh", &["-c", cmd], 80, 24).expect("spawn");
+    let out = read_until(&mut pty, Duration::from_secs(3));
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("TERM_OK"),
+        "TERM was unset in child: {text:?}"
+    );
+}
+
+#[test]
+fn colorterm_env_var_is_always_set_in_child() {
+    let cmd = "if [ -z \"$COLORTERM\" ]; then echo CT_EMPTY; else echo CT_OK; fi";
+    let mut pty = PtySimple::spawn("/bin/sh", &["-c", cmd], 80, 24).expect("spawn");
+    let out = read_until(&mut pty, Duration::from_secs(3));
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("CT_OK"),
+        "COLORTERM was unset in child: {text:?}"
+    );
+}
+
+#[test]
+fn embedded_nul_in_shell_path_is_rejected_not_panicking() {
+    let result = PtySimple::spawn("/bin/sh\0evil", &[], 80, 24);
+    assert!(result.is_err(), "a NUL byte in the path must be rejected");
+}
+
+#[test]
+fn embedded_nul_in_arg_is_rejected_not_panicking() {
+    let result = PtySimple::spawn("/bin/sh", &["-c", "echo\0hi"], 80, 24);
+    assert!(result.is_err(), "a NUL byte in an arg must be rejected");
+}

@@ -163,8 +163,8 @@ pub struct TermWindow {
     /// free on present. Without this, incremental dirty-row blits would only
     /// ever touch one of the two shm frames, leaving the rest black.
     backbuffer: Vec<u32>,
-    /// Resolved color theme (palette + default fg/bg), built from config.
-    theme: render::Theme,
+    /// Glyph source (bitmap or loaded TTF/OTF face) + resolved color theme.
+    renderer: render::Renderer,
     width: i32,
     height: i32,
     #[allow(dead_code)]
@@ -219,10 +219,10 @@ impl TermWindow {
         cols: u16,
         rows: u16,
         wake: waker::Waker,
-        theme: render::Theme,
+        renderer: render::Renderer,
     ) -> Result<Self> {
-        let cell_w = render::CELL_W;
-        let cell_h = render::CELL_H;
+        let cell_w = renderer.cell_w();
+        let cell_h = renderer.cell_h();
         let width = cols as i32 * cell_w;
         let height = rows as i32 * cell_h;
 
@@ -278,7 +278,7 @@ impl TermWindow {
             free_ids: Vec::new(),
         };
 
-        let backbuffer = vec![theme.bg_xrgb(); (width * height) as usize];
+        let backbuffer = vec![renderer.bg_xrgb(); (width * height) as usize];
 
         Ok(Self {
             sender,
@@ -306,7 +306,7 @@ impl TermWindow {
             shm_mem,
             pool,
             backbuffer,
-            theme,
+            renderer,
             width,
             height,
             scale: 1,
@@ -653,7 +653,7 @@ impl TermWindow {
         let pending = std::mem::take(&mut self.pending_dirty);
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
         for snap in &pending {
-            canvas.blit_snapshot(snap, &self.theme);
+            self.renderer.blit_snapshot(&mut canvas, snap);
         }
         self.shm_mem.pixels(slot).copy_from_slice(&self.backbuffer);
 
@@ -739,7 +739,7 @@ impl TermWindow {
         // previous content so the window doesn't flash blank mid-drag.
         let new_w = w as usize;
         let new_h = h as usize;
-        let mut new_back = vec![self.theme.bg_xrgb(); new_w * new_h];
+        let mut new_back = vec![self.renderer.bg_xrgb(); new_w * new_h];
         let old_w = self.width as usize;
         let old_h = self.height as usize;
         let copy_w = old_w.min(new_w);

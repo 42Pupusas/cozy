@@ -1,19 +1,26 @@
 #![allow(clippy::cast_possible_truncation)]
 //! Software terminal renderer: blit grid cells into a `u32` pixel buffer.
 //!
-//! Uses the embedded 8×16 bitmap font from [`crate::font`]. Each terminal cell
-//! occupies `GLYPH_W × GLYPH_H` pixels. For now only the 95 printable-ASCII
-//! glyphs are rendered; non-ASCII falls back to a solid block.
+//! Two glyph sources are supported, chosen at startup by [`Renderer::new`]:
+//!
+//! * **Bitmap fallback** — the embedded 8×16 [`crate::font`] PSF bitmap,
+//!   ASCII-only. Used when no `[font] path` is configured, or the configured
+//!   file fails to load/parse.
+//! * **TTF/OTF face** — a real font loaded via the `font` crate, rasterized
+//!   on demand into a growing glyph atlas (anti-aliased 8-bit alpha,
+//!   any Unicode codepoint the font covers — CJK, box-drawing, emoji, …).
 //!
 //! Color mapping: converts 256-palette indices to 24-bit RGB using the standard
 //! xterm color table; true-color cells pass through directly.
+
+use std::collections::HashMap;
 
 use grid::{Attrs, Cell, Color, DirtySnapshot};
 
 use crate::draw::{Canvas, Color as DrawColor};
 use crate::font::{FIRST, GLYPH_H, GLYPH_W, LAST};
 
-pub use crate::font::{FONT, GLYPH_H as CELL_H, GLYPH_W as CELL_W};
+pub use crate::font::FONT;
 
 // ── xterm 256-color palette ──────────────────────────────────────────────────
 
@@ -143,13 +150,139 @@ impl Theme {
     }
 }
 
-/// Grid-cell blitting, as methods on [`Canvas`] instead of free functions
-/// that took `pixels: &mut [u32]` + `buf_width` as their first two
-/// arguments -- `Canvas` already owns exactly that pair, so `canvas.blit_cell(..)`
-/// belongs on it rather than beside it.
-impl Canvas<'_> {
+// ── Glyph sources ─────────────────────────────────────────────────────────────
+
+/// A real TTF/OTF face plus its glyph atlas, growing on demand as new
+/// codepoints are drawn. Pre-seeded with printable ASCII + box-drawing so the
+/// common case never rasterizes at paint time.
+struct GlyphCache {
+    face: font::FontFace,
+    atlas: font::Atlas,
+    map: HashMap<u32, font::GlyphEntry>,
+    /// Distance from the top of the cell to the baseline, in pixels.
+    ascender: f32,
+}
+
+impl GlyphCache {
+    fn new(mut face: font::FontFace) -> Self {
+        let ascender = face.line.ascender;
+        let (atlas, map) = face.build_ascii_atlas(2048);
+        Self {
+            face,
+            atlas,
+            map,
+            ascender,
+        }
+    }
+
+    /// Look up (rasterizing + atlas-inserting on first use) the glyph entry
+    /// for `codepoint`. `None` if the atlas is full (extremely large glyph
+    /// sets) — the caller then just paints background for that cell.
+    fn entry(&mut self, codepoint: u32) -> Option<font::GlyphEntry> {
+        if let Some(e) = self.map.get(&codepoint) {
+            return Some(*e);
+        }
+        // `self.face` and `self.atlas` are disjoint fields, so this doesn't
+        // fight the borrow checker despite the mutable + immutable overlap.
+        let g = self.face.rasterize(codepoint);
+        let entry = self.atlas.insert(
+            &g.bitmap,
+            g.metrics.bearing_x as i32,
+            g.metrics.bearing_y as i32,
+            g.metrics.advance as i32,
+        );
+        if let Some(e) = entry {
+            self.map.insert(codepoint, e);
+        }
+        entry
+    }
+}
+
+enum GlyphSource {
+    /// The embedded 8×16 ASCII-only bitmap font (see [`crate::font`]).
+    Bitmap,
+    /// A loaded TTF/OTF face rasterized into a growing atlas. Boxed to keep
+    /// the `Bitmap` variant (the common case) from paying for the atlas's size.
+    Face(Box<GlyphCache>),
+}
+
+/// Owns the color theme and glyph source, and knows how to blit grid cells
+/// into a [`Canvas`]. Replaces the old free-standing `Canvas::blit_cell` /
+/// `blit_snapshot` methods so the (now dynamic, font-dependent) cell size and
+/// the glyph cache have somewhere to live between frames.
+pub struct Renderer {
+    theme: Theme,
+    glyphs: GlyphSource,
+    /// Resolved terminal cell size in pixels — `8×16` for the bitmap
+    /// fallback, or derived from the loaded face's metrics.
+    cell_w: i32,
+    cell_h: i32,
+}
+
+impl Renderer {
+    /// Build a renderer using only the embedded bitmap font (no TTF/OTF
+    /// loading). Used by tests and as the fallback path of [`Self::new`].
+    #[must_use]
+    pub fn builtin(theme: Theme) -> Self {
+        Self {
+            theme,
+            glyphs: GlyphSource::Bitmap,
+            cell_w: GLYPH_W,
+            cell_h: GLYPH_H,
+        }
+    }
+
+    /// Build a renderer from config: tries to load `font_cfg.path` at
+    /// `font_cfg.size` pixels; falls back to the embedded bitmap font (with a
+    /// diagnostic on stderr) if no path is configured or loading fails.
+    #[must_use]
+    pub fn new(theme: Theme, font_cfg: &config::FontConfig) -> Self {
+        let Some(path) = &font_cfg.path else {
+            return Self::builtin(theme);
+        };
+        // font.size is validated to 1..=256 in config; well within f32's exact range.
+        #[allow(clippy::cast_precision_loss)]
+        let px_size = font_cfg.size as f32;
+        match font::FontFace::load(path, px_size) {
+            Ok(face) => {
+                let cell_w = face.cell_width.round().max(1.0) as i32;
+                let cell_h = face.line.cell_height.round().max(1.0) as i32;
+                Self {
+                    theme,
+                    glyphs: GlyphSource::Face(Box::new(GlyphCache::new(face))),
+                    cell_w,
+                    cell_h,
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "platform: failed to load font {path:?}: {e} — falling back to embedded bitmap font"
+                );
+                Self::builtin(theme)
+            }
+        }
+    }
+
+    /// Terminal cell width in pixels.
+    #[must_use]
+    pub const fn cell_w(&self) -> i32 {
+        self.cell_w
+    }
+
+    /// Terminal cell height in pixels.
+    #[must_use]
+    pub const fn cell_h(&self) -> i32 {
+        self.cell_h
+    }
+
+    /// The theme background as a packed XRGB8888 word (backbuffer clear color).
+    #[must_use]
+    pub fn bg_xrgb(&self) -> u32 {
+        self.theme.bg_xrgb()
+    }
+
     /// Blit a single cell into the canvas at cell column/row `cx`/`cy`.
-    pub fn blit_cell(&mut self, cx: u16, cy: u16, cell: &Cell, theme: &Theme) {
+    pub fn blit_cell(&mut self, canvas: &mut Canvas<'_>, cx: u16, cy: u16, cell: &Cell) {
         // Spacer cells are the trailing (invisible) half of a wide glyph: the
         // lead cell paints both columns already, so drawing here would just
         // stamp a redundant blank over it (harmless but wasteful) -- skip.
@@ -157,21 +290,49 @@ impl Canvas<'_> {
             return;
         }
 
-        let (fg, bg) = theme.effective(&cell.attrs);
+        let (fg, bg) = self.theme.effective(&cell.attrs);
         let fg_px = fg.to_xrgb8888();
         let bg_px = bg.to_xrgb8888();
+        let ch = if cell.attrs.invisible { ' ' } else { cell.ch };
 
-        let buf_width = self.width() as u32;
-        let pixels = self.pixels_mut();
+        match &mut self.glyphs {
+            GlyphSource::Bitmap => {
+                Self::blit_cell_bitmap(canvas, cx, cy, cell.wide, ch, fg_px, bg_px);
+            }
+            GlyphSource::Face(cache) => {
+                Self::blit_cell_face(
+                    canvas,
+                    cache,
+                    cx,
+                    cy,
+                    self.cell_w,
+                    self.cell_h,
+                    cell.wide,
+                    ch,
+                    fg,
+                    bg,
+                );
+            }
+        }
+    }
+
+    /// Bitmap-font path: identical to the pre-M9 renderer (1-bit glyph, no AA).
+    fn blit_cell_bitmap(
+        canvas: &mut Canvas<'_>,
+        cx: u16,
+        cy: u16,
+        wide: bool,
+        ch: char,
+        fg_px: u32,
+        bg_px: u32,
+    ) {
+        let buf_width = canvas.width() as u32;
+        let pixels = canvas.pixels_mut();
 
         let px0 = u32::from(cx) * GLYPH_W as u32;
         let py0 = u32::from(cy) * GLYPH_H as u32;
-        // A wide cell occupies two glyph cells' worth of background so the fill
-        // doesn't leave a bg-colored gap under its spacer half.
-        let cell_cols: u32 = if cell.wide { 2 } else { 1 };
+        let cell_cols: u32 = if wide { 2 } else { 1 };
 
-        // Look up glyph bitmap.
-        let ch = if cell.attrs.invisible { ' ' } else { cell.ch };
         let glyph: Option<&[u8; 16]> = if ch >= FIRST as char && ch <= LAST as char {
             let idx = ch as usize - FIRST as usize;
             FONT.get(idx)
@@ -179,27 +340,16 @@ impl Canvas<'_> {
             None
         };
 
-        // Unknown glyphs (no ASCII bitmap) fall back to a solid ink block so
-        // missing coverage is visible rather than silently blank -- except for
-        // a wide cell's synthetic second half, which stays plain background.
         for row in 0..GLYPH_H as u32 {
             let py = py0 + row;
             let row_mask: u8 = glyph.map_or(0xff, |g| g[row as usize]);
             for col in 0..(GLYPH_W as u32 * cell_cols) {
                 let px = px0 + col;
-                // Clip to the buffer's actual bounds. The `px < buf_width` guard is
-                // critical: without it a cell from a STALE wider-geometry snapshot
-                // (one produced before a shrink, still queued when the backbuffer
-                // was already rebuilt narrower) would have px >= buf_width and the
-                // flat `py*buf_width + px` index would silently wrap into the NEXT
-                // row -- reordering and swallowing lines mid-drag. A plain
-                // `idx < len` check alone does not catch that horizontal overflow.
+                // See the wide-snapshot clip test below: without this a stale
+                // over-wide snapshot would wrap into the next row.
                 if px >= buf_width {
                     continue;
                 }
-                // Only the first GLYPH_W columns carry the (ASCII) bitmap; a wide
-                // cell's second half is background-only until a real font with
-                // CJK/emoji glyphs replaces the embedded bitmap.
                 let bit = if col < GLYPH_W as u32 {
                     (row_mask >> (7 - col)) & 1
                 } else {
@@ -214,22 +364,108 @@ impl Canvas<'_> {
         }
     }
 
+    /// Real-font path: fill the cell background, then alpha-blend the
+    /// rasterized (possibly multi-cell-wide, anti-aliased) glyph over it.
+    #[allow(clippy::too_many_arguments)]
+    fn blit_cell_face(
+        canvas: &mut Canvas<'_>,
+        cache: &mut GlyphCache,
+        cx: u16,
+        cy: u16,
+        cell_w: i32,
+        cell_h: i32,
+        wide: bool,
+        ch: char,
+        fg: DrawColor,
+        bg: DrawColor,
+    ) {
+        let buf_width = canvas.width() as u32;
+        let fg_px = fg.to_xrgb8888();
+        let bg_px = bg.to_xrgb8888();
+        let px0 = u32::from(cx) * cell_w as u32;
+        let py0 = u32::from(cy) * cell_h as u32;
+        let cell_cols: u32 = if wide { 2 } else { 1 };
+
+        {
+            let pixels = canvas.pixels_mut();
+            for row in 0..cell_h as u32 {
+                let py = py0 + row;
+                for col in 0..(cell_w as u32 * cell_cols) {
+                    let px = px0 + col;
+                    if px >= buf_width {
+                        continue;
+                    }
+                    let idx = (py * buf_width + px) as usize;
+                    if idx < pixels.len() {
+                        pixels[idx] = bg_px;
+                    }
+                }
+            }
+        }
+
+        let Some(entry) = cache.entry(ch as u32) else {
+            return;
+        };
+        if entry.width == 0 || entry.height == 0 {
+            return; // blank glyph (space etc.) — background is enough.
+        }
+
+        let baseline_y = py0 as i64 + cache.ascender.round() as i64;
+        let glyph_x0 = px0 as i64 + i64::from(entry.bearing_x);
+        let glyph_y0 = baseline_y - i64::from(entry.bearing_y);
+
+        let pixels = canvas.pixels_mut();
+        for row in 0..entry.height {
+            let py = glyph_y0 + i64::from(row);
+            if py < 0 {
+                continue;
+            }
+            let py = py as u32;
+            for col in 0..entry.width {
+                let px = glyph_x0 + i64::from(col);
+                if px < 0 || px as u32 >= buf_width {
+                    continue;
+                }
+                let px = px as u32;
+                let a = cache.atlas.data
+                    [((entry.y + row) * cache.atlas.width + (entry.x + col)) as usize];
+                if a == 0 {
+                    continue;
+                }
+                let idx = (py * buf_width + px) as usize;
+                let Some(dst) = pixels.get_mut(idx) else {
+                    continue;
+                };
+                *dst = if a == 255 { fg_px } else { blend(bg, fg, a) };
+            }
+        }
+    }
+
     /// Blit every dirty row in `snap` into the canvas.
-    pub fn blit_snapshot(&mut self, snap: &DirtySnapshot, theme: &Theme) {
+    pub fn blit_snapshot(&mut self, canvas: &mut Canvas<'_>, snap: &DirtySnapshot) {
         // Rows of the glyph grid that fit in this buffer. A stale snapshot from a
         // taller geometry may carry rows past the bottom; clip them rather than let
         // them paint into the wrong pixels.
-        let buf_width = self.width() as u32;
-        let buf_rows = (self.pixels_mut().len() as u32 / buf_width.max(1)) / GLYPH_H as u32;
+        let buf_width = canvas.width() as u32;
+        let buf_rows = (canvas.pixels_mut().len() as u32 / buf_width.max(1)) / self.cell_h as u32;
         for row in &snap.rows {
             if u32::from(row.row) >= buf_rows {
                 continue;
             }
             for (col, cell) in row.cells.iter().enumerate() {
-                self.blit_cell(col as u16, row.row, cell, theme);
+                self.blit_cell(canvas, col as u16, row.row, cell);
             }
         }
     }
+}
+
+/// Linear-interpolate `from` → `to` by `alpha/255`, packed as XRGB8888.
+fn blend(from: DrawColor, to: DrawColor, alpha: u8) -> u32 {
+    let a = u32::from(alpha);
+    let r = (u32::from(from.r) * (255 - a) + u32::from(to.r) * a) / 255;
+    let g = (u32::from(from.g) * (255 - a) + u32::from(to.g) * a) / 255;
+    let b = (u32::from(from.b) * (255 - a) + u32::from(to.b) * a) / 255;
+    (r << 16) | (g << 8) | b
 }
 
 #[cfg(test)]
@@ -249,8 +485,8 @@ mod tests {
     #[test]
     fn stale_wide_snapshot_does_not_bleed_into_next_row() {
         // Backbuffer sized for a NARROW grid: 2 cells wide, 2 rows tall.
-        let bw = 2 * CELL_W as u32;
-        let bh = 2 * CELL_H as u32;
+        let bw = 2 * GLYPH_W as u32;
+        let bh = 2 * GLYPH_H as u32;
         let mut pixels = vec![0u32; (bw * bh) as usize];
 
         // A STALE snapshot from a wider geometry: row 0 has 5 cells. Without
@@ -264,12 +500,14 @@ mod tests {
             }],
         };
         let theme = Theme::builtin();
-        Canvas::new(&mut pixels, bw as i32, bh as i32).blit_snapshot(&snap, &theme);
+        let bg = theme.bg_xrgb();
+        let mut renderer = Renderer::builtin(theme);
+        let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
+        renderer.blit_snapshot(&mut canvas, &snap);
 
-        // The second glyph row (pixels y in [CELL_H, 2*CELL_H)) must be all
+        // The second glyph row (pixels y in [GLYPH_H, 2*GLYPH_H)) must be all
         // background — nothing from the over-wide row 0 may have leaked there.
-        let bg = theme.bg.to_xrgb8888();
-        for y in CELL_H as u32..bh {
+        for y in GLYPH_H as u32..bh {
             for x in 0..bw {
                 let px = pixels[(y * bw + x) as usize];
                 assert_eq!(
@@ -283,8 +521,8 @@ mod tests {
     #[test]
     fn stale_tall_snapshot_row_is_clipped() {
         // Backbuffer for 2 rows; a stale snapshot references row 3.
-        let bw = 2 * CELL_W as u32;
-        let bh = 2 * CELL_H as u32;
+        let bw = 2 * GLYPH_W as u32;
+        let bh = 2 * GLYPH_H as u32;
         let mut pixels = vec![0u32; (bw * bh) as usize];
         let snap = DirtySnapshot {
             cols: 2,
@@ -293,11 +531,28 @@ mod tests {
                 cells: vec![cell('M'), cell('M')],
             }],
         };
-        Canvas::new(&mut pixels, bw as i32, bh as i32).blit_snapshot(&snap, &Theme::builtin());
+        let mut renderer = Renderer::builtin(Theme::builtin());
+        let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
+        renderer.blit_snapshot(&mut canvas, &snap);
         // Nothing should have been drawn at all.
         assert!(
             pixels.iter().all(|&p| p == 0),
             "off-bottom row 3 leaked into buffer"
         );
+    }
+
+    #[test]
+    fn builtin_renderer_uses_bitmap_cell_size() {
+        let r = Renderer::builtin(Theme::builtin());
+        assert_eq!(r.cell_w(), GLYPH_W);
+        assert_eq!(r.cell_h(), GLYPH_H);
+    }
+
+    #[test]
+    fn blend_alpha_zero_is_background_alpha_255_is_foreground() {
+        let bg = DrawColor::rgb(0, 0, 0);
+        let fg = DrawColor::rgb(255, 255, 255);
+        assert_eq!(blend(bg, fg, 0), bg.to_xrgb8888());
+        assert_eq!(blend(bg, fg, 255), fg.to_xrgb8888());
     }
 }

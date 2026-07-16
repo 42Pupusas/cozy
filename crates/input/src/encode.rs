@@ -944,6 +944,45 @@ mod tests {
         assert_eq!(encode(&e, Key::Char('6'), Modifiers::SHIFT), b"^");
     }
 
+    #[test]
+    fn number_row_shifted_full() {
+        let e = enc();
+        let pairs = [
+            ('3', '#'),
+            ('4', '$'),
+            ('5', '%'),
+            ('7', '&'),
+            ('8', '*'),
+            ('9', '('),
+            ('0', ')'),
+        ];
+        for (base, shifted) in pairs {
+            let expected = shifted.to_string();
+            assert_eq!(
+                encode(&e, Key::Char(base), Modifiers::SHIFT),
+                expected.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn shifted_letters_uppercase_the_whole_alphabet() {
+        let e = enc();
+        for c in 'a'..='z' {
+            let expected = c.to_ascii_uppercase().to_string();
+            assert_eq!(
+                encode(&e, Key::Char(c), Modifiers::SHIFT),
+                expected.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn shift_on_char_with_no_shifted_mapping_falls_back_to_plain() {
+        let e = enc();
+        assert_eq!(encode(&e, Key::Char('!'), Modifiers::SHIFT), b"!");
+    }
+
     // ── Keypad (encode_keypad) ──────────────────────────────────────────
 
     #[test]

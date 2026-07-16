@@ -323,7 +323,8 @@ fn ui_thread(
     quit: &AtomicBool,
 ) -> platform::Result<()> {
     let theme = platform::Theme::from_palette(&cfg.palette);
-    let mut win = TermWindow::new("terminal", COLS, ROWS, ui_wake, theme)?;
+    let renderer = platform::Renderer::new(theme, &cfg.font);
+    let mut win = TermWindow::new("terminal", COLS, ROWS, ui_wake, renderer)?;
     let encoder = Encoder::new();
 
     // Future: use cfg.cursor.blink / blink_rate in the renderer.

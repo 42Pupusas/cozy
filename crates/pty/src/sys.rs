@@ -360,7 +360,9 @@ impl PtyIoctl for RawFd {
                 core::ptr::addr_of_mut!(pts_no) as usize,
             )
         };
-        ret.into_errno_result().map(|_| pts_no).map_err(PtyError::OpenPt)
+        ret.into_errno_result()
+            .map(|_| pts_no)
+            .map_err(PtyError::OpenPt)
     }
 
     fn unlock_pty(self) -> Result<(), PtyError> {
@@ -372,7 +374,9 @@ impl PtyIoctl for RawFd {
                 core::ptr::addr_of!(lock) as usize,
             )
         };
-        ret.into_errno_result().map(|_| ()).map_err(PtyError::OpenPt)
+        ret.into_errno_result()
+            .map(|_| ())
+            .map_err(PtyError::OpenPt)
     }
 
     fn set_win_size(self, win_size: WinSize) -> Result<(), PtyError> {
@@ -383,7 +387,9 @@ impl PtyIoctl for RawFd {
                 core::ptr::addr_of!(win_size) as usize,
             )
         };
-        ret.into_errno_result().map(|_| ()).map_err(PtyError::WinSize)
+        ret.into_errno_result()
+            .map(|_| ())
+            .map_err(PtyError::WinSize)
     }
 
     #[allow(dead_code)] // exposed for completeness; no current caller queries winsize
@@ -396,14 +402,18 @@ impl PtyIoctl for RawFd {
                 core::ptr::addr_of_mut!(ws) as usize,
             )
         };
-        ret.into_errno_result().map(|_| ws).map_err(PtyError::WinSize)
+        ret.into_errno_result()
+            .map(|_| ws)
+            .map_err(PtyError::WinSize)
     }
 
     fn set_controlling_terminal(self) -> Result<(), PtyError> {
         let ret = unsafe {
             Syscall::Ioctl.invoke3(self.as_usize(), IoctlRequest::SetControllingTty as usize, 0)
         };
-        ret.into_errno_result().map(|_| ()).map_err(PtyError::OpenPt)
+        ret.into_errno_result()
+            .map(|_| ())
+            .map_err(PtyError::OpenPt)
     }
 }
 
@@ -508,7 +518,8 @@ impl WaitStatus {
     /// its only caller).
     const fn from_raw(status: i32) -> Self {
         // WIFEXITED(status): low 7 bits of status are 0 for a normal exit.
-        #[allow(clippy::verbose_bit_mask)] // & 0x7f reads as WIFEXITED's mask, not a power-of-two check
+        #[allow(clippy::verbose_bit_mask)]
+        // & 0x7f reads as WIFEXITED's mask, not a power-of-two check
         if status & 0x7f == 0 {
             // WEXITSTATUS(status)
             Self::Exited((status >> 8) & 0xff)

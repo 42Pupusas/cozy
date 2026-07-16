@@ -2,19 +2,23 @@
 
 use crate::{Action, Color, Config, ConfigError, CursorStyle};
 
-fn parse(toml: &str) -> Config {
-    Config::from_bytes(toml.as_bytes()).expect("parse failed")
-}
+/// Test-only helpers, kept as methods on `Config` rather than free functions
+/// since they only ever parse (or fail to parse) a `Config`.
+impl Config {
+    fn parse(toml: &str) -> Self {
+        Self::from_bytes(toml.as_bytes()).expect("parse failed")
+    }
 
-fn fail(toml: &str) -> String {
-    Config::from_bytes(toml.as_bytes()).unwrap_err().to_string()
+    fn fail(toml: &str) -> String {
+        Self::from_bytes(toml.as_bytes()).unwrap_err().to_string()
+    }
 }
 
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
 #[test]
 fn empty_doc_gives_defaults() {
-    let cfg = parse("");
+    let cfg = Config::parse("");
     assert_eq!(cfg.term, "xterm-256color");
     assert_eq!(cfg.scrollback, 10_000);
     assert_eq!(cfg.font.size, 14);
@@ -28,14 +32,14 @@ fn empty_doc_gives_defaults() {
 
 #[test]
 fn general_shell_and_term() {
-    let cfg = parse("[general]\nshell = \"/usr/bin/zsh\"\nterm  = \"xterm-kitty\"\n");
+    let cfg = Config::parse("[general]\nshell = \"/usr/bin/zsh\"\nterm  = \"xterm-kitty\"\n");
     assert_eq!(cfg.shell, "/usr/bin/zsh");
     assert_eq!(cfg.term, "xterm-kitty");
 }
 
 #[test]
 fn general_scrollback_zero() {
-    let cfg = parse("[general]\nscrollback = 0\n");
+    let cfg = Config::parse("[general]\nscrollback = 0\n");
     assert_eq!(cfg.scrollback, 0);
 }
 
@@ -43,7 +47,8 @@ fn general_scrollback_zero() {
 
 #[test]
 fn font_path_and_size() {
-    let cfg = parse("[font]\npath = \"/usr/share/fonts/TTF/Hack-Regular.ttf\"\nsize = 18\n");
+    let cfg =
+        Config::parse("[font]\npath = \"/usr/share/fonts/TTF/Hack-Regular.ttf\"\nsize = 18\n");
     assert_eq!(
         cfg.font.path.as_deref(),
         Some("/usr/share/fonts/TTF/Hack-Regular.ttf")
@@ -53,13 +58,13 @@ fn font_path_and_size() {
 
 #[test]
 fn font_size_out_of_range() {
-    let e = fail("[font]\nsize = 0\n");
+    let e = Config::fail("[font]\nsize = 0\n");
     assert!(e.contains("font.size"), "got: {e}");
 }
 
 #[test]
 fn font_size_upper_bound() {
-    let e = fail("[font]\nsize = 1000\n");
+    let e = Config::fail("[font]\nsize = 1000\n");
     assert!(e.contains("font.size"), "got: {e}");
 }
 
@@ -67,7 +72,7 @@ fn font_size_upper_bound() {
 
 #[test]
 fn cursor_beam_no_blink() {
-    let cfg = parse("[cursor]\nstyle = \"beam\"\nblink = false\nblink_rate = 250\n");
+    let cfg = Config::parse("[cursor]\nstyle = \"beam\"\nblink = false\nblink_rate = 250\n");
     assert_eq!(cfg.cursor.style, CursorStyle::Beam);
     assert!(!cfg.cursor.blink);
     assert_eq!(cfg.cursor.blink_rate, 250);
@@ -75,13 +80,13 @@ fn cursor_beam_no_blink() {
 
 #[test]
 fn cursor_underline() {
-    let cfg = parse("[cursor]\nstyle = \"underline\"\n");
+    let cfg = Config::parse("[cursor]\nstyle = \"underline\"\n");
     assert_eq!(cfg.cursor.style, CursorStyle::Underline);
 }
 
 #[test]
 fn cursor_bad_style() {
-    let e = fail("[cursor]\nstyle = \"bar\"\n");
+    let e = Config::fail("[cursor]\nstyle = \"bar\"\n");
     assert!(e.contains("cursor.style"), "got: {e}");
 }
 
@@ -89,21 +94,21 @@ fn cursor_bad_style() {
 
 #[test]
 fn colors_foreground_background() {
-    let cfg = parse("[colors]\nforeground = \"#ffffff\"\nbackground = \"#000000\"\n");
+    let cfg = Config::parse("[colors]\nforeground = \"#ffffff\"\nbackground = \"#000000\"\n");
     assert_eq!(cfg.palette.foreground, Color::from_rgb(0xff, 0xff, 0xff));
     assert_eq!(cfg.palette.background, Color::from_rgb(0x00, 0x00, 0x00));
 }
 
 #[test]
 fn colors_ansi_palette() {
-    let cfg = parse("[colors]\nred = \"#ff0000\"\nbright_red = \"#ff5555\"\n");
+    let cfg = Config::parse("[colors]\nred = \"#ff0000\"\nbright_red = \"#ff5555\"\n");
     assert_eq!(cfg.palette.ansi(1), Color::from_rgb(0xff, 0x00, 0x00));
     assert_eq!(cfg.palette.ansi(9), Color::from_rgb(0xff, 0x55, 0x55));
 }
 
 #[test]
 fn colors_ansi_palette_all_16_indices_match_named_fields() {
-    let cfg = parse(concat!(
+    let cfg = Config::parse(concat!(
         "[colors]\n",
         "black = \"#000001\"\nred = \"#000002\"\ngreen = \"#000003\"\nyellow = \"#000004\"\n",
         "blue = \"#000005\"\nmagenta = \"#000006\"\ncyan = \"#000007\"\nwhite = \"#000008\"\n",
@@ -140,7 +145,7 @@ fn colors_ansi_palette_all_16_indices_match_named_fields() {
 
 #[test]
 fn colors_ansi_palette_out_of_range_index_falls_back_to_foreground() {
-    let cfg = parse("[colors]\nforeground = \"#123456\"\n");
+    let cfg = Config::parse("[colors]\nforeground = \"#123456\"\n");
     for idx in [16u8, 17, 100, 255] {
         assert_eq!(cfg.palette.ansi(idx), cfg.palette.foreground, "idx {idx}");
     }
@@ -148,7 +153,7 @@ fn colors_ansi_palette_out_of_range_index_falls_back_to_foreground() {
 
 #[test]
 fn color_bad_hex() {
-    let e = fail("[colors]\nforeground = \"zzz\"\n");
+    let e = Config::fail("[colors]\nforeground = \"zzz\"\n");
     assert!(e.contains("rrggbb") || e.contains("foreground"), "got: {e}");
 }
 
@@ -169,7 +174,7 @@ fn color_as_u32() {
 
 #[test]
 fn keybinds_known_actions() {
-    let cfg = parse(concat!(
+    let cfg = Config::parse(concat!(
         "[keybinds]\n",
         "\"Ctrl+Shift+C\" = \"copy\"\n",
         "\"Ctrl+Shift+V\" = \"paste\"\n",
@@ -189,7 +194,7 @@ fn keybinds_known_actions() {
 
 #[test]
 fn keybinds_send_raw() {
-    let cfg = parse("[keybinds]\n\"Alt+F4\" = \"\\u001b[1;5D\"\n");
+    let cfg = Config::parse("[keybinds]\n\"Alt+F4\" = \"\\u001b[1;5D\"\n");
     assert_eq!(cfg.keybinds[0].chord, "Alt+F4");
     assert!(
         matches!(&cfg.keybinds[0].action, Action::Send(s) if s.contains('\x1b')),
@@ -202,7 +207,7 @@ fn keybinds_send_raw() {
 
 #[test]
 fn full_document() {
-    let cfg = parse(concat!(
+    let cfg = Config::parse(concat!(
         "[general]\n",
         "shell      = \"/bin/fish\"\n",
         "term       = \"xterm-256color\"\n",

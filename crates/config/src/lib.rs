@@ -333,121 +333,148 @@ impl Config {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
         let table = TomlTable::parse(bytes)?;
         let mut cfg = Self::default();
-        // [general]
-        if let Some(general) = table.get_table("general") {
-            if let Some(s) = general.get_str("shell") {
-                s.clone_into(&mut cfg.shell);
-            }
-            if let Some(s) = general.get_str("term") {
-                s.clone_into(&mut cfg.term);
-            }
-            // Scrollback fits comfortably in u32; clamp the validated range to usize.
-            if let Some(n) = general.get_int_range(
-                "scrollback",
-                "general.scrollback",
-                0,
-                1_000_000,
-                "must be between 0 and 1000000",
-            )? {
-                cfg.scrollback = usize::try_from(n).unwrap_or(0);
-            }
-        }
+        cfg.apply_general(&table)?;
+        cfg.apply_font(&table)?;
+        cfg.apply_cursor(&table)?;
+        cfg.apply_colors(&table)?;
+        cfg.apply_keybinds(&table);
+        Ok(cfg)
+    }
 
-        // [font]
-        if let Some(font) = table.get_table("font") {
-            if let Some(s) = font.get_str("path") {
-                cfg.font.path = Some(s.to_owned());
-            }
-            if let Some(n) =
-                font.get_int_range("size", "font.size", 1, 256, "must be between 1 and 256")?
-            {
-                cfg.font.size = u32::try_from(n).unwrap_or(cfg.font.size);
-            }
+    /// Apply the `[general]` table, if present.
+    ///
+    /// Split out of [`Self::from_bytes`] (along with its sibling `apply_*`
+    /// methods below) purely to keep that function under clippy's
+    /// line-count lint -- each section is independent and self-contained.
+    fn apply_general(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(general) = table.get_table("general") else {
+            return Ok(());
+        };
+        if let Some(s) = general.get_str("shell") {
+            s.clone_into(&mut self.shell);
         }
-
-        // [cursor]
-        if let Some(cursor) = table.get_table("cursor") {
-            if let Some(s) = cursor.get_str("style") {
-                cfg.cursor.style = match s {
-                    "block" => CursorStyle::Block,
-                    "beam" => CursorStyle::Beam,
-                    "underline" => CursorStyle::Underline,
-                    _ => {
-                        return Err(ConfigError::InvalidValue {
-                            field: "cursor.style",
-                            reason: "expected block | beam | underline",
-                        });
-                    }
-                };
-            }
-            if let Some(b) = cursor.get_bool("blink") {
-                cfg.cursor.blink = b;
-            }
-            if let Some(n) = cursor.get_int_range(
-                "blink_rate",
-                "cursor.blink_rate",
-                0,
-                60_000,
-                "must be between 0 and 60000",
-            )? {
-                cfg.cursor.blink_rate = u32::try_from(n).unwrap_or(cfg.cursor.blink_rate);
-            }
+        if let Some(s) = general.get_str("term") {
+            s.clone_into(&mut self.term);
         }
-
-        // [colors]
-        if let Some(colors) = table.get_table("colors") {
-            macro_rules! color_field {
-                ($field:ident, $key:literal) => {
-                    if let Some(s) = colors.get_str($key) {
-                        cfg.palette.$field =
-                            Color::parse_hex(s).ok_or(ConfigError::InvalidValue {
-                                field: $key,
-                                reason: "invalid #rrggbb hex color",
-                            })?;
-                    }
-                };
-            }
-            color_field!(foreground, "foreground");
-            color_field!(background, "background");
-            color_field!(black, "black");
-            color_field!(red, "red");
-            color_field!(green, "green");
-            color_field!(yellow, "yellow");
-            color_field!(blue, "blue");
-            color_field!(magenta, "magenta");
-            color_field!(cyan, "cyan");
-            color_field!(white, "white");
-            color_field!(bright_black, "bright_black");
-            color_field!(bright_red, "bright_red");
-            color_field!(bright_green, "bright_green");
-            color_field!(bright_yellow, "bright_yellow");
-            color_field!(bright_blue, "bright_blue");
-            color_field!(bright_magenta, "bright_magenta");
-            color_field!(bright_cyan, "bright_cyan");
-            color_field!(bright_white, "bright_white");
+        // Scrollback fits comfortably in u32; clamp the validated range to usize.
+        if let Some(n) = general.get_int_range(
+            "scrollback",
+            "general.scrollback",
+            0,
+            1_000_000,
+            "must be between 0 and 1000000",
+        )? {
+            self.scrollback = usize::try_from(n).unwrap_or(0);
         }
+        Ok(())
+    }
 
-        // [keybinds]
-        if let Some(keybinds) = table.get_table("keybinds") {
-            for (chord, val) in keybinds.iter() {
-                if let shelby::Value::String(action_str) = val {
-                    let action = match action_str.as_ref() {
-                        "copy" => Action::Copy,
-                        "paste" => Action::Paste,
-                        "scroll_up" => Action::ScrollUp,
-                        "scroll_down" => Action::ScrollDown,
-                        "new_tab" => Action::NewTab,
-                        "close_tab" => Action::CloseTab,
-                        other => Action::Send(other.to_owned()),
-                    };
-                    cfg.keybinds.push(Keybind {
-                        chord: chord.to_owned(),
-                        action,
+    /// Apply the `[font]` table, if present.
+    fn apply_font(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(font) = table.get_table("font") else {
+            return Ok(());
+        };
+        if let Some(s) = font.get_str("path") {
+            self.font.path = Some(s.to_owned());
+        }
+        if let Some(n) =
+            font.get_int_range("size", "font.size", 1, 256, "must be between 1 and 256")?
+        {
+            self.font.size = u32::try_from(n).unwrap_or(self.font.size);
+        }
+        Ok(())
+    }
+
+    /// Apply the `[cursor]` table, if present.
+    fn apply_cursor(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(cursor) = table.get_table("cursor") else {
+            return Ok(());
+        };
+        if let Some(s) = cursor.get_str("style") {
+            self.cursor.style = match s {
+                "block" => CursorStyle::Block,
+                "beam" => CursorStyle::Beam,
+                "underline" => CursorStyle::Underline,
+                _ => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "cursor.style",
+                        reason: "expected block | beam | underline",
                     });
                 }
+            };
+        }
+        if let Some(b) = cursor.get_bool("blink") {
+            self.cursor.blink = b;
+        }
+        if let Some(n) = cursor.get_int_range(
+            "blink_rate",
+            "cursor.blink_rate",
+            0,
+            60_000,
+            "must be between 0 and 60000",
+        )? {
+            self.cursor.blink_rate = u32::try_from(n).unwrap_or(self.cursor.blink_rate);
+        }
+        Ok(())
+    }
+
+    /// Apply the `[colors]` table, if present.
+    fn apply_colors(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(colors) = table.get_table("colors") else {
+            return Ok(());
+        };
+        macro_rules! color_field {
+            ($field:ident, $key:literal) => {
+                if let Some(s) = colors.get_str($key) {
+                    self.palette.$field = Color::parse_hex(s).ok_or(ConfigError::InvalidValue {
+                        field: $key,
+                        reason: "invalid #rrggbb hex color",
+                    })?;
+                }
+            };
+        }
+        color_field!(foreground, "foreground");
+        color_field!(background, "background");
+        color_field!(black, "black");
+        color_field!(red, "red");
+        color_field!(green, "green");
+        color_field!(yellow, "yellow");
+        color_field!(blue, "blue");
+        color_field!(magenta, "magenta");
+        color_field!(cyan, "cyan");
+        color_field!(white, "white");
+        color_field!(bright_black, "bright_black");
+        color_field!(bright_red, "bright_red");
+        color_field!(bright_green, "bright_green");
+        color_field!(bright_yellow, "bright_yellow");
+        color_field!(bright_blue, "bright_blue");
+        color_field!(bright_magenta, "bright_magenta");
+        color_field!(bright_cyan, "bright_cyan");
+        color_field!(bright_white, "bright_white");
+        Ok(())
+    }
+
+    /// Apply the `[keybinds]` table, if present.
+    fn apply_keybinds(&mut self, table: &TomlTable<'_>) {
+        let Some(keybinds) = table.get_table("keybinds") else {
+            return;
+        };
+        for (chord, val) in keybinds.iter() {
+            if let shelby::Value::String(action_str) = val {
+                let action = match action_str.as_ref() {
+                    "copy" => Action::Copy,
+                    "paste" => Action::Paste,
+                    "scroll_up" => Action::ScrollUp,
+                    "scroll_down" => Action::ScrollDown,
+                    "new_tab" => Action::NewTab,
+                    "close_tab" => Action::CloseTab,
+                    other => Action::Send(other.to_owned()),
+                };
+                self.keybinds.push(Keybind {
+                    chord: chord.to_owned(),
+                    action,
+                });
             }
         }
-
-        Ok(cfg)
     }
 }

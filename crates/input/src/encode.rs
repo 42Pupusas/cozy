@@ -157,6 +157,10 @@ impl Encoder {
             return Some(w.len());
         }
 
+        if is_legacy_editing_key(key) {
+            return self.encode_legacy_editing(key, mods, buf);
+        }
+
         Some(match key {
             // ── Printable characters ──────────────────────────────────────
             Key::Char(c) => {
@@ -171,93 +175,11 @@ impl Encoder {
                 w.len()
             }
 
-            // ── Enter / Backspace / Tab / Esc ────────────────────────────
-            Key::Enter => {
-                let mut w = SeqWriter::new(buf);
-                w.byte(b'\r');
-                w.len()
-            }
-            Key::Backspace => {
-                let mut w = SeqWriter::new(buf);
-                w.byte(b'\x7f');
-                w.len()
-            }
-            Key::Tab => {
-                let mut w = SeqWriter::new(buf);
-                if mods.shift() {
-                    w.bytes(b"\x1b[Z");
-                } else {
-                    w.byte(b'\t');
-                }
-                w.len()
-            }
-            Key::Esc => {
-                let mut w = SeqWriter::new(buf);
-                w.esc();
-                w.len()
-            }
-
-            // ── Delete / Insert ──────────────────────────────────────────
-            Key::Delete => {
-                let mut w = SeqWriter::new(buf);
-                w.bytes(b"\x1b[3~");
-                w.len()
-            }
-            Key::Insert => {
-                let mut w = SeqWriter::new(buf);
-                w.bytes(b"\x1b[2~");
-                w.len()
-            }
-
             // ── Arrows ───────────────────────────────────────────────────
             Key::Up => self.arrow(buf, b'A', mods),
             Key::Down => self.arrow(buf, b'B', mods),
             Key::Right => self.arrow(buf, b'C', mods),
             Key::Left => self.arrow(buf, b'D', mods),
-
-            // ── Home / End ───────────────────────────────────────────────
-            Key::Home => {
-                let mut w = SeqWriter::new(buf);
-                if mods.any_active() {
-                    w.csi_mod(b"1", mods, b'H');
-                } else if self.app_cursor {
-                    w.bytes(b"\x1bOH");
-                } else {
-                    w.bytes(b"\x1b[H");
-                }
-                w.len()
-            }
-            Key::End => {
-                let mut w = SeqWriter::new(buf);
-                if mods.any_active() {
-                    w.csi_mod(b"4", mods, b'~');
-                } else if self.app_cursor {
-                    w.bytes(b"\x1bOF");
-                } else {
-                    w.bytes(b"\x1b[F");
-                }
-                w.len()
-            }
-
-            // ── Page keys ────────────────────────────────────────────────
-            Key::PageUp => {
-                let mut w = SeqWriter::new(buf);
-                if mods.any_active() {
-                    w.csi_mod(b"5", mods, b'~');
-                } else {
-                    w.bytes(b"\x1b[5~");
-                }
-                w.len()
-            }
-            Key::PageDown => {
-                let mut w = SeqWriter::new(buf);
-                if mods.any_active() {
-                    w.csi_mod(b"6", mods, b'~');
-                } else {
-                    w.bytes(b"\x1b[6~");
-                }
-                w.len()
-            }
 
             // ── Function keys ────────────────────────────────────────────
             Key::F(n) => {
@@ -292,7 +214,85 @@ impl Encoder {
             | Key::NumLock
             | Key::ScrollLock
             | Key::Menu => return None,
+
+            // Handled by the `is_legacy_editing_key` early-return above.
+            Key::Enter
+            | Key::Backspace
+            | Key::Tab
+            | Key::Esc
+            | Key::Delete
+            | Key::Insert
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown => unreachable!("handled by encode_legacy_editing"),
         })
+    }
+
+    /// The "editing cluster": Enter/Backspace/Tab/Esc/Delete/Insert/Home/End/
+    /// PageUp/PageDown. Split out of [`Self::encode_legacy`] purely to keep
+    /// that function under clippy's line-count lint — these keys share no
+    /// state or logic with the rest of the legacy dispatch.
+    fn encode_legacy_editing(&self, key: Key, mods: Modifiers, buf: &mut [u8]) -> Option<usize> {
+        let mut w = SeqWriter::new(buf);
+        match key {
+            Key::Enter => {
+                w.byte(b'\r');
+            }
+            Key::Backspace => {
+                w.byte(b'\x7f');
+            }
+            Key::Tab => {
+                if mods.shift() {
+                    w.bytes(b"\x1b[Z");
+                } else {
+                    w.byte(b'\t');
+                }
+            }
+            Key::Esc => {
+                w.esc();
+            }
+            Key::Delete => {
+                w.bytes(b"\x1b[3~");
+            }
+            Key::Insert => {
+                w.bytes(b"\x1b[2~");
+            }
+            Key::Home => {
+                if mods.any_active() {
+                    w.csi_mod(b"1", mods, b'H');
+                } else if self.app_cursor {
+                    w.bytes(b"\x1bOH");
+                } else {
+                    w.bytes(b"\x1b[H");
+                }
+            }
+            Key::End => {
+                if mods.any_active() {
+                    w.csi_mod(b"4", mods, b'~');
+                } else if self.app_cursor {
+                    w.bytes(b"\x1bOF");
+                } else {
+                    w.bytes(b"\x1b[F");
+                }
+            }
+            Key::PageUp => {
+                if mods.any_active() {
+                    w.csi_mod(b"5", mods, b'~');
+                } else {
+                    w.bytes(b"\x1b[5~");
+                }
+            }
+            Key::PageDown => {
+                if mods.any_active() {
+                    w.csi_mod(b"6", mods, b'~');
+                } else {
+                    w.bytes(b"\x1b[6~");
+                }
+            }
+            _ => return None,
+        }
+        Some(w.len())
     }
 
     /// Encode the numeric-keypad keys, honouring application-keypad mode.
@@ -536,6 +536,24 @@ impl SeqWriter<'_> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// True for the keys handled by [`Encoder::encode_legacy_editing`] --
+/// Enter/Backspace/Tab/Esc/Delete/Insert/Home/End/PageUp/PageDown.
+const fn is_legacy_editing_key(key: Key) -> bool {
+    matches!(
+        key,
+        Key::Enter
+            | Key::Backspace
+            | Key::Tab
+            | Key::Esc
+            | Key::Delete
+            | Key::Insert
+            | Key::Home
+            | Key::End
+            | Key::PageUp
+            | Key::PageDown
+    )
+}
 
 /// Ctrl+letter → C0 byte (a=1 … z=26, space=0, @=0, [=27, \=28, ]=29, ^=30, _=31).
 const fn ctrl_byte(c: char) -> Option<u8> {

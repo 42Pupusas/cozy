@@ -443,186 +443,205 @@ impl ChildPid {
 
 // ── PTY open/fork ──────────────────────────────────────────────────────────
 
-/// Open a PTY master fd via `/dev/ptmx`.
-fn open_ptmx() -> Result<RawFd, PtyError> {
-    // "/dev/ptmx\0"
-    let path: &[u8] = b"/dev/ptmx\0";
-    let flags = OpenFlags::RDWR | OpenFlags::NOCTTY | OpenFlags::CLOEXEC;
-    let ret = unsafe { syscall3(Syscall::Open, path.as_ptr() as usize, flags.bits(), 0) };
-    errno_to_err(ret)
-        .map(RawFd::from_raw)
-        .map_err(PtyError::OpenPt)
-}
-
-/// Read the slave PTY device path for `master_fd` (`ptsname`-equivalent, via
-/// the `TIOCGPTN` ioctl behind [`PtyIoctl::pty_number`]).
-fn pts_path(master_fd: RawFd) -> Result<CString, PtyError> {
-    let pts_no = master_fd.pty_number()?;
-    let path = std::format!("/dev/pts/{pts_no}\0");
-    // SAFETY: we just formatted a valid null-terminated string.
-    Ok(unsafe { CString::from_vec_with_nul_unchecked(path.into_bytes()) })
-}
-
-/// Fork and exec the shell under the PTY slave.
+/// Constructor namespace for spawning a PTY + child process.
 ///
-/// Returns `(master_fd, child_pid)` in the parent.
-///
-/// # Safety
-///
-/// This function forks. After `fork`, only async-signal-safe functions are
-/// called in the child before `execve`. We use raw syscalls throughout.
-pub fn forkpty(
-    shell: &str,
-    args: &[&str],
-    win_size: WinSize,
-) -> Result<(RawFd, ChildPid), PtyError> {
-    let master_fd = open_ptmx()?;
-    master_fd.unlock_pty()?;
-    master_fd.set_win_size(win_size)?;
-    let slave_path = pts_path(master_fd)?;
+/// A zero-sized marker type rather than bare `pub fn`s at module scope:
+/// there's no existing `RawFd`/`ChildPid` receiver to hang these on (they
+/// produce one), so the idiomatic shape is `RawPty::fork(..)` -- the same
+/// pattern as `std::fs::File::open` or `TcpStream::connect`, which are
+/// associated functions rather than free functions or trait methods on an
+/// unrelated type.
+pub struct RawPty;
 
-    // Build execve argv.
-    let shell_cs = CString::new(shell).map_err(|_| PtyError::Exec(22))?;
-    let args_cs: Vec<CString> = args
-        .iter()
-        .map(|a| CString::new(*a).map_err(|_| PtyError::Exec(22)))
-        .collect::<Result<_, _>>()?;
-
-    // argv array: shell_cs + args_cs + NULL
-    let mut argv_ptrs: Vec<*const u8> = std::iter::once(shell_cs.as_ptr().cast())
-        .chain(args_cs.iter().map(|cs| cs.as_ptr().cast()))
-        .chain(std::iter::once(core::ptr::null()))
-        .collect();
-
-    // envp: a raw execve does NOT inherit the parent environment — passing NULL
-    // gives the child an *empty* env (no TERM, no PATH), which makes programs
-    // like `cargo` and `ls` disable colour. So we build the child environment
-    // explicitly: every parent variable, with TERM/COLORTERM guaranteed.
-    //
-    // The `CString`s must outlive the `execve` below; we keep them in `env_cs`
-    // and the pointer array in `envp_ptrs` (both live until function return,
-    // which never happens in the child — it execs or exits). Built *before* the
-    // fork so the child only dereferences already-constructed pointers.
-    let mut have_term = false;
-    let mut have_colorterm = false;
-    let mut env_cs: Vec<CString> = Vec::new();
-    for (k, v) in std::env::vars() {
-        if k == "TERM" {
-            have_term = true;
-        }
-        if k == "COLORTERM" {
-            have_colorterm = true;
-        }
-        if let Ok(cs) = CString::new(format!("{k}={v}")) {
-            env_cs.push(cs);
-        }
+impl RawPty {
+    /// Open a PTY master fd via `/dev/ptmx`.
+    fn open_ptmx() -> Result<RawFd, PtyError> {
+        // "/dev/ptmx\0"
+        let path: &[u8] = b"/dev/ptmx\0";
+        let flags = OpenFlags::RDWR | OpenFlags::NOCTTY | OpenFlags::CLOEXEC;
+        let ret = unsafe { syscall3(Syscall::Open, path.as_ptr() as usize, flags.bits(), 0) };
+        errno_to_err(ret)
+            .map(RawFd::from_raw)
+            .map_err(PtyError::OpenPt)
     }
-    if !have_term {
-        env_cs.push(CString::new("TERM=xterm-256color").unwrap());
-    }
-    if !have_colorterm {
-        env_cs.push(CString::new("COLORTERM=truecolor").unwrap());
-    }
-    let envp_ptrs: Vec<*const u8> = env_cs
-        .iter()
-        .map(|cs| cs.as_ptr().cast())
-        .chain(std::iter::once(core::ptr::null()))
-        .collect();
-    let envp: *const *const u8 = envp_ptrs.as_ptr();
 
-    // fork via clone(SIGCHLD, 0)
-    let pid = unsafe { syscall2(Syscall::Clone, Signal::Chld as usize, 0) };
-    match errno_to_err(pid) {
-        Err(e) => Err(PtyError::Fork(e)),
-        Ok(0) => {
-            // ── child ──────────────────────────────────────────────────
-            // Start a new session so the slave PTY becomes the controlling terminal.
-            unsafe { syscall0(Syscall::SetSid) };
+    /// Read the slave PTY device path for `master_fd` (`ptsname`-equivalent,
+    /// via the `TIOCGPTN` ioctl behind [`PtyIoctl::pty_number`]).
+    fn pts_path(master_fd: RawFd) -> Result<CString, PtyError> {
+        let pts_no = master_fd.pty_number()?;
+        let path = std::format!("/dev/pts/{pts_no}\0");
+        // SAFETY: we just formatted a valid null-terminated string.
+        Ok(unsafe { CString::from_vec_with_nul_unchecked(path.into_bytes()) })
+    }
 
-            // Open the slave PTY.
-            let slave_fd_ret = unsafe {
-                syscall3(Syscall::Open, slave_path.as_ptr() as usize, OpenFlags::RDWR.bits(), 0)
-            };
-            // Post-fork child: an `if let` with a diverging else is clearer
-            // than `map_or_else` with side-effecting closures.
-            #[allow(clippy::option_if_let_else)]
-            let slave_fd = if let Ok(fd) = errno_to_err(slave_fd_ret) {
-                RawFd::from_raw(fd)
-            } else {
-                // Can't report — just exit.
+    /// Fork and exec the shell under the PTY slave.
+    ///
+    /// Returns `(master_fd, child_pid)` in the parent.
+    ///
+    /// # Safety
+    ///
+    /// This function forks. After `fork`, only async-signal-safe functions
+    /// are called in the child before `execve`. We use raw syscalls
+    /// throughout.
+    pub fn fork(
+        shell: &str,
+        args: &[&str],
+        win_size: WinSize,
+    ) -> Result<(RawFd, ChildPid), PtyError> {
+        let master_fd = Self::open_ptmx()?;
+        master_fd.unlock_pty()?;
+        master_fd.set_win_size(win_size)?;
+        let slave_path = Self::pts_path(master_fd)?;
+
+        // Build execve argv.
+        let shell_cs = CString::new(shell).map_err(|_| PtyError::Exec(22))?;
+        let args_cs: Vec<CString> = args
+            .iter()
+            .map(|a| CString::new(*a).map_err(|_| PtyError::Exec(22)))
+            .collect::<Result<_, _>>()?;
+
+        // argv array: shell_cs + args_cs + NULL
+        let mut argv_ptrs: Vec<*const u8> = std::iter::once(shell_cs.as_ptr().cast())
+            .chain(args_cs.iter().map(|cs| cs.as_ptr().cast()))
+            .chain(std::iter::once(core::ptr::null()))
+            .collect();
+
+        // envp: a raw execve does NOT inherit the parent environment — passing
+        // NULL gives the child an *empty* env (no TERM, no PATH), which makes
+        // programs like `cargo` and `ls` disable colour. So we build the child
+        // environment explicitly: every parent variable, with TERM/COLORTERM
+        // guaranteed.
+        //
+        // The `CString`s must outlive the `execve` below; we keep them in
+        // `env_cs` and the pointer array in `envp_ptrs` (both live until
+        // function return, which never happens in the child — it execs or
+        // exits). Built *before* the fork so the child only dereferences
+        // already-constructed pointers.
+        let mut have_term = false;
+        let mut have_colorterm = false;
+        let mut env_cs: Vec<CString> = Vec::new();
+        for (k, v) in std::env::vars() {
+            if k == "TERM" {
+                have_term = true;
+            }
+            if k == "COLORTERM" {
+                have_colorterm = true;
+            }
+            if let Ok(cs) = CString::new(format!("{k}={v}")) {
+                env_cs.push(cs);
+            }
+        }
+        if !have_term {
+            env_cs.push(CString::new("TERM=xterm-256color").unwrap());
+        }
+        if !have_colorterm {
+            env_cs.push(CString::new("COLORTERM=truecolor").unwrap());
+        }
+        let envp_ptrs: Vec<*const u8> = env_cs
+            .iter()
+            .map(|cs| cs.as_ptr().cast())
+            .chain(std::iter::once(core::ptr::null()))
+            .collect();
+        let envp: *const *const u8 = envp_ptrs.as_ptr();
+
+        // fork via clone(SIGCHLD, 0)
+        let pid = unsafe { syscall2(Syscall::Clone, Signal::Chld as usize, 0) };
+        match errno_to_err(pid) {
+            Err(e) => Err(PtyError::Fork(e)),
+            Ok(0) => {
+                // ── child ──────────────────────────────────────────────
+                // Start a new session so the slave PTY becomes the
+                // controlling terminal.
+                unsafe { syscall0(Syscall::SetSid) };
+
+                // Open the slave PTY.
+                let slave_fd_ret = unsafe {
+                    syscall3(
+                        Syscall::Open,
+                        slave_path.as_ptr() as usize,
+                        OpenFlags::RDWR.bits(),
+                        0,
+                    )
+                };
+                // Post-fork child: an `if let` with a diverging else is
+                // clearer than `map_or_else` with side-effecting closures.
+                #[allow(clippy::option_if_let_else)]
+                let slave_fd = if let Ok(fd) = errno_to_err(slave_fd_ret) {
+                    RawFd::from_raw(fd)
+                } else {
+                    // Can't report — just exit.
+                    unsafe { syscall1(Syscall::Close, master_fd.as_usize()) };
+                    unsafe { syscall1(Syscall::ExitGroup, 1) };
+                    unreachable!()
+                };
+
+                // Set the slave as the controlling terminal.
+                let _ = slave_fd.set_controlling_terminal();
+
+                // Dup slave onto stdin/stdout/stderr.
+                for dest in [0usize, 1, 2] {
+                    unsafe { syscall2(Syscall::Dup2, slave_fd.as_usize(), dest) };
+                }
+
+                // Close master and extra slave fd.
                 unsafe { syscall1(Syscall::Close, master_fd.as_usize()) };
-                unsafe { syscall1(Syscall::ExitGroup, 1) };
+                if slave_fd.as_i32() > 2 {
+                    unsafe { syscall1(Syscall::Close, slave_fd.as_usize()) };
+                }
+
+                // execve
+                let ret = unsafe {
+                    syscall3(
+                        Syscall::Execve,
+                        shell_cs.as_ptr() as usize,
+                        argv_ptrs.as_mut_ptr() as usize,
+                        envp as usize,
+                    )
+                };
+                // execve only returns on error — exit child.
+                let _ = ret;
+                unsafe { syscall1(Syscall::ExitGroup, 127) };
                 unreachable!()
-            };
-
-            // Set the slave as the controlling terminal.
-            let _ = slave_fd.set_controlling_terminal();
-
-            // Dup slave onto stdin/stdout/stderr.
-            for dest in [0usize, 1, 2] {
-                unsafe { syscall2(Syscall::Dup2, slave_fd.as_usize(), dest) };
             }
-
-            // Close master and extra slave fd.
-            unsafe { syscall1(Syscall::Close, master_fd.as_usize()) };
-            if slave_fd.as_i32() > 2 {
-                unsafe { syscall1(Syscall::Close, slave_fd.as_usize()) };
+            Ok(child_pid) => {
+                // ── parent ─────────────────────────────────────────────
+                Ok((master_fd, ChildPid(child_pid as i32)))
             }
-
-            // execve
-            let ret = unsafe {
-                syscall3(
-                    Syscall::Execve,
-                    shell_cs.as_ptr() as usize,
-                    argv_ptrs.as_mut_ptr() as usize,
-                    envp as usize,
-                )
-            };
-            // execve only returns on error — exit child.
-            let _ = ret;
-            unsafe { syscall1(Syscall::ExitGroup, 127) };
-            unreachable!()
-        }
-        Ok(child_pid) => {
-            // ── parent ─────────────────────────────────────────────────
-            Ok((master_fd, ChildPid(child_pid as i32)))
         }
     }
-}
 
-// ── signalfd ───────────────────────────────────────────────────────────────
+    /// Block `SIGCHLD` in the calling thread and create a `signalfd` for it.
+    ///
+    /// The returned fd is readable (via `io_uring`) whenever a child exits.
+    pub fn signalfd_for_sigchld() -> Result<RawFd, PtyError> {
+        // Block SIGCHLD so it doesn't interrupt syscalls.
+        let mut mask = SigSet::empty();
+        mask.insert(Signal::Chld);
 
-/// Block `SIGCHLD` in the calling thread and create a `signalfd` for it.
-///
-/// The returned fd is readable (via `io_uring`) whenever a child exits.
-pub fn signalfd_for_sigchld() -> Result<RawFd, PtyError> {
-    // Block SIGCHLD so it doesn't interrupt syscalls.
-    let mut mask = SigSet::empty();
-    mask.insert(Signal::Chld);
+        let ret = unsafe {
+            syscall4(
+                Syscall::SigProcMask,
+                SigProcMaskHow::Block as usize,
+                core::ptr::addr_of!(mask) as usize,
+                0,
+                8, // sigsetsz
+            )
+        };
+        errno_to_err(ret).map_err(PtyError::SigMask)?;
 
-    let ret = unsafe {
-        syscall4(
-            Syscall::SigProcMask,
-            SigProcMaskHow::Block as usize,
-            core::ptr::addr_of!(mask) as usize,
-            0,
-            8, // sigsetsz
-        )
-    };
-    errno_to_err(ret).map_err(PtyError::SigMask)?;
-
-    // Create the signalfd.
-    let flags = SignalFdFlags::NONBLOCK | SignalFdFlags::CLOEXEC;
-    let ret = unsafe {
-        syscall4(
-            Syscall::SignalFd4,
-            usize::MAX, // -1 = new fd
-            core::ptr::addr_of!(mask) as usize,
-            8, // sigsetsz
-            flags.bits(),
-        )
-    };
-    errno_to_err(ret)
-        .map(RawFd::from_raw)
-        .map_err(PtyError::SignalFd)
+        // Create the signalfd.
+        let flags = SignalFdFlags::NONBLOCK | SignalFdFlags::CLOEXEC;
+        let ret = unsafe {
+            syscall4(
+                Syscall::SignalFd4,
+                usize::MAX, // -1 = new fd
+                core::ptr::addr_of!(mask) as usize,
+                8, // sigsetsz
+                flags.bits(),
+            )
+        };
+        errno_to_err(ret)
+            .map(RawFd::from_raw)
+            .map_err(PtyError::SignalFd)
+    }
 }

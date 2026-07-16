@@ -25,7 +25,7 @@ mod sys;
 
 pub use error::PtyError;
 pub use simple::PtySimple;
-pub use sys::{ChildPid, CloseFd, PtyIoctl, WinSize};
+pub use sys::{ChildPid, CloseFd, PtyIoctl, RawPty, WinSize};
 
 use quetzal_uring::{CqConsumer, SqProducer, UringQueue};
 use quetzalcoatl::capacity::Capacity;
@@ -116,8 +116,8 @@ impl Pty {
         args: &[&str],
         win_size: WinSize,
     ) -> Result<(Self, ChunkConsumer, WriteProducer, Arc<AtomicBool>), PtyError> {
-        let (master_fd, child_pid) = sys::forkpty(shell, args, win_size)?;
-        let signal_fd = sys::signalfd_for_sigchld()?;
+        let (master_fd, child_pid) = sys::RawPty::fork(shell, args, win_size)?;
+        let signal_fd = sys::RawPty::signalfd_for_sigchld()?;
 
         let (queue, sq, cq) = UringQueue::new(RING_ENTRIES).map_err(PtyError::UringSetup)?;
 

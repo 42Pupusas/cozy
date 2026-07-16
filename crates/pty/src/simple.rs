@@ -6,7 +6,7 @@
 //! spawning a PTY thread. Replaced by `Pty` + ring buffers in M5.
 
 use crate::error::PtyError;
-use crate::sys::{self, ChildPid, CloseFd, PtyIoctl, Syscall, WinSize};
+use crate::sys::{self, ChildPid, CloseFd, PtyIoctl, RawPty, Syscall, WinSize};
 use ququmatz::RawFd;
 
 /// A simple blocking-ish PTY handle for the integration prototype.
@@ -34,7 +34,7 @@ impl PtySimple {
     /// Returns [`PtyError`] if any syscall fails.
     pub fn spawn(shell: &str, args: &[&str], cols: u16, rows: u16) -> Result<Self, PtyError> {
         let win = WinSize { rows, cols, xpixel: 0, ypixel: 0 };
-        let (master_fd, child_pid) = sys::forkpty(shell, args, win)?;
+        let (master_fd, child_pid) = RawPty::fork(shell, args, win)?;
         master_fd.set_nonblock()?;
         Ok(Self { master_fd, child_pid })
     }

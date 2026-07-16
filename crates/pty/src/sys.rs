@@ -168,94 +168,118 @@ impl SigSet {
 
 // ── raw syscall shim ───────────────────────────────────────────────────────
 
-#[inline]
-unsafe fn syscall0(nr: Syscall) -> isize {
-    let ret: isize;
-    // SAFETY: caller upholds the unsafe-fn contract (valid syscall number).
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack)
-        );
+impl Syscall {
+    /// Invoke this syscall with no arguments.
+    ///
+    /// # Safety
+    /// Caller upholds the unsafe-fn contract for whichever syscall `self`
+    /// names (valid arguments, valid pointers, etc. per that syscall's man
+    /// page).
+    #[inline]
+    unsafe fn invoke0(self) -> isize {
+        let ret: isize;
+        // SAFETY: caller upholds the contract documented above.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") self as isize => ret,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        ret
     }
-    ret
-}
 
-#[inline]
-unsafe fn syscall1(nr: Syscall, a0: usize) -> isize {
-    let ret: isize;
-    // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a0,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack)
-        );
+    /// Invoke this syscall with one argument.
+    ///
+    /// # Safety
+    /// See [`Syscall::invoke0`].
+    #[inline]
+    unsafe fn invoke1(self, a0: usize) -> isize {
+        let ret: isize;
+        // SAFETY: caller upholds the contract documented above.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") self as isize => ret,
+                in("rdi") a0,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        ret
     }
-    ret
-}
 
-#[inline]
-pub unsafe fn syscall2(nr: Syscall, a0: usize, a1: usize) -> isize {
-    let ret: isize;
-    // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack)
-        );
+    /// Invoke this syscall with two arguments.
+    ///
+    /// # Safety
+    /// See [`Syscall::invoke0`].
+    #[inline]
+    pub unsafe fn invoke2(self, a0: usize, a1: usize) -> isize {
+        let ret: isize;
+        // SAFETY: caller upholds the contract documented above.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") self as isize => ret,
+                in("rdi") a0,
+                in("rsi") a1,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        ret
     }
-    ret
-}
 
-#[inline]
-pub unsafe fn syscall3(nr: Syscall, a0: usize, a1: usize, a2: usize) -> isize {
-    let ret: isize;
-    // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack)
-        );
+    /// Invoke this syscall with three arguments.
+    ///
+    /// # Safety
+    /// See [`Syscall::invoke0`].
+    #[inline]
+    pub unsafe fn invoke3(self, a0: usize, a1: usize, a2: usize) -> isize {
+        let ret: isize;
+        // SAFETY: caller upholds the contract documented above.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") self as isize => ret,
+                in("rdi") a0,
+                in("rsi") a1,
+                in("rdx") a2,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        ret
     }
-    ret
-}
 
-#[inline]
-unsafe fn syscall4(nr: Syscall, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
-    let ret: isize;
-    // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r10") a3,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack)
-        );
+    /// Invoke this syscall with four arguments.
+    ///
+    /// # Safety
+    /// See [`Syscall::invoke0`].
+    #[inline]
+    unsafe fn invoke4(self, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
+        let ret: isize;
+        // SAFETY: caller upholds the contract documented above.
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inlateout("rax") self as isize => ret,
+                in("rdi") a0,
+                in("rsi") a1,
+                in("rdx") a2,
+                in("r10") a3,
+                lateout("rcx") _,
+                lateout("r11") _,
+                options(nostack)
+            );
+        }
+        ret
     }
-    ret
 }
 
 const fn errno_to_err(ret: isize) -> Result<usize, i32> {
@@ -311,8 +335,7 @@ impl PtyIoctl for RawFd {
     fn pty_number(self) -> Result<u32, PtyError> {
         let mut pts_no: u32 = 0;
         let ret = unsafe {
-            syscall3(
-                Syscall::Ioctl,
+            Syscall::Ioctl.invoke3(
                 self.as_usize(),
                 IoctlRequest::GetPtyNumber as usize,
                 core::ptr::addr_of_mut!(pts_no) as usize,
@@ -324,8 +347,7 @@ impl PtyIoctl for RawFd {
     fn unlock_pty(self) -> Result<(), PtyError> {
         let lock: i32 = 0;
         let ret = unsafe {
-            syscall3(
-                Syscall::Ioctl,
+            Syscall::Ioctl.invoke3(
                 self.as_usize(),
                 IoctlRequest::SetPtyLock as usize,
                 core::ptr::addr_of!(lock) as usize,
@@ -336,8 +358,7 @@ impl PtyIoctl for RawFd {
 
     fn set_win_size(self, win_size: WinSize) -> Result<(), PtyError> {
         let ret = unsafe {
-            syscall3(
-                Syscall::Ioctl,
+            Syscall::Ioctl.invoke3(
                 self.as_usize(),
                 IoctlRequest::SetWinSize as usize,
                 core::ptr::addr_of!(win_size) as usize,
@@ -350,8 +371,7 @@ impl PtyIoctl for RawFd {
     fn get_win_size(self) -> Result<WinSize, PtyError> {
         let mut ws = WinSize::default();
         let ret = unsafe {
-            syscall3(
-                Syscall::Ioctl,
+            Syscall::Ioctl.invoke3(
                 self.as_usize(),
                 IoctlRequest::GetWinSize as usize,
                 core::ptr::addr_of_mut!(ws) as usize,
@@ -362,7 +382,7 @@ impl PtyIoctl for RawFd {
 
     fn set_controlling_terminal(self) -> Result<(), PtyError> {
         let ret = unsafe {
-            syscall3(Syscall::Ioctl, self.as_usize(), IoctlRequest::SetControllingTty as usize, 0)
+            Syscall::Ioctl.invoke3(self.as_usize(), IoctlRequest::SetControllingTty as usize, 0)
         };
         errno_to_err(ret).map(|_| ()).map_err(PtyError::OpenPt)
     }
@@ -377,7 +397,7 @@ pub trait CloseFd {
 
 impl CloseFd for RawFd {
     fn close(self) -> Result<(), i32> {
-        let ret = unsafe { syscall1(Syscall::Close, self.as_usize()) };
+        let ret = unsafe { Syscall::Close.invoke1(self.as_usize()) };
         errno_to_err(ret).map(|_| ())
     }
 }
@@ -397,7 +417,7 @@ impl ChildPid {
     /// outlive us as an orphan holding the PTY slave open).
     pub fn hangup(self) {
         if self.0 > 0 {
-            unsafe { syscall2(Syscall::Kill, self.0 as usize, Signal::Hup as usize) };
+            unsafe { Syscall::Kill.invoke2(self.0 as usize, Signal::Hup as usize) };
         }
     }
 
@@ -409,8 +429,7 @@ impl ChildPid {
         }
         let mut status: i32 = 0;
         unsafe {
-            syscall4(
-                Syscall::Wait4,
+            Syscall::Wait4.invoke4(
                 self.0 as usize,
                 core::ptr::addr_of_mut!(status) as usize,
                 Wait4Flags::Blocking as usize,
@@ -419,26 +438,51 @@ impl ChildPid {
         };
     }
 
-    /// Non-blocking reap (`WNOHANG`); returns the exit code if the child has
-    /// already exited.
+    /// Non-blocking reap (`WNOHANG`).
+    ///
+    /// `wait4`'s return value distinguishes "nothing to reap yet" (returns
+    /// `0`) from "reaped this pid" (returns the pid) -- collapsing that into
+    /// a bare exit-code `i32` would silently misreport a still-running child
+    /// as "exited with code 0". [`WaitStatus`] keeps that distinction, plus
+    /// whether the child exited normally vs. died by signal.
     ///
     /// # Errors
     /// Returns [`PtyError::WaitPid`] if `wait4` fails.
-    pub fn wait_nohang(self) -> Result<i32, PtyError> {
+    pub fn wait_nohang(self) -> Result<WaitStatus, PtyError> {
         let mut status: i32 = 0;
         let ret = unsafe {
-            syscall4(
-                Syscall::Wait4,
+            Syscall::Wait4.invoke4(
                 self.0 as usize,
                 core::ptr::addr_of_mut!(status) as usize,
                 Wait4Flags::NoHang as usize,
                 0,
             )
         };
-        errno_to_err(ret).map_err(PtyError::WaitPid)?;
-        // Decode exit status: WEXITSTATUS(status)
-        Ok((status >> 8) & 0xff)
+        let reaped_pid = errno_to_err(ret).map_err(PtyError::WaitPid)?;
+        if reaped_pid == 0 {
+            return Ok(WaitStatus::StillRunning);
+        }
+        // WIFEXITED(status): low 7 bits of status are 0 for a normal exit.
+        #[allow(clippy::verbose_bit_mask)] // & 0x7f reads as WIFEXITED's mask, not a power-of-two check
+        if status & 0x7f == 0 {
+            // WEXITSTATUS(status)
+            Ok(WaitStatus::Exited((status >> 8) & 0xff))
+        } else {
+            // WTERMSIG(status)
+            Ok(WaitStatus::Signaled(status & 0x7f))
+        }
     }
+}
+
+/// Outcome of a non-blocking [`ChildPid::wait_nohang`] reap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitStatus {
+    /// The child has not exited yet (`wait4` returned 0 under `WNOHANG`).
+    StillRunning,
+    /// The child exited normally with this exit code.
+    Exited(i32),
+    /// The child was killed by this signal number.
+    Signaled(i32),
 }
 
 // ── PTY open/fork ──────────────────────────────────────────────────────────
@@ -459,7 +503,7 @@ impl RawPty {
         // "/dev/ptmx\0"
         let path: &[u8] = b"/dev/ptmx\0";
         let flags = OpenFlags::RDWR | OpenFlags::NOCTTY | OpenFlags::CLOEXEC;
-        let ret = unsafe { syscall3(Syscall::Open, path.as_ptr() as usize, flags.bits(), 0) };
+        let ret = unsafe { Syscall::Open.invoke3(path.as_ptr() as usize, flags.bits(), 0) };
         errno_to_err(ret)
             .map(RawFd::from_raw)
             .map_err(PtyError::OpenPt)
@@ -545,19 +589,18 @@ impl RawPty {
         let envp: *const *const u8 = envp_ptrs.as_ptr();
 
         // fork via clone(SIGCHLD, 0)
-        let pid = unsafe { syscall2(Syscall::Clone, Signal::Chld as usize, 0) };
+        let pid = unsafe { Syscall::Clone.invoke2(Signal::Chld as usize, 0) };
         match errno_to_err(pid) {
             Err(e) => Err(PtyError::Fork(e)),
             Ok(0) => {
                 // ── child ──────────────────────────────────────────────
                 // Start a new session so the slave PTY becomes the
                 // controlling terminal.
-                unsafe { syscall0(Syscall::SetSid) };
+                unsafe { Syscall::SetSid.invoke0() };
 
                 // Open the slave PTY.
                 let slave_fd_ret = unsafe {
-                    syscall3(
-                        Syscall::Open,
+                    Syscall::Open.invoke3(
                         slave_path.as_ptr() as usize,
                         OpenFlags::RDWR.bits(),
                         0,
@@ -569,38 +612,48 @@ impl RawPty {
                 let slave_fd = if let Ok(fd) = errno_to_err(slave_fd_ret) {
                     RawFd::from_raw(fd)
                 } else {
-                    // Can't report — just exit.
-                    unsafe { syscall1(Syscall::Close, master_fd.as_usize()) };
-                    unsafe { syscall1(Syscall::ExitGroup, 1) };
+                    // Can't report -- just exit.
+                    unsafe { Syscall::Close.invoke1(master_fd.as_usize()) };
+                    unsafe { Syscall::ExitGroup.invoke1(1) };
                     unreachable!()
                 };
 
-                // Set the slave as the controlling terminal.
-                let _ = slave_fd.set_controlling_terminal();
+                // Set the slave as the controlling terminal. If this fails
+                // the shell starts with no controlling tty -- no job
+                // control, Ctrl-C/Ctrl-Z don't work -- which is bad enough
+                // to abort the child rather than limp on silently.
+                if slave_fd.set_controlling_terminal().is_err() {
+                    unsafe { Syscall::Close.invoke1(master_fd.as_usize()) };
+                    unsafe { Syscall::Close.invoke1(slave_fd.as_usize()) };
+                    unsafe { Syscall::ExitGroup.invoke1(1) };
+                    unreachable!()
+                }
 
                 // Dup slave onto stdin/stdout/stderr.
                 for dest in [0usize, 1, 2] {
-                    unsafe { syscall2(Syscall::Dup2, slave_fd.as_usize(), dest) };
+                    unsafe { Syscall::Dup2.invoke2(slave_fd.as_usize(), dest) };
                 }
 
                 // Close master and extra slave fd.
-                unsafe { syscall1(Syscall::Close, master_fd.as_usize()) };
+                unsafe { Syscall::Close.invoke1(master_fd.as_usize()) };
                 if slave_fd.as_i32() > 2 {
-                    unsafe { syscall1(Syscall::Close, slave_fd.as_usize()) };
+                    unsafe { Syscall::Close.invoke1(slave_fd.as_usize()) };
                 }
 
-                // execve
-                let ret = unsafe {
-                    syscall3(
-                        Syscall::Execve,
+                // execve only returns on error -- exit child. There is
+                // nowhere left to report the errno (we're past the point of
+                // no return, stdio is already the slave), so a fixed exit
+                // code is genuinely the best we can do here, matching the
+                // shell convention of 127 for "command not found/exec
+                // failed".
+                unsafe {
+                    Syscall::Execve.invoke3(
                         shell_cs.as_ptr() as usize,
                         argv_ptrs.as_mut_ptr() as usize,
                         envp as usize,
                     )
                 };
-                // execve only returns on error — exit child.
-                let _ = ret;
-                unsafe { syscall1(Syscall::ExitGroup, 127) };
+                unsafe { Syscall::ExitGroup.invoke1(127) };
                 unreachable!()
             }
             Ok(child_pid) => {
@@ -619,8 +672,7 @@ impl RawPty {
         mask.insert(Signal::Chld);
 
         let ret = unsafe {
-            syscall4(
-                Syscall::SigProcMask,
+            Syscall::SigProcMask.invoke4(
                 SigProcMaskHow::Block as usize,
                 core::ptr::addr_of!(mask) as usize,
                 0,
@@ -632,8 +684,7 @@ impl RawPty {
         // Create the signalfd.
         let flags = SignalFdFlags::NONBLOCK | SignalFdFlags::CLOEXEC;
         let ret = unsafe {
-            syscall4(
-                Syscall::SignalFd4,
+            Syscall::SignalFd4.invoke4(
                 usize::MAX, // -1 = new fd
                 core::ptr::addr_of!(mask) as usize,
                 8, // sigsetsz

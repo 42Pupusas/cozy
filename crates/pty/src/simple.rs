@@ -6,7 +6,7 @@
 //! spawning a PTY thread. Replaced by `Pty` + ring buffers in M5.
 
 use crate::error::PtyError;
-use crate::sys::{self, ChildPid, CloseFd, PtyIoctl, RawPty, Syscall, WinSize};
+use crate::sys::{ChildPid, CloseFd, PtyIoctl, RawPty, Syscall, WinSize};
 use ququmatz::RawFd;
 
 /// A simple blocking-ish PTY handle for the integration prototype.
@@ -109,13 +109,12 @@ impl PtyRawIo for RawFd {
     fn set_nonblock(self) -> Result<(), PtyError> {
         use crate::sys::{FcntlCmd, OpenFlags};
 
-        let flags = unsafe { sys::syscall2(Syscall::Fcntl, self.as_usize(), FcntlCmd::GetFl as usize) };
+        let flags = unsafe { Syscall::Fcntl.invoke2(self.as_usize(), FcntlCmd::GetFl as usize) };
         if flags < 0 {
             return Err(PtyError::Exec(-flags as i32));
         }
         let ret = unsafe {
-            sys::syscall3(
-                Syscall::Fcntl,
+            Syscall::Fcntl.invoke3(
                 self.as_usize(),
                 FcntlCmd::SetFl as usize,
                 flags as usize | OpenFlags::NONBLOCK.bits(),
@@ -128,10 +127,10 @@ impl PtyRawIo for RawFd {
     }
 
     fn raw_read(self, buf: &mut [u8]) -> isize {
-        unsafe { sys::syscall3(Syscall::Read, self.as_usize(), buf.as_mut_ptr() as usize, buf.len()) }
+        unsafe { Syscall::Read.invoke3(self.as_usize(), buf.as_mut_ptr() as usize, buf.len()) }
     }
 
     fn raw_write(self, buf: &[u8]) -> isize {
-        unsafe { sys::syscall3(Syscall::Write, self.as_usize(), buf.as_ptr() as usize, buf.len()) }
+        unsafe { Syscall::Write.invoke3(self.as_usize(), buf.as_ptr() as usize, buf.len()) }
     }
 }

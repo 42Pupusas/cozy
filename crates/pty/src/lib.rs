@@ -25,7 +25,7 @@ mod sys;
 
 pub use error::PtyError;
 pub use simple::PtySimple;
-pub use sys::{ChildPid, CloseFd, PtyIoctl, RawPty, WinSize};
+pub use sys::{ChildPid, CloseFd, PtyIoctl, RawPty, WaitStatus, WinSize};
 
 use quetzal_uring::{CqConsumer, SqProducer, UringQueue};
 use quetzalcoatl::capacity::Capacity;
@@ -231,10 +231,37 @@ impl Pty {
                         // will submit more if pending.
                     }
                     CqeAction::Signal => {
-                        exit_code = self.child_pid.wait_nohang().unwrap_or(0);
-                        got_exit = true;
-                        // Rearm the signalfd read for future signals.
-                        let _ = self.arm_signal();
+                        match self.child_pid.wait_nohang() {
+                            Ok(sys::WaitStatus::Exited(code)) => {
+                                exit_code = code;
+                                got_exit = true;
+                            }
+                            Ok(sys::WaitStatus::Signaled(_)) => {
+                                // Killed by a signal: no POSIX exit code:
+                                // report the shell convention (128 + signum)
+                                // rather than silently claiming success.
+                                exit_code = 128;
+                                got_exit = true;
+                            }
+                            Ok(sys::WaitStatus::StillRunning) => {
+                                // Spurious SIGCHLD wakeup (e.g. the child
+                                // was stopped/continued, not exited) --
+                                // nothing to reap yet, keep going.
+                            }
+                            Err(_) => {
+                                // wait4 failed: treat as exited so we don't
+                                // spin forever re-arming a signalfd that
+                                // can no longer tell us anything, but don't
+                                // claim a fabricated success code either.
+                                exit_code = -1;
+                                got_exit = true;
+                            }
+                        }
+                        // Rearm the signalfd read for future signals, unless
+                        // we're already tearing down.
+                        if !got_exit {
+                            self.arm_signal()?;
+                        }
                     }
                     CqeAction::None => {}
                 }

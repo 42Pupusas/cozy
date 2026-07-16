@@ -234,8 +234,13 @@ pub struct TermWindow {
     /// thread, no round-trip to the parser-owned grid. Indexed `[row][col]`,
     /// only the visible viewport.
     cell_mirror: Vec<Vec<grid::Cell>>,
-    /// Active mouse-drag selection, in viewport cell coords `(col, row)`.
-    selection: Option<((u16, u16), (u16, u16))>,
+    /// Active mouse-drag selection as `(col, row)` endpoints. `row` is a
+    /// *signed* viewport row: it can go negative when the selected text
+    /// scrolls off the top into scrollback, which keeps the selection
+    /// logically anchored to its text (scrolling back down reveals it still
+    /// selected) instead of being cleared. Renderers/extractors clamp to the
+    /// visible range.
+    selection: Option<((u16, i32), (u16, i32))>,
     /// Current viewport offset (lines scrolled into scrollback; 0 = live
     /// bottom). Tracked so a wheel-scroll shifts the selection with the text:
     /// the content is fixed but the view window moves, so a selection at
@@ -545,32 +550,18 @@ impl TermWindow {
         self.input_queue.pop_front()
     }
 
-    /// Shift the active selection up by `delta` rows to follow content that
-    /// scrolled off the top (new output pushed lines into scrollback). Rows
-    /// that scrolled away are dropped; if the whole selection scrolled off,
-    /// it's cleared. This keeps a highlight glued to its text as output
-    /// streams in, instead of stranding it on the viewport position.
+    /// Shift the active selection vertically by `delta` rows to follow its
+    /// text as the screen scrolls (positive `delta` = content scrolled up,
+    /// selection rows move up; negative = viewport scrolled into history,
+    /// selection rows move down). Rows may go negative — that just means the
+    /// selected text is currently above the visible area; the selection stays
+    /// anchored and reappears when you scroll back. Never clears.
     fn shift_selection_for_scroll(&mut self, delta: i32) {
         let Some(((ac, ar), (bc, br))) = self.selection else {
             return;
         };
-        let shift = |row: u16| -> Option<u16> {
-            let r = i32::from(row) - delta;
-            if r < 0 { None } else { Some(r as u16) }
-        };
-        match (shift(ar), shift(br)) {
-            (Some(nar), Some(nbr)) => {
-                self.selection = Some(((ac, nar), (bc, nbr)));
-                self.dirty = true;
-            }
-            // One end scrolled off: the selection is gone entirely (it spanned
-            // rows that are no longer on screen in a way we can't faithfully
-            // re-anchor), so clear it rather than show a wrong range.
-            _ => {
-                self.selection = None;
-                self.dirty = true;
-            }
-        }
+        self.selection = Some(((ac, ar - delta), (bc, br - delta)));
+        self.dirty = true;
     }
 
     /// The grid cell under the pointer, in viewport coordinates, or `(0,0)`
@@ -596,7 +587,13 @@ impl TermWindow {
         };
         let mut out = String::new();
         for row in sr..=er {
-            let line = self.cell_mirror.get(usize::from(row))?;
+            // Rows above/below the visible area (negative or past the mirror)
+            // hold no extractable text — skip them; the selection itself stays
+            // anchored and yields its text again once scrolled back on-screen.
+            if row < 0 {
+                continue;
+            }
+            let line = self.cell_mirror.get(row as usize)?;
             let c0 = if row == sr { usize::from(sc) } else { 0 };
             let c1 = if row == er {
                 usize::from(ec)
@@ -978,7 +975,8 @@ impl TermWindow {
                         // held — releasing ends the drag.
                         if self.left_held {
                             if let Some((anchor, _)) = self.selection {
-                                let cell = self.pointer_cell();
+                                let (cc, cr) = self.pointer_cell();
+                                let cell = (cc, i32::from(cr));
                                 if cell != anchor {
                                     self.selection = Some((anchor, cell));
                                     self.drag_moved = true;
@@ -1005,7 +1003,8 @@ impl TermWindow {
                                     // pointer cell; whether it becomes a real
                                     // selection or a no-op click is decided by
                                     // whether the pointer moves before release.
-                                    let cell = self.pointer_cell();
+                                    let (cc, cr) = self.pointer_cell();
+                                    let cell = (cc, i32::from(cr));
                                     self.selection = Some((cell, cell));
                                     self.drag_moved = false;
                                 }
@@ -1034,10 +1033,11 @@ impl TermWindow {
                         if axis == 0 {
                             // Convert the scroll magnitude to whole lines. A
                             // typical wheel detent is 15 (|value| ~ 15.0); map
-                            // each such step to 3 lines, like most terminals.
+                            // each such step to 1 line, for fine-grained
+                            // line-at-a-time scrolling.
                             let px = value.to_pixels().abs();
                             let steps = ((px + 7) / 15).max(1);
-                            let lines = steps * 3;
+                            let lines = steps;
                             let signed = if value.0 < 0 { lines } else { -lines };
                             self.input_queue
                                 .push_back(InputEvent::Scroll { lines: signed });
@@ -1215,14 +1215,20 @@ impl TermWindow {
     }
 
     /// The viewport rows the current selection touches (empty if none).
+    /// Selection rows are signed and may extend past the visible area
+    /// (selected text scrolled into scrollback); only the on-screen span is
+    /// returned, since off-screen rows need no repaint.
     fn selection_rows(&self) -> Vec<u16> {
         let Some(((_, ar), (_, br))) = self.selection else {
             return Vec::new();
         };
-        let rows = (self.height / self.cell_h).max(1) as u16;
-        let lo = ar.min(br);
-        let hi = ar.max(br).min(rows.saturating_sub(1));
-        (lo..=hi).collect()
+        let rows = (self.height / self.cell_h).max(1) as i32;
+        let lo = ar.min(br).max(0);
+        let hi = ar.max(br).min(rows - 1);
+        if lo > hi {
+            return Vec::new();
+        }
+        (lo..=hi).map(|r| r as u16).collect()
     }
 
     /// Overlay the selection highlight onto the backbuffer: each selected
@@ -1250,12 +1256,17 @@ impl TermWindow {
         const INV: u32 = 255 - ALPHA;
 
         let cols = (self.width / self.cell_w).max(1) as u16;
-        let rows = (self.height / self.cell_h).max(1) as u16;
+        let rows = (self.height / self.cell_h).max(1) as i32;
         let buf_w = self.width as usize;
 
-        for row in sr..=er.min(rows.saturating_sub(1)) {
-            let c0 = if row == sr { sc } else { 0 };
-            let c1 = if row == er { ec } else { cols - 1 };
+        // Clamp the signed selection span to the visible rows — off-screen
+        // (scrolled-away) parts of the selection get no highlight.
+        let vis_start = sr.max(0);
+        let vis_end = er.min(rows - 1);
+        for r in vis_start..=vis_end {
+            let row = r as u16;
+            let c0 = if r == sr { sc } else { 0 };
+            let c1 = if r == er { ec } else { cols - 1 };
             let c1 = c1.min(cols - 1);
             let py0 = usize::from(row) * self.cell_h as usize;
             let px0 = usize::from(c0) * self.cell_w as usize;

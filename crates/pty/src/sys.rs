@@ -286,11 +286,26 @@ impl Syscall {
     }
 }
 
-const fn errno_to_err(ret: isize) -> Result<usize, i32> {
-    if ret < 0 {
-        Err((-ret) as i32)
-    } else {
-        Ok(ret as usize)
+/// Extension trait turning a raw syscall return value into a `Result`.
+///
+/// Every direct syscall in this module returns a bare `isize`: negative is
+/// `-errno`, non-negative is the success value (fd, byte count, pid, ...).
+/// Was a free `errno_to_err(ret: isize)` function -- since its only argument
+/// IS the raw return value, it reads more clearly as a method on that value
+/// (`ret.into_errno_result()`), matching the `PtyIoctl`/`CloseFd` extension-
+/// trait-on-primitive style already used elsewhere in this file.
+trait RawSyscallReturn {
+    /// `Ok(n)` for `ret >= 0`, `Err(errno)` (positive) for `ret < 0`.
+    fn into_errno_result(self) -> Result<usize, i32>;
+}
+
+impl RawSyscallReturn for isize {
+    fn into_errno_result(self) -> Result<usize, i32> {
+        if self < 0 {
+            Err((-self) as i32)
+        } else {
+            Ok(self as usize)
+        }
     }
 }
 
@@ -345,7 +360,7 @@ impl PtyIoctl for RawFd {
                 core::ptr::addr_of_mut!(pts_no) as usize,
             )
         };
-        errno_to_err(ret).map(|_| pts_no).map_err(PtyError::OpenPt)
+        ret.into_errno_result().map(|_| pts_no).map_err(PtyError::OpenPt)
     }
 
     fn unlock_pty(self) -> Result<(), PtyError> {
@@ -357,7 +372,7 @@ impl PtyIoctl for RawFd {
                 core::ptr::addr_of!(lock) as usize,
             )
         };
-        errno_to_err(ret).map(|_| ()).map_err(PtyError::OpenPt)
+        ret.into_errno_result().map(|_| ()).map_err(PtyError::OpenPt)
     }
 
     fn set_win_size(self, win_size: WinSize) -> Result<(), PtyError> {
@@ -368,7 +383,7 @@ impl PtyIoctl for RawFd {
                 core::ptr::addr_of!(win_size) as usize,
             )
         };
-        errno_to_err(ret).map(|_| ()).map_err(PtyError::WinSize)
+        ret.into_errno_result().map(|_| ()).map_err(PtyError::WinSize)
     }
 
     #[allow(dead_code)] // exposed for completeness; no current caller queries winsize
@@ -381,14 +396,14 @@ impl PtyIoctl for RawFd {
                 core::ptr::addr_of_mut!(ws) as usize,
             )
         };
-        errno_to_err(ret).map(|_| ws).map_err(PtyError::WinSize)
+        ret.into_errno_result().map(|_| ws).map_err(PtyError::WinSize)
     }
 
     fn set_controlling_terminal(self) -> Result<(), PtyError> {
         let ret = unsafe {
             Syscall::Ioctl.invoke3(self.as_usize(), IoctlRequest::SetControllingTty as usize, 0)
         };
-        errno_to_err(ret).map(|_| ()).map_err(PtyError::OpenPt)
+        ret.into_errno_result().map(|_| ()).map_err(PtyError::OpenPt)
     }
 }
 
@@ -402,7 +417,7 @@ pub trait CloseFd {
 impl CloseFd for RawFd {
     fn close(self) -> Result<(), i32> {
         let ret = unsafe { Syscall::Close.invoke1(self.as_usize()) };
-        errno_to_err(ret).map(|_| ())
+        ret.into_errno_result().map(|_| ())
     }
 }
 
@@ -462,7 +477,7 @@ impl ChildPid {
                 0,
             )
         };
-        let reaped_pid = errno_to_err(ret).map_err(PtyError::WaitPid)?;
+        let reaped_pid = ret.into_errno_result().map_err(PtyError::WaitPid)?;
         if reaped_pid == 0 {
             return Ok(WaitStatus::StillRunning);
         }
@@ -523,7 +538,7 @@ impl RawPty {
         let path: &[u8] = b"/dev/ptmx\0";
         let flags = OpenFlags::RDWR | OpenFlags::NOCTTY | OpenFlags::CLOEXEC;
         let ret = unsafe { Syscall::Open.invoke3(path.as_ptr() as usize, flags.bits(), 0) };
-        errno_to_err(ret)
+        ret.into_errno_result()
             .map(RawFd::from_raw)
             .map_err(PtyError::OpenPt)
     }
@@ -609,7 +624,7 @@ impl RawPty {
 
         // fork via clone(SIGCHLD, 0)
         let pid = unsafe { Syscall::Clone.invoke2(Signal::Chld as usize, 0) };
-        match errno_to_err(pid) {
+        match pid.into_errno_result() {
             Err(e) => Err(PtyError::Fork(e)),
             Ok(0) => {
                 // ── child ──────────────────────────────────────────────
@@ -624,7 +639,7 @@ impl RawPty {
                 // Post-fork child: an `if let` with a diverging else is
                 // clearer than `map_or_else` with side-effecting closures.
                 #[allow(clippy::option_if_let_else)]
-                let slave_fd = if let Ok(fd) = errno_to_err(slave_fd_ret) {
+                let slave_fd = if let Ok(fd) = slave_fd_ret.into_errno_result() {
                     RawFd::from_raw(fd)
                 } else {
                     // Can't report -- just exit.
@@ -694,7 +709,7 @@ impl RawPty {
                 8, // sigsetsz
             )
         };
-        errno_to_err(ret).map_err(PtyError::SigMask)?;
+        ret.into_errno_result().map_err(PtyError::SigMask)?;
 
         // Create the signalfd.
         let flags = SignalFdFlags::NONBLOCK | SignalFdFlags::CLOEXEC;
@@ -706,7 +721,7 @@ impl RawPty {
                 flags.bits(),
             )
         };
-        errno_to_err(ret)
+        ret.into_errno_result()
             .map(RawFd::from_raw)
             .map_err(PtyError::SignalFd)
     }
@@ -714,7 +729,7 @@ impl RawPty {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenFlags, SigSet, Signal, WaitStatus, errno_to_err};
+    use super::{OpenFlags, RawSyscallReturn, SigSet, Signal, WaitStatus};
 
     #[test]
     fn wait_status_normal_exit_zero() {
@@ -794,21 +809,21 @@ mod tests {
 
     #[test]
     fn errno_to_err_positive_is_ok() {
-        assert_eq!(errno_to_err(42), Ok(42));
+        assert_eq!(42isize.into_errno_result(), Ok(42));
     }
 
     #[test]
     fn errno_to_err_zero_is_ok() {
-        assert_eq!(errno_to_err(0), Ok(0));
+        assert_eq!(0isize.into_errno_result(), Ok(0));
     }
 
     #[test]
     fn errno_to_err_negative_becomes_positive_errno() {
-        assert_eq!(errno_to_err(-11), Err(11));
+        assert_eq!((-11isize).into_errno_result(), Err(11));
     }
 
     #[test]
     fn errno_to_err_negative_one() {
-        assert_eq!(errno_to_err(-1), Err(1));
+        assert_eq!((-1isize).into_errno_result(), Err(1));
     }
 }

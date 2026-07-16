@@ -28,19 +28,33 @@ pub const TAG_POST: usize = 9;
 // reserved slots for CFF/CFF2/etc
 const _TAG_COUNT: usize = 16;
 
-const fn tag_index(tag: [u8; 4]) -> Option<usize> {
-    match &tag {
-        b"cmap" => Some(TAG_CMAP),
-        b"glyf" => Some(TAG_GLYF),
-        b"head" => Some(TAG_HEAD),
-        b"hhea" => Some(TAG_HHEA),
-        b"hmtx" => Some(TAG_HMTX),
-        b"loca" => Some(TAG_LOCA),
-        b"maxp" => Some(TAG_MAXP),
-        b"name" => Some(TAG_NAME),
-        b"OS/2" => Some(TAG_OS2),
-        b"post" => Some(TAG_POST),
-        _ => None,
+/// A raw 4-byte sfnt table tag (`"cmap"`, `"glyf"`, ...) as found in a font's
+/// table directory.
+///
+/// Was a free `tag_index(tag: [u8; 4]) -> Option<usize>` function; its sole
+/// argument is a bare `[u8; 4]` with no type of its own to hang the lookup
+/// off of, so this newtype gives it one -- `Tag(raw).index()` reads as
+/// "this tag's slot", rather than a disembodied byte-array classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Tag(pub [u8; 4]);
+
+impl Tag {
+    /// This tag's slot in [`FontFile::tables`], or `None` for tags this
+    /// parser doesn't track (CFF/CFF2/etc).
+    const fn index(self) -> Option<usize> {
+        match &self.0 {
+            b"cmap" => Some(TAG_CMAP),
+            b"glyf" => Some(TAG_GLYF),
+            b"head" => Some(TAG_HEAD),
+            b"hhea" => Some(TAG_HHEA),
+            b"hmtx" => Some(TAG_HMTX),
+            b"loca" => Some(TAG_LOCA),
+            b"maxp" => Some(TAG_MAXP),
+            b"name" => Some(TAG_NAME),
+            b"OS/2" => Some(TAG_OS2),
+            b"post" => Some(TAG_POST),
+            _ => None,
+        }
     }
 }
 
@@ -130,7 +144,7 @@ impl<'a> FontFile<'a> {
             let tag: [u8; 4] = data[base..base + 4].try_into().unwrap();
             let offset = data.u32_at(base + 8).ok_or(ParseError::TooShort)? as usize;
             let length = data.u32_at(base + 12).ok_or(ParseError::TooShort)? as usize;
-            if let Some(idx) = tag_index(tag) {
+            if let Some(idx) = Tag(tag).index() {
                 tables[idx] = Some(TableRecord { offset, length });
             }
         }

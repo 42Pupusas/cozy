@@ -125,13 +125,13 @@ impl LineBreaker {
                         } else {
                             // Non-whitespace opportunity (CJK) that overflows →
                             // roll back to the last opportunity or force-break here.
-                            let (end, next, w) =
-                                Opportunity::rollback_or_here(last_opportunity.as_ref(), i, line_width);
-                            lines.push(LineBreak {
-                                start_segment: line_start,
-                                end_segment: end,
-                                width: w,
-                            });
+                            let next = Self::flush_rollback(
+                                &mut lines,
+                                last_opportunity.as_ref(),
+                                i,
+                                line_start,
+                                line_width,
+                            );
                             line_start = next;
                             line_width = 0;
                             last_opportunity = None;
@@ -167,13 +167,13 @@ impl LineBreaker {
                 BreakKind::Prohibited => {
                     if !unlimited && line_width > 0 && line_width + seg.width > max_width {
                         // Roll back to the last opportunity, or force-break before here.
-                        let (end, next, w) =
-                            Opportunity::rollback_or_here(last_opportunity.as_ref(), i, line_width);
-                        lines.push(LineBreak {
-                            start_segment: line_start,
-                            end_segment: end,
-                            width: w,
-                        });
+                        let next = Self::flush_rollback(
+                            &mut lines,
+                            last_opportunity.as_ref(),
+                            i,
+                            line_start,
+                            line_width,
+                        );
                         line_start = next;
                         line_width = 0;
                         last_opportunity = None;
@@ -195,8 +195,28 @@ impl LineBreaker {
 
         lines
     }
-}
 
+    /// Shared tail of the two overflow-rollback branches: resolve where this
+    /// line actually ends (via [`Opportunity::rollback_or_here`]), push the
+    /// finished [`LineBreak`], and return the next line's starting segment.
+    /// Pulled out purely to keep `compute_breaks` under clippy's line-count
+    /// lint -- the two call sites were byte-for-byte identical.
+    fn flush_rollback(
+        lines: &mut Vec<LineBreak>,
+        last_opportunity: Option<&Opportunity>,
+        i: usize,
+        line_start: usize,
+        line_width: usize,
+    ) -> usize {
+        let (end, next, w) = Opportunity::rollback_or_here(last_opportunity, i, line_width);
+        lines.push(LineBreak {
+            start_segment: line_start,
+            end_segment: end,
+            width: w,
+        });
+        next
+    }
+}
 
 /// True if every byte of a segment's text is an ASCII space or tab.
 ///

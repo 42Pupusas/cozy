@@ -10,15 +10,24 @@ use crate::{
 const JBM: &str = "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf";
 const PX: f32 = 16.0;
 
-fn load_bytes() -> Vec<u8> {
-    std::fs::read(JBM).expect("JetBrains Mono not found — install fonts-jetbrains-mono")
+/// The one test fixture font (JetBrains Mono), namespaced as a zero-sized
+/// marker type rather than a bare `load_bytes()` function -- reads as
+/// `Jbm::bytes()`, the same "constructor namespace" shape used for
+/// `RawPty::fork` etc. in the non-test code, instead of a free fn with an
+/// implicit global (`JBM`) as its real input.
+struct Jbm;
+
+impl Jbm {
+    fn bytes() -> Vec<u8> {
+        std::fs::read(JBM).expect("JetBrains Mono not found — install fonts-jetbrains-mono")
+    }
 }
 
 // ── parse ─────────────────────────────────────────────────────────────────────
 
 #[test]
 fn parse_offset_table() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     // Required tables must be present.
     assert!(ff.table(crate::parse::TAG_HEAD).is_some(), "head missing");
@@ -58,7 +67,7 @@ fn parse_error_display_messages() {
 
 #[test]
 fn head_units_per_em_sane() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let head = Head::parse(&ff).unwrap();
     // Common values: 1000 (PostScript) or 2048 (TrueType)
@@ -71,7 +80,7 @@ fn head_units_per_em_sane() {
 
 #[test]
 fn hhea_ascender_positive_descender_negative() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let hhea = Hhea::parse(&ff).unwrap();
     assert!(hhea.ascender > 0, "ascender = {}", hhea.ascender);
@@ -80,7 +89,7 @@ fn hhea_ascender_positive_descender_negative() {
 
 #[test]
 fn maxp_num_glyphs_nonzero() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let maxp = Maxp::parse(&ff).unwrap();
     assert!(maxp.num_glyphs > 100, "num_glyphs = {}", maxp.num_glyphs);
@@ -88,7 +97,7 @@ fn maxp_num_glyphs_nonzero() {
 
 #[test]
 fn cmap_ascii_maps_correctly() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let cmap = Cmap::parse(&ff).unwrap();
 
@@ -104,7 +113,7 @@ fn cmap_ascii_maps_correctly() {
 
 #[test]
 fn cmap_notdef_for_unmapped() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let cmap = Cmap::parse(&ff).unwrap();
     // U+E000 private use — almost certainly unmapped in JBM.
@@ -114,7 +123,7 @@ fn cmap_notdef_for_unmapped() {
 
 #[test]
 fn hmtx_advance_nonzero_for_m() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let hhea = Hhea::parse(&ff).unwrap();
     let hmtx = Hmtx::parse(&ff, hhea.number_of_hmetrics).unwrap();
@@ -126,7 +135,7 @@ fn hmtx_advance_nonzero_for_m() {
 
 #[test]
 fn loca_gives_range_for_m() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let head = Head::parse(&ff).unwrap();
     let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
@@ -143,7 +152,7 @@ fn loca_gives_range_for_m() {
 
 #[test]
 fn outline_m_has_verbs() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let head = Head::parse(&ff).unwrap();
     let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
@@ -157,7 +166,7 @@ fn outline_m_has_verbs() {
 
 #[test]
 fn outline_space_is_empty() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let head = Head::parse(&ff).unwrap();
     let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
@@ -174,7 +183,7 @@ fn outline_space_is_empty() {
 
 #[test]
 fn raster_m_produces_nonzero_pixels() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let head = Head::parse(&ff).unwrap();
     let hhea = Hhea::parse(&ff).unwrap();
@@ -198,7 +207,7 @@ fn raster_m_produces_nonzero_pixels() {
 
 #[test]
 fn raster_bitmap_correct_size() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let head = Head::parse(&ff).unwrap();
     let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
@@ -226,7 +235,7 @@ fn atlas_inserts_blank_glyph_as_zero_size() {
 
 #[test]
 fn atlas_packs_without_overflow() {
-    let data = load_bytes();
+    let data = Jbm::bytes();
     let ff = FontFile::parse(&data).unwrap();
     let head = Head::parse(&ff).unwrap();
     let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();

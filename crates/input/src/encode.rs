@@ -150,7 +150,7 @@ impl Encoder {
         // Ctrl+letter → C0 control codes.
         if mods.ctrl()
             && let Key::Char(c) = key
-            && let Some(byte) = ctrl_byte(c)
+            && let Some(byte) = c.ctrl_byte()
         {
             let mut w = SeqWriter::new(buf);
             w.byte(byte);
@@ -537,24 +537,6 @@ impl SeqWriter<'_> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Ctrl+letter → C0 byte (a=1 … z=26, space=0, @=0, [=27, \=28, ]=29, ^=30, _=31).
-const fn ctrl_byte(c: char) -> Option<u8> {
-    match c {
-        'a'..='z' => Some(c as u8 - b'a' + 1),
-        'A'..='Z' => Some(c as u8 - b'A' + 1),
-        // `@`/space and the digit aliases collapse to the same C0 codes
-        // (Ctrl+2 = NUL, Ctrl+3 = ESC, … Ctrl+7 = US, Ctrl+8 = DEL).
-        '@' | ' ' | '2' => Some(0),
-        '[' | '3' => Some(27),
-        '\\' | '4' => Some(28),
-        ']' | '5' => Some(29),
-        '^' | '6' => Some(30),
-        '_' | '7' => Some(31),
-        '8' => Some(127),
-        _ => None,
-    }
-}
-
 /// Encode a character respecting shift and caps-lock, writing UTF-8 bytes
 /// into `tmp` (>= 4 bytes) and returning the written slice.
 ///
@@ -566,12 +548,27 @@ const fn ctrl_byte(c: char) -> Option<u8> {
 /// clipboard paste-as-keys round-trip correctly.
 trait EncodeTerminalChar {
     fn encode_terminal(self, shift: bool, caps: bool, tmp: &mut [u8; 4]) -> &[u8];
+
+    /// Ctrl+letter → C0 byte (a=1 … z=26, space=0, @=0, [=27, \=28, ]=29, ^=30, _=31).
+    ///
+    /// Was a free `ctrl_byte(c: char)` function -- its sole argument is the
+    /// type this trait already extends, so it belongs beside
+    /// `encode_terminal` as another `char` classification.
+    fn ctrl_byte(self) -> Option<u8>;
+
+    /// The shifted form of a US-QWERTY key. Returns `None` for characters
+    /// with no conventional shifted form (caller falls through to the
+    /// char's own encoding).
+    ///
+    /// Was a free `shifted_ascii(c: char)` function -- same reasoning as
+    /// `ctrl_byte` above.
+    fn shifted_ascii(self) -> Option<u8>;
 }
 
 impl EncodeTerminalChar for char {
     fn encode_terminal(self, shift: bool, caps: bool, tmp: &mut [u8; 4]) -> &[u8] {
         if shift || caps {
-            if let Some(s) = shifted_ascii(self) {
+            if let Some(s) = self.shifted_ascii() {
                 tmp[0] = s;
                 return &tmp[..1];
             }
@@ -583,37 +580,51 @@ impl EncodeTerminalChar for char {
         let len = s.len();
         &tmp[..len]
     }
-}
 
-/// The shifted form of a US-QWERTY key. Returns `None` for characters with
-/// no conventional shifted form (caller falls through to the char's own
-/// encoding).
-const fn shifted_ascii(c: char) -> Option<u8> {
-    Some(match c {
-        'a'..='z' => c as u8 - b'a' + b'A',
-        '1' => b'!',
-        '2' => b'@',
-        '3' => b'#',
-        '4' => b'$',
-        '5' => b'%',
-        '6' => b'^',
-        '7' => b'&',
-        '8' => b'*',
-        '9' => b'(',
-        '0' => b')',
-        '-' => b'_',
-        '=' => b'+',
-        '[' => b'{',
-        ']' => b'}',
-        '\\' => b'|',
-        ';' => b':',
-        '\'' => b'"',
-        '`' => b'~',
-        ',' => b'<',
-        '.' => b'>',
-        '/' => b'?',
-        _ => return None,
-    })
+    fn ctrl_byte(self) -> Option<u8> {
+        match self {
+            'a'..='z' => Some(self as u8 - b'a' + 1),
+            'A'..='Z' => Some(self as u8 - b'A' + 1),
+            // `@`/space and the digit aliases collapse to the same C0 codes
+            // (Ctrl+2 = NUL, Ctrl+3 = ESC, … Ctrl+7 = US, Ctrl+8 = DEL).
+            '@' | ' ' | '2' => Some(0),
+            '[' | '3' => Some(27),
+            '\\' | '4' => Some(28),
+            ']' | '5' => Some(29),
+            '^' | '6' => Some(30),
+            '_' | '7' => Some(31),
+            '8' => Some(127),
+            _ => None,
+        }
+    }
+
+    fn shifted_ascii(self) -> Option<u8> {
+        Some(match self {
+            'a'..='z' => self as u8 - b'a' + b'A',
+            '1' => b'!',
+            '2' => b'@',
+            '3' => b'#',
+            '4' => b'$',
+            '5' => b'%',
+            '6' => b'^',
+            '7' => b'&',
+            '8' => b'*',
+            '9' => b'(',
+            '0' => b')',
+            '-' => b'_',
+            '=' => b'+',
+            '[' => b'{',
+            ']' => b'}',
+            '\\' => b'|',
+            ';' => b':',
+            '\'' => b'"',
+            '`' => b'~',
+            ',' => b'<',
+            '.' => b'>',
+            '/' => b'?',
+            _ => return None,
+        })
+    }
 }
 
 /// How a key is encoded in the kitty protocol.

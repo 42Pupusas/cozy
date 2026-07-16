@@ -158,11 +158,23 @@ struct CmsgHdr {
 
 const CMSG_HDR_LEN: usize = std::mem::size_of::<CmsgHdr>();
 
-/// Round `len` up to the platform word alignment, matching the kernel's
-/// `CMSG_ALIGN`.
-const fn cmsg_align(len: usize) -> usize {
-    let a = std::mem::size_of::<size_t>();
-    (len + a - 1) & !(a - 1)
+/// Extension trait rounding a byte length up to the platform word
+/// alignment, matching the kernel's `CMSG_ALIGN`.
+///
+/// Was a free `cmsg_align(len: usize)` function -- its sole argument is a
+/// bare `usize`, so it reads as a method on that value
+/// (`len.cmsg_aligned()`), matching the `RawSyscallReturn`-on-`isize` style
+/// used in `pty::sys` for the same kind of "raw primitive, no natural
+/// receiver type" helper.
+trait CmsgAlign {
+    fn cmsg_aligned(self) -> Self;
+}
+
+impl CmsgAlign for usize {
+    fn cmsg_aligned(self) -> Self {
+        let a = std::mem::size_of::<size_t>();
+        (self + a - 1) & !(a - 1)
+    }
 }
 
 /// A `sendmsg`/`recvmsg` message: a data buffer plus an optional SCM_RIGHTS
@@ -188,7 +200,7 @@ impl OutgoingMessage {
             Vec::new()
         } else {
             let fd_bytes = std::mem::size_of::<RawFd>() * fds.len();
-            let total = cmsg_align(CMSG_HDR_LEN + fd_bytes);
+            let total = (CMSG_HDR_LEN + fd_bytes).cmsg_aligned();
             let mut buf = vec![0u8; total];
             // SAFETY: `buf` is sized for the header + fd payload computed above;
             // we write exactly that layout.
@@ -243,7 +255,7 @@ impl IncomingControl {
     /// `MsgHdr` -- and thus the width of the control region inside each
     /// provided buffer.
     pub fn reserve_len(max_fds: usize) -> usize {
-        cmsg_align(CMSG_HDR_LEN + std::mem::size_of::<RawFd>() * max_fds)
+        (CMSG_HDR_LEN + std::mem::size_of::<RawFd>() * max_fds).cmsg_aligned()
     }
 
     /// Parse SCM_RIGHTS file descriptors out of a received control (cmsg)
@@ -596,7 +608,7 @@ mod tests {
         assert!(many > one);
         // Always at least big enough for the cmsg header itself.
         assert!(one >= CMSG_HDR_LEN);
-        assert_eq!(IncomingControl::reserve_len(0), cmsg_align(CMSG_HDR_LEN));
+        assert_eq!(IncomingControl::reserve_len(0), CMSG_HDR_LEN.cmsg_aligned());
     }
 
     #[test]
@@ -628,10 +640,10 @@ mod tests {
     #[test]
     fn cmsg_align_rounds_up_to_word_size() {
         let word = std::mem::size_of::<size_t>();
-        assert_eq!(cmsg_align(0), 0);
-        assert_eq!(cmsg_align(1), word);
-        assert_eq!(cmsg_align(word), word);
-        assert_eq!(cmsg_align(word + 1), word * 2);
+        assert_eq!(0usize.cmsg_aligned(), 0);
+        assert_eq!(1usize.cmsg_aligned(), word);
+        assert_eq!(word.cmsg_aligned(), word);
+        assert_eq!((word + 1).cmsg_aligned(), word * 2);
     }
 }
 

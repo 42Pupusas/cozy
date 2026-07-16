@@ -544,6 +544,20 @@ impl Reader {
                 pushed = true;
             }
 
+            // Forward any fds that arrived with this recv batch as one `Fd`
+            // event, pushed after the message events above. Wayland attaches
+            // fds out of band to a single message (clipboard send/receive,
+            // keymap); in practice an fd-bearing event arrives as its own
+            // recvmsg, so the batch correlates with the message just pushed.
+            // The main thread consumes them by order.
+            if !self.pending_fds.is_empty() {
+                let fds = core::mem::take(&mut self.pending_fds);
+                if producer.push_block(Event::Fd(fds)).is_err() {
+                    return Ok(());
+                }
+                pushed = true;
+            }
+
             // Wake the UI thread, which polls a shared eventfd rather than
             // blocking on this ring (it also waits on the dirty-snapshot ring).
             if pushed {

@@ -51,6 +51,7 @@
 
 pub mod conn;
 pub mod cursor;
+pub mod cursor_anim;
 pub mod draw;
 pub mod error;
 pub mod event;
@@ -64,6 +65,7 @@ pub mod wire;
 mod render;
 pub mod window;
 
+pub use cursor_anim::{CursorAnimConfig, CursorAnimator};
 pub use error::{Error, Result};
 pub use render::{Renderer, Theme};
 pub use waker::Waker;

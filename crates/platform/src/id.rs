@@ -81,6 +81,14 @@ object_ids! {
     ToplevelDecorationId,
     /// `wl_output` — a physical/logical display, advertising its scale factor.
     OutputId,
+    /// `wl_data_device_manager` — clipboard/DnD factory global.
+    DataDeviceManagerId,
+    /// `wl_data_device` — per-seat clipboard/DnD endpoint.
+    DataDeviceId,
+    /// `wl_data_source` — data we offer to other clients (our copy).
+    DataSourceId,
+    /// `wl_data_offer` — data another client offers us (their copy / our paste).
+    DataOfferId,
 }
 
 /// An event serial — echoed back in acks/pongs. Distinct from an object id so

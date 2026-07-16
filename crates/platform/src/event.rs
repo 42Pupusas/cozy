@@ -27,7 +27,9 @@ use crate::id::{ObjectId, Serial};
 use crate::protocol::{Fixed, FromOpcode};
 
 /// One decoded Wayland message handed from the reader thread to the main thread.
-#[derive(Clone, Debug)]
+///
+/// Not `Clone`: the `Fd` variant owns `OwnedFd`s, which can't be duplicated.
+#[derive(Debug)]
 pub enum Event {
     /// A message whose arguments fit in up to four 32-bit words. `args[..nargs]`
     /// are valid; interpret them per `(object_id, opcode)`. Pointer motion,
@@ -47,6 +49,15 @@ pub enum Event {
     /// thread — which owns the held-key state — can re-apply the held key's
     /// motion. Carries no payload; the main thread already knows what's held.
     Repeat,
+    /// File descriptors received as ancillary (SCM_RIGHTS) data alongside a
+    /// message. Wayland attaches fds *out of band* to a specific message
+    /// (`wl_data_source.send`, `wl_data_offer.receive`, `wl_keyboard.keymap`),
+    /// not as a standalone message — so the reader forwards the message itself
+    /// (as `Wire`/`Bytes`) and, separately, the batch of fds that arrived with
+    /// the same recv completion, as one `Fd` event pushed immediately after.
+    /// The main thread correlates them by order: the `Fd` batch belongs to the
+    /// message event that just preceded it.
+    Fd(Vec<std::os::fd::OwnedFd>),
 }
 
 impl Event {
@@ -104,7 +115,7 @@ impl Event {
     pub fn object_id(&self) -> u32 {
         match self {
             Event::Wire { object_id, .. } => *object_id,
-            Event::Bytes(_) | Event::Repeat => 0,
+            Event::Bytes(_) | Event::Repeat | Event::Fd(_) => 0,
         }
     }
 
@@ -113,7 +124,7 @@ impl Event {
     pub fn opcode(&self) -> u16 {
         match self {
             Event::Wire { opcode, .. } => *opcode,
-            Event::Bytes(_) | Event::Repeat => 0,
+            Event::Bytes(_) | Event::Repeat | Event::Fd(_) => 0,
         }
     }
 

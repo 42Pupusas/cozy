@@ -62,7 +62,10 @@ impl DirtyRegion {
 
     /// Take a snapshot of current dirty rows and reset the tracker.
     ///
-    /// The snapshot contains a copy of every dirty row's cells.
+    /// The snapshot contains a copy of every dirty row's cells. `cursor`/
+    /// `cursor_changed` are filled in by the caller ([`crate::Grid`]), which
+    /// is the only place that knows the previous cursor state to diff
+    /// against.
     pub(crate) fn take_snapshot(&mut self, screen: &Screen) -> DirtySnapshot {
         let mut rows = Vec::new();
         for (word_idx, &word) in self.words.iter().enumerate() {
@@ -89,6 +92,8 @@ impl DirtyRegion {
         DirtySnapshot {
             rows,
             cols: self.cols,
+            cursor: CursorInfo::default(),
+            cursor_changed: false,
         }
     }
 
@@ -117,7 +122,12 @@ pub(crate) fn viewport_snapshot(
             .collect();
         out.push(DirtyRow { row, cells });
     }
-    DirtySnapshot { rows: out, cols }
+    DirtySnapshot {
+        rows: out,
+        cols,
+        cursor: CursorInfo::default(),
+        cursor_changed: false,
+    }
 }
 
 /// A row of cells that needs to be redrawn.
@@ -129,6 +139,21 @@ pub struct DirtyRow {
     pub cells: Vec<Cell>,
 }
 
+/// The cursor's position and visibility, carried on every [`DirtySnapshot`]
+/// so the renderer can track cursor movement even on frames where no cell
+/// content changed (e.g. a bare cursor-movement escape with no glyph
+/// printed) -- without this the renderer would have no way to know the
+/// cursor moved and animate it there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CursorInfo {
+    /// Column (0-indexed).
+    pub col: u16,
+    /// Row (0-indexed).
+    pub row: u16,
+    /// Whether the cursor is visible (DECTCEM, `CSI ?25h`/`l`).
+    pub visible: bool,
+}
+
 /// Snapshot of all rows that changed since the last render.
 ///
 /// Sent from the grid-thread to the renderer-thread via SPSC ring.
@@ -138,12 +163,19 @@ pub struct DirtySnapshot {
     pub rows: Vec<DirtyRow>,
     /// Column count (grid width).
     pub cols: u16,
+    /// The cursor's current position/visibility.
+    pub cursor: CursorInfo,
+    /// True if `cursor` differs from the last snapshot sent -- lets the
+    /// renderer detect "the cursor moved but no cell changed" so it still
+    /// repaints (and animates) even when `rows` is empty.
+    pub cursor_changed: bool,
 }
 
 impl DirtySnapshot {
-    /// True if no rows changed.
+    /// True if no rows changed AND the cursor didn't move/toggle visibility
+    /// either -- i.e. there is genuinely nothing new for the renderer to do.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.rows.is_empty() && !self.cursor_changed
     }
 }

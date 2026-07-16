@@ -25,11 +25,13 @@ mod cell;
 mod cursor;
 mod dirty;
 mod screen;
+mod selection;
 
 pub use cell::{Attrs, Cell, Color};
 pub use cursor::{Cursor, CursorShape};
-pub use dirty::{DirtyRegion, DirtyRow, DirtySnapshot};
+pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot};
 pub use screen::Screen;
+pub use selection::{Point as SelPoint, Selection};
 
 use vt_parser::{C0, CsiAction, Event, OscCmd, SgrAttr};
 
@@ -73,6 +75,11 @@ pub struct Grid {
     /// move clears it instead — so a newline ending a full-width line leaves
     /// that line correctly *unwrapped* (no false stitch on resize).
     pending_wrap: bool,
+    /// The cursor info last handed out in a [`DirtySnapshot`] -- compared
+    /// against the live cursor in [`Grid::take_dirty`] so a snapshot's
+    /// `cursor_changed` flag is set whenever the cursor moved or toggled
+    /// visibility, even on a frame where no cell content changed.
+    last_cursor: CursorInfo,
 }
 
 impl Grid {
@@ -91,6 +98,7 @@ impl Grid {
             viewport_dirty: false,
             replies: Vec::new(),
             pending_wrap: false,
+            last_cursor: CursorInfo::default(),
         }
     }
 
@@ -174,25 +182,55 @@ impl Grid {
     }
 
     /// Take the current dirty snapshot, resetting the dirty accumulator.
+    ///
+    /// Always fills in the cursor's current position/visibility, and sets
+    /// `cursor_changed` whenever it differs from the cursor in the last
+    /// snapshot taken -- so the renderer sees cursor movement even on a
+    /// frame where no cell content changed (a bare cursor-move escape with
+    /// no glyph printed), which it needs to animate the cursor sliding
+    /// between cells.
     pub fn take_dirty(&mut self) -> DirtySnapshot {
+        // The viewport can only scroll while the alt screen (with no
+        // scrollback) is inactive, so its cursor is always the primary
+        // screen's -- but while scrolled, the *visual* cursor position isn't
+        // meaningful (it may be far off the visible viewport), so we hide it
+        // rather than draw it at a wrong or nonsensical spot.
+        let cur = if self.viewport_offset != 0 {
+            CursorInfo {
+                col: self.cursor.col,
+                row: self.cursor.row,
+                visible: false,
+            }
+        } else {
+            CursorInfo {
+                col: self.cursor.col,
+                row: self.cursor.row,
+                visible: self.cursor.visible,
+            }
+        };
+        let cursor_changed = cur != self.last_cursor;
+        self.last_cursor = cur;
+
         if self.viewport_dirty {
             self.viewport_dirty = false;
             self.dirty.clear();
             let cols = self.primary.cols();
             let rows = self.primary.rows();
-            return crate::dirty::viewport_snapshot(
-                &self.primary,
-                self.viewport_offset,
-                cols,
-                rows,
-            );
+            let mut snap =
+                crate::dirty::viewport_snapshot(&self.primary, self.viewport_offset, cols, rows);
+            snap.cursor = cur;
+            snap.cursor_changed = cursor_changed;
+            return snap;
         }
         let screen = if self.alt_active {
             &self.alternate
         } else {
             &self.primary
         };
-        self.dirty.take_snapshot(screen)
+        let mut snap = self.dirty.take_snapshot(screen);
+        snap.cursor = cur;
+        snap.cursor_changed = cursor_changed;
+        snap
     }
 
     /// Return the viewport to the live bottom if it was scrolled up. Called on

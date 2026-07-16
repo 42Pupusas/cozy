@@ -598,6 +598,83 @@ impl Renderer {
             }
         }
     }
+
+    /// Overlay the cursor onto the canvas at a **fractional** cell position
+    /// (`visual_col`/`visual_row`, in cell units -- e.g. `4.5` is halfway
+    /// between columns 4 and 5), so a caller animating a slide between cells
+    /// can render every intermediate frame, not just whole-cell positions.
+    ///
+    /// `alpha` (`0.0..=1.0`) is the current blink opacity; `0.0` paints
+    /// nothing. The cursor alpha-blends a tint over whatever is already
+    /// there rather than overwriting it, so the glyph underneath stays
+    /// legible through a translucent or mid-fade cursor (matching
+    /// Ghostty/WezTerm's default look).
+    pub fn draw_cursor(
+        &self,
+        canvas: &mut Canvas<'_>,
+        visual_col: f32,
+        visual_row: f32,
+        shape: grid::CursorShape,
+        alpha: f32,
+    ) {
+        if alpha <= 0.0 {
+            return;
+        }
+        let alpha = alpha.min(1.0);
+        let (fg, _) = self.theme.effective(&Attrs::default());
+        let buf_w = canvas.width();
+        let buf_h = canvas.height();
+        let px0 = visual_col * self.cell_w as f32;
+        let py0 = visual_row * self.cell_h as f32;
+
+        let (rx0, ry0, rx1, ry1) = match shape {
+            grid::CursorShape::Block => {
+                (px0, py0, px0 + self.cell_w as f32, py0 + self.cell_h as f32)
+            }
+            grid::CursorShape::Bar => {
+                const BAR_W: f32 = 2.0;
+                (px0, py0, px0 + BAR_W, py0 + self.cell_h as f32)
+            }
+            grid::CursorShape::Underline => {
+                const UNDERLINE_H: f32 = 2.0;
+                (
+                    px0,
+                    py0 + self.cell_h as f32 - UNDERLINE_H,
+                    px0 + self.cell_w as f32,
+                    py0 + self.cell_h as f32,
+                )
+            }
+        };
+
+        let x0 = rx0.floor().max(0.0) as i32;
+        let y0 = ry0.floor().max(0.0) as i32;
+        let x1 = rx1.ceil().min(buf_w as f32) as i32;
+        let y1 = ry1.ceil().min(buf_h as f32) as i32;
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+
+        let pixels = canvas.pixels_mut();
+        let fg_r = f32::from(fg.r);
+        let fg_g = f32::from(fg.g);
+        let fg_b = f32::from(fg.b);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let idx = (y as usize) * (buf_w as usize) + (x as usize);
+                let Some(dst) = pixels.get_mut(idx) else {
+                    continue;
+                };
+                let d = *dst;
+                let dr = f32::from(((d >> 16) & 0xff) as u8);
+                let dg = f32::from(((d >> 8) & 0xff) as u8);
+                let db = f32::from((d & 0xff) as u8);
+                let nr = (fg_r - dr).mul_add(alpha, dr).round() as u32;
+                let ng = (fg_g - dg).mul_add(alpha, dg).round() as u32;
+                let nb = (fg_b - db).mul_add(alpha, db).round() as u32;
+                *dst = (d & 0xff00_0000) | (nr << 16) | (ng << 8) | nb;
+            }
+        }
+    }
 }
 
 /// Composite an anti-aliased glyph edge pixel: `glyph_a/255` coverage of
@@ -667,6 +744,8 @@ mod tests {
                 row: 0,
                 cells: (0..5).map(|_| cell('M')).collect(),
             }],
+            cursor: grid::CursorInfo::default(),
+            cursor_changed: false,
         };
         let theme = Theme::builtin();
         let bg = theme.bg_xrgb();
@@ -699,6 +778,8 @@ mod tests {
                 row: 3,
                 cells: vec![cell('M'), cell('M')],
             }],
+            cursor: grid::CursorInfo::default(),
+            cursor_changed: false,
         };
         let mut renderer = Renderer::builtin(Theme::builtin());
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);

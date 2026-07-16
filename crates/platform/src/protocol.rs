@@ -370,6 +370,100 @@ requests! {
         Release = 0,
     }
 }
+
+requests! {
+    /// `wl_data_device_manager` requests — clipboard/DnD factory.
+    DataDeviceManagerRequest {
+        /// Create a data source (data we offer to other clients).
+        CreateDataSource = 0,
+        /// Get the per-seat data device.
+        GetDataDevice = 1,
+    }
+}
+requests! {
+    /// `wl_data_device` requests.
+    DataDeviceRequest {
+        /// Start a drag-and-drop (unused here).
+        StartDrag = 0,
+        /// Set the clipboard selection to our data source: `serial`, `source`.
+        SetSelection = 1,
+        /// Release the device (v2+).
+        Release = 2,
+    }
+}
+events! {
+    /// `wl_data_device` events.
+    DataDeviceEvent {
+        /// A new drag offer appeared (unused here).
+        DataOffer = 0,
+        /// Keyboard focus entered during DnD (unused here).
+        Enter = 1,
+        /// DnD focus left (unused here).
+        Leave = 2,
+        /// DnD motion (unused here).
+        Motion = 3,
+        /// DnD drop (unused here).
+        Drop = 4,
+        /// The clipboard selection changed: `id` (a `wl_data_offer`, or 0).
+        Selection = 5,
+    }
+}
+requests! {
+    /// `wl_data_source` requests — data we offer to other clients (our copy).
+    DataSourceRequest {
+        /// Advertise one MIME type we can provide: `mime_type` (string).
+        Offer = 0,
+        /// Destroy the source.
+        Destroy = 1,
+        /// Set the allowed DnD actions (v3+; unused for plain clipboard).
+        SetActions = 2,
+    }
+}
+events! {
+    /// `wl_data_source` events.
+    DataSourceEvent {
+        /// A destination accepted a MIME type (drag target; unused here).
+        Target = 0,
+        /// A client requests the data: `mime_type` (string), `fd` — we write
+        /// the selection to `fd` and close it. The fd rides in ancillary data.
+        Send = 1,
+        /// The selection was replaced by another client; destroy our source.
+        Cancelled = 2,
+        /// DnD drop performed (unused here).
+        DndDropPerformed = 3,
+        /// DnD finished (unused here).
+        DndFinished = 4,
+        /// Action offered (unused here).
+        Action = 5,
+    }
+}
+requests! {
+    /// `wl_data_offer` requests — data another client offers us (our paste).
+    DataOfferRequest {
+        /// Accept a MIME type (drag; for clipboard we can send a null serial):
+        /// `serial`, `mime_type`.
+        Accept = 0,
+        /// Ask the source to transfer: `mime_type`, `fd` — we read from `fd`.
+        Receive = 1,
+        /// Destroy the offer.
+        Destroy = 2,
+        /// Finish a DnD offer (unused here).
+        Finish = 3,
+        /// Set actions (unused here).
+        SetActions = 4,
+    }
+}
+events! {
+    /// `wl_data_offer` events.
+    DataOfferEvent {
+        /// The source advertises one MIME type it can provide: `mime_type`.
+        Offer = 0,
+        /// Source actions (v3+; unused).
+        SourceActions = 1,
+        /// Offered action (v3+; unused).
+        Action = 2,
+    }
+}
 events! {
     /// `wl_keyboard` events.
     KeyboardEvent {
@@ -723,6 +817,11 @@ pub const WL_OUTPUT: Interface = Interface {
     name: "wl_output",
     // v2 adds `done`/`scale` events, which is the whole reason we bind this.
     version: 2,
+};
+pub const WL_DATA_DEVICE_MANAGER: Interface = Interface {
+    name: "wl_data_device_manager",
+    // v1 has create_data_source/get_data_device — all plain clipboard needs.
+    version: 1,
 };
 
 requests! {

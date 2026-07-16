@@ -335,9 +335,20 @@ fn ui_thread(
     let theme = platform::Theme::from_palette(&cfg.palette);
     let font = cfg.font.clone();
     let opacity = cfg.window.opacity;
+    // Map the cursor config to the platform's animation config. blink_rate is
+    // the half-period (ms per on/off); the animator wants the full cycle.
+    let cursor_cfg = platform::CursorAnimConfig {
+        shape: match cfg.cursor.style {
+            config::CursorStyle::Block => grid::CursorShape::Block,
+            config::CursorStyle::Beam => grid::CursorShape::Bar,
+            config::CursorStyle::Underline => grid::CursorShape::Underline,
+        },
+        blink: cfg.cursor.blink,
+        period_ms: (cfg.cursor.blink_rate * 2) as f32,
+    };
     // TermWindow reads the output scale and calls this closure to rasterize
     // the font at native density (HiDPI-aware).
-    let mut win = TermWindow::new("terminal", COLS, ROWS, ui_wake, move |scale| {
+    let mut win = TermWindow::new("terminal", COLS, ROWS, ui_wake, cursor_cfg, move |scale| {
         platform::Renderer::with_scale(theme, &font, scale).with_opacity(opacity)
     })?;
     let encoder = Encoder::new();
@@ -345,9 +356,6 @@ fn ui_thread(
     // Track the grid's current row count for page-scroll sizing (updated on
     // resize). Seeded from the startup dimensions.
     let mut grid_rows = ROWS;
-
-    // Future: use cfg.cursor.blink / blink_rate in the renderer.
-    let _ = (&cfg.cursor.blink, &cfg.cursor.blink_rate);
 
     loop {
         if quit.load(Ordering::Relaxed) {
@@ -389,6 +397,12 @@ fn ui_thread(
                     // grid and re-renders the moved viewport.
                     let _ = scroll_tx.push(ParserMsg::Scroll { delta: lines });
                 }
+                InputEvent::Paste(bytes) => {
+                    // Clipboard contents from another client: write to the PTY
+                    // so the shell/app receives them as typed input.
+                    let _ = input_tx.push(InputMsg::Bytes(bytes.into_boxed_slice()));
+                    sent_input = true;
+                }
                 InputEvent::Key {
                     key,
                     state,
@@ -426,10 +440,29 @@ fn ui_thread(
                             _ => {}
                         }
                     }
+                    // Ctrl+Shift+C / Ctrl+Shift+V: copy / paste via the system
+                    // clipboard (handled by the window, not sent to the shell).
+                    if kstate == KeyState::Pressed && mods.ctrl() && mods.shift() {
+                        match ikey {
+                            Key::Char('c') => {
+                                win.copy_selection();
+                                continue;
+                            }
+                            Key::Char('v') => {
+                                win.request_paste();
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
                     let mut ibuf = [0u8; 64];
                     if let Some(n) = encoder.encode_key(ikey, kstate, mods, &mut ibuf) {
                         let _ = input_tx.push(InputMsg::Bytes(ibuf[..n].into()));
                         sent_input = true;
+                        // Any real keystroke snaps the cursor blink back to
+                        // full opacity -- it should never be caught mid-fade
+                        // by what you just typed.
+                        win.notify_activity();
                     }
                 }
             }
@@ -446,12 +479,19 @@ fn ui_thread(
 
         // Idle: block in poll(2) on the UI wakeup eventfd instead of
         // busy-spinning. The Wayland reader signals it after pushing protocol
-        // events; the parser signals it after producing a dirty snapshot. The
-        // 100ms cap bounds quit-flag latency. `win.wait` drains the counter
-        // after waking; any signal that raced in during this iteration's reads
-        // leaves the counter set, so the poll returns at once (no lost wakeup).
+        // events; the parser signals it after producing a dirty snapshot.
+        // `win.wait` drains the counter after waking; any signal that raced in
+        // during this iteration's reads leaves the counter set, so the poll
+        // returns at once (no lost wakeup).
+        //
+        // While the cursor is mid-slide or blinking-and-visible, cap the wait
+        // at ~16ms (one 60fps frame) instead of the normal 100ms so the
+        // animation actually advances smoothly instead of updating in big
+        // 100ms jumps; otherwise it stays the full 100ms, bounding only
+        // quit-flag latency as before.
         if !did_work {
-            win.wait(100);
+            let cap = if win.wants_animation_frame() { 16 } else { 100 };
+            win.wait(cap);
         }
     }
 

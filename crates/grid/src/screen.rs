@@ -73,6 +73,21 @@ impl Screen {
         self.scrollback_len
     }
 
+    /// Get a cell by **absolute buffer row** (`0` = oldest scrollback row,
+    /// `scrollback_len` = top visible row). Used by selection extraction,
+    /// which operates across the whole `[scrollback | visible]` buffer.
+    #[must_use]
+    pub fn abs_cell(&self, col: u16, abs_row: usize) -> Cell {
+        let idx = abs_row * usize::from(self.cols) + usize::from(col);
+        self.buf.get(idx).copied().unwrap_or_default()
+    }
+
+    /// Whether the row at absolute index `abs_row` soft-wraps onto the next.
+    #[must_use]
+    pub fn abs_wrapped(&self, abs_row: usize) -> bool {
+        self.wrapped.get(abs_row).copied().unwrap_or(false)
+    }
+
     /// Get a cell `(col, row)` as seen through a viewport offset.
     ///
     /// `viewport_offset == 0` is the live view (the bottom of the buffer).

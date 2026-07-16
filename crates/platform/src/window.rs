@@ -23,17 +23,20 @@ use crate::draw::Point;
 use crate::error::{Error, Result};
 use crate::event::Event;
 use crate::id::{
-    BufferId, CallbackId, CompositorId, DisplayId, KeyboardId, ObjectId, OutputId, PointerId,
-    PoolId, RegistryId, SeatId, ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
+    BufferId, CallbackId, CompositorId, DataDeviceId, DataDeviceManagerId, DataOfferId,
+    DataSourceId, DisplayId, KeyboardId, ObjectId, OutputId, PointerId, PoolId, RegistryId, SeatId,
+    ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
 };
 use crate::keymap;
 use crate::protocol::Modifiers;
 use crate::protocol::{
     self as proto, BufferEvent, BufferRequest, ButtonState, CallbackEvent, CompositorRequest,
-    DisplayEvent, DisplayRequest, Format, Key, KeyState, KeyboardEvent, OutputEvent, PointerButton,
-    PointerEvent, PointerRequest, RegistryEvent, RegistryRequest, SeatCapability, SeatEvent,
-    SeatRequest, ShmPoolRequest, ShmRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest,
-    WmBaseEvent, WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
+    DataDeviceEvent, DataDeviceManagerRequest, DataDeviceRequest, DataOfferEvent, DataOfferRequest,
+    DataSourceEvent, DataSourceRequest, DisplayEvent, DisplayRequest, Format, Key, KeyState,
+    KeyboardEvent, OutputEvent, PointerButton, PointerEvent, PointerRequest, RegistryEvent,
+    RegistryRequest, SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest, ShmRequest,
+    SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent, WmBaseRequest, XdgSurfaceEvent,
+    XdgSurfaceRequest,
 };
 use crate::render;
 use crate::sys::{RepeatTimer, ShmBuffer};
@@ -64,6 +67,9 @@ pub enum InputEvent {
     Scroll {
         lines: i32,
     },
+    /// Clipboard text read from another client, to be written to the PTY
+    /// (a paste). Carries the raw clipboard bytes.
+    Paste(Vec<u8>),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -159,6 +165,13 @@ pub struct TermWindow {
 
     cursor: Option<cursor::Cursor>,
 
+    /// Smooth cursor-slide + blink animation state. Advanced by wall-clock
+    /// time in [`Self::tick`]; see [`crate::cursor_anim`].
+    cursor_anim: crate::cursor_anim::CursorAnimator,
+    /// Wall-clock instant of the last [`Self::tick`] call, for computing the
+    /// animator's `dt_ms`.
+    last_tick: std::time::Instant,
+
     frames: [Frame; 2],
     shm_mem: ShmBuffer,
     /// The shm pool currently backing `frames`. Destroyed and replaced on every
@@ -206,6 +219,53 @@ pub struct TermWindow {
     pending_dirty: Vec<grid::DirtySnapshot>,
     /// Pending input events for the caller.
     input_queue: std::collections::VecDeque<InputEvent>,
+
+    // ── Clipboard & selection ────────────────────────────────────────────
+    /// `(manager, per-seat device)` if the compositor supports `wl_data_device`.
+    data_device: Option<(DataDeviceManagerId, DataDeviceId)>,
+    /// The live data source we publish while our selection is on the clipboard.
+    clipboard_source: Option<DataSourceId>,
+    /// Text we last copied (served to other clients on `data_source.send`).
+    clipboard_text: String,
+    /// The clipboard offer from another client (for paste), with its MIME types.
+    clipboard_offer: Option<DataOfferId>,
+    /// Mirror of the latest grid content the renderer has drawn, used to
+    /// extract selection text and paint the highlight — entirely on the UI
+    /// thread, no round-trip to the parser-owned grid. Indexed `[row][col]`,
+    /// only the visible viewport.
+    cell_mirror: Vec<Vec<grid::Cell>>,
+    /// Active mouse-drag selection, in viewport cell coords `(col, row)`.
+    selection: Option<((u16, u16), (u16, u16))>,
+    /// Set when a `data_source.send` just arrived; the next `Event::Fd` is the
+    /// pipe to write our clipboard text into.
+    awaiting_send_fd: bool,
+    /// Paste channel: helper threads that read a paste pipe send the bytes
+    /// here; the UI loop drains it in `tick`. (std mpsc — multiple paste
+    /// helper threads may be in flight, so a multi-producer channel.)
+    paste_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    paste_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// The serial from the most recent `wl_keyboard.enter` (keyboard-focus)
+    /// event. This is the serial the compositor expects in
+    /// `wl_data_device.set_selection`: it proves we hold keyboard focus at the
+    /// moment of the copy, and — unlike a stale `wl_pointer.button` /
+    /// `wl_keyboard.key` serial from an arbitrary earlier press — it stays
+    /// valid for the whole focused period. Using a stale serial is exactly
+    /// what triggers the compositor's "invalid arguments" protocol error.
+    focus_serial: u32,
+    /// Whether the current press has moved enough to count as a drag. A press
+    /// + release with no motion is a *click*, which clears the selection; a
+    /// drag sets it. Set on press, tested on release.
+    drag_moved: bool,
+    /// Viewport rows that carried a highlight on the previous frame. Repainted
+    /// clean on the next frame before the (possibly moved/cleared) selection
+    /// is re-tinted, so highlight never lingers after deselect or drag.
+    prev_selection_rows: Vec<u16>,
+    /// Viewport rows the cursor overlay touched on the previous frame.
+    /// Repainted clean before drawing the cursor at its new (possibly
+    /// mid-slide) position, the same idempotent scheme as
+    /// `prev_selection_rows` -- without this a sliding cursor would leave a
+    /// trail of tinted cells behind it.
+    prev_cursor_rows: Vec<u16>,
 }
 
 impl Drop for TermWindow {
@@ -248,6 +308,7 @@ impl TermWindow {
         cols: u16,
         rows: u16,
         wake: waker::Waker,
+        cursor_cfg: crate::cursor_anim::CursorAnimConfig,
         build_renderer: impl FnOnce(i32) -> render::Renderer,
     ) -> Result<Self> {
         let (mut sender, reader, repeat_timer) = Conn::connect()?;
@@ -267,7 +328,7 @@ impl TermWindow {
             })
             .map_err(Error::ReaderSpawn)?;
 
-        let (compositor, shm, wm_base, seat, output) =
+        let (compositor, shm, wm_base, seat, output, data_device_manager) =
             Registry::discover(&mut sender, &mut events)?;
         // Ask the compositor what buffer scale this output actually wants
         // (1 = normal DPI, 2 = HiDPI @2x, ...) *before* building the renderer,
@@ -327,12 +388,29 @@ impl TermWindow {
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<crate::conn::WindowRequest>::new(Capacity::exact(64)).split();
         let (id_start, id_end) = sender.alloc_id_block(256);
-        let window_tx = WindowSender {
+        let mut window_tx = WindowSender {
             tx: req_tx,
             next_id: id_start,
             id_end,
             free_ids: Vec::new(),
         };
+
+        // Clipboard: create the per-seat data device, if the compositor
+        // advertised a `wl_data_device_manager`. Without one (rare), copy/paste
+        // is simply unavailable and the fields stay `None`.
+        let data_device = data_device_manager.map(|mgr| {
+            let dev: DataDeviceId = window_tx.alloc_id();
+            window_tx.request(
+                MessageBuilder::new(mgr, DataDeviceManagerRequest::GetDataDevice)
+                    .new_id(dev)
+                    .object(seat),
+            );
+            (mgr, dev)
+        });
+
+        // Paste channel: helper threads that read a paste pipe send the bytes
+        // here; the UI loop drains it each `tick`.
+        let (paste_tx, paste_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
         // Use `bg_packed()`, not `bg_xrgb()`: a translucent window's initial
         // backbuffer must carry the configured alpha from frame one, not
@@ -380,12 +458,41 @@ impl TermWindow {
             pending_resize: None,
             pending_dirty: Vec::new(),
             input_queue: std::collections::VecDeque::new(),
+            data_device,
+            clipboard_source: None,
+            clipboard_text: String::new(),
+            clipboard_offer: None,
+            cell_mirror: Vec::new(),
+            selection: None,
+            awaiting_send_fd: false,
+            paste_tx,
+            paste_rx,
+            focus_serial: 0,
+            drag_moved: false,
+            prev_selection_rows: Vec::new(),
+            prev_cursor_rows: Vec::new(),
+            cursor_anim: crate::cursor_anim::CursorAnimator::new(cursor_cfg),
+            last_tick: std::time::Instant::now(),
         })
     }
 
     /// Queue a dirty snapshot to be blitted on the next frame.
     pub fn push_dirty(&mut self, snap: grid::DirtySnapshot) {
         if !snap.is_empty() {
+            // Keep the cell mirror in sync so selection/highlight/extraction
+            // always reflect the latest drawn content.
+            for row in &snap.rows {
+                let r = usize::from(row.row);
+                if self.cell_mirror.len() <= r {
+                    self.cell_mirror.resize(r + 1, Vec::new());
+                }
+                self.cell_mirror[r] = row.cells.clone();
+            }
+            // Feed the cursor animator the grid's authoritative cursor state
+            // -- this is what lets it start a slide even on a frame where no
+            // cell content changed (a bare cursor-move escape).
+            self.cursor_anim
+                .set_target(snap.cursor.col, snap.cursor.row, snap.cursor.visible);
             self.pending_dirty.push(snap);
             self.dirty = true;
         }
@@ -394,6 +501,133 @@ impl TermWindow {
     /// Pull the next pending input event, if any.
     pub fn next_input(&mut self) -> Option<InputEvent> {
         self.input_queue.pop_front()
+    }
+
+    /// The grid cell under the pointer, in viewport coordinates, or `(0,0)`
+    /// when the pointer is outside the content area.
+    fn pointer_cell(&self) -> (u16, u16) {
+        let col = (self.pointer_pos.x / self.cell_w).clamp(0, self.width / self.cell_w - 1);
+        let row = (self.pointer_pos.y / self.cell_h).clamp(0, self.height / self.cell_h - 1);
+        (col as u16, row as u16)
+    }
+
+    /// Extract the currently selected text (viewport coords) from the cell
+    /// mirror. `None` if there's no non-empty selection.
+    #[must_use]
+    pub fn selected_text(&self) -> Option<String> {
+        let ((ac, ar), (bc, br)) = self.selection?;
+        if (ac, ar) == (bc, br) {
+            return None;
+        }
+        let ((sc, sr), (ec, er)) = if (ar, ac) <= (br, bc) {
+            ((ac, ar), (bc, br))
+        } else {
+            ((bc, br), (ac, ar))
+        };
+        let mut out = String::new();
+        for row in sr..=er {
+            let line = self.cell_mirror.get(usize::from(row))?;
+            let c0 = if row == sr { usize::from(sc) } else { 0 };
+            let c1 = if row == er {
+                usize::from(ec)
+            } else {
+                line.len().saturating_sub(1)
+            };
+            let mut s = String::new();
+            for col in c0..=c1.min(line.len().saturating_sub(1)) {
+                let cell = line[col];
+                if !cell.spacer {
+                    s.push(cell.ch);
+                }
+            }
+            out.push_str(s.trim_end());
+            if row != er {
+                out.push('\n');
+            }
+        }
+        Some(out)
+    }
+
+    /// Copy the current selection to the system clipboard (Ctrl+Shift+C).
+    /// Publishes a `wl_data_source` offering `text/plain` and serves
+    /// `clipboard_text` to peers on request. No-op without a selection or
+    /// clipboard support.
+    pub fn copy_selection(&mut self) {
+        let Some(text) = self.selected_text() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        self.clipboard_text = text;
+        let Some((mgr, dev)) = self.data_device else {
+            return;
+        };
+        // `set_selection` requires the serial proving we hold keyboard focus
+        // (the `wl_keyboard.enter` serial). Without focus (shouldn't happen —
+        // copy only makes sense on a focused window) we keep the text locally
+        // but skip the Wayland publish rather than risk an invalid serial.
+        let serial = self.focus_serial;
+        if serial == 0 {
+            eprintln!("platform: copy skipped — no keyboard focus serial yet");
+            return;
+        }
+        let src: DataSourceId = self.window_tx.alloc_id();
+        eprintln!(
+            "platform: set_selection dev={} src={} serial={serial}",
+            dev.raw(),
+            src.raw()
+        );
+        self.window_tx.request(
+            MessageBuilder::new(mgr, DataDeviceManagerRequest::CreateDataSource).new_id(src),
+        );
+        self.window_tx
+            .request(MessageBuilder::new(src, DataSourceRequest::Offer).string("text/plain"));
+        // Wire arg order is (source, serial): libwayland marshals args in XML
+        // declaration order, and wl_data_device.set_selection declares
+        // `source` before `serial`. Sending (serial, source) makes the
+        // compositor read the source id as the serial and vice versa ->
+        // "invalid arguments" protocol error.
+        self.window_tx.request(
+            MessageBuilder::new(dev, DataDeviceRequest::SetSelection)
+                .object(src)
+                .u32(serial),
+        );
+        self.clipboard_source = Some(src);
+    }
+
+    /// Request a paste from the system clipboard (Ctrl+Shift+V): ask the
+    /// current offer's source to transfer `text/plain` over a pipe. We hand
+    /// the pipe's write end to the peer (out-of-band fd); it writes the
+    /// clipboard contents and closes. A helper thread blocks reading our end
+    /// and pushes the bytes back as an [`InputEvent::Paste`].
+    pub fn request_paste(&mut self) {
+        let Some(offer) = self.clipboard_offer else {
+            return;
+        };
+        let Ok((mut reader, writer)) = std::os::unix::net::UnixStream::pair() else {
+            return;
+        };
+        // `receive(mime_type, fd)`: the fd travels as ancillary data, not a
+        // wire word, so the message body is just the mime string.
+        self.window_tx.send_with_fds(
+            MessageBuilder::new(offer, DataOfferRequest::Receive)
+                .string("text/plain")
+                .finish(),
+            vec![writer.into()],
+        );
+        // Read on a helper thread (blocks until the peer writes + closes),
+        // then hand the bytes to the UI loop via the paste channel.
+        let tx = self.paste_tx.clone();
+        let wake = self.wake.clone();
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            if reader.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                let _ = tx.send(buf);
+                wake.signal();
+            }
+        });
     }
 
     /// A clone of the UI wakeup channel. Hand this to any thread (e.g. the
@@ -432,8 +666,51 @@ impl TermWindow {
                 return Ok(false);
             }
         }
+
+        // Drain any paste bytes a helper thread finished reading.
+        while let Ok(bytes) = self.paste_rx.try_recv() {
+            self.input_queue.push_back(InputEvent::Paste(bytes));
+        }
+
+        self.advance_cursor_anim();
         self.maybe_present()?;
         Ok(true)
+    }
+
+    /// Step the cursor slide/blink animation forward by the wall-clock time
+    /// elapsed since the last tick, and mark the window dirty if anything
+    /// visibly moved. Called once per [`Self::tick`]/[`Self::run_once`], so
+    /// its cadence is exactly the UI loop's -- the caller
+    /// ([`Self::wants_animation_frame`]) is responsible for polling often
+    /// enough (~60fps) while an animation is in flight instead of idling on
+    /// the full event-wait timeout.
+    fn advance_cursor_anim(&mut self) {
+        let now = std::time::Instant::now();
+        let dt_ms = now.duration_since(self.last_tick).as_secs_f32() * 1000.0;
+        self.last_tick = now;
+        // Cap dt so a long stall (window minimized, debugger pause, ...)
+        // doesn't make the cursor jump-slide in one giant step on resume.
+        let dt_ms = dt_ms.min(100.0);
+        if self.cursor_anim.advance(dt_ms) {
+            self.dirty = true;
+        }
+    }
+
+    /// Whether the caller should keep polling at animation-frame-rate
+    /// (~60fps) instead of blocking on [`Self::wait`]'s full timeout -- true
+    /// while the cursor is mid-slide, or blinking and visible.
+    #[must_use]
+    pub fn wants_animation_frame(&self) -> bool {
+        self.cursor_anim.is_animating()
+    }
+
+    /// Notify the cursor animator of user activity (a keystroke): resets the
+    /// blink phase to full opacity so the cursor is always solid the instant
+    /// you type, never mid-fade. Call this whenever the caller sends bytes to
+    /// the PTY in response to a key press.
+    pub fn notify_activity(&mut self) {
+        self.cursor_anim.on_activity();
+        self.dirty = true;
     }
 
     /// Block for the next Wayland event, then drain all queued events.
@@ -456,15 +733,62 @@ impl TermWindow {
                 break;
             }
         }
+        self.advance_cursor_anim();
         self.maybe_present()?;
         Ok(self.lifecycle != Lifecycle::Closing)
     }
 
     // ── private ───────────────────────────────────────────────────────────
 
+    /// Consume the fd batch that followed a clipboard `send`/`receive`.
+    /// `send` → we write our `clipboard_text` to the peer's pipe; `receive`
+    /// (our paste request) → we read the peer's clipboard from the pipe.
+    fn handle_clipboard_fds(&mut self, fds: Vec<std::os::fd::OwnedFd>) {
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd as _;
+        let Some(fd) = fds.into_iter().next() else {
+            return;
+        };
+        let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
+        if self.awaiting_send_fd {
+            self.awaiting_send_fd = false;
+            // Write our selection, then close (dropping the File on scope
+            // exit signals EOF to the pasting client). Best-effort.
+            let mut f = unsafe { std::fs::File::from_raw_fd(raw) };
+            let _ = f.write_all(self.clipboard_text.as_bytes());
+        } else {
+            // Unsolicited fd (e.g. the XKB keymap fd, which we don't parse).
+            // Re-wrap so it closes on drop instead of leaking.
+            let _f = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        }
+    }
+
+    /// Handle the string-bearing clipboard events routed as raw `Bytes`:
+    /// `data_source.send` (a peer wants our clipboard) and `data_offer.offer`
+    /// (a peer advertises a MIME type). `data_device.selection` is fixed-arg
+    /// and handled in the Wire path.
+    fn handle_clipboard_bytes(&mut self, wire: &WireEvent<'_>) {
+        if let Some(src) = self.clipboard_source {
+            if wire.object_id == src.raw()
+                && DataSourceEvent::from_opcode(wire.opcode) == Some(DataSourceEvent::Send)
+            {
+                self.awaiting_send_fd = true;
+            }
+        }
+    }
+
     fn handle_event(&mut self, ev: Event) -> Result<()> {
+        // Clipboard fds arrive as a standalone `Fd` event immediately after the
+        // message that triggered them (see conn.rs). Route by what we asked for.
+        if let Event::Fd(fds) = ev {
+            self.handle_clipboard_fds(fds);
+            return Ok(());
+        }
+
         // wl_display events arrive as raw bytes (the reader routes object 1 to
         // `Bytes`). Handle error (fatal) and delete_id (id recycling) here.
+        // String-bearing data-device events (source.send / offer.receive /
+        // offer.offer) also route to `Bytes`, so we dispatch them here too.
         if let Event::Bytes(ref bytes) = ev {
             let (mut wire, _) = WireEvent::parse(bytes).ok_or(Error::ReaderStopped)?;
             if wire.object_id == DisplayId(1).raw() {
@@ -483,7 +807,8 @@ impl TermWindow {
                     None => {}
                 }
             }
-            // Registry global (during setup - already handled, ignore here).
+            // Clipboard source/offer events that carry a mime-type string.
+            self.handle_clipboard_bytes(&wire);
             return Ok(());
         }
 
@@ -602,12 +927,40 @@ impl TermWindow {
                     }
                     Some(PointerEvent::Motion) => {
                         self.pointer_pos = ev.point(1, 2);
+                        // Extend an active drag selection.
+                        if let Some((anchor, _)) = self.selection {
+                            let cell = self.pointer_cell();
+                            if cell != anchor {
+                                self.selection = Some((anchor, cell));
+                                self.drag_moved = true;
+                                self.dirty = true;
+                            }
+                        }
                     }
                     Some(PointerEvent::Button) => {
                         let button = PointerButton::from_code(ev.arg(2));
                         let state = ButtonState::from_raw(ev.arg(3));
-                        // Right-click paste etc. handled by crates/input (M5).
-                        let _ = (button, state);
+                        match (button, state) {
+                            (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
+                                // Begin a potential selection at the pointer
+                                // cell; whether it becomes a real selection or
+                                // a deselect-click is decided on release.
+                                let cell = self.pointer_cell();
+                                self.selection = Some((cell, cell));
+                                self.drag_moved = false;
+                                self.dirty = true;
+                            }
+                            (Some(PointerButton::Left), Some(ButtonState::Released)) => {
+                                // A press+release with no motion is a *click*:
+                                // clear any selection. A drag (motion between
+                                // press and release) leaves the selection set.
+                                if !self.drag_moved {
+                                    self.selection = None;
+                                }
+                                self.dirty = true;
+                            }
+                            _ => {}
+                        }
                     }
                     Some(PointerEvent::Axis) => {
                         // Axis args: (time, axis, value). axis 0 = vertical.
@@ -638,6 +991,11 @@ impl TermWindow {
         if let Some(keyboard) = self.keyboard {
             if ev.is(keyboard) {
                 match ev.event::<KeyboardEvent>() {
+                    Some(KeyboardEvent::Enter) => {
+                        // Keyboard focus gained: arg(0) is the serial we must
+                        // present to `set_selection` to prove we own focus.
+                        self.focus_serial = ev.arg(0);
+                    }
                     Some(KeyboardEvent::Key) => {
                         let physical = Key::from_code(ev.arg(2));
                         let logical = physical.map(keymap::PhysicalKey::to_logical);
@@ -669,6 +1027,15 @@ impl TermWindow {
                             }
                             _ => {}
                         }
+                        // Esc clears any active selection (and still passes
+                        // through to the application as a normal Esc).
+                        if logical == Some(Key::Esc)
+                            && state == Some(KeyState::Pressed)
+                            && self.selection.is_some()
+                        {
+                            self.selection = None;
+                            self.dirty = true;
+                        }
                         self.input_queue.push_back(InputEvent::Key {
                             key: logical,
                             state,
@@ -699,6 +1066,40 @@ impl TermWindow {
             }
         }
 
+        // wl_data_device.* — clipboard selection offers from other clients.
+        if let Some((_, dev)) = self.data_device {
+            if ev.is(dev) && ev.event::<DataDeviceEvent>() == Some(DataDeviceEvent::Selection) {
+                // arg(0) = new wl_data_offer id (0 = selection cleared).
+                let raw = ev.arg(0);
+                self.clipboard_offer = if raw == 0 {
+                    None
+                } else {
+                    Some(DataOfferId::from_raw(raw))
+                };
+                return Ok(());
+            }
+        }
+
+        // wl_data_offer.* — MIME types a peer advertises (we only need to know
+        // the offer exists; we always request text/plain on paste).
+        if let Some(offer) = self.clipboard_offer {
+            if ev.is(offer) {
+                if ev.event::<DataOfferEvent>() == Some(DataOfferEvent::Offer) {
+                    // Could track the mime list; we just accept text/plain.
+                }
+                return Ok(());
+            }
+        }
+
+        // wl_data_source.cancelled arrives as a fixed-arg (Wire) event; the
+        // string-bearing send is handled in handle_clipboard_bytes.
+        if let Some(src) = self.clipboard_source {
+            if ev.is(src) && ev.event::<DataSourceEvent>() == Some(DataSourceEvent::Cancelled) {
+                self.clipboard_source = None;
+                return Ok(());
+            }
+        }
+
         Ok(())
     }
 
@@ -720,6 +1121,124 @@ impl TermWindow {
         Ok(())
     }
 
+    /// Repaint the given viewport rows from the cell mirror into the
+    /// backbuffer (clean, un-highlighted pixels). Called before tinting the
+    /// current selection and after clearing one, so the highlight is
+    /// idempotent (never compounds across frames) and fully reversible.
+    fn repaint_rows(&mut self, rows: &[u16]) {
+        let cols = (self.width / self.cell_w).max(1) as u16;
+        let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
+        for &row in rows {
+            let Some(line) = self.cell_mirror.get(usize::from(row)) else {
+                continue;
+            };
+            // Clone the row's cells so we don't hold a borrow on `self` while
+            // the renderer needs `&mut self`.
+            let cells = line.clone();
+            for (col, cell) in cells.iter().enumerate().take(usize::from(cols)) {
+                self.renderer.blit_cell(&mut canvas, col as u16, row, cell);
+            }
+        }
+    }
+
+    /// The viewport rows the current selection touches (empty if none).
+    fn selection_rows(&self) -> Vec<u16> {
+        let Some(((_, ar), (_, br))) = self.selection else {
+            return Vec::new();
+        };
+        let rows = (self.height / self.cell_h).max(1) as u16;
+        let lo = ar.min(br);
+        let hi = ar.max(br).min(rows.saturating_sub(1));
+        (lo..=hi).collect()
+    }
+
+    /// Overlay the selection highlight onto the backbuffer: each selected
+    /// cell's rect is alpha-blended toward a fixed highlight tint (a light
+    /// steel-blue), giving the familiar "selected text" look without
+    /// disturbing glyph pixels' relative contrast. Assumes the affected rows
+    /// were just repainted clean (see [`Self::repaint_rows`]).
+    fn apply_selection_highlight(&mut self) {
+        let Some(((ac, ar), (bc, br))) = self.selection else {
+            return;
+        };
+        if (ac, ar) == (bc, br) {
+            return;
+        }
+        let ((sc, sr), (ec, er)) = if (ar, ac) <= (br, bc) {
+            ((ac, ar), (bc, br))
+        } else {
+            ((bc, br), (ac, ar))
+        };
+        // Highlight tint + strength (0..255). ~35% steel-blue.
+        const HR: u32 = 0x40;
+        const HG: u32 = 0x60;
+        const HB: u32 = 0xa0;
+        const ALPHA: u32 = 90;
+        const INV: u32 = 255 - ALPHA;
+
+        let cols = (self.width / self.cell_w).max(1) as u16;
+        let rows = (self.height / self.cell_h).max(1) as u16;
+        let buf_w = self.width as usize;
+
+        for row in sr..=er.min(rows.saturating_sub(1)) {
+            let c0 = if row == sr { sc } else { 0 };
+            let c1 = if row == er { ec } else { cols - 1 };
+            let c1 = c1.min(cols - 1);
+            let py0 = usize::from(row) * self.cell_h as usize;
+            let px0 = usize::from(c0) * self.cell_w as usize;
+            let px1 = (usize::from(c1) + 1) * self.cell_w as usize;
+            for py in py0..py0 + self.cell_h as usize {
+                let base = py * buf_w;
+                if base >= self.backbuffer.len() {
+                    break;
+                }
+                for px in px0..px1.min(buf_w) {
+                    let idx = base + px;
+                    if idx >= self.backbuffer.len() {
+                        break;
+                    }
+                    let p = self.backbuffer[idx];
+                    let r = (p >> 16) & 0xff;
+                    let g = (p >> 8) & 0xff;
+                    let b = p & 0xff;
+                    let nr = (r * INV + HR * ALPHA) / 255;
+                    let ng = (g * INV + HG * ALPHA) / 255;
+                    let nb = (b * INV + HB * ALPHA) / 255;
+                    // Preserve the top byte (alpha for translucent windows).
+                    self.backbuffer[idx] = (p & 0xff00_0000) | (nr << 16) | (ng << 8) | nb;
+                }
+            }
+        }
+    }
+
+    /// Draw the cursor overlay at its current animated (possibly
+    /// mid-slide, possibly mid-blink-fade) position, on top of whatever
+    /// [`Self::apply_selection_highlight`] just painted. Returns the whole-
+    /// number viewport rows the drawn cursor rect touches (0, 1, or -- for a
+    /// cursor spanning a slide between two rows -- 2), so the next frame
+    /// knows which rows to repaint clean first (see `prev_cursor_rows`).
+    fn draw_cursor_overlay(&mut self) -> Vec<u16> {
+        let alpha = self.cursor_anim.alpha();
+        if alpha <= 0.0 {
+            return Vec::new();
+        }
+        let (vc, vr) = self.cursor_anim.visual_pos();
+        let shape = self.cursor_anim.shape();
+        {
+            let mut canvas =
+                crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
+            self.renderer.draw_cursor(&mut canvas, vc, vr, shape, alpha);
+        }
+
+        let row_top = vr.floor().max(0.0) as u16;
+        let row_bot = vr.ceil().max(0.0) as u16;
+        if row_top == row_bot {
+            vec![row_top]
+        } else {
+            vec![row_top, row_bot]
+        }
+    }
+
     fn maybe_present(&mut self) -> Result<()> {
         if self.lifecycle != Lifecycle::Mapped {
             return Ok(());
@@ -731,8 +1250,7 @@ impl TermWindow {
         let Some(slot) = self.frames.iter().position(|f| f.free) else {
             return Ok(());
         };
-        let frame = &mut self.frames[slot];
-        frame.free = false;
+        self.frames[slot].free = false;
 
         // Blit pending dirty snapshots into the persistent backbuffer, which
         // always holds the full image, then copy it into the free shm frame.
@@ -741,12 +1259,36 @@ impl TermWindow {
         for snap in &pending {
             self.renderer.blit_snapshot(&mut canvas, snap);
         }
+        drop(canvas);
+        // Selection highlight. Repaint the rows that *were* highlighted last
+        // frame (clean), plus the rows the selection touches now (so a moved
+        // drag doesn't double-tint), then tint the current selection. This
+        // keeps the effect idempotent and removable on deselect. The cursor
+        // overlay's old rows are included too, since the cursor may be
+        // sliding through (or resting on) a row the selection logic doesn't
+        // know about, and it must be repainted clean before either the
+        // selection tint or the cursor itself redraw on top.
+        let mut rows_to_repaint = std::mem::take(&mut self.prev_selection_rows);
+        for r in self.selection_rows() {
+            if !rows_to_repaint.contains(&r) {
+                rows_to_repaint.push(r);
+            }
+        }
+        for r in std::mem::take(&mut self.prev_cursor_rows) {
+            if !rows_to_repaint.contains(&r) {
+                rows_to_repaint.push(r);
+            }
+        }
+        self.repaint_rows(&rows_to_repaint);
+        self.apply_selection_highlight();
+        self.prev_selection_rows = self.selection_rows();
+        self.prev_cursor_rows = self.draw_cursor_overlay();
         self.shm_mem.pixels(slot).copy_from_slice(&self.backbuffer);
 
         let buf_w = self.width;
         let buf_h = self.height;
         let stride = buf_w * 4;
-        let buf = frame.buffer;
+        let buf = self.frames[slot].buffer;
 
         self.window_tx.request(
             MessageBuilder::new(self.surface, SurfaceRequest::Attach)
@@ -884,7 +1426,14 @@ impl Registry {
     fn discover(
         sender: &mut Sender,
         events: &mut Consumer<Event>,
-    ) -> Result<(CompositorId, ShmId, WmBaseId, SeatId, Option<OutputId>)> {
+    ) -> Result<(
+        CompositorId,
+        ShmId,
+        WmBaseId,
+        SeatId,
+        Option<OutputId>,
+        Option<DataDeviceManagerId>,
+    )> {
         let registry: RegistryId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
@@ -895,6 +1444,7 @@ impl Registry {
         let mut wm_base: Option<WmBaseId> = None;
         let mut seat: Option<SeatId> = None;
         let mut output: Option<OutputId> = None;
+        let mut data_device_manager: Option<DataDeviceManagerId> = None;
 
         // A registry burst is unbounded and unordered -- there is no event
         // that says "no more globals", so we can only wait for the globals we
@@ -944,6 +1494,13 @@ impl Registry {
                         let v = proto::WL_OUTPUT.version.min(version);
                         output = Some(Self::bind(sender, registry, name, &interface, v)?);
                     }
+                    s if s == proto::WL_DATA_DEVICE_MANAGER.name
+                        && data_device_manager.is_none() =>
+                    {
+                        let v = proto::WL_DATA_DEVICE_MANAGER.version.min(version);
+                        data_device_manager =
+                            Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
                     _ => {}
                 }
             }
@@ -954,6 +1511,7 @@ impl Registry {
             wm_base.ok_or(Error::ReaderStopped)?,
             seat.ok_or(Error::ReaderStopped)?,
             output,
+            data_device_manager,
         ))
     }
 
@@ -1004,6 +1562,8 @@ impl Registry {
                     }
                 }
                 Event::Repeat => {}
+                // Fd-carrying events never occur during output-scale probing.
+                Event::Fd(_) => {}
             }
         }
     }

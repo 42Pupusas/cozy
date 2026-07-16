@@ -10,7 +10,7 @@
 
 use grid::{Attrs, Cell, Color, DirtySnapshot};
 
-use crate::draw::Color as DrawColor;
+use crate::draw::{Canvas, Color as DrawColor};
 use crate::font::{FIRST, GLYPH_H, GLYPH_W, LAST};
 
 pub use crate::font::{FONT, GLYPH_H as CELL_H, GLYPH_W as CELL_W};
@@ -139,89 +139,87 @@ impl Theme {
     }
 }
 
-/// Blit a single cell into the pixel buffer.
-///
-/// `pixels` is the full framebuffer slice (`width × height` u32 words),
-/// `buf_width` is the stride in pixels, `cx`/`cy` are the cell column/row.
-pub fn blit_cell(
-    pixels: &mut [u32],
-    buf_width: u32,
-    cx: u16,
-    cy: u16,
-    cell: &Cell,
-    theme: &Theme,
-) {
-    // Spacer cells are the trailing (invisible) half of a wide glyph: the
-    // lead cell paints both columns already, so drawing here would just
-    // stamp a redundant blank over it (harmless but wasteful) -- skip.
-    if cell.spacer {
-        return;
+/// Grid-cell blitting, as methods on [`Canvas`] instead of free functions
+/// that took `pixels: &mut [u32]` + `buf_width` as their first two
+/// arguments -- `Canvas` already owns exactly that pair, so `canvas.blit_cell(..)`
+/// belongs on it rather than beside it.
+impl Canvas<'_> {
+    /// Blit a single cell into the canvas at cell column/row `cx`/`cy`.
+    pub fn blit_cell(&mut self, cx: u16, cy: u16, cell: &Cell, theme: &Theme) {
+        // Spacer cells are the trailing (invisible) half of a wide glyph: the
+        // lead cell paints both columns already, so drawing here would just
+        // stamp a redundant blank over it (harmless but wasteful) -- skip.
+        if cell.spacer {
+            return;
+        }
+
+        let (fg, bg) = theme.effective(&cell.attrs);
+        let fg_px = fg.to_xrgb8888();
+        let bg_px = bg.to_xrgb8888();
+
+        let buf_width = self.width() as u32;
+        let pixels = self.pixels_mut();
+
+        let px0 = u32::from(cx) * GLYPH_W as u32;
+        let py0 = u32::from(cy) * GLYPH_H as u32;
+        // A wide cell occupies two glyph cells' worth of background so the fill
+        // doesn't leave a bg-colored gap under its spacer half.
+        let cell_cols: u32 = if cell.wide { 2 } else { 1 };
+
+        // Look up glyph bitmap.
+        let ch = if cell.attrs.invisible { ' ' } else { cell.ch };
+        let glyph: Option<&[u8; 16]> = if ch >= FIRST as char && ch <= LAST as char {
+            let idx = ch as usize - FIRST as usize;
+            FONT.get(idx)
+        } else {
+            None
+        };
+
+        // Unknown glyphs (no ASCII bitmap) fall back to a solid ink block so
+        // missing coverage is visible rather than silently blank -- except for
+        // a wide cell's synthetic second half, which stays plain background.
+        for row in 0..GLYPH_H as u32 {
+            let py = py0 + row;
+            let row_mask: u8 = glyph.map_or(0xff, |g| g[row as usize]);
+            for col in 0..(GLYPH_W as u32 * cell_cols) {
+                let px = px0 + col;
+                // Clip to the buffer's actual bounds. The `px < buf_width` guard is
+                // critical: without it a cell from a STALE wider-geometry snapshot
+                // (one produced before a shrink, still queued when the backbuffer
+                // was already rebuilt narrower) would have px >= buf_width and the
+                // flat `py*buf_width + px` index would silently wrap into the NEXT
+                // row -- reordering and swallowing lines mid-drag. A plain
+                // `idx < len` check alone does not catch that horizontal overflow.
+                if px >= buf_width {
+                    continue;
+                }
+                // Only the first GLYPH_W columns carry the (ASCII) bitmap; a wide
+                // cell's second half is background-only until a real font with
+                // CJK/emoji glyphs replaces the embedded bitmap.
+                let bit = if col < GLYPH_W as u32 { (row_mask >> (7 - col)) & 1 } else { 0 };
+                let pixel = if bit != 0 { fg_px } else { bg_px };
+                let idx = (py * buf_width + px) as usize;
+                if idx < pixels.len() {
+                    pixels[idx] = pixel;
+                }
+            }
+        }
     }
 
-    let (fg, bg) = theme.effective(&cell.attrs);
-    let fg_px = fg.to_xrgb8888();
-    let bg_px = bg.to_xrgb8888();
-
-    let px0 = u32::from(cx) * GLYPH_W as u32;
-    let py0 = u32::from(cy) * GLYPH_H as u32;
-    // A wide cell occupies two glyph cells' worth of background so the fill
-    // doesn't leave a bg-colored gap under its spacer half.
-    let cell_cols: u32 = if cell.wide { 2 } else { 1 };
-
-    // Look up glyph bitmap.
-    let ch = if cell.attrs.invisible { ' ' } else { cell.ch };
-    let glyph: Option<&[u8; 16]> = if ch >= FIRST as char && ch <= LAST as char {
-        let idx = ch as usize - FIRST as usize;
-        FONT.get(idx)
-    } else {
-        None
-    };
-
-    // Unknown glyphs (no ASCII bitmap) fall back to a solid ink block so
-    // missing coverage is visible rather than silently blank -- except for
-    // a wide cell's synthetic second half, which stays plain background.
-    for row in 0..GLYPH_H as u32 {
-        let py = py0 + row;
-        let row_mask: u8 = glyph.map_or(0xff, |g| g[row as usize]);
-        for col in 0..(GLYPH_W as u32 * cell_cols) {
-            let px = px0 + col;
-            // Clip to the buffer's actual bounds. The `px < buf_width` guard is
-            // critical: without it a cell from a STALE wider-geometry snapshot
-            // (one produced before a shrink, still queued when the backbuffer
-            // was already rebuilt narrower) would have px >= buf_width and the
-            // flat `py*buf_width + px` index would silently wrap into the NEXT
-            // row -- reordering and swallowing lines mid-drag. A plain
-            // `idx < len` check alone does not catch that horizontal overflow.
-            if px >= buf_width {
+    /// Blit every dirty row in `snap` into the canvas.
+    pub fn blit_snapshot(&mut self, snap: &DirtySnapshot, theme: &Theme) {
+        // Rows of the glyph grid that fit in this buffer. A stale snapshot from a
+        // taller geometry may carry rows past the bottom; clip them rather than let
+        // them paint into the wrong pixels.
+        let buf_width = self.width() as u32;
+        let buf_rows = (self.pixels_mut().len() as u32 / buf_width.max(1)) / GLYPH_H as u32;
+        for row in &snap.rows {
+            if u32::from(row.row) >= buf_rows {
                 continue;
             }
-            // Only the first GLYPH_W columns carry the (ASCII) bitmap; a wide
-            // cell's second half is background-only until a real font with
-            // CJK/emoji glyphs replaces the embedded bitmap.
-            let bit = if col < GLYPH_W as u32 { (row_mask >> (7 - col)) & 1 } else { 0 };
-            let pixel = if bit != 0 { fg_px } else { bg_px };
-            let idx = (py * buf_width + px) as usize;
-            if idx < pixels.len() {
-                pixels[idx] = pixel;
+            for (col, cell) in row.cells.iter().enumerate() {
+                self.blit_cell(col as u16, row.row, cell, theme);
             }
-        }
-    }
-}
-
-/// Blit every dirty row in `snap` into the framebuffer.
-///
-/// `pixels` is the entire framebuffer (`buf_width × buf_height` u32 words).
-pub fn blit_snapshot(pixels: &mut [u32], buf_width: u32, snap: &DirtySnapshot, theme: &Theme) {
-    // Rows of the glyph grid that fit in this buffer. A stale snapshot from a
-    // taller geometry may carry rows past the bottom; clip them rather than let
-    // them paint into the wrong pixels.
-    let buf_rows = (pixels.len() as u32 / buf_width.max(1)) / GLYPH_H as u32;
-    for row in &snap.rows {
-        if u32::from(row.row) >= buf_rows {
-            continue;
-        }
-        for (col, cell) in row.cells.iter().enumerate() {
-            blit_cell(pixels, buf_width, col as u16, row.row, cell, theme);
         }
     }
 }
@@ -250,7 +248,7 @@ mod tests {
             rows: vec![DirtyRow { row: 0, cells: (0..5).map(|_| cell('M')).collect() }],
         };
         let theme = Theme::builtin();
-        blit_snapshot(&mut pixels, bw, &snap, &theme);
+        Canvas::new(&mut pixels, bw as i32, bh as i32).blit_snapshot(&snap, &theme);
 
         // The second glyph row (pixels y in [CELL_H, 2*CELL_H)) must be all
         // background — nothing from the over-wide row 0 may have leaked there.
@@ -273,7 +271,7 @@ mod tests {
             cols: 2,
             rows: vec![DirtyRow { row: 3, cells: vec![cell('M'), cell('M')] }],
         };
-        blit_snapshot(&mut pixels, bw, &snap, &Theme::builtin());
+        Canvas::new(&mut pixels, bw as i32, bh as i32).blit_snapshot(&snap, &Theme::builtin());
         // Nothing should have been drawn at all.
         assert!(pixels.iter().all(|&p| p == 0), "off-bottom row 3 leaked into buffer");
     }

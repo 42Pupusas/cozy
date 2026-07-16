@@ -6,9 +6,13 @@
 //! pixels with the hotspot at its tip. As we add more shapes (move, resize,
 //! text, …) the surface remains the same; we just attach a different buffer.
 
+use crate::conn::{ConnError, Sender};
 use crate::draw::Color;
-use crate::id::{BufferId, SurfaceId};
+use crate::error::{Error, Result};
+use crate::id::{BufferId, CompositorId, ShmId, SurfaceId};
+use crate::protocol::{CompositorRequest, Format, ShmPoolRequest, ShmRequest, SurfaceRequest};
 use crate::sys::ShmBuffer;
+use crate::wire::MessageBuilder;
 
 /// Width and height of the cursor image, in pixels.
 pub const CURSOR_SIZE: i32 = 16;
@@ -48,7 +52,7 @@ const LEFT_PTR_BITMAP: &[u8] = &[
 /// Write the left-arrow cursor into `pixels`, which must be at least
 /// `CURSOR_SIZE × CURSOR_SIZE` elements. Fills every pixel — call on a
 /// zero-initialized or don't-care buffer.
-pub fn write_left_ptr(pixels: &mut [u32]) {
+fn write_left_ptr(pixels: &mut [u32]) {
     let black = Color::BLACK.to_argb8888();
     let white = Color::WHITE.to_argb8888();
 
@@ -73,4 +77,47 @@ pub struct Cursor {
     /// compositor may read it.
     #[allow(dead_code)] // held for the mmap lifetime
     pub shm: ShmBuffer,
+}
+
+impl Cursor {
+    /// Set up the cursor surface: allocate its shm buffer, paint the
+    /// left-arrow bitmap into it, and attach + commit the Wayland surface.
+    ///
+    /// Was a free `create_cursor(sender, shm, compositor)` function in
+    /// `window.rs` -- it builds nothing but a `Cursor`, so it belongs as a
+    /// constructor on the type it returns, the same shape as
+    /// `RawPty::fork`/`File::open` elsewhere in this codebase.
+    pub fn create(sender: &mut Sender, shm: ShmId, compositor: CompositorId) -> Result<Self> {
+        let cs = CURSOR_SIZE as usize;
+        let mut cshm = ShmBuffer::new(cs, cs, 1).map_err(|e| Error::Conn(ConnError::Sys(e)))?;
+        write_left_ptr(cshm.pixels(0));
+        let cursor_pool: crate::id::PoolId = sender.alloc_id();
+        let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
+            .new_id(cursor_pool)
+            .i32(cshm.size_bytes() as i32)
+            .finish();
+        sender.send_with_fds(msg, &[cshm.fd()])?;
+        let cursor_surface: SurfaceId = sender.alloc_id();
+        sender.request(
+            MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(cursor_surface),
+        )?;
+        let cursor_buffer: BufferId = sender.alloc_id();
+        sender.request(
+            MessageBuilder::new(cursor_pool, ShmPoolRequest::CreateBuffer)
+                .new_id(cursor_buffer)
+                .i32(0)
+                .i32(CURSOR_SIZE)
+                .i32(CURSOR_SIZE)
+                .i32(CURSOR_SIZE * 4)
+                .u32(Format::Argb8888.code()),
+        )?;
+        sender.request(
+            MessageBuilder::new(cursor_surface, SurfaceRequest::Attach)
+                .object(cursor_buffer)
+                .i32(0)
+                .i32(0),
+        )?;
+        sender.request(MessageBuilder::new(cursor_surface, SurfaceRequest::Commit))?;
+        Ok(Self { surface: cursor_surface, buffer: cursor_buffer, shm: cshm })
+    }
 }

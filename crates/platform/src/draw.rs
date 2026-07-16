@@ -133,6 +133,13 @@ impl<'a> Canvas<'a> {
         self.height
     }
 
+    /// The raw pixel buffer, mutable. Escape hatch for other modules (e.g.
+    /// `render`'s grid-cell blitting) that need direct flat-index access
+    /// rather than one of `Canvas`'s coordinate-based drawing primitives.
+    pub fn pixels_mut(&mut self) -> &mut [u32] {
+        self.pixels
+    }
+
     /// The whole canvas as a rect — handy for full-surface ops.
     pub fn bounds(&self) -> Rect {
         Rect::new(0, 0, self.width, self.height)

@@ -209,7 +209,7 @@ impl TermWindow {
         sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetTitle).string(title))?;
         sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
 
-        let cursor = create_cursor(&mut sender, shm, compositor).ok();
+        let cursor = cursor::Cursor::create(&mut sender, shm, compositor).ok();
 
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<crate::conn::WindowRequest>::new(Capacity::exact(64)).split();
@@ -587,8 +587,9 @@ impl TermWindow {
         // Blit pending dirty snapshots into the persistent backbuffer, which
         // always holds the full image, then copy it into the free shm frame.
         let pending = std::mem::take(&mut self.pending_dirty);
+        let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
         for snap in &pending {
-            render::blit_snapshot(&mut self.backbuffer, self.width as u32, snap, &self.theme);
+            canvas.blit_snapshot(snap, &self.theme);
         }
         self.shm_mem.pixels(slot).copy_from_slice(&self.backbuffer);
 
@@ -747,44 +748,6 @@ fn create_frames(
         slot.buffer = buffer;
     }
     Ok((frames, shm_mem, pool))
-}
-
-fn create_cursor(
-    sender: &mut Sender,
-    shm: ShmId,
-    compositor: CompositorId,
-) -> Result<cursor::Cursor> {
-    let cs = cursor::CURSOR_SIZE as usize;
-    let mut cshm = ShmBuffer::new(cs, cs, 1).map_err(|e| Error::Conn(ConnError::Sys(e)))?;
-    cursor::write_left_ptr(cshm.pixels(0));
-    let cursor_pool: PoolId = sender.alloc_id();
-    let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
-        .new_id(cursor_pool)
-        .i32(cshm.size_bytes() as i32)
-        .finish();
-    sender.send_with_fds(msg, &[cshm.fd()])?;
-    let cursor_surface: SurfaceId = sender.alloc_id();
-    sender.request(
-        MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(cursor_surface),
-    )?;
-    let cursor_buffer: BufferId = sender.alloc_id();
-    sender.request(
-        MessageBuilder::new(cursor_pool, ShmPoolRequest::CreateBuffer)
-            .new_id(cursor_buffer)
-            .i32(0)
-            .i32(cursor::CURSOR_SIZE)
-            .i32(cursor::CURSOR_SIZE)
-            .i32(cursor::CURSOR_SIZE * 4)
-            .u32(Format::Argb8888.code()),
-    )?;
-    sender.request(
-        MessageBuilder::new(cursor_surface, SurfaceRequest::Attach)
-            .object(cursor_buffer)
-            .i32(0)
-            .i32(0),
-    )?;
-    sender.request(MessageBuilder::new(cursor_surface, SurfaceRequest::Commit))?;
-    Ok(cursor::Cursor { surface: cursor_surface, buffer: cursor_buffer, shm: cshm })
 }
 
 fn bind_globals(

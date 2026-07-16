@@ -256,6 +256,10 @@ pub struct TermWindow {
     /// + release with no motion is a *click*, which clears the selection; a
     /// drag sets it. Set on press, tested on release.
     drag_moved: bool,
+    /// Whether the left mouse button is currently held down. Motion only
+    /// extends a selection while this is true — releasing the button ends the
+    /// drag for good (the selection itself stays visible).
+    left_held: bool,
     /// Viewport rows that carried a highlight on the previous frame. Repainted
     /// clean on the next frame before the (possibly moved/cleared) selection
     /// is re-tinted, so highlight never lingers after deselect or drag.
@@ -469,6 +473,7 @@ impl TermWindow {
             paste_rx,
             focus_serial: 0,
             drag_moved: false,
+            left_held: false,
             prev_selection_rows: Vec::new(),
             prev_cursor_rows: Vec::new(),
             cursor_anim: crate::cursor_anim::CursorAnimator::new(cursor_cfg),
@@ -573,11 +578,6 @@ impl TermWindow {
             return;
         }
         let src: DataSourceId = self.window_tx.alloc_id();
-        eprintln!(
-            "platform: set_selection dev={} src={} serial={serial}",
-            dev.raw(),
-            src.raw()
-        );
         self.window_tx.request(
             MessageBuilder::new(mgr, DataDeviceManagerRequest::CreateDataSource).new_id(src),
         );
@@ -763,20 +763,6 @@ impl TermWindow {
         }
     }
 
-    /// Handle the string-bearing clipboard events routed as raw `Bytes`:
-    /// `data_source.send` (a peer wants our clipboard) and `data_offer.offer`
-    /// (a peer advertises a MIME type). `data_device.selection` is fixed-arg
-    /// and handled in the Wire path.
-    fn handle_clipboard_bytes(&mut self, wire: &WireEvent<'_>) {
-        if let Some(src) = self.clipboard_source {
-            if wire.object_id == src.raw()
-                && DataSourceEvent::from_opcode(wire.opcode) == Some(DataSourceEvent::Send)
-            {
-                self.awaiting_send_fd = true;
-            }
-        }
-    }
-
     fn handle_event(&mut self, ev: Event) -> Result<()> {
         // Clipboard fds arrive as a standalone `Fd` event immediately after the
         // message that triggered them (see conn.rs). Route by what we asked for.
@@ -787,8 +773,6 @@ impl TermWindow {
 
         // wl_display events arrive as raw bytes (the reader routes object 1 to
         // `Bytes`). Handle error (fatal) and delete_id (id recycling) here.
-        // String-bearing data-device events (source.send / offer.receive /
-        // offer.offer) also route to `Bytes`, so we dispatch them here too.
         if let Event::Bytes(ref bytes) = ev {
             let (mut wire, _) = WireEvent::parse(bytes).ok_or(Error::ReaderStopped)?;
             if wire.object_id == DisplayId(1).raw() {
@@ -807,8 +791,6 @@ impl TermWindow {
                     None => {}
                 }
             }
-            // Clipboard source/offer events that carry a mime-type string.
-            self.handle_clipboard_bytes(&wire);
             return Ok(());
         }
 
@@ -927,13 +909,16 @@ impl TermWindow {
                     }
                     Some(PointerEvent::Motion) => {
                         self.pointer_pos = ev.point(1, 2);
-                        // Extend an active drag selection.
-                        if let Some((anchor, _)) = self.selection {
-                            let cell = self.pointer_cell();
-                            if cell != anchor {
-                                self.selection = Some((anchor, cell));
-                                self.drag_moved = true;
-                                self.dirty = true;
+                        // Extend the selection only while the left button is
+                        // held — releasing ends the drag.
+                        if self.left_held {
+                            if let Some((anchor, _)) = self.selection {
+                                let cell = self.pointer_cell();
+                                if cell != anchor {
+                                    self.selection = Some((anchor, cell));
+                                    self.drag_moved = true;
+                                    self.dirty = true;
+                                }
                             }
                         }
                     }
@@ -942,18 +927,30 @@ impl TermWindow {
                         let state = ButtonState::from_raw(ev.arg(3));
                         match (button, state) {
                             (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
-                                // Begin a potential selection at the pointer
-                                // cell; whether it becomes a real selection or
-                                // a deselect-click is decided on release.
-                                let cell = self.pointer_cell();
-                                self.selection = Some((cell, cell));
-                                self.drag_moved = false;
+                                self.left_held = true;
+                                if self.selection.is_some() {
+                                    // A press while a selection is visible is
+                                    // a dismiss-click: clear it and don't
+                                    // start a new one. The user starts a fresh
+                                    // selection with a press on empty space.
+                                    self.selection = None;
+                                    self.drag_moved = false;
+                                } else {
+                                    // Begin a potential selection at the
+                                    // pointer cell; whether it becomes a real
+                                    // selection or a no-op click is decided by
+                                    // whether the pointer moves before release.
+                                    let cell = self.pointer_cell();
+                                    self.selection = Some((cell, cell));
+                                    self.drag_moved = false;
+                                }
                                 self.dirty = true;
                             }
                             (Some(PointerButton::Left), Some(ButtonState::Released)) => {
-                                // A press+release with no motion is a *click*:
-                                // clear any selection. A drag (motion between
-                                // press and release) leaves the selection set.
+                                self.left_held = false;
+                                // Release ends the drag. If the pointer never
+                                // moved since press, this was a bare click on
+                                // empty space — nothing to keep.
                                 if !self.drag_moved {
                                     self.selection = None;
                                 }
@@ -1091,11 +1088,22 @@ impl TermWindow {
             }
         }
 
-        // wl_data_source.cancelled arrives as a fixed-arg (Wire) event; the
-        // string-bearing send is handled in handle_clipboard_bytes.
+        // wl_data_source.* — a peer wants our clipboard (send) or replaced it
+        // (cancelled). Both arrive as Wire events (the reader only routes
+        // display/registry to Bytes); send's string arg is misparsed into the
+        // inline u32 slots, but we don't need it — we always serve text/plain.
         if let Some(src) = self.clipboard_source {
-            if ev.is(src) && ev.event::<DataSourceEvent>() == Some(DataSourceEvent::Cancelled) {
-                self.clipboard_source = None;
+            if ev.is(src) {
+                match ev.event::<DataSourceEvent>() {
+                    Some(DataSourceEvent::Send) => {
+                        // The fd to write into arrives as the next Event::Fd.
+                        self.awaiting_send_fd = true;
+                    }
+                    Some(DataSourceEvent::Cancelled) => {
+                        self.clipboard_source = None;
+                    }
+                    _ => {}
+                }
                 return Ok(());
             }
         }
@@ -1218,25 +1226,36 @@ impl TermWindow {
     /// cursor spanning a slide between two rows -- 2), so the next frame
     /// knows which rows to repaint clean first (see `prev_cursor_rows`).
     fn draw_cursor_overlay(&mut self) -> Vec<u16> {
+        let (vc, vr) = self.cursor_anim.visual_pos();
+        let pulse = self.cursor_anim.pulse();
         let alpha = self.cursor_anim.alpha();
-        if alpha <= 0.0 {
+
+        if alpha <= 0.0 && pulse.is_none() {
             return Vec::new();
         }
-        let (vc, vr) = self.cursor_anim.visual_pos();
+
         let shape = self.cursor_anim.shape();
         {
             let mut canvas =
                 crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
-            self.renderer.draw_cursor(&mut canvas, vc, vr, shape, alpha);
+            if alpha > 0.0 {
+                self.renderer.draw_cursor(&mut canvas, vc, vr, shape, alpha);
+            }
+            if let Some(t) = pulse {
+                self.renderer.draw_cursor_pulse(&mut canvas, vc, vr, t);
+            }
         }
 
+        // The pulse ring extends past the cell's own bounds, so widen the
+        // repaint hint by one row on each side when it's active.
         let row_top = vr.floor().max(0.0) as u16;
         let row_bot = vr.ceil().max(0.0) as u16;
-        if row_top == row_bot {
-            vec![row_top]
+        let (lo, hi) = if pulse.is_some() {
+            (row_top.saturating_sub(1), row_bot.saturating_add(1))
         } else {
-            vec![row_top, row_bot]
-        }
+            (row_top, row_bot)
+        };
+        (lo..=hi).collect()
     }
 
     fn maybe_present(&mut self) -> Result<()> {

@@ -22,8 +22,25 @@
 
 use grid::CursorShape;
 
-/// How long a cell-to-cell slide takes, in milliseconds.
+/// How long a cell-to-cell slide takes, in milliseconds (short jumps, e.g.
+/// normal typing/cursor movement).
 const SLIDE_MS: f32 = 90.0;
+
+/// Upper bound on slide duration for very long jumps (e.g. a multi-line
+/// paste landing far from where you were) — long enough for the eye to
+/// track the motion, short enough to not feel sluggish.
+const SLIDE_MS_MAX: f32 = 260.0;
+
+/// Cell-distance beyond which a jump is considered "long": below it, the
+/// slide always takes the base SLIDE_MS; above it, duration scales up
+/// toward SLIDE_MS_MAX and a landing pulse is armed.
+const LONG_JUMP_CELLS: f32 = 8.0;
+
+/// Cell-distance at which slide duration reaches SLIDE_MS_MAX.
+const MAX_JUMP_CELLS: f32 = 40.0;
+
+/// How long the landing-pulse ring takes to expand and fade out, in ms.
+const PULSE_MS: f32 = 380.0;
 
 /// The dimmest point of the blink sine wave (never fully invisible — a
 /// completely-disappearing cursor reads as a glitch, not a blink).
@@ -69,6 +86,12 @@ pub struct CursorAnimator {
     target_col: u16,
     target_row: u16,
     slide_elapsed_ms: f32,
+    slide_ms: f32,
+
+    // Landing-pulse state: armed on a long jump, fires once the slide
+    // settles. `pulse_elapsed_ms >= PULSE_MS` means "not currently pulsing".
+    pulse_pending: bool,
+    pulse_elapsed_ms: f32,
 
     // Blink state: phase since the last reset, wrapped to `period_ms`.
     blink_phase_ms: f32,
@@ -86,6 +109,9 @@ impl CursorAnimator {
             target_col: 0,
             target_row: 0,
             slide_elapsed_ms: SLIDE_MS, // start "at rest", no slide in flight
+            slide_ms: SLIDE_MS,
+            pulse_pending: false,
+            pulse_elapsed_ms: PULSE_MS, // start "at rest", no pulse in flight
             blink_phase_ms: 0.0,
             visible: true,
         }
@@ -109,11 +135,25 @@ impl CursorAnimator {
     pub fn set_target(&mut self, col: u16, row: u16, visible: bool) {
         if (col, row) != (self.target_col, self.target_row) {
             let (vc, vr) = self.visual_pos();
+            let dist = (f32::from(col) - vc).hypot(f32::from(row) - vr);
             self.start_col = vc;
             self.start_row = vr;
             self.target_col = col;
             self.target_row = row;
             self.slide_elapsed_ms = 0.0;
+
+            // Long jumps (e.g. a paste landing far away) get a longer, more
+            // trackable slide, plus a landing pulse once they arrive --
+            // everyday cursor moves are short and unaffected.
+            if dist > LONG_JUMP_CELLS {
+                let t =
+                    ((dist - LONG_JUMP_CELLS) / (MAX_JUMP_CELLS - LONG_JUMP_CELLS)).clamp(0.0, 1.0);
+                self.slide_ms = lerp(SLIDE_MS, SLIDE_MS_MAX, t);
+                self.pulse_pending = true;
+            } else {
+                self.slide_ms = SLIDE_MS;
+                self.pulse_pending = false;
+            }
         }
         self.visible = visible;
     }
@@ -132,9 +172,20 @@ impl CursorAnimator {
     /// idling on the next real event.
     pub fn advance(&mut self, dt_ms: f32) -> bool {
         let mut animating = false;
-        if self.slide_elapsed_ms < SLIDE_MS {
-            self.slide_elapsed_ms = (self.slide_elapsed_ms + dt_ms).min(SLIDE_MS);
-            if self.slide_elapsed_ms < SLIDE_MS {
+        if self.slide_elapsed_ms < self.slide_ms {
+            self.slide_elapsed_ms = (self.slide_elapsed_ms + dt_ms).min(self.slide_ms);
+            if self.slide_elapsed_ms < self.slide_ms {
+                animating = true;
+            } else if self.pulse_pending {
+                // The slide just settled at the destination -- fire the
+                // landing pulse now, from a clean start.
+                self.pulse_pending = false;
+                self.pulse_elapsed_ms = 0.0;
+            }
+        }
+        if self.pulse_elapsed_ms < PULSE_MS {
+            self.pulse_elapsed_ms = (self.pulse_elapsed_ms + dt_ms).min(PULSE_MS);
+            if self.pulse_elapsed_ms < PULSE_MS {
                 animating = true;
             }
         }
@@ -151,10 +202,10 @@ impl CursorAnimator {
     /// Current visual (float) cell position, easing toward the target.
     #[must_use]
     pub fn visual_pos(&self) -> (f32, f32) {
-        if self.slide_elapsed_ms >= SLIDE_MS {
+        if self.slide_elapsed_ms >= self.slide_ms {
             return (f32::from(self.target_col), f32::from(self.target_row));
         }
-        let t = ease_out_cubic(self.slide_elapsed_ms / SLIDE_MS);
+        let t = ease_out_cubic(self.slide_elapsed_ms / self.slide_ms);
         (
             lerp(self.start_col, f32::from(self.target_col), t),
             lerp(self.start_row, f32::from(self.target_row), t),
@@ -193,9 +244,24 @@ impl CursorAnimator {
     /// or blink is turned off).
     #[must_use]
     pub fn is_animating(&self) -> bool {
-        let sliding = self.slide_elapsed_ms < SLIDE_MS;
+        let sliding = self.slide_elapsed_ms < self.slide_ms;
+        let pulsing = self.pulse_elapsed_ms < PULSE_MS;
         let blinking = self.cfg.blink && self.visible;
-        sliding || blinking
+        sliding || pulsing || blinking
+    }
+
+    /// Landing-pulse progress: `None` if no pulse is currently in flight;
+    /// otherwise `Some(t)` with `t` in `0.0..=1.0` (0 = just landed, 1 =
+    /// fully faded out). The renderer uses this to draw a brief expanding,
+    /// fading ring at the cursor's cell so a long jump (e.g. a paste landing
+    /// far away) draws the eye to where it ended up.
+    #[must_use]
+    pub fn pulse(&self) -> Option<f32> {
+        if self.pulse_elapsed_ms < PULSE_MS {
+            Some(self.pulse_elapsed_ms / PULSE_MS)
+        } else {
+            None
+        }
     }
 }
 
@@ -393,6 +459,47 @@ mod tests {
         let mut a = CursorAnimator::new(cfg(true));
         a.set_target(0, 0, false);
         assert!(!a.is_animating());
+    }
+
+    #[test]
+    fn short_jump_does_not_arm_a_pulse() {
+        let mut a = CursorAnimator::new(cfg(false));
+        a.set_target(3, 0, true); // well under LONG_JUMP_CELLS
+        a.advance(SLIDE_MS);
+        assert!(a.pulse().is_none(), "short jumps must not pulse");
+    }
+
+    #[test]
+    fn long_jump_arms_a_pulse_that_fires_on_arrival() {
+        let mut a = CursorAnimator::new(cfg(false));
+        a.set_target(30, 5, true); // far beyond LONG_JUMP_CELLS
+        // Pulse only fires once the slide settles, not mid-flight.
+        a.advance(1.0);
+        assert!(a.pulse().is_none(), "pulse must not fire before landing");
+        // Drive just past the (distance-scaled, possibly > SLIDE_MS) slide,
+        // but not so far the pulse (which starts right after) also finishes.
+        a.advance(SLIDE_MS_MAX + 1.0);
+        assert!(
+            a.pulse().is_some(),
+            "pulse should be active right after landing"
+        );
+        // Eventually the pulse itself fades out.
+        a.advance(PULSE_MS + 1.0);
+        assert!(a.pulse().is_none(), "pulse must eventually finish");
+    }
+
+    #[test]
+    fn long_jump_slide_takes_longer_than_a_short_one() {
+        let mut short = CursorAnimator::new(cfg(false));
+        short.set_target(2, 0, true);
+        let mut long = CursorAnimator::new(cfg(false));
+        long.set_target(35, 0, true);
+        // After the short jump's normal duration, the short one is done...
+        short.advance(SLIDE_MS);
+        assert_eq!(short.visual_pos(), (2.0, 0.0));
+        // ...but the long one should not have arrived yet.
+        long.advance(SLIDE_MS);
+        assert_ne!(long.visual_pos(), (35.0, 0.0));
     }
 
     #[test]

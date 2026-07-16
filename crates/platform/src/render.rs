@@ -632,8 +632,17 @@ impl Renderer {
                 (px0, py0, px0 + self.cell_w as f32, py0 + self.cell_h as f32)
             }
             grid::CursorShape::Bar => {
-                const BAR_W: f32 = 2.0;
-                (px0, py0, px0 + BAR_W, py0 + self.cell_h as f32)
+                // Slightly narrower than before, and inset a hair
+                // vertically so it doesn't touch neighbouring lines --
+                // reads as a slim text-caret rather than a full-height bar.
+                const BAR_W: f32 = 1.5;
+                const VERT_INSET: f32 = 1.5;
+                (
+                    px0,
+                    py0 + VERT_INSET,
+                    px0 + BAR_W,
+                    py0 + self.cell_h as f32 - VERT_INSET,
+                )
             }
             grid::CursorShape::Underline => {
                 const UNDERLINE_H: f32 = 2.0;
@@ -672,6 +681,80 @@ impl Renderer {
                 let ng = (fg_g - dg).mul_add(alpha, dg).round() as u32;
                 let nb = (fg_b - db).mul_add(alpha, db).round() as u32;
                 *dst = (d & 0xff00_0000) | (nr << 16) | (ng << 8) | nb;
+            }
+        }
+    }
+
+    /// Draw the "landing pulse" ring: a thin outline centered on the cell
+    /// at `(visual_col, visual_row)`, expanded outward and faded out as `t`
+    /// (`0.0` = just landed, `1.0` = fully gone) advances. Used after a long
+    /// cursor jump (e.g. a multi-line paste) settles, to draw the eye to
+    /// where the cursor ended up.
+    pub fn draw_cursor_pulse(
+        &self,
+        canvas: &mut Canvas<'_>,
+        visual_col: f32,
+        visual_row: f32,
+        t: f32,
+    ) {
+        if !(0.0..1.0).contains(&t) {
+            return;
+        }
+        let (fg, _) = self.theme.effective(&Attrs::default());
+        let buf_w = canvas.width();
+        let buf_h = canvas.height();
+
+        // Ring grows outward from the cell bounds by up to ~60% of a cell,
+        // and fades out over the same span -- an expanding, dissolving box.
+        let grow = t * (self.cell_w.min(self.cell_h) as f32) * 0.6;
+        let alpha = 1.0 - t;
+        let x0f = visual_col.mul_add(self.cell_w as f32, -grow);
+        let y0f = visual_row.mul_add(self.cell_h as f32, -grow);
+        let x1f = x0f + self.cell_w as f32 + grow * 2.0;
+        let y1f = y0f + self.cell_h as f32 + grow * 2.0;
+
+        let x0 = x0f.floor().max(0.0) as i32;
+        let y0 = y0f.floor().max(0.0) as i32;
+        let x1 = x1f.ceil().min(buf_w as f32) as i32;
+        let y1 = y1f.ceil().min(buf_h as f32) as i32;
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        const THICK: i32 = 2;
+        let pixels = canvas.pixels_mut();
+        let fg_r = f32::from(fg.r);
+        let fg_g = f32::from(fg.g);
+        let fg_b = f32::from(fg.b);
+        let mut blend_px = |x: i32, y: i32| {
+            if x < 0 || y < 0 || x >= buf_w || y >= buf_h {
+                return;
+            }
+            let idx = (y as usize) * (buf_w as usize) + (x as usize);
+            let Some(dst) = pixels.get_mut(idx) else {
+                return;
+            };
+            let d = *dst;
+            let dr = f32::from(((d >> 16) & 0xff) as u8);
+            let dg = f32::from(((d >> 8) & 0xff) as u8);
+            let db = f32::from((d & 0xff) as u8);
+            let nr = (fg_r - dr).mul_add(alpha, dr).round() as u32;
+            let ng = (fg_g - dg).mul_add(alpha, dg).round() as u32;
+            let nb = (fg_b - db).mul_add(alpha, db).round() as u32;
+            *dst = (d & 0xff00_0000) | (nr << 16) | (ng << 8) | nb;
+        };
+        for y in y0..y1 {
+            let on_h_edge = y < y0 + THICK || y >= y1 - THICK;
+            if on_h_edge {
+                for x in x0..x1 {
+                    blend_px(x, y);
+                }
+            } else {
+                for x in x0..(x0 + THICK).min(x1) {
+                    blend_px(x, y);
+                }
+                for x in (x1 - THICK).max(x0)..x1 {
+                    blend_px(x, y);
+                }
             }
         }
     }

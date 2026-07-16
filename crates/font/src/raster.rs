@@ -40,84 +40,92 @@ struct Edge {
 
 // ── Public entry ──────────────────────────────────────────────────────────────
 
-/// Rasterize `outline` into a bitmap of size `w × h`.
-///
-/// `scale`     — font-units → pixels (typically `px_size / units_per_em`)
-/// `baseline`  — Y pixel at which the font baseline sits (usually close to `h`)
-/// `x_offset`  — horizontal shift in pixels (left side bearing applied by caller)
-#[must_use] 
-pub fn rasterize(outline: &Outline, w: u32, h: u32, scale: f32, baseline: f32, x_offset: f32) -> Bitmap {
-    let mut edges: Vec<Edge> = Vec::new();
+impl Outline {
+    /// Rasterize this outline into a bitmap of size `w × h`.
+    ///
+    /// `scale`     — font-units → pixels (typically `px_size / units_per_em`)
+    /// `baseline`  — Y pixel at which the font baseline sits (usually close to `h`)
+    /// `x_offset`  — horizontal shift in pixels (left side bearing applied by caller)
+    ///
+    /// Was a free `rasterize(outline: &Outline, ..)` function — moved onto
+    /// `Outline` itself since it's the only thing being consumed here; this
+    /// also disambiguates by name from `FontFace::rasterize` (`outline.rasterize(..)`
+    /// vs `face.rasterize(codepoint)`) instead of both being called `rasterize`
+    /// at different scopes.
+    #[must_use] 
+    pub fn rasterize(&self, w: u32, h: u32, scale: f32, baseline: f32, x_offset: f32) -> Bitmap {
+        let mut edges: Vec<Edge> = Vec::new();
 
-    // Transform a font-unit point to pixel coords.
-    let tx = |p: Point| -> (f32, f32) {
-        let px = p.x.mul_add(scale, x_offset);
-        // Y in fonts goes up; in pixels it goes down — flip around baseline.
-        let py = p.y.mul_add(-scale, baseline);
-        (px, py)
-    };
+        // Transform a font-unit point to pixel coords.
+        let tx = |p: Point| -> (f32, f32) {
+            let px = p.x.mul_add(scale, x_offset);
+            // Y in fonts goes up; in pixels it goes down — flip around baseline.
+            let py = p.y.mul_add(-scale, baseline);
+            (px, py)
+        };
 
-    let mut current = (0.0f32, 0.0f32);
-    let mut contour_start = (0.0f32, 0.0f32);
+        let mut current = (0.0f32, 0.0f32);
+        let mut contour_start = (0.0f32, 0.0f32);
 
-    for &verb in &outline.verbs {
-        match verb {
-            Verb::MoveTo(p) => {
-                let (px, py) = tx(p);
-                current = (px, py);
-                contour_start = (px, py);
-            }
-            Verb::LineTo(p) => {
-                let (px, py) = tx(p);
-                push_edge(&mut edges, current, (px, py));
-                current = (px, py);
-            }
-            Verb::QuadTo(ctrl, end) => {
-                let (cx, cy) = tx(ctrl);
-                let (ex, ey) = tx(end);
-                // Subdivide into ~8 segments — sufficient for pixel-scale glyphs.
-                subdivide_quad(&mut edges, current, (cx, cy), (ex, ey), 3);
-                current = (ex, ey);
-            }
-            Verb::Close => {
-                push_edge(&mut edges, current, contour_start);
-                current = contour_start;
-            }
-        }
-    }
-
-    // Scanline fill.
-    let mut bmp = Bitmap::blank(w, h);
-    for scanline in 0..h {
-        let y = scanline as f32 + 0.5; // sample at center of pixel row
-
-        // Collect X intersections on this scanline with non-zero winding.
-        let mut crossings: Vec<(f32, i8)> = edges.iter()
-            .filter_map(|e| edge_x_at(e, y))
-            .collect();
-
-        crossings.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-
-        let mut winding = 0i32;
-        let mut prev_x  = 0.0f32;
-        let mut inside   = false;
-
-        for (x, w_delta) in crossings {
-            if inside {
-                // Fill from prev_x to x.
-                let x0 = (prev_x.ceil() as i64).max(0) as u32;
-                let x1 = (x.ceil() as i64).max(0).min(i64::from(w)) as u32;
-                for col in x0..x1 {
-                    bmp.data[(scanline * w + col) as usize] = 255;
+        for &verb in &self.verbs {
+            match verb {
+                Verb::MoveTo(p) => {
+                    let (px, py) = tx(p);
+                    current = (px, py);
+                    contour_start = (px, py);
+                }
+                Verb::LineTo(p) => {
+                    let (px, py) = tx(p);
+                    push_edge(&mut edges, current, (px, py));
+                    current = (px, py);
+                }
+                Verb::QuadTo(ctrl, end) => {
+                    let (cx, cy) = tx(ctrl);
+                    let (ex, ey) = tx(end);
+                    // Subdivide into ~8 segments — sufficient for pixel-scale glyphs.
+                    subdivide_quad(&mut edges, current, (cx, cy), (ex, ey), 3);
+                    current = (ex, ey);
+                }
+                Verb::Close => {
+                    push_edge(&mut edges, current, contour_start);
+                    current = contour_start;
                 }
             }
-            winding += i32::from(w_delta);
-            inside   = winding != 0;
-            prev_x   = x;
         }
-    }
 
-    bmp
+        // Scanline fill.
+        let mut bmp = Bitmap::blank(w, h);
+        for scanline in 0..h {
+            let y = scanline as f32 + 0.5; // sample at center of pixel row
+
+            // Collect X intersections on this scanline with non-zero winding.
+            let mut crossings: Vec<(f32, i8)> = edges.iter()
+                .filter_map(|e| edge_x_at(e, y))
+                .collect();
+
+            crossings.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+            let mut winding = 0i32;
+            let mut prev_x  = 0.0f32;
+            let mut inside   = false;
+
+            for (x, w_delta) in crossings {
+                if inside {
+                    // Fill from prev_x to x.
+                    let x0 = (prev_x.ceil() as i64).max(0) as u32;
+                    let x1 = (x.ceil() as i64).max(0).min(i64::from(w)) as u32;
+                    for col in x0..x1 {
+                        bmp.data[(scanline * w + col) as usize] = 255;
+                    }
+                }
+                winding += i32::from(w_delta);
+                inside   = winding != 0;
+                prev_x   = x;
+            }
+        }
+
+        bmp
+    }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

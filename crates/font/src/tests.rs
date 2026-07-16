@@ -4,7 +4,6 @@ use crate::{
     atlas::Atlas,
     face::FontFace,
     parse::{FontFile, ParseError},
-    raster::rasterize,
     tables::{Cmap, Head, Hhea, Hmtx, Loca, Maxp},
 };
 
@@ -169,7 +168,7 @@ fn raster_m_produces_nonzero_pixels() {
     let ascender = hhea.ascender as f32 * scale;
     let w = 16u32;
     let h = 20u32;
-    let bmp = rasterize(&outline, w, h, scale, ascender, 0.0);
+    let bmp = outline.rasterize(w, h, scale, ascender, 0.0);
 
     let nonzero = bmp.data.iter().filter(|&&v| v > 0).count();
     assert!(nonzero > 0, "rasterized 'M' bitmap is all-zero");
@@ -187,7 +186,7 @@ fn raster_bitmap_correct_size() {
     let gid   = cmap.glyph_id('M' as u32);
     let (off, len) = loca.glyph_range(gid).unwrap();
     let outline = crate::outline::decode_glyph(glyf, off, len, 0).unwrap();
-    let bmp = rasterize(&outline, 16, 20, scale, 16.0, 0.0);
+    let bmp = outline.rasterize(16, 20, scale, 16.0, 0.0);
     assert_eq!(bmp.data.len(), (16 * 20) as usize);
 }
 
@@ -239,7 +238,7 @@ fn atlas_packs_without_overflow() {
         let px_x_min = outline.x_min as f32 * scale;
         let w = ((px_x_max - px_x_min).ceil() as u32).max(1);
         let h = ((px_y_max - px_y_min).ceil() as u32).max(1);
-        let bmp = rasterize(&outline, w, h, scale, ascender, -px_x_min);
+        let bmp = outline.rasterize(w, h, scale, ascender, -px_x_min);
         atlas.insert(&bmp, lsb_raw as i32, (px_y_max) as i32, (adv_raw as f32 * scale) as i32);
         packed += 1;
     }

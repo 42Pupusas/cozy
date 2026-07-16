@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use crate::atlas::{Atlas, GlyphEntry};
 use crate::outline::decode_glyph;
 use crate::parse::{FontFile, ParseError};
-use crate::raster::{Bitmap, rasterize};
+use crate::raster::Bitmap;
 use crate::tables::{Cmap, Head, Hhea, Hmtx, Loca, Maxp};
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
@@ -205,7 +205,7 @@ impl FontFace {
         let bitmap = if outline.verbs.is_empty() {
             Bitmap::blank(0, 0)
         } else {
-            rasterize(&outline, bmp_w, bmp_h, scale, top, -left)
+            outline.rasterize(bmp_w, bmp_h, scale, top, -left)
         };
 
         let metrics = GlyphMetrics {

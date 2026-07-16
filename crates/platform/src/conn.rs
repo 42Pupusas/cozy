@@ -117,8 +117,8 @@ const MAX_FDS: usize = 16;
 ///
 /// All other events we care about (pointer, configure, ping, close, seat caps)
 /// have only fixed `u32`/`i32` args and are inlined.
-const DISPLAY_ID: u32 = 1;
-const REGISTRY_ID: u32 = 2;
+pub(crate) const DISPLAY_ID: u32 = 1;
+pub(crate) const REGISTRY_ID: u32 = 2;
 
 /// `user_data` tags on the rx ring, so the reader can tell its two kinds of
 /// completion apart: the multishot recv on the socket vs. the one-shot poll on
@@ -396,7 +396,7 @@ impl Reader {
 
             // Drain whole messages out of the inbox and forward them.
             while let Some(size) = WireEvent::parse(&self.inbox).map(|(_, s)| s) {
-                let event = encode(&self.inbox[..size]);
+                let event = Event::from_wire_msg(&self.inbox[..size]);
                 self.inbox.drain(..size);
                 // push_block waits if the consumer is behind; if the consumer
                 // has dropped, push returns the value back and we stop.
@@ -475,7 +475,7 @@ impl Reader {
         }
 
         if flags.contains(CqeFlags::BUFFER)
-            && let Some(buf_id) = buffer_id(flags)
+            && let Some(buf_id) = flags.buffer_id()
         {
             if let Some(parts) =
                 self.pool
@@ -500,54 +500,23 @@ impl Reader {
     }
 }
 
-/// Decode the buffer-id from a CQE's flags (upper 16 bits, when BUFFER is set).
-fn buffer_id(flags: CqeFlags) -> Option<u16> {
-    if flags.contains(CqeFlags::BUFFER) {
-        Some((flags.bits() >> 16) as u16)
-    } else {
-        None
-    }
+/// Extends `ququmatz`'s `CqeFlags` with the provided-buffer-id decode --
+/// was a free `buffer_id(flags)` function taking `CqeFlags` as its only
+/// arg, the shape an extension trait exists for (`CqeFlags` is external,
+/// so no inherent impl is possible).
+trait CqeFlagsExt {
+    /// Decode the buffer id from the CQE's flags (upper 16 bits), or `None`
+    /// if the `BUFFER` bit isn't set.
+    fn buffer_id(self) -> Option<u16>;
 }
 
-/// Turn one whole wire message (`msg`, including its 8-byte header) into a
-/// channel [`Event`].
-///
-/// Messages from `wl_display` and `wl_registry` carry strings, so they're
-/// forwarded as raw bytes for the main thread to re-parse with the full wire
-/// decoder. Everything else inlines up to four `u32` args.
-fn encode(msg: &[u8]) -> Event {
-    let object_id = u32::from_ne_bytes(
-        msg[0..4]
-            .try_into()
-            .expect("Wayland message shorter than 4-byte header"),
-    );
-    let opcode = u16::from_ne_bytes(
-        msg[4..6]
-            .try_into()
-            .expect("Wayland message shorter than 6-byte header"),
-    );
-
-    if object_id == DISPLAY_ID || object_id == REGISTRY_ID {
-        return Event::Bytes(msg.to_vec().into_boxed_slice());
-    }
-
-    // Read up to four u32 args from the message body (after the header).
-    let body = &msg[8..];
-    let mut args = [0u32; 4];
-    let n = (body.len() / 4).min(4);
-    for (i, slot) in args.iter_mut().enumerate().take(n) {
-        let off = i * 4;
-        *slot = u32::from_ne_bytes(
-            body[off..off + 4]
-                .try_into()
-                .expect("Wayland message body shorter than argument window"),
-        );
-    }
-    Event::Wire {
-        object_id,
-        opcode,
-        args,
-        nargs: n as u8,
+impl CqeFlagsExt for CqeFlags {
+    fn buffer_id(self) -> Option<u16> {
+        if self.contains(CqeFlags::BUFFER) {
+            Some((self.bits() >> 16) as u16)
+        } else {
+            None
+        }
     }
 }
 

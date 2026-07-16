@@ -50,6 +50,55 @@ pub enum Event {
 }
 
 impl Event {
+    /// Decode one whole wire message (`msg`, including its 8-byte header)
+    /// into an `Event`. Was a free `encode(msg: &[u8]) -> Event` function in
+    /// `conn.rs`'s reader thread -- it builds nothing but an `Event`, so it
+    /// belongs as a constructor on the type it returns.
+    ///
+    /// Messages from `wl_display` and `wl_registry` carry strings, so
+    /// they're forwarded as raw bytes ([`Event::Bytes`]) for the main thread
+    /// to re-parse with the full wire decoder. Everything else inlines up to
+    /// four `u32` args into [`Event::Wire`].
+    ///
+    /// # Panics
+    /// If `msg` is shorter than the 8-byte Wayland message header.
+    #[must_use]
+    pub fn from_wire_msg(msg: &[u8]) -> Self {
+        let object_id = u32::from_ne_bytes(
+            msg[0..4]
+                .try_into()
+                .expect("Wayland message shorter than 4-byte header"),
+        );
+        let opcode = u16::from_ne_bytes(
+            msg[4..6]
+                .try_into()
+                .expect("Wayland message shorter than 6-byte header"),
+        );
+
+        if object_id == crate::conn::DISPLAY_ID || object_id == crate::conn::REGISTRY_ID {
+            return Self::Bytes(msg.to_vec().into_boxed_slice());
+        }
+
+        // Read up to four u32 args from the message body (after the header).
+        let body = &msg[8..];
+        let mut args = [0u32; 4];
+        let n = (body.len() / 4).min(4);
+        for (i, slot) in args.iter_mut().enumerate().take(n) {
+            let off = i * 4;
+            *slot = u32::from_ne_bytes(
+                body[off..off + 4]
+                    .try_into()
+                    .expect("Wayland message body shorter than argument window"),
+            );
+        }
+        Self::Wire {
+            object_id,
+            opcode,
+            args,
+            nargs: n as u8,
+        }
+    }
+
     /// The object id this event is about (raw wire value), or 0 for the
     /// non-`Wire` variants (`Bytes`, `Repeat`), which aren't about an object.
     pub fn object_id(&self) -> u32 {

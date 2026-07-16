@@ -216,90 +216,89 @@ pub(crate) const REGISTRY_ID: u32 = 2;
 const UD_RECV: u64 = 0;
 const UD_TIMER: u64 = 1;
 
-/// Build the AF_UNIX socket, the two rings, connect, register the recv pool, arm
-/// the first multishot recv, and create the (disarmed) key-repeat timer. Returns
-/// the [`Sender`] and [`RepeatTimer`] (main thread) and the [`Reader`] (its own
-/// thread). The reader polls the timer's fd; the [`RepeatTimer`] that owns it
-/// stays on the main thread, which arms/disarms it as keys are held/released.
+/// Marker type whose sole job is to host [`Conn::connect`] -- the operation
+/// isn't a method on any value that exists yet (it *builds* the values), so
+/// it lives as an associated fn on a zero-sized namespace type rather than a
+/// bare top-level `connect()`.
 pub struct Conn;
 
 impl Conn {
-    /// See module-level [`connect`] docs — this is the same operation as a
-    /// constructor on a marker type, so callers spell it `Conn::connect()`
-    /// rather than a bare top-level `connect()`.
+    /// Build the AF_UNIX socket, the two rings, connect, register the recv
+    /// pool, arm the first multishot recv, and create the (disarmed)
+    /// key-repeat timer. Returns the [`Sender`] and [`RepeatTimer`] (main
+    /// thread) and the [`Reader`] (its own thread). The reader polls the
+    /// timer's fd; the [`RepeatTimer`] that owns it stays on the main
+    /// thread, which arms/disarms it as keys are held/released.
     pub fn connect() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
-        connect_impl()
+        let runtime =
+            std::env::var_os("XDG_RUNTIME_DIR").ok_or(ConnError::Env("XDG_RUNTIME_DIR"))?;
+        let display = std::env::var_os("WAYLAND_DISPLAY")
+            .unwrap_or_else(|| std::ffi::OsString::from("wayland-0"));
+        let mut path = PathBuf::from(runtime);
+        path.push(&display);
+
+        // AF_UNIX stream socket (ququmatz's typed Socket is IPv4-only, so we make
+        // the fd ourselves and adopt it).
+        let sock_owned = Sender::make_unix_socket()?;
+        let sock = RawFd::from_raw(sock_owned.as_raw_fd() as usize);
+
+        // Two rings on the same fd: the send ring (main thread) and the recv ring
+        // (reader thread). They're built differently — see the build_* functions.
+        let mut ring_tx = Sender::build_tx_ring()?;
+        let mut ring_rx = Reader::build_rx_ring()?;
+
+        // Connect once (on the tx ring — any ring works, the socket is shared).
+        let path_bytes = path.as_os_str().as_encoded_bytes();
+        let addr = sys::SockAddrUn::new(path_bytes);
+        // SAFETY: `addr` outlives the blocking submit below.
+        let cqe = Sender::run_one(&mut ring_tx, Sqe::connect(sock, addr.as_bytes()))?;
+        if cqe < 0 {
+            return Err(ConnError::Connect(io::Error::from_raw_os_error(-cqe)));
+        }
+
+        // Recv pool lives on the rx ring.
+        let pool = ring_rx
+            .register_provided_buffers(POOL_BGID, POOL_BUFFERS, POOL_BUF_SIZE)
+            .map_err(ConnError::Register)?;
+
+        // Persistent recv header: no name, control region wide enough for a
+        // SCM_RIGHTS cmsg of up to MAX_FDS fds. Buffer-select supplies the data
+        // buffer from the pool, so the iov stays empty.
+        let recv_controllen = sys::IncomingControl::reserve_len(MAX_FDS) as u32;
+        let mut recv_hdr = Box::new(MsgHdr::default());
+        recv_hdr.msg_namelen = RECV_NAMELEN;
+        recv_hdr.msg_controllen = recv_controllen as usize;
+
+        // Key-repeat clock. Owned by the main thread (which arms/disarms it as keys
+        // go down/up); the reader only polls its fd, so it gets the raw integer —
+        // exactly how the socket fd is shared across the two threads.
+        let timer = RepeatTimer::new()?;
+        let timer_fd = RawFd::from_raw(timer.fd().as_raw_fd() as usize);
+
+        // The reader arms its own multishot recv as the first thing it does on its
+        // own thread — crucial, because `single_issuer`/`defer_taskrun` bind a ring
+        // to the thread that first submits to it. The rx ring must only ever be
+        // touched by the reader thread, the tx ring only by the main thread.
+        let reader = Reader {
+            sock,
+            timer_fd,
+            ring: ring_rx,
+            pool,
+            recv_hdr,
+            recv_controllen,
+            inbox: Vec::with_capacity(POOL_BUF_SIZE as usize),
+            pending_fds: Vec::new(),
+        };
+
+        let sender = Sender {
+            sock,
+            _sock_owned: sock_owned,
+            ring: ring_tx,
+            next_id: 2,
+        };
+
+        Ok((sender, reader, timer))
     }
-}
-
-fn connect_impl() -> Result<(Sender, Reader, RepeatTimer), ConnError> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR").ok_or(ConnError::Env("XDG_RUNTIME_DIR"))?;
-    let display = std::env::var_os("WAYLAND_DISPLAY")
-        .unwrap_or_else(|| std::ffi::OsString::from("wayland-0"));
-    let mut path = PathBuf::from(runtime);
-    path.push(&display);
-
-    // AF_UNIX stream socket (ququmatz's typed Socket is IPv4-only, so we make
-    // the fd ourselves and adopt it).
-    let sock_owned = Sender::make_unix_socket()?;
-    let sock = RawFd::from_raw(sock_owned.as_raw_fd() as usize);
-
-    // Two rings on the same fd: the send ring (main thread) and the recv ring
-    // (reader thread). They're built differently — see the build_* functions.
-    let mut ring_tx = Sender::build_tx_ring()?;
-    let mut ring_rx = Reader::build_rx_ring()?;
-
-    // Connect once (on the tx ring — any ring works, the socket is shared).
-    let path_bytes = path.as_os_str().as_encoded_bytes();
-    let addr = sys::SockAddrUn::new(path_bytes);
-    // SAFETY: `addr` outlives the blocking submit below.
-    let cqe = Sender::run_one(&mut ring_tx, Sqe::connect(sock, addr.as_bytes()))?;
-    if cqe < 0 {
-        return Err(ConnError::Connect(io::Error::from_raw_os_error(-cqe)));
-    }
-
-    // Recv pool lives on the rx ring.
-    let pool = ring_rx
-        .register_provided_buffers(POOL_BGID, POOL_BUFFERS, POOL_BUF_SIZE)
-        .map_err(ConnError::Register)?;
-
-    // Persistent recv header: no name, control region wide enough for a
-    // SCM_RIGHTS cmsg of up to MAX_FDS fds. Buffer-select supplies the data
-    // buffer from the pool, so the iov stays empty.
-    let recv_controllen = sys::IncomingControl::reserve_len(MAX_FDS) as u32;
-    let mut recv_hdr = Box::new(MsgHdr::default());
-    recv_hdr.msg_namelen = RECV_NAMELEN;
-    recv_hdr.msg_controllen = recv_controllen as usize;
-
-    // Key-repeat clock. Owned by the main thread (which arms/disarms it as keys
-    // go down/up); the reader only polls its fd, so it gets the raw integer —
-    // exactly how the socket fd is shared across the two threads.
-    let timer = RepeatTimer::new()?;
-    let timer_fd = RawFd::from_raw(timer.fd().as_raw_fd() as usize);
-
-    // The reader arms its own multishot recv as the first thing it does on its
-    // own thread — crucial, because `single_issuer`/`defer_taskrun` bind a ring
-    // to the thread that first submits to it. The rx ring must only ever be
-    // touched by the reader thread, the tx ring only by the main thread.
-    let reader = Reader {
-        sock,
-        timer_fd,
-        ring: ring_rx,
-        pool,
-        recv_hdr,
-        recv_controllen,
-        inbox: Vec::with_capacity(POOL_BUF_SIZE as usize),
-        pending_fds: Vec::new(),
-    };
-
-    let sender = Sender {
-        sock,
-        _sock_owned: sock_owned,
-        ring: ring_tx,
-        next_id: 2,
-    };
-
-    Ok((sender, reader, timer))
 }
 
 // ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@
 //! instead — no external dependencies.
 
 use crate::bidi::{bidi_class, BidiClass, Direction};
-use crate::measurement::segment_width;
+use crate::measurement::SegmentCellWidth;
 
 /// How the line-breaker may handle the break opportunity **before** this segment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -36,155 +36,190 @@ pub struct Segment<'a> {
     pub direction: Direction,
 }
 
-/// Segment an input `&str` into a `Vec<Segment>`.
+/// Stateless UAX #29-ish word segmenter.
 ///
-/// The segmenter produces:
-/// - One segment per UAX #29 word (word runs together with their trailing
-///   spaces as two separate segments).
-/// - Newlines become mandatory-break segments of width 0.
-/// - CJK characters each get their own 2-cell segment (each is a break
-///   opportunity by itself).
-/// - Combining characters are merged into the preceding segment.
-#[must_use]
-pub fn segment(text: &str) -> Vec<Segment<'_>> {
-    let mut segments: Vec<Segment<'_>> = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0; // byte offset into `text`
+/// A struct (rather than a bare function) so the operation reads as
+/// `Segmenter.segment(text)` and can later grow configuration (locale,
+/// tailoring) as fields without breaking the call site.
+pub struct Segmenter;
 
-    while i < text.len() {
-        let remaining = &text[i..];
-        let c = first_char(remaining);
+impl Segmenter {
+    /// Segment an input `&str` into a `Vec<Segment>`.
+    ///
+    /// The segmenter produces:
+    /// - One segment per UAX #29 word (word runs together with their trailing
+    ///   spaces as two separate segments).
+    /// - Newlines become mandatory-break segments of width 0.
+    /// - CJK characters each get their own 2-cell segment (each is a break
+    ///   opportunity by itself).
+    /// - Combining characters are merged into the preceding segment.
+    #[must_use]
+    pub fn segment(text: &str) -> Vec<Segment<'_>> {
+        let mut segments: Vec<Segment<'_>> = Vec::new();
+        let bytes = text.as_bytes();
+        let mut i = 0; // byte offset into `text`
 
-        // ── Newline → mandatory break ────────────────────────────────────
-        if c == '\n' {
-            segments.push(Segment {
-                text:         &text[i..=i],
-                width:        0,
-                break_before: BreakKind::Mandatory,
-                direction:    Direction::Ltr,
-            });
-            i += 1;
-            continue;
-        }
+        while i < text.len() {
+            let remaining = &text[i..];
+            let c = remaining.first_char();
 
-        // ── Carriage return (skip or treat as newline) ───────────────────
-        if c == '\r' {
-            // Consume \r\n as one mandatory break, or lone \r.
-            let end = if bytes.get(i + 1) == Some(&b'\n') { i + 2 } else { i + 1 };
-            segments.push(Segment {
-                text:         &text[i..end],
-                width:        0,
-                break_before: BreakKind::Mandatory,
-                direction:    Direction::Ltr,
-            });
-            i = end;
-            continue;
-        }
-
-        // ── Whitespace (space / tab) → opportunity ───────────────────────
-        if c == ' ' || c == '\t' {
-            let start = i;
-            while i < text.len() {
-                let ch = first_char(&text[i..]);
-                if ch != ' ' && ch != '\t' {
-                    break;
-                }
-                i += ch.len_utf8();
+            // ── Newline → mandatory break ────────────────────────────────
+            if c == '\n' {
+                segments.push(Segment {
+                    text:         &text[i..=i],
+                    width:        0,
+                    break_before: BreakKind::Mandatory,
+                    direction:    Direction::Ltr,
+                });
+                i += 1;
+                continue;
             }
-            let slice = &text[start..i];
-            segments.push(Segment {
-                text:         slice,
-                width:        segment_width(slice),
-                break_before: BreakKind::Opportunity,
-                direction:    Direction::Ltr,
-            });
-            continue;
-        }
 
-        // ── CJK / wide character → each is its own break opportunity ─────
-        if is_cjk(c) {
-            let len = c.len_utf8();
-            segments.push(Segment {
-                text:         &text[i..i + len],
-                width:        2,
-                break_before: BreakKind::Opportunity,
-                direction:    bidi_dir(c),
-            });
-            i += len;
-            continue;
-        }
-
-        // ── Word run (letters + combining marks) ─────────────────────────
-        {
-            let start = i;
-            i += c.len_utf8();
-            while i < text.len() {
-                let ch = first_char(&text[i..]);
-                if ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t' || is_cjk(ch) {
-                    break;
-                }
-                // Combining marks attach to the preceding character.
-                i += ch.len_utf8();
+            // ── Carriage return (skip or treat as newline) ───────────────
+            if c == '\r' {
+                // Consume \r\n as one mandatory break, or lone \r.
+                let end = if bytes.get(i + 1) == Some(&b'\n') { i + 2 } else { i + 1 };
+                segments.push(Segment {
+                    text:         &text[i..end],
+                    width:        0,
+                    break_before: BreakKind::Mandatory,
+                    direction:    Direction::Ltr,
+                });
+                i = end;
+                continue;
             }
-            let slice = &text[start..i];
-            let break_before = if segments.is_empty() {
-                BreakKind::Prohibited
-            } else {
-                // A word after a space segment gets Prohibited (the space
-                // already carried the opportunity); a word after another
-                // word gets Opportunity (rare — hyphen-break case).
-                match segments.last().map(|s| s.break_before) {
-                    Some(BreakKind::Opportunity) => BreakKind::Prohibited,
-                    _ => BreakKind::Opportunity,
+
+            // ── Whitespace (space / tab) → opportunity ───────────────────
+            if c == ' ' || c == '\t' {
+                let start = i;
+                while i < text.len() {
+                    let ch = text[i..].first_char();
+                    if ch != ' ' && ch != '\t' {
+                        break;
+                    }
+                    i += ch.len_utf8();
                 }
-            };
-            segments.push(Segment {
-                text:         slice,
-                width:        segment_width(slice),
-                break_before,
-                direction:    paragraph_dir_of(slice),
-            });
+                let slice = &text[start..i];
+                segments.push(Segment {
+                    text:         slice,
+                    width:        slice.segment_width(),
+                    break_before: BreakKind::Opportunity,
+                    direction:    Direction::Ltr,
+                });
+                continue;
+            }
+
+            // ── CJK / wide character → each is its own break opportunity ─
+            if c.is_cjk() {
+                let len = c.len_utf8();
+                segments.push(Segment {
+                    text:         &text[i..i + len],
+                    width:        2,
+                    break_before: BreakKind::Opportunity,
+                    direction:    c.bidi_dir(),
+                });
+                i += len;
+                continue;
+            }
+
+            // ── Word run (letters + combining marks) ──────────────────────
+            {
+                let start = i;
+                i += c.len_utf8();
+                while i < text.len() {
+                    let ch = text[i..].first_char();
+                    if ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t' || ch.is_cjk() {
+                        break;
+                    }
+                    // Combining marks attach to the preceding character.
+                    i += ch.len_utf8();
+                }
+                let slice = &text[start..i];
+                let break_before = if segments.is_empty() {
+                    BreakKind::Prohibited
+                } else {
+                    // A word after a space segment gets Prohibited (the space
+                    // already carried the opportunity); a word after another
+                    // word gets Opportunity (rare — hyphen-break case).
+                    match segments.last().map(|s| s.break_before) {
+                        Some(BreakKind::Opportunity) => BreakKind::Prohibited,
+                        _ => BreakKind::Opportunity,
+                    }
+                };
+                segments.push(Segment {
+                    text:         slice,
+                    width:        slice.segment_width(),
+                    break_before,
+                    direction:    slice.paragraph_dir(),
+                });
+            }
         }
+
+        segments
     }
-
-    segments
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers, as trait methods on the primitives they extend ────────────────
 
 /// Decode the first `char` of a non-empty `&str` — panics on empty input.
-#[inline]
-fn first_char(s: &str) -> char {
-    s.chars().next().expect("non-empty str")
+trait FirstChar {
+    fn first_char(&self) -> char;
 }
 
-/// True if `c` is a CJK / wide ideograph (each is an independent break point).
-const fn is_cjk(c: char) -> bool {
-    let cp = c as u32;
-    matches!(cp,
-        0x1100..=0x115f |   // Hangul leading consonants
-        0x2e80..=0x303e |   // CJK Radicals + Symbols
-        0x3041..=0x33bf |   // Hiragana / Katakana / Bopomofo
-        0x3400..=0x4dbf |   // CJK Ext A
-        0x4e00..=0x9fff |   // CJK Unified
-        0xa000..=0xa4cf |   // Yi
-        0xac00..=0xd7af |   // Hangul Syllables
-        0xf900..=0xfaff |   // CJK Compat Ideographs
-        0x20000..=0x2a6df | // CJK Ext B
-        0x2a700..=0x2ceaf | // CJK Ext C–E
-        0x30000..=0x3134f   // CJK Ext G
-    )
-}
-
-const fn bidi_dir(c: char) -> Direction {
-    match bidi_class(c) {
-        BidiClass::R => Direction::Rtl,
-        _ => Direction::Ltr,
+impl FirstChar for str {
+    #[inline]
+    fn first_char(&self) -> char {
+        self.chars().next().expect("non-empty str")
     }
 }
 
-fn paragraph_dir_of(s: &str) -> Direction {
-    crate::bidi::paragraph_direction(s)
+/// Extends `char` with a CJK / wide-ideograph test and BiDi-direction lookup,
+/// as methods instead of free functions taking `char` as their first
+/// argument — same shape as [`crate::measurement::CellWidth`].
+trait CharExt {
+    /// True if this char is a CJK / wide ideograph (each is an independent
+    /// break point).
+    fn is_cjk(&self) -> bool;
+    /// The [`Direction`] this char's strong BiDi class implies.
+    fn bidi_dir(&self) -> Direction;
+}
+
+impl CharExt for char {
+    fn is_cjk(&self) -> bool {
+        let cp = *self as u32;
+        matches!(cp,
+            0x1100..=0x115f |   // Hangul leading consonants
+            0x2e80..=0x303e |   // CJK Radicals + Symbols
+            0x3041..=0x33bf |   // Hiragana / Katakana / Bopomofo
+            0x3400..=0x4dbf |   // CJK Ext A
+            0x4e00..=0x9fff |   // CJK Unified
+            0xa000..=0xa4cf |   // Yi
+            0xac00..=0xd7af |   // Hangul Syllables
+            0xf900..=0xfaff |   // CJK Compat Ideographs
+            0x20000..=0x2a6df | // CJK Ext B
+            0x2a700..=0x2ceaf | // CJK Ext C–E
+            0x30000..=0x3134f   // CJK Ext G
+        )
+    }
+
+    fn bidi_dir(&self) -> Direction {
+        match bidi_class(*self) {
+            BidiClass::R => Direction::Rtl,
+            _ => Direction::Ltr,
+        }
+    }
+}
+
+/// Extends `str` with paragraph-direction resolution, delegating to
+/// [`crate::bidi`].
+trait ParagraphDir {
+    fn paragraph_dir(&self) -> Direction;
+}
+
+impl ParagraphDir for str {
+    fn paragraph_dir(&self) -> Direction {
+        crate::bidi::paragraph_direction(self)
+    }
 }
 
 #[cfg(test)]
@@ -193,7 +228,7 @@ mod tests {
 
     #[test]
     fn plain_words() {
-        let segs = segment("hello world");
+        let segs = Segmenter::segment("hello world");
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[0].text, "hello");
         assert_eq!(segs[1].text, " ");
@@ -204,7 +239,7 @@ mod tests {
 
     #[test]
     fn newline_is_mandatory() {
-        let segs = segment("foo\nbar");
+        let segs = Segmenter::segment("foo\nbar");
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[1].break_before, BreakKind::Mandatory);
         assert_eq!(segs[1].width, 0);
@@ -212,7 +247,7 @@ mod tests {
 
     #[test]
     fn crlf_is_one_mandatory_segment() {
-        let segs = segment("a\r\nb");
+        let segs = Segmenter::segment("a\r\nb");
         // a, \r\n, b
         assert_eq!(segs.len(), 3);
         assert_eq!(segs[1].text, "\r\n");
@@ -221,7 +256,7 @@ mod tests {
 
     #[test]
     fn cjk_each_own_segment() {
-        let segs = segment("中文");
+        let segs = Segmenter::segment("中文");
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].width, 2);
         assert_eq!(segs[1].width, 2);
@@ -230,7 +265,7 @@ mod tests {
 
     #[test]
     fn mixed_ascii_cjk() {
-        let segs = segment("hi中");
+        let segs = Segmenter::segment("hi中");
         // "hi", "中"
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].width, 2);
@@ -239,18 +274,18 @@ mod tests {
 
     #[test]
     fn empty_string() {
-        assert_eq!(segment("").len(), 0);
+        assert_eq!(Segmenter::segment("").len(), 0);
     }
 
     #[test]
     fn tab_is_opportunity() {
-        let segs = segment("a\tb");
+        let segs = Segmenter::segment("a\tb");
         assert_eq!(segs[1].break_before, BreakKind::Opportunity);
     }
 
     #[test]
     fn widths_sum() {
-        let segs = segment("ab cd");
+        let segs = Segmenter::segment("ab cd");
         let total: usize = segs.iter().map(|s| s.width).sum();
         assert_eq!(total, 5); // "ab"=2 " "=1 "cd"=2
     }

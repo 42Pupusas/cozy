@@ -28,7 +28,28 @@ pub enum Direction {
     Rtl,
 }
 
-/// Determine the BiDi class of a Unicode scalar (P2/P3 strong-type test).
+/// Extends `char` with BiDi-class classification, mirroring
+/// [`crate::measurement::CellWidth`]'s trait-on-`char` shape.
+pub trait BidiChar {
+    /// The BiDi class of `self` (P2/P3 strong-type test).
+    fn bidi_class(&self) -> BidiClass;
+}
+
+impl BidiChar for char {
+    fn bidi_class(&self) -> BidiClass {
+        let cp = *self as u32;
+        if is_strong_rtl(cp) {
+            BidiClass::R
+        } else if is_strong_ltr(cp) {
+            BidiClass::L
+        } else {
+            BidiClass::Neutral
+        }
+    }
+}
+
+/// Free-function form of [`BidiChar::bidi_class`], kept `const` (traits
+/// can't be `const fn` yet) for callers needing compile-time evaluation.
 #[must_use]
 pub const fn bidi_class(c: char) -> BidiClass {
     let cp = c as u32;
@@ -41,25 +62,45 @@ pub const fn bidi_class(c: char) -> BidiClass {
     }
 }
 
-/// Determine base paragraph direction by scanning for the first strong
-/// directional character (UAX #9 P2–P3).  Returns `Ltr` if none is found.
-#[must_use]
-pub fn paragraph_direction(text: &str) -> Direction {
-    for c in text.chars() {
-        match bidi_class(c) {
-            BidiClass::L => return Direction::Ltr,
-            BidiClass::R => return Direction::Rtl,
-            BidiClass::Neutral => {}
-        }
-    }
-    Direction::Ltr
+/// Extends `str` with paragraph-direction resolution and LTR-purity testing.
+pub trait BidiStr {
+    /// Determine base paragraph direction by scanning for the first strong
+    /// directional character (UAX #9 P2–P3).  Returns `Ltr` if none is found.
+    fn paragraph_direction(&self) -> Direction;
+
+    /// Whether this run of text is purely LTR (no RTL characters at all).
+    /// Callers can fast-path layout for the common case.
+    fn is_ltr_only(&self) -> bool;
 }
 
-/// Whether a run of text is purely LTR (no RTL characters at all).
-/// Callers can fast-path layout for the common case.
+impl BidiStr for str {
+    fn paragraph_direction(&self) -> Direction {
+        for c in self.chars() {
+            match c.bidi_class() {
+                BidiClass::L => return Direction::Ltr,
+                BidiClass::R => return Direction::Rtl,
+                BidiClass::Neutral => {}
+            }
+        }
+        Direction::Ltr
+    }
+
+    fn is_ltr_only(&self) -> bool {
+        self.chars().all(|c| c.bidi_class() != BidiClass::R)
+    }
+}
+
+/// Free-function form of [`BidiStr::paragraph_direction`], for callers that
+/// don't want to import the trait.
+#[must_use]
+pub fn paragraph_direction(text: &str) -> Direction {
+    text.paragraph_direction()
+}
+
+/// Free-function form of [`BidiStr::is_ltr_only`].
 #[must_use]
 pub fn is_ltr_only(text: &str) -> bool {
-    text.chars().all(|c| bidi_class(c) != BidiClass::R)
+    text.is_ltr_only()
 }
 
 // ── Strong RTL ranges (Unicode categories R and AL) ───────────────────────────
@@ -138,53 +179,53 @@ mod tests {
 
     #[test]
     fn ascii_letter_is_ltr() {
-        assert_eq!(bidi_class('A'), BidiClass::L);
-        assert_eq!(bidi_class('z'), BidiClass::L);
+        assert_eq!('A'.bidi_class(), BidiClass::L);
+        assert_eq!('z'.bidi_class(), BidiClass::L);
     }
 
     #[test]
     fn hebrew_is_rtl() {
-        assert_eq!(bidi_class('א'), BidiClass::R);
-        assert_eq!(bidi_class('ש'), BidiClass::R);
+        assert_eq!('א'.bidi_class(), BidiClass::R);
+        assert_eq!('ש'.bidi_class(), BidiClass::R);
     }
 
     #[test]
     fn arabic_is_rtl() {
-        assert_eq!(bidi_class('ع'), BidiClass::R);
+        assert_eq!('ع'.bidi_class(), BidiClass::R);
     }
 
     #[test]
     fn digit_is_neutral() {
-        assert_eq!(bidi_class('5'), BidiClass::Neutral);
+        assert_eq!('5'.bidi_class(), BidiClass::Neutral);
     }
 
     #[test]
     fn paragraph_direction_ltr() {
-        assert_eq!(paragraph_direction("hello world"), Direction::Ltr);
+        assert_eq!("hello world".paragraph_direction(), Direction::Ltr);
     }
 
     #[test]
     fn paragraph_direction_rtl() {
-        assert_eq!(paragraph_direction("שלום"), Direction::Rtl);
+        assert_eq!("שלום".paragraph_direction(), Direction::Rtl);
     }
 
     #[test]
     fn paragraph_direction_ltr_first_wins() {
-        assert_eq!(paragraph_direction("a שלום"), Direction::Ltr);
+        assert_eq!("a שלום".paragraph_direction(), Direction::Ltr);
     }
 
     #[test]
     fn paragraph_direction_empty_is_ltr() {
-        assert_eq!(paragraph_direction(""), Direction::Ltr);
+        assert_eq!("".paragraph_direction(), Direction::Ltr);
     }
 
     #[test]
     fn ltr_only_pure() {
-        assert!(is_ltr_only("hello 123"));
+        assert!("hello 123".is_ltr_only());
     }
 
     #[test]
     fn ltr_only_rejects_rtl() {
-        assert!(!is_ltr_only("hello שלום"));
+        assert!(!"hello שלום".is_ltr_only());
     }
 }

@@ -32,16 +32,25 @@ struct Opportunity {
     width:      usize,
 }
 
-/// Compute line-break positions for a sequence of segments.
+/// Stateless greedy line-breaking walk.
 ///
-/// # Parameters
-/// - `segments` — output of [`crate::analysis::segment`].
-/// - `max_width` — maximum line width in cells (`0` means unlimited).
-///
-/// # Returns
-/// One `LineBreak` per line, in order.  An empty input produces one empty line.
-#[must_use]
-pub fn compute_breaks<'a>(segments: &'a [Segment<'a>], max_width: usize) -> Vec<LineBreak> {
+/// A struct (rather than a bare function) so the operation reads as
+/// `LineBreaker.compute_breaks(...)`, matching [`crate::analysis::Segmenter`]'s
+/// shape and leaving room for future tailoring (e.g. break-strictness) as
+/// fields.
+pub struct LineBreaker;
+
+impl LineBreaker {
+    /// Compute line-break positions for a sequence of segments.
+    ///
+    /// # Parameters
+    /// - `segments` — output of [`crate::analysis::Segmenter::segment`].
+    /// - `max_width` — maximum line width in cells (`0` means unlimited).
+    ///
+    /// # Returns
+    /// One `LineBreak` per line, in order.  An empty input produces one empty line.
+    #[must_use]
+    pub fn compute_breaks<'a>(segments: &'a [Segment<'a>], max_width: usize) -> Vec<LineBreak> {
     if segments.is_empty() {
         return vec![LineBreak { start_segment: 0, end_segment: 0, width: 0 }];
     }
@@ -72,7 +81,7 @@ pub fn compute_breaks<'a>(segments: &'a [Segment<'a>], max_width: usize) -> Vec<
 
             // ── Break opportunity ─────────────────────────────────────────
             BreakKind::Opportunity => {
-                let ws = is_whitespace_seg(seg.text);
+                let ws = seg.is_whitespace();
 
                 if !unlimited && line_width > 0 && line_width + seg.width > max_width {
                     // Overflow at an opportunity.
@@ -150,6 +159,7 @@ pub fn compute_breaks<'a>(segments: &'a [Segment<'a>], max_width: usize) -> Vec<
     });
 
     lines
+    }
 }
 
 /// Roll back to `last_opportunity` if set, or force-break immediately before `i`.
@@ -165,20 +175,29 @@ const fn rollback_or_here(
     }
 }
 
-/// True if every byte in `s` is an ASCII space or tab.
-#[inline]
-fn is_whitespace_seg(s: &str) -> bool {
-    s.bytes().all(|b| b == b' ' || b == b'\t')
+/// True if every byte of a segment's text is an ASCII space or tab.
+///
+/// Was a free `is_whitespace_seg(s: &str)` function called only with
+/// `seg.text` -- moved onto [`Segment`] as `Segment::is_whitespace`.
+trait SegmentExt {
+    fn is_whitespace(&self) -> bool;
+}
+
+impl SegmentExt for Segment<'_> {
+    #[inline]
+    fn is_whitespace(&self) -> bool {
+        self.text.bytes().all(|b| b == b' ' || b == b'\t')
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::segment;
+    use crate::analysis::Segmenter;
 
     fn break_text(text: &str, max_width: usize) -> Vec<String> {
-        let segs = segment(text);
-        let breaks = compute_breaks(&segs, max_width);
+        let segs = Segmenter::segment(text);
+        let breaks = LineBreaker::compute_breaks(&segs, max_width);
         breaks.iter().map(|lb| {
             segs[lb.start_segment..lb.end_segment]
                 .iter()
@@ -239,8 +258,8 @@ mod tests {
 
     #[test]
     fn empty_string_one_empty_line() {
-        let segs = segment("");
-        let breaks = compute_breaks(&segs, 80);
+        let segs = Segmenter::segment("");
+        let breaks = LineBreaker::compute_breaks(&segs, 80);
         assert_eq!(breaks.len(), 1);
         assert_eq!(breaks[0].width, 0);
     }

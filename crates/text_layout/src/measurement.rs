@@ -67,27 +67,19 @@ impl StrCellWidth for str {
     }
 }
 
-/// Measure the cell width of a Unicode scalar: 0, 1, or 2.
-///
-/// Thin free-function wrapper kept for call sites that don't want to import
-/// the [`CellWidth`] trait just to call `c.cell_width()`.
-#[must_use]
-pub fn cell_width(c: char) -> u8 {
-    c.cell_width()
+/// Extends `str` with a `segment_width` alias for [`StrCellWidth::str_width`],
+/// named separately to mirror pretext's API surface (a "segment" is just a
+/// `&str` slice from the segmenter's point of view).
+pub trait SegmentCellWidth {
+    /// The cell width of `self` when treated as a layout segment.
+    fn segment_width(&self) -> usize;
 }
 
-/// Measure the total cell width of a `&str`.
-#[must_use]
-pub fn str_width(s: &str) -> usize {
-    s.chars().map(|c| usize::from(c.cell_width())).sum()
-}
-
-/// Measure the cell width of a single segment (a `&str` slice).
-/// Identical to `str_width`; named separately to mirror pretext's API surface.
-#[inline]
-#[must_use]
-pub fn segment_width(s: &str) -> usize {
-    str_width(s)
+impl SegmentCellWidth for str {
+    #[inline]
+    fn segment_width(&self) -> usize {
+        self.str_width()
+    }
 }
 
 // ── Zero-width ranges (UAX #11 + Unicode General Category Mn/Me/Cf) ──────────
@@ -248,42 +240,42 @@ mod tests {
     #[test]
     fn ascii_is_1() {
         for c in ' '..='~' {
-            assert_eq!(cell_width(c), 1, "expected width 1 for {c:?}");
+            assert_eq!(c.cell_width(), 1, "expected width 1 for {c:?}");
         }
     }
 
     #[test]
     fn controls_are_0() {
-        assert_eq!(cell_width('\0'), 0);
-        assert_eq!(cell_width('\x1b'), 0);
-        assert_eq!(cell_width('\x7f'), 0);
+        assert_eq!('\0'.cell_width(), 0);
+        assert_eq!('\x1b'.cell_width(), 0);
+        assert_eq!('\x7f'.cell_width(), 0);
     }
 
     #[test]
     fn cjk_is_2() {
-        assert_eq!(cell_width('中'), 2);
-        assert_eq!(cell_width('あ'), 2);
-        assert_eq!(cell_width('한'), 2);
+        assert_eq!('中'.cell_width(), 2);
+        assert_eq!('あ'.cell_width(), 2);
+        assert_eq!('한'.cell_width(), 2);
     }
 
     #[test]
     fn latin_extended_is_1() {
-        assert_eq!(cell_width('é'), 1);
-        assert_eq!(cell_width('ñ'), 1);
-        assert_eq!(cell_width('ü'), 1);
+        assert_eq!('é'.cell_width(), 1);
+        assert_eq!('ñ'.cell_width(), 1);
+        assert_eq!('ü'.cell_width(), 1);
     }
 
     #[test]
     fn zwj_is_0() {
-        assert_eq!(cell_width('\u{200d}'), 0); // ZWJ
-        assert_eq!(cell_width('\u{200b}'), 0); // ZWSP
+        assert_eq!('\u{200d}'.cell_width(), 0); // ZWJ
+        assert_eq!('\u{200b}'.cell_width(), 0); // ZWSP
     }
 
     #[test]
     fn str_width_mixed() {
-        assert_eq!(str_width("hello"), 5);
-        assert_eq!(str_width("中文"), 4);
-        assert_eq!(str_width("hi中"), 4);
-        assert_eq!(str_width(""), 0);
+        assert_eq!("hello".str_width(), 5);
+        assert_eq!("中文".str_width(), 4);
+        assert_eq!("hi中".str_width(), 4);
+        assert_eq!("".str_width(), 0);
     }
 }

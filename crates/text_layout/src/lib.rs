@@ -34,4 +34,4 @@ pub mod line_break;
 pub mod measurement;
 pub mod layout;
 
-pub use layout::{layout, LayoutLine, LayoutParams};
+pub use layout::{LayoutLine, LayoutParams, Layouter};

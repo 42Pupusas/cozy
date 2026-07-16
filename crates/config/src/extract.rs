@@ -34,6 +34,20 @@ pub trait TableExt<'t> {
         hi: i64,
         reason: &'static str,
     ) -> Result<Option<i64>, ConfigError>;
+
+    /// Read a float in `[lo, hi]`, returning a typed validation error
+    /// otherwise. Integers are accepted too (TOML's `1` is a valid `1.0`).
+    /// `key` is the table-relative lookup key; `field` is the qualified name
+    /// used in error messages (e.g. `"window.opacity"`). Returns `Ok(None)`
+    /// when absent.
+    fn get_float_range(
+        &self,
+        key: &'static str,
+        field: &'static str,
+        lo: f64,
+        hi: f64,
+        reason: &'static str,
+    ) -> Result<Option<f64>, ConfigError>;
 }
 
 impl<'t> TableExt<'t> for Table<'t> {
@@ -73,6 +87,33 @@ impl<'t> TableExt<'t> for Table<'t> {
             Some(_) => Err(ConfigError::InvalidValue {
                 field,
                 reason: "expected integer",
+            }),
+        }
+    }
+
+    // Every caller today validates a config field bounded to a tiny range
+    // (e.g. window.opacity in 0.0..=1.0), so the i64->f64 conversion here
+    // never approaches the 2^53 exact-integer boundary where precision loss
+    // could occur -- it just needs to accept a bare TOML integer as a float.
+    #[allow(clippy::cast_precision_loss)]
+    fn get_float_range(
+        &self,
+        key: &'static str,
+        field: &'static str,
+        lo: f64,
+        hi: f64,
+        reason: &'static str,
+    ) -> Result<Option<f64>, ConfigError> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(Value::Float(n)) if (lo..=hi).contains(n) => Ok(Some(*n)),
+            Some(Value::Integer(n)) if (lo..=hi).contains(&(*n as f64)) => Ok(Some(*n as f64)),
+            Some(Value::Float(_) | Value::Integer(_)) => {
+                Err(ConfigError::InvalidValue { field, reason })
+            }
+            Some(_) => Err(ConfigError::InvalidValue {
+                field,
+                reason: "expected a number",
             }),
         }
     }

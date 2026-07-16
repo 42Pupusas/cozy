@@ -85,6 +85,7 @@ impl Frame {
         shm: ShmId,
         width: i32,
         height: i32,
+        format: Format,
     ) -> Result<([Self; 2], ShmBuffer, PoolId)> {
         let shm_mem = ShmBuffer::new(width as usize, height as usize, 2)
             .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
@@ -108,7 +109,7 @@ impl Frame {
                     .i32(width)
                     .i32(height)
                     .i32(stride)
-                    .u32(Format::Xrgb8888.code()),
+                    .u32(format.code()),
             )?;
             slot.buffer = buffer;
         }
@@ -158,6 +159,12 @@ pub struct TermWindow {
     /// The shm pool currently backing `frames`. Destroyed and replaced on every
     /// resize so its old buffers/pool id get recycled via `delete_id`.
     pool: PoolId,
+    /// `wl_shm` pixel format backing `frames` -- `Argb8888` when the
+    /// renderer has a window opacity < 1.0 configured, else the cheaper
+    /// `Xrgb8888`. Fixed for the window's lifetime (set once from
+    /// `renderer.needs_alpha()` in [`Self::new`]); `resize` reuses it so a
+    /// live-resized translucent window doesn't silently go opaque.
+    buf_format: Format,
     /// Persistent full-window backbuffer. Dirty rows are blitted here (it keeps
     /// the complete last-known image), then copied into whichever shm frame is
     /// free on present. Without this, incremental dirty-row blits would only
@@ -244,7 +251,16 @@ impl TermWindow {
             .map_err(Error::ReaderSpawn)?;
 
         let (compositor, shm, wm_base, seat) = Registry::discover(&mut sender, &mut events)?;
-        let (frames, shm_mem, pool) = Frame::create_pair(&mut sender, shm, width, height)?;
+        // A translucent window (window.opacity < 1.0) needs per-pixel alpha
+        // (Argb8888); an opaque one keeps the cheaper Xrgb8888 the compositor
+        // doesn't have to blend -- zero behavior change for the common case.
+        let buf_format = if renderer.needs_alpha() {
+            Format::Argb8888
+        } else {
+            Format::Xrgb8888
+        };
+        let (frames, shm_mem, pool) =
+            Frame::create_pair(&mut sender, shm, width, height, buf_format)?;
 
         let surface: SurfaceId = sender.alloc_id();
         sender.request(
@@ -278,7 +294,10 @@ impl TermWindow {
             free_ids: Vec::new(),
         };
 
-        let backbuffer = vec![renderer.bg_xrgb(); (width * height) as usize];
+        // Use `bg_packed()`, not `bg_xrgb()`: a translucent window's initial
+        // backbuffer must carry the configured alpha from frame one, not
+        // flash fully opaque until the first real paint.
+        let backbuffer = vec![renderer.bg_packed(); (width * height) as usize];
 
         Ok(Self {
             sender,
@@ -305,6 +324,7 @@ impl TermWindow {
             frames,
             shm_mem,
             pool,
+            buf_format,
             backbuffer,
             renderer,
             width,
@@ -728,7 +748,7 @@ impl TermWindow {
                     .i32(w)
                     .i32(h)
                     .i32(stride)
-                    .u32(Format::Xrgb8888.code()),
+                    .u32(self.buf_format.code()),
             );
             frame.buffer = buffer;
             frame.free = true;
@@ -736,10 +756,12 @@ impl TermWindow {
         // Carry the old image into the new backbuffer (top-left aligned) instead
         // of clearing to background. The grid reflow + full snapshot arrives a
         // round-trip later via the parser thread; until then we keep showing the
-        // previous content so the window doesn't flash blank mid-drag.
+        // previous content so the window doesn't flash blank mid-drag. Use
+        // `bg_packed()` (not `bg_xrgb()`) so newly-exposed area on a grow
+        // carries the configured window alpha instead of flashing opaque.
         let new_w = w as usize;
         let new_h = h as usize;
-        let mut new_back = vec![self.renderer.bg_xrgb(); new_w * new_h];
+        let mut new_back = vec![self.renderer.bg_packed(); new_w * new_h];
         let old_w = self.width as usize;
         let old_h = self.height as usize;
         let copy_w = old_w.min(new_w);

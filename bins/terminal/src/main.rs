@@ -323,7 +323,7 @@ fn ui_thread(
     quit: &AtomicBool,
 ) -> platform::Result<()> {
     let theme = platform::Theme::from_palette(&cfg.palette);
-    let renderer = platform::Renderer::new(theme, &cfg.font);
+    let renderer = platform::Renderer::new(theme, &cfg.font).with_opacity(cfg.window.opacity);
     let mut win = TermWindow::new("terminal", COLS, ROWS, ui_wake, renderer)?;
     let encoder = Encoder::new();
 

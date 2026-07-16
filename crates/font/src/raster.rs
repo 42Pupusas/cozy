@@ -181,35 +181,69 @@ impl Outline {
             }
         }
 
-        // Scanline fill.
+        // Scanline fill with antialiasing: each pixel row is supersampled
+        // vertically (`SS` sub-scanlines) and each covered span contributes
+        // *exact fractional* horizontal coverage to its boundary pixels,
+        // rather than snapping edges to whole columns. Without this, curves
+        // (which dominate a typeface like Inconsolata) come out as hard,
+        // jagged "chewed"-looking stair-steps instead of smooth glyphs.
+        const SS: u32 = 4; // vertical supersamples per pixel row
         let mut bmp = Bitmap::blank(w, h);
+        let mut coverage = vec![0.0f32; w as usize];
+
         for scanline in 0..h {
-            let y = scanline as f32 + 0.5; // sample at center of pixel row
+            coverage.iter_mut().for_each(|c| *c = 0.0);
 
-            // Collect X intersections on this scanline with non-zero winding.
-            let mut crossings: Vec<(f32, i8)> = edges.iter().filter_map(|e| e.x_at(y)).collect();
+            for sub in 0..SS {
+                let y = scanline as f32 + (sub as f32 + 0.5) / SS as f32;
 
-            crossings.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                let mut crossings: Vec<(f32, i8)> =
+                    edges.iter().filter_map(|e| e.x_at(y)).collect();
+                crossings.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
 
-            let mut winding = 0i32;
-            let mut prev_x = 0.0f32;
-            let mut inside = false;
+                let mut winding = 0i32;
+                let mut prev_x = 0.0f32;
+                let mut inside = false;
 
-            for (x, w_delta) in crossings {
-                if inside {
-                    // Fill from prev_x to x.
-                    let x0 = (prev_x.ceil() as i64).max(0) as u32;
-                    let x1 = (x.ceil() as i64).max(0).min(i64::from(w)) as u32;
-                    for col in x0..x1 {
-                        bmp.data[(scanline * w + col) as usize] = 255;
+                for (x, w_delta) in crossings {
+                    if inside {
+                        add_span_coverage(&mut coverage, prev_x, x, 1.0 / SS as f32);
                     }
+                    winding += i32::from(w_delta);
+                    inside = winding != 0;
+                    prev_x = x;
                 }
-                winding += i32::from(w_delta);
-                inside = winding != 0;
-                prev_x = x;
+            }
+
+            for (col, &c) in coverage.iter().enumerate() {
+                let a = (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+                bmp.data[(scanline as usize) * w as usize + col] = a;
             }
         }
 
         bmp
+    }
+}
+
+/// Add fractional coverage `weight` for the span `[x0, x1)` into `coverage`,
+/// splitting partial weight onto the boundary pixels the span doesn't fully
+/// cover. `coverage` indices map 1:1 to pixel columns.
+fn add_span_coverage(coverage: &mut [f32], x0: f32, x1: f32, weight: f32) {
+    let w = coverage.len() as f32;
+    let x0 = x0.clamp(0.0, w);
+    let x1 = x1.clamp(0.0, w);
+    if x1 <= x0 {
+        return;
+    }
+
+    let start = x0.floor() as usize;
+    let end = x1.ceil() as usize;
+    for col in start..end.min(coverage.len()) {
+        let px0 = col as f32;
+        let px1 = px0 + 1.0;
+        let overlap = x1.min(px1) - x0.max(px0);
+        if overlap > 0.0 {
+            coverage[col] += overlap * weight;
+        }
     }
 }

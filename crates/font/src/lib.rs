@@ -26,6 +26,6 @@ pub mod face;
 mod tests;
 
 pub use atlas::{Atlas, GlyphEntry};
-pub use face::{FontFace, GlyphMetrics, RasterizedGlyph};
+pub use face::{FontFace, GlyphMetrics, LoadError, RasterizedGlyph};
 pub use raster::Bitmap;
 pub use tables::GlyphId;

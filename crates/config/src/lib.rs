@@ -13,7 +13,11 @@
 //!
 //! [font]
 //! path = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf"
-//! size = 14                        # cell height in pixels (will be rounded)
+//! size = 14                        # point size, like Alacritty/most terminals
+//!                                   # (rendered at 96 DPI: 1pt = 96/72 px)
+//!
+//! [window]
+//! opacity = 1.0                    # 0.0 (fully transparent) .. 1.0 (opaque)
 //!
 //! [cursor]
 //! style       = "block"            # block | beam | underline
@@ -197,16 +201,54 @@ impl Palette {
 pub struct FontConfig {
     /// Path to the TTF/OTF file.
     pub path: Option<String>,
-    /// Cell height in pixels.
+    /// Point size (typographic points, matching Alacritty/most terminals --
+    /// *not* pixels). Converted to a pixel size for rasterization assuming
+    /// the standard 96 DPI (`px = pt * 96 / 72`); see [`FontConfig::px_size`].
     pub size: u32,
+}
+
+impl FontConfig {
+    /// Standard screen DPI used to convert `size` (points) to a pixel size
+    /// for the rasterizer. 96 DPI is the universal web/desktop-Linux default
+    /// (and what Alacritty assumes absent real monitor DPI info), so a given
+    /// point size renders at the same pixel size other terminals show it at.
+    const DPI: f32 = 96.0;
+
+    /// This config's font size in pixels, as consumed by [`FontFace::load`](../font/struct.FontFace.html#method.load).
+    ///
+    /// `size` is validated to `1..=256` points; the result comfortably fits
+    /// `f32` with no precision loss.
+    #[must_use]
+    pub fn px_size(&self) -> f32 {
+        self.size as f32 * Self::DPI / 72.0
+    }
 }
 
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
             path: None,
-            size: 14,
+            size: 14, // points, matching Alacritty's default-ish size
         }
+    }
+}
+
+/// Window configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowConfig {
+    /// Background opacity, `0.0` (fully transparent) to `1.0` (opaque).
+    ///
+    /// Only the window background is affected -- cell foreground (glyph)
+    /// pixels are always drawn fully opaque, matching Alacritty's default
+    /// `transparent_background_colors = false` behavior. Requires a
+    /// compositor that composites transparent surfaces (most Wayland ones
+    /// do); on one that doesn't, this has no visible effect.
+    pub opacity: f64,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self { opacity: 1.0 }
     }
 }
 
@@ -261,6 +303,7 @@ pub struct Config {
     /// Lines of scrollback (`0` = unlimited).
     pub scrollback: usize,
     pub font: FontConfig,
+    pub window: WindowConfig,
     pub cursor: CursorConfig,
     pub palette: Palette,
     pub keybinds: Vec<Keybind>,
@@ -273,6 +316,7 @@ impl Default for Config {
             term: "xterm-256color".to_owned(),
             scrollback: 10_000,
             font: FontConfig::default(),
+            window: WindowConfig::default(),
             cursor: CursorConfig::default(),
             palette: Palette::default(),
             keybinds: Vec::new(),
@@ -335,6 +379,7 @@ impl Config {
         let mut cfg = Self::default();
         cfg.apply_general(&table)?;
         cfg.apply_font(&table)?;
+        cfg.apply_window(&table)?;
         cfg.apply_cursor(&table)?;
         cfg.apply_colors(&table)?;
         cfg.apply_keybinds(&table);
@@ -381,6 +426,23 @@ impl Config {
             font.get_int_range("size", "font.size", 1, 256, "must be between 1 and 256")?
         {
             self.font.size = u32::try_from(n).unwrap_or(self.font.size);
+        }
+        Ok(())
+    }
+
+    /// Apply the `[window]` table, if present.
+    fn apply_window(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(window) = table.get_table("window") else {
+            return Ok(());
+        };
+        if let Some(n) = window.get_float_range(
+            "opacity",
+            "window.opacity",
+            0.0,
+            1.0,
+            "must be between 0.0 and 1.0",
+        )? {
+            self.window.opacity = n;
         }
         Ok(())
     }

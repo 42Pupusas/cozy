@@ -9,6 +9,44 @@ use crate::tables::{Cmap, Head, Hhea, Hmtx, Loca, Maxp};
 
 // ── Public re-exports ─────────────────────────────────────────────────────────
 
+/// Everything that can go wrong loading a font file from disk.
+///
+/// Kept distinct from [`ParseError`] (which is only about malformed font
+/// bytes) so a missing/unreadable file is never misreported as "font data
+/// too short" — that used to happen when [`FontFace::load`] collapsed every
+/// `std::io::Error` into `ParseError::TooShort`.
+#[derive(Debug)]
+pub enum LoadError {
+    /// The file couldn't be read (missing, permission denied, not a file, ...).
+    Io(std::io::Error),
+    /// The file was read fine but its bytes aren't a valid TTF/OTF.
+    Parse(ParseError),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "couldn't read font file: {e}"),
+            Self::Parse(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Parse(e) => Some(e),
+        }
+    }
+}
+
+impl From<ParseError> for LoadError {
+    fn from(e: ParseError) -> Self {
+        Self::Parse(e)
+    }
+}
+
 /// Per-glyph metrics in pixels (at the configured pixel size).
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphMetrics {
@@ -84,10 +122,11 @@ impl FontFace {
     /// Load a TTF/OTF file from disk and configure it at `px_size` pixels tall.
     ///
     /// # Errors
-    /// Returns [`ParseError`] on malformed font data.
-    pub fn load(path: impl AsRef<std::path::Path>, px_size: f32) -> Result<Self, ParseError> {
-        let data = std::fs::read(path).map_err(|_| ParseError::TooShort)?;
-        Self::from_bytes(data, px_size)
+    /// Returns [`LoadError::Io`] if the file can't be read (missing, permission
+    /// denied, ...) or [`LoadError::Parse`] if its bytes aren't a valid TTF/OTF.
+    pub fn load(path: impl AsRef<std::path::Path>, px_size: f32) -> Result<Self, LoadError> {
+        let data = std::fs::read(path).map_err(LoadError::Io)?;
+        Ok(Self::from_bytes(data, px_size)?)
     }
 
     /// Parse from already-loaded bytes.
@@ -195,7 +234,8 @@ impl FontFace {
         let outline =
             loca.glyph_range(gid)
                 .map_or_else(crate::outline::Outline::default, |(off, len)| {
-                    crate::outline::Outline::decode(self.glyf(), off, len, 0).unwrap_or_default()
+                    crate::outline::Outline::decode(self.glyf(), off, len, &loca, 0)
+                        .unwrap_or_default()
                 });
 
         // Compute pixel-space bounding box from font-unit bbox.
@@ -244,11 +284,16 @@ impl FontFace {
 
         for cp in codepoints {
             let g = self.do_rasterize(cp);
+            // Round (not truncate) fractional pixel metrics before casting --
+            // truncation biases every glyph downward/leftward by up to a
+            // pixel depending on its particular fractional bearing, which
+            // visibly misaligns glyphs with descenders (g, p, y, q, j) whose
+            // bearing_y fraction differs from ascender-only glyphs.
             let entry = atlas.insert(
                 &g.bitmap,
-                g.metrics.bearing_x as i32,
-                g.metrics.bearing_y as i32,
-                g.metrics.advance as i32,
+                g.metrics.bearing_x.round() as i32,
+                g.metrics.bearing_y.round() as i32,
+                g.metrics.advance.round() as i32,
             );
             if let Some(e) = entry {
                 map.insert(cp, e);

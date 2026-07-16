@@ -185,11 +185,15 @@ impl GlyphCache {
         // `self.face` and `self.atlas` are disjoint fields, so this doesn't
         // fight the borrow checker despite the mutable + immutable overlap.
         let g = self.face.rasterize(codepoint);
+        // Round (not truncate) -- see the matching comment in
+        // `FontFace::build_ascii_atlas`; truncating here reproduces the same
+        // per-glyph vertical/horizontal jitter for any codepoint rasterized
+        // lazily (i.e. everything outside the pre-seeded ASCII atlas).
         let entry = self.atlas.insert(
             &g.bitmap,
-            g.metrics.bearing_x as i32,
-            g.metrics.bearing_y as i32,
-            g.metrics.advance as i32,
+            g.metrics.bearing_x.round() as i32,
+            g.metrics.bearing_y.round() as i32,
+            g.metrics.advance.round() as i32,
         );
         if let Some(e) = entry {
             self.map.insert(codepoint, e);
@@ -217,6 +221,14 @@ pub struct Renderer {
     /// fallback, or derived from the loaded face's metrics.
     cell_w: i32,
     cell_h: i32,
+    /// Alpha applied to *pure background* pixels (no glyph coverage), `0–255`.
+    /// `255` (the default) means fully opaque, and every packed pixel is then
+    /// byte-identical to the pre-transparency `to_xrgb8888()` output — this
+    /// only changes behavior when a window opacity `< 1.0` is configured.
+    /// Any pixel with glyph coverage (even a faint anti-aliased edge) is
+    /// always packed fully opaque, matching Alacritty's default "background
+    /// glass, text solid" look (`transparent_background_colors = false`).
+    bg_alpha: u8,
 }
 
 impl Renderer {
@@ -229,7 +241,26 @@ impl Renderer {
             glyphs: GlyphSource::Bitmap,
             cell_w: GLYPH_W,
             cell_h: GLYPH_H,
+            bg_alpha: 255,
         }
+    }
+
+    /// Set the window background opacity, `0.0` (fully transparent) to `1.0`
+    /// (opaque). Only affects pure-background pixels — glyph pixels are
+    /// always packed fully opaque (see [`Self::bg_alpha`]). Values outside
+    /// `[0.0, 1.0]` are clamped; `config::WindowConfig::opacity` is already
+    /// validated to that range, so this is just defense in depth.
+    #[must_use]
+    pub fn with_opacity(mut self, opacity: f64) -> Self {
+        self.bg_alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        self
+    }
+
+    /// Whether this renderer's window needs an alpha-capable Wayland buffer
+    /// format (`Argb8888`) rather than the cheaper opaque `Xrgb8888`.
+    #[must_use]
+    pub const fn needs_alpha(&self) -> bool {
+        self.bg_alpha < 255
     }
 
     /// Build a renderer from config: tries to load `font_cfg.path` at
@@ -240,9 +271,9 @@ impl Renderer {
         let Some(path) = &font_cfg.path else {
             return Self::builtin(theme);
         };
-        // font.size is validated to 1..=256 in config; well within f32's exact range.
-        #[allow(clippy::cast_precision_loss)]
-        let px_size = font_cfg.size as f32;
+        // font.size is a point size (like Alacritty); convert to pixels at
+        // the standard 96 DPI so a given point size matches other terminals.
+        let px_size = font_cfg.px_size();
         match font::FontFace::load(path, px_size) {
             Ok(face) => {
                 let cell_w = face.cell_width.round().max(1.0) as i32;
@@ -252,6 +283,7 @@ impl Renderer {
                     glyphs: GlyphSource::Face(Box::new(GlyphCache::new(face))),
                     cell_w,
                     cell_h,
+                    bg_alpha: 255,
                 }
             }
             Err(e) => {
@@ -275,10 +307,37 @@ impl Renderer {
         self.cell_h
     }
 
-    /// The theme background as a packed XRGB8888 word (backbuffer clear color).
+    /// The theme background as a packed XRGB8888 word (backbuffer clear
+    /// color), ignoring window opacity. Kept byte-identical to before M10's
+    /// transparency support for any caller that only ever ran opaque
+    /// windows; use [`Self::bg_packed`] for a backbuffer fill that's correct
+    /// under a configured `[window] opacity`.
     #[must_use]
     pub fn bg_xrgb(&self) -> u32 {
         self.theme.bg_xrgb()
+    }
+
+    /// The theme background, packed for whatever this renderer's buffer
+    /// format actually is: plain XRGB8888 (top byte ignored, identical to
+    /// [`Self::bg_xrgb`]) when opaque, or premultiplied ARGB8888 at
+    /// [`Self::needs_alpha`]'s alpha when a window opacity `< 1.0` is
+    /// configured. Callers that fill/clear a whole backbuffer (initial
+    /// alloc, resize-carry) should use this, not `bg_xrgb`, so newly exposed
+    /// area matches the translucent look instead of flashing opaque.
+    #[must_use]
+    pub fn bg_packed(&self) -> u32 {
+        Self::pack_bg(self.theme.bg, self.bg_alpha)
+    }
+
+    /// Pack a background color at `bg_alpha`: plain XRGB8888 when fully
+    /// opaque (byte-identical to the pre-transparency renderer), or
+    /// premultiplied ARGB8888 otherwise.
+    fn pack_bg(bg: DrawColor, bg_alpha: u8) -> u32 {
+        if bg_alpha == 255 {
+            bg.to_xrgb8888()
+        } else {
+            bg.premultiplied_argb8888(bg_alpha)
+        }
     }
 
     /// Blit a single cell into the canvas at cell column/row `cx`/`cy`.
@@ -291,8 +350,17 @@ impl Renderer {
         }
 
         let (fg, bg) = self.theme.effective(&cell.attrs);
-        let fg_px = fg.to_xrgb8888();
-        let bg_px = bg.to_xrgb8888();
+        // Glyph ink is always fully opaque, regardless of window opacity —
+        // matching Alacritty's default "translucent glass, solid text" look.
+        // `premultiplied_argb8888(255)` degenerates to plain packed RGB (top
+        // byte 0xff) in the opaque case, so this is a no-op split from
+        // `to_xrgb8888()` only once `needs_alpha()` is true.
+        let fg_px = if self.bg_alpha == 255 {
+            fg.to_xrgb8888()
+        } else {
+            fg.premultiplied_argb8888(255)
+        };
+        let bg_px = Self::pack_bg(bg, self.bg_alpha);
         let ch = if cell.attrs.invisible { ' ' } else { cell.ch };
 
         match &mut self.glyphs {
@@ -311,6 +379,7 @@ impl Renderer {
                     ch,
                     fg,
                     bg,
+                    self.bg_alpha,
                 );
             }
         }
@@ -366,6 +435,12 @@ impl Renderer {
 
     /// Real-font path: fill the cell background, then alpha-blend the
     /// rasterized (possibly multi-cell-wide, anti-aliased) glyph over it.
+    ///
+    /// `bg_alpha` is the window's configured background opacity (`255` =
+    /// opaque). Any pixel touched by glyph coverage — including partially
+    /// anti-aliased edge pixels — is always packed fully opaque, so text
+    /// stays crisp and solid even in a translucent window; only untouched
+    /// background pixels carry `bg_alpha`.
     #[allow(clippy::too_many_arguments)]
     fn blit_cell_face(
         canvas: &mut Canvas<'_>,
@@ -378,10 +453,15 @@ impl Renderer {
         ch: char,
         fg: DrawColor,
         bg: DrawColor,
+        bg_alpha: u8,
     ) {
         let buf_width = canvas.width() as u32;
-        let fg_px = fg.to_xrgb8888();
-        let bg_px = bg.to_xrgb8888();
+        let fg_px = if bg_alpha == 255 {
+            fg.to_xrgb8888()
+        } else {
+            fg.premultiplied_argb8888(255)
+        };
+        let bg_px = Self::pack_bg(bg, bg_alpha);
         let px0 = u32::from(cx) * cell_w as u32;
         let py0 = u32::from(cy) * cell_h as u32;
         let cell_cols: u32 = if wide { 2 } else { 1 };
@@ -436,7 +516,11 @@ impl Renderer {
                 let Some(dst) = pixels.get_mut(idx) else {
                     continue;
                 };
-                *dst = if a == 255 { fg_px } else { blend(bg, fg, a) };
+                *dst = if a == 255 {
+                    fg_px
+                } else {
+                    blend(bg, fg, a, bg_alpha)
+                };
             }
         }
     }
@@ -459,8 +543,36 @@ impl Renderer {
     }
 }
 
-/// Linear-interpolate `from` → `to` by `alpha/255`, packed as XRGB8888.
-fn blend(from: DrawColor, to: DrawColor, alpha: u8) -> u32 {
+/// Composite an anti-aliased glyph edge pixel: `glyph_a/255` coverage of
+/// opaque ink (`fg`) over a background (`bg`) that is itself translucent at
+/// `bg_alpha/255` (the window opacity). Returns a plain packed RGB word
+/// (top byte ignored, i.e. XRGB8888) when `bg_alpha == 255` — byte-identical
+/// to the original (pre-M10) blend — or a **premultiplied** ARGB8888 word
+/// otherwise, per `wl_shm`'s wire format.
+fn blend(bg: DrawColor, fg: DrawColor, glyph_a: u8, bg_alpha: u8) -> u32 {
+    if bg_alpha == 255 {
+        return blend_opaque(bg, fg, glyph_a);
+    }
+    // Ink is opaque; the window glass shows through the uncovered fraction.
+    // Porter-Duff "ink over glass", composited directly in premultiplied space.
+    let ink_a = f64::from(glyph_a) / 255.0;
+    let glass_a = f64::from(bg_alpha) / 255.0;
+    let uncovered = glass_a * (1.0 - ink_a);
+    let out_a = ink_a + uncovered;
+    let pr = f64::from(fg.r).mul_add(ink_a, f64::from(bg.r) * uncovered);
+    let pg = f64::from(fg.g).mul_add(ink_a, f64::from(bg.g) * uncovered);
+    let pb = f64::from(fg.b).mul_add(ink_a, f64::from(bg.b) * uncovered);
+    let a8 = (out_a * 255.0).round() as u32;
+    let r8 = pr.round() as u32;
+    let g8 = pg.round() as u32;
+    let b8 = pb.round() as u32;
+    (a8 << 24) | (r8 << 16) | (g8 << 8) | b8
+}
+
+/// The original (pre-transparency) linear-interpolate `from` → `to` by
+/// `alpha/255`, packed as XRGB8888. Split out of [`blend`] so the opaque
+/// path (the overwhelmingly common case) stays exactly as before.
+fn blend_opaque(from: DrawColor, to: DrawColor, alpha: u8) -> u32 {
     let a = u32::from(alpha);
     let r = (u32::from(from.r) * (255 - a) + u32::from(to.r) * a) / 255;
     let g = (u32::from(from.g) * (255 - a) + u32::from(to.g) * a) / 255;
@@ -552,7 +664,63 @@ mod tests {
     fn blend_alpha_zero_is_background_alpha_255_is_foreground() {
         let bg = DrawColor::rgb(0, 0, 0);
         let fg = DrawColor::rgb(255, 255, 255);
-        assert_eq!(blend(bg, fg, 0), bg.to_xrgb8888());
-        assert_eq!(blend(bg, fg, 255), fg.to_xrgb8888());
+        // bg_alpha = 255 (opaque window): the pre-M10 XRGB8888 behavior.
+        assert_eq!(blend(bg, fg, 0, 255), bg.to_xrgb8888());
+        assert_eq!(blend(bg, fg, 255, 255), fg.to_xrgb8888());
+    }
+
+    #[test]
+    fn blend_translucent_window_zero_glyph_coverage_is_translucent_bg() {
+        let bg = DrawColor::rgb(10, 20, 30);
+        let fg = DrawColor::rgb(255, 255, 255);
+        // No glyph ink at all: falls back to the plain translucent background
+        // pixel, alpha == bg_alpha exactly. wl_shm wants *premultiplied*
+        // alpha, so the color channels are also scaled by bg_alpha/255 (128
+        // -> ~0.502), not carried through straight.
+        let px = blend(bg, fg, 0, 128);
+        assert_eq!(px >> 24, 128);
+        assert_eq!((px >> 16) & 0xff, 5, "10 * 128/255 rounds to 5");
+        assert_eq!((px >> 8) & 0xff, 10, "20 * 128/255 rounds to 10");
+        assert_eq!(px & 0xff, 15, "30 * 128/255 rounds to 15");
+    }
+
+    #[test]
+    fn blend_translucent_window_full_glyph_coverage_is_opaque_fg() {
+        let bg = DrawColor::rgb(10, 20, 30);
+        let fg = DrawColor::rgb(200, 100, 50);
+        // glyph_a == 255 short-circuits in blit_cell_face before calling
+        // blend, but blend itself must still be correct if called directly:
+        // full ink coverage means fully opaque foreground regardless of the
+        // window's glass opacity.
+        let px = blend(bg, fg, 255, 128);
+        assert_eq!(px >> 24, 255, "full glyph coverage must be fully opaque");
+        assert_eq!((px >> 16) & 0xff, 200);
+        assert_eq!((px >> 8) & 0xff, 100);
+        assert_eq!(px & 0xff, 50);
+    }
+
+    #[test]
+    fn renderer_with_opacity_reports_needs_alpha() {
+        let r = Renderer::builtin(Theme::builtin());
+        assert!(!r.needs_alpha());
+        let r = r.with_opacity(0.8);
+        assert!(r.needs_alpha());
+        let r = r.with_opacity(1.0);
+        assert!(!r.needs_alpha());
+    }
+
+    #[test]
+    fn renderer_bg_packed_matches_bg_xrgb_when_opaque() {
+        let r = Renderer::builtin(Theme::builtin());
+        assert_eq!(r.bg_packed(), r.bg_xrgb());
+    }
+
+    #[test]
+    fn renderer_bg_packed_carries_alpha_when_translucent() {
+        let r = Renderer::builtin(Theme::builtin()).with_opacity(0.5);
+        let packed = r.bg_packed();
+        let alpha = packed >> 24;
+        // 0.5 * 255 rounds to 128 (127.5 -> 128).
+        assert_eq!(alpha, 128);
     }
 }

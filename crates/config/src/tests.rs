@@ -68,6 +68,39 @@ fn font_size_upper_bound() {
     assert!(e.contains("font.size"), "got: {e}");
 }
 
+// ── [window] ───────────────────────────────────────────────────
+
+#[test]
+fn window_opacity_default_is_opaque() {
+    let cfg = Config::parse("");
+    assert!((cfg.window.opacity - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn window_opacity_fractional() {
+    let cfg = Config::parse("[window]\nopacity = 0.80\n");
+    assert!((cfg.window.opacity - 0.80).abs() < 1e-9);
+}
+
+#[test]
+fn window_opacity_accepts_bare_integers() {
+    // TOML `0` / `1` are valid floats in spirit; accept them like Alacritty does.
+    let cfg = Config::parse("[window]\nopacity = 0\n");
+    assert!((cfg.window.opacity - 0.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn window_opacity_out_of_range() {
+    let e = Config::fail("[window]\nopacity = 1.5\n");
+    assert!(e.contains("window.opacity"), "got: {e}");
+}
+
+#[test]
+fn window_opacity_negative_rejected() {
+    let e = Config::fail("[window]\nopacity = -0.1\n");
+    assert!(e.contains("window.opacity"), "got: {e}");
+}
+
 // ── [cursor] ──────────────────────────────────────────────────────────────────
 
 #[test]

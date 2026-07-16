@@ -4,7 +4,7 @@
 //! glyph bytecode. Composite glyphs are recursively expanded.
 
 use crate::parse::{ByteSliceExt, ParseError};
-use crate::tables::GlyphId;
+use crate::tables::{GlyphId, Loca};
 
 // ── Geometry ──────────────────────────────────────────────────────────────────
 
@@ -64,6 +64,10 @@ impl Outline {
     /// `glyf_data` is the entire `glyf` table; the glyph itself lives at
     /// `glyf_data[glyph_off..glyph_off + glyph_len]`.
     ///
+    /// `loca` resolves component glyph ids for composite glyphs (e.g. an
+    /// accented letter, or an `i`/`j` whose dot is a separate component from
+    /// its dotless stem) — without it those glyphs would decode to nothing.
+    ///
     /// Was a free `decode_glyph(glyf_data, ..)` function -- moved onto
     /// `Outline` since it's the type being produced, mirroring the
     /// `T::parse(bytes)` convention used by the sibling `tables` module.
@@ -71,6 +75,7 @@ impl Outline {
         glyf_data: &[u8],
         glyph_off: usize,
         glyph_len: usize,
+        loca: &Loca<'_>,
         depth: u8,
     ) -> Result<Self, ParseError> {
         if depth > 8 {
@@ -91,7 +96,7 @@ impl Outline {
         if num_contours >= 0 {
             Self::decode_simple(d, num_contours as usize, x_min, y_min, x_max, y_max)
         } else {
-            Self::decode_composite(glyf_data, d, depth, x_min, y_min, x_max, y_max)
+            Self::decode_composite(glyf_data, d, loca, depth, x_min, y_min, x_max, y_max)
         }
     }
 
@@ -249,6 +254,7 @@ impl Outline {
     fn decode_composite(
         glyf_data: &[u8],
         d: &[u8],
+        loca: &Loca<'_>,
         depth: u8,
         x_min: i16,
         y_min: i16,
@@ -291,12 +297,8 @@ impl Outline {
                 cursor += 8;
             }
 
-            // Recursively decode the component glyph.
-            // We need loca to find it — locate via glyf table bounds heuristic:
-            // components reference glyph ids in the same file so we re-use the
-            // glyf_data slice and search forward for the glyph header.
-            // (A full implementation would pass Loca in; here we use a helper.)
-            let component = Self::find_component(glyf_data, glyph_index, depth);
+            // Recursively decode the component glyph via `loca`.
+            let component = Self::find_component(glyf_data, loca, glyph_index, depth);
             // Translate and append.
             for verb in component.verbs {
                 outline.verbs.push(verb.translate(dx, dy));
@@ -313,13 +315,15 @@ impl Outline {
     /// Resolve a composite glyph's referenced component by id.
     ///
     /// Was a free `find_component(glyf_data, ..)` function -- moved onto
-    /// `Outline` since it produces one.
-    fn find_component(glyf_data: &[u8], _gid: GlyphId, _depth: u8) -> Self {
-        // Composite expansion requires Loca; we defer full support to when
-        // FontFace passes Loca in. Return an empty outline as a safe stub —
-        // composite glyphs in JetBrains Mono are rare (only accented letters).
-        let _ = glyf_data;
-        Self::default()
+    /// `Outline` since it produces one. Previously a stub returning an empty
+    /// outline unconditionally (composite glyphs — accented letters, and in
+    /// some fonts even plain `i`/`j` — silently vanished); now actually
+    /// resolves the component's byte range via `loca` and recurses.
+    fn find_component(glyf_data: &[u8], loca: &Loca<'_>, gid: GlyphId, depth: u8) -> Self {
+        let Some((off, len)) = loca.glyph_range(gid) else {
+            return Self::default();
+        };
+        Self::decode(glyf_data, off, len, loca, depth + 1).unwrap_or_default()
     }
 }
 

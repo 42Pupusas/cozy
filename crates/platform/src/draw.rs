@@ -43,6 +43,21 @@ impl Color {
     pub const fn to_argb8888(self) -> u32 {
         ((self.a as u32) << 24) | ((self.r as u32) << 16) | ((self.g as u32) << 8) | (self.b as u32)
     }
+
+    /// Pack `(r, g, b)` at `alpha` into a **premultiplied** ARGB8888 word, as
+    /// `wl_shm` requires for any format other than the fully-opaque case: the
+    /// wire spec says "pre-multiplied alpha is used for pixel values" for
+    /// every `wl_shm` format. `alpha == 255` degenerates to the identity
+    /// (straight == premultiplied at full opacity), so callers can use this
+    /// unconditionally without a fast-path split.
+    #[must_use]
+    pub fn premultiplied_argb8888(self, alpha: u8) -> u32 {
+        let a = u32::from(alpha);
+        let r = (u32::from(self.r) * a) / 255;
+        let g = (u32::from(self.g) * a) / 255;
+        let b = (u32::from(self.b) * a) / 255;
+        (a << 24) | (r << 16) | (g << 8) | b
+    }
 }
 
 /// A handful of named colors so call sites read in words, not hex.

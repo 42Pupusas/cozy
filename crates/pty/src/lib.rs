@@ -25,7 +25,7 @@ mod sys;
 
 pub use error::PtyError;
 pub use simple::PtySimple;
-pub use sys::WinSize;
+pub use sys::{ChildPid, CloseFd, PtyIoctl, WinSize};
 
 use quetzal_uring::{CqConsumer, SqProducer, UringQueue};
 use quetzalcoatl::capacity::Capacity;
@@ -80,7 +80,7 @@ pub struct Pty {
     /// Master fd of the pseudoterminal.
     master_fd: ququmatz::RawFd,
     /// PID of the child process.
-    child_pid: i32,
+    child_pid: ChildPid,
     /// `io_uring` queue driving all master-fd I/O.
     queue: UringQueue,
     /// SQ producer — for submitting read/write SQEs.
@@ -156,7 +156,7 @@ impl Pty {
     ///
     /// Returns [`PtyError`] if the `TIOCSWINSZ` ioctl fails.
     pub fn resize(&self, win_size: WinSize) -> Result<(), PtyError> {
-        sys::set_win_size(self.master_fd, win_size)
+        self.master_fd.set_win_size(win_size)
     }
 
     /// Run the PTY I/O event loop. **Blocks the calling thread until the
@@ -231,7 +231,7 @@ impl Pty {
                         // will submit more if pending.
                     }
                     CqeAction::Signal => {
-                        exit_code = sys::waitpid(self.child_pid).unwrap_or(0);
+                        exit_code = self.child_pid.wait_nohang().unwrap_or(0);
                         got_exit = true;
                         // Rearm the signalfd read for future signals.
                         let _ = self.arm_signal();
@@ -324,8 +324,8 @@ impl Pty {
 
     fn cleanup(&self) {
         self.queue.close();
-        let _ = sys::close_fd(self.master_fd);
-        let _ = sys::close_fd(self.signal_fd);
+        let _ = self.master_fd.close();
+        let _ = self.signal_fd.close();
     }
 }
 

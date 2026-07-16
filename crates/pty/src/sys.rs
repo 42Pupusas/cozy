@@ -4,6 +4,15 @@
 //!
 //! All unsafe is contained here. Every function documents the invariant
 //! that makes each unsafe block sound.
+//!
+//! Syscall numbers, `ioctl` requests, and flag bits are grouped into small
+//! `#[repr(usize)]` enums / bitflag-ish newtypes instead of loose `const`s,
+//! so a bad value is a type error rather than a typo in a sea of `usize`s.
+//! Each enum is `#[repr(usize)]`, so a plain `as usize` cast at the call
+//! site is all that's needed to feed it to a syscall — no wrapper method.
+//! Operations on an open fd (window size, locking, `TIOCSCTTY`, closing) are
+//! exposed as extension traits ([`PtyIoctl`], [`CloseFd`]) on [`RawFd`]
+//! rather than free functions taking the fd as their first argument.
 
 #![allow(unsafe_code)]
 
@@ -11,45 +20,126 @@ use crate::error::PtyError;
 use ququmatz::RawFd;
 use std::ffi::CString;
 
-// ── libc constants (inline to avoid any libc dep) ─────────────────────────
+// ── syscall numbers (x86_64 Linux) ─────────────────────────────────────────
 
-// Syscall numbers (x86_64 Linux)
-const SYS_CLONE: usize = 56;
-const SYS_EXECVE: usize = 59;
-const SYS_WAITPID: usize = 61; // actually wait4
-const SYS_SIGPROCMASK: usize = 14;
-const SYS_SIGNALFD4: usize = 289;
-const SYS_CLOSE: usize = 3;
-const SYS_IOCTL: usize = 16;
-const SYS_OPEN: usize = 2;
-const SYS_SETSID: usize = 112;
-const SYS_DUP2: usize = 33;
-const SYS_KILL: usize = 62;
+/// `x86_64` Linux syscall numbers used by this crate.
+///
+/// `pty` only targets `Linux/x86_64` (see the crate-level doc comment), so a
+/// single flat enum is sufficient — no per-arch tables needed.
+#[cfg(target_arch = "x86_64")]
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Syscall {
+    Read = 0,
+    Write = 1,
+    Open = 2,
+    Close = 3,
+    SigProcMask = 14,
+    Ioctl = 16,
+    Dup2 = 33,
+    Clone = 56,
+    Execve = 59,
+    /// Also known as `wait4`.
+    Wait4 = 61,
+    Kill = 62,
+    Fcntl = 72,
+    SetSid = 112,
+    SignalFd4 = 289,
+    ExitGroup = 231,
+}
 
-// Signal numbers
-const SIGHUP: usize = 1;
+/// A POSIX signal number.
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signal {
+    Hup = 1,
+    Chld = 17,
+}
 
-// ioctl request codes
-const TIOCSWINSZ: usize = 0x5414;
-#[allow(dead_code)]
-const TIOCGWINSZ: usize = 0x5413;
-const TIOCSCTTY: usize = 0x540E;
+/// `ioctl(2)` request codes used to manage a PTY.
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IoctlRequest {
+    /// `TIOCGPTN` — fetch the slave PTY number.
+    GetPtyNumber = 0x8004_5430,
+    /// `TIOCSPTLCK` — lock/unlock the slave PTY (0 = unlock).
+    SetPtyLock = 0x4004_5431,
+    /// `TIOCGWINSZ` — read the window size.
+    GetWinSize = 0x5413,
+    /// `TIOCSWINSZ` — set the window size.
+    SetWinSize = 0x5414,
+    /// `TIOCSCTTY` — make this fd the controlling terminal.
+    SetControllingTty = 0x540E,
+}
 
-// PTY ops
-const O_RDWR: usize = 2;
-const O_NOCTTY: usize = 0x400;
-const O_CLOEXEC: usize = 0x80000;
+/// `fcntl(2)` commands.
+#[repr(usize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FcntlCmd {
+    GetFl = 3,
+    SetFl = 4,
+}
 
-// clone flags for fork
-const SIGCHLD: usize = 17;
+/// `sigprocmask(2)` "how" argument.
+#[repr(usize)]
+#[derive(Clone, Copy)]
+pub enum SigProcMaskHow {
+    Block = 0,
+}
 
-// signalfd
-const SFD_NONBLOCK: usize = 0o4000;
-const SFD_CLOEXEC: usize = 0o2_000_000;
-const SIGCHLD_BIT: u64 = 1 << 16; // bit 16 in sigset (SIGCHLD = 17, 0-indexed = 16)
+/// `wait4(2)` option flags.
+#[repr(usize)]
+#[derive(Clone, Copy)]
+pub enum Wait4Flags {
+    Blocking = 0,
+    NoHang = 1,
+}
 
-// wait4
-const WNOHANG: usize = 1;
+/// `open(2)` / `fcntl(2)` flag bits.
+///
+/// A plain enum can't be OR-ed together, so this is a bitflag-style newtype
+/// with associated consts and a `BitOr` impl — the minimal amount of
+/// ceremony needed to keep flag combination type-safe.
+#[derive(Clone, Copy)]
+pub struct OpenFlags(usize);
+
+impl OpenFlags {
+    pub const RDWR: Self = Self(2);
+    pub const NOCTTY: Self = Self(0x400);
+    pub const CLOEXEC: Self = Self(0x8_0000);
+    pub const NONBLOCK: Self = Self(0o4000);
+
+    pub const fn bits(self) -> usize {
+        self.0
+    }
+}
+
+impl core::ops::BitOr for OpenFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+/// `signalfd4(2)` flag bits.
+#[derive(Clone, Copy)]
+struct SignalFdFlags(usize);
+
+impl SignalFdFlags {
+    const NONBLOCK: Self = Self(0o4000);
+    const CLOEXEC: Self = Self(0o2_000_000);
+
+    const fn bits(self) -> usize {
+        self.0
+    }
+}
+
+impl core::ops::BitOr for SignalFdFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
 
 /// Terminal window dimensions.
 #[derive(Clone, Copy, Debug, Default)]
@@ -65,10 +155,21 @@ pub struct WinSize {
 #[repr(C)]
 struct SigSet([u64; 1]);
 
+impl SigSet {
+    const fn empty() -> Self {
+        Self([0u64; 1])
+    }
+
+    const fn insert(&mut self, sig: Signal) {
+        // Sigset bit N (0-indexed) corresponds to signal N+1.
+        self.0[0] |= 1u64 << (sig as usize - 1);
+    }
+}
+
 // ── raw syscall shim ───────────────────────────────────────────────────────
 
 #[inline]
-unsafe fn syscall0(nr: usize) -> isize {
+unsafe fn syscall0(nr: Syscall) -> isize {
     let ret: isize;
     // SAFETY: caller upholds the unsafe-fn contract (valid syscall number).
     unsafe {
@@ -84,7 +185,7 @@ unsafe fn syscall0(nr: usize) -> isize {
 }
 
 #[inline]
-unsafe fn syscall1(nr: usize, a0: usize) -> isize {
+unsafe fn syscall1(nr: Syscall, a0: usize) -> isize {
     let ret: isize;
     // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
     unsafe {
@@ -101,7 +202,7 @@ unsafe fn syscall1(nr: usize, a0: usize) -> isize {
 }
 
 #[inline]
-unsafe fn syscall2(nr: usize, a0: usize, a1: usize) -> isize {
+pub unsafe fn syscall2(nr: Syscall, a0: usize, a1: usize) -> isize {
     let ret: isize;
     // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
     unsafe {
@@ -119,7 +220,7 @@ unsafe fn syscall2(nr: usize, a0: usize, a1: usize) -> isize {
 }
 
 #[inline]
-unsafe fn syscall3(nr: usize, a0: usize, a1: usize, a2: usize) -> isize {
+pub unsafe fn syscall3(nr: Syscall, a0: usize, a1: usize, a2: usize) -> isize {
     let ret: isize;
     // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
     unsafe {
@@ -138,7 +239,7 @@ unsafe fn syscall3(nr: usize, a0: usize, a1: usize, a2: usize) -> isize {
 }
 
 #[inline]
-unsafe fn syscall4(nr: usize, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
+unsafe fn syscall4(nr: Syscall, a0: usize, a1: usize, a2: usize, a3: usize) -> isize {
     let ret: isize;
     // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
     unsafe {
@@ -165,53 +266,201 @@ const fn errno_to_err(ret: isize) -> Result<usize, i32> {
     }
 }
 
+// ── fd extension traits ─────────────────────────────────────────────────────
+
+/// PTY-related `ioctl(2)` operations on a raw fd.
+///
+/// Grouping these as an extension trait on [`RawFd`] (rather than five free
+/// functions each taking a fd) reads as `fd.set_win_size(..)` at the call
+/// site and keeps every PTY ioctl in one place.
+pub trait PtyIoctl: Copy {
+    /// Fetch the slave PTY number (`TIOCGPTN`) — used to build `/dev/pts/<n>`.
+    ///
+    /// # Errors
+    /// Returns [`PtyError::OpenPt`] if the ioctl fails.
+    fn pty_number(self) -> Result<u32, PtyError>;
+
+    /// Unlock the slave PTY (`TIOCSPTLCK` with lock = 0), the raw-syscall
+    /// equivalent of `unlockpt(3)`.
+    ///
+    /// # Errors
+    /// Returns [`PtyError::OpenPt`] if the ioctl fails.
+    fn unlock_pty(self) -> Result<(), PtyError>;
+
+    /// Push a new window size via `TIOCSWINSZ`.
+    ///
+    /// # Errors
+    /// Returns [`PtyError::WinSize`] if the ioctl fails.
+    fn set_win_size(self, win_size: WinSize) -> Result<(), PtyError>;
+
+    /// Query the current window size via `TIOCGWINSZ`.
+    ///
+    /// # Errors
+    /// Returns [`PtyError::WinSize`] if the ioctl fails.
+    fn get_win_size(self) -> Result<WinSize, PtyError>;
+
+    /// Make this fd the controlling terminal of the calling process
+    /// (`TIOCSCTTY`). Only meaningful post-fork, in a new session.
+    ///
+    /// # Errors
+    /// Returns [`PtyError::OpenPt`] if the ioctl fails.
+    fn set_controlling_terminal(self) -> Result<(), PtyError>;
+}
+
+impl PtyIoctl for RawFd {
+    fn pty_number(self) -> Result<u32, PtyError> {
+        let mut pts_no: u32 = 0;
+        let ret = unsafe {
+            syscall3(
+                Syscall::Ioctl,
+                self.as_usize(),
+                IoctlRequest::GetPtyNumber as usize,
+                core::ptr::addr_of_mut!(pts_no) as usize,
+            )
+        };
+        errno_to_err(ret).map(|_| pts_no).map_err(PtyError::OpenPt)
+    }
+
+    fn unlock_pty(self) -> Result<(), PtyError> {
+        let lock: i32 = 0;
+        let ret = unsafe {
+            syscall3(
+                Syscall::Ioctl,
+                self.as_usize(),
+                IoctlRequest::SetPtyLock as usize,
+                core::ptr::addr_of!(lock) as usize,
+            )
+        };
+        errno_to_err(ret).map(|_| ()).map_err(PtyError::OpenPt)
+    }
+
+    fn set_win_size(self, win_size: WinSize) -> Result<(), PtyError> {
+        let ret = unsafe {
+            syscall3(
+                Syscall::Ioctl,
+                self.as_usize(),
+                IoctlRequest::SetWinSize as usize,
+                core::ptr::addr_of!(win_size) as usize,
+            )
+        };
+        errno_to_err(ret).map(|_| ()).map_err(PtyError::WinSize)
+    }
+
+    #[allow(dead_code)] // exposed for completeness; no current caller queries winsize
+    fn get_win_size(self) -> Result<WinSize, PtyError> {
+        let mut ws = WinSize::default();
+        let ret = unsafe {
+            syscall3(
+                Syscall::Ioctl,
+                self.as_usize(),
+                IoctlRequest::GetWinSize as usize,
+                core::ptr::addr_of_mut!(ws) as usize,
+            )
+        };
+        errno_to_err(ret).map(|_| ws).map_err(PtyError::WinSize)
+    }
+
+    fn set_controlling_terminal(self) -> Result<(), PtyError> {
+        let ret = unsafe {
+            syscall3(Syscall::Ioctl, self.as_usize(), IoctlRequest::SetControllingTty as usize, 0)
+        };
+        errno_to_err(ret).map(|_| ()).map_err(PtyError::OpenPt)
+    }
+}
+
+/// Close a raw fd via a direct syscall (no libc dependency).
+pub trait CloseFd {
+    /// # Errors
+    /// Returns the raw errno if `close(2)` fails.
+    fn close(self) -> Result<(), i32>;
+}
+
+impl CloseFd for RawFd {
+    fn close(self) -> Result<(), i32> {
+        let ret = unsafe { syscall1(Syscall::Close, self.as_usize()) };
+        errno_to_err(ret).map(|_| ())
+    }
+}
+
+// ── child process handle ────────────────────────────────────────────────────
+
+/// PID of a child spawned under a PTY slave.
+///
+/// Wrapping the raw `i32` keeps `hangup` / `reap_blocking` / `wait_nohang`
+/// as methods on the process itself instead of free functions each
+/// re-stating "this takes a pid".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildPid(pub i32);
+
+impl ChildPid {
+    /// Send `SIGHUP` (best effort — used on teardown so the shell doesn't
+    /// outlive us as an orphan holding the PTY slave open).
+    pub fn hangup(self) {
+        if self.0 > 0 {
+            unsafe { syscall2(Syscall::Kill, self.0 as usize, Signal::Hup as usize) };
+        }
+    }
+
+    /// Blocking reap (no `WNOHANG`) — call after [`ChildPid::hangup`] so the
+    /// zombie is collected and we don't leak a process-table entry.
+    pub fn reap_blocking(self) {
+        if self.0 <= 0 {
+            return;
+        }
+        let mut status: i32 = 0;
+        unsafe {
+            syscall4(
+                Syscall::Wait4,
+                self.0 as usize,
+                core::ptr::addr_of_mut!(status) as usize,
+                Wait4Flags::Blocking as usize,
+                0,
+            )
+        };
+    }
+
+    /// Non-blocking reap (`WNOHANG`); returns the exit code if the child has
+    /// already exited.
+    ///
+    /// # Errors
+    /// Returns [`PtyError::WaitPid`] if `wait4` fails.
+    pub fn wait_nohang(self) -> Result<i32, PtyError> {
+        let mut status: i32 = 0;
+        let ret = unsafe {
+            syscall4(
+                Syscall::Wait4,
+                self.0 as usize,
+                core::ptr::addr_of_mut!(status) as usize,
+                Wait4Flags::NoHang as usize,
+                0,
+            )
+        };
+        errno_to_err(ret).map_err(PtyError::WaitPid)?;
+        // Decode exit status: WEXITSTATUS(status)
+        Ok((status >> 8) & 0xff)
+    }
+}
+
 // ── PTY open/fork ──────────────────────────────────────────────────────────
 
 /// Open a PTY master fd via `/dev/ptmx`.
 fn open_ptmx() -> Result<RawFd, PtyError> {
     // "/dev/ptmx\0"
     let path: &[u8] = b"/dev/ptmx\0";
-    let flags = O_RDWR | O_NOCTTY | O_CLOEXEC;
-    let ret = unsafe { syscall3(SYS_OPEN, path.as_ptr() as usize, flags, 0) };
+    let flags = OpenFlags::RDWR | OpenFlags::NOCTTY | OpenFlags::CLOEXEC;
+    let ret = unsafe { syscall3(Syscall::Open, path.as_ptr() as usize, flags.bits(), 0) };
     errno_to_err(ret)
         .map(RawFd::from_raw)
         .map_err(PtyError::OpenPt)
 }
 
-/// Read the slave PTY device path from `/proc/self/fd/<master_fd>` symlink
-/// via `ptsname`-equivalent: read `/dev/pts/<n>` by calling `TIOCGPTN` ioctl.
+/// Read the slave PTY device path for `master_fd` (`ptsname`-equivalent, via
+/// the `TIOCGPTN` ioctl behind [`PtyIoctl::pty_number`]).
 fn pts_path(master_fd: RawFd) -> Result<CString, PtyError> {
-    // TIOCGPTN returns the pts number
-    const TIOCGPTN: usize = 0x8004_5430;
-    let mut pts_no: u32 = 0;
-    let ret = unsafe {
-        syscall3(
-            SYS_IOCTL,
-            master_fd.as_usize(),
-            TIOCGPTN,
-            core::ptr::addr_of_mut!(pts_no) as usize,
-        )
-    };
-    errno_to_err(ret).map_err(PtyError::OpenPt)?;
-
+    let pts_no = master_fd.pty_number()?;
     let path = std::format!("/dev/pts/{pts_no}\0");
     // SAFETY: we just formatted a valid null-terminated string.
     Ok(unsafe { CString::from_vec_with_nul_unchecked(path.into_bytes()) })
-}
-
-/// Unlock a PTY master fd (`grantpt` + `unlockpt` equivalent via `TIOCSPTLCK`).
-fn unlock_pt(master_fd: RawFd) -> Result<(), PtyError> {
-    const TIOCSPTLCK: usize = 0x4004_5431;
-    let lock: i32 = 0;
-    let ret = unsafe {
-        syscall3(
-            SYS_IOCTL,
-            master_fd.as_usize(),
-            TIOCSPTLCK,
-            core::ptr::addr_of!(lock) as usize,
-        )
-    };
-    errno_to_err(ret).map(|_| ()).map_err(PtyError::OpenPt)
 }
 
 /// Fork and exec the shell under the PTY slave.
@@ -222,10 +471,14 @@ fn unlock_pt(master_fd: RawFd) -> Result<(), PtyError> {
 ///
 /// This function forks. After `fork`, only async-signal-safe functions are
 /// called in the child before `execve`. We use raw syscalls throughout.
-pub fn forkpty(shell: &str, args: &[&str], win_size: WinSize) -> Result<(RawFd, i32), PtyError> {
+pub fn forkpty(
+    shell: &str,
+    args: &[&str],
+    win_size: WinSize,
+) -> Result<(RawFd, ChildPid), PtyError> {
     let master_fd = open_ptmx()?;
-    unlock_pt(master_fd)?;
-    set_win_size(master_fd, win_size)?;
+    master_fd.unlock_pty()?;
+    master_fd.set_win_size(win_size)?;
     let slave_path = pts_path(master_fd)?;
 
     // Build execve argv.
@@ -278,47 +531,48 @@ pub fn forkpty(shell: &str, args: &[&str], win_size: WinSize) -> Result<(RawFd, 
     let envp: *const *const u8 = envp_ptrs.as_ptr();
 
     // fork via clone(SIGCHLD, 0)
-    let pid = unsafe { syscall2(SYS_CLONE, SIGCHLD, 0) };
+    let pid = unsafe { syscall2(Syscall::Clone, Signal::Chld as usize, 0) };
     match errno_to_err(pid) {
         Err(e) => Err(PtyError::Fork(e)),
         Ok(0) => {
             // ── child ──────────────────────────────────────────────────
             // Start a new session so the slave PTY becomes the controlling terminal.
-            unsafe { syscall0(SYS_SETSID) };
+            unsafe { syscall0(Syscall::SetSid) };
 
             // Open the slave PTY.
-            let flags = O_RDWR;
             let slave_fd_ret = unsafe {
-                syscall3(SYS_OPEN, slave_path.as_ptr() as usize, flags, 0)
+                syscall3(Syscall::Open, slave_path.as_ptr() as usize, OpenFlags::RDWR.bits(), 0)
             };
             // Post-fork child: an `if let` with a diverging else is clearer
             // than `map_or_else` with side-effecting closures.
             #[allow(clippy::option_if_let_else)]
-            let slave_fd = if let Ok(fd) = errno_to_err(slave_fd_ret) { fd as i32 } else {
+            let slave_fd = if let Ok(fd) = errno_to_err(slave_fd_ret) {
+                RawFd::from_raw(fd)
+            } else {
                 // Can't report — just exit.
-                unsafe { syscall1(SYS_CLOSE, master_fd.as_usize()) };
-                unsafe { syscall1(crate::sys::SYS_EXIT_GROUP, 1) };
+                unsafe { syscall1(Syscall::Close, master_fd.as_usize()) };
+                unsafe { syscall1(Syscall::ExitGroup, 1) };
                 unreachable!()
             };
 
             // Set the slave as the controlling terminal.
-            unsafe { syscall3(SYS_IOCTL, slave_fd as usize, TIOCSCTTY, 0) };
+            let _ = slave_fd.set_controlling_terminal();
 
             // Dup slave onto stdin/stdout/stderr.
             for dest in [0usize, 1, 2] {
-                unsafe { syscall2(SYS_DUP2, slave_fd as usize, dest) };
+                unsafe { syscall2(Syscall::Dup2, slave_fd.as_usize(), dest) };
             }
 
             // Close master and extra slave fd.
-            unsafe { syscall1(SYS_CLOSE, master_fd.as_usize()) };
-            if slave_fd > 2 {
-                unsafe { syscall1(SYS_CLOSE, slave_fd as usize) };
+            unsafe { syscall1(Syscall::Close, master_fd.as_usize()) };
+            if slave_fd.as_i32() > 2 {
+                unsafe { syscall1(Syscall::Close, slave_fd.as_usize()) };
             }
 
             // execve
             let ret = unsafe {
                 syscall3(
-                    SYS_EXECVE,
+                    Syscall::Execve,
                     shell_cs.as_ptr() as usize,
                     argv_ptrs.as_mut_ptr() as usize,
                     envp as usize,
@@ -326,47 +580,14 @@ pub fn forkpty(shell: &str, args: &[&str], win_size: WinSize) -> Result<(RawFd, 
             };
             // execve only returns on error — exit child.
             let _ = ret;
-            unsafe { syscall1(SYS_EXIT_GROUP, 127) };
+            unsafe { syscall1(Syscall::ExitGroup, 127) };
             unreachable!()
         }
         Ok(child_pid) => {
             // ── parent ─────────────────────────────────────────────────
-            Ok((master_fd, child_pid as i32))
+            Ok((master_fd, ChildPid(child_pid as i32)))
         }
     }
-}
-
-// syscall used only in child — referenced above
-const SYS_EXIT_GROUP: usize = 231;
-
-// ── Window size ────────────────────────────────────────────────────────────
-
-/// Push a new window size to the PTY via `TIOCSWINSZ`.
-pub fn set_win_size(master_fd: RawFd, win_size: WinSize) -> Result<(), PtyError> {
-    let ret = unsafe {
-        syscall3(
-            SYS_IOCTL,
-            master_fd.as_usize(),
-            TIOCSWINSZ,
-            core::ptr::addr_of!(win_size) as usize,
-        )
-    };
-    errno_to_err(ret).map(|_| ()).map_err(PtyError::WinSize)
-}
-
-/// Query current window size via `TIOCGWINSZ`.
-#[allow(dead_code)]
-pub fn get_win_size(master_fd: RawFd) -> Result<WinSize, PtyError> {
-    let mut ws = WinSize::default();
-    let ret = unsafe {
-        syscall3(
-            SYS_IOCTL,
-            master_fd.as_usize(),
-            TIOCGWINSZ,
-            core::ptr::addr_of_mut!(ws) as usize,
-        )
-    };
-    errno_to_err(ret).map(|_| ws).map_err(PtyError::WinSize)
 }
 
 // ── signalfd ───────────────────────────────────────────────────────────────
@@ -375,16 +596,14 @@ pub fn get_win_size(master_fd: RawFd) -> Result<WinSize, PtyError> {
 ///
 /// The returned fd is readable (via `io_uring`) whenever a child exits.
 pub fn signalfd_for_sigchld() -> Result<RawFd, PtyError> {
-    const SIG_BLOCK: usize = 0;
-
     // Block SIGCHLD so it doesn't interrupt syscalls.
-    let mut mask = SigSet([0u64; 1]);
-    mask.0[0] |= SIGCHLD_BIT;
+    let mut mask = SigSet::empty();
+    mask.insert(Signal::Chld);
 
     let ret = unsafe {
         syscall4(
-            SYS_SIGPROCMASK,
-            SIG_BLOCK,
+            Syscall::SigProcMask,
+            SigProcMaskHow::Block as usize,
             core::ptr::addr_of!(mask) as usize,
             0,
             8, // sigsetsz
@@ -393,72 +612,17 @@ pub fn signalfd_for_sigchld() -> Result<RawFd, PtyError> {
     errno_to_err(ret).map_err(PtyError::SigMask)?;
 
     // Create the signalfd.
-    let flags = SFD_NONBLOCK | SFD_CLOEXEC;
+    let flags = SignalFdFlags::NONBLOCK | SignalFdFlags::CLOEXEC;
     let ret = unsafe {
         syscall4(
-            SYS_SIGNALFD4,
+            Syscall::SignalFd4,
             usize::MAX, // -1 = new fd
             core::ptr::addr_of!(mask) as usize,
-            8,     // sigsetsz
-            flags,
+            8, // sigsetsz
+            flags.bits(),
         )
     };
     errno_to_err(ret)
         .map(RawFd::from_raw)
         .map_err(PtyError::SignalFd)
-}
-
-// ── waitpid ────────────────────────────────────────────────────────────────
-
-/// Reap a child and return its exit code.
-///
-/// `pid = 0` means wait for any child.
-pub fn waitpid(pid: i32) -> Result<i32, PtyError> {
-    let mut status: i32 = 0;
-    let ret = unsafe {
-        syscall4(
-            SYS_WAITPID,
-            pid as usize,
-            core::ptr::addr_of_mut!(status) as usize,
-            WNOHANG,
-            0,
-        )
-    };
-    errno_to_err(ret).map_err(PtyError::WaitPid)?;
-    // Decode exit status: WEXITSTATUS(status)
-    Ok((status >> 8) & 0xff)
-}
-
-/// Send `SIGHUP` to the child process (best effort — used on teardown so the
-/// shell doesn't outlive us as an orphan holding the PTY slave open).
-pub fn hangup(pid: i32) {
-    if pid > 0 {
-        unsafe { syscall2(SYS_KILL, pid as usize, SIGHUP) };
-    }
-}
-
-/// Blocking reap of a specific child (no `WNOHANG`) — call after `hangup` so the
-/// zombie is collected and we don't leak a process-table entry.
-pub fn reap_blocking(pid: i32) {
-    if pid <= 0 {
-        return;
-    }
-    let mut status: i32 = 0;
-    unsafe {
-        syscall4(
-            SYS_WAITPID,
-            pid as usize,
-            core::ptr::addr_of_mut!(status) as usize,
-            0, // blocking
-            0,
-        )
-    };
-}
-
-// ── fd helpers ─────────────────────────────────────────────────────────────
-
-/// Close a raw fd.
-pub fn close_fd(fd: RawFd) -> Result<(), i32> {
-    let ret = unsafe { syscall1(SYS_CLOSE, fd.as_usize()) };
-    errno_to_err(ret).map(|_| ())
 }

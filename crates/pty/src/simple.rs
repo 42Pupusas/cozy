@@ -6,13 +6,13 @@
 //! spawning a PTY thread. Replaced by `Pty` + ring buffers in M5.
 
 use crate::error::PtyError;
-use crate::sys::{self, WinSize};
+use crate::sys::{self, ChildPid, CloseFd, PtyIoctl, Syscall, WinSize};
 use ququmatz::RawFd;
 
 /// A simple blocking-ish PTY handle for the integration prototype.
 pub struct PtySimple {
     master_fd: RawFd,
-    child_pid: i32,
+    child_pid: ChildPid,
 }
 
 impl Drop for PtySimple {
@@ -21,9 +21,9 @@ impl Drop for PtySimple {
     /// keeps the PTY slave — and on Wayland the leftover client connection —
     /// alive, leaving a ghost window after we exit.
     fn drop(&mut self) {
-        sys::hangup(self.child_pid);
-        sys::reap_blocking(self.child_pid);
-        let _ = sys::close_fd(self.master_fd);
+        self.child_pid.hangup();
+        self.child_pid.reap_blocking();
+        let _ = self.master_fd.close();
     }
 }
 
@@ -35,7 +35,7 @@ impl PtySimple {
     pub fn spawn(shell: &str, args: &[&str], cols: u16, rows: u16) -> Result<Self, PtyError> {
         let win = WinSize { rows, cols, xpixel: 0, ypixel: 0 };
         let (master_fd, child_pid) = sys::forkpty(shell, args, win)?;
-        set_nonblock(master_fd)?;
+        master_fd.set_nonblock()?;
         Ok(Self { master_fd, child_pid })
     }
 
@@ -48,7 +48,7 @@ impl PtySimple {
     /// # Errors
     /// Returns [`PtyError`] on real I/O errors.
     pub fn try_read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, PtyError> {
-        let n = raw_read(self.master_fd, buf);
+        let n = self.master_fd.raw_read(buf);
         // EAGAIN (11) / EWOULDBLOCK (11 on Linux) — no data, not an error.
         if n == -11 {
             return Ok(None);
@@ -66,7 +66,7 @@ impl PtySimple {
     pub fn write(&mut self, data: &[u8]) -> Result<(), PtyError> {
         let mut offset = 0;
         while offset < data.len() {
-            let n = raw_write(self.master_fd, &data[offset..]);
+            let n = self.master_fd.raw_write(&data[offset..]);
             if n <= 0 {
                 let errno = if n < 0 { -n as i32 } else { 5 /* EIO */ };
                 return Err(PtyError::Exec(errno));
@@ -89,73 +89,49 @@ impl PtySimple {
     /// Returns [`PtyError`] if the ioctl fails.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
         let win = WinSize { rows, cols, xpixel: 0, ypixel: 0 };
-        sys::set_win_size(self.master_fd, win)
+        self.master_fd.set_win_size(win)
     }
 }
 
-// ── raw syscalls ─────────────────────────────────────────────────────────────
+// ── raw I/O extension trait ─────────────────────────────────────────────────
 
-fn set_nonblock(fd: RawFd) -> Result<(), PtyError> {
-    const SYS_FCNTL: usize = 72;
-    const F_GETFL: usize = 3;
-    const F_SETFL: usize = 4;
-    const O_NONBLOCK: usize = 0o4000;
-    let flags = unsafe { syscall2(SYS_FCNTL, fd.as_usize(), F_GETFL) };
-    if flags < 0 {
-        return Err(PtyError::Exec(-flags as i32));
-    }
-    let ret = unsafe {
-        syscall3(SYS_FCNTL, fd.as_usize(), F_SETFL, flags as usize | O_NONBLOCK)
-    };
-    if ret < 0 {
-        return Err(PtyError::Exec(-ret as i32));
-    }
-    Ok(())
+/// Non-blocking-mode setup and raw `read(2)`/`write(2)` on a PTY master fd.
+///
+/// Kept separate from [`PtyIoctl`] since these are plain I/O syscalls, not
+/// `ioctl`s — but still belong on `RawFd` rather than as free functions.
+trait PtyRawIo: Copy {
+    fn set_nonblock(self) -> Result<(), PtyError>;
+    fn raw_read(self, buf: &mut [u8]) -> isize;
+    fn raw_write(self, buf: &[u8]) -> isize;
 }
 
-fn raw_read(fd: RawFd, buf: &mut [u8]) -> isize {
-    const SYS_READ: usize = 0;
-    unsafe { syscall3(SYS_READ, fd.as_usize(), buf.as_mut_ptr() as usize, buf.len()) }
-}
+impl PtyRawIo for RawFd {
+    fn set_nonblock(self) -> Result<(), PtyError> {
+        use crate::sys::{FcntlCmd, OpenFlags};
 
-fn raw_write(fd: RawFd, buf: &[u8]) -> isize {
-    const SYS_WRITE: usize = 1;
-    unsafe { syscall3(SYS_WRITE, fd.as_usize(), buf.as_ptr() as usize, buf.len()) }
-}
-
-#[inline]
-unsafe fn syscall2(nr: usize, a0: usize, a1: usize) -> isize {
-    let ret: isize;
-    // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack)
-        );
+        let flags = unsafe { sys::syscall2(Syscall::Fcntl, self.as_usize(), FcntlCmd::GetFl as usize) };
+        if flags < 0 {
+            return Err(PtyError::Exec(-flags as i32));
+        }
+        let ret = unsafe {
+            sys::syscall3(
+                Syscall::Fcntl,
+                self.as_usize(),
+                FcntlCmd::SetFl as usize,
+                flags as usize | OpenFlags::NONBLOCK.bits(),
+            )
+        };
+        if ret < 0 {
+            return Err(PtyError::Exec(-ret as i32));
+        }
+        Ok(())
     }
-    ret
-}
 
-#[inline]
-unsafe fn syscall3(nr: usize, a0: usize, a1: usize, a2: usize) -> isize {
-    let ret: isize;
-    // SAFETY: caller upholds the unsafe-fn contract (valid syscall number/args).
-    unsafe {
-        core::arch::asm!(
-            "syscall",
-            inlateout("rax") nr as isize => ret,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            lateout("rcx") _,
-            lateout("r11") _,
-            options(nostack)
-        );
+    fn raw_read(self, buf: &mut [u8]) -> isize {
+        unsafe { sys::syscall3(Syscall::Read, self.as_usize(), buf.as_mut_ptr() as usize, buf.len()) }
     }
-    ret
+
+    fn raw_write(self, buf: &[u8]) -> isize {
+        unsafe { sys::syscall3(Syscall::Write, self.as_usize(), buf.as_ptr() as usize, buf.len()) }
+    }
 }

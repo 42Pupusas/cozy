@@ -244,17 +244,37 @@ impl FontFace {
         let right = f32::from(outline.x_max) * scale;
         let left = f32::from(outline.x_min) * scale;
 
+        // Snap the glyph's baseline-to-top distance to a *whole* pixel
+        // (ceil, so the glyph is never clipped) before it becomes
+        // `bearing_y`/the rasterizer's baseline reference.
+        //
+        // This is the actual fix for cross-glyph baseline misalignment
+        // (glyphs looking "snaky"/not sharing a row): `top` is a different
+        // fractional value for every glyph (e.g. 8.531 for 'x' vs 8.717 for
+        // 'o', even though both sit exactly on the baseline with no
+        // descender) because glyph-specific outline overshoot varies. Later,
+        // `FontFace::cell_bearing_y` computes `round(ascender - bearing_y)`
+        // once (no longer double-rounded) — but `round(a - x)` only equals
+        // `round(a) - x` for *integer* `x`; with `x = top` still fractional
+        // and different per glyph, each glyph still picked up its own
+        // leftover rounding remainder and landed on a different cell row.
+        // Ceiling `top` first makes it a whole number, so the identity holds
+        // exactly and every glyph's baseline lands on the same cell row.
+        let top_i = top.ceil();
+        let bottom_i = bottom.floor();
+
         let bmp_w = ((right - left).ceil() as u32).max(1);
-        let bmp_h = ((top - bottom).ceil() as u32).max(1);
+        let bmp_h = ((top_i - bottom_i).max(1.0)) as u32;
 
-        let bearing_y = top; // top of glyph above baseline
+        let bearing_y = top_i; // whole pixels above baseline — see comment above
 
-        // Rasterize: baseline sits at `top` inside the bitmap,
-        // glyph x starts at `left`.
+        // Rasterize: baseline sits at `top_i` (the whole-pixel row, not the
+        // fractional glyph-specific extent) inside the bitmap, glyph x
+        // starts at `left`.
         let bitmap = if outline.verbs.is_empty() {
             Bitmap::blank(0, 0)
         } else {
-            outline.rasterize(bmp_w, bmp_h, scale, top, -left)
+            outline.rasterize(bmp_w, bmp_h, scale, top_i, -left)
         };
 
         let metrics = GlyphMetrics {

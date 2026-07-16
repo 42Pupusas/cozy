@@ -96,8 +96,17 @@ impl Screen {
     /// Erase columns `col0..=col1` on `row`.
     pub fn erase_line_range(&mut self, row: u16, col0: u16, col1: u16) {
         let base = self.visible_row_start(row);
-        let c0 = usize::from(col0);
-        let c1 = usize::from(col1).min(usize::from(self.cols) - 1);
+        let mut c0 = usize::from(col0);
+        let mut c1 = usize::from(col1).min(usize::from(self.cols) - 1);
+        // Never orphan half of a wide-char pair: if the erase boundary falls
+        // on a spacer cell, pull c0 left onto its lead; if it falls on a wide
+        // lead cell, push c1 right onto its spacer.
+        if c0 < self.cols as usize && self.buf[base + c0].spacer && c0 > 0 {
+            c0 -= 1;
+        }
+        if c1 < self.cols as usize && self.buf[base + c1].wide && c1 + 1 < self.cols as usize {
+            c1 += 1;
+        }
         for cell in &mut self.buf[base + c0..=base + c1] {
             *cell = Cell::default();
         }
@@ -214,6 +223,8 @@ impl Screen {
         }
         // Blank at right.
         self.buf[base + col_i + move_len..base + cols].fill(Cell::default());
+        // The shift can slice a wide-char pair in half at either seam.
+        self.sanitize_wide_pairs(row);
     }
 
     /// Insert `n` blank characters at `(col, row)`, shifting right chars right.
@@ -230,6 +241,35 @@ impl Screen {
             );
         }
         self.buf[base + col_i..base + col_i + n_i].fill(Cell::default());
+        self.sanitize_wide_pairs(row);
+    }
+
+    /// Scan a row and blank any wide-char cell whose spacer partner is
+    /// missing/wrong (or vice versa). Called after any operation that can
+    /// shift cells without moving their pair atomically (delete/insert
+    /// chars), preventing an orphaned half-glyph from lingering on screen.
+    fn sanitize_wide_pairs(&mut self, row: u16) {
+        let cols = usize::from(self.cols);
+        let base = self.visible_row_start(row);
+        let mut col = 0usize;
+        while col < cols {
+            let cell = self.buf[base + col];
+            if cell.wide {
+                let has_partner = col + 1 < cols && self.buf[base + col + 1].spacer;
+                if has_partner {
+                    col += 1; // skip the valid spacer partner
+                } else {
+                    self.buf[base + col] = Cell::default();
+                }
+            } else if cell.spacer {
+                // A spacer with no wide lead directly to its left is orphaned.
+                let has_lead = col > 0 && self.buf[base + col - 1].wide;
+                if !has_lead {
+                    self.buf[base + col] = Cell::default();
+                }
+            }
+            col += 1;
+        }
     }
 
     /// Resize to `new_cols` x `new_rows`, **reflowing** soft-wrapped lines to
@@ -304,6 +344,22 @@ impl Screen {
                 let mut row_cells = vec![Cell::default(); new_cols_u];
                 if start < end {
                     row_cells[..end - start].copy_from_slice(&line[start..end]);
+                }
+                // The naive slice-at-new_cols_u break can land exactly on a
+                // wide-char pair's seam, leaving an orphaned lead (no spacer
+                // to its right) or an orphaned spacer (no lead to its left).
+                // Blank the orphan rather than let a half-glyph render or
+                // corrupt the next row's read. (Full width-aware line
+                // breaking that never splits a pair is a follow-up.)
+                if let Some(last) = row_cells.last_mut()
+                    && last.wide
+                {
+                    *last = Cell::default();
+                }
+                if let Some(first) = row_cells.first_mut()
+                    && first.spacer
+                {
+                    *first = Cell::default();
                 }
                 rows_out.push((row_cells, p + 1 < pieces));
             }

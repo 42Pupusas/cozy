@@ -108,7 +108,7 @@ impl Grid {
     }
 
     /// Apply a parsed VT event to the grid.
-    pub fn apply(&mut self, event: &Event) {
+    pub fn apply(&mut self, event: &Event<'_>) {
         match event {
             Event::Print(ch) => self.print(*ch),
             Event::Control(c0) => self.control(*c0),
@@ -165,9 +165,12 @@ impl Grid {
     }
 
     fn print(&mut self, ch: char) {
-        // Realize a deferred wrap from the previous glyph: now that a real
-        // printable char has arrived, the prior line genuinely continues, so
-        // mark it wrapped and move to the start of the next physical row.
+        let width = text_layout::measurement::cell_width(ch);
+        if width == 0 {
+            self.combine_onto_previous();
+            return;
+        }
+
         if self.pending_wrap {
             let row = self.cursor.row;
             self.active_screen_mut().set_wrapped(row, true);
@@ -176,20 +179,44 @@ impl Grid {
             self.pending_wrap = false;
         }
 
+        let cols = self.active_screen().cols();
+        if width == 2 && self.cursor.col + 1 == cols {
+            let row = self.cursor.row;
+            let c = self.cursor.col;
+            self.active_screen_mut().set_cell(c, row, Cell::default());
+            self.dirty.mark(c, row);
+            self.active_screen_mut().set_wrapped(row, true);
+            self.cursor.col = 0;
+            self.cursor_down(1, true);
+        }
+
         let col = self.cursor.col;
         let row = self.cursor.row;
         let attrs = self.attrs;
-        self.active_screen_mut().set_cell(col, row, Cell { ch, attrs });
+        let is_wide = width == 2;
+        self.active_screen_mut().set_cell(col, row, Cell { ch, attrs, wide: is_wide, spacer: false });
         self.dirty.mark(col, row);
         let cols = self.active_screen().cols();
-        if col + 1 < cols {
-            self.cursor.col += 1;
+
+        if is_wide && col + 1 < cols {
+            self.active_screen_mut().set_cell(col + 1, row, Cell { ch: ' ', attrs, wide: false, spacer: true });
+            self.dirty.mark(col + 1, row);
+        }
+
+        let advance = if is_wide { 2 } else { 1 };
+        if col + advance < cols {
+            self.cursor.col += advance;
         } else {
-            // Last column filled: defer the wrap. The cursor stays here; a
-            // following glyph realizes the wrap (above), while a CR/LF/cursor
-            // move clears the flag, leaving this line unwrapped.
+            self.cursor.col = cols - 1;
             self.pending_wrap = true;
         }
+    }
+
+    fn combine_onto_previous(&mut self) {
+        // No grapheme-cluster storage yet: a zero-width combining mark is
+        // dropped rather than corrupting an unrelated cell. This still keeps
+        // the cursor from mis-advancing on ZWJ emoji sequences, accents, etc.
+        // (documented degradation until Cell stores a cluster string).
     }
 
     fn control(&mut self, c0: C0) {
@@ -531,6 +558,8 @@ mod tests {
         p.feed(s, |ev| grid.apply(&ev));
     }
 
+    const CJK_ZHONG: &str = "\u{4e2d}"; // '中' (Chinese for "middle") — 2 cells wide
+
     #[test]
     fn print_text() {
         let mut g = Grid::new(10, 3);
@@ -726,6 +755,89 @@ mod tests {
         // After taking, should be clean.
         let snap2 = g.take_dirty();
         assert!(snap2.is_empty());
+    }
+
+    // ── Wide-char (CJK/emoji) tests ──────────────────────────────────
+
+    #[test]
+    fn wide_char_occupies_two_cells() {
+        let mut g = Grid::new(10, 3);
+        apply_str(&mut g, CJK_ZHONG.as_bytes());
+        let lead = g.screen().get_cell(0, 0);
+        let spacer = g.screen().get_cell(1, 0);
+        assert_eq!(lead.ch, CJK_ZHONG.chars().next().unwrap());
+        assert!(lead.wide);
+        assert!(!lead.spacer);
+        assert!(spacer.spacer);
+        assert!(!spacer.wide);
+        assert_eq!(g.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn mixed_ascii_and_wide_advance_correctly() {
+        let mut g = Grid::new(10, 3);
+        let s = format!("a{CJK_ZHONG}b");
+        apply_str(&mut g, s.as_bytes());
+        assert_eq!(g.screen().get_cell(0, 0).ch, 'a');
+        assert_eq!(g.screen().get_cell(1, 0).ch, CJK_ZHONG.chars().next().unwrap());
+        assert!(g.screen().get_cell(2, 0).spacer);
+        assert_eq!(g.screen().get_cell(3, 0).ch, 'b');
+        assert_eq!(g.cursor(), (4, 0));
+    }
+
+    #[test]
+    fn wide_char_wraps_whole_when_it_would_straddle_margin() {
+        // 5-col grid: "abcd" fills 4 cols, one column left -- a wide char
+        // must not split across the margin; it wraps whole onto the next row.
+        let mut g = Grid::new(5, 3);
+        let s = format!("abcd{CJK_ZHONG}");
+        apply_str(&mut g, s.as_bytes());
+        assert_eq!(g.screen().get_cell(4, 0).ch, ' ');
+        assert!(g.screen().is_wrapped(0));
+        assert_eq!(g.screen().get_cell(0, 1).ch, CJK_ZHONG.chars().next().unwrap());
+        assert!(g.screen().get_cell(1, 1).spacer);
+        assert_eq!(g.cursor(), (2, 1));
+    }
+
+    #[test]
+    fn zero_width_combining_mark_does_not_advance_cursor() {
+        let mut g = Grid::new(10, 3);
+        let s = "e\u{0301}"; // e + combining acute
+        apply_str(&mut g, s.as_bytes());
+        assert_eq!(g.cursor(), (1, 0));
+    }
+
+    #[test]
+    fn erase_line_clears_orphaned_wide_pair() {
+        let mut g = Grid::new(10, 3);
+        let s = format!("{CJK_ZHONG}x");
+        apply_str(&mut g, s.as_bytes());
+        // Move to col 2 (1-indexed), the spacer, then erase to end of line.
+        apply_str(&mut g, b"\x1b[1;2H\x1b[K");
+        let lead = g.screen().get_cell(0, 0);
+        assert_eq!(lead.ch, ' ', "orphaned wide lead must be cleared too");
+        assert!(!lead.wide);
+    }
+
+    #[test]
+    fn resize_does_not_leave_orphan_wide_cell() {
+        let mut g = Grid::new(6, 3);
+        let s = format!("ab{CJK_ZHONG}de");
+        apply_str(&mut g, s.as_bytes());
+        g.resize(3, 5);
+        for row in 0..g.screen().rows() {
+            for col in 0..g.screen().cols() {
+                let c = g.screen().get_cell(col, row);
+                if c.wide {
+                    assert!(col + 1 < g.screen().cols(), "wide cell at last column with no room for spacer");
+                    assert!(g.screen().get_cell(col + 1, row).spacer);
+                }
+                if c.spacer {
+                    assert!(col > 0);
+                    assert!(g.screen().get_cell(col - 1, row).wide);
+                }
+            }
+        }
     }
 }
 

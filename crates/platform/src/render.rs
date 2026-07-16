@@ -151,12 +151,22 @@ pub fn blit_cell(
     cell: &Cell,
     theme: &Theme,
 ) {
+    // Spacer cells are the trailing (invisible) half of a wide glyph: the
+    // lead cell paints both columns already, so drawing here would just
+    // stamp a redundant blank over it (harmless but wasteful) -- skip.
+    if cell.spacer {
+        return;
+    }
+
     let (fg, bg) = theme.effective(&cell.attrs);
     let fg_px = fg.to_xrgb8888();
     let bg_px = bg.to_xrgb8888();
 
     let px0 = u32::from(cx) * GLYPH_W as u32;
     let py0 = u32::from(cy) * GLYPH_H as u32;
+    // A wide cell occupies two glyph cells' worth of background so the fill
+    // doesn't leave a bg-colored gap under its spacer half.
+    let cell_cols: u32 = if cell.wide { 2 } else { 1 };
 
     // Look up glyph bitmap.
     let ch = if cell.attrs.invisible { ' ' } else { cell.ch };
@@ -167,22 +177,28 @@ pub fn blit_cell(
         None
     };
 
+    // Unknown glyphs (no ASCII bitmap) fall back to a solid ink block so
+    // missing coverage is visible rather than silently blank -- except for
+    // a wide cell's synthetic second half, which stays plain background.
     for row in 0..GLYPH_H as u32 {
         let py = py0 + row;
         let row_mask: u8 = glyph.map_or(0xff, |g| g[row as usize]);
-        for col in 0..GLYPH_W as u32 {
+        for col in 0..(GLYPH_W as u32 * cell_cols) {
             let px = px0 + col;
             // Clip to the buffer's actual bounds. The `px < buf_width` guard is
             // critical: without it a cell from a STALE wider-geometry snapshot
             // (one produced before a shrink, still queued when the backbuffer
             // was already rebuilt narrower) would have px >= buf_width and the
             // flat `py*buf_width + px` index would silently wrap into the NEXT
-            // row — reordering and swallowing lines mid-drag. A plain
+            // row -- reordering and swallowing lines mid-drag. A plain
             // `idx < len` check alone does not catch that horizontal overflow.
             if px >= buf_width {
                 continue;
             }
-            let bit = (row_mask >> (7 - col)) & 1;
+            // Only the first GLYPH_W columns carry the (ASCII) bitmap; a wide
+            // cell's second half is background-only until a real font with
+            // CJK/emoji glyphs replaces the embedded bitmap.
+            let bit = if col < GLYPH_W as u32 { (row_mask >> (7 - col)) & 1 } else { 0 };
             let pixel = if bit != 0 { fg_px } else { bg_px };
             let idx = (py * buf_width + px) as usize;
             if idx < pixels.len() {
@@ -216,7 +232,7 @@ mod tests {
     use grid::{DirtyRow, DirtySnapshot};
 
     fn cell(ch: char) -> Cell {
-        Cell { ch, attrs: Attrs::default() }
+        Cell { ch, attrs: Attrs::default(), wide: false, spacer: false }
     }
 
     #[test]

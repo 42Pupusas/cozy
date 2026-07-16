@@ -35,6 +35,16 @@ pub struct Cell {
     pub ch: char,
     /// Graphic attributes.
     pub attrs: Attrs,
+    /// True if this cell holds the leading (visible) half of a 2-cell-wide
+    /// glyph (CJK, fullwidth forms, some emoji). The cell immediately to its
+    /// right is a paired [`Cell::spacer`] and must never be drawn or split
+    /// from its lead independently.
+    pub wide: bool,
+    /// True if this cell is the trailing (invisible) half of a wide glyph
+    /// occupying the cell to its left. Renderers must skip spacer cells;
+    /// grid operations that would erase/overwrite only one half of a pair
+    /// must clear the other half too, to avoid an orphaned half-glyph.
+    pub spacer: bool,
 }
 
 impl Default for Cell {
@@ -42,6 +52,8 @@ impl Default for Cell {
         Self {
             ch: ' ',
             attrs: Attrs::default(),
+            wide: false,
+            spacer: false,
         }
     }
 }

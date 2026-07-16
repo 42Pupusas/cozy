@@ -55,7 +55,7 @@ mod tests;
 pub use color::Color;
 
 use extract as ex;
-use shelby::parse_document;
+use shelby::Table as TomlTable;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -291,7 +291,7 @@ impl Config {
 
     /// Parse config from raw TOML bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
-        let table = parse_document(bytes)?;
+        let table = TomlTable::parse(bytes)?;
         let mut cfg = Self::default();
         // [general]
         if let Some(general) = ex::table(&table, "general") {

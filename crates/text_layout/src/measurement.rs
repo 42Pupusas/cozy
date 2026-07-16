@@ -13,41 +13,73 @@
 //! For GUI chrome (non-terminal surfaces) where pixel-accurate advance widths
 //! matter, callers should multiply cell widths by the cell pixel width.
 
-/// Return the cell width of a Unicode scalar: 0, 1, or 2.
+/// Cell-width measurement, as a method on `char`.
 ///
-/// - `0` — combining / zero-width characters (do not advance the cursor)
-/// - `1` — narrow characters (the default for most of Unicode)
-/// - `2` — wide characters (CJK, fullwidth, certain emoji)
+/// Instead of a free function that took `char` as its first argument -- the
+/// same shape as the `unicode-width` crate's `UnicodeWidthChar` trait, which
+/// this mirrors for our terminal-specific width rules.
+pub trait CellWidth {
+    /// The cell width of `self`: 0, 1, or 2.
+    fn cell_width(&self) -> u8;
+}
+
+impl CellWidth for char {
+    /// - `0` — combining / zero-width characters (do not advance the cursor)
+    /// - `1` — narrow characters (the default for most of Unicode)
+    /// - `2` — wide characters (CJK, fullwidth, certain emoji)
+    fn cell_width(&self) -> u8 {
+        let cp = *self as u32;
+
+        // Fast path: ASCII printable (0x20–0x7e) → always 1.
+        if (0x20..=0x7e).contains(&cp) {
+            return 1;
+        }
+        // NUL and C0/C1 controls → 0 (no advance; caller decides how to display them).
+        if cp < 0x20 || (0x7f..=0x9f).contains(&cp) {
+            return 0;
+        }
+
+        // Zero-width / combining.
+        if is_zero_width(cp) {
+            return 0;
+        }
+
+        // Wide (2-cell) ranges.
+        if is_wide(cp) {
+            return 2;
+        }
+
+        1
+    }
+}
+
+/// Extends `str` with total cell-width measurement (sums each char's
+/// [`CellWidth::cell_width`]). A separate trait from `CellWidth` since the
+/// return type differs (`usize` total vs. `u8` per-char).
+pub trait StrCellWidth {
+    /// The total cell width of every char in `self`.
+    fn str_width(&self) -> usize;
+}
+
+impl StrCellWidth for str {
+    fn str_width(&self) -> usize {
+        self.chars().map(|c| usize::from(c.cell_width())).sum()
+    }
+}
+
+/// Measure the cell width of a Unicode scalar: 0, 1, or 2.
+///
+/// Thin free-function wrapper kept for call sites that don't want to import
+/// the [`CellWidth`] trait just to call `c.cell_width()`.
 #[must_use]
 pub fn cell_width(c: char) -> u8 {
-    let cp = c as u32;
-
-    // Fast path: ASCII printable (0x20–0x7e) → always 1.
-    if (0x20..=0x7e).contains(&cp) {
-        return 1;
-    }
-    // NUL and C0/C1 controls → 0 (no advance; caller decides how to display them).
-    if cp < 0x20 || (0x7f..=0x9f).contains(&cp) {
-        return 0;
-    }
-
-    // Zero-width / combining.
-    if is_zero_width(cp) {
-        return 0;
-    }
-
-    // Wide (2-cell) ranges.
-    if is_wide(cp) {
-        return 2;
-    }
-
-    1
+    c.cell_width()
 }
 
 /// Measure the total cell width of a `&str`.
 #[must_use]
 pub fn str_width(s: &str) -> usize {
-    s.chars().map(|c| usize::from(cell_width(c))).sum()
+    s.chars().map(|c| usize::from(c.cell_width())).sum()
 }
 
 /// Measure the cell width of a single segment (a `&str` slice).

@@ -30,8 +30,37 @@ pub enum Direction {
     Rtl,
 }
 
-/// Extends `char` with BiDi-class classification, mirroring
-/// [`crate::measurement::CellWidth`]'s trait-on-`char` shape.
+impl BidiClass {
+    /// Classify `c`'s BiDi type (P2/P3 strong-type test).
+    ///
+    /// This used to be written out twice -- once as a `BidiChar::bidi_class`
+    /// trait method on `char`, once again as a free `bidi_class(c)` function
+    /// (kept `const`, since trait methods can't be `const fn` yet, for
+    /// callers needing compile-time evaluation). Both had the exact same
+    /// three-line body. `char -> BidiClass` is a conversion *into* this
+    /// type, so it belongs here as an associated function, the same way
+    /// [`CodePoint::of`] is `CodePoint`'s constructor rather than a trait
+    /// bolted onto `char`. One definition, callable as both `BidiClass::of(c)`
+    /// and (via the [`BidiChar`] trait below, for method-chaining call
+    /// sites) `c.bidi_class()`.
+    #[must_use]
+    pub const fn of(c: char) -> Self {
+        let cp = CodePoint::of(c);
+        if cp.is_strong_rtl() {
+            Self::R
+        } else if cp.is_strong_ltr() {
+            Self::L
+        } else {
+            Self::Neutral
+        }
+    }
+}
+
+/// Extends `char` with BiDi-class classification.
+///
+/// Mirrors [`crate::measurement::CellWidth`]'s trait-on-`char` shape.
+/// Delegates to [`BidiClass::of`] -- the non-const trait method exists
+/// purely for method-call ergonomics at non-const call sites.
 pub trait BidiChar {
     /// The BiDi class of `self` (P2/P3 strong-type test).
     fn bidi_class(&self) -> BidiClass;
@@ -39,28 +68,7 @@ pub trait BidiChar {
 
 impl BidiChar for char {
     fn bidi_class(&self) -> BidiClass {
-        let cp = CodePoint::of(*self);
-        if cp.is_strong_rtl() {
-            BidiClass::R
-        } else if cp.is_strong_ltr() {
-            BidiClass::L
-        } else {
-            BidiClass::Neutral
-        }
-    }
-}
-
-/// Free-function form of [`BidiChar::bidi_class`], kept `const` (traits
-/// can't be `const fn` yet) for callers needing compile-time evaluation.
-#[must_use]
-pub const fn bidi_class(c: char) -> BidiClass {
-    let cp = CodePoint::of(c);
-    if cp.is_strong_rtl() {
-        BidiClass::R
-    } else if cp.is_strong_ltr() {
-        BidiClass::L
-    } else {
-        BidiClass::Neutral
+        BidiClass::of(*self)
     }
 }
 
@@ -90,19 +98,6 @@ impl BidiStr for str {
     fn is_ltr_only(&self) -> bool {
         self.chars().all(|c| c.bidi_class() != BidiClass::R)
     }
-}
-
-/// Free-function form of [`BidiStr::paragraph_direction`], for callers that
-/// don't want to import the trait.
-#[must_use]
-pub fn paragraph_direction(text: &str) -> Direction {
-    text.paragraph_direction()
-}
-
-/// Free-function form of [`BidiStr::is_ltr_only`].
-#[must_use]
-pub fn is_ltr_only(text: &str) -> bool {
-    text.is_ltr_only()
 }
 
 // ── Strong RTL ranges (Unicode categories R and AL) ───────────────────────────

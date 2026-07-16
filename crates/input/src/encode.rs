@@ -432,7 +432,7 @@ impl Encoder {
             KeyState::Repeated => 2,
             KeyState::Released => 3,
         };
-        let (number, terminator) = match kitty_key(key)? {
+        let (number, terminator) = match KittyKey::from_key(key)? {
             KittyKey::Unicode(cp) => (cp, b'u'),
             KittyKey::Tilde(n) => (n, b'~'),
             KittyKey::Letter(l) => (1, l),
@@ -630,52 +630,61 @@ enum KittyKey {
     Letter(u8),
 }
 
-/// Classify a key for kitty encoding.  Returns `None` for keys with no mapping.
-const fn kitty_key(key: Key) -> Option<KittyKey> {
-    use KittyKey::{Letter, Tilde, Unicode};
-    Some(match key {
-        Key::Char(c) => Unicode(c as u32),
-        Key::Enter => Unicode(13),
-        Key::Backspace => Unicode(127),
-        Key::Tab => Unicode(9),
-        Key::Esc => Unicode(27),
-        // Legacy tilde-form functional keys.
-        Key::Insert => Tilde(2),
-        Key::Delete => Tilde(3),
-        Key::PageUp => Tilde(5),
-        Key::PageDown => Tilde(6),
-        // Legacy letter-form functional keys.
-        Key::Up => Letter(b'A'),
-        Key::Down => Letter(b'B'),
-        Key::Right => Letter(b'C'),
-        Key::Left => Letter(b'D'),
-        Key::Home => Letter(b'H'),
-        Key::End => Letter(b'F'),
-        // F1–F4 use letter forms; F5+ use tilde forms with their legacy numbers.
-        Key::F(1) => Letter(b'P'),
-        Key::F(2) => Letter(b'Q'),
-        Key::F(3) => Tilde(13),
-        Key::F(4) => Letter(b'S'),
-        Key::F(5) => Tilde(15),
-        Key::F(6) => Tilde(17),
-        Key::F(7) => Tilde(18),
-        Key::F(8) => Tilde(19),
-        Key::F(9) => Tilde(20),
-        Key::F(10) => Tilde(21),
-        Key::F(11) => Tilde(23),
-        Key::F(12) => Tilde(24),
-        // Keys with no legacy form — canonical PUA codepoints (kitty spec).
-        Key::KpEnter => Unicode(57414),
-        Key::CapsLock => Unicode(57358),
-        Key::ScrollLock => Unicode(57359),
-        Key::NumLock => Unicode(57360),
-        Key::Menu => Unicode(57363),
-        Key::Shift => Unicode(57441),
-        Key::Ctrl => Unicode(57442),
-        Key::Alt => Unicode(57443),
-        Key::Super => Unicode(57444),
-        _ => return None,
-    })
+impl KittyKey {
+    /// Classify `key` for kitty encoding.  Returns `None` for keys with no
+    /// mapping.
+    ///
+    /// Was a free `kitty_key(key)` function -- moved onto `KittyKey` as the
+    /// `Key -> KittyKey` conversion it actually is, mirroring the
+    /// `T::from_code`/`T::from_raw` convention `platform::protocol` uses for
+    /// its wire-code conversions (`PointerButton::from_code`,
+    /// `ButtonState::from_raw`, …).
+    const fn from_key(key: Key) -> Option<Self> {
+        use KittyKey::{Letter, Tilde, Unicode};
+        Some(match key {
+            Key::Char(c) => Unicode(c as u32),
+            Key::Enter => Unicode(13),
+            Key::Backspace => Unicode(127),
+            Key::Tab => Unicode(9),
+            Key::Esc => Unicode(27),
+            // Legacy tilde-form functional keys.
+            Key::Insert => Tilde(2),
+            Key::Delete => Tilde(3),
+            Key::PageUp => Tilde(5),
+            Key::PageDown => Tilde(6),
+            // Legacy letter-form functional keys.
+            Key::Up => Letter(b'A'),
+            Key::Down => Letter(b'B'),
+            Key::Right => Letter(b'C'),
+            Key::Left => Letter(b'D'),
+            Key::Home => Letter(b'H'),
+            Key::End => Letter(b'F'),
+            // F1–F4 use letter forms; F5+ use tilde forms with their legacy numbers.
+            Key::F(1) => Letter(b'P'),
+            Key::F(2) => Letter(b'Q'),
+            Key::F(3) => Tilde(13),
+            Key::F(4) => Letter(b'S'),
+            Key::F(5) => Tilde(15),
+            Key::F(6) => Tilde(17),
+            Key::F(7) => Tilde(18),
+            Key::F(8) => Tilde(19),
+            Key::F(9) => Tilde(20),
+            Key::F(10) => Tilde(21),
+            Key::F(11) => Tilde(23),
+            Key::F(12) => Tilde(24),
+            // Keys with no legacy form — canonical PUA codepoints (kitty spec).
+            Key::KpEnter => Unicode(57414),
+            Key::CapsLock => Unicode(57358),
+            Key::ScrollLock => Unicode(57359),
+            Key::NumLock => Unicode(57360),
+            Key::Menu => Unicode(57363),
+            Key::Shift => Unicode(57441),
+            Key::Ctrl => Unicode(57442),
+            Key::Alt => Unicode(57443),
+            Key::Super => Unicode(57444),
+            _ => return None,
+        })
+    }
 }
 
 impl SeqWriter<'_> {

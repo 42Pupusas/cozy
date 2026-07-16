@@ -8,7 +8,7 @@
 //! the browser.  We implement a compact UAX #29 word-break state machine
 //! instead — no external dependencies.
 
-use crate::bidi::{BidiClass, Direction, bidi_class};
+use crate::bidi::{BidiClass, BidiStr, Direction};
 use crate::measurement::SegmentCellWidth;
 
 /// How the line-breaker may handle the break opportunity **before** this segment.
@@ -154,7 +154,7 @@ impl Segmenter {
                     text: slice,
                     width: slice.segment_width(),
                     break_before,
-                    direction: slice.paragraph_dir(),
+                    direction: slice.paragraph_direction(),
                 });
             }
         }
@@ -207,22 +207,10 @@ impl CharExt for char {
     }
 
     fn bidi_dir(&self) -> Direction {
-        match bidi_class(*self) {
+        match BidiClass::of(*self) {
             BidiClass::R => Direction::Rtl,
             _ => Direction::Ltr,
         }
-    }
-}
-
-/// Extends `str` with paragraph-direction resolution, delegating to
-/// [`crate::bidi`].
-trait ParagraphDir {
-    fn paragraph_dir(&self) -> Direction;
-}
-
-impl ParagraphDir for str {
-    fn paragraph_dir(&self) -> Direction {
-        crate::bidi::paragraph_direction(self)
     }
 }
 

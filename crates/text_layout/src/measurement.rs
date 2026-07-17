@@ -29,6 +29,14 @@ impl CellWidth for char {
     /// - `0` — combining / zero-width characters (do not advance the cursor)
     /// - `1` — narrow characters (the default for most of Unicode)
     /// - `2` — wide characters (CJK, fullwidth, certain emoji)
+    ///
+    /// `#[inline]` so the ASCII fast path (a single range compare, taken by
+    /// every byte of a plain-text/scroll stream) folds directly into hot
+    /// callers like `grid::Grid::print` instead of paying an out-of-line
+    /// call + the cold Unicode-table code staying in the caller's I-cache
+    /// footprint. The two big `matches!` tables live in separate
+    /// (non-inlined) `CodePoint` methods so only the fast path is duplicated.
+    #[inline]
     fn cell_width(&self) -> u8 {
         let cp = *self as u32;
 
@@ -91,6 +99,11 @@ impl SegmentCellWidth for str {
 impl CodePoint {
     /// True if this code point is zero-width / combining (does not advance
     /// the cursor): variation selectors, tags, ZWJ, ZWNJ, BOM, soft-hyphen, …
+    ///
+    /// `#[inline(never)]`: this is the cold half of [`CellWidth::cell_width`]
+    /// (only reached by non-ASCII input). Keeping the big range table
+    /// out-of-line lets the inlined ASCII fast path stay tiny in hot callers.
+    #[inline(never)]
     const fn is_zero_width(self) -> bool {
         let Self(cp) = self;
         matches!(cp,
@@ -162,6 +175,11 @@ impl CodePoint {
     /// True if this code point occupies 2 cells in a fixed-width terminal
     /// (UAX #11 East Asian Width categories W and F, plus wide-presentation
     /// emoji).
+    ///
+    /// `#[inline(never)]`: cold half of [`CellWidth::cell_width`], as with
+    /// [`CodePoint::is_zero_width`] — keep the wide-range table out of hot
+    /// callers' I-cache.
+    #[inline(never)]
     const fn is_wide(self) -> bool {
         let Self(cp) = self;
         matches!(cp,

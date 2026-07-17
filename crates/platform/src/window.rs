@@ -1617,39 +1617,12 @@ impl TermWindow {
     fn draw_fps_overlay(&mut self) -> Vec<u16> {
         match self.debug_fps {
             DebugFps::Off => Vec::new(),
-            DebugFps::Log => {
-                let now = std::time::Instant::now();
-                if now.duration_since(self.frame_stats.last_log).as_secs_f32() >= 1.0 {
-                    self.frame_stats.last_log = now;
-                    let fps = self.frame_stats.fps();
-                    let busy_us = self.frame_stats.drain_busy_us();
-                    // Frame interval at this fps, in microseconds. `busy_us`
-                    // is CPU time actually spent in maybe_present; the rest of
-                    // the interval was spent blocked on `wl_callback.done`.
-                    let interval_us = if fps > 0.0 {
-                        1_000_000.0 / f64::from(fps)
-                    } else {
-                        0.0
-                    };
-                    let bound = if interval_us > 0.0 && busy_us / interval_us > 0.6 {
-                        "CPU-bound"
-                    } else {
-                        "compositor-bound"
-                    };
-                    let backlog = self.frame_stats.max_backlog_since_log;
-                    let no_slot = self.frame_stats.skipped_no_slot;
-                    let not_ready = self.frame_stats.skipped_not_ready;
-                    self.frame_stats.max_backlog_since_log = 0;
-                    self.frame_stats.skipped_no_slot = 0;
-                    self.frame_stats.skipped_not_ready = 0;
-                    eprintln!(
-                        "terminal: {fps:.1} fps | present-busy {busy_us:.0} us/frame \
-                         (interval {interval_us:.0} us) -> {bound} | backlog max {backlog} | \
-                         skipped no-slot {no_slot} not-ready {not_ready}"
-                    );
-                }
-                Vec::new()
-            }
+            // The stderr readout is emitted from `log_frame_pacing`, called at
+            // the top of every `maybe_present` (including its skip paths) so
+            // the counter split keeps reporting even while presents are being
+            // starved -- the exact regime we want to diagnose. Nothing to draw
+            // into the backbuffer here.
+            DebugFps::Log => Vec::new(),
             DebugFps::Overlay => {
                 let text = format!("{:.1} fps", self.frame_stats.fps());
                 let cols = (self.width / self.cell_w).max(1) as u16;
@@ -1682,12 +1655,65 @@ impl TermWindow {
         }
     }
 
+    /// Emit the frame-pacing diagnostic to stderr ~once a second when
+    /// `TERMINAL_DEBUG_FPS=log`. Called at the *top* of every `maybe_present`
+    /// -- crucially including the calls that early-return without presenting
+    /// (`skipped_not_ready` / `skipped_no_slot`) -- so the counter split stays
+    /// live even under a hard stall, when successful presents (and thus the
+    /// old log site in `draw_fps_overlay`) go quiet exactly when the numbers
+    /// matter most.
+    ///
+    /// The line answers the scroll-flood question directly:
+    /// - `skipped no-slot`  ≫ `not-ready`  → buffer starvation (both shm
+    ///   frames held by the compositor) → more frames would help (triple
+    ///   buffering).
+    /// - `skipped not-ready` ≫ `no-slot`   → pure vsync pacing (waiting on
+    ///   `wl_callback.done`); more buffers won't help.
+    /// - `-> CPU-bound`                     → render work itself is the wall.
+    fn log_frame_pacing(&mut self) {
+        if self.debug_fps != DebugFps::Log {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(self.frame_stats.last_log).as_secs_f32() < 1.0 {
+            return;
+        }
+        self.frame_stats.last_log = now;
+        let fps = self.frame_stats.fps();
+        let busy_us = self.frame_stats.drain_busy_us();
+        // Frame interval at this fps, in microseconds. `busy_us` is CPU time
+        // actually spent in maybe_present; the rest of the interval was spent
+        // blocked on `wl_callback.done`.
+        let interval_us = if fps > 0.0 {
+            1_000_000.0 / f64::from(fps)
+        } else {
+            0.0
+        };
+        let bound = if interval_us > 0.0 && busy_us / interval_us > 0.6 {
+            "CPU-bound"
+        } else {
+            "compositor-bound"
+        };
+        let backlog = self.frame_stats.max_backlog_since_log;
+        let no_slot = self.frame_stats.skipped_no_slot;
+        let not_ready = self.frame_stats.skipped_not_ready;
+        self.frame_stats.max_backlog_since_log = 0;
+        self.frame_stats.skipped_no_slot = 0;
+        self.frame_stats.skipped_not_ready = 0;
+        eprintln!(
+            "terminal: {fps:.1} fps | present-busy {busy_us:.0} us/frame \
+             (interval {interval_us:.0} us) -> {bound} | backlog max {backlog} | \
+             skipped no-slot {no_slot} not-ready {not_ready}"
+        );
+    }
+
     fn maybe_present(&mut self) -> Result<()> {
         if self.lifecycle != Lifecycle::Mapped {
             return Ok(());
         }
         self.apply_pending_resize()?;
         self.frame_stats.note_backlog(self.pending_dirty.len());
+        self.log_frame_pacing();
         if !self.dirty || !self.frame_ready {
             if self.dirty && !self.frame_ready {
                 self.frame_stats.skipped_not_ready += 1;

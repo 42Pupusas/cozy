@@ -392,16 +392,31 @@ impl Pty {
     }
 
     /// Handle a write CQE: requeue the unwritten tail of a short write (in
-    /// front of anything still pending, preserving byte order) or drop the
-    /// buffer on error (an errored master-fd write means the child is gone —
-    /// requeueing would spin forever on EIO).
+    /// front of anything still pending, preserving byte order).
+    ///
+    /// A negative result is a raw `-errno`. Transient errnos — `EAGAIN`
+    /// (the PTY line discipline's input queue is momentarily full, which a
+    /// large burst write routinely hits) and `EINTR` — mean *zero* bytes of
+    /// this SQE were actually written, so the whole buffer must be requeued
+    /// or those bytes vanish silently (this was a real bug: a large write
+    /// into a slow reader could drop a whole in-flight chunk and never
+    /// surface an error). Only a fatal errno (`EIO`/`EBADF`/etc — the
+    /// child/slave side is actually gone) drops the buffer, since requeueing
+    /// that would spin forever.
     fn complete_write(&mut self, result: i32) {
+        const EAGAIN: i32 = 11;
+        const EINTR: i32 = 4;
         if result >= 0 {
             let written = result as usize;
             if written < self.write_len {
                 for i in (written..self.write_len).rev() {
                     self.pending_write.push_front(self.write_buf[i]);
                 }
+            }
+        } else if result == -EAGAIN || result == -EINTR {
+            // Nothing was written — requeue the entire buffer in order.
+            for i in (0..self.write_len).rev() {
+                self.pending_write.push_front(self.write_buf[i]);
             }
         }
         self.write_in_flight = false;

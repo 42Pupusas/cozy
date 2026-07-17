@@ -364,6 +364,18 @@ fn ui_thread(
     })?;
     let encoder = Encoder::new();
 
+    // Idle poll cap while an animation (cursor slide/blink) is in flight, in
+    // milliseconds -- derived from `[window] target_fps`. This is a *target*
+    // poll cadence, not a guaranteed frame rate: the actual ceiling is the
+    // compositor's own vsync (`wl_callback.done` gates every present in
+    // `TermWindow::maybe_present`), so on a 60Hz output setting this above 60
+    // just means the loop wakes more often than it can usefully present,
+    // spending a little extra CPU for lower input-to-animation latency. On a
+    // 90/120/144Hz+ output it lets the animation actually track the higher
+    // refresh rate. `target_fps` is validated to `1..=1000` by config, so
+    // this is always `>= 1`.
+    let anim_poll_cap_ms = (1000 / cfg.window.target_fps.max(1)).max(1).cast_signed();
+
     // Track the grid's current row count for page-scroll sizing (updated on
     // resize). Seeded from the startup dimensions.
     let mut grid_rows = ROWS;
@@ -508,12 +520,16 @@ fn ui_thread(
         // returns at once (no lost wakeup).
         //
         // While the cursor is mid-slide or blinking-and-visible, cap the wait
-        // at ~16ms (one 60fps frame) instead of the normal 100ms so the
-        // animation actually advances smoothly instead of updating in big
-        // 100ms jumps; otherwise it stays the full 100ms, bounding only
-        // quit-flag latency as before.
+        // at ANIM_POLL_CAP_MS instead of the normal 100ms so the animation
+        // actually advances smoothly instead of updating in big 100ms jumps;
+        // otherwise it stays the full 100ms, bounding only quit-flag latency
+        // as before.
         if !did_work {
-            let cap = if win.wants_animation_frame() { 16 } else { 100 };
+            let cap = if win.wants_animation_frame() {
+                anim_poll_cap_ms
+            } else {
+                100
+            };
             win.wait(cap);
         }
     }

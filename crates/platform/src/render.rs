@@ -713,10 +713,22 @@ impl Renderer {
         let x1f = x0f + self.cell_w as f32 + grow * 2.0;
         let y1f = y0f + self.cell_h as f32 + grow * 2.0;
 
+        // Clamp to the grid-aligned content area, not just the raw buffer
+        // size. A window's pixel size is rarely an exact multiple of the
+        // cell size, leaving a thin dead strip along the bottom/right edge
+        // that `repaint_rows` never touches (it only repaints whole grid
+        // rows from the cell mirror). Letting the ring bleed into that strip
+        // stamps pixels there that nothing ever erases again -- stray white
+        // boxes stuck at the edge of the window forever. Clip to the last
+        // full cell's bounds instead so the ring never leaves the area the
+        // normal repaint path actually owns.
+        let grid_max_x = (buf_w / self.cell_w) * self.cell_w;
+        let grid_max_y = (buf_h / self.cell_h) * self.cell_h;
+
         let x0 = x0f.floor().max(0.0) as i32;
         let y0 = y0f.floor().max(0.0) as i32;
-        let x1 = x1f.ceil().min(buf_w as f32) as i32;
-        let y1 = y1f.ceil().min(buf_h as f32) as i32;
+        let x1 = x1f.ceil().min(buf_w as f32).min(grid_max_x as f32) as i32;
+        let y1 = y1f.ceil().min(buf_h as f32).min(grid_max_y as f32) as i32;
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -966,6 +978,49 @@ mod tests {
     fn renderer_bg_packed_matches_bg_xrgb_when_opaque() {
         let r = Renderer::builtin(Theme::builtin());
         assert_eq!(r.bg_packed(), r.bg_xrgb());
+    }
+
+    #[test]
+    fn cursor_pulse_does_not_paint_past_the_grid_aligned_area() {
+        // A buffer size that is NOT an exact multiple of the cell size --
+        // the common case after a mouse resize -- leaving a dead strip along
+        // the bottom and right edges that `repaint_rows` never touches.
+        let cell_w = GLYPH_W as u32;
+        let cell_h = GLYPH_H as u32;
+        let extra_x = 5; // sub-cell leftover strip on the right
+        let extra_y = 5; // sub-cell leftover strip on the bottom
+        let cols = 4u32;
+        let rows = 4u32;
+        let bw = cols * cell_w + extra_x;
+        let bh = rows * cell_h + extra_y;
+        let mut pixels = vec![0u32; (bw * bh) as usize];
+
+        let renderer = Renderer::builtin(Theme::builtin());
+        let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
+        // Land the cursor at the bottom-right cell, mid-pulse (t is picked so
+        // `grow` is near its max -- the worst case for bleeding past the
+        // grid-aligned area).
+        renderer.draw_cursor_pulse(
+            &mut canvas,
+            (cols - 1) as f32,
+            (rows - 1) as f32,
+            0.99,
+        );
+
+        // Nothing in the dead strip (past the last full cell) may have been
+        // touched -- those pixels are never repainted again by the normal
+        // row-based repaint path, so any stray ink there is permanent.
+        for y in 0..bh {
+            for x in 0..bw {
+                if x >= cols * cell_w || y >= rows * cell_h {
+                    let px = pixels[(y * bw + x) as usize];
+                    assert_eq!(
+                        px, 0,
+                        "dead-strip pixel ({x},{y}) was painted: {px:#x}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

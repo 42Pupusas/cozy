@@ -162,7 +162,56 @@ fn uring_resize_reaches_child() {
 }
 
 #[test]
+fn uring_large_write_stress_many_iterations() {
+    for iter in 0..40 {
+        let h = Harness::spawn("/bin/sh", &["-c", "stty -echo; echo READY; exec cat"]);
+        h.wait_output(Duration::from_secs(5), |o| {
+            o.windows(5).any(|w| w == b"READY")
+        });
+        let mut payload = Vec::with_capacity(20_000);
+        for i in 0..2000u32 {
+            payload.extend_from_slice(format!("{i:07}\n").as_bytes());
+        }
+        let needle_last = b"0001999\r\n".to_vec();
+        h.send(PtyInput::Bytes(payload.into_boxed_slice()));
+        let deadline = Duration::from_secs(3);
+        let start = Instant::now();
+        loop {
+            let out = h.output.lock().unwrap().clone();
+            if out.windows(needle_last.len()).any(|w| w == &needle_last[..]) {
+                break;
+            }
+            if start.elapsed() >= deadline {
+                panic!(
+                    "iter {iter}: stalled; got {} bytes, last bit: {:?}",
+                    out.len(),
+                    String::from_utf8_lossy(&out[out.len().saturating_sub(60)..])
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        h.send(PtyInput::Quit);
+        let _ = h.wait_exit(Duration::from_secs(5));
+    }
+}
+
+#[test]
 fn uring_large_write_is_chunked_and_ordered() {
+    uring_large_write_is_chunked_and_ordered_once(0);
+}
+
+/// Stress variant: repeats the single-shot check many times in one process,
+/// to shake out any low-probability ordering/requeue race under `io_uring`
+/// that a single iteration might not hit. Kept separate from the base test
+/// so a flake here doesn't rename/hide the canonical regression test.
+#[test]
+fn uring_large_write_is_chunked_and_ordered_stress() {
+    for iter in 0..60 {
+        uring_large_write_is_chunked_and_ordered_once(iter);
+    }
+}
+
+fn uring_large_write_is_chunked_and_ordered_once(iter: u32) {
     // 20 KiB of patterned input through cat — crosses the 4 KiB write-buffer
     // boundary several times; ordering must survive the requeue path.
     // `stty -echo` first: the line discipline's echo interleaves with cat's
@@ -188,12 +237,22 @@ fn uring_large_write_is_chunked_and_ordered() {
     let first_pos = out
         .windows(needle_first.len())
         .position(|w| w == &needle_first[..])
-        .expect("first line present");
+        .unwrap_or_else(|| {
+            panic!(
+                "iter {iter}: first line not present; out.len()={} head={:?} tail={:?}",
+                out.len(),
+                String::from_utf8_lossy(&out[..out.len().min(120)]),
+                String::from_utf8_lossy(&out[out.len().saturating_sub(120)..])
+            )
+        });
     let last_pos = out
         .windows(needle_last.len())
         .position(|w| w == &needle_last[..])
         .expect("last line present");
-    assert!(first_pos < last_pos, "order preserved across write chunks");
+    assert!(
+        first_pos < last_pos,
+        "iter {iter}: order preserved across write chunks"
+    );
     h.send(PtyInput::Quit);
     let _ = h.wait_exit(Duration::from_secs(5));
 }

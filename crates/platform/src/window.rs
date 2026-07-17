@@ -79,10 +79,88 @@ enum Lifecycle {
     Closing,
 }
 
+/// Debug FPS instrumentation mode -- see the `debug_fps` field on
+/// [`TermWindow`]. Set once at startup from the `TERMINAL_DEBUG_FPS`
+/// environment variable and fixed for the window's lifetime.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DebugFps {
+    /// No instrumentation -- zero cost (one enum compare per frame).
+    Off,
+    /// Draw a live "NN.N fps" readout in the top-right corner every frame.
+    Overlay,
+    /// Print "terminal: NN.N fps" to stderr about once a second.
+    Log,
+}
+
+impl DebugFps {
+    /// `TERMINAL_DEBUG_FPS=1` / `=true` → [`Self::Overlay`];
+    /// `TERMINAL_DEBUG_FPS=log` → [`Self::Log`]; unset or anything else →
+    /// [`Self::Off`].
+    fn from_env() -> Self {
+        match std::env::var("TERMINAL_DEBUG_FPS") {
+            Ok(v) if v == "log" => Self::Log,
+            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Self::Overlay,
+            _ => Self::Off,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 struct Frame {
     buffer: BufferId,
     free: bool,
+}
+
+/// Rolling window of present timestamps, used to compute a live "presented
+/// FPS" figure -- how often [`TermWindow::maybe_present`] actually flips a
+/// frame, which (since presents are gated on the compositor's
+/// `wl_callback.done`) is the true on-screen refresh rate, not just how busy
+/// the render loop is.
+struct FrameStats {
+    /// Timestamps of the last up-to-`CAP` presents, oldest first.
+    times: std::collections::VecDeque<std::time::Instant>,
+    /// Wall-clock instant `times` was last logged to stderr (only used by
+    /// [`DebugFps::Log`]).
+    last_log: std::time::Instant,
+}
+
+/// How many recent presents [`FrameStats`] keeps around to average over.
+const FRAME_STATS_CAP: usize = 120;
+
+impl FrameStats {
+    fn new() -> Self {
+        Self {
+            times: std::collections::VecDeque::with_capacity(FRAME_STATS_CAP),
+            last_log: std::time::Instant::now(),
+        }
+    }
+
+    /// Record a present that just happened.
+    fn record(&mut self) {
+        let now = std::time::Instant::now();
+        self.times.push_back(now);
+        while self.times.len() > FRAME_STATS_CAP {
+            self.times.pop_front();
+        }
+    }
+
+    /// Presented frames per second, averaged over the retained window.
+    /// `0.0` until at least two presents have been recorded.
+    fn fps(&self) -> f32 {
+        let Some(&first) = self.times.front() else {
+            return 0.0;
+        };
+        let Some(&last) = self.times.back() else {
+            return 0.0;
+        };
+        let span = last.duration_since(first).as_secs_f32();
+        if span <= 0.0 || self.times.len() < 2 {
+            return 0.0;
+        }
+        #[allow(clippy::cast_precision_loss)] // FRAME_STATS_CAP is tiny (120)
+        let intervals = (self.times.len() - 1) as f32;
+        intervals / span
+    }
 }
 
 impl Frame {
@@ -188,6 +266,15 @@ pub struct TermWindow {
     /// free on present. Without this, incremental dirty-row blits would only
     /// ever touch one of the two shm frames, leaving the rest black.
     backbuffer: Vec<u32>,
+    /// Per-frame-slot "needs re-copying from the backbuffer" bitmap, indexed
+    /// by cell row, index-parallel with `frames`. A row is set whenever the
+    /// backbuffer changes there; presenting into a slot copies + damages only
+    /// that slot's set rows (which may be a superset of this frame's changes,
+    /// if the slot sat out a present or two) then clears them. Without this,
+    /// every present -- even a single keystroke moving the cursor one row --
+    /// would memcpy the whole backbuffer and damage the entire surface,
+    /// forcing the compositor to recomposite the full window every frame.
+    stale_rows: [Vec<bool>; 2],
     /// Glyph source (bitmap or loaded TTF/OTF face) + resolved color theme.
     renderer: render::Renderer,
     width: i32,
@@ -280,6 +367,17 @@ pub struct TermWindow {
     /// `prev_selection_rows` -- without this a sliding cursor would leave a
     /// trail of tinted cells behind it.
     prev_cursor_rows: Vec<u16>,
+
+    /// Debug FPS instrumentation mode, fixed at startup from
+    /// `TERMINAL_DEBUG_FPS`. `Off` costs one enum compare per frame.
+    debug_fps: DebugFps,
+    /// Rolling present-time window backing the FPS readout/log; only
+    /// populated when `debug_fps != DebugFps::Off`.
+    frame_stats: FrameStats,
+    /// Viewport rows the FPS overlay text touched last frame -- repainted
+    /// clean before redrawing it, the same idempotent scheme as
+    /// `prev_cursor_rows`/`prev_selection_rows`.
+    prev_fps_rows: Vec<u16>,
 }
 
 impl Drop for TermWindow {
@@ -430,6 +528,11 @@ impl TermWindow {
         // backbuffer must carry the configured alpha from frame one, not
         // flash fully opaque until the first real paint.
         let backbuffer = vec![renderer.bg_packed(); (width * height) as usize];
+        // Both shm frames start as blank memory (freshly mmap'd), so every
+        // row is "stale" relative to the backbuffer until the first present
+        // copies it in.
+        let row_count = (rows as usize).max(1);
+        let stale_rows = [vec![true; row_count], vec![true; row_count]];
 
         Ok(Self {
             sender,
@@ -458,6 +561,7 @@ impl TermWindow {
             pool,
             buf_format,
             backbuffer,
+            stale_rows,
             renderer,
             width,
             height,
@@ -489,6 +593,9 @@ impl TermWindow {
             prev_cursor_rows: Vec::new(),
             cursor_anim: crate::cursor_anim::CursorAnimator::new(cursor_cfg),
             last_tick: std::time::Instant::now(),
+            debug_fps: DebugFps::from_env(),
+            frame_stats: FrameStats::new(),
+            prev_fps_rows: Vec::new(),
         })
     }
 
@@ -1227,6 +1334,23 @@ impl TermWindow {
         Ok(())
     }
 
+    /// Mark viewport rows as needing to be re-copied from the backbuffer into
+    /// *both* shm frame slots next time each is presented into. Called
+    /// whenever the backbuffer actually changes at those rows (content blit,
+    /// selection tint, cursor overlay, FPS overlay), so [`Self::maybe_present`]
+    /// only ever copies/damages what's actually different, instead of the
+    /// whole window on every frame.
+    fn mark_rows_stale(&mut self, rows: impl IntoIterator<Item = u16>) {
+        for row in rows {
+            let r = usize::from(row);
+            for slot in &mut self.stale_rows {
+                if let Some(flag) = slot.get_mut(r) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+
     /// Repaint the given viewport rows from the cell mirror into the
     /// backbuffer (clean, un-highlighted pixels). Called before tinting the
     /// current selection and after clearing one, so the highlight is
@@ -1367,6 +1491,57 @@ impl TermWindow {
         (lo..=hi).collect()
     }
 
+    /// Debug FPS instrumentation: draw a "NN.N fps" readout into the top-right
+    /// corner of the backbuffer (`DebugFps::Overlay`), or print the same
+    /// figure to stderr about once a second (`DebugFps::Log`). No-op (and
+    /// essentially free -- one enum compare) when `debug_fps` is `Off`.
+    /// Returns the viewport rows the overlay text touched, for
+    /// `prev_fps_rows` bookkeeping (same idempotent repaint scheme as the
+    /// cursor/selection overlays).
+    fn draw_fps_overlay(&mut self) -> Vec<u16> {
+        match self.debug_fps {
+            DebugFps::Off => Vec::new(),
+            DebugFps::Log => {
+                let now = std::time::Instant::now();
+                if now.duration_since(self.frame_stats.last_log).as_secs_f32() >= 1.0 {
+                    self.frame_stats.last_log = now;
+                    eprintln!("terminal: {:.1} fps", self.frame_stats.fps());
+                }
+                Vec::new()
+            }
+            DebugFps::Overlay => {
+                let text = format!("{:.1} fps", self.frame_stats.fps());
+                let cols = (self.width / self.cell_w).max(1) as u16;
+                let text_cols = text.chars().count() as u16;
+                if text_cols == 0 || text_cols > cols {
+                    return Vec::new();
+                }
+                let start_col = cols - text_cols;
+                // High-contrast fixed readout: white on black, independent of
+                // the active theme, so it's always legible regardless of
+                // what's underneath.
+                let attrs = grid::Attrs {
+                    fg: grid::Color::Rgb(0xff, 0xff, 0xff),
+                    bg: grid::Color::Rgb(0x00, 0x00, 0x00),
+                    ..grid::Attrs::default()
+                };
+                let mut canvas =
+                    crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
+                for (i, ch) in text.chars().enumerate() {
+                    let cell = grid::Cell {
+                        ch,
+                        attrs,
+                        wide: false,
+                        spacer: false,
+                    };
+                    self.renderer
+                        .blit_cell(&mut canvas, start_col + i as u16, 0, &cell);
+                }
+                vec![0u16]
+            }
+        }
+    }
+
     fn maybe_present(&mut self) -> Result<()> {
         if self.lifecycle != Lifecycle::Mapped {
             return Ok(());
@@ -1381,11 +1556,15 @@ impl TermWindow {
         self.frames[slot].free = false;
 
         // Blit pending dirty snapshots into the persistent backbuffer, which
-        // always holds the full image, then copy it into the free shm frame.
+        // always holds the full image, then copy only the rows that actually
+        // changed into the free shm frame -- tracked in `touched_rows` and
+        // reconciled against `stale_rows` below.
         let pending = std::mem::take(&mut self.pending_dirty);
+        let mut touched_rows: Vec<u16> = Vec::new();
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
         for snap in &pending {
             self.renderer.blit_snapshot(&mut canvas, snap);
+            touched_rows.extend(snap.rows.iter().map(|r| r.row));
         }
         drop(canvas);
         // Selection highlight. Repaint the rows that *were* highlighted last
@@ -1407,30 +1586,78 @@ impl TermWindow {
                 rows_to_repaint.push(r);
             }
         }
+        for r in std::mem::take(&mut self.prev_fps_rows) {
+            if !rows_to_repaint.contains(&r) {
+                rows_to_repaint.push(r);
+            }
+        }
         self.repaint_rows(&rows_to_repaint);
+        touched_rows.extend_from_slice(&rows_to_repaint);
         self.apply_selection_highlight();
+        touched_rows.extend(self.selection_rows());
         self.prev_selection_rows = self.selection_rows();
-        self.prev_cursor_rows = self.draw_cursor_overlay();
-        self.shm_mem.pixels(slot).copy_from_slice(&self.backbuffer);
+        let new_cursor_rows = self.draw_cursor_overlay();
+        touched_rows.extend_from_slice(&new_cursor_rows);
+        self.prev_cursor_rows = new_cursor_rows;
+        self.frame_stats.record();
+        let new_fps_rows = self.draw_fps_overlay();
+        touched_rows.extend_from_slice(&new_fps_rows);
+        self.prev_fps_rows = new_fps_rows;
 
+        // Every row touched this frame is now stale relative to *both* shm
+        // slots (whichever one isn't presented into this time still needs
+        // catching up next time it's used).
+        self.mark_rows_stale(touched_rows);
+
+        // Copy + damage only the rows this slot is actually stale for --
+        // typically just the handful that changed (e.g. one line of typing),
+        // not the whole window. Contiguous stale rows are coalesced into one
+        // Damage rect each, to keep the common single-row case at one
+        // message instead of one per row.
         let buf_w = self.width;
-        let buf_h = self.height;
-        let stride = buf_w * 4;
-        let buf = self.frames[slot].buffer;
+        let cols_bytes = buf_w as usize;
+        let dst = self.shm_mem.pixels(slot);
+        let stale = &mut self.stale_rows[slot];
+        let mut damage_rects: Vec<(i32, i32)> = Vec::new(); // (row_start, row_count)
+        let mut row = 0usize;
+        while row < stale.len() {
+            if !stale[row] {
+                row += 1;
+                continue;
+            }
+            let run_start = row;
+            while row < stale.len() && stale[row] {
+                stale[row] = false;
+                row += 1;
+            }
+            let run_len = row - run_start;
+            let src_off = run_start * self.cell_h as usize * cols_bytes;
+            let len = run_len * self.cell_h as usize * cols_bytes;
+            if let (Some(src_slice), Some(dst_slice)) = (
+                self.backbuffer.get(src_off..src_off + len),
+                dst.get_mut(src_off..src_off + len),
+            ) {
+                dst_slice.copy_from_slice(src_slice);
+            }
+            damage_rects.push((run_start as i32, run_len as i32));
+        }
 
+        let buf = self.frames[slot].buffer;
         self.window_tx.request(
             MessageBuilder::new(self.surface, SurfaceRequest::Attach)
                 .object(buf)
                 .i32(0)
                 .i32(0),
         );
-        self.window_tx.request(
-            MessageBuilder::new(self.surface, SurfaceRequest::Damage)
-                .i32(0)
-                .i32(0)
-                .i32(buf_w)
-                .i32(buf_h),
-        );
+        for (row_start, row_count) in damage_rects {
+            self.window_tx.request(
+                MessageBuilder::new(self.surface, SurfaceRequest::Damage)
+                    .i32(0)
+                    .i32(row_start * self.cell_h)
+                    .i32(buf_w)
+                    .i32(row_count * self.cell_h),
+            );
+        }
         let cb: CallbackId = self.window_tx.alloc_id();
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Frame).new_id(cb));
@@ -1440,7 +1667,6 @@ impl TermWindow {
 
         self.frame_ready = false;
         self.dirty = false;
-        let _ = stride;
         Ok(())
     }
 
@@ -1512,6 +1738,13 @@ impl TermWindow {
         self.width = w;
         self.height = h;
         self.dirty = true;
+        // Both shm buffers are brand-new (freshly created, uninitialized)
+        // memory, so every row is stale relative to the backbuffer in both
+        // slots -- the next two presents each need a full copy to actually
+        // fill their buffer, not just the rows that changed since the old
+        // size.
+        let row_count = ((h / self.cell_h).max(1)) as usize;
+        self.stale_rows = [vec![true; row_count], vec![true; row_count]];
         // Both buffers are brand-new and free, and any in-flight frame callback
         // referred to the now-destroyed surface contents. Force the next
         // present to fire immediately so we never leave the surface showing a

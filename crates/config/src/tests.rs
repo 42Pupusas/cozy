@@ -101,6 +101,30 @@ fn window_opacity_negative_rejected() {
     assert!(e.contains("window.opacity"), "got: {e}");
 }
 
+#[test]
+fn window_target_fps_default_is_60() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.window.target_fps, 60);
+}
+
+#[test]
+fn window_target_fps_custom() {
+    let cfg = Config::parse("[window]\ntarget_fps = 144\n");
+    assert_eq!(cfg.window.target_fps, 144);
+}
+
+#[test]
+fn window_target_fps_zero_rejected() {
+    let e = Config::fail("[window]\ntarget_fps = 0\n");
+    assert!(e.contains("window.target_fps"), "got: {e}");
+}
+
+#[test]
+fn window_target_fps_upper_bound() {
+    let e = Config::fail("[window]\ntarget_fps = 1001\n");
+    assert!(e.contains("window.target_fps"), "got: {e}");
+}
+
 // ── [cursor] ──────────────────────────────────────────────────────────────────
 
 #[test]

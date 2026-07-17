@@ -436,7 +436,20 @@ impl Renderer {
         }
     }
 
-    /// Bitmap-font path: identical to the pre-M9 renderer (1-bit glyph, no AA).
+    /// Bitmap-font path: 1-bit glyph, no AA.
+    ///
+    /// Row-batched like [`Self::blit_cell_face`]: the clipped scanline width
+    /// is computed once per cell (not once per pixel), each row is
+    /// background-filled with a single slice `fill`, and ink is stamped only
+    /// where the glyph's bitmask has set bits -- a space (the overwhelmingly
+    /// common cell) does one `fill` per row and nothing else. Previously this
+    /// did a per-pixel bounds check + bit test + index multiply -- a hot
+    /// path `perf record` on the `blit` bench showed dominating render time.
+    ///
+    /// Unknown/non-ASCII chars fall back to a solid ink block (`mask =
+    /// 0xff`), matching the pre-M9 renderer's "tofu" glyph -- this is
+    /// deliberately different from [`Canvas::draw_char`], which leaves
+    /// unknown chars blank.
     fn blit_cell_bitmap(
         canvas: &mut Canvas<'_>,
         cx: u16,
@@ -447,11 +460,25 @@ impl Renderer {
         bg_px: u32,
     ) {
         let buf_width = canvas.width() as u32;
-        let pixels = canvas.pixels_mut();
-
         let px0 = u32::from(cx) * GLYPH_W as u32;
         let py0 = u32::from(cy) * GLYPH_H as u32;
         let cell_cols: u32 = if wide { 2 } else { 1 };
+        let cell_px_w = GLYPH_W as u32 * cell_cols;
+
+        // See the wide-snapshot clip test below: without this a stale
+        // over-wide snapshot would wrap into the next row.
+        let clipped_w = if px0 >= buf_width {
+            0
+        } else {
+            cell_px_w.min(buf_width - px0)
+        };
+        if clipped_w == 0 {
+            return;
+        }
+        // The bitmap glyph itself is always exactly GLYPH_W wide (no
+        // double-width bitmap glyphs) -- a wide cell's second half is pure
+        // background, so ink is never stamped past this.
+        let glyph_w = clipped_w.min(GLYPH_W as u32);
 
         let glyph: Option<&[u8; 16]> = if ch >= FIRST as char && ch <= LAST as char {
             let idx = ch as usize - FIRST as usize;
@@ -460,25 +487,30 @@ impl Renderer {
             None
         };
 
+        let pixels = canvas.pixels_mut();
         for row in 0..GLYPH_H as u32 {
             let py = py0 + row;
-            let row_mask: u8 = glyph.map_or(0xff, |g| g[row as usize]);
-            for col in 0..(GLYPH_W as u32 * cell_cols) {
-                let px = px0 + col;
-                // See the wide-snapshot clip test below: without this a stale
-                // over-wide snapshot would wrap into the next row.
-                if px >= buf_width {
-                    continue;
-                }
-                let bit = if col < GLYPH_W as u32 {
-                    (row_mask >> (7 - col)) & 1
-                } else {
-                    0
-                };
-                let pixel = if bit != 0 { fg_px } else { bg_px };
-                let idx = (py * buf_width + px) as usize;
-                if idx < pixels.len() {
-                    pixels[idx] = pixel;
+            let row_start = (py * buf_width + px0) as usize;
+            let row_end = row_start + clipped_w as usize;
+            let Some(row_slice) = pixels.get_mut(row_start..row_end) else {
+                continue;
+            };
+            row_slice.fill(bg_px);
+
+            let mask: u8 = glyph.map_or(0xff, |g| g[row as usize]);
+            if mask == 0 {
+                continue; // already background-filled above.
+            }
+            if mask == 0xff && glyph_w == GLYPH_W as u32 {
+                // Solid row (blank-font fallback, or a glyph row that
+                // happens to be fully inked) -- one fill instead of 8 bit
+                // tests.
+                row_slice[..glyph_w as usize].fill(fg_px);
+                continue;
+            }
+            for col in 0..glyph_w {
+                if mask & (0x80 >> col) != 0 {
+                    row_slice[col as usize] = fg_px;
                 }
             }
         }
@@ -519,16 +551,24 @@ impl Renderer {
 
         {
             let pixels = canvas.pixels_mut();
-            for row in 0..cell_h as u32 {
-                let py = py0 + row;
-                for col in 0..(cell_w as u32 * cell_cols) {
-                    let px = px0 + col;
-                    if px >= buf_width {
-                        continue;
-                    }
-                    let idx = (py * buf_width + px) as usize;
-                    if idx < pixels.len() {
-                        pixels[idx] = bg_px;
+            // Precompute the clipped scanline width once (rather than a
+            // per-pixel bounds check + index multiply) and fill each row
+            // with a single slice `fill` -- the background is almost always
+            // a solid rectangle, so this is the hot path for every cell
+            // drawn.
+            let cell_px_w = cell_w as u32 * cell_cols;
+            let clipped_w = if px0 >= buf_width {
+                0
+            } else {
+                cell_px_w.min(buf_width - px0)
+            };
+            if clipped_w > 0 {
+                for row in 0..cell_h as u32 {
+                    let py = py0 + row;
+                    let row_start = (py * buf_width + px0) as usize;
+                    let row_end = row_start + clipped_w as usize;
+                    if let Some(row_slice) = pixels.get_mut(row_start..row_end) {
+                        row_slice.fill(bg_px);
                     }
                 }
             }
@@ -552,43 +592,103 @@ impl Renderer {
         let glyph_y0 = py0 as i64 + i64::from(entry.bearing_y);
 
         let pixels = canvas.pixels_mut();
+        let atlas_w = cache.atlas.width;
         for row in 0..entry.height {
             let py = glyph_y0 + i64::from(row);
             if py < 0 {
                 continue;
             }
             let py = py as u32;
+            // Hoist the row base indices out of the column loop: both the
+            // destination row base (`py * buf_width`) and the atlas source
+            // row base (`(entry.y + row) * atlas_w`) are per-row constants,
+            // not per-pixel.
+            let dst_row_base = py as usize * buf_width as usize;
+            let atlas_row_base = ((entry.y + row) * atlas_w) as usize;
             for col in 0..entry.width {
                 let px = glyph_x0 + i64::from(col);
                 if px < 0 || px as u32 >= buf_width {
                     continue;
                 }
                 let px = px as u32;
-                let a = cache.atlas.data
-                    [((entry.y + row) * cache.atlas.width + (entry.x + col)) as usize];
+                let a = cache.atlas.data[atlas_row_base + (entry.x + col) as usize];
                 if a == 0 {
                     continue;
                 }
-                let idx = (py * buf_width + px) as usize;
+                let idx = dst_row_base + px as usize;
                 let Some(dst) = pixels.get_mut(idx) else {
                     continue;
                 };
                 *dst = if a == 255 {
                     fg_px
                 } else {
-                    blend(bg, fg, a, bg_alpha)
+                    fg.blend_glyph(bg, a, bg_alpha)
                 };
             }
         }
     }
 
     /// Blit every dirty row in `snap` into the canvas.
-    pub fn blit_snapshot(&mut self, canvas: &mut Canvas<'_>, snap: &DirtySnapshot) {
+    ///
+    /// When `snap.scroll_span == Some((top, bot, delta))` the content in rows
+    /// `[top, bot]` moved up by `delta`. Rather than re-rasterize every cell,
+    /// `copy_within` the backbuffer's scanlines up by `delta * cell_h`, then
+    /// paint the snapshot's dirty rows on top -- which the grid has already
+    /// placed at their true post-scroll positions, so an in-place edit
+    /// batched in the same snapshot lands correctly instead of being clobbered
+    /// by the shift. This is the classic terminal pixel-scroll optimization,
+    /// but decoupled from the dirty-row set. Skipped for viewport
+    /// (scrollback-scroll) snapshots, whose rows are an unrelated slice of
+    /// history, not a continuation of the prior frame.
+    ///
+    /// Returns `Some((top, bot, delta))` when a pixel-scroll `copy_within` was
+    /// performed: the backbuffer's scanlines for rows `top..=bot` were shifted
+    /// up by `delta` rows. The caller needs this because any overlay it baked
+    /// into the backbuffer last frame (cursor, selection tint, fps readout) got
+    /// dragged up by the same shift, so its bookkeeping of "rows to repaint
+    /// clean" must be shifted to match — otherwise the old overlay pixels are
+    /// scrubbed at their pre-scroll row and the shifted copy is left behind as
+    /// a static imprint.
+    pub fn blit_snapshot(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        snap: &DirtySnapshot,
+    ) -> Option<(u16, u16, u16)> {
         // Rows of the glyph grid that fit in this buffer. A stale snapshot from a
         // taller geometry may carry rows past the bottom; clip them rather than let
         // them paint into the wrong pixels.
         let buf_width = canvas.width() as u32;
         let buf_rows = (canvas.pixels_mut().len() as u32 / buf_width.max(1)) / self.cell_h as u32;
+
+        // Explicit scroll band: the grid tells us exactly which rows moved up
+        // and by how much, decoupled from which rows are dirty. Pixel-shift the
+        // band, then fall through to paint the snapshot's precise dirty rows on
+        // top -- those now sit at their true post-scroll positions, so an
+        // in-place edit batched alongside a scroll is painted correctly instead
+        // of being clobbered by a whole-region re-blit or a bad shift.
+        let mut scrolled: Option<(u16, u16, u16)> = None;
+        if snap.viewport_offset.is_none() {
+            if let Some((top, bot, delta)) = snap.scroll_span {
+                let top = u32::from(top);
+                let bot = u32::from(bot);
+                let delta = u32::from(delta);
+                if delta > 0 && delta <= bot - top && bot < buf_rows {
+                    let row_scanlines = self.cell_h as usize;
+                    let row_words = buf_width as usize * row_scanlines;
+                    let keep_rows = (bot - top + 1 - delta) as usize;
+                    let src_row = top as usize + delta as usize;
+                    let dst_off = top as usize * row_words;
+                    let src_off = src_row * row_words;
+                    let pixels = canvas.pixels_mut();
+                    pixels.copy_within(src_off..src_off + keep_rows * row_words, dst_off);
+                    scrolled = Some((top as u16, bot as u16, delta as u16));
+                }
+            }
+        }
+
+        // Paint every dirty row (they are already at correct post-scroll
+        // positions). This covers both the genuinely-new bottom rows of a
+        // scroll and any in-place edits batched in the same snapshot.
         for row in &snap.rows {
             if u32::from(row.row) >= buf_rows {
                 continue;
@@ -597,6 +697,7 @@ impl Renderer {
                 self.blit_cell(canvas, col as u16, row.row, cell);
             }
         }
+        scrolled
     }
 
     /// Overlay the cursor onto the canvas at a **fractional** cell position
@@ -772,43 +873,6 @@ impl Renderer {
     }
 }
 
-/// Composite an anti-aliased glyph edge pixel: `glyph_a/255` coverage of
-/// opaque ink (`fg`) over a background (`bg`) that is itself translucent at
-/// `bg_alpha/255` (the window opacity). Returns a plain packed RGB word
-/// (top byte ignored, i.e. XRGB8888) when `bg_alpha == 255` — byte-identical
-/// to the original (pre-M10) blend — or a **premultiplied** ARGB8888 word
-/// otherwise, per `wl_shm`'s wire format.
-fn blend(bg: DrawColor, fg: DrawColor, glyph_a: u8, bg_alpha: u8) -> u32 {
-    if bg_alpha == 255 {
-        return blend_opaque(bg, fg, glyph_a);
-    }
-    // Ink is opaque; the window glass shows through the uncovered fraction.
-    // Porter-Duff "ink over glass", composited directly in premultiplied space.
-    let ink_a = f64::from(glyph_a) / 255.0;
-    let glass_a = f64::from(bg_alpha) / 255.0;
-    let uncovered = glass_a * (1.0 - ink_a);
-    let out_a = ink_a + uncovered;
-    let pr = f64::from(fg.r).mul_add(ink_a, f64::from(bg.r) * uncovered);
-    let pg = f64::from(fg.g).mul_add(ink_a, f64::from(bg.g) * uncovered);
-    let pb = f64::from(fg.b).mul_add(ink_a, f64::from(bg.b) * uncovered);
-    let a8 = (out_a * 255.0).round() as u32;
-    let r8 = pr.round() as u32;
-    let g8 = pg.round() as u32;
-    let b8 = pb.round() as u32;
-    (a8 << 24) | (r8 << 16) | (g8 << 8) | b8
-}
-
-/// The original (pre-transparency) linear-interpolate `from` → `to` by
-/// `alpha/255`, packed as XRGB8888. Split out of [`blend`] so the opaque
-/// path (the overwhelmingly common case) stays exactly as before.
-fn blend_opaque(from: DrawColor, to: DrawColor, alpha: u8) -> u32 {
-    let a = u32::from(alpha);
-    let r = (u32::from(from.r) * (255 - a) + u32::from(to.r) * a) / 255;
-    let g = (u32::from(from.g) * (255 - a) + u32::from(to.g) * a) / 255;
-    let b = (u32::from(from.b) * (255 - a) + u32::from(to.b) * a) / 255;
-    (r << 16) | (g << 8) | b
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +907,7 @@ mod tests {
             cursor_changed: false,
             content_delta: 0,
             viewport_offset: None,
+            scroll_span: None,
         };
         let theme = Theme::builtin();
         let bg = theme.bg_xrgb();
@@ -864,6 +929,270 @@ mod tests {
     }
 
     #[test]
+    fn content_scroll_pixel_shifts_backbuffer_instead_of_reblitting_unchanged_rows() {
+        // A 1x4 grid (arbitrary width, 4 rows). Paint distinct glyphs into
+        // each row first via a normal (non-scrolled) snapshot, then send a
+        // content_delta=1 snapshot whose dirty rows are the classic
+        // "whole-region redirtied by a scroll" shape: rows 0..=3 all
+        // reported dirty, where rows 0..=2 are just the old rows 1..=3
+        // shifted up (unchanged content) and row 3 is genuinely new.
+        let bw = GLYPH_W as u32;
+        let bh = 4 * GLYPH_H as u32;
+        let mut pixels = vec![0u32; (bw * bh) as usize];
+        let mut renderer = Renderer::builtin(Theme::builtin());
+
+        let initial = DirtySnapshot {
+            cols: 1,
+            rows: vec![
+                DirtyRow {
+                    row: 0,
+                    cells: vec![cell('A')],
+                },
+                DirtyRow {
+                    row: 1,
+                    cells: vec![cell('B')],
+                },
+                DirtyRow {
+                    row: 2,
+                    cells: vec![cell('C')],
+                },
+                DirtyRow {
+                    row: 3,
+                    cells: vec![cell('D')],
+                },
+            ],
+            cursor: grid::CursorInfo::default(),
+            cursor_changed: false,
+            content_delta: 0,
+            viewport_offset: None,
+            scroll_span: None,
+        };
+        {
+            let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
+            renderer.blit_snapshot(&mut canvas, &initial);
+        }
+        // Snapshot the pixels for what row 1 (glyph 'B') looked like -- after
+        // a scroll-up by 1, this should reappear verbatim at row 0.
+        let row_len = (bw * GLYPH_H as u32) as usize;
+        let old_row1: Vec<u32> = pixels[row_len..2 * row_len].to_vec();
+        let old_row2: Vec<u32> = pixels[2 * row_len..3 * row_len].to_vec();
+        let old_row3: Vec<u32> = pixels[3 * row_len..4 * row_len].to_vec();
+
+        // Now the scroll: content moved up by 1 line, so old rows 1,2,3
+        // are now at 0,1,2, and row 3 is fresh content ('E').
+        let scrolled = DirtySnapshot {
+            cols: 1,
+            rows: vec![
+                DirtyRow {
+                    row: 0,
+                    cells: vec![cell('B')],
+                },
+                DirtyRow {
+                    row: 1,
+                    cells: vec![cell('C')],
+                },
+                DirtyRow {
+                    row: 2,
+                    cells: vec![cell('D')],
+                },
+                DirtyRow {
+                    row: 3,
+                    cells: vec![cell('E')],
+                },
+            ],
+            cursor: grid::CursorInfo::default(),
+            cursor_changed: false,
+            content_delta: 1,
+            viewport_offset: None,
+            scroll_span: Some((0, 3, 1)),
+        };
+        let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
+        renderer.blit_snapshot(&mut canvas, &scrolled);
+
+        // Row 0 must now be byte-identical to the old row 1 ('B') -- proof
+        // it was copied via copy_within, not re-rasterized (re-rasterizing
+        // 'B' would produce the same glyph too, so this alone isn't
+        // conclusive, but combined with the other rows it demonstrates the
+        // shift happened contiguously).
+        assert_eq!(&pixels[0..row_len], &old_row1[..]);
+        assert_eq!(&pixels[row_len..2 * row_len], &old_row2[..]);
+        assert_eq!(&pixels[2 * row_len..3 * row_len], &old_row3[..]);
+        // Row 3 is fresh -- must differ from the old row 3 ('D''s pixels),
+        // since it now holds 'E'.
+        assert_ne!(&pixels[3 * row_len..4 * row_len], &old_row3[..]);
+    }
+
+    // Build a full-screen scroll snapshot: the grid scrolled up by `delta`,
+    // so visible row i now shows logical line `base_line + i`. Every visible
+    // row is dirty, content_delta == delta, and scroll_span covers the whole
+    // screen (rows 0..=rows-1) shifted up by `delta` when `delta > 0`.
+    fn scroll_snap(cols: u16, rows: u16, base_line: u32, delta: u16) -> DirtySnapshot {
+        let dirty = (0..rows)
+            .map(|r| {
+                let line = base_line + u32::from(r);
+                // Distinct glyph per logical line so overlap/misalignment shows.
+                let ch = char::from(b'a' + (line % 26) as u8);
+                DirtyRow {
+                    row: r,
+                    cells: (0..cols).map(|_| cell(ch)).collect(),
+                }
+            })
+            .collect();
+        DirtySnapshot {
+            cols,
+            rows: dirty,
+            cursor: grid::CursorInfo::default(),
+            cursor_changed: false,
+            content_delta: delta,
+            viewport_offset: None,
+            scroll_span: if delta > 0 {
+                Some((0, rows - 1, delta))
+            } else {
+                None
+            },
+        }
+    }
+
+    #[test]
+    fn fast_pixel_scroll_matches_full_reblit_across_composed_frames() {
+        // The heart of the flood-jank question: after a sequence of scroll
+        // snapshots (some composed into one present), the fast pixel-scroll
+        // path must leave the backbuffer byte-identical to a from-scratch full
+        // re-blit of the final visible content. If it diverges, the live
+        // display garbles even though the grid (scrollback) is correct --
+        // exactly the reported symptom.
+        let cols = 4u16;
+        let rows = 8u16;
+        let bw = cols as u32 * GLYPH_W as u32;
+        let bh = rows as u32 * GLYPH_H as u32;
+
+        // Reference renderer: full re-blit of the final state (delta forced 0
+        // so it never takes the fast path).
+        let final_base = 100u32;
+        let mut reference = vec![0u32; (bw * bh) as usize];
+        {
+            let mut r = Renderer::builtin(Theme::builtin());
+            let mut full = scroll_snap(cols, rows, final_base, 0);
+            full.content_delta = 0;
+            let mut canvas = Canvas::new(&mut reference, bw as i32, bh as i32);
+            r.blit_snapshot(&mut canvas, &full);
+        }
+
+        // Fast-path renderer: reach the SAME final state by scrolling there in
+        // steps. Seed with the pre-scroll frame (full blit), then apply scroll
+        // snapshots whose deltas sum so the final visible top line == final_base.
+        let mut fast = vec![0u32; (bw * bh) as usize];
+        let mut r = Renderer::builtin(Theme::builtin());
+        // Seed: visible top line = final_base - total_scroll.
+        let steps = [1u16, 2, 3]; // composed deltas; sum = 6
+        let total: u32 = steps.iter().map(|&d| u32::from(d)).sum();
+        let seed_base = final_base - total;
+        {
+            let mut seed = scroll_snap(cols, rows, seed_base, 0);
+            seed.content_delta = 0;
+            let mut canvas = Canvas::new(&mut fast, bw as i32, bh as i32);
+            r.blit_snapshot(&mut canvas, &seed);
+        }
+        // Now scroll to final in steps, each a fast-path snapshot.
+        let mut acc = 0u32;
+        {
+            let mut canvas = Canvas::new(&mut fast, bw as i32, bh as i32);
+            for &d in &steps {
+                acc += u32::from(d);
+                let base = seed_base + acc;
+                let snap = scroll_snap(cols, rows, base, d);
+                let scrolled = r.blit_snapshot(&mut canvas, &snap);
+                assert!(
+                    scrolled.is_some(),
+                    "delta={d} should take the fast pixel-scroll path"
+                );
+            }
+        }
+
+        assert_eq!(
+            fast, reference,
+            "fast pixel-scroll diverged from full re-blit of the same final content"
+        );
+    }
+
+    #[test]
+    fn pixel_scroll_reports_shifted_band_for_overlay_cleanup() {
+        // The pixel-scroll path must tell the caller which rows it shifted and
+        // by how much, so baked overlays (cursor/selection/fps) can have their
+        // repaint bookkeeping remapped -- otherwise a dragged-up cursor imprint
+        // is left behind. A non-scroll snapshot must report None.
+        let bw = GLYPH_W as u32;
+        let bh = 4 * GLYPH_H as u32;
+        let mut pixels = vec![0u32; (bw * bh) as usize];
+        let mut renderer = Renderer::builtin(Theme::builtin());
+
+        let full = DirtySnapshot {
+            cols: 1,
+            rows: vec![
+                DirtyRow {
+                    row: 0,
+                    cells: vec![cell('A')],
+                },
+                DirtyRow {
+                    row: 1,
+                    cells: vec![cell('B')],
+                },
+                DirtyRow {
+                    row: 2,
+                    cells: vec![cell('C')],
+                },
+                DirtyRow {
+                    row: 3,
+                    cells: vec![cell('D')],
+                },
+            ],
+            cursor: grid::CursorInfo::default(),
+            cursor_changed: false,
+            content_delta: 0,
+            viewport_offset: None,
+            scroll_span: None,
+        };
+        {
+            let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
+            // A plain repaint is not a scroll -- no shift to report.
+            assert_eq!(renderer.blit_snapshot(&mut canvas, &full), None);
+        }
+
+        let scrolled = DirtySnapshot {
+            cols: 1,
+            rows: vec![
+                DirtyRow {
+                    row: 0,
+                    cells: vec![cell('B')],
+                },
+                DirtyRow {
+                    row: 1,
+                    cells: vec![cell('C')],
+                },
+                DirtyRow {
+                    row: 2,
+                    cells: vec![cell('D')],
+                },
+                DirtyRow {
+                    row: 3,
+                    cells: vec![cell('E')],
+                },
+            ],
+            cursor: grid::CursorInfo::default(),
+            cursor_changed: false,
+            content_delta: 1,
+            viewport_offset: None,
+            scroll_span: Some((0, 3, 1)),
+        };
+        let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
+        // Rows 0..=3 shifted up by 1.
+        assert_eq!(
+            renderer.blit_snapshot(&mut canvas, &scrolled),
+            Some((0, 3, 1))
+        );
+    }
+
+    #[test]
     fn stale_tall_snapshot_row_is_clipped() {
         // Backbuffer for 2 rows; a stale snapshot references row 3.
         let bw = 2 * GLYPH_W as u32;
@@ -879,6 +1208,7 @@ mod tests {
             cursor_changed: false,
             content_delta: 0,
             viewport_offset: None,
+            scroll_span: None,
         };
         let mut renderer = Renderer::builtin(Theme::builtin());
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
@@ -930,8 +1260,8 @@ mod tests {
         let bg = DrawColor::rgb(0, 0, 0);
         let fg = DrawColor::rgb(255, 255, 255);
         // bg_alpha = 255 (opaque window): the pre-M10 XRGB8888 behavior.
-        assert_eq!(blend(bg, fg, 0, 255), bg.to_xrgb8888());
-        assert_eq!(blend(bg, fg, 255, 255), fg.to_xrgb8888());
+        assert_eq!(fg.blend_glyph(bg, 0, 255), bg.to_xrgb8888());
+        assert_eq!(fg.blend_glyph(bg, 255, 255), fg.to_xrgb8888());
     }
 
     #[test]
@@ -942,7 +1272,7 @@ mod tests {
         // pixel, alpha == bg_alpha exactly. wl_shm wants *premultiplied*
         // alpha, so the color channels are also scaled by bg_alpha/255 (128
         // -> ~0.502), not carried through straight.
-        let px = blend(bg, fg, 0, 128);
+        let px = fg.blend_glyph(bg, 0, 128);
         assert_eq!(px >> 24, 128);
         assert_eq!((px >> 16) & 0xff, 5, "10 * 128/255 rounds to 5");
         assert_eq!((px >> 8) & 0xff, 10, "20 * 128/255 rounds to 10");
@@ -954,10 +1284,10 @@ mod tests {
         let bg = DrawColor::rgb(10, 20, 30);
         let fg = DrawColor::rgb(200, 100, 50);
         // glyph_a == 255 short-circuits in blit_cell_face before calling
-        // blend, but blend itself must still be correct if called directly:
-        // full ink coverage means fully opaque foreground regardless of the
-        // window's glass opacity.
-        let px = blend(bg, fg, 255, 128);
+        // blend_glyph, but blend_glyph itself must still be correct if
+        // called directly: full ink coverage means fully opaque foreground
+        // regardless of the window's glass opacity.
+        let px = fg.blend_glyph(bg, 255, 128);
         assert_eq!(px >> 24, 255, "full glyph coverage must be fully opaque");
         assert_eq!((px >> 16) & 0xff, 200);
         assert_eq!((px >> 8) & 0xff, 100);
@@ -1000,12 +1330,7 @@ mod tests {
         // Land the cursor at the bottom-right cell, mid-pulse (t is picked so
         // `grow` is near its max -- the worst case for bleeding past the
         // grid-aligned area).
-        renderer.draw_cursor_pulse(
-            &mut canvas,
-            (cols - 1) as f32,
-            (rows - 1) as f32,
-            0.99,
-        );
+        renderer.draw_cursor_pulse(&mut canvas, (cols - 1) as f32, (rows - 1) as f32, 0.99);
 
         // Nothing in the dead strip (past the last full cell) may have been
         // touched -- those pixels are never repainted again by the normal
@@ -1014,10 +1339,7 @@ mod tests {
             for x in 0..bw {
                 if x >= cols * cell_w || y >= rows * cell_h {
                     let px = pixels[(y * bw + x) as usize];
-                    assert_eq!(
-                        px, 0,
-                        "dead-strip pixel ({x},{y}) was painted: {px:#x}"
-                    );
+                    assert_eq!(px, 0, "dead-strip pixel ({x},{y}) was painted: {px:#x}");
                 }
             }
         }

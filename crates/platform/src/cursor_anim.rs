@@ -46,16 +46,6 @@ const PULSE_MS: f32 = 380.0;
 /// completely-disappearing cursor reads as a glitch, not a blink).
 const MIN_ALPHA: f32 = 0.15;
 
-/// Cubic ease-out: fast start, gentle settle. `t` in `[0, 1]`.
-fn ease_out_cubic(t: f32) -> f32 {
-    let inv = 1.0 - t;
-    (inv * inv).mul_add(-inv, 1.0)
-}
-
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    (b - a).mul_add(t, a)
-}
-
 /// Cursor animation configuration, derived from `config::CursorConfig`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CursorAnimConfig {
@@ -100,6 +90,22 @@ pub struct CursorAnimator {
 }
 
 impl CursorAnimator {
+    /// Cubic ease-out: fast start, gentle settle. `t` in `[0, 1]`.
+    ///
+    /// Was a free `ease_out_cubic(t)` function -- moved onto `CursorAnimator`
+    /// as the sole user of this easing curve.
+    fn ease_out_cubic(t: f32) -> f32 {
+        let inv = 1.0 - t;
+        (inv * inv).mul_add(-inv, 1.0)
+    }
+
+    /// Linear interpolation `a` -> `b` by `t`.
+    ///
+    /// Was a free `lerp(a, b, t)` function.
+    fn lerp(a: f32, b: f32, t: f32) -> f32 {
+        (b - a).mul_add(t, a)
+    }
+
     #[must_use]
     pub fn new(cfg: CursorAnimConfig) -> Self {
         Self {
@@ -148,7 +154,7 @@ impl CursorAnimator {
             if dist > LONG_JUMP_CELLS {
                 let t =
                     ((dist - LONG_JUMP_CELLS) / (MAX_JUMP_CELLS - LONG_JUMP_CELLS)).clamp(0.0, 1.0);
-                self.slide_ms = lerp(SLIDE_MS, SLIDE_MS_MAX, t);
+                self.slide_ms = Self::lerp(SLIDE_MS, SLIDE_MS_MAX, t);
                 self.pulse_pending = true;
             } else {
                 self.slide_ms = SLIDE_MS;
@@ -205,10 +211,10 @@ impl CursorAnimator {
         if self.slide_elapsed_ms >= self.slide_ms {
             return (f32::from(self.target_col), f32::from(self.target_row));
         }
-        let t = ease_out_cubic(self.slide_elapsed_ms / self.slide_ms);
+        let t = Self::ease_out_cubic(self.slide_elapsed_ms / self.slide_ms);
         (
-            lerp(self.start_col, f32::from(self.target_col), t),
-            lerp(self.start_row, f32::from(self.target_row), t),
+            Self::lerp(self.start_col, f32::from(self.target_col), t),
+            Self::lerp(self.start_row, f32::from(self.target_row), t),
         )
     }
 
@@ -358,6 +364,11 @@ mod tests {
         assert!(!a.advance(5000.0), "hidden cursor has nothing to animate");
     }
 
+    // `alpha()` returns the exact hardcoded constants 0.0/1.0 in these
+    // states (not a computed/accumulated float), so a strict `==` is
+    // correct here, not a precision-loss trap -- see `alpha_starts_full...`
+    // below for the case that legitimately needs an epsilon comparison.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn alpha_is_zero_when_hidden() {
         let mut a = CursorAnimator::new(cfg(true));
@@ -365,6 +376,7 @@ mod tests {
         assert_eq!(a.alpha(), 0.0);
     }
 
+    #[allow(clippy::float_cmp)]
     #[test]
     fn alpha_is_always_one_when_blink_disabled() {
         let mut a = CursorAnimator::new(cfg(false));

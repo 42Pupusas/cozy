@@ -220,6 +220,7 @@ impl FontConfig {
     /// `size` is validated to `1..=256` points; the result comfortably fits
     /// `f32` with no precision loss.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn px_size(&self) -> f32 {
         self.size as f32 * Self::DPI / 72.0
     }

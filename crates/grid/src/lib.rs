@@ -5,7 +5,20 @@
     clippy::needless_pass_by_ref_mut,
     clippy::trivially_copy_pass_by_ref,
     clippy::items_after_test_module,
-    clippy::single_match
+    clippy::single_match,
+    // Terminal geometry (`cols`/`rows`/scroll offsets) is bounded well under
+    // i32/u16 range in practice (a `u16` cell coordinate, a scrollback capped
+    // at `SCROLLBACK_MAX = 10_000`), so the exhaustive `as` casts pedantic
+    // flags throughout this crate are false positives, not real overflow
+    // risk -- see e.g. `Screen::get_viewport_cell`'s `scrollback_len as i64`.
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    // `Grid`/`TermWindow`-shaped state machines naturally accumulate a
+    // handful of independent bool flags (blink on/off, focused, dirty,
+    // bracketed-paste, ...); forcing them into an enum soup would obscure
+    // more than it clarifies for booleans that are genuinely independent.
+    clippy::struct_excessive_bools
 )]
 //! Terminal screen model.
 //!
@@ -76,6 +89,16 @@ pub struct Grid {
     /// scrollback). Emitted on the snapshot so the renderer can shift its
     /// selection/mirror to keep highlights glued to the text, then reset.
     content_delta: u16,
+    /// Accumulated content scroll for the next snapshot, as `(top, bot,
+    /// delta)`: the region `[top, bot]` moved up by `delta` rows. Lets the
+    /// renderer pixel-shift that exact band and then paint only the precise
+    /// dirty rows on top -- instead of inferring the band from the dirty-row
+    /// span (wrong now that scrolls shift marks in place rather than
+    /// blanket-dirtying the region). `None` when nothing scrolled, or when a
+    /// batch mixed scrolls over *different* regions (the fast path is given up
+    /// and the whole region repainted). Distinct from `content_delta`, which
+    /// is the scrollback-push amount used for selection/mirror tracking.
+    scroll_accum: Option<(u16, u16, u16)>,
     /// Bytes the terminal must write back to the PTY (CPR, DA, etc.).
     /// Drained by the driver via [`Grid::take_replies`] after each batch.
     replies: Vec<u8>,
@@ -90,6 +113,12 @@ pub struct Grid {
     /// `cursor_changed` flag is set whenever the cursor moved or toggled
     /// visibility, even on a frame where no cell content changed.
     last_cursor: CursorInfo,
+    /// Set by [`Grid::requeue_snapshot`] when a snapshot carrying a cursor
+    /// change couldn't be delivered (the ring was full). Forces the *next*
+    /// [`Grid::take_dirty`] to report `cursor_changed` even if the cursor
+    /// happens to already equal `last_cursor` (which was optimistically
+    /// updated when the lost snapshot was taken).
+    force_cursor_changed: bool,
 }
 
 impl Grid {
@@ -108,9 +137,11 @@ impl Grid {
             viewport_offset: 0,
             viewport_dirty: false,
             content_delta: 0,
+            scroll_accum: None,
             replies: Vec::new(),
             pending_wrap: false,
             last_cursor: CursorInfo::default(),
+            force_cursor_changed: false,
         }
     }
 
@@ -220,7 +251,8 @@ impl Grid {
                 visible: self.cursor.visible,
             }
         };
-        let cursor_changed = cur != self.last_cursor;
+        let cursor_changed = cur != self.last_cursor || self.force_cursor_changed;
+        self.force_cursor_changed = false;
         self.last_cursor = cur;
 
         if self.viewport_dirty {
@@ -239,6 +271,9 @@ impl Grid {
             // there's no content delta, so this is 0 there anyway.
             snap.content_delta = self.content_delta;
             self.content_delta = 0;
+            // A viewport (full-frame) snapshot repaints everything, so any
+            // accumulated scroll band is moot -- drop it.
+            self.scroll_accum = None;
             return snap;
         }
         let screen = if self.alt_active {
@@ -251,8 +286,52 @@ impl Grid {
         snap.cursor_changed = cursor_changed;
         snap.content_delta = self.content_delta;
         snap.viewport_offset = None;
+        // Hand the renderer the exact scrolled band so it can pixel-shift then
+        // paint the precise dirty rows on top. The (0,0,0) sentinel (mixed
+        // regions) and any zero-delta collapse to None: no shift, just repaint
+        // the dirty rows directly.
+        snap.scroll_span = match self.scroll_accum.take() {
+            Some((t, b, d)) if d > 0 && b >= t => Some((t, b, d)),
+            _ => None,
+        };
         self.content_delta = 0;
         snap
+    }
+
+    /// Merge a [`DirtySnapshot`] that could not be delivered (the renderer's
+    /// ring was full) back into the dirty tracker, so its rows are re-emitted
+    /// on the next [`Grid::take_dirty`] instead of being silently lost.
+    ///
+    /// Must be called immediately after the failed push, before any further
+    /// [`Grid::apply`] runs on this thread: rows are re-marked dirty using
+    /// their row index only (the cell contents underneath are still current,
+    /// since nothing else ran between the `take_dirty` that produced this
+    /// snapshot and this call). The cursor-changed flag and content-scroll
+    /// delta — both consumed/reset by that `take_dirty` — are restored too.
+    pub fn requeue_snapshot(&mut self, snap: &DirtySnapshot) {
+        if let Some(offset) = snap.viewport_offset {
+            // A full-frame viewport snapshot: nothing incremental to
+            // re-mark, just re-arm the viewport-dirty path so the next
+            // take_dirty rebuilds the same full frame.
+            self.viewport_offset = usize::from(offset);
+            self.viewport_dirty = true;
+        } else {
+            for row in &snap.rows {
+                self.dirty.mark_row(row.row);
+            }
+        }
+        self.content_delta = self.content_delta.saturating_add(snap.content_delta);
+        // The dropped snapshot's pixel-shift never ran in the renderer's
+        // backbuffer (it never arrived), and its precise dirty rows do NOT
+        // include the shifted-but-unchanged rows -- those still rely on the
+        // shift. So fold the scroll band back in; the next take_dirty re-emits
+        // it (composing with any scroll since), and the renderer shifts then.
+        if let Some((t, b, d)) = snap.scroll_span {
+            self.accumulate_scroll(t, b, d);
+        }
+        if snap.cursor_changed {
+            self.force_cursor_changed = true;
+        }
     }
 
     /// Return the viewport to the live bottom if it was scrolled up. Called on
@@ -408,6 +487,28 @@ impl Grid {
         }
     }
 
+    /// Fold one content scroll of `[top, bot]` by `delta` into `scroll_accum`.
+    /// Multiple scrolls over the *same* region within a batch add up; a scroll
+    /// over a *different* region abandons the fast path (`None`), which the
+    /// renderer reads as "repaint the dirty rows the slow way".
+    fn accumulate_scroll(&mut self, top: u16, bot: u16, delta: u16) {
+        if delta == 0 {
+            return;
+        }
+        match self.scroll_accum {
+            None => self.scroll_accum = Some((top, bot, delta)),
+            Some((t, b, d)) if t == top && b == bot => {
+                self.scroll_accum = Some((t, b, d.saturating_add(delta)));
+            }
+            Some(_) => {
+                // Conflicting regions in one batch: give up the pixel-shift
+                // and let the renderer repaint the (precisely) dirty rows.
+                // Sentinel (0,0,0) can't occur naturally (delta>0 guarded).
+                self.scroll_accum = Some((0, 0, 0));
+            }
+        }
+    }
+
     fn cursor_down(&mut self, n: u16, scroll: bool) {
         let (rows, top, bot) = {
             let s = self.active_screen();
@@ -418,7 +519,18 @@ impl Grid {
                 let scroll_lines = (self.cursor.row + n).saturating_sub(bot);
                 let d = self.active_screen_mut().scroll_up(scroll_lines, top, bot);
                 self.content_delta = self.content_delta.saturating_add(d);
-                self.dirty.mark_rows(top, bot);
+                // Shift existing dirty marks up with the content (and dirty the
+                // freshly-exposed bottom rows) rather than blanket-marking the
+                // whole region -- so a batch mixing this scroll with in-place
+                // edits reports each changed row at its true post-scroll
+                // position. The clamped shift distance (matching the cells'
+                // actual move) is recorded for the renderer's pixel-shift.
+                // `bot >= top` here (a reversed region makes scroll_up return
+                // 0), but guard the span arithmetic anyway.
+                let region = bot.saturating_sub(top).saturating_add(1);
+                let moved = scroll_lines.min(region);
+                self.dirty.scroll_up(moved, top, bot);
+                self.accumulate_scroll(top, bot, moved);
                 self.cursor.row = bot;
             } else {
                 self.cursor.row = rows - 1;
@@ -547,7 +659,10 @@ impl Grid {
                 let (top, bot) = self.active_screen().scroll_region();
                 let d = self.active_screen_mut().scroll_up(*n, top, bot);
                 self.content_delta = self.content_delta.saturating_add(d);
-                self.dirty.mark_rows(top, bot);
+                let region = bot.saturating_sub(top).saturating_add(1);
+                let moved = (*n).min(region);
+                self.dirty.scroll_up(moved, top, bot);
+                self.accumulate_scroll(top, bot, moved);
             }
             CsiAction::ScrollDown(n) => {
                 let (top, bot) = self.active_screen().scroll_region();
@@ -745,6 +860,42 @@ mod tests {
     }
 
     #[test]
+    fn scroll_batched_with_inplace_edit_yields_precise_rows_and_scroll_span() {
+        // The flood/arrow-key bug: a snapshot that batches a content scroll
+        // together with an in-place edit of an already-visible row must report
+        // (a) a scroll_span for the pixel-shift and (b) *only* the genuinely
+        // changed rows -- not the whole region -- so the renderer shifts then
+        // paints exactly those rows. Previously the region was blanket-marked,
+        // so the edit was indistinguishable from a shifted row and got lost.
+        let mut g = Grid::new(10, 4);
+        apply_str(&mut g, b"l0\r\nl1\r\nl2\r\nl3"); // fill 4 rows, cursor on row 3
+        let _ = g.take_dirty(); // drain
+
+        // One newline scrolls everything up by 1 (l0 into scrollback), then we
+        // overwrite the top visible row in place -- all in one batch, one
+        // snapshot.
+        apply_str(&mut g, b"\r\n"); // scroll up by 1; cursor now row 3, col 0
+        apply_str(&mut g, b"\x1b[1;1H"); // cursor home (row 0)
+        apply_str(&mut g, b"X"); // in-place edit of row 0
+        let snap = g.take_dirty();
+
+        // The whole screen shifted up by 1.
+        assert_eq!(snap.scroll_span, Some((0, 3, 1)));
+        // content_delta tracks the scrollback push (1 line).
+        assert_eq!(snap.content_delta, 1);
+        // Dirty rows: row 0 (the 'X' edit) and row 3 (the freshly-exposed
+        // blank bottom the scroll pulled in) -- NOT all four rows.
+        let mut rows: Vec<u16> = snap.rows.iter().map(|r| r.row).collect();
+        rows.sort_unstable();
+        assert_eq!(rows, vec![0, 3]);
+        // The edit really is 'X' at row 0 col 0.
+        assert_eq!(
+            snap.rows.iter().find(|r| r.row == 0).unwrap().cells[0].ch,
+            'X'
+        );
+    }
+
+    #[test]
     fn take_dirty_reports_content_scroll_delta() {
         // Fill a 3-row screen, then push 2 more lines so 2 scroll into
         // scrollback. The next dirty snapshot must report content_delta == 2
@@ -758,6 +909,53 @@ mod tests {
         // Delta resets after being reported.
         let snap2 = g.take_dirty();
         assert_eq!(snap2.content_delta, 0);
+    }
+
+    #[test]
+    fn requeue_snapshot_re_emits_lost_rows_on_next_take_dirty() {
+        // Simulate a dirty_tx.push failure: take a snapshot, then requeue it
+        // (as if the ring were full) instead of delivering it. The next
+        // take_dirty must reproduce the same rows -- nothing gets lost.
+        let mut g = Grid::new(10, 3);
+        apply_str(&mut g, b"hello");
+        let snap = g.take_dirty();
+        assert!(!snap.rows.is_empty());
+        let row_indices: Vec<u16> = snap.rows.iter().map(|r| r.row).collect();
+
+        g.requeue_snapshot(&snap);
+
+        let snap2 = g.take_dirty();
+        let row_indices2: Vec<u16> = snap2.rows.iter().map(|r| r.row).collect();
+        assert_eq!(row_indices, row_indices2);
+    }
+
+    #[test]
+    fn requeue_snapshot_restores_cursor_changed_and_content_delta() {
+        let mut g = Grid::new(10, 3);
+        apply_str(&mut g, b"l0\r\nl1\r\nl2\r\n");
+        let _ = g.take_dirty(); // drain fill, establishes last_cursor
+        apply_str(&mut g, b"l3\r\nl4"); // scrolls some lines; moves the cursor
+        let snap = g.take_dirty();
+        assert!(snap.cursor_changed);
+        assert!(snap.content_delta > 0);
+        let delta = snap.content_delta;
+
+        // Requeue as if delivery failed -- nothing else touches the grid in
+        // between, matching the real pty/parser thread's usage.
+        g.requeue_snapshot(&snap);
+
+        // A no-op take_dirty (no new apply calls) would normally report
+        // cursor_changed = false (the cursor hasn't moved further) and
+        // content_delta = 0 -- but the requeue must force both back on so
+        // the renderer still sees what it missed.
+        let snap2 = g.take_dirty();
+        assert!(snap2.cursor_changed);
+        assert_eq!(snap2.content_delta, delta);
+
+        // And it's a one-shot: the next take_dirty is back to normal.
+        let snap3 = g.take_dirty();
+        assert!(!snap3.cursor_changed);
+        assert_eq!(snap3.content_delta, 0);
     }
 
     #[test]

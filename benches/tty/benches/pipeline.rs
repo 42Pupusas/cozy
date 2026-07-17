@@ -25,7 +25,7 @@
 
 use divan::counter::BytesCount;
 use grid::Grid;
-use tty_benches::{CORPORA, COLS, ROWS, Corpus};
+use tty_benches::{COLS, CORPORA, Corpus, ROWS};
 use vt_parser::Parser;
 
 #[global_allocator]
@@ -40,9 +40,11 @@ fn feed_apply(bencher: divan::Bencher, corpus: &Corpus) {
     let bytes = (corpus.generate)(COLS, ROWS, corpus.default_n);
     let mut parser = Parser::new();
     let mut grid = Grid::new(COLS, ROWS);
-    bencher.counter(BytesCount::of_slice(&bytes)).bench_local(|| {
-        parser.feed(divan::black_box(&bytes), |ev| {
-            grid.apply(&ev);
+    bencher
+        .counter(BytesCount::of_slice(&bytes))
+        .bench_local(|| {
+            parser.feed(divan::black_box(&bytes), |ev| {
+                grid.apply(&ev);
+            });
         });
-    });
 }

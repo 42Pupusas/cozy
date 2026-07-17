@@ -47,180 +47,204 @@ const POINTER_NAMES: &[&str] = &[
     "top_left_arrow",
 ];
 
-/// Read `$XCURSOR_THEME` (default `"default"`) and `$XCURSOR_SIZE` (default
-/// 24), and try to load a pointer cursor at (approximately) `size * scale`
-/// physical pixels. Returns `None` if no theme on disk has a decodable
-/// pointer image — callers should fall back to a built-in bitmap.
-pub fn load_system_pointer(scale: i32) -> Option<CursorImage> {
-    let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
-    let base_size: u32 = std::env::var("XCURSOR_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    let want_size = base_size.saturating_mul(scale.max(1) as u32);
-    load_pointer(&theme, want_size)
-}
+impl CursorImage {
+    /// Read `$XCURSOR_THEME` (default `"default"`) and `$XCURSOR_SIZE`
+    /// (default 24), and try to load a pointer cursor at (approximately)
+    /// `size * scale` physical pixels. Returns `None` if no theme on disk has
+    /// a decodable pointer image — callers should fall back to a built-in
+    /// bitmap.
+    ///
+    /// Was a free `load_system_pointer(scale)` function -- moved onto
+    /// `CursorImage` as the constructor for "the real desktop pointer".
+    #[must_use]
+    pub fn load_system_pointer(scale: i32) -> Option<Self> {
+        let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
+        let base_size: u32 = std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+        let want_size = base_size.saturating_mul(scale.max(1) as u32);
+        Self::load(&theme, want_size)
+    }
 
-/// Same as [`load_system_pointer`] but with an explicit theme/size, for
-/// testing without depending on process environment.
-pub fn load_pointer(theme: &str, want_size: u32) -> Option<CursorImage> {
-    let dirs = search_dirs();
-    let chain = resolve_theme_chain(theme, &dirs);
+    /// Same as [`CursorImage::load_system_pointer`] but with an explicit
+    /// theme/size, for testing without depending on process environment.
+    ///
+    /// Was a free `load_pointer(theme, want_size)` function.
+    #[must_use]
+    pub fn load(theme: &str, want_size: u32) -> Option<Self> {
+        let dirs = Self::search_dirs();
+        let chain = Self::resolve_theme_chain(theme, &dirs);
 
-    for theme_name in &chain {
-        for dir in &dirs {
-            for name in POINTER_NAMES {
-                let path = dir.join(theme_name).join("cursors").join(name);
-                if let Ok(bytes) = fs::read(&path) {
-                    if let Some(img) = parse_best(&bytes, want_size) {
-                        return Some(img);
+        for theme_name in &chain {
+            for dir in &dirs {
+                for name in POINTER_NAMES {
+                    let path = dir.join(theme_name).join("cursors").join(name);
+                    if let Ok(bytes) = fs::read(&path) {
+                        if let Some(img) = Self::parse_best(&bytes, want_size) {
+                            return Some(img);
+                        }
                     }
                 }
             }
         }
+        None
     }
-    None
-}
 
-/// Directories that may contain `<theme>/cursors/<name>` files, in the
-/// order `libXcursor` searches them (user overrides before system dirs).
-fn search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        dirs.push(PathBuf::from(&home).join(".icons"));
-        let xdg_data =
-            std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
-        dirs.push(PathBuf::from(xdg_data).join("icons"));
+    /// Parse an Xcursor file and return the image whose nominal size (the
+    /// TOC `subtype` for image chunks) is closest to `want_size`.
+    ///
+    /// Was a free `parse_best(bytes, want_size)` function.
+    fn parse_best(bytes: &[u8], want_size: u32) -> Option<Self> {
+        let mut best: Option<(u32, Self)> = None;
+        for img in Self::parse_all(bytes) {
+            let diff = img.width.max(want_size) - img.width.min(want_size);
+            match &best {
+                Some((best_diff, _)) if *best_diff <= diff => {}
+                _ => best = Some((diff, img)),
+            }
+        }
+        best.map(|(_, img)| img)
     }
-    dirs.push(PathBuf::from("/usr/share/icons"));
-    dirs.push(PathBuf::from("/usr/local/share/icons"));
-    dirs
-}
 
-/// Breadth-first walk of `Inherits=` chains starting at `theme`, across all
-/// search dirs, so `"default" -> Adwaita -> hicolor` resolves even though
-/// each theme's `index.theme` lives in a different directory tree.
-fn resolve_theme_chain(theme: &str, dirs: &[PathBuf]) -> Vec<String> {
-    let mut seen = vec![theme.to_string()];
-    let mut queue = vec![theme.to_string()];
-    while let Some(cur) = queue.pop() {
-        for dir in dirs {
-            let idx = dir.join(&cur).join("index.theme");
-            if let Ok(text) = fs::read_to_string(&idx) {
-                for parent in parse_inherits(&text) {
-                    if !seen.contains(&parent) {
-                        seen.push(parent.clone());
-                        queue.push(parent);
+    /// Decode every image chunk in an Xcursor file. Malformed/truncated
+    /// chunks are skipped rather than aborting the whole file, matching the
+    /// reference parser's tolerance for partially-broken theme files.
+    ///
+    /// Was a free `parse_all_images(bytes)` function.
+    fn parse_all(bytes: &[u8]) -> Vec<Self> {
+        let mut out = Vec::new();
+        let Some(mut r) = Reader::new(bytes) else {
+            return out;
+        };
+        let Some(magic) = r.u32() else { return out };
+        let Some(header) = r.u32() else { return out };
+        let Some(_version) = r.u32() else { return out };
+        let Some(ntoc) = r.u32() else { return out };
+        if magic != XCUR_MAGIC || header != 16 {
+            return out;
+        }
+
+        // TOC entries: (type, subtype, position), 12 bytes each.
+        let mut positions = Vec::with_capacity(ntoc as usize);
+        for _ in 0..ntoc {
+            let Some(chunk_type) = r.u32() else { break };
+            let Some(_subtype) = r.u32() else { break };
+            let Some(position) = r.u32() else { break };
+            if chunk_type == CHUNK_IMAGE {
+                positions.push(position as usize);
+            }
+        }
+
+        for pos in positions {
+            if let Some(img) = Self::parse_chunk(bytes, pos) {
+                out.push(img);
+            }
+        }
+        out
+    }
+
+    /// Was a free `parse_image_chunk(bytes, pos)` function.
+    fn parse_chunk(bytes: &[u8], pos: usize) -> Option<Self> {
+        let mut r = Reader::new(bytes.get(pos..)?)?;
+        let img_header = r.u32()?;
+        let _img_type = r.u32()?;
+        let _img_subtype = r.u32()?;
+        let img_version = r.u32()?;
+        let width = r.u32()?;
+        let height = r.u32()?;
+        let xhot = r.u32()?;
+        let yhot = r.u32()?;
+        let _delay = r.u32()?;
+
+        if img_header != 36 || img_version != 1 {
+            return None;
+        }
+        // Sanity bound: refuse absurd sizes rather than trying to allocate
+        // gigabytes from a corrupt/malicious file.
+        if width == 0 || height == 0 || width > 4096 || height > 4096 {
+            return None;
+        }
+
+        let npixels = (width as usize).checked_mul(height as usize)?;
+        let nbytes = npixels.checked_mul(4)?;
+        let pixel_bytes = r.take(nbytes)?;
+
+        // Xcursor pixel data is already premultiplied ARGB8888, little-endian
+        // -- exactly what wl_shm's Argb8888 format wants, so this is a
+        // straight byte-to-u32 reinterpretation, no math needed.
+        let mut pixels = Vec::with_capacity(npixels);
+        for chunk in pixel_bytes.chunks_exact(4) {
+            pixels.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+
+        Some(Self {
+            width,
+            height,
+            hotspot_x: xhot.min(width - 1),
+            hotspot_y: yhot.min(height - 1),
+            pixels,
+        })
+    }
+
+    /// Directories that may contain `<theme>/cursors/<name>` files, in the
+    /// order `libXcursor` searches them (user overrides before system dirs).
+    ///
+    /// Was a free `search_dirs()` function -- moved onto `CursorImage`
+    /// alongside its only caller, `load`.
+    fn search_dirs() -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(home) = std::env::var("HOME") {
+            dirs.push(PathBuf::from(&home).join(".icons"));
+            let xdg_data =
+                std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
+            dirs.push(PathBuf::from(xdg_data).join("icons"));
+        }
+        dirs.push(PathBuf::from("/usr/share/icons"));
+        dirs.push(PathBuf::from("/usr/local/share/icons"));
+        dirs
+    }
+
+    /// Breadth-first walk of `Inherits=` chains starting at `theme`, across
+    /// all search dirs, so `"default" -> Adwaita -> hicolor` resolves even
+    /// though each theme's `index.theme` lives in a different directory
+    /// tree.
+    ///
+    /// Was a free `resolve_theme_chain(theme, dirs)` function.
+    fn resolve_theme_chain(theme: &str, dirs: &[PathBuf]) -> Vec<String> {
+        let mut seen = vec![theme.to_string()];
+        let mut queue = vec![theme.to_string()];
+        while let Some(cur) = queue.pop() {
+            for dir in dirs {
+                let idx = dir.join(&cur).join("index.theme");
+                if let Ok(text) = fs::read_to_string(&idx) {
+                    for parent in Self::parse_inherits(&text) {
+                        if !seen.contains(&parent) {
+                            seen.push(parent.clone());
+                            queue.push(parent);
+                        }
                     }
                 }
             }
         }
+        seen
     }
-    seen
-}
 
-/// Extract the comma-separated `Inherits=` value from an `index.theme` INI
-/// file's `[Icon Theme]` section (we don't care about other sections, and
-/// this key is unique enough not to need real INI parsing).
-fn parse_inherits(text: &str) -> Vec<String> {
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Inherits=") {
-            return rest.split(',').map(str::trim).map(str::to_string).collect();
+    /// Extract the comma-separated `Inherits=` value from an `index.theme`
+    /// INI file's `[Icon Theme]` section (we don't care about other
+    /// sections, and this key is unique enough not to need real INI
+    /// parsing).
+    ///
+    /// Was a free `parse_inherits(text)` function.
+    fn parse_inherits(text: &str) -> Vec<String> {
+        for line in text.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("Inherits=") {
+                return rest.split(',').map(str::trim).map(str::to_string).collect();
+            }
         }
+        Vec::new()
     }
-    Vec::new()
-}
-
-/// Parse an Xcursor file and return the image whose nominal size (the TOC
-/// `subtype` for image chunks) is closest to `want_size`.
-fn parse_best(bytes: &[u8], want_size: u32) -> Option<CursorImage> {
-    let mut best: Option<(u32, CursorImage)> = None;
-    for img in parse_all_images(bytes) {
-        let diff = img.width.max(want_size) - img.width.min(want_size);
-        match &best {
-            Some((best_diff, _)) if *best_diff <= diff => {}
-            _ => best = Some((diff, img)),
-        }
-    }
-    best.map(|(_, img)| img)
-}
-
-/// Decode every image chunk in an Xcursor file. Malformed/truncated chunks
-/// are skipped rather than aborting the whole file, matching the reference
-/// parser's tolerance for partially-broken theme files.
-fn parse_all_images(bytes: &[u8]) -> Vec<CursorImage> {
-    let mut out = Vec::new();
-    let Some(mut r) = Reader::new(bytes) else {
-        return out;
-    };
-    let Some(magic) = r.u32() else { return out };
-    let Some(header) = r.u32() else { return out };
-    let Some(_version) = r.u32() else { return out };
-    let Some(ntoc) = r.u32() else { return out };
-    if magic != XCUR_MAGIC || header != 16 {
-        return out;
-    }
-
-    // TOC entries: (type, subtype, position), 12 bytes each.
-    let mut positions = Vec::with_capacity(ntoc as usize);
-    for _ in 0..ntoc {
-        let Some(chunk_type) = r.u32() else { break };
-        let Some(_subtype) = r.u32() else { break };
-        let Some(position) = r.u32() else { break };
-        if chunk_type == CHUNK_IMAGE {
-            positions.push(position as usize);
-        }
-    }
-
-    for pos in positions {
-        if let Some(img) = parse_image_chunk(bytes, pos) {
-            out.push(img);
-        }
-    }
-    out
-}
-
-fn parse_image_chunk(bytes: &[u8], pos: usize) -> Option<CursorImage> {
-    let mut r = Reader::new(bytes.get(pos..)?)?;
-    let img_header = r.u32()?;
-    let _img_type = r.u32()?;
-    let _img_subtype = r.u32()?;
-    let img_version = r.u32()?;
-    let width = r.u32()?;
-    let height = r.u32()?;
-    let xhot = r.u32()?;
-    let yhot = r.u32()?;
-    let _delay = r.u32()?;
-
-    if img_header != 36 || img_version != 1 {
-        return None;
-    }
-    // Sanity bound: refuse absurd sizes rather than trying to allocate
-    // gigabytes from a corrupt/malicious file.
-    if width == 0 || height == 0 || width > 4096 || height > 4096 {
-        return None;
-    }
-
-    let npixels = (width as usize).checked_mul(height as usize)?;
-    let nbytes = npixels.checked_mul(4)?;
-    let pixel_bytes = r.take(nbytes)?;
-
-    // Xcursor pixel data is already premultiplied ARGB8888, little-endian —
-    // exactly what wl_shm's Argb8888 format wants, so this is a straight
-    // byte-to-u32 reinterpretation, no math needed.
-    let mut pixels = Vec::with_capacity(npixels);
-    for chunk in pixel_bytes.chunks_exact(4) {
-        pixels.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-
-    Some(CursorImage {
-        width,
-        height,
-        hotspot_x: xhot.min(width - 1),
-        hotspot_y: yhot.min(height - 1),
-        pixels,
-    })
 }
 
 /// Minimal little-endian cursor over a byte slice.
@@ -299,7 +323,7 @@ mod tests {
     #[test]
     fn parses_single_image_chunk() {
         let file = build_xcursor_file(&[(4, 4, 1, 1, 0xffaa_bbcc)]);
-        let imgs = parse_all_images(&file);
+        let imgs = CursorImage::parse_all(&file);
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].width, 4);
         assert_eq!(imgs[0].height, 4);
@@ -312,7 +336,7 @@ mod tests {
     #[test]
     fn picks_closest_size_to_requested() {
         let file = build_xcursor_file(&[(16, 16, 0, 0, 1), (32, 32, 0, 0, 2), (48, 48, 0, 0, 3)]);
-        let best = parse_best(&file, 30).unwrap();
+        let best = CursorImage::parse_best(&file, 30).unwrap();
         assert_eq!(best.width, 32);
     }
 
@@ -320,26 +344,26 @@ mod tests {
     fn rejects_bad_magic() {
         let mut file = build_xcursor_file(&[(4, 4, 0, 0, 1)]);
         file[0] = 0; // corrupt magic
-        assert!(parse_all_images(&file).is_empty());
+        assert!(CursorImage::parse_all(&file).is_empty());
     }
 
     #[test]
     fn truncated_file_yields_no_images_not_a_panic() {
         let file = build_xcursor_file(&[(4, 4, 0, 0, 1)]);
         for cut in 0..file.len() {
-            let _ = parse_all_images(&file[..cut]);
+            let _ = CursorImage::parse_all(&file[..cut]);
         }
     }
 
     #[test]
     fn parse_inherits_reads_comma_list() {
         let ini = "[Icon Theme]\nName=default\nInherits=Adwaita,hicolor\n";
-        assert_eq!(parse_inherits(ini), vec!["Adwaita", "hicolor"]);
+        assert_eq!(CursorImage::parse_inherits(ini), vec!["Adwaita", "hicolor"]);
     }
 
     #[test]
     fn parse_inherits_missing_key_is_empty() {
-        assert!(parse_inherits("[Icon Theme]\nName=foo\n").is_empty());
+        assert!(CursorImage::parse_inherits("[Icon Theme]\nName=foo\n").is_empty());
     }
 
     #[test]
@@ -364,6 +388,6 @@ mod tests {
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
         buf.extend_from_slice(&0u32.to_le_bytes());
-        assert!(parse_all_images(&buf).is_empty());
+        assert!(CursorImage::parse_all(&buf).is_empty());
     }
 }

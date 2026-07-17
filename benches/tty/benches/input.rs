@@ -16,7 +16,7 @@ fn main() {
     divan::main();
 }
 
-fn modes() -> &'static [KeyboardMode] {
+const fn modes() -> &'static [KeyboardMode] {
     &[
         KeyboardMode::Legacy,
         KeyboardMode::XtermModifyOtherKeys,
@@ -36,9 +36,9 @@ const KEYS: &[(Key, Modifiers)] = &[
 ];
 
 #[divan::bench(args = modes())]
-fn encode_key(bencher: divan::Bencher, mode: &KeyboardMode) {
+fn encode_key(bencher: divan::Bencher, mode: KeyboardMode) {
     let mut enc = Encoder::new();
-    enc.keyboard_mode = *mode;
+    enc.keyboard_mode = mode;
     let mut buf = [0u8; 64];
     bencher.bench_local(|| {
         for (key, mods) in KEYS {

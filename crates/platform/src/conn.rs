@@ -99,7 +99,7 @@ mod error_tests {
     use std::error::Error as _;
 
     fn io_err(msg: &str) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, msg.to_string())
+        io::Error::other(msg.to_string())
     }
 
     #[test]
@@ -374,8 +374,15 @@ impl Sender {
     fn make_unix_socket() -> Result<OwnedFd, ConnError> {
         use std::os::fd::FromRawFd;
         const SOCK_STREAM: i32 = 1;
+        // `SOCK_CLOEXEC` (02000000): the Wayland connection must NOT be inherited
+        // by processes the PTY shell spawns. Without it, a shell child that
+        // outlives the terminal keeps this socket open, so the compositor never
+        // sees the connection close and leaves a frozen window behind after we
+        // exit. Setting it atomically at socket() creation avoids the
+        // fork-between-socket-and-fcntl race a later FD_CLOEXEC would have.
+        const SOCK_CLOEXEC: i32 = 0o2_000_000;
         // SAFETY: standard socket(2) call; we adopt the returned fd as owned.
-        let fd = unsafe { libc_socket(sys::AF_UNIX, SOCK_STREAM, 0) };
+        let fd = unsafe { libc_socket(sys::AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(ConnError::Sys(SysError::Socket(io::Error::last_os_error())));
         }

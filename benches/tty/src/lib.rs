@@ -119,7 +119,10 @@ pub fn dense_cells(cols: u16, _rows: u16, n: usize) -> Vec<u8> {
         let c = (i % 6) + 41;
         out.extend_from_slice(format!("\x1b[{c}m").as_bytes());
         for col in 0..cols {
-            out.push(b'0' + (col % 10) as u8);
+            // `col % 10` is always in `0..10`, so the truncating cast is exact.
+            #[allow(clippy::cast_possible_truncation)]
+            let digit = (col % 10) as u8;
+            out.push(b'0' + digit);
         }
         out.extend_from_slice(b"\r\n");
     }
@@ -155,15 +158,21 @@ pub fn alt_screen_thrash(_cols: u16, _rows: u16, n: usize) -> Vec<u8> {
 }
 
 /// Cursor-heavy CSI stress modeled on interactive full-screen apps (vim/less
-/// style): cursor addressing, relative moves, and clears, with only a little
-/// text — the opposite extreme from `plain_scroll`'s pure Print stream.
+/// style).
+///
+/// Cursor addressing, relative moves, and clears, with only a little text --
+/// the opposite extreme from `plain_scroll`'s pure Print stream.
 #[must_use]
 pub fn cursor_dance(cols: u16, rows: u16, n: usize) -> Vec<u8> {
     let mut out = Vec::new();
     let rows = rows.max(1);
     let cols = cols.max(1);
     for i in 0..n {
+        // `i % rows`/`(i * 7) % cols` are bounded by `rows`/`cols: u16`, so
+        // the truncating casts back to u16 are exact.
+        #[allow(clippy::cast_possible_truncation)]
         let row = (i % rows as usize) as u16 + 1;
+        #[allow(clippy::cast_possible_truncation)]
         let col = ((i * 7) % cols as usize) as u16 + 1;
         out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
         out.extend_from_slice(b"\x1b[K");
@@ -178,8 +187,9 @@ pub fn cursor_dance(cols: u16, rows: u16, n: usize) -> Vec<u8> {
     out
 }
 
-/// OSC-heavy stress: window title updates interleaved with a little text,
-/// exercising the parser's `OscString` state and `Event::Osc` path (which,
+/// OSC-heavy stress: window title updates interleaved with a little text.
+///
+/// Exercises the parser's `OscString` state and `Event::Osc` path (which,
 /// unlike most events, borrows text out of the parser's own buffer).
 #[must_use]
 pub fn osc_titles(_cols: u16, _rows: u16, n: usize) -> Vec<u8> {

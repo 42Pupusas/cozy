@@ -44,6 +44,11 @@ use crate::wire::{Event as WireEvent, MessageBuilder};
 
 const EVENT_RING_CAP: usize = 1024;
 
+/// Stable Wayland `app_id` for our toplevel. Fixed (not the caller's title) so
+/// compositor window rules and tooling can match this window reliably even
+/// after the shell rewrites the title at runtime.
+const APP_ID: &str = "forfun.terminal";
+
 const DEFAULT_REPEAT_RATE: u32 = 25;
 const DEFAULT_REPEAT_DELAY: u32 = 600;
 
@@ -122,6 +127,23 @@ struct FrameStats {
     /// Wall-clock instant `times` was last logged to stderr (only used by
     /// [`DebugFps::Log`]).
     last_log: std::time::Instant,
+    /// Accumulated CPU time spent doing the actual work inside
+    /// `maybe_present` (blit + shm copy + damage bookkeeping) since the last
+    /// log, and how many presents that covers. Divided out at log time to
+    /// answer the only question that matters under a flood: is a low fps
+    /// CPU-bound (busy ~ frame interval) or compositor-bound (busy <<
+    /// interval, i.e. we're blocked waiting on `wl_callback.done`)?
+    busy_since_log: std::time::Duration,
+    presents_since_log: u32,
+    /// Largest `pending_dirty` backlog (snapshots awaiting one present) seen
+    /// since the last log. A monotonic ramp here is the signature of the
+    /// present being gated while the parser keeps queueing frames.
+    max_backlog_since_log: usize,
+    /// Times `maybe_present` bailed because the compositor still held both shm
+    /// buffers (`wl_buffer.release` lagging), vs. because we hadn't yet gotten
+    /// the frame callback. Distinguishes buffer-starvation from vsync pacing.
+    skipped_no_slot: u32,
+    skipped_not_ready: u32,
 }
 
 /// How many recent presents [`FrameStats`] keeps around to average over.
@@ -132,6 +154,41 @@ impl FrameStats {
         Self {
             times: std::collections::VecDeque::with_capacity(FRAME_STATS_CAP),
             last_log: std::time::Instant::now(),
+            busy_since_log: std::time::Duration::ZERO,
+            presents_since_log: 0,
+            max_backlog_since_log: 0,
+            skipped_no_slot: 0,
+            skipped_not_ready: 0,
+        }
+    }
+
+    fn note_backlog(&mut self, depth: usize) {
+        self.max_backlog_since_log = self.max_backlog_since_log.max(depth);
+    }
+
+    /// Add the CPU time one `maybe_present` spent on real work (not blocked on
+    /// the compositor).
+    fn record_busy(&mut self, dur: std::time::Duration) {
+        self.busy_since_log += dur;
+        self.presents_since_log += 1;
+    }
+
+    /// Mean busy microseconds per present since the last log, then reset the
+    /// accumulator. `0.0` if no presents happened.
+    ///
+    /// This is a diagnostics-only average (logged frame-pacing stats); a
+    /// `u128` microsecond count losing precision in the f64 conversion at
+    /// any value this process could plausibly accumulate is not observable
+    /// in the logged output.
+    #[allow(clippy::cast_precision_loss)]
+    fn drain_busy_us(&mut self) -> f64 {
+        let n = self.presents_since_log;
+        let total = std::mem::take(&mut self.busy_since_log);
+        self.presents_since_log = 0;
+        if n == 0 {
+            0.0
+        } else {
+            total.as_micros() as f64 / f64::from(n)
         }
     }
 
@@ -211,6 +268,10 @@ impl Frame {
 /// Feed [`grid::DirtySnapshot`]s via [`TermWindow::push_dirty`]; the window
 /// blits them on the next frame.  Input arrives back through the
 /// [`InputEvent`] iterator (`.next_input()`).
+// This window owns a dozen genuinely-independent state flags (focused,
+// needs_redraw, bracketed-paste, ...) that don't share a state machine --
+// bundling them into enums would just be indirection for indirection's sake.
+#[allow(clippy::struct_excessive_bools)]
 pub struct TermWindow {
     sender: Sender,
     request_rx: mpsc::Consumer<crate::conn::WindowRequest>,
@@ -252,8 +313,11 @@ pub struct TermWindow {
 
     frames: [Frame; 2],
     shm_mem: ShmBuffer,
-    /// The shm pool currently backing `frames`. Destroyed and replaced on every
-    /// resize so its old buffers/pool id get recycled via `delete_id`.
+    /// The shm pool currently backing `frames`. Created once and reused across
+    /// resizes: it grows in place (`ftruncate` + `mremap` + `wl_shm_pool.resize`)
+    /// and shrinks lazily (the pool stays oversized). Only the per-resize
+    /// buffers are torn down and recreated; the pool id itself lives for the
+    /// window's lifetime.
     pool: PoolId,
     /// `wl_shm` pixel format backing `frames` -- `Argb8888` when the
     /// renderer has a window opacity < 1.0 configured, else the cheaper
@@ -349,9 +413,10 @@ pub struct TermWindow {
     /// valid for the whole focused period. Using a stale serial is exactly
     /// what triggers the compositor's "invalid arguments" protocol error.
     focus_serial: u32,
-    /// Whether the current press has moved enough to count as a drag. A press
-    /// + release with no motion is a *click*, which clears the selection; a
-    /// drag sets it. Set on press, tested on release.
+    /// Whether the current press has moved enough to count as a drag.
+    ///
+    /// A press + release with no motion is a *click*, which clears the
+    /// selection; a drag sets it. Set on press, tested on release.
     drag_moved: bool,
     /// Whether the left mouse button is currently held down. Motion only
     /// extends a selection while this is true — releasing the button ends the
@@ -440,8 +505,14 @@ impl TermWindow {
             })
             .map_err(Error::ReaderSpawn)?;
 
-        let (compositor, shm, wm_base, seat, output, data_device_manager) =
-            Registry::discover(&mut sender, &mut events)?;
+        let Globals {
+            compositor,
+            shm,
+            wm_base,
+            seat,
+            output,
+            data_device_manager,
+        } = Registry::discover(&mut sender, &mut events)?;
         // Ask the compositor what buffer scale this output actually wants
         // (1 = normal DPI, 2 = HiDPI @2x, ...) *before* building the renderer,
         // so the font rasterizes at native pixel density instead of being
@@ -493,6 +564,11 @@ impl TermWindow {
             MessageBuilder::new(xdg_surface, XdgSurfaceRequest::GetToplevel).new_id(toplevel),
         )?;
         sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetTitle).string(title))?;
+        // Also advertise a fixed app_id. The title is human-facing and shells
+        // rewrite it at runtime (OSC 0/2), so it's a poor match key; app_id is
+        // stable, letting tools (e.g. scripts/stress/resize_storm.sh) target
+        // *this* window without also grabbing whatever terminal launched it.
+        sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetAppId).string(APP_ID))?;
         sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
 
         let cursor = cursor::Cursor::create(&mut sender, shm, compositor, scale).ok();
@@ -641,13 +717,19 @@ impl TermWindow {
                 }
             }
             // Keep the cell mirror in sync so selection/highlight/extraction
-            // always reflect the latest drawn content.
+            // always reflect the latest drawn content. `clone_from` (rather
+            // than `row.cells.clone()` + assign) reuses the existing row
+            // Vec's heap allocation when its capacity already fits -- the
+            // overwhelmingly common case, since a row's width doesn't change
+            // between snapshots -- instead of allocating a fresh Vec and
+            // dropping the old one on every single dirty row of every
+            // snapshot.
             for row in &snap.rows {
                 let r = usize::from(row.row);
                 if self.cell_mirror.len() <= r {
                     self.cell_mirror.resize(r + 1, Vec::new());
                 }
-                self.cell_mirror[r] = row.cells.clone();
+                self.cell_mirror[r].clone_from(&row.cells);
             }
             // Feed the cursor animator the grid's authoritative cursor state
             // -- this is what lets it start a slide even on a frame where no
@@ -729,8 +811,8 @@ impl TermWindow {
                 line.len().saturating_sub(1)
             };
             let mut s = String::new();
-            for col in c0..=c1.min(line.len().saturating_sub(1)) {
-                let cell = line[col];
+            let end = c1.min(line.len().saturating_sub(1));
+            for cell in &line[c0..=end] {
                 if !cell.spacer {
                     s.push(cell.ch);
                 }
@@ -1355,6 +1437,40 @@ impl TermWindow {
     /// backbuffer (clean, un-highlighted pixels). Called before tinting the
     /// current selection and after clearing one, so the highlight is
     /// idempotent (never compounds across frames) and fully reversible.
+    /// Remap overlay-tracking row indices through the pixel-scrolls that
+    /// `blit_snapshot` performed this frame. Each scroll `(top, bot, delta)`
+    /// shifted the backbuffer scanlines for rows `top..=bot` up by `delta`, so
+    /// a tracked row `r` in that band now lives at `r - delta`. A row that
+    /// scrolled above `top` (i.e. `r - delta < top`) is gone from the visible
+    /// backbuffer entirely and needs no cleanup; drop it. Rows outside the
+    /// band are untouched. Applied in the same order the scrolls happened so
+    /// multiple scrolls in one frame compose correctly.
+    fn shift_overlay_rows(rows: &mut Vec<u16>, scrolls: &[(u16, u16, u16)]) {
+        for &(top, bot, delta) in scrolls {
+            rows.retain_mut(|r| {
+                if *r >= top && *r <= bot {
+                    if *r < top + delta {
+                        // Scrolled off the top of the band; nothing to clean.
+                        return false;
+                    }
+                    *r -= delta;
+                }
+                true
+            });
+        }
+    }
+
+    /// Add every row of each pixel-scrolled band `[top, bot]` to `touched`.
+    /// A `copy_within` in the backbuffer rewrote all those rows, but the shm
+    /// frame slots aren't scrolled -- they're the actually-presented pixels --
+    /// so each moved row must be copied backbuffer->shm and damaged this frame,
+    /// even though only the new bottom rows appear in the snapshot's dirty set.
+    fn extend_with_scrolled_bands(touched: &mut Vec<u16>, scrolls: &[(u16, u16, u16)]) {
+        for &(top, bot, _delta) in scrolls {
+            touched.extend(top..=bot);
+        }
+    }
+
     fn repaint_rows(&mut self, rows: &[u16]) {
         let cols = (self.width / self.cell_w).max(1) as u16;
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
@@ -1379,7 +1495,7 @@ impl TermWindow {
         let Some(((_, ar), (_, br))) = self.selection else {
             return Vec::new();
         };
-        let rows = (self.height / self.cell_h).max(1) as i32;
+        let rows = (self.height / self.cell_h).max(1);
         let lo = ar.min(br).max(0);
         let hi = ar.max(br).min(rows - 1);
         if lo > hi {
@@ -1413,7 +1529,7 @@ impl TermWindow {
         const INV: u32 = 255 - ALPHA;
 
         let cols = (self.width / self.cell_w).max(1) as u16;
-        let rows = (self.height / self.cell_h).max(1) as i32;
+        let rows = (self.height / self.cell_h).max(1);
         let buf_w = self.width as usize;
 
         // Clamp the signed selection span to the visible rows — off-screen
@@ -1505,7 +1621,32 @@ impl TermWindow {
                 let now = std::time::Instant::now();
                 if now.duration_since(self.frame_stats.last_log).as_secs_f32() >= 1.0 {
                     self.frame_stats.last_log = now;
-                    eprintln!("terminal: {:.1} fps", self.frame_stats.fps());
+                    let fps = self.frame_stats.fps();
+                    let busy_us = self.frame_stats.drain_busy_us();
+                    // Frame interval at this fps, in microseconds. `busy_us`
+                    // is CPU time actually spent in maybe_present; the rest of
+                    // the interval was spent blocked on `wl_callback.done`.
+                    let interval_us = if fps > 0.0 {
+                        1_000_000.0 / f64::from(fps)
+                    } else {
+                        0.0
+                    };
+                    let bound = if interval_us > 0.0 && busy_us / interval_us > 0.6 {
+                        "CPU-bound"
+                    } else {
+                        "compositor-bound"
+                    };
+                    let backlog = self.frame_stats.max_backlog_since_log;
+                    let no_slot = self.frame_stats.skipped_no_slot;
+                    let not_ready = self.frame_stats.skipped_not_ready;
+                    self.frame_stats.max_backlog_since_log = 0;
+                    self.frame_stats.skipped_no_slot = 0;
+                    self.frame_stats.skipped_not_ready = 0;
+                    eprintln!(
+                        "terminal: {fps:.1} fps | present-busy {busy_us:.0} us/frame \
+                         (interval {interval_us:.0} us) -> {bound} | backlog max {backlog} | \
+                         skipped no-slot {no_slot} not-ready {not_ready}"
+                    );
                 }
                 Vec::new()
             }
@@ -1547,26 +1688,85 @@ impl TermWindow {
             return Ok(());
         }
         self.apply_pending_resize()?;
+        self.frame_stats.note_backlog(self.pending_dirty.len());
         if !self.dirty || !self.frame_ready {
+            if self.dirty && !self.frame_ready {
+                self.frame_stats.skipped_not_ready += 1;
+            }
             return Ok(());
         }
         let Some(slot) = self.frames.iter().position(|f| f.free) else {
+            self.frame_stats.skipped_no_slot += 1;
             return Ok(());
         };
         self.frames[slot].free = false;
+        // Time the real work below (blit + shm copy + damage), excluding the
+        // early-return checks and the compositor wait that gated us getting
+        // here. See `FrameStats::record_busy`.
+        let present_start = std::time::Instant::now();
 
         // Blit pending dirty snapshots into the persistent backbuffer, which
         // always holds the full image, then copy only the rows that actually
         // changed into the free shm frame -- tracked in `touched_rows` and
         // reconciled against `stale_rows` below.
         let pending = std::mem::take(&mut self.pending_dirty);
+        // Coalesce the whole backlog before blitting. Under a hard scroll flood
+        // the parser publishes ~30 snapshots per vsync -- each a full-band
+        // pixel-scroll (`scroll_span`) plus its freshly-revealed rows -- and
+        // the old `for snap in &pending` loop blitted every one: ~30 full-
+        // screen `copy_within` memmoves for a single presented frame (measured
+        // on niri: a 29-47 deep backlog took 17-23 ms in one present, flipping
+        // the loop CPU-bound and dropping 60 -> ~43 fps).
+        //
+        // `DirtySnapshot::compose` folds a run into one snapshot that, blitted
+        // once, reproduces the ordered result: same-band scrolls sum their
+        // deltas (N shifts of the band collapse to one shift of the summed
+        // delta) and rows merge last-writer-wins, relabelled up by later
+        // scrolls. A snapshot that can't compose (viewport repaint, geometry
+        // change, or a different scroll band) closes the current accumulator
+        // and starts a fresh one, so ordering across barriers is preserved.
+        let mut folded: Vec<grid::DirtySnapshot> = Vec::new();
+        for snap in pending {
+            let composed = folded.last_mut().is_some_and(|acc| acc.compose(&snap));
+            if !composed {
+                folded.push(snap);
+            }
+        }
         let mut touched_rows: Vec<u16> = Vec::new();
+        let mut scrolls: Vec<(u16, u16, u16)> = Vec::new();
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
-        for snap in &pending {
-            self.renderer.blit_snapshot(&mut canvas, snap);
+        for snap in &folded {
+            if let Some(scroll) = self.renderer.blit_snapshot(&mut canvas, snap) {
+                scrolls.push(scroll);
+            }
             touched_rows.extend(snap.rows.iter().map(|r| r.row));
         }
-        drop(canvas);
+        // `Canvas` borrows `self.backbuffer` mutably and holds no resources of
+        // its own (no `Drop` impl) -- this ends that borrow early so the code
+        // below can use `self` again; `drop()` here is a borrow-checker nudge,
+        // not resource cleanup.
+        let _ = canvas;
+        // A pixel-scroll `copy_within` shifted the backbuffer up -- and with it
+        // any overlay we baked last frame (cursor, selection, fps). The row
+        // lists that tell us where to repaint those clean now point one screen-
+        // position too low, so remap them by the same shift before use, or the
+        // dragged-up overlay pixels get left behind as a static imprint.
+        if !scrolls.is_empty() {
+            Self::shift_overlay_rows(&mut self.prev_cursor_rows, &scrolls);
+            Self::shift_overlay_rows(&mut self.prev_selection_rows, &scrolls);
+            Self::shift_overlay_rows(&mut self.prev_fps_rows, &scrolls);
+            // The pixel-scroll `copy_within` rewrote EVERY backbuffer row in
+            // the band `[top, bot]` (their content shifted up), but the
+            // snapshot's dirty rows -- what feeds `touched_rows` -- only cover
+            // the genuinely-new bottom rows, since the grid shifts its dirty
+            // marks up with the content. Without marking the whole band stale,
+            // the shifted rows never get re-copied from the backbuffer into the
+            // shm slots (which are the actual presented pixels), so the screen
+            // freezes everything except the bottom few new rows -- the "only a
+            // few lines scroll, the rest is stale" flood artifact. Mark the
+            // full band so every moved row is re-copied + damaged.
+            Self::extend_with_scrolled_bands(&mut touched_rows, &scrolls);
+        }
         // Selection highlight. Repaint the rows that *were* highlighted last
         // frame (clean), plus the rows the selection touches now (so a moved
         // drag doesn't double-tint), then tint the current selection. This
@@ -1616,9 +1816,20 @@ impl TermWindow {
         // message instead of one per row.
         let buf_w = self.width;
         let cols_bytes = buf_w as usize;
+        let cell_h = self.cell_h as usize;
+        // The buffer height need not be an exact multiple of cell_h -- the
+        // compositor hands us whatever configure size it likes. `stale_rows`
+        // only tracks whole cell rows (`height / cell_h`, floored), so the
+        // `height - row_count*cell_h` leftover scanlines at the very bottom
+        // belong to no row's band. When a stale run reaches the last tracked
+        // row, extend its copy + damage down to the true buffer bottom so that
+        // partial strip is filled too -- otherwise the freshly-mmap'd (zeroed)
+        // shm bottom shows through as a blank line.
+        let buf_h = self.height as usize;
         let dst = self.shm_mem.pixels(slot);
         let stale = &mut self.stale_rows[slot];
-        let mut damage_rects: Vec<(i32, i32)> = Vec::new(); // (row_start, row_count)
+        let last_row = stale.len().saturating_sub(1);
+        let mut damage_rects: Vec<(i32, i32)> = Vec::new(); // (y_px, height_px)
         let mut row = 0usize;
         while row < stale.len() {
             if !stale[row] {
@@ -1626,20 +1837,27 @@ impl TermWindow {
                 continue;
             }
             let run_start = row;
+            let mut reaches_bottom = false;
             while row < stale.len() && stale[row] {
                 stale[row] = false;
+                if row == last_row {
+                    reaches_bottom = true;
+                }
                 row += 1;
             }
-            let run_len = row - run_start;
-            let src_off = run_start * self.cell_h as usize * cols_bytes;
-            let len = run_len * self.cell_h as usize * cols_bytes;
+            let y0 = run_start * cell_h;
+            // The run's natural pixel end, stretched to the real buffer bottom
+            // when it includes the last row so the sub-cell remainder is caught.
+            let y1 = if reaches_bottom { buf_h } else { row * cell_h };
+            let src_off = y0 * cols_bytes;
+            let len = (y1 - y0) * cols_bytes;
             if let (Some(src_slice), Some(dst_slice)) = (
                 self.backbuffer.get(src_off..src_off + len),
                 dst.get_mut(src_off..src_off + len),
             ) {
                 dst_slice.copy_from_slice(src_slice);
             }
-            damage_rects.push((run_start as i32, run_len as i32));
+            damage_rects.push((y0 as i32, (y1 - y0) as i32));
         }
 
         let buf = self.frames[slot].buffer;
@@ -1649,13 +1867,13 @@ impl TermWindow {
                 .i32(0)
                 .i32(0),
         );
-        for (row_start, row_count) in damage_rects {
+        for (y_px, height_px) in damage_rects {
             self.window_tx.request(
                 MessageBuilder::new(self.surface, SurfaceRequest::Damage)
                     .i32(0)
-                    .i32(row_start * self.cell_h)
+                    .i32(y_px)
                     .i32(buf_w)
-                    .i32(row_count * self.cell_h),
+                    .i32(height_px),
             );
         }
         let cb: CallbackId = self.window_tx.alloc_id();
@@ -1667,44 +1885,45 @@ impl TermWindow {
 
         self.frame_ready = false;
         self.dirty = false;
+        self.frame_stats.record_busy(present_start.elapsed());
         Ok(())
     }
 
     fn resize(&mut self, w: i32, h: i32) -> Result<()> {
-        // Destroy the old buffers and pool first. The server answers each with
-        // `wl_display.delete_id`, which recycles those ids — without this, every
-        // resize step leaks 3 ids (pool + 2 buffers) until the block is gone.
+        // Destroy only the old *buffers* — the pool itself is reused. The server
+        // answers each Destroy with `wl_display.delete_id`, which recycles those
+        // ids; without it every resize step would leak 2 buffer ids. (Before,
+        // the pool was destroyed and rebuilt too, which also re-`mmap`ped and
+        // re-sent the shm fd on every drag frame — now avoided.)
         for frame in &self.frames {
             self.window_tx
                 .request(MessageBuilder::new(frame.buffer, BufferRequest::Destroy));
         }
-        self.window_tx
-            .request(MessageBuilder::new(self.pool, ShmPoolRequest::Destroy));
 
-        self.shm_mem = ShmBuffer::new(w as usize, h as usize, 2)
+        // Grow the existing pool in place instead of tearing it down: `ftruncate`
+        // the memfd + `mremap` our mapping, and only when it actually grew tell
+        // the compositor via `wl_shm_pool.resize`. A shrink keeps the oversized
+        // pool and skips the round-trip entirely (lazy shrink). Either way the
+        // shm fd is never re-sent, so a resize storm stops thrashing the pool.
+        let grew = self
+            .shm_mem
+            .resize(w as usize, h as usize)
             .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
         let stride = w * 4;
 
-        // Route the whole pool+buffer sequence through the `window_tx` MPSC ring
-        // so it stays correctly ordered with any already-queued present
-        // requests (Attach/Damage/Frame/Commit). `create_pool` carries the shm
-        // fd, so we `dup_fd` it and hand ownership to the ring (the original fd
-        // stays open for our mmap).
-        let pool: PoolId = self.window_tx.alloc_id();
-        let dup = self
-            .shm_mem
-            .dup_fd()
-            .map_err(|e| Error::Conn(ConnError::Io(e)))?;
-        let pool_msg = MessageBuilder::new(self.shm, ShmRequest::CreatePool)
-            .new_id(pool)
-            .i32(self.shm_mem.size_bytes() as i32)
-            .finish();
-        self.window_tx.send_with_fds(pool_msg, vec![dup]);
+        if let Some(new_cap) = grew {
+            // Route the resize through the same `window_tx` MPSC ring as the
+            // buffer creates below so it stays ordered ahead of them (the pool
+            // must be big enough before the new buffers are carved out of it).
+            self.window_tx.request(
+                MessageBuilder::new(self.pool, ShmPoolRequest::Resize).i32(new_cap as i32),
+            );
+        }
 
         for (i, frame) in self.frames.iter_mut().enumerate() {
             let buffer: BufferId = self.window_tx.alloc_id();
             self.window_tx.request(
-                MessageBuilder::new(pool, ShmPoolRequest::CreateBuffer)
+                MessageBuilder::new(self.pool, ShmPoolRequest::CreateBuffer)
                     .new_id(buffer)
                     .i32(self.shm_mem.frame_offset(i) as i32)
                     .i32(w)
@@ -1734,7 +1953,7 @@ impl TermWindow {
         }
         self.backbuffer = new_back;
 
-        self.pool = pool;
+        // `self.pool` is unchanged — we reuse it across resizes now.
         self.width = w;
         self.height = h;
         self.dirty = true;
@@ -1775,6 +1994,19 @@ impl TermWindow {
 
 struct Registry;
 
+/// The core globals [`Registry::discover`] binds off the wire. Grouped into
+/// a named tuple struct (rather than a bare 6-tuple) purely to give clippy's
+/// `type_complexity` lint something readable to point at -- destructured at
+/// the one call site exactly like the tuple it replaced.
+struct Globals {
+    compositor: CompositorId,
+    shm: ShmId,
+    wm_base: WmBaseId,
+    seat: SeatId,
+    output: Option<OutputId>,
+    data_device_manager: Option<DataDeviceManagerId>,
+}
+
 impl Registry {
     /// Bind the globals every window needs off the wire, including (if the
     /// compositor advertises one) the first `wl_output` -- so
@@ -1784,17 +2016,7 @@ impl Registry {
     ///
     /// Was a free `bind_globals(sender, events)` function -- moved onto
     /// `Registry` as its entry point.
-    fn discover(
-        sender: &mut Sender,
-        events: &mut Consumer<Event>,
-    ) -> Result<(
-        CompositorId,
-        ShmId,
-        WmBaseId,
-        SeatId,
-        Option<OutputId>,
-        Option<DataDeviceManagerId>,
-    )> {
+    fn discover(sender: &mut Sender, events: &mut Consumer<Event>) -> Result<Globals> {
         let registry: RegistryId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
@@ -1866,14 +2088,14 @@ impl Registry {
                 }
             }
         }
-        Ok((
-            compositor.ok_or(Error::ReaderStopped)?,
-            shm.ok_or(Error::ReaderStopped)?,
-            wm_base.ok_or(Error::ReaderStopped)?,
-            seat.ok_or(Error::ReaderStopped)?,
+        Ok(Globals {
+            compositor: compositor.ok_or(Error::ReaderStopped)?,
+            shm: shm.ok_or(Error::ReaderStopped)?,
+            wm_base: wm_base.ok_or(Error::ReaderStopped)?,
+            seat: seat.ok_or(Error::ReaderStopped)?,
             output,
             data_device_manager,
-        ))
+        })
     }
 
     /// Read `output`'s advertised buffer scale via `wl_display.sync`: send a
@@ -1950,5 +2172,70 @@ impl Registry {
                 .new_id(new_obj),
         )?;
         Ok(new_obj)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TermWindow;
+
+    #[test]
+    fn scrolled_band_marks_every_moved_row_touched_not_just_new_ones() {
+        // Regression: a fast-scroll frame's snapshot only lists the genuinely-
+        // new bottom rows as dirty (the grid shifts its dirty marks up with the
+        // content). But the pixel-scroll copy_within rewrote the WHOLE band in
+        // the backbuffer, and the shm slots aren't scrolled, so every moved row
+        // must be re-copied. If only the new rows were marked, the screen would
+        // freeze all but the bottom few lines -- the reported flood artifact.
+        let mut touched = vec![9u16, 10, 11]; // the 3 new bottom rows
+        TermWindow::extend_with_scrolled_bands(&mut touched, &[(0, 11, 3)]);
+        touched.sort_unstable();
+        touched.dedup();
+        // The full band 0..=11 must now be present, not just 9,10,11.
+        assert_eq!(touched, (0u16..=11).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn shift_overlay_rows_remaps_the_cursor_imprint_up_by_the_scroll() {
+        // A cursor baked at row 5 last frame. This frame the whole screen
+        // (rows 0..=9) pixel-scrolled up by 1, so the imprint now lives at
+        // row 4 -- that's where we must repaint clean, not row 5.
+        let mut rows = vec![5u16];
+        TermWindow::shift_overlay_rows(&mut rows, &[(0, 9, 1)]);
+        assert_eq!(rows, vec![4]);
+    }
+
+    #[test]
+    fn shift_overlay_rows_drops_rows_scrolled_off_the_top() {
+        // A row inside the shifted band but within `delta` of its top scrolled
+        // off-screen entirely; there's nothing left to clean, so it's dropped.
+        let mut rows = vec![0u16, 1, 2];
+        TermWindow::shift_overlay_rows(&mut rows, &[(0, 9, 2)]);
+        // row 0,1 scrolled off (0-2 < 0, 1-2 < 0); row 2 -> 0.
+        assert_eq!(rows, vec![0]);
+    }
+
+    #[test]
+    fn shift_overlay_rows_leaves_rows_outside_the_band_untouched() {
+        // Only rows 3..=6 scrolled; a tracked row above/below the band keeps
+        // its position.
+        let mut rows = vec![1u16, 5, 8];
+        TermWindow::shift_overlay_rows(&mut rows, &[(3, 6, 1)]);
+        assert_eq!(rows, vec![1, 4, 8]);
+    }
+
+    #[test]
+    fn shift_overlay_rows_composes_multiple_scrolls_in_order() {
+        // Two scrolls in one frame compose: row 7 -> 6 -> 5.
+        let mut rows = vec![7u16];
+        TermWindow::shift_overlay_rows(&mut rows, &[(0, 9, 1), (0, 9, 1)]);
+        assert_eq!(rows, vec![5]);
+    }
+
+    #[test]
+    fn shift_overlay_rows_noop_without_scrolls() {
+        let mut rows = vec![2u16, 4];
+        TermWindow::shift_overlay_rows(&mut rows, &[]);
+        assert_eq!(rows, vec![2, 4]);
     }
 }

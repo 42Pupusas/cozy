@@ -58,6 +58,55 @@ impl Color {
         let b = (u32::from(self.b) * a) / 255;
         (a << 24) | (r << 16) | (g << 8) | b
     }
+
+    /// Composite an anti-aliased glyph edge pixel: `glyph_a/255` coverage of
+    /// opaque ink (`self`, the foreground) over a `bg` background that is
+    /// itself translucent at `bg_alpha/255` (the window opacity). Returns a
+    /// plain packed RGB word (top byte ignored, i.e. XRGB8888) when
+    /// `bg_alpha == 255` -- byte-identical to the original (pre-M10) blend --
+    /// or a **premultiplied** ARGB8888 word otherwise, per `wl_shm`'s wire
+    /// format.
+    ///
+    /// Was a free `blend(bg, fg, glyph_a, bg_alpha)` function in
+    /// `render.rs` -- moved onto `Color` (the foreground ink) since it's
+    /// fundamentally a color-compositing operation, not a renderer concern.
+    #[must_use]
+    pub fn blend_glyph(self, bg: Color, glyph_a: u8, bg_alpha: u8) -> u32 {
+        let fg = self;
+        if bg_alpha == 255 {
+            return bg.blend_opaque_to(fg, glyph_a);
+        }
+        // Ink is opaque; the window glass shows through the uncovered fraction.
+        // Porter-Duff "ink over glass", composited directly in premultiplied space.
+        let ink_a = f64::from(glyph_a) / 255.0;
+        let glass_a = f64::from(bg_alpha) / 255.0;
+        let uncovered = glass_a * (1.0 - ink_a);
+        let out_a = ink_a + uncovered;
+        let pr = f64::from(fg.r).mul_add(ink_a, f64::from(bg.r) * uncovered);
+        let pg = f64::from(fg.g).mul_add(ink_a, f64::from(bg.g) * uncovered);
+        let pb = f64::from(fg.b).mul_add(ink_a, f64::from(bg.b) * uncovered);
+        let a8 = (out_a * 255.0).round() as u32;
+        let r8 = pr.round() as u32;
+        let g8 = pg.round() as u32;
+        let b8 = pb.round() as u32;
+        (a8 << 24) | (r8 << 16) | (g8 << 8) | b8
+    }
+
+    /// The original (pre-transparency) linear-interpolate `self` to `to` by
+    /// `alpha/255`, packed as XRGB8888. Split out of [`Color::blend_glyph`]
+    /// so the opaque path (the overwhelmingly common case) stays exactly as
+    /// before.
+    ///
+    /// Was a free `blend_opaque(from, to, alpha)` function in `render.rs`.
+    #[must_use]
+    pub fn blend_opaque_to(self, to: Color, alpha: u8) -> u32 {
+        let from = self;
+        let a = u32::from(alpha);
+        let r = (u32::from(from.r) * (255 - a) + u32::from(to.r) * a) / 255;
+        let g = (u32::from(from.g) * (255 - a) + u32::from(to.g) * a) / 255;
+        let b = (u32::from(from.b) * (255 - a) + u32::from(to.b) * a) / 255;
+        (r << 16) | (g << 8) | b
+    }
 }
 
 /// A handful of named colors so call sites read in words, not hex.

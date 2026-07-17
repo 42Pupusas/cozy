@@ -319,7 +319,7 @@ fn config_error_display_invalid_value() {
 #[test]
 fn config_error_source_present_for_io_and_toml_only() {
     use std::error::Error as _;
-    let io_err = ConfigError::Io(std::io::Error::new(std::io::ErrorKind::Other, "x"));
+    let io_err = ConfigError::Io(std::io::Error::other("x"));
     assert!(io_err.source().is_some());
 
     let invalid = ConfigError::InvalidValue {

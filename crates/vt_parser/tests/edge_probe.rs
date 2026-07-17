@@ -35,7 +35,7 @@ fn esc_aborts_partial_csi() {
     assert_eq!(events, vec![CsiAction::CursorUp(3)]);
 }
 
-/// A sequence split across feed() calls must reassemble.
+/// A sequence split across `feed()` calls must reassemble.
 #[test]
 fn csi_split_across_feeds() {
     let mut p = Parser::new();

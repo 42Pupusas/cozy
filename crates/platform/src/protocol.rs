@@ -183,6 +183,10 @@ requests! {
         CreateBuffer = 0,
         /// Destroy the pool and free the fd (v3+).
         Destroy = 1,
+        /// Grow the pool to a new (larger) byte size after the backing fd has
+        /// been `ftruncate`d. The compositor re-maps to match; the size may
+        /// only ever increase.
+        Resize = 2,
     }
 }
 
@@ -222,6 +226,10 @@ requests! {
     ToplevelRequest {
         Destroy = 0,
         SetTitle = 2,
+        /// Stable, machine-facing identifier (app_id) the compositor uses for
+        /// window rules / matching — distinct from the human-facing title,
+        /// which apps overwrite at runtime via OSC.
+        SetAppId = 3,
     }
 }
 

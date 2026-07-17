@@ -1,4 +1,4 @@
-//! `text_layout::Layouter::layout`: segmentation + BiDi + line-breaking.
+//! `text_layout::Layouter::layout`: segmentation + `BiDi` + line-breaking.
 //!
 //! Separate from the VT pipeline corpora above (those are byte streams with
 //! escape sequences; layout wants plain text paragraphs), so this file uses
@@ -26,7 +26,7 @@ const CJK_PARAGRAPH: &str =
 const BIDI_PARAGRAPH: &str =
     "Hello שלום world مرحبا text with mixed English, Hebrew, and Arabic runs 123 456.";
 
-fn fixtures() -> &'static [(&'static str, &'static str)] {
+const fn fixtures() -> &'static [(&'static str, &'static str)] {
     &[
         ("ascii", ASCII_PARAGRAPH),
         ("cjk", CJK_PARAGRAPH),

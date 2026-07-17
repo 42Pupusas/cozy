@@ -17,7 +17,7 @@ fn cursor_down_u16_max_no_overflow() {
     assert_eq!(g.cursor().1, 23);
 }
 
-/// CUD with cursor already at the bottom: `row + n` exceeds u16::MAX.
+/// CUD with cursor already at the bottom: `row + n` exceeds `u16::MAX`.
 #[test]
 fn cursor_down_from_bottom_u16_overflow() {
     let mut g = Grid::new(80, 24);
@@ -25,7 +25,7 @@ fn cursor_down_from_bottom_u16_overflow() {
     assert_eq!(g.cursor().1, 23);
 }
 
-/// CUF with cursor already at the right edge: `col + n` exceeds u16::MAX.
+/// CUF with cursor already at the right edge: `col + n` exceeds `u16::MAX`.
 #[test]
 fn cursor_forward_from_edge_u16_overflow() {
     let mut g = Grid::new(80, 24);
@@ -33,15 +33,15 @@ fn cursor_forward_from_edge_u16_overflow() {
     assert_eq!(g.cursor().0, 79);
 }
 
-/// ECH with cursor at right edge: `col + n` exceeds u16::MAX.
+/// ECH with cursor at right edge: `col + n` exceeds `u16::MAX`.
 #[test]
 fn erase_chars_from_edge_u16_overflow() {
     let mut g = Grid::new(80, 24);
     feed(&mut g, b"\x1b[1;80H\x1b[65535X");
 }
 
-/// LF at the bottom with a huge preceding CUD; also tab near u16::MAX col is
-/// impossible, but `(col/8+1)*8` can overflow if col is near u16::MAX via a
+/// LF at the bottom with a huge preceding CUD; also tab near `u16::MAX` col is
+/// impossible, but `(col/8+1)*8` can overflow if col is near `u16::MAX` via a
 /// 65535-wide resize — cheap to guard anyway.
 #[test]
 fn cursor_next_line_from_bottom_u16_overflow() {
@@ -201,7 +201,7 @@ fn device_attributes_replies() {
     assert_eq!(replies, b"\x1b[?6c");
 }
 
-/// take_replies must drain -- a second call before any new query returns empty.
+/// `take_replies` must drain -- a second call before any new query returns empty.
 #[test]
 fn take_replies_drains_buffer() {
     let mut g = Grid::new(80, 24);

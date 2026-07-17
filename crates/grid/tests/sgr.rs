@@ -1,6 +1,11 @@
 //! Coverage for `Grid::apply_sgr` (CSI `m`) — every attribute on/off toggle,
 //! every color mode, and the multi-attribute-in-one-sequence path.
 
+// Test bodies convert small, already-range-checked SGR param deltas (e.g.
+// `n - 30` for a loop over `n in 30..=37`) into `u8` color indices --
+// genuinely always in range, so the pedantic truncation lint is noise here.
+#![allow(clippy::cast_possible_truncation)]
+
 use grid::{Color, Grid};
 use vt_parser::Parser;
 

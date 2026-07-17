@@ -14,7 +14,7 @@ use crate::id::{BufferId, CompositorId, ShmId, SurfaceId};
 use crate::protocol::{CompositorRequest, Format, ShmPoolRequest, ShmRequest, SurfaceRequest};
 use crate::sys::ShmBuffer;
 use crate::wire::MessageBuilder;
-use crate::xcursor::{self, CursorImage};
+use crate::xcursor::CursorImage;
 
 /// Width and height of the built-in fallback cursor bitmap, in pixels.
 pub const FALLBACK_SIZE: i32 = 16;
@@ -74,7 +74,7 @@ impl Cursor {
         compositor: CompositorId,
         scale: i32,
     ) -> Result<Self> {
-        let image = xcursor::load_system_pointer(scale);
+        let image = CursorImage::load_system_pointer(scale);
         let (width, height, hotspot_x, hotspot_y) = match &image {
             Some(img) => (
                 img.width as i32,

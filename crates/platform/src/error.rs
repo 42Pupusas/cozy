@@ -95,7 +95,7 @@ mod tests {
 
     #[test]
     fn display_reader_spawn_includes_inner_io_error() {
-        let inner = io::Error::new(io::ErrorKind::Other, "no threads");
+        let inner = io::Error::other("no threads");
         let e = Error::ReaderSpawn(inner);
         assert_eq!(e.to_string(), "failed to spawn reader thread: no threads");
     }
@@ -112,11 +112,7 @@ mod tests {
     fn source_present_only_for_conn_and_reader_spawn() {
         use std::error::Error as _;
         assert!(Error::Conn(ConnError::Closed).source().is_some());
-        assert!(
-            Error::ReaderSpawn(io::Error::new(io::ErrorKind::Other, "x"))
-                .source()
-                .is_some()
-        );
+        assert!(Error::ReaderSpawn(io::Error::other("x")).source().is_some());
         assert!(Error::ReaderStopped.source().is_none());
         assert!(Error::ReaderPanicked.source().is_none());
         assert!(
@@ -138,7 +134,7 @@ mod tests {
 
     #[test]
     fn from_sys_error_wraps_through_conn_sys_variant() {
-        let inner = SysError::Memfd(io::Error::new(io::ErrorKind::Other, "x"));
+        let inner = SysError::Memfd(io::Error::other("x"));
         let msg = inner.to_string();
         let e: Error = inner.into();
         match e {

@@ -81,6 +81,9 @@ const PROT_READ: i32 = 0x1;
 const PROT_WRITE: i32 = 0x2;
 const MAP_SHARED: i32 = 0x1;
 const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+/// `mremap` flag: allow the kernel to relocate the mapping if it can't grow it
+/// in place. Without it a grow that can't extend the current VMA fails.
+const MREMAP_MAYMOVE: i32 = 0x1;
 
 unsafe extern "C" {
     fn memfd_create(name: *const u8, flags: u32) -> RawFd;
@@ -94,6 +97,12 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut c_void;
     fn munmap(addr: *mut c_void, length: size_t) -> i32;
+    fn mremap(
+        old_address: *mut c_void,
+        old_size: size_t,
+        new_size: size_t,
+        flags: i32,
+    ) -> *mut c_void;
     fn timerfd_create(clockid: i32, flags: i32) -> RawFd;
     fn timerfd_settime(
         fd: RawFd,
@@ -345,6 +354,12 @@ pub struct ShmBuffer {
     /// Bytes in one frame (`frame_pixels * 4`).
     frame_bytes: usize,
     frames: usize,
+    /// Bytes actually backing the mapping / fd / server-side pool. Grows only
+    /// (never shrinks) so we can reuse the same `wl_shm_pool` across resizes:
+    /// on a shrink the logical `frame_bytes` drops but this stays put, so the
+    /// mapping and pool are left oversized and the extra space sits idle until
+    /// a later grow reclaims it. Always `>= frame_bytes * frames`.
+    capacity_bytes: usize,
     fd: OwnedFd,
 }
 
@@ -361,8 +376,12 @@ impl ShmBuffer {
 
         // memfd: an anonymous in-RAM file. Name is purely for debugging.
         let name = b"paint-shm\0";
-        // SAFETY: name is a valid NUL-terminated C string; flags = 0.
-        let raw = unsafe { memfd_create(name.as_ptr(), 0) };
+        // `MFD_CLOEXEC` (1): don't leak the shm fd into PTY-shell children. A
+        // child that inherits it keeps the pool alive; combined with a leaked
+        // Wayland socket that's what freezes the window after we exit.
+        const MFD_CLOEXEC: u32 = 0x0001;
+        // SAFETY: name is a valid NUL-terminated C string.
+        let raw = unsafe { memfd_create(name.as_ptr(), MFD_CLOEXEC) };
         if raw < 0 {
             return Err(SysError::Memfd(io::Error::last_os_error()));
         }
@@ -396,6 +415,7 @@ impl ShmBuffer {
             frame_pixels,
             frame_bytes,
             frames,
+            capacity_bytes: total_bytes,
             fd,
         })
     }
@@ -427,15 +447,70 @@ impl ShmBuffer {
         self.fd.as_fd()
     }
 
-    /// Duplicate the underlying fd for sending through the MPSC ring during
-    /// resize — the original must stay open for the `mmap` mapping.
+    /// Duplicate the underlying fd for sending through the MPSC ring — the
+    /// original must stay open for the `mmap` mapping. Kept for callers that
+    /// hand a fresh pool fd to the compositor; `resize` no longer re-sends the
+    /// fd (it grows the existing pool in place).
+    #[allow(dead_code)]
     pub fn dup_fd(&self) -> io::Result<OwnedFd> {
         self.fd.try_clone()
     }
 
-    /// Total pool size in bytes (all frames) — the `create_pool` size.
+    /// Total pool size in bytes — the `create_pool` / `wl_shm_pool.resize`
+    /// size. This is the *capacity* (grow-only), which after a lazy shrink is
+    /// larger than the `frame_bytes * frames` currently in use.
     pub fn size_bytes(&self) -> usize {
-        self.frame_bytes * self.frames
+        self.capacity_bytes
+    }
+
+    /// Re-shape the pool to hold `frames` frames of `width * height`, reusing
+    /// the existing mapping and fd instead of allocating a fresh pool.
+    ///
+    /// Returns `Some(new_capacity)` when the backing store had to *grow* — the
+    /// fd was `ftruncate`d up and the mapping `mremap`ped, so the caller must
+    /// issue a `wl_shm_pool.resize` to `new_capacity` before creating buffers
+    /// past the old end. Returns `None` when the new layout fit inside the
+    /// current capacity: the frame dimensions shrank (or held), the mapping is
+    /// untouched, and no server round-trip is needed (lazy shrink).
+    ///
+    /// Growth is generous — the capacity at least doubles — so a drag's stream
+    /// of resizes settles into `None` (no syscalls, no re-`mmap`) after the
+    /// first couple of steps.
+    pub fn resize(&mut self, width: usize, height: usize) -> Result<Option<usize>, SysError> {
+        let frame_pixels = width * height;
+        let frame_bytes = frame_pixels * 4;
+        let needed = frame_bytes * self.frames;
+        self.frame_pixels = frame_pixels;
+        self.frame_bytes = frame_bytes;
+
+        if needed <= self.capacity_bytes {
+            // Fits — keep the oversized mapping, skip the server round-trip.
+            return Ok(None);
+        }
+
+        // Grow-only, doubling so repeated small grows amortise to nothing.
+        let new_cap = needed.max(self.capacity_bytes.saturating_mul(2));
+
+        // SAFETY: fd is our own memfd; growing a memfd never truncates data.
+        if unsafe { ftruncate(self.fd.as_raw_fd(), new_cap as i64) } < 0 {
+            return Err(SysError::Ftruncate(io::Error::last_os_error()));
+        }
+        // SAFETY: `ptr`/`capacity_bytes` describe our live mapping; MAYMOVE lets
+        // the kernel relocate it if it can't extend in place.
+        let ptr = unsafe {
+            mremap(
+                self.ptr as *mut c_void,
+                self.capacity_bytes,
+                new_cap,
+                MREMAP_MAYMOVE,
+            )
+        };
+        if ptr == MAP_FAILED {
+            return Err(SysError::Mmap(io::Error::last_os_error()));
+        }
+        self.ptr = ptr as *mut u32;
+        self.capacity_bytes = new_cap;
+        Ok(Some(new_cap))
     }
 }
 
@@ -469,8 +544,12 @@ impl RepeatTimer {
     /// Create a disarmed `CLOCK_MONOTONIC` timerfd.
     pub fn new() -> Result<Self, SysError> {
         use std::os::fd::FromRawFd;
-        // SAFETY: a plain timerfd_create with no flags; we adopt the owned fd.
-        let raw = unsafe { timerfd_create(CLOCK_MONOTONIC, 0) };
+        // `TFD_CLOEXEC` (02000000): don't leak the key-repeat timerfd into
+        // PTY-shell children. Same close-on-exec hygiene as the shm memfd and
+        // the Wayland socket.
+        const TFD_CLOEXEC: i32 = 0o2_000_000;
+        // SAFETY: timerfd_create with a valid clock + CLOEXEC; we adopt the fd.
+        let raw = unsafe { timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC) };
         if raw < 0 {
             return Err(SysError::TimerfdCreate(io::Error::last_os_error()));
         }
@@ -537,7 +616,7 @@ mod tests {
     use std::os::fd::AsFd;
 
     fn io_err(msg: &str) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, msg.to_string())
+        io::Error::other(msg.to_string())
     }
 
     #[test]
@@ -635,6 +714,37 @@ mod tests {
             (*cmsg).cmsg_type = 99; // not SCM_RIGHTS
         }
         assert!(IncomingControl::fds(&buf).is_empty());
+    }
+
+    #[test]
+    fn shm_resize_grows_only_when_needed_and_shrinks_lazily() {
+        // Start small, then walk the size around to exercise grow + lazy shrink.
+        let mut shm = ShmBuffer::new(64, 64, 2).expect("initial alloc");
+        let cap0 = shm.size_bytes();
+        assert_eq!(cap0, 64 * 64 * 4 * 2);
+
+        // Growing past capacity re-truncates + remaps and reports the new size,
+        // which at least doubles (generous, amortised) growth.
+        let grew = shm.resize(200, 200).expect("grow");
+        let cap1 = grew.expect("grow should report a new capacity");
+        assert_eq!(cap1, shm.size_bytes());
+        assert!(cap1 >= 200 * 200 * 4 * 2);
+        assert!(cap1 >= cap0 * 2);
+
+        // The mapping must be writable across the full new frame at both slots.
+        shm.pixels(0)[200 * 200 - 1] = 0xdead_beef;
+        shm.pixels(1)[0] = 0x00c0_ffee;
+        assert_eq!(shm.pixels(0)[200 * 200 - 1], 0xdead_beef);
+
+        // Shrinking keeps the oversized pool: no re-map, no server round-trip.
+        assert!(shm.resize(100, 100).expect("shrink").is_none());
+        assert_eq!(shm.size_bytes(), cap1);
+        // frame_offset now reflects the smaller logical frame, still in-bounds.
+        assert_eq!(shm.frame_offset(1), 100 * 100 * 4);
+
+        // Growing again but still within the retained capacity stays lazy.
+        assert!(shm.resize(150, 150).expect("regrow within cap").is_none());
+        assert_eq!(shm.size_bytes(), cap1);
     }
 
     #[test]

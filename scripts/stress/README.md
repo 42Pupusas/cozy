@@ -65,10 +65,13 @@ sh scripts/stress/paste_flood.sh    # paste a big buffer into the window
 4. **`wide_unicode.sh`** — CJK / emoji heavy text, stressing `text_layout`,
    glyph-atlas growth, and the `Cell::wide`/`spacer` double-width path in
    `crates/grid`.
-5. **`resize_storm.sh`** — rapid resize events (needs `wmctrl`/`xdotool`, or
-   just drag-resize by hand), stressing `TermWindow::resize` which tears down
-   and recreates the whole shm pool + both buffers on every resize, plus grid
-   reflow.
+5. **`resize_storm.sh`** — rapid resize events (Wayland-aware: uses `niri msg`
+   on niri, `hyprctl` on Hyprland, or `swaymsg` on Sway, falling back to
+   `xdotool` on X11/XWayland; otherwise drag-resize by hand), stressing
+   `TermWindow::resize`. The pool now
+   grows in place and shrinks lazily instead of being rebuilt every frame, so
+   this confirms a resize flood no longer thrashes the shm pool; the grid
+   reflow in the parser thread still runs each step.
 6. **`alt_screen_thrash.sh`** — rapid `smcup`/`rmcup` (alternate screen)
    toggling, exercising grid mode switches and full-screen dirty snapshots.
 7. **`paste_flood.sh`** — generates a large text blob to clipboard-paste by

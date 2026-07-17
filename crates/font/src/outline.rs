@@ -251,6 +251,12 @@ impl Outline {
     ///
     /// Was a free `decode_composite(glyf_data, ..)` function -- moved onto
     /// `Outline` alongside its sibling `decode`/`decode_simple`.
+    ///
+    /// The four `x_min`/`y_min`/`x_max`/`y_max` bounds are the glyph's own
+    /// `glyf` table header fields, read once by the caller and threaded
+    /// through verbatim -- bundling them into a bounds struct would just
+    /// move the four fields to a call-site literal instead of removing them.
+    #[allow(clippy::too_many_arguments)]
     fn decode_composite(
         glyf_data: &[u8],
         d: &[u8],

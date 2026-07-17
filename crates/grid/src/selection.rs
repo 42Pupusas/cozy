@@ -95,7 +95,7 @@ impl Screen {
             return String::new();
         }
         let (start, end) = sel.ordered();
-        let cols = usize::from(self.cols());
+        let row_width = usize::from(self.cols());
         let total_rows = self.scrollback_len() + usize::from(self.rows());
         let mut out = String::new();
 
@@ -103,23 +103,25 @@ impl Screen {
             if abs_row >= total_rows {
                 break;
             }
-            let col0 = if abs_row == start.row {
+            let first_col = if abs_row == start.row {
                 usize::from(start.col)
             } else {
                 0
             };
-            let col1 = if abs_row == end.row {
+            let last_col = if abs_row == end.row {
                 usize::from(end.col)
             } else {
-                cols - 1
+                row_width - 1
             };
-            let col1 = col1.min(cols - 1);
+            let last_col = last_col.min(row_width - 1);
 
             // Gather the row's characters (skipping spacer halves of wide
             // glyphs, which carry a placeholder ' ' that would double-count).
             let mut line = String::new();
-            for col in col0..=col1 {
-                let cell = self.abs_cell(col as u16, abs_row);
+            for col in first_col..=last_col {
+                // Safe: `col` is bounded above by `row_width - 1`, and
+                // `row_width` came from `self.cols(): u16`.
+                let cell = self.abs_cell(u16::try_from(col).unwrap_or(u16::MAX), abs_row);
                 if cell.spacer {
                     continue;
                 }

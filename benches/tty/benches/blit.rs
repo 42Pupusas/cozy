@@ -16,6 +16,15 @@
 //! Run:
 //!   cargo bench -p tty-benches --bench blit
 
+// Buffer geometry (COLS/ROWS x a font's small cell_w/cell_h) never comes
+// close to i32/usize truncation or sign-loss range -- these casts mirror the
+// real renderer's own (also-allowed) geometry casts, not a real risk.
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+
 use divan::counter::ItemsCount;
 use grid::{DirtySnapshot, Grid};
 use platform::draw::Canvas;

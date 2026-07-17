@@ -9,12 +9,22 @@
 use crate::Cell;
 
 /// A rectangular grid of cells with optional scrollback.
+///
+/// The logical `[scrollback | visible]` window does NOT have to sit at the
+/// front of `buf`. It floats at physical row offset `head`, and `buf` is
+/// allocated with `scrollback_max` rows of *slack* past the maximum window
+/// size. This is what makes a sustained flood cheap: once scrollback is full,
+/// evicting the oldest line is just `head += 1` (the surviving rows never
+/// move), instead of an O(scrollback) slide-to-front on every single line --
+/// which turned a long flood quadratic and stalled it outright. When `head`
+/// walks off the end of the slack, we compact once (move the window back to
+/// row 0), giving amortized O(1) eviction.
 pub struct Screen {
-    /// All rows: `[scrollback rows ... | visible rows]`.
-    /// Visible area starts at `buf[scrollback_len..]`.
+    /// Backing store, `cap_rows(rows, scrollback_max)` rows tall. The live
+    /// window occupies physical rows `[head .. head + scrollback_len + rows)`.
     buf: Vec<Cell>,
     /// Per physical row: true if the line continues (soft-wrapped) onto the
-    /// next physical row. Parallel to rows in `buf`; length `total`.
+    /// next physical row. Parallel to rows in `buf`; same length as `buf/cols`.
     /// This is what lets `resize` reflow instead of clip.
     wrapped: Vec<bool>,
     cols: u16,
@@ -23,6 +33,10 @@ pub struct Screen {
     scrollback_max: usize,
     /// Current number of scrollback lines stored.
     scrollback_len: usize,
+    /// Physical row where the window (absolute row 0 = oldest scrollback row)
+    /// currently begins. Advanced cheaply on eviction; reset to 0 on compaction
+    /// and whenever the buffer is rebuilt (`resize`, `erase_scrollback`).
+    head: usize,
     /// Scroll region top (0-indexed, inclusive).
     scroll_top: u16,
     /// Scroll region bottom (0-indexed, inclusive).
@@ -30,8 +44,24 @@ pub struct Screen {
 }
 
 impl Screen {
+    /// Total rows to allocate: twice the biggest possible window
+    /// (`rows + scrollback_max`). The window is at most `rows + scrollback_max`
+    /// rows; the other half is slack the floating `head` advances into before a
+    /// compaction is needed. With `slack == rows + scrollback_max` and each
+    /// eviction advancing `head` by `n` rows, a compaction (which moves the whole
+    /// window, ~`rows + scrollback_max` rows) is amortized over ~`(rows +
+    /// scrollback_max) / n` evictions -> O(n) row-copies per scroll, never the
+    /// O(scrollback) slide-to-front that stalled sustained floods.
+    ///
+    /// Was a free `cap_rows(rows, scrollback_max)` function -- moved onto
+    /// `Screen` as an associated function since it computes a `Screen`
+    /// sizing invariant, not a standalone calculation.
+    fn cap_rows(rows: usize, scrollback_max: usize) -> usize {
+        2 * (rows + scrollback_max)
+    }
+
     pub fn new(cols: u16, rows: u16, scrollback_max: usize) -> Self {
-        let total = usize::from(rows) + scrollback_max;
+        let total = Self::cap_rows(usize::from(rows), scrollback_max);
         Self {
             buf: vec![Cell::default(); total * usize::from(cols)],
             wrapped: vec![false; total],
@@ -39,6 +69,7 @@ impl Screen {
             rows,
             scrollback_max,
             scrollback_len: 0,
+            head: 0,
             scroll_top: 0,
             scroll_bot: rows.saturating_sub(1),
         }
@@ -78,14 +109,17 @@ impl Screen {
     /// which operates across the whole `[scrollback | visible]` buffer.
     #[must_use]
     pub fn abs_cell(&self, col: u16, abs_row: usize) -> Cell {
-        let idx = abs_row * usize::from(self.cols) + usize::from(col);
+        let idx = (self.head + abs_row) * usize::from(self.cols) + usize::from(col);
         self.buf.get(idx).copied().unwrap_or_default()
     }
 
     /// Whether the row at absolute index `abs_row` soft-wraps onto the next.
     #[must_use]
     pub fn abs_wrapped(&self, abs_row: usize) -> bool {
-        self.wrapped.get(abs_row).copied().unwrap_or(false)
+        self.wrapped
+            .get(self.head + abs_row)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Get a cell `(col, row)` as seen through a viewport offset.
@@ -104,7 +138,7 @@ impl Screen {
         if abs_row < 0 {
             return Cell::default();
         }
-        let idx = abs_row as usize * usize::from(self.cols) + usize::from(col);
+        let idx = (self.head + abs_row as usize) * usize::from(self.cols) + usize::from(col);
         self.buf.get(idx).copied().unwrap_or_default()
     }
 
@@ -116,7 +150,7 @@ impl Screen {
 
     /// Mark (or clear) the soft-wrap continuation flag for a visible row.
     pub fn set_wrapped(&mut self, row: u16, wrapped: bool) {
-        let idx = self.scrollback_len + usize::from(row);
+        let idx = self.head + self.scrollback_len + usize::from(row);
         if idx < self.wrapped.len() {
             self.wrapped[idx] = wrapped;
         }
@@ -125,7 +159,7 @@ impl Screen {
     /// Whether a visible row soft-wraps onto the next.
     #[must_use]
     pub fn is_wrapped(&self, row: u16) -> bool {
-        let idx = self.scrollback_len + usize::from(row);
+        let idx = self.head + self.scrollback_len + usize::from(row);
         self.wrapped.get(idx).copied().unwrap_or(false)
     }
 
@@ -163,9 +197,13 @@ impl Screen {
 
     /// Clear entire visible area.
     pub fn clear(&mut self) {
-        let start = self.scrollback_len * usize::from(self.cols);
-        self.buf[start..].fill(Cell::default());
-        for w in &mut self.wrapped[self.scrollback_len..] {
+        let start = (self.head + self.scrollback_len) * usize::from(self.cols);
+        let end =
+            (self.head + self.scrollback_len + usize::from(self.rows)) * usize::from(self.cols);
+        self.buf[start..end].fill(Cell::default());
+        for w in &mut self.wrapped[self.head + self.scrollback_len
+            ..self.head + self.scrollback_len + usize::from(self.rows)]
+        {
             *w = false;
         }
     }
@@ -180,20 +218,20 @@ impl Screen {
             return;
         }
         let cols = usize::from(self.cols);
-        let sb = self.scrollback_len;
+        let vis_start = self.head + self.scrollback_len;
         let vis_cells = usize::from(self.rows) * cols;
-        // Move the visible block down to the front of the buffer.
-        self.buf.copy_within(sb * cols..sb * cols + vis_cells, 0);
-        self.wrapped.copy_within(sb..sb + usize::from(self.rows), 0);
-        // Blank the now-stale region after the visible block (old scrollback
-        // tail + the fixed scrollback_max capacity region may hold leftovers).
-        let tail = vis_cells;
-        let cap = (usize::from(self.rows) + self.scrollback_max) * cols;
-        let buf_len = self.buf.len();
-        self.buf[tail..cap.min(buf_len)].fill(Cell::default());
+        // Move the visible block to the front of the buffer and re-anchor the
+        // window at head 0.
+        self.buf
+            .copy_within(vis_start * cols..vis_start * cols + vis_cells, 0);
+        self.wrapped
+            .copy_within(vis_start..vis_start + usize::from(self.rows), 0);
+        // Blank everything after the visible block (old scrollback + slack).
+        self.buf[vis_cells..].fill(Cell::default());
         for w in &mut self.wrapped[usize::from(self.rows)..] {
             *w = false;
         }
+        self.head = 0;
         self.scrollback_len = 0;
     }
 
@@ -231,58 +269,60 @@ impl Screen {
         // Never scroll by more than the region height.
         let n = n.min(bot_i - top_i);
 
-        // How many scrolled-off lines genuinely enter scrollback. Only a
+        // Does this scroll rotate content through scrollback history? Only a
         // top-region (top_i == 0) scroll on the primary screen (scrollback_max
-        // > 0) pushes history; DL and the alternate screen pass push_scrollback
-        // == false and never grow history.
-        let push = if push_scrollback && top_i == 0 && self.scrollback_max > 0 {
-            n.min(self.scrollback_max - self.scrollback_len)
-        } else {
-            0
-        };
+        // > 0) does; DL and the alternate screen pass push_scrollback == false
+        // and never touch history. NOTE: this must NOT be gated on there being
+        // *room to grow* history -- once scrollback is full the scroll still
+        // rotates (dropping the oldest line to make room for the new one). The
+        // old code selected the branch on `push > 0`, which became 0 when full,
+        // so a full-scrollback flood silently discarded every scrolled-off line
+        // instead of rotating it in -- history froze at its fill point and the
+        // rest of the output was lost.
+        let rotates_history = push_scrollback && top_i == 0 && self.scrollback_max > 0;
 
         let vis_rows = bot_i - top_i + 1;
         let keep = vis_rows - n;
         let base = self.scrollback_len;
 
-        if push > 0 {
-            // Rebuild the [scrollback | visible-region] window explicitly. It
-            // currently occupies [0 .. base + vis_rows):
-            //   [ S(0..base) | v0 v1 ... v(vis_rows-1) ]
-            // Scrolling up by `n` moves the top `n` visible rows into scrollback
-            // and pulls `n` blank rows in at the bottom:
-            //   [ S(0..base) v0..v(n-1) | v(n)..v(vis_rows-1) B..B ]
-            // then scrollback is capped at scrollback_max by dropping its OLDEST
-            // rows from the front.
-            let region_start = base * cols;
-            let region_end = (base + vis_rows) * cols;
-
-            // New scrollback = old scrollback + the n scrolled-off visible rows.
-            let mut cells: Vec<Cell> = Vec::with_capacity((base + vis_rows) * cols);
-            let mut wrap: Vec<bool> = Vec::with_capacity(base + vis_rows);
-            cells.extend_from_slice(&self.buf[0..base * cols]); // old scrollback
-            wrap.extend_from_slice(&self.wrapped[0..base]);
-            cells.extend_from_slice(&self.buf[region_start..region_start + n * cols]); // scrolled off
-            wrap.extend_from_slice(&self.wrapped[base..base + n]);
-            // New visible = surviving rows + n blanks.
-            cells.extend_from_slice(&self.buf[region_start + n * cols..region_end]);
-            wrap.extend_from_slice(&self.wrapped[base + n..base + vis_rows]);
-            cells.resize(cells.len() + n * cols, Cell::default());
-            wrap.resize(wrap.len() + n, false);
-
-            // Cap scrollback: drop the oldest rows that overflow scrollback_max.
+        if rotates_history {
+            // History rotation is O(n), not O(scrollback). The top `n` visible
+            // rows become scrollback simply by GROWING the boundary
+            // (scrollback_len += n) -- the rows are already sitting in place, so
+            // nothing moves. If that overflows the cap, the oldest `drop_rows`
+            // rows are evicted by ADVANCING the floating window head
+            // (head += drop_rows); again nothing moves, the old rows just fall
+            // outside the window. Only the `n` freshly-exposed bottom rows are
+            // written (blanked). `head` may need to walk into slack; compact
+            // just before it would run past the buffer end.
             let new_base = (base + n).min(self.scrollback_max);
             let drop_rows = (base + n) - new_base;
 
-            let src_off = drop_rows * cols;
-            let out_rows = cells.len() / cols - drop_rows;
-            self.buf[..out_rows * cols].copy_from_slice(&cells[src_off..]);
-            self.wrapped[..out_rows].copy_from_slice(&wrap[drop_rows..]);
+            // Ensure the window can grow at the bottom without running off the
+            // end of the backing store; compact to the front if not. The
+            // highest physical row written is `head + drop_rows + new_base +
+            // vis_rows` == `head + base + n + vis_rows` (drop_rows + new_base ==
+            // base + n), so reserve that many rows from the current head BEFORE
+            // advancing it. (Amortized O(1): compaction fires only once per full
+            // traversal of the slack region.)
+            self.ensure_tail_room(base + n + vis_rows);
+
+            self.head += drop_rows;
             self.scrollback_len = new_base;
+
+            // Blank the `n` freshly-exposed rows at the bottom of the window.
+            let out_rows = new_base + vis_rows; // window rows in use, from head
+            let blank_from = self.head + out_rows - n;
+            let blank_to = self.head + out_rows;
+            self.buf[blank_from * cols..blank_to * cols].fill(Cell::default());
+            for w in &mut self.wrapped[blank_from..blank_to] {
+                *w = false;
+            }
         } else {
             // No scrollback involvement: shift the surviving rows up within the
-            // region in place, then blank the bottom n rows.
-            let region_top = base + top_i;
+            // region in place, then blank the bottom n rows. All indices are
+            // relative to the floating window (head + base + top_i).
+            let region_top = self.head + base + top_i;
             if keep > 0 {
                 self.buf.copy_within(
                     (region_top + n) * cols..(region_top + n + keep) * cols,
@@ -317,7 +357,7 @@ impl Screen {
         let n = usize::from(n);
         let top_i = usize::from(top);
         let bot_i = usize::from(bot);
-        let vis_off = self.scrollback_len;
+        let vis_off = self.head + self.scrollback_len;
 
         if n == 0 || top_i >= bot_i {
             return;
@@ -433,6 +473,9 @@ impl Screen {
         let total_old = self.scrollback_len + usize::from(self.rows);
         let cursor_abs = self.scrollback_len + usize::from(cursor.1);
         let cursor_col = usize::from(cursor.0);
+        // All source reads below are absolute logical rows [0 .. total_old);
+        // translate to physical rows through the floating window head.
+        let head = self.head;
 
         // 1. Stitch physical rows into logical lines via the wrapped flags,
         //    recording where the cursor falls.
@@ -444,13 +487,13 @@ impl Screen {
             let li = lines.len();
             let mut cells: Vec<Cell> = Vec::new();
             loop {
-                let base = r * old_cols;
+                let base = (head + r) * old_cols;
                 if r == cursor_abs {
                     cursor_line = li;
                     cursor_offset = cells.len() + cursor_col;
                 }
                 cells.extend_from_slice(&self.buf[base..base + old_cols]);
-                let cont = self.wrapped.get(r).copied().unwrap_or(false);
+                let cont = self.wrapped.get(head + r).copied().unwrap_or(false);
                 r += 1;
                 if !cont || r >= total_old {
                     break;
@@ -535,7 +578,7 @@ impl Screen {
         let dropped = overflow - new_sb_len;
         let visible_count = m - overflow;
 
-        let total = new_rows_u + self.scrollback_max;
+        let total = Self::cap_rows(new_rows_u, self.scrollback_max);
         let mut new_buf = vec![Cell::default(); total * new_cols_u];
         let mut new_wrapped = vec![false; total];
 
@@ -554,6 +597,8 @@ impl Screen {
 
         self.buf = new_buf;
         self.wrapped = new_wrapped;
+        // The rebuilt buffer packs the window at the front: re-anchor head.
+        self.head = 0;
         // Store the CLAMPED dimensions (>= 1): the buffer was allocated with
         // new_cols_u/new_rows_u, and a 0 here would desync the stride and
         // overflow every `cols - 1` / `rows - 1` elsewhere.
@@ -582,7 +627,7 @@ impl Screen {
     pub fn content_rows(&self) -> u16 {
         let cols = usize::from(self.cols);
         for row in (0..usize::from(self.rows)).rev() {
-            let start = (self.scrollback_len + row) * cols;
+            let start = (self.head + self.scrollback_len + row) * cols;
             if self.buf[start..start + cols]
                 .iter()
                 .any(|c| *c != Cell::default())
@@ -595,8 +640,36 @@ impl Screen {
 
     // ── private ───────────────────────────────────────────────────────────
 
+    /// Guarantee the window `[head .. head + window_rows)` fits within `buf`
+    /// with `head` unchanged, or slide the whole live window back to physical
+    /// row 0 (a compaction) if it would run off the end. `window_rows` is the
+    /// number of rows the window will occupy AFTER the pending growth.
+    ///
+    /// Compaction copies at most `window_rows` rows, and only fires once the
+    /// floating `head` has walked across the entire slack region, so the cost
+    /// is amortized to O(1) row-copies per evicted line -- the whole point of
+    /// the floating window over the old slide-to-front (which paid O(window)
+    /// on every single evicted line and stalled sustained floods).
+    fn ensure_tail_room(&mut self, window_rows: usize) {
+        let cols = usize::from(self.cols);
+        let cap = self.wrapped.len();
+        if self.head + window_rows <= cap {
+            return;
+        }
+        // Move the currently-live rows [head .. head + live) down to row 0.
+        // Only the rows already in use need to travel; the pending growth is
+        // blanked by the caller afterward.
+        let live = self.scrollback_len + usize::from(self.rows);
+        if self.head > 0 {
+            self.buf
+                .copy_within(self.head * cols..(self.head + live) * cols, 0);
+            self.wrapped.copy_within(self.head..self.head + live, 0);
+        }
+        self.head = 0;
+    }
+
     fn visible_row_start(&self, row: u16) -> usize {
-        (self.scrollback_len + usize::from(row)) * usize::from(self.cols)
+        (self.head + self.scrollback_len + usize::from(row)) * usize::from(self.cols)
     }
 
     fn visible_idx(&self, col: u16, row: u16) -> usize {
@@ -651,5 +724,111 @@ mod tests {
         assert_eq!(row_char(&s, 0), 'd');
         assert_eq!(row_char(&s, 1), 'e');
         assert_eq!(row_char(&s, 2), ' ');
+    }
+
+    #[test]
+    fn scroll_up_accumulates_history_up_to_scrollback_max() {
+        // cols=1, rows=2, scrollback_max=3. Each single-line scroll pushes the
+        // current top row into history until it saturates at scrollback_max.
+        // Exercises the (common, still-growing) drop_rows==0 fast path of the
+        // in-place rewrite -- which must copy nothing yet still land the same
+        // [oldest..newest] history the old allocate-and-rebuild produced.
+        let mut s = Screen::new(1, 2, 3);
+        for ch in ['A', 'B', 'C'] {
+            fill_row(&mut s, 0, ch);
+            s.scroll_up(1, 0, 1);
+        }
+        assert_eq!(s.scrollback_len(), 3, "history filled to the cap");
+        assert_eq!(s.abs_cell(0, 0).ch, 'A', "oldest history row");
+        assert_eq!(s.abs_cell(0, 1).ch, 'B');
+        assert_eq!(s.abs_cell(0, 2).ch, 'C', "newest history row");
+    }
+
+    #[test]
+    fn multi_line_scroll_evicts_oldest_when_it_overflows_scrollback() {
+        // Drive the drop_rows>0 eviction branch: seed one history row, then a
+        // multi-line scroll whose push exceeds the remaining cap, forcing the
+        // oldest row to slide off the front. Guards the in-place copy_within +
+        // blank arithmetic that replaced the allocate-and-rebuild.
+        let mut s = Screen::new(1, 3, 2);
+        // First push: history = [p]; visible becomes [q, r, blank].
+        fill_row(&mut s, 0, 'p');
+        fill_row(&mut s, 1, 'q');
+        fill_row(&mut s, 2, 'r');
+        s.scroll_up(1, 0, 2);
+        assert_eq!(s.scrollback_len(), 1);
+        assert_eq!(s.abs_cell(0, 0).ch, 'p');
+
+        // Now a 2-line scroll: q,r would enter history (base=1, n=2), but
+        // scrollback_max=2, so the oldest ('p') is evicted -- history = [q, r].
+        s.scroll_up(2, 0, 2);
+        assert_eq!(s.scrollback_len(), 2, "history capped at max");
+        assert_eq!(s.abs_cell(0, 0).ch, 'q', "'p' evicted, 'q' now oldest");
+        assert_eq!(s.abs_cell(0, 1).ch, 'r', "newest history row");
+        assert_eq!(
+            row_char(&s, 0),
+            ' ',
+            "visible fully blanked by the 2-scroll"
+        );
+    }
+
+    #[test]
+    fn sustained_single_line_scroll_past_full_keeps_rotating_history() {
+        // Regression: a flood scrolls one line at a time far past the point
+        // where scrollback is FULL. Once len == max, `push = n.min(max-len)`
+        // was 0, so the scroll fell into the no-history branch and silently
+        // discarded every further scrolled-off line -- history froze at its
+        // fill point and later output was lost (scroll-back showed 0..cap then
+        // jumped straight to the last screen). Each further scroll must keep
+        // rotating: drop the oldest history row, append the newest.
+        // cols=1, rows=2, scrollback_max=3.
+        let mut s = Screen::new(1, 2, 3);
+        // Push A,B,C,D,E,F one line at a time (six scrolls, well past the cap).
+        for ch in ['A', 'B', 'C', 'D', 'E', 'F'] {
+            fill_row(&mut s, 0, ch);
+            s.scroll_up(1, 0, 1);
+        }
+        // History stays capped at 3 and holds the THREE MOST RECENT scrolled
+        // rows -- D,E,F -- not the first three (A,B,C) it would freeze on.
+        assert_eq!(s.scrollback_len(), 3, "history stays capped at max");
+        assert_eq!(s.abs_cell(0, 0).ch, 'D', "oldest retained row rotated to D");
+        assert_eq!(s.abs_cell(0, 1).ch, 'E');
+        assert_eq!(s.abs_cell(0, 2).ch, 'F', "newest scrolled row retained");
+    }
+
+    #[test]
+    fn long_flood_past_slack_compacts_and_keeps_last_lines_correct() {
+        // Drive far more scrolls than the backing store's slack can hold, so
+        // the floating window head walks off the end and `ensure_tail_room`
+        // compacts (potentially several times). Throughout, scrollback must
+        // stay capped and hold the most-recent lines in order -- i.e. the
+        // floating-window + compaction bookkeeping is transparent. This is the
+        // sustained-flood case that must stay O(1)/line (no slide-to-front)
+        // AND lossless.
+        // cols=1, rows=2, scrollback_max=4 -> cap_rows = 2*(2+4)=12 physical
+        // rows; 500 single-line scrolls force many head advances + compactions.
+        let mut s = Screen::new(1, 2, 4);
+        let n = 500u32;
+        for i in 0..n {
+            // Distinct glyph per line so misordering/loss is visible.
+            let ch = char::from(b'a' + (i % 26) as u8);
+            fill_row(&mut s, 0, ch);
+            s.scroll_up(1, 0, 1);
+        }
+        // Each filled row is pushed straight into scrollback by its scroll, so
+        // after the flood the visible area is blank and history holds the last
+        // `scrollback_max` filled lines (n-4 .. n-1) in order, oldest first.
+        assert_eq!(s.scrollback_len(), 4, "history capped at max throughout");
+        for k in 0..4u32 {
+            let line = n - 4 + k; // lines n-4 .. n-1
+            let want = char::from(b'a' + (line % 26) as u8);
+            assert_eq!(
+                s.abs_cell(0, k as usize).ch,
+                want,
+                "absolute row {k} should hold flood line {line}"
+            );
+        }
+        assert_eq!(row_char(&s, 0), ' ', "top visible row blank after flood");
+        assert_eq!(row_char(&s, 1), ' ', "bottom visible row blank after flood");
     }
 }

@@ -51,6 +51,58 @@ use vt_parser::{C0, CsiAction, Event, OscCmd, SgrAttr};
 /// Scrollback limit (lines above the visible area).
 pub const SCROLLBACK_MAX: usize = 10_000;
 
+/// What kind of repaint the next [`Grid::take_dirty`] owes the renderer.
+///
+/// Mutually exclusive by construction: a viewport scroll repaints every
+/// visible row from scratch, which makes any accumulated incremental scroll
+/// band moot, so there is no state where both apply. Replaces a `bool`
+/// (`viewport_dirty`) plus an `Option<(u16, u16, u16)>` (`scroll_accum`) that
+/// used to live side by side on `Grid` and had to be reasoned about together
+/// (setting the scroll band while a viewport repaint was pending was
+/// harmless -- `take_dirty` discarded it unread -- but only obviously so by
+/// reading that function).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRepaint {
+    /// Incremental: `dirty` tracks exactly which rows changed. `Some((top,
+    /// bot, delta))` when everything in `[top, bot]` also shifted up by
+    /// `delta` rows since the last snapshot, letting the renderer pixel-shift
+    /// that band and paint only the true dirty rows on top; `None` when
+    /// nothing scrolled, or a batch mixed scrolls over different regions (the
+    /// fast path is abandoned and the dirty rows are repainted directly).
+    Incremental(Option<(u16, u16, u16)>),
+    /// A full-frame repaint of the whole viewport is owed: every visible row
+    /// changed because the view scrolled into/out of scrollback.
+    Viewport,
+}
+
+impl Default for PendingRepaint {
+    fn default() -> Self {
+        Self::Incremental(None)
+    }
+}
+
+impl PendingRepaint {
+    /// Fold one content scroll of `[top, bot]` by `delta` into an
+    /// `Incremental` scroll band. Multiple scrolls over the *same* region
+    /// within a batch add up; a scroll over a *different* region abandons the
+    /// fast path (`Some((0, 0, 0))`, the same sentinel `take_dirty` already
+    /// collapses to `None`). A pending `Viewport` repaint is left untouched --
+    /// it will discard any scroll band on the next `take_dirty` regardless.
+    fn accumulate_scroll(&mut self, top: u16, bot: u16, delta: u16) {
+        if delta == 0 {
+            return;
+        }
+        let Self::Incremental(band) = self else {
+            return;
+        };
+        *band = Some(match *band {
+            None => (top, bot, delta),
+            Some((t, b, d)) if t == top && b == bot => (t, b, d.saturating_add(delta)),
+            Some(_) => (0, 0, 0),
+        });
+    }
+}
+
 /// The terminal grid: primary screen, alternate screen, scrollback, cursor.
 ///
 /// Feed [`Event`]s from the VT parser via [`Grid::apply`]. After each batch,
@@ -80,25 +132,22 @@ pub struct Grid {
     /// into history. Only the primary screen has scrollback, so this is forced
     /// back to `0` whenever the alternate screen is active.
     viewport_offset: usize,
-    /// Set when the viewport offset changed and the next [`Grid::take_dirty`]
-    /// must emit a full-frame snapshot (every visible row changes when the view
-    /// scrolls, so incremental dirty rows would be wrong).
-    viewport_dirty: bool,
+    /// What the next [`Grid::take_dirty`] owes the renderer: either an
+    /// incremental repaint (tracked by `dirty`, with an optional accumulated
+    /// scroll band for the pixel-shift fast path) or a full-frame viewport
+    /// repaint (every visible row changed because the view scrolled). These
+    /// two used to be a `bool` and an `Option<(u16, u16, u16)>` living side by
+    /// side, which let callers set the scroll band while a viewport repaint
+    /// was already pending -- harmless (it was discarded unread) but not
+    /// obviously so. Modeling them as one enum makes "a viewport repaint
+    /// makes any pending scroll band moot" a structural fact instead of
+    /// something you have to trace through `take_dirty` to confirm.
+    pending_repaint: PendingRepaint,
     /// Lines the primary screen's content scrolled up since the last
     /// [`Grid::take_dirty`] snapshot (new output pushing lines into
     /// scrollback). Emitted on the snapshot so the renderer can shift its
     /// selection/mirror to keep highlights glued to the text, then reset.
     content_delta: u16,
-    /// Accumulated content scroll for the next snapshot, as `(top, bot,
-    /// delta)`: the region `[top, bot]` moved up by `delta` rows. Lets the
-    /// renderer pixel-shift that exact band and then paint only the precise
-    /// dirty rows on top -- instead of inferring the band from the dirty-row
-    /// span (wrong now that scrolls shift marks in place rather than
-    /// blanket-dirtying the region). `None` when nothing scrolled, or when a
-    /// batch mixed scrolls over *different* regions (the fast path is given up
-    /// and the whole region repainted). Distinct from `content_delta`, which
-    /// is the scrollback-push amount used for selection/mirror tracking.
-    scroll_accum: Option<(u16, u16, u16)>,
     /// Bytes the terminal must write back to the PTY (CPR, DA, etc.).
     /// Drained by the driver via [`Grid::take_replies`] after each batch.
     replies: Vec<u8>,
@@ -135,9 +184,8 @@ impl Grid {
             dirty: DirtyRegion::new(cols, rows),
             saved_cursor: None,
             viewport_offset: 0,
-            viewport_dirty: false,
+            pending_repaint: PendingRepaint::default(),
             content_delta: 0,
-            scroll_accum: None,
             replies: Vec::new(),
             pending_wrap: false,
             last_cursor: CursorInfo::default(),
@@ -159,7 +207,7 @@ impl Grid {
         let new = (cur + delta).clamp(0, max);
         if new != cur {
             self.viewport_offset = new as usize;
-            self.viewport_dirty = true;
+            self.pending_repaint = PendingRepaint::Viewport;
         }
     }
 
@@ -255,13 +303,12 @@ impl Grid {
         self.force_cursor_changed = false;
         self.last_cursor = cur;
 
-        if self.viewport_dirty {
-            self.viewport_dirty = false;
+        if self.pending_repaint == PendingRepaint::Viewport {
+            self.pending_repaint = PendingRepaint::default();
             self.dirty.clear();
             let cols = self.primary.cols();
             let rows = self.primary.rows();
-            let mut snap =
-                crate::dirty::viewport_snapshot(&self.primary, self.viewport_offset, cols, rows);
+            let mut snap = DirtySnapshot::viewport(&self.primary, self.viewport_offset, cols, rows);
             snap.cursor = cur;
             snap.cursor_changed = cursor_changed;
             // Keep the accumulated content_delta so the renderer can tell an
@@ -272,8 +319,8 @@ impl Grid {
             snap.content_delta = self.content_delta;
             self.content_delta = 0;
             // A viewport (full-frame) snapshot repaints everything, so any
-            // accumulated scroll band is moot -- drop it.
-            self.scroll_accum = None;
+            // accumulated scroll band -- there wasn't one anyway, since
+            // `pending_repaint` can only hold one variant at a time -- is moot.
             return snap;
         }
         let screen = if self.alt_active {
@@ -290,7 +337,10 @@ impl Grid {
         // paint the precise dirty rows on top. The (0,0,0) sentinel (mixed
         // regions) and any zero-delta collapse to None: no shift, just repaint
         // the dirty rows directly.
-        snap.scroll_span = match self.scroll_accum.take() {
+        let PendingRepaint::Incremental(band) = core::mem::take(&mut self.pending_repaint) else {
+            unreachable!("handled by the Viewport branch above");
+        };
+        snap.scroll_span = match band {
             Some((t, b, d)) if d > 0 && b >= t => Some((t, b, d)),
             _ => None,
         };
@@ -311,10 +361,10 @@ impl Grid {
     pub fn requeue_snapshot(&mut self, snap: &DirtySnapshot) {
         if let Some(offset) = snap.viewport_offset {
             // A full-frame viewport snapshot: nothing incremental to
-            // re-mark, just re-arm the viewport-dirty path so the next
+            // re-mark, just re-arm the viewport repaint so the next
             // take_dirty rebuilds the same full frame.
             self.viewport_offset = usize::from(offset);
-            self.viewport_dirty = true;
+            self.pending_repaint = PendingRepaint::Viewport;
         } else {
             for row in &snap.rows {
                 self.dirty.mark_row(row.row);
@@ -327,7 +377,7 @@ impl Grid {
         // shift. So fold the scroll band back in; the next take_dirty re-emits
         // it (composing with any scroll since), and the renderer shifts then.
         if let Some((t, b, d)) = snap.scroll_span {
-            self.accumulate_scroll(t, b, d);
+            self.pending_repaint.accumulate_scroll(t, b, d);
         }
         if snap.cursor_changed {
             self.force_cursor_changed = true;
@@ -339,7 +389,7 @@ impl Grid {
     fn snap_viewport_to_bottom(&mut self) {
         if self.viewport_offset != 0 {
             self.viewport_offset = 0;
-            self.viewport_dirty = true;
+            self.pending_repaint = PendingRepaint::Viewport;
         }
     }
 
@@ -487,28 +537,6 @@ impl Grid {
         }
     }
 
-    /// Fold one content scroll of `[top, bot]` by `delta` into `scroll_accum`.
-    /// Multiple scrolls over the *same* region within a batch add up; a scroll
-    /// over a *different* region abandons the fast path (`None`), which the
-    /// renderer reads as "repaint the dirty rows the slow way".
-    fn accumulate_scroll(&mut self, top: u16, bot: u16, delta: u16) {
-        if delta == 0 {
-            return;
-        }
-        match self.scroll_accum {
-            None => self.scroll_accum = Some((top, bot, delta)),
-            Some((t, b, d)) if t == top && b == bot => {
-                self.scroll_accum = Some((t, b, d.saturating_add(delta)));
-            }
-            Some(_) => {
-                // Conflicting regions in one batch: give up the pixel-shift
-                // and let the renderer repaint the (precisely) dirty rows.
-                // Sentinel (0,0,0) can't occur naturally (delta>0 guarded).
-                self.scroll_accum = Some((0, 0, 0));
-            }
-        }
-    }
-
     fn cursor_down(&mut self, n: u16, scroll: bool) {
         let (rows, top, bot) = {
             let s = self.active_screen();
@@ -530,7 +558,7 @@ impl Grid {
                 let region = bot.saturating_sub(top).saturating_add(1);
                 let moved = scroll_lines.min(region);
                 self.dirty.scroll_up(moved, top, bot);
-                self.accumulate_scroll(top, bot, moved);
+                self.pending_repaint.accumulate_scroll(top, bot, moved);
                 self.cursor.row = bot;
             } else {
                 self.cursor.row = rows - 1;
@@ -606,7 +634,17 @@ impl Grid {
                         // the same to ED 2 so a plain `clear` wipes history too
                         // (matching the user's expectation). Both force the
                         // viewport back to the live bottom.
-                        screen.erase_range(0, 0, cols - 1, rows - 1);
+                        //
+                        // `clear()` does one bulk `fill()` over the whole
+                        // visible area (+ a flat wrapped-flag reset), instead
+                        // of `erase_range`'s per-row `erase_line_range` calls
+                        // with their per-row wide-char boundary checks -- for
+                        // a whole-screen erase there's no boundary to check
+                        // (every row runs col 0..=cols-1), so the loop is pure
+                        // overhead. This is the single hottest path in the
+                        // alt-screen-thrash workload (smcup/rmcup + ED2 on
+                        // every flip).
+                        screen.clear();
                         screen.erase_scrollback();
                     }
                     _ => {}
@@ -662,7 +700,7 @@ impl Grid {
                 let region = bot.saturating_sub(top).saturating_add(1);
                 let moved = (*n).min(region);
                 self.dirty.scroll_up(moved, top, bot);
-                self.accumulate_scroll(top, bot, moved);
+                self.pending_repaint.accumulate_scroll(top, bot, moved);
             }
             CsiAction::ScrollDown(n) => {
                 let (top, bot) = self.active_screen().scroll_region();

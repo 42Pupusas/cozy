@@ -154,34 +154,6 @@ impl DirtyRegion {
     }
 }
 
-/// Build a full-frame snapshot of the whole visible screen through a viewport
-/// offset (`0` = live view at the bottom; `k` = scrolled `k` lines into
-/// scrollback). Used when the viewport moves: every row's content changes, so
-/// the renderer needs a complete repaint rather than incremental dirty rows.
-pub fn viewport_snapshot(
-    screen: &Screen,
-    viewport_offset: usize,
-    cols: u16,
-    rows: u16,
-) -> DirtySnapshot {
-    let mut out = Vec::with_capacity(usize::from(rows));
-    for row in 0..rows {
-        let cells: Vec<Cell> = (0..cols)
-            .map(|col| screen.get_viewport_cell(col, row, viewport_offset))
-            .collect();
-        out.push(DirtyRow { row, cells });
-    }
-    DirtySnapshot {
-        rows: out,
-        cols,
-        cursor: CursorInfo::default(),
-        cursor_changed: false,
-        content_delta: 0,
-        viewport_offset: Some(viewport_offset.min(u16::MAX as usize) as u16),
-        scroll_span: None,
-    }
-}
-
 /// A row of cells that needs to be redrawn.
 #[derive(Debug, Clone)]
 pub struct DirtyRow {
@@ -247,6 +219,35 @@ pub struct DirtySnapshot {
 }
 
 impl DirtySnapshot {
+    /// Build a full-frame snapshot of the whole visible screen through a
+    /// viewport offset (`0` = live view at the bottom; `k` = scrolled `k`
+    /// lines into scrollback). Used when the viewport moves: every row's
+    /// content changes, so the renderer needs a complete repaint rather than
+    /// incremental dirty rows.
+    ///
+    /// Was a free `viewport_snapshot(screen, viewport_offset, cols, rows)`
+    /// function -- moved onto `DirtySnapshot` as an associated constructor,
+    /// alongside `DirtyRegion::take_snapshot` (the incremental counterpart it
+    /// mirrors).
+    pub(crate) fn viewport(screen: &Screen, viewport_offset: usize, cols: u16, rows: u16) -> Self {
+        let mut out = Vec::with_capacity(usize::from(rows));
+        for row in 0..rows {
+            let cells: Vec<Cell> = (0..cols)
+                .map(|col| screen.get_viewport_cell(col, row, viewport_offset))
+                .collect();
+            out.push(DirtyRow { row, cells });
+        }
+        Self {
+            rows: out,
+            cols,
+            cursor: CursorInfo::default(),
+            cursor_changed: false,
+            content_delta: 0,
+            viewport_offset: Some(viewport_offset.min(u16::MAX as usize) as u16),
+            scroll_span: None,
+        }
+    }
+
     /// True if no rows changed AND the cursor didn't move/toggle visibility
     /// either -- i.e. there is genuinely nothing new for the renderer to do.
     #[must_use]

@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "bins/*",
     "crates/*",
-    # "benches/*",  # uncomment when first bench is added
+    "benches/*",
 ]
 
 [workspace.package]

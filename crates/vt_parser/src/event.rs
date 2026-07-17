@@ -195,7 +195,7 @@ pub enum CsiAction {
 /// Parsed OSC command.
 ///
 /// Text payloads borrow from the parser's internal OSC accumulation buffer,
-/// so an `OscCmd` (and the `Event` wrapping it) must be consumed before the
+/// so an `OscCmd` (and the `TermEvent` wrapping it) must be consumed before the
 /// next byte is fed to the parser — exactly what the `Parser::feed` callback
 /// shape guarantees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,8 +213,15 @@ pub enum OscCmd<'a> {
 /// A terminal event emitted by the parser. Borrows from the parser's
 /// internal buffers (see [`OscCmd`]), so it's only valid for the duration of
 /// the [`Parser::feed`] callback that produced it.
+///
+/// Named `TermEvent`, not the bare `Event` this used to be, because the
+/// input pipeline has three unrelated event types in a chain — the Wayland
+/// wire event (`platform::wire::WireEvent`), the reader→main-thread event
+/// (`platform::event::RawEvent`), and this one, several stages later and
+/// downstream of the PTY entirely — and a bare `Event` at each stage used
+/// to force every call site to alias-import to tell them apart.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event<'a> {
+pub enum TermEvent<'a> {
     /// A printable Unicode character (or a multi-byte sequence decoded to char).
     Print(char),
     /// C0 control character.

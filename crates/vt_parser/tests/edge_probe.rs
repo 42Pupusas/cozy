@@ -1,6 +1,6 @@
 //! Scratch probes for the coverage review — verifying suspected edge-case bugs.
 
-use vt_parser::{CsiAction, Event, Parser};
+use vt_parser::{CsiAction, Parser, TermEvent};
 
 /// `CSI ;5H` — leading empty param should default row=1, col=5.
 #[test]
@@ -8,7 +8,7 @@ fn csi_leading_empty_param() {
     let mut p = Parser::new();
     let mut got = None;
     p.feed(b"\x1b[;5H", |ev| {
-        if let Event::Csi(CsiAction::CursorPosition { row, col }) = ev {
+        if let TermEvent::Csi(CsiAction::CursorPosition { row, col }) = ev {
             got = Some((row, col));
         }
     });
@@ -28,7 +28,7 @@ fn esc_aborts_partial_csi() {
     let mut p = Parser::new();
     let mut events = Vec::new();
     p.feed(b"\x1b[12\x1b[3A", |ev| {
-        if let Event::Csi(a) = ev {
+        if let TermEvent::Csi(a) = ev {
             events.push(a);
         }
     });
@@ -43,7 +43,7 @@ fn csi_split_across_feeds() {
     p.feed(b"\x1b[", |_| {});
     p.feed(b"5", |_| {});
     p.feed(b"A", |ev| {
-        if let Event::Csi(a) = ev {
+        if let TermEvent::Csi(a) = ev {
             got = Some(a);
         }
     });
@@ -56,7 +56,7 @@ fn utf8_surrogate_is_replaced() {
     let mut p = Parser::new();
     let mut seen = Vec::new();
     p.feed(&[0xED, 0xA0, 0x80], |ev| {
-        if let Event::Print(c) = ev {
+        if let TermEvent::Print(c) = ev {
             seen.push(c);
         }
     });
@@ -79,7 +79,7 @@ fn csi_param_value_saturates() {
     let mut p = Parser::new();
     let mut got = None;
     p.feed(b"\x1b[999999999A", |ev| {
-        if let Event::Csi(CsiAction::CursorUp(n)) = ev {
+        if let TermEvent::Csi(CsiAction::CursorUp(n)) = ev {
             got = Some(n);
         }
     });

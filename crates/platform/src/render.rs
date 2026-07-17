@@ -146,7 +146,7 @@ impl Theme {
     fn effective(&self, attrs: &Attrs) -> (DrawColor, DrawColor) {
         let fg = self.resolve(attrs.fg, self.fg);
         let bg = self.resolve(attrs.bg, self.bg);
-        if attrs.inverse { (bg, fg) } else { (fg, bg) }
+        if attrs.inverse() { (bg, fg) } else { (fg, bg) }
     }
 }
 
@@ -412,7 +412,7 @@ impl Renderer {
             fg.premultiplied_argb8888(255)
         };
         let bg_px = Self::pack_bg(bg, self.bg_alpha);
-        let ch = if cell.attrs.invisible { ' ' } else { cell.ch };
+        let ch = if cell.attrs.invisible() { ' ' } else { cell.ch };
 
         match &mut self.glyphs {
             GlyphSource::Bitmap => {

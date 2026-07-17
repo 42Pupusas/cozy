@@ -24,92 +24,92 @@ fn attrs_after(sgr_seq: &[u8]) -> grid::Attrs {
 
 #[test]
 fn bold_on() {
-    assert!(attrs_after(b"\x1b[1m").bold);
+    assert!(attrs_after(b"\x1b[1m").bold());
 }
 
 #[test]
 fn dim_on() {
-    assert!(attrs_after(b"\x1b[2m").dim);
+    assert!(attrs_after(b"\x1b[2m").dim());
 }
 
 #[test]
 fn italic_on() {
-    assert!(attrs_after(b"\x1b[3m").italic);
+    assert!(attrs_after(b"\x1b[3m").italic());
 }
 
 #[test]
 fn underline_on() {
-    assert!(attrs_after(b"\x1b[4m").underline);
+    assert!(attrs_after(b"\x1b[4m").underline());
 }
 
 #[test]
 fn blink_on() {
-    assert!(attrs_after(b"\x1b[5m").blink);
+    assert!(attrs_after(b"\x1b[5m").blink());
 }
 
 #[test]
 fn rapid_blink_also_sets_blink() {
     // SgrAttr::Blink | SgrAttr::RapidBlink share the same cell flag -- we
     // don't model blink speed separately.
-    assert!(attrs_after(b"\x1b[6m").blink);
+    assert!(attrs_after(b"\x1b[6m").blink());
 }
 
 #[test]
 fn inverse_on() {
-    assert!(attrs_after(b"\x1b[7m").inverse);
+    assert!(attrs_after(b"\x1b[7m").inverse());
 }
 
 #[test]
 fn invisible_on() {
-    assert!(attrs_after(b"\x1b[8m").invisible);
+    assert!(attrs_after(b"\x1b[8m").invisible());
 }
 
 #[test]
 fn strikethrough_on() {
-    assert!(attrs_after(b"\x1b[9m").strikethrough);
+    assert!(attrs_after(b"\x1b[9m").strikethrough());
 }
 
 #[test]
 fn normal_intensity_clears_both_bold_and_dim() {
     let a = attrs_after(b"\x1b[1;2;22m");
-    assert!(!a.bold);
-    assert!(!a.dim);
+    assert!(!a.bold());
+    assert!(!a.dim());
 }
 
 #[test]
 fn no_italic_clears_only_italic() {
     let a = attrs_after(b"\x1b[3;23m");
-    assert!(!a.italic);
+    assert!(!a.italic());
 }
 
 #[test]
 fn no_underline_clears_only_underline() {
     let a = attrs_after(b"\x1b[4;24m");
-    assert!(!a.underline);
+    assert!(!a.underline());
 }
 
 #[test]
 fn no_blink_clears_only_blink() {
     let a = attrs_after(b"\x1b[5;25m");
-    assert!(!a.blink);
+    assert!(!a.blink());
 }
 
 #[test]
 fn no_inverse_clears_only_inverse() {
     let a = attrs_after(b"\x1b[7;27m");
-    assert!(!a.inverse);
+    assert!(!a.inverse());
 }
 
 #[test]
 fn no_invisible_clears_only_invisible() {
     let a = attrs_after(b"\x1b[8;28m");
-    assert!(!a.invisible);
+    assert!(!a.invisible());
 }
 
 #[test]
 fn no_strikethrough_clears_only_strikethrough() {
     let a = attrs_after(b"\x1b[9;29m");
-    assert!(!a.strikethrough);
+    assert!(!a.strikethrough());
 }
 
 #[test]
@@ -193,10 +193,10 @@ fn bg_rgb_truecolor() {
 #[test]
 fn multiple_attrs_in_one_sequence_all_apply() {
     let a = attrs_after(b"\x1b[1;3;4;7;38;2;1;2;3;48;5;9m");
-    assert!(a.bold);
-    assert!(a.italic);
-    assert!(a.underline);
-    assert!(a.inverse);
+    assert!(a.bold());
+    assert!(a.italic());
+    assert!(a.underline());
+    assert!(a.inverse());
     assert_eq!(a.fg, Color::Rgb(1, 2, 3));
     assert_eq!(a.bg, Color::Indexed(9));
 }
@@ -214,8 +214,8 @@ fn attrs_persist_across_prints_until_changed() {
     feed(&mut g, b"\x1b[1mAB");
     let a0 = g.screen().get_cell(0, 0).attrs;
     let a1 = g.screen().get_cell(1, 0).attrs;
-    assert!(a0.bold);
-    assert!(a1.bold);
+    assert!(a0.bold());
+    assert!(a1.bold());
 }
 
 #[test]
@@ -224,6 +224,6 @@ fn attrs_do_not_leak_backward_to_already_printed_cells() {
     feed(&mut g, b"A\x1b[1mB");
     let a0 = g.screen().get_cell(0, 0).attrs;
     let a1 = g.screen().get_cell(1, 0).attrs;
-    assert!(!a0.bold);
-    assert!(a1.bold);
+    assert!(!a0.bold());
+    assert!(a1.bold());
 }

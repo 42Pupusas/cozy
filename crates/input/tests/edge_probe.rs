@@ -122,7 +122,7 @@ fn sgr_coord_beyond_223_is_not_clamped() {
     assert_eq!(s, "\x1b[<0;5001;3001M");
 }
 
-/// `ButtonMotion` / `AnyEvent` modes must still encode via the X10-style path
+/// ButtonMotion / AnyEvent modes must still encode via the X10-style path
 /// (not silently dropped as unsupported).
 #[test]
 fn button_motion_mode_encodes() {
@@ -185,7 +185,7 @@ fn kitty_all_modifiers_combine() {
     assert_eq!(s, "\x1b[97;16:1u");
 }
 
-/// Repeated key state must be reported distinctly (`event_type=2`) in kitty
+/// Repeated key state must be reported distinctly (event_type=2) in kitty
 /// mode, not collapsed into press.
 #[test]
 fn kitty_repeated_state_reports_event_type_2() {

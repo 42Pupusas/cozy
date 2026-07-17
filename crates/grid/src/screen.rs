@@ -41,6 +41,16 @@ pub struct Screen {
     scroll_top: u16,
     /// Scroll region bottom (0-indexed, inclusive).
     scroll_bot: u16,
+    /// Fast-path guard: `true` guarantees the whole visible area is blank
+    /// (`Cell::default()`) with no soft-wrap flags set, so a `clear()` can be
+    /// skipped entirely. Set by `clear()`; cleared by the only two methods that
+    /// can inject non-blank state (`set_cell`, `set_wrapped`) -- `print()`
+    /// routes through both. Every other mutator (erase/scroll) only ever
+    /// produces blanks from blanks, so it preserves the flag untouched. This is
+    /// what makes the alt-screen-thrash workload (smcup/rmcup + a redundant ED2
+    /// on every flip) cheap: the ED2 clear lands on an already-blank buffer and
+    /// becomes a no-op instead of a full-screen memset.
+    all_blank: bool,
 }
 
 impl Screen {
@@ -72,6 +82,9 @@ impl Screen {
             head: 0,
             scroll_top: 0,
             scroll_bot: rows.saturating_sub(1),
+            // A freshly allocated buffer is genuinely all-blank (`vec!` of
+            // `Cell::default()`), so the first clear can be elided too.
+            all_blank: true,
         }
     }
 
@@ -146,6 +159,7 @@ impl Screen {
     pub fn set_cell(&mut self, col: u16, row: u16, cell: Cell) {
         let idx = self.visible_idx(col, row);
         self.buf[idx] = cell;
+        self.all_blank = false;
     }
 
     /// Mark (or clear) the soft-wrap continuation flag for a visible row.
@@ -153,6 +167,9 @@ impl Screen {
         let idx = self.head + self.scrollback_len + usize::from(row);
         if idx < self.wrapped.len() {
             self.wrapped[idx] = wrapped;
+        }
+        if wrapped {
+            self.all_blank = false;
         }
     }
 
@@ -197,6 +214,11 @@ impl Screen {
 
     /// Clear entire visible area.
     pub fn clear(&mut self) {
+        // Already provably blank -> the fill + wrapped-reset below are pure
+        // memset traffic over cells that are already `Cell::default()`. Skip.
+        if self.all_blank {
+            return;
+        }
         let start = (self.head + self.scrollback_len) * usize::from(self.cols);
         let end =
             (self.head + self.scrollback_len + usize::from(self.rows)) * usize::from(self.cols);
@@ -206,6 +228,7 @@ impl Screen {
         {
             *w = false;
         }
+        self.all_blank = true;
     }
 
     /// Discard all scrollback history. The visible area keeps its content and

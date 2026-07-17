@@ -634,8 +634,8 @@ impl UiWorker<'_> {
                         {
                             continue;
                         }
-                        let mods = platform_mods(modifiers);
-                        let Some(ikey) = platform_key(key) else {
+                        let mods = modifiers.to_input();
+                        let Some(ikey) = key.to_input() else {
                             continue;
                         };
                         // Shift+PgUp/PgDn scroll the grid viewport by a page,
@@ -720,118 +720,135 @@ impl UiWorker<'_> {
 }
 
 // ── Key / modifier translation ────────────────────────────────────────────────
-
-fn platform_mods(m: platform::protocol::Modifiers) -> Modifiers {
-    let any = m.depressed | m.latched | m.locked;
-    let mut out = Modifiers::NONE;
-    if any & 0x01 != 0 {
-        out = out | Modifiers::SHIFT;
-    }
-    if any & 0x04 != 0 {
-        out = out | Modifiers::CTRL;
-    }
-    if any & 0x08 != 0 {
-        out = out | Modifiers::ALT;
-    }
-    if any & 0x40 != 0 {
-        out = out | Modifiers::SUPER;
-    }
-    if m.locked & 0x02 != 0 {
-        out = out | Modifiers::CAPS;
-    }
-    out
+//
+// `platform::protocol::{Key, Modifiers}` and `input::{Key, Modifiers}` are both
+// foreign to this crate, so a `From` impl is blocked by the orphan rule --
+// these traits are the local-trait workaround, giving the conversions a
+// method-call spelling (`raw_mods.to_input()`, `raw_key.to_input()`) instead
+// of two orbiting free functions.
+trait ToInputMods {
+    fn to_input(self) -> Modifiers;
 }
 
-#[allow(clippy::too_many_lines)]
-fn platform_key(k: Option<platform::protocol::Key>) -> Option<Key> {
-    use platform::protocol::Key as PK;
-    Some(match k? {
-        PK::A => Key::Char('a'),
-        PK::B => Key::Char('b'),
-        PK::C => Key::Char('c'),
-        PK::D => Key::Char('d'),
-        PK::E => Key::Char('e'),
-        PK::F => Key::Char('f'),
-        PK::G => Key::Char('g'),
-        PK::H => Key::Char('h'),
-        PK::I => Key::Char('i'),
-        PK::J => Key::Char('j'),
-        PK::K => Key::Char('k'),
-        PK::L => Key::Char('l'),
-        PK::M => Key::Char('m'),
-        PK::N => Key::Char('n'),
-        PK::O => Key::Char('o'),
-        PK::P => Key::Char('p'),
-        PK::Q => Key::Char('q'),
-        PK::R => Key::Char('r'),
-        PK::S => Key::Char('s'),
-        PK::T => Key::Char('t'),
-        PK::U => Key::Char('u'),
-        PK::V => Key::Char('v'),
-        PK::W => Key::Char('w'),
-        PK::X => Key::Char('x'),
-        PK::Y => Key::Char('y'),
-        PK::Z => Key::Char('z'),
+impl ToInputMods for platform::protocol::Modifiers {
+    fn to_input(self) -> Modifiers {
+        let any = self.depressed | self.latched | self.locked;
+        let mut out = Modifiers::NONE;
+        if any & 0x01 != 0 {
+            out = out | Modifiers::SHIFT;
+        }
+        if any & 0x04 != 0 {
+            out = out | Modifiers::CTRL;
+        }
+        if any & 0x08 != 0 {
+            out = out | Modifiers::ALT;
+        }
+        if any & 0x40 != 0 {
+            out = out | Modifiers::SUPER;
+        }
+        if self.locked & 0x02 != 0 {
+            out = out | Modifiers::CAPS;
+        }
+        out
+    }
+}
 
-        PK::N1 => Key::Char('1'),
-        PK::N2 => Key::Char('2'),
-        PK::N3 => Key::Char('3'),
-        PK::N4 => Key::Char('4'),
-        PK::N5 => Key::Char('5'),
-        PK::N6 => Key::Char('6'),
-        PK::N7 => Key::Char('7'),
-        PK::N8 => Key::Char('8'),
-        PK::N9 => Key::Char('9'),
-        PK::N0 => Key::Char('0'),
+trait ToInputKey {
+    fn to_input(self) -> Option<Key>;
+}
 
-        PK::Minus => Key::Char('-'),
-        PK::Equal => Key::Char('='),
-        PK::LBracket => Key::Char('['),
-        PK::RBracket => Key::Char(']'),
-        PK::Backslash => Key::Char('\\'),
-        PK::Semicolon => Key::Char(';'),
-        PK::Apostrophe => Key::Char('\''),
-        PK::Backtick => Key::Char('`'),
-        PK::Comma => Key::Char(','),
-        PK::Dot => Key::Char('.'),
-        PK::Slash => Key::Char('/'),
-        PK::Space => Key::Char(' '),
+impl ToInputKey for Option<platform::protocol::Key> {
+    #[allow(clippy::too_many_lines)]
+    fn to_input(self) -> Option<Key> {
+        use platform::protocol::Key as PK;
+        Some(match self? {
+            PK::A => Key::Char('a'),
+            PK::B => Key::Char('b'),
+            PK::C => Key::Char('c'),
+            PK::D => Key::Char('d'),
+            PK::E => Key::Char('e'),
+            PK::F => Key::Char('f'),
+            PK::G => Key::Char('g'),
+            PK::H => Key::Char('h'),
+            PK::I => Key::Char('i'),
+            PK::J => Key::Char('j'),
+            PK::K => Key::Char('k'),
+            PK::L => Key::Char('l'),
+            PK::M => Key::Char('m'),
+            PK::N => Key::Char('n'),
+            PK::O => Key::Char('o'),
+            PK::P => Key::Char('p'),
+            PK::Q => Key::Char('q'),
+            PK::R => Key::Char('r'),
+            PK::S => Key::Char('s'),
+            PK::T => Key::Char('t'),
+            PK::U => Key::Char('u'),
+            PK::V => Key::Char('v'),
+            PK::W => Key::Char('w'),
+            PK::X => Key::Char('x'),
+            PK::Y => Key::Char('y'),
+            PK::Z => Key::Char('z'),
 
-        PK::Enter => Key::Enter,
-        PK::Backspace => Key::Backspace,
-        PK::Tab => Key::Tab,
-        PK::Esc => Key::Esc,
-        PK::Delete => Key::Delete,
-        PK::Insert => Key::Insert,
+            PK::N1 => Key::Char('1'),
+            PK::N2 => Key::Char('2'),
+            PK::N3 => Key::Char('3'),
+            PK::N4 => Key::Char('4'),
+            PK::N5 => Key::Char('5'),
+            PK::N6 => Key::Char('6'),
+            PK::N7 => Key::Char('7'),
+            PK::N8 => Key::Char('8'),
+            PK::N9 => Key::Char('9'),
+            PK::N0 => Key::Char('0'),
 
-        PK::Up => Key::Up,
-        PK::Down => Key::Down,
-        PK::Left => Key::Left,
-        PK::Right => Key::Right,
-        PK::Home => Key::Home,
-        PK::End => Key::End,
-        PK::PageUp => Key::PageUp,
-        PK::PageDown => Key::PageDown,
+            PK::Minus => Key::Char('-'),
+            PK::Equal => Key::Char('='),
+            PK::LBracket => Key::Char('['),
+            PK::RBracket => Key::Char(']'),
+            PK::Backslash => Key::Char('\\'),
+            PK::Semicolon => Key::Char(';'),
+            PK::Apostrophe => Key::Char('\''),
+            PK::Backtick => Key::Char('`'),
+            PK::Comma => Key::Char(','),
+            PK::Dot => Key::Char('.'),
+            PK::Slash => Key::Char('/'),
+            PK::Space => Key::Char(' '),
 
-        PK::F1 => Key::F(1),
-        PK::F2 => Key::F(2),
-        PK::F3 => Key::F(3),
-        PK::F4 => Key::F(4),
-        PK::F5 => Key::F(5),
-        PK::F6 => Key::F(6),
-        PK::F7 => Key::F(7),
-        PK::F8 => Key::F(8),
-        PK::F9 => Key::F(9),
-        PK::F10 => Key::F(10),
-        PK::F11 => Key::F(11),
-        PK::F12 => Key::F(12),
+            PK::Enter => Key::Enter,
+            PK::Backspace => Key::Backspace,
+            PK::Tab => Key::Tab,
+            PK::Esc => Key::Esc,
+            PK::Delete => Key::Delete,
+            PK::Insert => Key::Insert,
 
-        PK::LShift | PK::RShift => Key::Shift,
-        PK::LCtrl | PK::RCtrl => Key::Ctrl,
-        PK::LAlt | PK::RAlt => Key::Alt,
-        PK::LMeta | PK::RMeta => Key::Super,
-        PK::CapsLock => Key::CapsLock,
-    })
+            PK::Up => Key::Up,
+            PK::Down => Key::Down,
+            PK::Left => Key::Left,
+            PK::Right => Key::Right,
+            PK::Home => Key::Home,
+            PK::End => Key::End,
+            PK::PageUp => Key::PageUp,
+            PK::PageDown => Key::PageDown,
+
+            PK::F1 => Key::F(1),
+            PK::F2 => Key::F(2),
+            PK::F3 => Key::F(3),
+            PK::F4 => Key::F(4),
+            PK::F5 => Key::F(5),
+            PK::F6 => Key::F(6),
+            PK::F7 => Key::F(7),
+            PK::F8 => Key::F(8),
+            PK::F9 => Key::F(9),
+            PK::F10 => Key::F(10),
+            PK::F11 => Key::F(11),
+            PK::F12 => Key::F(12),
+
+            PK::LShift | PK::RShift => Key::Shift,
+            PK::LCtrl | PK::RCtrl => Key::Ctrl,
+            PK::LAlt | PK::RAlt => Key::Alt,
+            PK::LMeta | PK::RMeta => Key::Super,
+            PK::CapsLock => Key::CapsLock,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -841,7 +858,7 @@ mod key_translation_tests {
 
     #[test]
     fn platform_key_none_input_gives_none() {
-        assert_eq!(platform_key(None), None);
+        assert_eq!(None::<PK>.to_input(), None);
     }
 
     #[test]
@@ -875,7 +892,7 @@ mod key_translation_tests {
             (PK::Z, 'z'),
         ];
         for (k, c) in pairs {
-            assert_eq!(platform_key(Some(k)), Some(Key::Char(c)), "{k:?} -> {c:?}");
+            assert_eq!(Some(k).to_input(), Some(Key::Char(c)), "{k:?} -> {c:?}");
         }
     }
 
@@ -894,7 +911,7 @@ mod key_translation_tests {
             (PK::N9, '9'),
         ];
         for (k, c) in pairs {
-            assert_eq!(platform_key(Some(k)), Some(Key::Char(c)), "{k:?} -> {c:?}");
+            assert_eq!(Some(k).to_input(), Some(Key::Char(c)), "{k:?} -> {c:?}");
         }
     }
 
@@ -915,30 +932,30 @@ mod key_translation_tests {
             (PK::Space, ' '),
         ];
         for (k, c) in pairs {
-            assert_eq!(platform_key(Some(k)), Some(Key::Char(c)), "{k:?} -> {c:?}");
+            assert_eq!(Some(k).to_input(), Some(Key::Char(c)), "{k:?} -> {c:?}");
         }
     }
 
     #[test]
     fn platform_key_named_keys() {
-        assert_eq!(platform_key(Some(PK::Enter)), Some(Key::Enter));
-        assert_eq!(platform_key(Some(PK::Backspace)), Some(Key::Backspace));
-        assert_eq!(platform_key(Some(PK::Tab)), Some(Key::Tab));
-        assert_eq!(platform_key(Some(PK::Esc)), Some(Key::Esc));
-        assert_eq!(platform_key(Some(PK::Delete)), Some(Key::Delete));
-        assert_eq!(platform_key(Some(PK::Insert)), Some(Key::Insert));
+        assert_eq!(Some(PK::Enter).to_input(), Some(Key::Enter));
+        assert_eq!(Some(PK::Backspace).to_input(), Some(Key::Backspace));
+        assert_eq!(Some(PK::Tab).to_input(), Some(Key::Tab));
+        assert_eq!(Some(PK::Esc).to_input(), Some(Key::Esc));
+        assert_eq!(Some(PK::Delete).to_input(), Some(Key::Delete));
+        assert_eq!(Some(PK::Insert).to_input(), Some(Key::Insert));
     }
 
     #[test]
     fn platform_key_navigation_cluster() {
-        assert_eq!(platform_key(Some(PK::Up)), Some(Key::Up));
-        assert_eq!(platform_key(Some(PK::Down)), Some(Key::Down));
-        assert_eq!(platform_key(Some(PK::Left)), Some(Key::Left));
-        assert_eq!(platform_key(Some(PK::Right)), Some(Key::Right));
-        assert_eq!(platform_key(Some(PK::Home)), Some(Key::Home));
-        assert_eq!(platform_key(Some(PK::End)), Some(Key::End));
-        assert_eq!(platform_key(Some(PK::PageUp)), Some(Key::PageUp));
-        assert_eq!(platform_key(Some(PK::PageDown)), Some(Key::PageDown));
+        assert_eq!(Some(PK::Up).to_input(), Some(Key::Up));
+        assert_eq!(Some(PK::Down).to_input(), Some(Key::Down));
+        assert_eq!(Some(PK::Left).to_input(), Some(Key::Left));
+        assert_eq!(Some(PK::Right).to_input(), Some(Key::Right));
+        assert_eq!(Some(PK::Home).to_input(), Some(Key::Home));
+        assert_eq!(Some(PK::End).to_input(), Some(Key::End));
+        assert_eq!(Some(PK::PageUp).to_input(), Some(Key::PageUp));
+        assert_eq!(Some(PK::PageDown).to_input(), Some(Key::PageDown));
     }
 
     #[test]
@@ -958,27 +975,27 @@ mod key_translation_tests {
             (PK::F12, 12),
         ];
         for (k, n) in pairs {
-            assert_eq!(platform_key(Some(k)), Some(Key::F(n)), "{k:?} -> F({n})");
+            assert_eq!(Some(k).to_input(), Some(Key::F(n)), "{k:?} -> F({n})");
         }
     }
 
     #[test]
     fn platform_key_modifier_keys_collapse_left_and_right_variants() {
-        assert_eq!(platform_key(Some(PK::LShift)), Some(Key::Shift));
-        assert_eq!(platform_key(Some(PK::RShift)), Some(Key::Shift));
-        assert_eq!(platform_key(Some(PK::LCtrl)), Some(Key::Ctrl));
-        assert_eq!(platform_key(Some(PK::RCtrl)), Some(Key::Ctrl));
-        assert_eq!(platform_key(Some(PK::LAlt)), Some(Key::Alt));
-        assert_eq!(platform_key(Some(PK::RAlt)), Some(Key::Alt));
-        assert_eq!(platform_key(Some(PK::LMeta)), Some(Key::Super));
-        assert_eq!(platform_key(Some(PK::RMeta)), Some(Key::Super));
-        assert_eq!(platform_key(Some(PK::CapsLock)), Some(Key::CapsLock));
+        assert_eq!(Some(PK::LShift).to_input(), Some(Key::Shift));
+        assert_eq!(Some(PK::RShift).to_input(), Some(Key::Shift));
+        assert_eq!(Some(PK::LCtrl).to_input(), Some(Key::Ctrl));
+        assert_eq!(Some(PK::RCtrl).to_input(), Some(Key::Ctrl));
+        assert_eq!(Some(PK::LAlt).to_input(), Some(Key::Alt));
+        assert_eq!(Some(PK::RAlt).to_input(), Some(Key::Alt));
+        assert_eq!(Some(PK::LMeta).to_input(), Some(Key::Super));
+        assert_eq!(Some(PK::RMeta).to_input(), Some(Key::Super));
+        assert_eq!(Some(PK::CapsLock).to_input(), Some(Key::CapsLock));
     }
 
     #[test]
     fn platform_mods_none_when_nothing_set() {
         let m = platform::protocol::Modifiers::default();
-        assert_eq!(platform_mods(m), Modifiers::NONE);
+        assert_eq!(m.to_input(), Modifiers::NONE);
     }
 
     #[test]
@@ -987,7 +1004,7 @@ mod key_translation_tests {
             depressed: 0x01,
             ..Default::default()
         };
-        assert_eq!(platform_mods(m), Modifiers::SHIFT);
+        assert_eq!(m.to_input(), Modifiers::SHIFT);
     }
 
     #[test]
@@ -996,7 +1013,7 @@ mod key_translation_tests {
             latched: 0x04,
             ..Default::default()
         };
-        assert_eq!(platform_mods(m), Modifiers::CTRL);
+        assert_eq!(m.to_input(), Modifiers::CTRL);
     }
 
     #[test]
@@ -1005,7 +1022,7 @@ mod key_translation_tests {
             locked: 0x08,
             ..Default::default()
         };
-        assert_eq!(platform_mods(m), Modifiers::ALT);
+        assert_eq!(m.to_input(), Modifiers::ALT);
     }
 
     #[test]
@@ -1014,7 +1031,7 @@ mod key_translation_tests {
             depressed: 0x40,
             ..Default::default()
         };
-        assert_eq!(platform_mods(m), Modifiers::SUPER);
+        assert_eq!(m.to_input(), Modifiers::SUPER);
     }
 
     #[test]
@@ -1026,19 +1043,19 @@ mod key_translation_tests {
             locked: 0x02,
             ..Default::default()
         };
-        assert_eq!(platform_mods(locked), Modifiers::CAPS);
+        assert_eq!(locked.to_input(), Modifiers::CAPS);
 
         let depressed = platform::protocol::Modifiers {
             depressed: 0x02,
             ..Default::default()
         };
-        assert_eq!(platform_mods(depressed), Modifiers::NONE);
+        assert_eq!(depressed.to_input(), Modifiers::NONE);
 
         let latched = platform::protocol::Modifiers {
             latched: 0x02,
             ..Default::default()
         };
-        assert_eq!(platform_mods(latched), Modifiers::NONE);
+        assert_eq!(latched.to_input(), Modifiers::NONE);
     }
 
     #[test]
@@ -1049,7 +1066,7 @@ mod key_translation_tests {
             locked: 0x02,
             group: 0,
         };
-        let out = platform_mods(m);
+        let out = m.to_input();
         assert_eq!(
             out,
             Modifiers::SHIFT
@@ -1068,6 +1085,6 @@ mod key_translation_tests {
             latched: 0x01,
             ..Default::default()
         };
-        assert_eq!(platform_mods(m), Modifiers::SHIFT);
+        assert_eq!(m.to_input(), Modifiers::SHIFT);
     }
 }

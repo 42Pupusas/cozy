@@ -10,7 +10,7 @@ use crate::{
 const JBM: &str = "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf";
 const PX: f32 = 16.0;
 
-/// The one test fixture font (`JetBrains` Mono), namespaced as a zero-sized
+/// The one test fixture font (JetBrains Mono), namespaced as a zero-sized
 /// marker type rather than a bare `load_bytes()` function -- reads as
 /// `Jbm::bytes()`, the same "constructor namespace" shape used for
 /// `RawPty::fork` etc. in the non-test code, instead of a free fn with an
@@ -191,12 +191,12 @@ fn raster_m_produces_nonzero_pixels() {
     let cmap = Cmap::parse(&ff).unwrap();
     let glyf = ff.table(crate::parse::TAG_GLYF).unwrap();
 
-    let scale = PX / f32::from(head.units_per_em);
+    let scale = PX / head.units_per_em as f32;
     let gid = cmap.glyph_id('M' as u32);
     let (off, len) = loca.glyph_range(gid).unwrap();
     let outline = crate::outline::Outline::decode(glyf, off, len, &loca, 0).unwrap();
 
-    let ascender = f32::from(hhea.ascender) * scale;
+    let ascender = hhea.ascender as f32 * scale;
     let w = 16u32;
     let h = 20u32;
     let bmp = outline.rasterize(w, h, scale, ascender, 0.0);
@@ -213,7 +213,7 @@ fn raster_bitmap_correct_size() {
     let loca = Loca::parse(&ff, head.index_to_loc_format).unwrap();
     let cmap = Cmap::parse(&ff).unwrap();
     let glyf = ff.table(crate::parse::TAG_GLYF).unwrap();
-    let scale = PX / f32::from(head.units_per_em);
+    let scale = PX / head.units_per_em as f32;
     let gid = cmap.glyph_id('M' as u32);
     let (off, len) = loca.glyph_range(gid).unwrap();
     let outline = crate::outline::Outline::decode(glyf, off, len, &loca, 0).unwrap();
@@ -233,11 +233,6 @@ fn atlas_inserts_blank_glyph_as_zero_size() {
     assert_eq!(entry.advance, 500);
 }
 
-// x_min/x_max vs y_min/y_max are the idiomatic names for a glyph bounding
-// box; clippy's similar-names lint would rather they weren't both spelled
-// out, but renaming one pair to something less symmetric would only make
-// the geometry harder to follow.
-#[allow(clippy::similar_names)]
 #[test]
 fn atlas_packs_without_overflow() {
     let data = Jbm::bytes();
@@ -248,8 +243,8 @@ fn atlas_packs_without_overflow() {
     let glyf = ff.table(crate::parse::TAG_GLYF).unwrap();
     let hhea = Hhea::parse(&ff).unwrap();
     let hmtx = Hmtx::parse(&ff, hhea.number_of_hmetrics).unwrap();
-    let scale = PX / f32::from(head.units_per_em);
-    let ascender = f32::from(hhea.ascender) * scale;
+    let scale = PX / head.units_per_em as f32;
+    let ascender = hhea.ascender as f32 * scale;
 
     let mut atlas = Atlas::new(512, 512);
     let mut packed = 0u32;
@@ -257,26 +252,29 @@ fn atlas_packs_without_overflow() {
     for cp in 0x21u32..=0x7Eu32 {
         let gid = cmap.glyph_id(cp);
         let (adv_raw, lsb_raw) = hmtx.metrics(gid);
-        let Some((off, len)) = loca.glyph_range(gid) else {
-            // blank glyph (space)
-            let bmp = crate::raster::Bitmap::blank(0, 0);
-            atlas.insert(&bmp, 0, 0, (f32::from(adv_raw) * scale) as i32);
-            packed += 1;
-            continue;
+        let (off, len) = match loca.glyph_range(gid) {
+            Some(r) => r,
+            None => {
+                // blank glyph (space)
+                let bmp = crate::raster::Bitmap::blank(0, 0);
+                atlas.insert(&bmp, 0, 0, (adv_raw as f32 * scale) as i32);
+                packed += 1;
+                continue;
+            }
         };
         let outline = crate::outline::Outline::decode(glyf, off, len, &loca, 0).unwrap();
-        let bounds_y_max = f32::from(outline.y_max) * scale;
-        let bounds_y_min = f32::from(outline.y_min) * scale;
-        let bounds_x_max = f32::from(outline.x_max) * scale;
-        let bounds_x_min = f32::from(outline.x_min) * scale;
-        let w = ((bounds_x_max - bounds_x_min).ceil() as u32).max(1);
-        let h = ((bounds_y_max - bounds_y_min).ceil() as u32).max(1);
-        let bmp = outline.rasterize(w, h, scale, ascender, -bounds_x_min);
+        let px_y_max = outline.y_max as f32 * scale;
+        let px_y_min = outline.y_min as f32 * scale;
+        let px_x_max = outline.x_max as f32 * scale;
+        let px_x_min = outline.x_min as f32 * scale;
+        let w = ((px_x_max - px_x_min).ceil() as u32).max(1);
+        let h = ((px_y_max - px_y_min).ceil() as u32).max(1);
+        let bmp = outline.rasterize(w, h, scale, ascender, -px_x_min);
         atlas.insert(
             &bmp,
-            i32::from(lsb_raw),
-            (bounds_y_max) as i32,
-            (f32::from(adv_raw) * scale) as i32,
+            lsb_raw as i32,
+            (px_y_max) as i32,
+            (adv_raw as f32 * scale) as i32,
         );
         packed += 1;
     }

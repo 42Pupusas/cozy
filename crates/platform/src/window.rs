@@ -21,7 +21,7 @@ use crate::conn::{Conn, ConnError, Sender, WindowSender};
 use crate::cursor;
 use crate::draw::Point;
 use crate::error::{Error, Result};
-use crate::event::Event;
+use crate::event::RawEvent;
 use crate::id::{
     BufferId, CallbackId, CompositorId, DataDeviceId, DataDeviceManagerId, DataOfferId,
     DataSourceId, DisplayId, KeyboardId, ObjectId, OutputId, PointerId, PoolId, RegistryId, SeatId,
@@ -40,7 +40,7 @@ use crate::protocol::{
 };
 use crate::render;
 use crate::sys::{RepeatTimer, ShmBuffer};
-use crate::wire::{Event as WireEvent, MessageBuilder};
+use crate::wire::{MessageBuilder, WireEvent};
 
 const EVENT_RING_CAP: usize = 1024;
 
@@ -276,7 +276,7 @@ pub struct TermWindow {
     sender: Sender,
     request_rx: mpsc::Consumer<crate::conn::WindowRequest>,
     window_tx: WindowSender,
-    events: Consumer<Event>,
+    events: Consumer<RawEvent>,
     reader: Option<std::thread::JoinHandle<Result<()>>>,
     /// Shared wakeup the reader signals after pushing events; also exposed to
     /// the app (via [`TermWindow::waker`]) so the parser thread can wake the UI
@@ -397,7 +397,7 @@ pub struct TermWindow {
     /// the content is fixed but the view window moves, so a selection at
     /// viewport row R must move by the offset change to stay on its text.
     view_offset: i32,
-    /// Set when a `data_source.send` just arrived; the next `Event::Fd` is the
+    /// Set when a `data_source.send` just arrived; the next `RawEvent::Fd` is the
     /// pipe to write our clipboard text into.
     awaiting_send_fd: bool,
     /// Paste channel: helper threads that read a paste pipe send the bytes
@@ -490,7 +490,7 @@ impl TermWindow {
     ) -> Result<Self> {
         let (mut sender, reader, repeat_timer) = Conn::connect()?;
         let (producer, mut events) =
-            RingBuffer::<Event>::new(Capacity::exact(EVENT_RING_CAP)).split();
+            RingBuffer::<RawEvent>::new(Capacity::exact(EVENT_RING_CAP)).split();
         // The reader signals this after pushing events so the UI thread, which
         // polls instead of blocking on a single ring, wakes.
         let reader_wake = wake.clone();
@@ -1035,17 +1035,17 @@ impl TermWindow {
         }
     }
 
-    fn handle_event(&mut self, ev: Event) -> Result<()> {
+    fn handle_event(&mut self, ev: RawEvent) -> Result<()> {
         // Clipboard fds arrive as a standalone `Fd` event immediately after the
         // message that triggered them (see conn.rs). Route by what we asked for.
-        if let Event::Fd(fds) = ev {
+        if let RawEvent::Fd(fds) = ev {
             self.handle_clipboard_fds(fds);
             return Ok(());
         }
 
         // wl_display events arrive as raw bytes (the reader routes object 1 to
         // `Bytes`). Handle error (fatal) and delete_id (id recycling) here.
-        if let Event::Bytes(ref bytes) = ev {
+        if let RawEvent::Bytes(ref bytes) = ev {
             let (mut wire, _) = WireEvent::parse(bytes).ok_or(Error::ReaderStopped)?;
             if wire.object_id == DisplayId(1).raw() {
                 match DisplayEvent::from_opcode(wire.opcode) {
@@ -1067,7 +1067,7 @@ impl TermWindow {
         }
 
         // Key repeat timer.
-        if matches!(ev, Event::Repeat) {
+        if matches!(ev, RawEvent::Repeat) {
             if let Some(key) = self.held_key {
                 self.input_queue.push_back(InputEvent::Key {
                     key: Some(key),
@@ -1383,7 +1383,7 @@ impl TermWindow {
             if ev.is(src) {
                 match ev.event::<DataSourceEvent>() {
                     Some(DataSourceEvent::Send) => {
-                        // The fd to write into arrives as the next Event::Fd.
+                        // The fd to write into arrives as the next RawEvent::Fd.
                         self.awaiting_send_fd = true;
                     }
                     Some(DataSourceEvent::Cancelled) => {
@@ -1661,11 +1661,10 @@ impl TermWindow {
                 // High-contrast fixed readout: white on black, independent of
                 // the active theme, so it's always legible regardless of
                 // what's underneath.
-                let attrs = grid::Attrs {
-                    fg: grid::Color::Rgb(0xff, 0xff, 0xff),
-                    bg: grid::Color::Rgb(0x00, 0x00, 0x00),
-                    ..grid::Attrs::default()
-                };
+                let attrs = grid::Attrs::with_colors(
+                    grid::Color::Rgb(0xff, 0xff, 0xff),
+                    grid::Color::Rgb(0x00, 0x00, 0x00),
+                );
                 let mut canvas =
                     crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
                 for (i, ch) in text.chars().enumerate() {
@@ -2016,7 +2015,7 @@ impl Registry {
     ///
     /// Was a free `bind_globals(sender, events)` function -- moved onto
     /// `Registry` as its entry point.
-    fn discover(sender: &mut Sender, events: &mut Consumer<Event>) -> Result<Globals> {
+    fn discover(sender: &mut Sender, events: &mut Consumer<RawEvent>) -> Result<Globals> {
         let registry: RegistryId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
@@ -2035,7 +2034,9 @@ impl Registry {
         // below for how we still give it a chance to appear).
         while compositor.is_none() || shm.is_none() || wm_base.is_none() || seat.is_none() {
             let event = events.pop_block().ok_or(Error::ReaderStopped)?;
-            let Event::Bytes(bytes) = event else { continue };
+            let RawEvent::Bytes(bytes) = event else {
+                continue;
+            };
             let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
                 continue;
             };
@@ -2110,7 +2111,7 @@ impl Registry {
     /// compositor happens to send `geometry`/`mode` first. Returns `1` (no
     /// scaling) if the output never reports a scale (some compositors only
     /// send it when it's non-default) or times out.
-    fn output_scale(sender: &mut Sender, events: &mut Consumer<Event>, output: OutputId) -> i32 {
+    fn output_scale(sender: &mut Sender, events: &mut Consumer<RawEvent>, output: OutputId) -> i32 {
         let cb: CallbackId = sender.alloc_id();
         if sender
             .request(MessageBuilder::new(DisplayId(1), DisplayRequest::Sync).new_id(cb))
@@ -2125,7 +2126,7 @@ impl Registry {
                 return scale;
             };
             match event {
-                Event::Bytes(bytes) => {
+                RawEvent::Bytes(bytes) => {
                     let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
                         continue;
                     };
@@ -2135,7 +2136,7 @@ impl Registry {
                         scale = ev.i32();
                     }
                 }
-                Event::Wire {
+                RawEvent::Wire {
                     object_id, opcode, ..
                 } => {
                     if object_id == cb.raw()
@@ -2144,9 +2145,9 @@ impl Registry {
                         return scale;
                     }
                 }
-                Event::Repeat => {}
+                RawEvent::Repeat => {}
                 // Fd-carrying events never occur during output-scale probing.
-                Event::Fd(_) => {}
+                RawEvent::Fd(_) => {}
             }
         }
     }

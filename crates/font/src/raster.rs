@@ -142,10 +142,6 @@ impl Outline {
     /// at different scopes.
     #[must_use]
     pub fn rasterize(&self, w: u32, h: u32, scale: f32, baseline: f32, x_offset: f32) -> Bitmap {
-        // Vertical supersamples per pixel row (see the scanline-fill comment
-        // below for why).
-        const SS: u32 = 4;
-
         let mut edges: Vec<Edge> = Vec::new();
 
         // Transform a font-unit point to pixel coords.
@@ -191,11 +187,12 @@ impl Outline {
         // rather than snapping edges to whole columns. Without this, curves
         // (which dominate a typeface like Inconsolata) come out as hard,
         // jagged "chewed"-looking stair-steps instead of smooth glyphs.
+        const SS: u32 = 4; // vertical supersamples per pixel row
         let mut bmp = Bitmap::blank(w, h);
         let mut coverage = vec![0.0f32; w as usize];
 
         for scanline in 0..h {
-            coverage.fill(0.0);
+            coverage.iter_mut().for_each(|c| *c = 0.0);
 
             for sub in 0..SS {
                 let y = scanline as f32 + (sub as f32 + 0.5) / SS as f32;
@@ -210,7 +207,7 @@ impl Outline {
 
                 for (x, w_delta) in crossings {
                     if inside {
-                        Self::add_span_coverage(&mut coverage, prev_x, x, 1.0 / SS as f32);
+                        add_span_coverage(&mut coverage, prev_x, x, 1.0 / SS as f32);
                     }
                     winding += i32::from(w_delta);
                     inside = winding != 0;
@@ -226,32 +223,27 @@ impl Outline {
 
         bmp
     }
+}
 
-    /// Add fractional coverage `weight` for the span `[x0, x1)` into
-    /// `coverage`, splitting partial weight onto the boundary pixels the
-    /// span doesn't fully cover. `coverage` indices map 1:1 to pixel columns.
-    ///
-    /// Was a free `add_span_coverage(coverage, x0, x1, weight)` function --
-    /// moved onto `Outline` (an associated function, since `coverage` is a
-    /// bare scratch buffer, not a type of its own) alongside `rasterize`,
-    /// its only caller.
-    fn add_span_coverage(coverage: &mut [f32], x0: f32, x1: f32, weight: f32) {
-        let w = coverage.len() as f32;
-        let x0 = x0.clamp(0.0, w);
-        let x1 = x1.clamp(0.0, w);
-        if x1 <= x0 {
-            return;
-        }
+/// Add fractional coverage `weight` for the span `[x0, x1)` into `coverage`,
+/// splitting partial weight onto the boundary pixels the span doesn't fully
+/// cover. `coverage` indices map 1:1 to pixel columns.
+fn add_span_coverage(coverage: &mut [f32], x0: f32, x1: f32, weight: f32) {
+    let w = coverage.len() as f32;
+    let x0 = x0.clamp(0.0, w);
+    let x1 = x1.clamp(0.0, w);
+    if x1 <= x0 {
+        return;
+    }
 
-        let start = x0.floor() as usize;
-        let end = x1.ceil() as usize;
-        for col in start..end.min(coverage.len()) {
-            let px0 = col as f32;
-            let px1 = px0 + 1.0;
-            let overlap = x1.min(px1) - x0.max(px0);
-            if overlap > 0.0 {
-                coverage[col] += overlap * weight;
-            }
+    let start = x0.floor() as usize;
+    let end = x1.ceil() as usize;
+    for col in start..end.min(coverage.len()) {
+        let px0 = col as f32;
+        let px1 = px0 + 1.0;
+        let overlap = x1.min(px1) - x0.max(px0);
+        if overlap > 0.0 {
+            coverage[col] += overlap * weight;
         }
     }
 }

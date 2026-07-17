@@ -89,18 +89,26 @@ impl MessageBuilder {
 }
 
 /// A decoded event header plus a cursor over its argument bytes.
-pub struct Event<'a> {
+///
+/// Named `WireEvent` (not the bare `Event` this module used to export)
+/// because it's the first of three unrelated event types the terminal's
+/// input pipeline threads through: this one (raw Wayland bytes, freshly
+/// parsed off the wire), [`crate::event::RawEvent`] (the reader→main-thread
+/// hand-off), and `vt_parser::TermEvent` (parsed VT/ANSI escape sequences,
+/// downstream of the PTY entirely — unrelated to Wayland but easy to
+/// confuse with the other two when everything is just called `Event`).
+pub struct WireEvent<'a> {
     pub object_id: u32,
     pub opcode: u16,
     args: &'a [u8],
     pos: usize,
 }
 
-impl<'a> Event<'a> {
+impl<'a> WireEvent<'a> {
     /// Try to parse one event from the front of `data`. Returns the event and
     /// the number of bytes it consumed, or `None` if `data` is a partial
     /// header (caller should read more).
-    pub fn parse(data: &'a [u8]) -> Option<(Event<'a>, usize)> {
+    pub fn parse(data: &'a [u8]) -> Option<(WireEvent<'a>, usize)> {
         if data.len() < 8 {
             return None;
         }
@@ -111,7 +119,7 @@ impl<'a> Event<'a> {
             return None;
         }
         Some((
-            Event {
+            WireEvent {
                 object_id,
                 opcode,
                 args: &data[8..size],
@@ -191,7 +199,7 @@ mod tests {
         let total = raw.len();
         // MessageBuilder writes a request, but the wire layout is identical to
         // an event, so we can parse it as one.
-        let (mut ev, consumed) = Event::parse(&raw).unwrap();
+        let (mut ev, consumed) = WireEvent::parse(&raw).unwrap();
         assert_eq!(consumed, total);
         assert_eq!(ev.object_id, 42);
         assert_eq!(ev.u32(), 0xDEAD_BEEF);

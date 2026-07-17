@@ -22,7 +22,7 @@ platform` (renderer), plus `text_layout` and `input` on the side.
 
 ## Why parser and pipeline are separate benches
 
-`vt_parser::Event` borrows from the parser's internal buffers (OSC text in
+`vt_parser::TermEvent` borrows from the parser's internal buffers (OSC text in
 particular), so events can't be parsed once and replayed into the grid —
 the parser has to run inline with every grid apply. There is therefore no
 "grid alone" bench. Instead:

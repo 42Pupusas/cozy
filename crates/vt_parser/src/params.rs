@@ -38,6 +38,7 @@ impl Params {
     }
 
     /// Feed a digit character into the current parameter.
+    #[inline]
     pub(crate) fn push_digit(&mut self, digit: u8) {
         if self.len <= self.cur {
             self.len = self.cur + 1;
@@ -45,6 +46,28 @@ impl Params {
         self.buf[self.cur] = self.buf[self.cur]
             .saturating_mul(10)
             .saturating_add(u16::from(digit - b'0'));
+    }
+
+    /// Fold a run of consecutive ASCII digits into the current parameter in
+    /// one shot. Hoists the `len`/`cur` bookkeeping and the slot load/store
+    /// out of the per-digit loop so the accumulator stays in a register —
+    /// this is the batched fast path used by `Parser::feed` for the digit
+    /// runs that dominate SGR-heavy streams (truecolor, 256-color).
+    ///
+    /// `digits` must contain only bytes in `b'0'..=b'9'`.
+    #[inline]
+    pub(crate) fn push_digits(&mut self, digits: &[u8]) {
+        if digits.is_empty() {
+            return;
+        }
+        if self.len <= self.cur {
+            self.len = self.cur + 1;
+        }
+        let mut v = self.buf[self.cur];
+        for &d in digits {
+            v = v.saturating_mul(10).saturating_add(u16::from(d - b'0'));
+        }
+        self.buf[self.cur] = v;
     }
 
     /// Terminate the current parameter and start a new one.

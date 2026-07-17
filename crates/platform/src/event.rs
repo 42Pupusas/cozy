@@ -1,26 +1,33 @@
 //! The event type that crosses the reader→main channel.
 //!
 //! The reader thread is a pure parser: it pulls bytes off the socket, splits
-//! them into whole Wayland messages, and pushes each one as an [`Event`] onto a
-//! lock-free SPSC ring. It does **not** interpret meaning — it doesn't know
+//! them into whole Wayland messages, and pushes each one as a [`RawEvent`] onto
+//! a lock-free SPSC ring. It does **not** interpret meaning — it doesn't know
 //! which object id is the pointer or the surface, because those ids are
 //! allocated on the main thread. The main thread, which owns id allocation, maps
 //! each event to meaning.
 //!
 //! Most Wayland events we care about carry a small, fixed set of `u32`/`i32`
 //! arguments (pointer motion, configure, ping — all ≤ 4 words), so the common
-//! [`Event::Wire`] variant inlines them with no allocation. The few
+//! [`RawEvent::Wire`] variant inlines them with no allocation. The few
 //! variable-length or string-bearing events (`wl_display.error`,
 //! `wl_registry.global`) are rarer and carried as raw bytes in
-//! [`Event::Bytes`], parsed on the main thread.
+//! [`RawEvent::Bytes`], parsed on the main thread.
 //!
 //! The `object_id` and `opcode` are stored raw — the reader can't know which
 //! interface an id belongs to, so it can't produce an interface-typed
 //! [`ObjectId`](crate::id::ObjectId). The main thread, which *does* know, uses
-//! the typed accessors below ([`is`](Event::is), [`event`](Event::event),
-//! [`serial`](Event::serial), [`fixed`](Event::fixed), [`point`](Event::point))
+//! the typed accessors below ([`is`](RawEvent::is), [`event`](RawEvent::event),
+//! [`serial`](RawEvent::serial), [`fixed`](RawEvent::fixed), [`point`](RawEvent::point))
 //! to interpret each event without sprinkling `.raw()` / `Serial(..)` / `Fixed(..)`
 //! conversions through the dispatch code.
+//!
+//! This is the middle link of three unrelated event types the input pipeline
+//! threads through, hence the specific name: [`crate::wire::WireEvent`] is
+//! this one's raw material (freshly parsed off the socket, still just a
+//! header + byte cursor), and `vt_parser::TermEvent` is downstream of the
+//! PTY entirely, several stages later. Calling all three bare `Event` used
+//! to force every call site to alias-import to tell them apart.
 
 use crate::draw::Point;
 use crate::id::{ObjectId, Serial};
@@ -30,7 +37,7 @@ use crate::protocol::{Fixed, FromOpcode};
 ///
 /// Not `Clone`: the `Fd` variant owns `OwnedFd`s, which can't be duplicated.
 #[derive(Debug)]
-pub enum Event {
+pub enum RawEvent {
     /// A message whose arguments fit in up to four 32-bit words. `args[..nargs]`
     /// are valid; interpret them per `(object_id, opcode)`. Pointer motion,
     /// configure, ping, seat capabilities, toplevel close all land here.
@@ -60,16 +67,16 @@ pub enum Event {
     Fd(Vec<std::os::fd::OwnedFd>),
 }
 
-impl Event {
+impl RawEvent {
     /// Decode one whole wire message (`msg`, including its 8-byte header)
-    /// into an `Event`. Was a free `encode(msg: &[u8]) -> Event` function in
-    /// `conn.rs`'s reader thread -- it builds nothing but an `Event`, so it
+    /// into a `RawEvent`. Was a free `encode(msg: &[u8]) -> Event` function in
+    /// `conn.rs`'s reader thread -- it builds nothing but a `RawEvent`, so it
     /// belongs as a constructor on the type it returns.
     ///
     /// Messages from `wl_display` and `wl_registry` carry strings, so
-    /// they're forwarded as raw bytes ([`Event::Bytes`]) for the main thread
+    /// they're forwarded as raw bytes ([`RawEvent::Bytes`]) for the main thread
     /// to re-parse with the full wire decoder. Everything else inlines up to
-    /// four `u32` args into [`Event::Wire`].
+    /// four `u32` args into [`RawEvent::Wire`].
     ///
     /// # Panics
     /// If `msg` is shorter than the 8-byte Wayland message header.
@@ -114,8 +121,8 @@ impl Event {
     /// non-`Wire` variants (`Bytes`, `Repeat`), which aren't about an object.
     pub fn object_id(&self) -> u32 {
         match self {
-            Event::Wire { object_id, .. } => *object_id,
-            Event::Bytes(_) | Event::Repeat | Event::Fd(_) => 0,
+            RawEvent::Wire { object_id, .. } => *object_id,
+            RawEvent::Bytes(_) | RawEvent::Repeat | RawEvent::Fd(_) => 0,
         }
     }
 
@@ -123,8 +130,8 @@ impl Event {
     /// variants (`Bytes`, `Repeat`).
     pub fn opcode(&self) -> u16 {
         match self {
-            Event::Wire { opcode, .. } => *opcode,
-            Event::Bytes(_) | Event::Repeat | Event::Fd(_) => 0,
+            RawEvent::Wire { opcode, .. } => *opcode,
+            RawEvent::Bytes(_) | RawEvent::Repeat | RawEvent::Fd(_) => 0,
         }
     }
 
@@ -143,7 +150,7 @@ impl Event {
     /// Read fixed arg `i` as a `u32` (0 if out of range).
     pub fn arg(&self, i: usize) -> u32 {
         match self {
-            Event::Wire { args, nargs, .. } if i < *nargs as usize => args[i],
+            RawEvent::Wire { args, nargs, .. } if i < *nargs as usize => args[i],
             _ => 0,
         }
     }

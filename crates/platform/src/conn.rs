@@ -11,7 +11,7 @@
 //!
 //! * [`Reader`] owns the receive ring and the provided-buffer pool. It runs on
 //!   its own thread: arm a multishot `recvmsg`, block, reap completions, split
-//!   the bytes into whole Wayland messages, and push each as an [`Event`] onto a
+//!   the bytes into whole Wayland messages, and push each as a [`RawEvent`] onto a
 //!   lock-free SPSC ring. Arm / reap / re-arm are all local to this ring, so the
 //!   re-arm never crosses a thread boundary — no shared state.
 //! * [`Sender`] owns the send ring and stays on the main thread. It allocates
@@ -31,10 +31,10 @@ use quetzalcoatl::spsc::Producer;
 use ququmatz::types::{CqeFlags, MsgFlags, MsgHdr, PollMask, RawFd};
 use ququmatz::{IoUring, ProvidedBufferRing, Sqe};
 
-use crate::event::Event;
+use crate::event::RawEvent;
 use crate::id::ObjectId;
 use crate::sys::{self, OutgoingMessage, RepeatTimer, SysError};
-use crate::wire::{Event as WireEvent, MessageBuilder};
+use crate::wire::{MessageBuilder, WireEvent};
 
 /// A failure setting up or running the Wayland connection.
 #[derive(Debug)]
@@ -463,7 +463,7 @@ impl Sender {
 // ---------------------------------------------------------------------------
 
 /// Owns the receive ring and buffer pool. Parses the socket byte stream into
-/// whole Wayland messages and pushes each as an [`Event`]. Runs on its own
+/// whole Wayland messages and pushes each as a [`RawEvent`]. Runs on its own
 /// thread via [`run`](Reader::run).
 pub struct Reader {
     sock: RawFd,
@@ -506,14 +506,14 @@ impl Reader {
     }
 
     /// Run the receive loop until the connection closes or `producer`'s consumer
-    /// is dropped. Each whole Wayland message becomes one pushed [`Event`].
+    /// is dropped. Each whole Wayland message becomes one pushed [`RawEvent`].
     ///
     /// Must run on the thread that will own the rx ring for its whole life — it
     /// arms the multishot recv here so this thread is the ring's sole issuer
     /// (required by `single_issuer`/`defer_taskrun`).
     pub fn run(
         mut self,
-        producer: Producer<Event>,
+        producer: Producer<RawEvent>,
         waker: Option<waker::Waker>,
     ) -> Result<(), ConnError> {
         // Arm the first multishot recv and the key-repeat timer poll, both from
@@ -541,7 +541,7 @@ impl Reader {
 
             // Drain whole messages out of the inbox and forward them.
             while let Some(size) = WireEvent::parse(&self.inbox).map(|(_, s)| s) {
-                let event = Event::from_wire_msg(&self.inbox[..size]);
+                let event = RawEvent::from_wire_msg(&self.inbox[..size]);
                 self.inbox.drain(..size);
                 // push_block waits if the consumer is behind; if the consumer
                 // has dropped, push returns the value back and we stop.
@@ -559,7 +559,7 @@ impl Reader {
             // The main thread consumes them by order.
             if !self.pending_fds.is_empty() {
                 let fds = core::mem::take(&mut self.pending_fds);
-                if producer.push_block(Event::Fd(fds)).is_err() {
+                if producer.push_block(RawEvent::Fd(fds)).is_err() {
                     return Ok(());
                 }
                 pushed = true;
@@ -604,12 +604,12 @@ impl Reader {
 
     /// Handle a timerfd-poll completion: drain the expiration count (clearing
     /// the level-triggered readiness so the re-armed poll won't busy-loop), push
-    /// one [`Event::Repeat`] tick, and re-arm the poll. One readiness edge yields
+    /// one [`RawEvent::Repeat`] tick, and re-arm the poll. One readiness edge yields
     /// one tick regardless of how many expiries piled up.
     fn absorb_timer_cqe(
         &mut self,
         result: i32,
-        producer: &Producer<Event>,
+        producer: &Producer<RawEvent>,
     ) -> Result<(), ConnError> {
         // A poll error (e.g. the fd went away) is fatal for the timer; surface
         // it like any other ring I/O error.
@@ -618,7 +618,7 @@ impl Reader {
         }
         RepeatTimer::drain_fd(self.timer_fd.as_i32());
         // Best-effort: if the consumer dropped, the main loop is ending anyway.
-        let _ = producer.push_block(Event::Repeat);
+        let _ = producer.push_block(RawEvent::Repeat);
         self.arm_timer_poll()
     }
 

@@ -46,7 +46,7 @@ pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot};
 pub use screen::Screen;
 pub use selection::{Point as SelPoint, Selection};
 
-use vt_parser::{C0, CsiAction, Event, OscCmd, SgrAttr};
+use vt_parser::{C0, CsiAction, OscCmd, SgrAttr, TermEvent};
 
 /// Scrollback limit (lines above the visible area).
 pub const SCROLLBACK_MAX: usize = 10_000;
@@ -255,20 +255,20 @@ impl Grid {
     ///
     /// New output snaps the viewport back to the live bottom (standard terminal
     /// behavior: typing or fresh output always returns you to the prompt).
-    pub fn apply(&mut self, event: &Event<'_>) {
+    pub fn apply(&mut self, event: &TermEvent<'_>) {
         self.snap_viewport_to_bottom();
         match event {
-            Event::Print(ch) => self.print(*ch),
-            Event::Control(c0) => self.control(*c0),
-            Event::Csi(action) => self.csi(action),
-            Event::Osc(cmd) => self.osc(cmd),
-            Event::Esc {
+            TermEvent::Print(ch) => self.print(*ch),
+            TermEvent::Control(c0) => self.control(*c0),
+            TermEvent::Csi(action) => self.csi(action),
+            TermEvent::Osc(cmd) => self.osc(cmd),
+            TermEvent::Esc {
                 intermediate,
                 final_byte,
             } => {
                 self.esc(*intermediate, *final_byte);
             }
-            Event::Dcs | Event::Ignored => {}
+            TermEvent::Dcs | TermEvent::Ignored => {}
         }
     }
 
@@ -752,24 +752,24 @@ impl Grid {
     fn apply_sgr(&mut self, attr: &SgrAttr) {
         match attr {
             SgrAttr::Reset => self.attrs = Attrs::default(),
-            SgrAttr::Bold => self.attrs.bold = true,
-            SgrAttr::Dim => self.attrs.dim = true,
-            SgrAttr::Italic => self.attrs.italic = true,
-            SgrAttr::Underline => self.attrs.underline = true,
-            SgrAttr::Blink | SgrAttr::RapidBlink => self.attrs.blink = true,
-            SgrAttr::Inverse => self.attrs.inverse = true,
-            SgrAttr::Invisible => self.attrs.invisible = true,
-            SgrAttr::Strikethrough => self.attrs.strikethrough = true,
+            SgrAttr::Bold => self.attrs.set_bold(true),
+            SgrAttr::Dim => self.attrs.set_dim(true),
+            SgrAttr::Italic => self.attrs.set_italic(true),
+            SgrAttr::Underline => self.attrs.set_underline(true),
+            SgrAttr::Blink | SgrAttr::RapidBlink => self.attrs.set_blink(true),
+            SgrAttr::Inverse => self.attrs.set_inverse(true),
+            SgrAttr::Invisible => self.attrs.set_invisible(true),
+            SgrAttr::Strikethrough => self.attrs.set_strikethrough(true),
             SgrAttr::NormalIntensity => {
-                self.attrs.bold = false;
-                self.attrs.dim = false;
+                self.attrs.set_bold(false);
+                self.attrs.set_dim(false);
             }
-            SgrAttr::NoItalic => self.attrs.italic = false,
-            SgrAttr::NoUnderline => self.attrs.underline = false,
-            SgrAttr::NoBlink => self.attrs.blink = false,
-            SgrAttr::NoInverse => self.attrs.inverse = false,
-            SgrAttr::NoInvisible => self.attrs.invisible = false,
-            SgrAttr::NoStrikethrough => self.attrs.strikethrough = false,
+            SgrAttr::NoItalic => self.attrs.set_italic(false),
+            SgrAttr::NoUnderline => self.attrs.set_underline(false),
+            SgrAttr::NoBlink => self.attrs.set_blink(false),
+            SgrAttr::NoInverse => self.attrs.set_inverse(false),
+            SgrAttr::NoInvisible => self.attrs.set_invisible(false),
+            SgrAttr::NoStrikethrough => self.attrs.set_strikethrough(false),
             SgrAttr::FgStandard(n) => self.attrs.fg = Color::Indexed(*n),
             SgrAttr::BgStandard(n) => self.attrs.bg = Color::Indexed(*n),
             SgrAttr::FgDefault => self.attrs.fg = Color::Default,
@@ -1025,7 +1025,7 @@ mod tests {
     fn sgr_bold() {
         let mut g = Grid::new(10, 3);
         apply_str(&mut g, b"\x1b[1mA");
-        assert!(g.screen().get_cell(0, 0).attrs.bold);
+        assert!(g.screen().get_cell(0, 0).attrs.bold());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! DEL-is-ignored, CSI-ignore recovery, DCS/SOS/PM/APC string termination,
 //! and ESC-state edge cases. Previously 58% branch coverage (CC 17).
 
-use vt_parser::{CsiAction, Event, Parser};
+use vt_parser::{CsiAction, Parser, TermEvent};
 
 #[test]
 fn can_aborts_in_progress_csi_and_emits_control() {
@@ -16,7 +16,7 @@ fn can_aborts_in_progress_csi_and_emits_control() {
     // Parser must be back in Ground: a plain letter now prints normally.
     let mut seen = None;
     p.feed(b"A", |ev| {
-        if let Event::Print(c) = ev {
+        if let TermEvent::Print(c) = ev {
             seen = Some(c);
         }
     });
@@ -29,7 +29,7 @@ fn sub_aborts_in_progress_escape_sequence() {
     p.feed(b"\x1b[?25", |_| {});
     let mut got_control = false;
     p.feed(b"\x1a", |ev| {
-        if matches!(ev, Event::Control(_)) {
+        if matches!(ev, TermEvent::Control(_)) {
             got_control = true;
         }
     });
@@ -38,7 +38,7 @@ fn sub_aborts_in_progress_escape_sequence() {
     // Confirm the abort really reset state to Ground.
     let mut got = None;
     p.feed(b"\x1b[5A", |ev| {
-        if let Event::Csi(a) = ev {
+        if let TermEvent::Csi(a) = ev {
             got = Some(a);
         }
     });
@@ -50,7 +50,7 @@ fn del_byte_is_silently_ignored_in_ground_state() {
     let mut p = Parser::new();
     let mut seen = Vec::new();
     p.feed(b"a\x7fb", |ev| {
-        if let Event::Print(c) = ev {
+        if let TermEvent::Print(c) = ev {
             seen.push(c);
         }
     });
@@ -63,7 +63,7 @@ fn del_byte_is_ignored_mid_csi_sequence_without_disrupting_it() {
     let mut p = Parser::new();
     let mut got = None;
     p.feed(b"\x1b[3\x7fA", |ev| {
-        if let Event::Csi(a) = ev {
+        if let TermEvent::Csi(a) = ev {
             got = Some(a);
         }
     });
@@ -86,7 +86,7 @@ fn csi_ignore_recovers_to_ground_on_alphabetic_final_byte() {
     // Ground. Confirm a subsequent independent CSI sequence parses cleanly.
     let mut got = None;
     p.feed(b"\x1b[7A", |ev| {
-        if let Event::Csi(a) = ev {
+        if let TermEvent::Csi(a) = ev {
             got = Some(a);
         }
     });
@@ -101,7 +101,7 @@ fn csi_ignore_recovers_on_tilde_final_byte() {
     p.feed(b"~", |_| {}); // '~' is one of the two recognised exits
     let mut got = None;
     p.feed(b"\x1b[2A", |ev| {
-        if let Event::Csi(a) = ev {
+        if let TermEvent::Csi(a) = ev {
             got = Some(a);
         }
     });
@@ -118,7 +118,7 @@ fn dcs_sequence_terminated_by_bare_st_byte() {
     let mut saw_dcs = false;
     p.feed(b"\x1bPpayload", |_| {});
     p.feed(&[0x9C], |ev| {
-        if matches!(ev, Event::Dcs) {
+        if matches!(ev, TermEvent::Dcs) {
             saw_dcs = true;
         }
     });
@@ -129,7 +129,7 @@ fn dcs_sequence_terminated_by_bare_st_byte() {
 fn dcs_sequence_terminated_by_esc_backslash_yields_esc_event_not_dcs() {
     // ESC always wins the "anywhere" race and re-enters Escape state; the
     // following '\' is then a plain final byte handled by `escape()`,
-    // producing an `Event::Esc`, not `Event::Dcs`. Document that behaviour.
+    // producing an `TermEvent::Esc`, not `TermEvent::Dcs`. Document that behaviour.
     let mut p = Parser::new();
     let mut got = None;
     p.feed(b"\x1bPsome dcs payload\x1b\\", |ev| {
@@ -146,7 +146,7 @@ fn sos_pm_apc_sequences_all_terminate_on_bare_st_byte() {
         p.feed(&[0x1b, intro], |_| {});
         p.feed(b"payload", |_| {});
         p.feed(&[0x9C], |ev| {
-            if matches!(ev, Event::Dcs) {
+            if matches!(ev, TermEvent::Dcs) {
                 saw_dcs = true;
             }
         });
@@ -167,7 +167,7 @@ fn escape_state_control_byte_resets_silently_to_ground() {
     // Parser should be back in Ground and able to print normally.
     let mut seen = None;
     p.feed(b"z", |ev| {
-        if let Event::Print(c) = ev {
+        if let TermEvent::Print(c) = ev {
             seen = Some(c);
         }
     });
@@ -181,7 +181,7 @@ fn escape_intermediate_accepts_multiple_intermediates_then_final() {
     let mut p = Parser::new();
     let mut got = None;
     p.feed(b"\x1b #8", |ev| {
-        if let Event::Esc {
+        if let TermEvent::Esc {
             intermediate,
             final_byte,
         } = ev
@@ -207,7 +207,7 @@ fn utf8_continuation_state_reached_via_advance_for_all_lengths() {
     let mut seen = Vec::new();
     // 2, 3, and 4-byte sequences all drive utf8_continue via advance().
     p.feed("é€🦀".as_bytes(), |ev| {
-        if let Event::Print(c) = ev {
+        if let TermEvent::Print(c) = ev {
             seen.push(c);
         }
     });

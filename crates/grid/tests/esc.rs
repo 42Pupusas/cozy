@@ -28,7 +28,7 @@ fn ris_resets_attrs_so_new_text_is_plain() {
     feed(&mut g, b"\x1b[1m"); // bold on
     feed(&mut g, b"\x1bc"); // RIS
     feed(&mut g, b"X");
-    assert!(!g.screen().get_cell(0, 0).attrs.bold);
+    assert!(!g.screen().get_cell(0, 0).attrs.bold());
 }
 
 #[test]
@@ -53,7 +53,7 @@ fn decsc_decrc_roundtrip_cursor_and_attrs() {
     feed(&mut g, b"\x1b8"); // DECRC - restore
     assert_eq!(g.cursor(), (3, 2)); // col=3 (0-idx), row=2 (0-idx)
     feed(&mut g, b"X");
-    assert!(g.screen().get_cell(3, 2).attrs.bold);
+    assert!(g.screen().get_cell(3, 2).attrs.bold());
 }
 
 #[test]

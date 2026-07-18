@@ -42,7 +42,7 @@ mod selection;
 
 pub use cell::{Attrs, Cell, Color};
 pub use cursor::{Cursor, CursorShape};
-pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot};
+pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand};
 pub use screen::Screen;
 pub use selection::{Point as SelPoint, Selection};
 
@@ -63,13 +63,13 @@ pub const SCROLLBACK_MAX: usize = 10_000;
 /// reading that function).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingRepaint {
-    /// Incremental: `dirty` tracks exactly which rows changed. `Some((top,
-    /// bot, delta))` when everything in `[top, bot]` also shifted up by
-    /// `delta` rows since the last snapshot, letting the renderer pixel-shift
-    /// that band and paint only the true dirty rows on top; `None` when
-    /// nothing scrolled, or a batch mixed scrolls over different regions (the
-    /// fast path is abandoned and the dirty rows are repainted directly).
-    Incremental(Option<(u16, u16, u16)>),
+    /// Incremental: `dirty` tracks exactly which rows changed. `Some(band)`
+    /// when everything in `[band.top, band.bot]` also shifted up by
+    /// `band.delta` rows since the last snapshot, letting the renderer
+    /// pixel-shift that band and paint only the true dirty rows on top; `None`
+    /// when nothing scrolled, or a batch mixed scrolls over different regions
+    /// (the fast path is abandoned and the dirty rows are repainted directly).
+    Incremental(Option<ScrollBand>),
     /// A full-frame repaint of the whole viewport is owed: every visible row
     /// changed because the view scrolled into/out of scrollback.
     Viewport,
@@ -96,9 +96,17 @@ impl PendingRepaint {
             return;
         };
         *band = Some(match *band {
-            None => (top, bot, delta),
-            Some((t, b, d)) if t == top && b == bot => (t, b, d.saturating_add(delta)),
-            Some(_) => (0, 0, 0),
+            None => ScrollBand { top, bot, delta },
+            Some(b) if b.top == top && b.bot == bot => ScrollBand {
+                top,
+                bot,
+                delta: b.delta.saturating_add(delta),
+            },
+            Some(_) => ScrollBand {
+                top: 0,
+                bot: 0,
+                delta: 0,
+            },
         });
     }
 }
@@ -340,10 +348,7 @@ impl Grid {
         let PendingRepaint::Incremental(band) = core::mem::take(&mut self.pending_repaint) else {
             unreachable!("handled by the Viewport branch above");
         };
-        snap.scroll_span = match band {
-            Some((t, b, d)) if d > 0 && b >= t => Some((t, b, d)),
-            _ => None,
-        };
+        snap.scroll_span = band.filter(|b| b.is_active());
         self.content_delta = 0;
         snap
     }
@@ -376,8 +381,8 @@ impl Grid {
         // include the shifted-but-unchanged rows -- those still rely on the
         // shift. So fold the scroll band back in; the next take_dirty re-emits
         // it (composing with any scroll since), and the renderer shifts then.
-        if let Some((t, b, d)) = snap.scroll_span {
-            self.pending_repaint.accumulate_scroll(t, b, d);
+        if let Some(b) = snap.scroll_span {
+            self.pending_repaint.accumulate_scroll(b.top, b.bot, b.delta);
         }
         if snap.cursor_changed {
             self.force_cursor_changed = true;
@@ -918,7 +923,14 @@ mod tests {
         let snap = g.take_dirty();
 
         // The whole screen shifted up by 1.
-        assert_eq!(snap.scroll_span, Some((0, 3, 1)));
+        assert_eq!(
+            snap.scroll_span,
+            Some(ScrollBand {
+                top: 0,
+                bot: 3,
+                delta: 1
+            })
+        );
         // content_delta tracks the scrollback push (1 line).
         assert_eq!(snap.content_delta, 1);
         // Dirty rows: row 0 (the 'X' edit) and row 3 (the freshly-exposed

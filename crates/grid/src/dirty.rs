@@ -179,6 +179,37 @@ pub struct CursorInfo {
     pub visible: bool,
 }
 
+/// A band of rows `[top, bot]` whose content moved up by `delta` since the
+/// last snapshot.
+///
+/// This is the unit of the terminal pixel-scroll optimization: the renderer
+/// `copy_within`-shifts that pixel band up by `delta` rows, then paints the
+/// snapshot's precise dirty rows on top.
+///
+/// Replaces the naked `(u16, u16, u16)` triple that used to thread through
+/// `DirtySnapshot::scroll_span`, `PendingRepaint::Incremental`,
+/// `Renderer::blit_snapshot`'s return, and `shift_overlay_rows` — four sites
+/// that each had to remember which slot was which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollBand {
+    /// First row of the band (inclusive).
+    pub top: u16,
+    /// Last row of the band (inclusive).
+    pub bot: u16,
+    /// Rows the band's content shifted up by.
+    pub delta: u16,
+}
+
+impl ScrollBand {
+    /// A real, paintable shift: a non-zero delta over a well-formed band.
+    /// The `(0, 0, 0)` "mixed regions" sentinel and any zero-delta collapse
+    /// to inactive — no pixel-shift, just repaint the dirty rows directly.
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        self.delta > 0 && self.bot >= self.top
+    }
+}
+
 /// Snapshot of all rows that changed since the last render.
 ///
 /// Sent from the grid-thread to the renderer-thread via SPSC ring.
@@ -206,8 +237,8 @@ pub struct DirtySnapshot {
     /// as the user wheel-scrolls through history — the content is fixed but
     /// the view window moves, the opposite transform of `content_delta`.
     pub viewport_offset: Option<u16>,
-    /// `Some((top, bot, delta))` when the content in rows `[top, bot]` moved
-    /// up by `delta` since the last snapshot. The renderer `copy_within`-
+    /// `Some(band)` when the content in rows `[band.top, band.bot]` moved
+    /// up by `band.delta` since the last snapshot. The renderer `copy_within`-
     /// shifts that pixel band up, then paints only the snapshot's dirty rows
     /// on top -- which now sit at their true post-scroll positions. This
     /// replaces the old scheme of inferring the scroll from the dirty-row
@@ -215,7 +246,7 @@ pub struct DirtySnapshot {
     /// in-place edit batched alongside the scroll). `None` when nothing
     /// scrolled or the fast path was abandoned (dirty rows are then painted
     /// directly, no shift).
-    pub scroll_span: Option<(u16, u16, u16)>,
+    pub scroll_span: Option<ScrollBand>,
 }
 
 impl DirtySnapshot {
@@ -286,9 +317,13 @@ impl DirtySnapshot {
         let band = match (self.scroll_span, next.scroll_span) {
             (existing, None) => existing,
             (None, Some(b)) => Some(b),
-            (Some((t1, b1, d1)), Some((t2, b2, d2))) => {
-                if t1 == t2 && b1 == b2 {
-                    Some((t1, b1, d1.saturating_add(d2)))
+            (Some(a), Some(b)) => {
+                if a.top == b.top && a.bot == b.bot {
+                    Some(ScrollBand {
+                        top: a.top,
+                        bot: a.bot,
+                        delta: a.delta.saturating_add(b.delta),
+                    })
                 } else {
                     return false;
                 }
@@ -300,7 +335,7 @@ impl DirtySnapshot {
         // outside the band are untouched. A BTreeMap keeps the result sorted
         // ascending, as the `rows` invariant requires.
         let mut map: BTreeMap<u16, DirtyRow> = BTreeMap::new();
-        if let Some((top, bot, delta)) = next.scroll_span {
+        if let Some(ScrollBand { top, bot, delta }) = next.scroll_span {
             for row in self.rows.drain(..) {
                 let r = row.row;
                 if r >= top && r <= bot {
@@ -401,6 +436,10 @@ mod tests {
         }
     }
 
+    fn band(top: u16, bot: u16, delta: u16) -> ScrollBand {
+        ScrollBand { top, bot, delta }
+    }
+
     fn snap(cols: u16, scroll: Option<(u16, u16, u16)>, rows: &[(u16, char)]) -> DirtySnapshot {
         DirtySnapshot {
             rows: rows
@@ -415,7 +454,7 @@ mod tests {
             cursor_changed: false,
             content_delta: 0,
             viewport_offset: None,
-            scroll_span: scroll,
+            scroll_span: scroll.map(|(t, b, d)| band(t, b, d)),
         }
     }
 
@@ -430,7 +469,7 @@ mod tests {
         let mut a = snap(4, Some((0, 7, 2)), &[(6, 'a'), (7, 'b')]);
         let b = snap(4, Some((0, 7, 3)), &[(5, 'c'), (6, 'd'), (7, 'e')]);
         assert!(a.compose(&b));
-        assert_eq!(a.scroll_span, Some((0, 7, 5)));
+        assert_eq!(a.scroll_span, Some(band(0, 7, 5)));
         // a's freshly-painted rows 6,7 drag up by b's delta 3 -> rows 3,4;
         // b's rows 5,6,7 sit on top. All sorted ascending.
         assert_eq!(
@@ -485,7 +524,7 @@ mod tests {
         let mut a = snap(4, None, &[(5, 'a')]);
         let b = snap(4, Some((0, 7, 2)), &[(7, 'b')]);
         assert!(a.compose(&b));
-        assert_eq!(a.scroll_span, Some((0, 7, 2)));
+        assert_eq!(a.scroll_span, Some(band(0, 7, 2)));
         assert_eq!(row_map(&a), vec![(3, 'a'), (7, 'b')]);
     }
 }

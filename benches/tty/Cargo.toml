@@ -14,6 +14,7 @@ grid        = { path = "../../crates/grid" }
 platform    = { path = "../../crates/platform" }
 text_layout = { path = "../../crates/text_layout" }
 input       = { path = "../../crates/input" }
+quetzalcoatl = { workspace = true }
 divan       = "0.1"
 
 [[bench]]
@@ -38,4 +39,8 @@ harness = false
 
 [[bench]]
 name    = "input"
+harness = false
+
+[[bench]]
+name    = "transport"
 harness = false

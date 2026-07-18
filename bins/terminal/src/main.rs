@@ -3,11 +3,11 @@
 //! Thread topology (M8):
 //!
 //! ```text
-//!  ┌────────────┐  SPSC<PtyChunk>   ┌──────────────┐  SPSC<DirtySnapshot>  ┌──────────────┐
+//!  ┌────────────┐  MPSC<ParserMsg>  ┌──────────────┐  SPSC<DirtySnapshot>  ┌──────────────┐
 //!  │ PtyWorker  │ ────────────────► │ ParserWorker  │ ─────────────────────► │  UiWorker    │
-//!  │            │                   │ (vt_parser +  │                        │  (Wayland    │
+//!  │            │  (Data carries    │ (vt_parser +  │                        │  (Wayland    │
 //!  │ forkpty    │ ◄──────────────── │  grid)        │                        │   window)    │
-//!  └────────────┘  SPSC<InputMsg>  └──────────────┘                        └──────┬───────┘
+//!  └────────────┘  MPSC<InputMsg>  └──────────────┘                        └──────┬───────┘
 //!                  (key bytes /                                                     │
 //!                   resize / quit)                                    SPSC<InputMsg>│
 //!                                                                                  ▼
@@ -19,7 +19,11 @@
 //! `run` method on its own OS thread (`UiWorker` runs on the main thread) --
 //! not a free function taking half a dozen loose channel arguments.
 //!
-//! All rings are quetzalcoatl SPSC — no mutexes, no async runtime.
+//! Rings are quetzalcoatl SPSC/MPSC (MPSC where two threads fan in: pty+ui
+//! into the parser, ui+parser into the pty) — no mutexes, no async runtime.
+//! The pty→parser `Data` message carries its 4 KiB read buffer inline, so the
+//! ring's slots are the buffer pool: no per-chunk heap allocation and no
+//! free-list recycle ring.
 //! Config is loaded from `$XDG_CONFIG_HOME/terminal/config.toml` at startup.
 
 #![allow(clippy::cast_possible_truncation)]
@@ -47,19 +51,26 @@ const ROWS: u16 = 24;
 /// PTY read buffer size.
 const PTY_BUF: usize = 4096;
 
-// Ring topology (4 rings, one per thread edge of the pty→parser→ui→pty cycle,
-// plus a free-list ring returning spent buffers parser→pty):
+// Ring topology (3 rings, one per directed edge of the pty→parser→ui→pty
+// cycle -- the data ring carries its read buffer inline, so no separate
+// free-list ring is needed to recycle buffers parser→pty):
 //
 //   parser_in  (ParserMsg)    pty + ui  → parser   MPSC  data chunks + resizes
 //   dirty      (DirtySnapshot) parser   → ui       SPSC  render snapshots
 //   input      (InputMsg)      ui + parser → pty    MPSC  keystrokes + CPR replies
-//   chunk_free (Box<[u8; PTY_BUF]>) parser → pty    SPSC  recycled read buffers
+//
+// The pty→parser data ring carries its 4 KiB read buffer *inline* in each
+// `ParserMsg::Data` slot (not behind a `Box`), so the ring's own slots are
+// the buffer pool: there is no separate free-list ring recycling spent
+// buffers, and no per-chunk heap allocation. A single 4 KiB copy into the
+// slot on push replaces the old `Box` indirection + free-list round-trip;
+// measured (benches/tty transport) as end-to-end noise once the parser+grid
+// work that rides on every chunk is accounted for.
 //
 /// Ring capacities (power-of-two items).
 const RING_PARSER_IN: usize = 64; // ParserMsg slots     pty+ui → parser
 const RING_DIRTY: usize = 16; // DirtySnapshot slots parser → ui
 const RING_INPUT: usize = 64; // InputMsg slots      ui+parser → pty
-const RING_CHUNK_FREE: usize = 128; // free chunk buffers  parser → pty
 
 /// Cap on how many `ParserMsg`s the parser thread folds into one grid batch
 /// before publishing a dirty snapshot and re-entering the loop. Without this,
@@ -79,16 +90,29 @@ const BATCH_TIME_CAP: Duration = Duration::from_millis(5);
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
-/// A raw PTY read chunk — heap-allocated to keep the ring slots small.
+/// A raw PTY read chunk — the buffer lives *inline* in the ring slot, not
+/// behind a `Box`. This makes the data ring its own buffer pool (no
+/// free-list ring, no per-chunk allocation); the tradeoff is a single 4 KiB
+/// copy into the slot on push, which the pty thread pays in `on_output`.
+/// `len` bytes of `buf` are valid; the tail is unspecified padding.
 #[derive(Clone)]
 struct PtyChunk {
-    buf: Box<[u8; PTY_BUF]>,
+    buf: [u8; PTY_BUF],
     len: usize,
 }
 
 /// Messages into the parser/grid thread. Merged onto one MPSC ring: the pty
 /// thread sends shell output (`Data`), the ui thread sends window resizes
 /// (`Resize`) so the grid tracks the new cell extent and reflows.
+//
+// `Data` is deliberately large: it carries the 4 KiB read buffer inline so
+// the ring slot doubles as the buffer pool (see the topology note above).
+// Boxing it — clippy's usual suggestion — would re-introduce the per-chunk
+// heap indirection and free-list recycle ring this design exists to delete,
+// and the size disparity is harmless here: the ring is a fixed 64 slots, so
+// the whole buffer is ~263 KiB allocated once at startup, and `Resize`/
+// `Scroll` are rare relative to `Data`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 enum ParserMsg {
     Data(PtyChunk),
@@ -147,15 +171,6 @@ fn run(cfg: &Config) -> platform::Result<()> {
     let (input_tx, input_rx) =
         mpsc::RingBuffer::<InputMsg>::new(Capacity::exact(RING_INPUT)).split();
     let reply_tx = input_tx.clone();
-    // chunk_free is SPSC: the parser thread is the sole producer (it returns
-    // a buffer once it's done parsing it), the pty thread the sole consumer
-    // (it pops a recycled buffer instead of allocating a fresh one for each
-    // read). Best-effort in both directions -- if it's ever empty the pty
-    // thread just allocates, and if it's ever full the parser thread just
-    // drops the buffer -- so this is a pure allocator-churn optimization,
-    // never a correctness dependency.
-    let (chunk_free_tx, chunk_free_rx) =
-        RingBuffer::<Box<[u8; PTY_BUF]>>::new(Capacity::exact(RING_CHUNK_FREE)).split();
 
     // ── Shared quit flag ────────────────────────────────────────────────────
     let quit = Arc::new(AtomicBool::new(false));
@@ -186,7 +201,6 @@ fn run(cfg: &Config) -> platform::Result<()> {
         shell,
         parser_tx: parser_data_tx,
         input_rx,
-        chunk_free_rx,
         input_wake: pty_wake,
         quit: quit_pty,
     }
@@ -199,7 +213,6 @@ fn run(cfg: &Config) -> platform::Result<()> {
         parser_rx: parser_in_rx,
         dirty_tx,
         reply_tx,
-        chunk_free_tx,
         ui_wake: parser_ui_wake,
         pty_wake: parser_pty_wake,
         bracketed_paste: bracketed_paste_parser,
@@ -240,7 +253,6 @@ struct PtyWorker {
     shell: String,
     parser_tx: mpsc::Producer<ParserMsg>,
     input_rx: mpsc::Consumer<InputMsg>,
-    chunk_free_rx: quetzalcoatl::spsc::Consumer<Box<[u8; PTY_BUF]>>,
     input_wake: waker::Waker,
     quit: Arc<AtomicBool>,
 }
@@ -259,7 +271,6 @@ impl PtyWorker {
             shell,
             parser_tx,
             mut input_rx,
-            mut chunk_free_rx,
             input_wake,
             quit,
         } = self;
@@ -309,11 +320,10 @@ impl PtyWorker {
         // single chunk in practice; the loop stays defensive against either
         // constant changing independently in the future.
         //
-        // Buffer recycling: prefer a buffer the parser thread has handed back
-        // through `chunk_free_rx` over a fresh heap allocation -- at hundreds
-        // of MB/s of PTY output a fresh `Box<[u8; 4096]>` per chunk is
-        // allocator churn the free-list ring avoids entirely on the
-        // steady-state path.
+        // The read bytes are copied *inline* into the `ParserMsg::Data` slot
+        // (the ring slot is the buffer -- no `Box`, no free-list recycle
+        // ring). One 4 KiB copy per chunk; the ring's fixed slots are reused
+        // in place as the parser drains them.
         //
         // Real backpressure: returns `false` (telling `Pty::run` NOT to
         // re-arm the master-fd read) when the parser ring is full, instead
@@ -321,9 +331,7 @@ impl PtyWorker {
         // then fills up and throttles the child's `write(2)` calls for us.
         let on_output = move |bytes: &[u8]| -> bool {
             for part in bytes.chunks(PTY_BUF) {
-                let mut buf = chunk_free_rx
-                    .pop()
-                    .unwrap_or_else(|| Box::new([0u8; PTY_BUF]));
+                let mut buf = [0u8; PTY_BUF];
                 buf[..part.len()].copy_from_slice(part);
                 if parser_tx
                     .push(ParserMsg::Data(PtyChunk {
@@ -359,7 +367,6 @@ struct ParserWorker {
     parser_rx: mpsc::Consumer<ParserMsg>,
     dirty_tx: quetzalcoatl::spsc::Producer<DirtySnapshot>,
     reply_tx: mpsc::Producer<InputMsg>,
-    chunk_free_tx: quetzalcoatl::spsc::Producer<Box<[u8; PTY_BUF]>>,
     ui_wake: waker::Waker,
     pty_wake: waker::Waker,
     bracketed_paste: Arc<AtomicBool>,
@@ -381,16 +388,20 @@ impl ParserWorker {
     /// grid), so resizes are NOT deferred or coalesced across interleaved
     /// data.
     ///
-    /// After a `Data` chunk is fully parsed its buffer is done being read
-    /// from, so it's handed back on `chunk_free_tx` for the pty thread to
-    /// reuse on its next read -- best-effort: if the free-list ring is
-    /// momentarily full the buffer is just dropped (allocated fresh again
-    /// later), never a correctness issue.
+    /// The `Data` chunk carries its bytes inline; once parsed the chunk is
+    /// simply dropped and its ring slot becomes free for the pty thread to
+    /// write the next read into -- no buffer hand-back, because the ring
+    /// slot *is* the buffer.
+    //
+    // Takes `&self` for symmetry with its peer methods (`flush_replies`,
+    // `publish`) even though it no longer needs worker state now that the
+    // free-list hand-back is gone -- keeping the `self.feed(...)` call shape
+    // reads better than a lone associated function.
+    #[allow(clippy::unused_self)]
     fn feed(&self, grid: &mut Grid, parser: &mut Parser, msg: ParserMsg) {
         match msg {
             ParserMsg::Data(chunk) => {
                 parser.feed(&chunk.buf[..chunk.len], |ev| grid.apply(&ev));
-                let _ = self.chunk_free_tx.push(chunk.buf);
             }
             ParserMsg::Resize { cols, rows } => grid.resize(cols, rows),
             ParserMsg::Scroll { delta } => grid.scroll_viewport(delta),

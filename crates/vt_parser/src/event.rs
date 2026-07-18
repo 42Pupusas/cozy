@@ -188,6 +188,27 @@ pub enum CsiAction {
     DeviceAttributes(u8),
     /// ICH — insert characters (@).
     InsertChars(u16),
+    /// DECSCUSR — set cursor style (`CSI Ps SP q`).
+    CursorStyle(u16),
+    /// TBC — tab clear (`CSI Ps g`). `0` = clear stop at cursor, `3` = clear all.
+    TabClear(u16),
+    /// CHT — cursor forward tab (`CSI Ps I`): advance `Ps` tab stops.
+    CursorForwardTab(u16),
+    /// CBT — cursor backward tab (`CSI Ps Z`): retreat `Ps` tab stops.
+    CursorBackTab(u16),
+    /// `CSI > 4 ; Pv m` — xterm modifyOtherKeys level (`Pv`: 0/1/2).
+    XtermModifyOtherKeys(u16),
+    /// Kitty keyboard protocol: `CSI > flags u` — push a new entry onto the
+    /// progressive-enhancement flag stack.
+    KittyKeyboardPush(u8),
+    /// Kitty keyboard protocol: `CSI < Pn u` — pop `Pn` entries off the stack.
+    KittyKeyboardPop(u16),
+    /// Kitty keyboard protocol: `CSI = flags ; mode u` — set the current
+    /// stack entry. `mode`: 1 = replace, 2 = OR in, 3 = AND out (unset bits).
+    KittyKeyboardSet { flags: u8, mode: u8 },
+    /// Kitty keyboard protocol: `CSI ? u` — query the current flags (reply
+    /// `CSI ? flags u`).
+    KittyKeyboardQuery,
     /// Unknown CSI sequence.
     Unknown { final_byte: u8, params: Params },
 }
@@ -206,6 +227,21 @@ pub enum OscCmd<'a> {
     SetColor { index: u8, spec: &'a str },
     /// OSC 8 — hyperlink.
     Hyperlink { uri: &'a str },
+    /// OSC 10 — query/set the default foreground color. `?` asks the
+    /// terminal to reply with its current color (used by TUIs to detect
+    /// light/dark theme); any other payload is a set request.
+    ForegroundColor(&'a str),
+    /// OSC 11 — query/set the default background color. Same shape as
+    /// [`Self::ForegroundColor`].
+    BackgroundColor(&'a str),
+    /// OSC 52 — clipboard set/query. `selection` is the buffer letter
+    /// (`c` = clipboard, `p`/`q` = primary/secondary, ...); `data` is the
+    /// base64 payload (or `?` for a query, which we don't answer -- reading
+    /// our own clipboard back out is not implemented).
+    Clipboard { selection: &'a str, data: &'a str },
+    /// OSC 133 — shell-integration semantic prompt marks (`A`=prompt start,
+    /// `B`=command start, `C`=command executed, `D`=command finished).
+    ShellIntegration(&'a str),
     /// Unrecognised OSC.
     Unknown { ps: u8, data: &'a str },
 }

@@ -89,6 +89,10 @@ object_ids! {
     DataSourceId,
     /// `wl_data_offer` — data another client offers us (their copy / our paste).
     DataOfferId,
+    /// `zwlr_layer_shell_v1` — the layer-surface factory global.
+    LayerShellId,
+    /// `zwlr_layer_surface_v1` — an edge-anchored surface (bars, panels).
+    LayerSurfaceId,
 }
 
 /// An event serial — echoed back in acks/pongs. Distinct from an object id so

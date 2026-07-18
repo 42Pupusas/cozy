@@ -70,3 +70,34 @@ pub enum MouseMode {
     /// press/release, variable length.
     Sgr,
 }
+
+impl MouseMode {
+    /// Pack into one byte for cross-thread transport (e.g. an `AtomicU8`
+    /// shuttling the grid's negotiated mode to the UI thread's `Encoder`).
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::X10 => 1,
+            Self::Normal => 2,
+            Self::ButtonMotion => 3,
+            Self::AnyEvent => 4,
+            Self::Sgr => 5,
+        }
+    }
+
+    /// Inverse of [`Self::to_u8`]. Any unrecognized byte decodes to `Off`
+    /// (fail safe -- never accidentally reports mouse events an app didn't
+    /// ask for).
+    #[must_use]
+    pub const fn from_u8(b: u8) -> Self {
+        match b {
+            1 => Self::X10,
+            2 => Self::Normal,
+            3 => Self::ButtonMotion,
+            4 => Self::AnyEvent,
+            5 => Self::Sgr,
+            _ => Self::Off,
+        }
+    }
+}

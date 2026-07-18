@@ -838,8 +838,21 @@ impl Grid {
             CsiAction::DecRst(mode) | CsiAction::ResetMode(mode) => {
                 self.set_mode(*mode, false);
             }
-            // Ignore unhandled CSI sequences.
-            CsiAction::Unknown { .. } => {}
+            // Not yet wired into the grid (DECSCUSR/tab-stop/xterm-modify-
+            // keys/Kitty-keyboard-protocol reporting -- `vt_parser` parses
+            // them but the grid has no cursor-shape/tab-stop model yet) and
+            // unrecognised sequences: both are safely ignorable no-ops for
+            // now rather than a build-breaking non-exhaustive match.
+            CsiAction::CursorStyle(_)
+            | CsiAction::TabClear(_)
+            | CsiAction::CursorForwardTab(_)
+            | CsiAction::CursorBackTab(_)
+            | CsiAction::XtermModifyOtherKeys(_)
+            | CsiAction::KittyKeyboardPush(_)
+            | CsiAction::KittyKeyboardPop(_)
+            | CsiAction::KittyKeyboardSet { .. }
+            | CsiAction::KittyKeyboardQuery
+            | CsiAction::Unknown { .. } => {}
         }
     }
 

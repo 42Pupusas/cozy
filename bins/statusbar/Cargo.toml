@@ -1,0 +1,16 @@
+[package]
+name    = "statusbar-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "statusbar"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+statusbar    = { path = "../../crates/statusbar" }
+platform     = { path = "../../crates/platform" }
+waker        = { path = "../../crates/waker" }

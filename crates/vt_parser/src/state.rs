@@ -357,8 +357,14 @@ impl Parser {
                 self.params.next_param();
                 None
             }
-            // Another intermediate
+            // Another intermediate — e.g. the SP in `CSI Ps SP q` (DECSCUSR).
+            // BUG FIX: this previously changed state without recording the
+            // byte, so `self.intermediate` stayed `None` and `dispatch_csi`
+            // saw a bare `(None, b'q')` instead of `(Some(b' '), b'q')` —
+            // DECSCUSR (and anything else with a numeric param before its
+            // intermediate) could never be recognised.
             0x20..=0x2F => {
+                self.intermediate = Some(byte);
                 self.state = State::CsiIntermediate;
                 None
             }
@@ -455,6 +461,26 @@ impl Parser {
             (Some(b'?'), b'h') => CsiAction::DecSet(p.get_raw(0)),
             // DECRST
             (Some(b'?'), b'l') => CsiAction::DecRst(p.get_raw(0)),
+            // DECSCUSR — set cursor style (`CSI Ps SP q`).
+            (Some(b' '), b'q') => CsiAction::CursorStyle(p.get_or(0, 1)),
+            // TBC — tab clear (`CSI Ps g`).
+            (None, b'g') => CsiAction::TabClear(p.get_raw(0)),
+            // CHT — cursor forward tab.
+            (None, b'I') => CsiAction::CursorForwardTab(p.get_or(0, 1)),
+            // CBT — cursor backward tab.
+            (None, b'Z') => CsiAction::CursorBackTab(p.get_or(0, 1)),
+            // xterm modifyOtherKeys: `CSI > 4 ; Pv m`.
+            (Some(b'>'), b'm') if p.get_raw(0) == 4 => {
+                CsiAction::XtermModifyOtherKeys(p.get_raw(1))
+            }
+            // Kitty keyboard protocol.
+            (Some(b'>'), b'u') => CsiAction::KittyKeyboardPush(p.get_raw(0) as u8),
+            (Some(b'<'), b'u') => CsiAction::KittyKeyboardPop(p.get_or(0, 1)),
+            (Some(b'='), b'u') => CsiAction::KittyKeyboardSet {
+                flags: p.get_raw(0) as u8,
+                mode: p.get_or(1, 1) as u8,
+            },
+            (Some(b'?'), b'u') => CsiAction::KittyKeyboardQuery,
             // Unknown
             _ => CsiAction::Unknown {
                 final_byte,
@@ -606,6 +632,16 @@ impl Parser {
                 let uri = pt.splitn(2, ';').nth(1).unwrap_or(pt);
                 OscCmd::Hyperlink { uri }
             }
+            10 => OscCmd::ForegroundColor(pt),
+            11 => OscCmd::BackgroundColor(pt),
+            52 => {
+                // OSC 52 ; selection ; base64-data BEL — clipboard set/query.
+                let mut parts = pt.splitn(2, ';');
+                let selection = parts.next().unwrap_or("");
+                let data = parts.next().unwrap_or("");
+                OscCmd::Clipboard { selection, data }
+            }
+            133 => OscCmd::ShellIntegration(pt),
             _ => OscCmd::Unknown { ps, data: pt },
         };
 
@@ -777,6 +813,92 @@ mod tests {
             }
         });
         assert_eq!(seen, vec!['🦀']);
+    }
+
+    #[test]
+    fn decscusr_cursor_style_recognised() {
+        // Regression: `csi_param`'s intermediate-byte transition used to
+        // drop the SP byte, so `CSI Ps SP q` dispatched as bare `(None, 'q')`
+        // and was never recognised at all.
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[2 q", |ev| {
+            assert_eq!(ev, TermEvent::Csi(CsiAction::CursorStyle(2)));
+            count += 1;
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn decscusr_default_param_is_one() {
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[ q", |ev| {
+            assert_eq!(ev, TermEvent::Csi(CsiAction::CursorStyle(1)));
+            count += 1;
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn tab_clear_and_tab_stop_moves() {
+        let mut p = Parser::new();
+        let mut i = 0;
+        p.feed(b"\x1b[3g\x1b[2I\x1b[Z", |ev| {
+            match i {
+                0 => assert_eq!(ev, TermEvent::Csi(CsiAction::TabClear(3))),
+                1 => assert_eq!(ev, TermEvent::Csi(CsiAction::CursorForwardTab(2))),
+                2 => assert_eq!(ev, TermEvent::Csi(CsiAction::CursorBackTab(1))),
+                _ => panic!("unexpected extra event"),
+            }
+            i += 1;
+        });
+        assert_eq!(i, 3);
+    }
+
+    #[test]
+    fn xterm_modify_other_keys_level() {
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[>4;2m", |ev| {
+            assert_eq!(ev, TermEvent::Csi(CsiAction::XtermModifyOtherKeys(2)));
+            count += 1;
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn kitty_keyboard_push_pop_set_query() {
+        let mut p = Parser::new();
+        let mut i = 0;
+        p.feed(b"\x1b[>1u\x1b[<1u\x1b[=5;1u\x1b[?u", |ev| {
+            match i {
+                0 => assert_eq!(ev, TermEvent::Csi(CsiAction::KittyKeyboardPush(1))),
+                1 => assert_eq!(ev, TermEvent::Csi(CsiAction::KittyKeyboardPop(1))),
+                2 => assert_eq!(
+                    ev,
+                    TermEvent::Csi(CsiAction::KittyKeyboardSet { flags: 5, mode: 1 })
+                ),
+                3 => assert_eq!(ev, TermEvent::Csi(CsiAction::KittyKeyboardQuery)),
+                _ => panic!("unexpected extra event"),
+            }
+            i += 1;
+        });
+        assert_eq!(i, 4);
+    }
+
+    #[test]
+    fn osc_10_11_52_133_recognised() {
+        let mut p = Parser::new();
+        let mut seen = Vec::new();
+        p.feed(b"\x1b]10;?\x07", |ev| seen.push(format!("{ev:?}")));
+        p.feed(b"\x1b]11;?\x07", |ev| seen.push(format!("{ev:?}")));
+        p.feed(b"\x1b]52;c;aGVsbG8=\x07", |ev| seen.push(format!("{ev:?}")));
+        p.feed(b"\x1b]133;A\x07", |ev| seen.push(format!("{ev:?}")));
+        assert!(seen[0].contains("ForegroundColor"));
+        assert!(seen[1].contains("BackgroundColor"));
+        assert!(seen[2].contains("Clipboard"));
+        assert!(seen[3].contains("ShellIntegration"));
     }
 
     #[test]

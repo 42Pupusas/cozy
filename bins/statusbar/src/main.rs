@@ -138,18 +138,29 @@ impl Modules {
         changed
     }
 
-    /// Every module's rendered form, right-to-left draw order (rightmost
-    /// module first), separated by a thin divider.
+    /// Left section, left-to-right draw order: the always-visible
+    /// connectivity + clock cluster.
+    fn left_segments(&self) -> Vec<String> {
+        vec![self.wifi.clone(), self.bluetooth.clone(), self.clock.clone()]
+    }
+
+    /// Center section -- unused for now (kept as an empty group so the
+    /// three-section layout is exercised even with nothing docked there;
+    /// a sway-IPC workspace/window-title module would land here).
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
+    fn center_segments(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Right section, right-to-left draw order (rightmost module first):
+    /// everything not claimed by `left_segments`.
     fn right_segments(&self) -> Vec<String> {
         vec![
-            self.clock.clone(),
             self.date.clone(),
             self.battery.clone(),
             self.temp.clone(),
             self.cpu.clone(),
             self.mem.clone(),
-            self.wifi.clone(),
-            self.bluetooth.clone(),
             self.vol_out.clone(),
             self.vol_in.clone(),
             self.brightness.clone(),
@@ -172,8 +183,34 @@ fn paint(
     let pad = 8 * scale;
     let gap = 16 * scale;
 
-    // Left: nothing wired up yet (workspaces/window-title would land here
-    // once a sway-IPC client is added) — leave the gutter clear.
+    // Left: left-to-right layout, each segment starting `gap` past the
+    // previous one's end.
+    let mut left_edge = pad;
+    for seg in modules.left_segments() {
+        if seg.is_empty() {
+            continue;
+        }
+        text.draw_text_alpha(canvas, &seg, left_edge, y, fg, bg, bg_alpha);
+        let w = text.measure(&seg);
+        left_edge += w + gap;
+    }
+
+    // Center: horizontally centered as one contiguous cluster (joined by
+    // `gap`), regardless of what the left/right sections are doing.
+    let center = modules.center_segments();
+    if !center.is_empty() {
+        let joined_w: i32 = center.iter().map(|s| text.measure(s)).sum::<i32>()
+            + gap * (center.len() as i32 - 1).max(0);
+        let mut x = (canvas.width() - joined_w) / 2;
+        for seg in &center {
+            if seg.is_empty() {
+                continue;
+            }
+            let w = text.measure(seg);
+            text.draw_text_alpha(canvas, seg, x, y, fg, bg, bg_alpha);
+            x += w + gap;
+        }
+    }
 
     // Right-to-left layout: draw each segment ending `gap` to the left of
     // the previous one's start.

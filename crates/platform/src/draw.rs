@@ -102,9 +102,15 @@ impl Color {
     pub fn blend_opaque_to(self, to: Color, alpha: u8) -> u32 {
         let from = self;
         let a = u32::from(alpha);
-        let r = (u32::from(from.r) * (255 - a) + u32::from(to.r) * a) / 255;
-        let g = (u32::from(from.g) * (255 - a) + u32::from(to.g) * a) / 255;
-        let b = (u32::from(from.b) * (255 - a) + u32::from(to.b) * a) / 255;
+        // `div255(x)` == `x / 255` exactly for any u32 in `[0, 255*255]` (the
+        // range these lerp numerators occupy), but with a multiply+shift
+        // instead of a hardware divide. This is the anti-aliased glyph-edge
+        // blend, ~21% of the real Face-path flood (perf) -- three divides per
+        // AA pixel were the single most expensive op in that frame.
+        let div255 = |x: u32| (x + 1 + (x >> 8)) >> 8;
+        let r = div255(u32::from(from.r) * (255 - a) + u32::from(to.r) * a);
+        let g = div255(u32::from(from.g) * (255 - a) + u32::from(to.g) * a);
+        let b = div255(u32::from(from.b) * (255 - a) + u32::from(to.b) * a);
         (r << 16) | (g << 8) | b
     }
 }
@@ -438,6 +444,25 @@ mod tests {
     #[test]
     fn rect_inset_shrinks() {
         assert_eq!(Rect::new(0, 0, 10, 10).inset(2), Rect::new(2, 2, 6, 6));
+    }
+
+    #[test]
+    fn blend_opaque_div255_matches_exact_division_for_every_input() {
+        // blend_opaque_to swapped `/255` for a multiply-shift div255. Prove it
+        // is bit-identical to real division across every (channel, alpha) pair,
+        // so glyph colors can never drift by a least-significant bit.
+        for from in [0u8, 1, 63, 127, 128, 200, 254, 255] {
+            for to in [0u8, 1, 63, 127, 128, 200, 254, 255] {
+                for a in 0u32..=255 {
+                    let num =
+                        u32::from(from) * (255 - a) + u32::from(to) * a;
+                    let packed = Color::rgb(from, from, from)
+                        .blend_opaque_to(Color::rgb(to, to, to), a as u8);
+                    let ch = packed & 0xff;
+                    assert_eq!(ch, num / 255, "from={from} to={to} a={a}");
+                }
+            }
+        }
     }
 
     #[test]

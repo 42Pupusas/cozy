@@ -593,32 +593,41 @@ impl Renderer {
 
         let pixels = canvas.pixels_mut();
         let atlas_w = cache.atlas.width;
-        for row in 0..entry.height {
-            let py = glyph_y0 + i64::from(row);
-            if py < 0 {
-                continue;
-            }
-            let py = py as u32;
+        let buf_h = (pixels.len() / buf_width.max(1) as usize) as i64;
+
+        // Clip the glyph's column span to the buffer ONCE, not per pixel. The
+        // old inner loop paid a `px < 0 || px >= buf_width` branch on every
+        // glyph pixel (perf: `blit_cell` was 60% of the real Face-path flood);
+        // since `glyph_x0` is row-independent, the valid column range
+        // `[col_lo, col_hi)` is a per-glyph constant. Same for rows via
+        // `glyph_y0`. Empty span => nothing on screen.
+        let col_lo = (-glyph_x0).max(0) as u32;
+        let col_hi = (i64::from(buf_width) - glyph_x0)
+            .clamp(0, i64::from(entry.width)) as u32;
+        let row_lo = (-glyph_y0).max(0) as u32;
+        let row_hi = (buf_h - glyph_y0).clamp(0, i64::from(entry.height)) as u32;
+        if col_lo >= col_hi {
+            return;
+        }
+
+        for row in row_lo..row_hi {
+            let py = (glyph_y0 + i64::from(row)) as usize;
             // Hoist the row base indices out of the column loop: both the
             // destination row base (`py * buf_width`) and the atlas source
             // row base (`(entry.y + row) * atlas_w`) are per-row constants,
             // not per-pixel.
-            let dst_row_base = py as usize * buf_width as usize;
+            let dst_row_base = py * buf_width as usize;
             let atlas_row_base = ((entry.y + row) * atlas_w) as usize;
-            for col in 0..entry.width {
-                let px = glyph_x0 + i64::from(col);
-                if px < 0 || px as u32 >= buf_width {
-                    continue;
-                }
-                let px = px as u32;
-                let a = cache.atlas.data[atlas_row_base + (entry.x + col) as usize];
+            // Both `px` (via col_lo/col_hi) and `py` (via row_lo/row_hi) are
+            // now provably in-bounds, so the inner loop is a checkless write.
+            let dst_base = dst_row_base + (glyph_x0 + i64::from(col_lo)) as usize;
+            let atlas_base = atlas_row_base + (entry.x + col_lo) as usize;
+            for i in 0..(col_hi - col_lo) as usize {
+                let a = cache.atlas.data[atlas_base + i];
                 if a == 0 {
                     continue;
                 }
-                let idx = dst_row_base + px as usize;
-                let Some(dst) = pixels.get_mut(idx) else {
-                    continue;
-                };
+                let dst = &mut pixels[dst_base + i];
                 *dst = if a == 255 {
                     fg_px
                 } else {

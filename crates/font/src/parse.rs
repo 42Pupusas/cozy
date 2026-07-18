@@ -28,6 +28,11 @@ pub const TAG_POST: usize = 9;
 // reserved slots for CFF/CFF2/etc
 const _TAG_COUNT: usize = 16;
 
+/// The `ttcf` magic (`TrueType` Collection header), big-endian as a `u32` --
+/// i.e. `Self::parse` sees this instead of a normal sfnt version (`0x00010000`
+/// / `OTTO`) at byte 0 when the file is a `.ttc` bundling several sub-fonts.
+const TTC_TAG: u32 = 0x7474_6366; // b"ttcf"
+
 /// A raw 4-byte sfnt table tag (`"cmap"`, `"glyf"`, ...) as found in a font's
 /// table directory.
 ///

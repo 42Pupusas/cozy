@@ -62,9 +62,12 @@ sh scripts/stress/paste_flood.sh    # paste a big buffer into the window
 3. **`truecolor_flood.sh`** — 24-bit SGR color gradient, stressing per-cell
    color resolution (`Theme::effective`, `render.rs`'s palette/RGB path) and
    attribute-change churn (every cell has a distinct `Attrs`).
-4. **`wide_unicode.sh`** — CJK / emoji heavy text, stressing `text_layout`,
-   glyph-atlas growth, and the `Cell::wide`/`spacer` double-width path in
-   `crates/grid`.
+4. **`wide_unicode.sh`** — wide-presentation emoji heavy text, stressing
+   `text_layout`, glyph-atlas growth, and the `Cell::wide`/`spacer`
+   double-width path in `crates/grid`. Uses emoji rather than CJK ideographs
+   since no CJK-covering font is wired up by default (see the
+   `glyph_render_check` note above) -- CJK text would just render tofu
+   instead of exercising the rasterizer.
 5. **`resize_storm.sh`** — rapid resize events (Wayland-aware: uses `niri msg`
    on niri, `hyprctl` on Hyprland, or `swaymsg` on Sway, falling back to
    `xdotool` on X11/XWayland; otherwise drag-resize by hand), stressing

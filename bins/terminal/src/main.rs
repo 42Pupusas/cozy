@@ -216,6 +216,10 @@ enum InputMsg {
 enum UiEvent {
     Bell,
     Title(String),
+    /// A newly-interned OSC 8 hyperlink: `(link_id, uri)`. The UI thread
+    /// mirrors these into its own id->URI table so a click handler never has
+    /// to reach across to the parser-thread-owned `Grid` to resolve one.
+    Link(u32, String),
 }
 
 // ── Entry ──────────────────────────────────────────────────────────────────────
@@ -702,6 +706,9 @@ impl ParserSession {
             if let Some(title) = self.grid.take_title() {
                 self.ui_events.lock().unwrap().push(UiEvent::Title(title));
             }
+            for (id, uri) in self.grid.take_new_links() {
+                self.ui_events.lock().unwrap().push(UiEvent::Link(id, uri));
+            }
 
             self.publish();
         }
@@ -786,6 +793,10 @@ impl UiWorker<'_> {
         // Track the grid's current row count for page-scroll sizing (updated on
         // resize). Seeded from the startup dimensions.
         let mut grid_rows = ROWS;
+        // Mirror of the grid's OSC 8 link table, id -> URI, built incrementally
+        // from `UiEvent::Link`. Lets a Ctrl+click resolve the cell under the
+        // pointer's `link_id` without reaching across to the parser thread.
+        let mut links: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
 
         loop {
             if quit.load(Ordering::Relaxed) {
@@ -807,6 +818,9 @@ impl UiWorker<'_> {
                 match ev {
                     UiEvent::Bell => win.bell(),
                     UiEvent::Title(title) => win.set_title(&title),
+                    UiEvent::Link(id, uri) => {
+                        links.insert(id, uri);
+                    }
                 }
                 did_work = true;
             }
@@ -930,6 +944,25 @@ impl UiWorker<'_> {
                         modifiers,
                     } => {
                         use platform::window::MouseEventKind;
+                        // Ctrl+click on an OSC 8 hyperlink opens it in the
+                        // user's default handler instead of being forwarded
+                        // to the shell -- matching every other terminal's
+                        // hyperlink convention (kitty, foot, WezTerm, ...).
+                        // Only fires when no app has claimed mouse reporting
+                        // (`mouse_mode == Off`): a mouse-aware app like vim
+                        // gets the click as usual and can handle OSC 8 itself.
+                        if kind == MouseEventKind::Press
+                            && button == platform::window::MouseButton::Left
+                            && modifiers.to_input().ctrl()
+                            && TermModes::unpack(term_modes.load(Ordering::Relaxed)).mouse_mode
+                                == MouseMode::Off
+                        {
+                            let link_id = win.link_id_at(col, row);
+                            if link_id != 0 && let Some(uri) = links.get(&link_id) {
+                                let _ = std::process::Command::new("xdg-open").arg(uri).spawn();
+                                continue;
+                            }
+                        }
                         let mev = MouseEvent {
                             button: match button {
                                 platform::window::MouseButton::Left => MouseButton::Left,

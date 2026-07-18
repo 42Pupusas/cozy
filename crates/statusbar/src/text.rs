@@ -28,13 +28,32 @@ pub struct FaceRenderer {
     ascender: f32,
     /// Line height in pixels -- used to vertically center text in the bar.
     cell_height: f32,
+    /// Fallback face (e.g. Noto Emoji) consulted for codepoints `face`
+    /// doesn't cover -- mirrors `platform::render`'s `GlyphCache`. `None`
+    /// when no emoji font is configured (or it failed to load), in which
+    /// case an uncovered codepoint rasterizes `face`'s own `.notdef`.
+    fallback: Option<FontFace>,
 }
 
 impl TextRenderer {
     /// Load `path` at `px_size`; falls back to the embedded bitmap font
     /// (with a diagnostic on stderr) if `path` is `None` or fails to load.
+    ///
+    /// Equivalent to `Self::load_with_emoji(path, None, px_size)`.
     #[must_use]
     pub fn load(path: Option<&str>, px_size: f32) -> Self {
+        Self::load_with_emoji(path, None, px_size)
+    }
+
+    /// Load `path` at `px_size`, with an optional `emoji_path` fallback face
+    /// consulted for codepoints `path`'s face doesn't cover (mirrors
+    /// `config::Config::bar_emoji_path`/`platform::Renderer`'s emoji
+    /// fallback). Falls back to the embedded bitmap font (with a
+    /// diagnostic on stderr) if `path` is `None` or fails to load; a bad or
+    /// missing `emoji_path` just means no fallback (also diagnosed), not a
+    /// hard failure.
+    #[must_use]
+    pub fn load_with_emoji(path: Option<&str>, emoji_path: Option<&str>, px_size: f32) -> Self {
         let Some(path) = path else {
             return Self::Bitmap;
         };
@@ -43,12 +62,14 @@ impl TextRenderer {
                 let ascender = face.line.ascender;
                 let cell_height = face.line.cell_height;
                 let (atlas, map) = face.build_ascii_atlas(2048);
+                let fallback = Self::load_fallback(emoji_path, px_size);
                 Self::Face(Box::new(FaceRenderer {
                     face,
                     atlas,
                     map,
                     ascender,
                     cell_height,
+                    fallback,
                 }))
             }
             Err(e) => {
@@ -56,6 +77,22 @@ impl TextRenderer {
                     "statusbar: failed to load font {path:?}: {e} — falling back to embedded bitmap font"
                 );
                 Self::Bitmap
+            }
+        }
+    }
+
+    /// Load the emoji fallback face, if `emoji_path` is set. Diagnoses (but
+    /// doesn't abort on) a bad path, same treatment as the primary face's
+    /// own failure handling.
+    fn load_fallback(emoji_path: Option<&str>, px_size: f32) -> Option<FontFace> {
+        let path = emoji_path?;
+        match FontFace::load(path, px_size) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!(
+                    "statusbar: failed to load emoji font {path:?}: {e} — emoji will render as tofu"
+                );
+                None
             }
         }
     }
@@ -97,6 +134,25 @@ impl TextRenderer {
     /// anti-aliased edge blending on the face path -- the bitmap path
     /// ignores it, being 1-bit). Returns the x just past the last glyph.
     pub fn draw_text(&mut self, canvas: &mut Canvas, text: &str, x: i32, y: i32, fg: Color, bg: Color) -> i32 {
+        self.draw_text_alpha(canvas, text, x, y, fg, bg, 255)
+    }
+
+    /// Same as [`Self::draw_text`], but `bg_alpha` (`0-255`) is the
+    /// background's own packed alpha -- needed so anti-aliased glyph edges
+    /// blend correctly when the bar's background is translucent (mirrors
+    /// `platform::Renderer`'s `bg_alpha` plumbing). `255` (opaque) is
+    /// identical to [`Self::draw_text`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_alpha(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        x: i32,
+        y: i32,
+        fg: Color,
+        bg: Color,
+        bg_alpha: u8,
+    ) -> i32 {
         match self {
             Self::Bitmap => {
                 canvas.draw_text(text, x, y, fg);
@@ -109,7 +165,7 @@ impl TextRenderer {
                         continue;
                     };
                     if entry.width > 0 && entry.height > 0 {
-                        blit_glyph(canvas, &f.atlas, &entry, pen_x, y, fg, bg);
+                        blit_glyph(canvas, &f.atlas, &entry, pen_x, y, fg, bg, bg_alpha);
                     }
                     pen_x += entry.advance;
                 }
@@ -128,8 +184,24 @@ impl TextRenderer {
         fg: Color,
         bg: Color,
     ) {
+        self.draw_text_right_alpha(canvas, text, right_x, y, fg, bg, 255);
+    }
+
+    /// [`Self::draw_text_right`] with an explicit background alpha -- see
+    /// [`Self::draw_text_alpha`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_right_alpha(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        right_x: i32,
+        y: i32,
+        fg: Color,
+        bg: Color,
+        bg_alpha: u8,
+    ) {
         let w = self.measure(text);
-        self.draw_text(canvas, text, right_x - w, y, fg, bg);
+        self.draw_text_alpha(canvas, text, right_x - w, y, fg, bg, bg_alpha);
     }
 }
 
@@ -140,7 +212,18 @@ impl FaceRenderer {
         if let Some(e) = self.map.get(&codepoint) {
             return Some(*e);
         }
-        let g = self.face.rasterize(codepoint);
+        // Consult the fallback face only when the primary genuinely lacks
+        // the glyph -- cheap cmap-only check, same pattern as
+        // `platform::render::GlyphCache::entry`.
+        let use_fallback = !self.face.has_glyph(codepoint) && self.fallback.is_some();
+        let g = if use_fallback {
+            self.fallback
+                .as_mut()
+                .expect("use_fallback implies fallback.is_some()")
+                .rasterize(codepoint)
+        } else {
+            self.face.rasterize(codepoint)
+        };
         let entry = self.atlas.insert(
             &g.bitmap,
             g.metrics.bearing_x.round() as i32,
@@ -157,6 +240,7 @@ impl FaceRenderer {
 /// Alpha-blend one rasterized glyph from `atlas` onto `canvas` at pen
 /// position `(pen_x, pen_y)` (`pen_y` = the line's top row, matching
 /// `entry.bearing_y`'s convention -- see `font::atlas::GlyphEntry`).
+#[allow(clippy::too_many_arguments)]
 fn blit_glyph(
     canvas: &mut Canvas,
     atlas: &Atlas,
@@ -165,6 +249,7 @@ fn blit_glyph(
     pen_y: i32,
     fg: Color,
     bg: Color,
+    bg_alpha: u8,
 ) {
     let buf_width = canvas.width();
     let buf_height = canvas.height();
@@ -181,7 +266,16 @@ fn blit_glyph(
 
     let pixels = canvas.pixels_mut();
     let atlas_w = atlas.width as i32;
-    let fg_px = fg.to_xrgb8888();
+    // Glyph ink is always fully opaque regardless of window opacity
+    // ("translucent glass, solid text"), matching
+    // `platform::Renderer::blit_cell_face` -- `premultiplied_argb8888(255)`
+    // degenerates to plain packed RGB when the buffer is opaque anyway, so
+    // this is a no-op split from `to_xrgb8888()` only once translucent.
+    let fg_px = if bg_alpha == 255 {
+        fg.to_xrgb8888()
+    } else {
+        fg.premultiplied_argb8888(255)
+    };
 
     for row in row_lo..row_hi {
         let py = (glyph_top + row) as usize;
@@ -199,7 +293,7 @@ fn blit_glyph(
             *dst = if a == 255 {
                 fg_px
             } else {
-                fg.blend_glyph(bg, a, 255)
+                fg.blend_glyph(bg, a, bg_alpha)
             };
         }
     }

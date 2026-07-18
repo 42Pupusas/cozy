@@ -1216,6 +1216,7 @@ mod tests {
             attrs: Attrs::default(),
             wide: false,
             spacer: false,
+            link_id: 0,
         }
     }
 
@@ -1238,6 +1239,7 @@ mod tests {
             attrs: *a,
             wide,
             spacer,
+            link_id: 0,
         };
         let def = Attrs::default();
         let cells = vec![

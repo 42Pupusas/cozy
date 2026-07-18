@@ -126,6 +126,7 @@ fn main() {
                 attrs: grid::Attrs::default(),
                 wide: false,
                 spacer: false,
+                link_id: 0,
             };
             {
                 let mut canvas = Canvas::new(&mut backbuffer, bw, bh);

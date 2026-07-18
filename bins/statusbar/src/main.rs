@@ -157,12 +157,14 @@ impl Modules {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint(
     canvas: &mut Canvas,
     modules: &Modules,
     text: &mut TextRenderer,
     fg: Color,
     bg: Color,
+    bg_alpha: u8,
     bar_height: i32,
     scale: i32,
 ) {
@@ -180,7 +182,7 @@ fn paint(
         if seg.is_empty() {
             continue;
         }
-        text.draw_text_right(canvas, &seg, right_edge, y, fg, bg);
+        text.draw_text_right_alpha(canvas, &seg, right_edge, y, fg, bg, bg_alpha);
         let w = text.measure(&seg);
         right_edge -= w + gap;
     }
@@ -194,7 +196,7 @@ fn main() {
 
     let wake = waker::Waker::new().expect("create waker");
     let bar_height = cfg.bar_height() as i32;
-    let mut window = match BarWindow::new(Edge::Top, bar_height, wake) {
+    let mut window = match BarWindow::new(Edge::Top, bar_height, cfg.bar_opacity(), wake) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("statusbar: failed to open layer-shell window: {e}");
@@ -211,6 +213,7 @@ fn main() {
         let c = cfg.bar_foreground();
         Color::rgb(c.r, c.g, c.b)
     };
+    let bg_alpha = (cfg.bar_opacity().clamp(0.0, 1.0) * 255.0).round() as u8;
     window.set_background(bg);
 
     // Font size is a point size (like the terminal's own `[font] size`);
@@ -218,7 +221,7 @@ fn main() {
     // pixel density so it renders crisp on HiDPI, matching
     // `platform::Renderer::with_scale`'s convention.
     let px_size = cfg.bar_font_px_size() * scale as f32;
-    let mut text = TextRenderer::load(cfg.bar_font_path(), px_size);
+    let mut text = TextRenderer::load_with_emoji(cfg.bar_font_path(), cfg.bar_emoji_path(), px_size);
 
     let mut modules = Modules::new();
     let bar_height = window.height();
@@ -228,7 +231,9 @@ fn main() {
         if changed {
             window.request_redraw();
         }
-        match window.tick(|canvas| paint(canvas, &modules, &mut text, fg, bg, bar_height, scale)) {
+        match window.tick(|canvas| {
+            paint(canvas, &modules, &mut text, fg, bg, bg_alpha, bar_height, scale);
+        }) {
             Ok(true) => {}
             Ok(false) => break,
             Err(e) => {

@@ -107,13 +107,23 @@ pub struct Cell {
     /// grid operations that would erase/overwrite only one half of a pair
     /// must clear the other half too, to avoid an orphaned half-glyph.
     pub spacer: bool,
+    /// OSC 8 hyperlink id, or `0` for "no link". Indexes into
+    /// `Grid`'s link table (never exposed here -- `Cell` stays a dumb value
+    /// type with no back-reference to the grid that produced it) rather than
+    /// storing the URI inline, which would blow `Cell` up by the length of
+    /// every distinct URI printed instead of one `u32` per cell regardless of
+    /// how long or how many links are on screen.
+    pub link_id: u32,
 }
 
 #[cfg(test)]
 mod size_tests {
     #[test]
-    fn cell_is_16_bytes() {
-        assert_eq!(std::mem::size_of::<super::Cell>(), 16);
+    fn cell_is_20_bytes() {
+        // Grew from 16 to 20 bytes when `link_id: u32` was added for OSC 8
+        // hyperlink support -- still a plain memcpy-able POD, just one word
+        // wider, so `fill`/`copy_within`/snapshot/blit stay cheap memsets.
+        assert_eq!(std::mem::size_of::<super::Cell>(), 20);
         assert_eq!(std::mem::size_of::<super::Attrs>(), 9);
     }
 }
@@ -125,6 +135,7 @@ impl Default for Cell {
             attrs: Attrs::default(),
             wide: false,
             spacer: false,
+            link_id: 0,
         }
     }
 }

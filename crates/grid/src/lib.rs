@@ -248,6 +248,22 @@ pub struct Grid {
     /// arrived (the UI thread's window keeps showing whatever title it last
     /// applied -- this only carries the *change*, not a live mirror).
     pending_title: Option<String>,
+    /// OSC 8 hyperlink table: `link_table[id - 1]` is the URI for
+    /// `Cell::link_id == id` (id `0` means "no link", so this is 1-indexed).
+    /// Append-only for the lifetime of the terminal (URIs are typically a
+    /// tiny, bounded set -- shell prompts, `ls --hyperlink`, a handful of
+    /// links in a man page -- so there's no eviction; a process living long
+    /// enough to make this a real memory concern would have far bigger
+    /// scrollback-driven costs already dominating).
+    link_table: Vec<String>,
+    /// The link id new cells are stamped with, per `print()`. Set by an OSC 8
+    /// with a non-empty URI (interning it into `link_table` if new); reset to
+    /// `0` by a bare `OSC 8 ; ; ST` (the close-link form).
+    active_link_id: u32,
+    /// How many entries of `link_table` [`Grid::take_new_links`] has already
+    /// handed to the UI thread; the next call only reports the suffix past
+    /// this index.
+    published_links: usize,
 }
 
 /// A designated character set slot (G0/G1). Only the two xterm/VT100
@@ -419,6 +435,9 @@ impl Grid {
             shifted_to_g1: false,
             bell_pending: false,
             pending_title: None,
+            link_table: Vec::new(),
+            active_link_id: 0,
+            published_links: 0,
         }
     }
 
@@ -795,6 +814,7 @@ impl Grid {
         let col = self.cursor.col;
         let row = self.cursor.row;
         let attrs = self.attrs;
+        let link_id = self.active_link_id;
         let is_wide = width == 2;
         self.active_screen_mut().set_cell(
             col,
@@ -804,6 +824,7 @@ impl Grid {
                 attrs,
                 wide: is_wide,
                 spacer: false,
+                link_id,
             },
         );
         self.dirty.mark(col, row);
@@ -818,6 +839,7 @@ impl Grid {
                     attrs,
                     wide: false,
                     spacer: true,
+                    link_id,
                 },
             );
             self.dirty.mark(col + 1, row);
@@ -1441,8 +1463,61 @@ impl Grid {
             OscCmd::SetTitle(title) => {
                 self.pending_title = Some((*title).to_string());
             }
+            OscCmd::Hyperlink { uri } => self.set_active_link(uri),
             _ => {}
         }
+    }
+
+    /// OSC 8 handler: an empty `uri` closes the current link (subsequent
+    /// cells go back to `link_id == 0`); a non-empty one opens a new one,
+    /// interning it into `link_table` -- reusing an existing entry's id if
+    /// this exact URI is already the most recently opened one, which is the
+    /// overwhelmingly common case (`OSC 8 ; ; url ST text OSC 8 ; ; ST`
+    /// wrapping a single run of text) and keeps that pattern from growing the
+    /// table on every single link a prompt or `ls --hyperlink` prints.
+    fn set_active_link(&mut self, uri: &str) {
+        if uri.is_empty() {
+            self.active_link_id = 0;
+            return;
+        }
+        if self.link_table.last().is_some_and(|last| last == uri) {
+            self.active_link_id = self.link_table.len() as u32;
+            return;
+        }
+        self.link_table.push(uri.to_string());
+        self.active_link_id = self.link_table.len() as u32;
+    }
+
+    /// Resolve a [`Cell::link_id`] back to its URI, or `None` for `0`
+    /// ("no link") or a stale id from before the last RIS. Read by the UI
+    /// thread to decide what to open on a hyperlink click and whether to draw
+    /// the hover-underline.
+    #[must_use]
+    pub fn link_uri(&self, link_id: u32) -> Option<&str> {
+        if link_id == 0 {
+            return None;
+        }
+        self.link_table
+            .get(usize::try_from(link_id).ok()?.checked_sub(1)?)
+            .map(String::as_str)
+    }
+
+    /// Newly-interned link URIs since the last call, as `(id, uri)` pairs, in
+    /// the order they were interned; clears the backlog. The grid itself
+    /// lives on the parser thread, so the UI thread (which needs the URI text
+    /// to open on click) can't just borrow `link_table` directly -- this lets
+    /// it mirror the table incrementally the same low-volume,
+    /// observed-exactly-once way `take_bell`/`take_title` hand over one-shot
+    /// events, without re-sending the whole table every batch.
+    pub fn take_new_links(&mut self) -> Vec<(u32, String)> {
+        let start = self.published_links;
+        let out: Vec<(u32, String)> = self.link_table[start..]
+            .iter()
+            .enumerate()
+            .map(|(i, uri)| (u32::try_from(start + i + 1).unwrap_or(u32::MAX), uri.clone()))
+            .collect();
+        self.published_links = self.link_table.len();
+        out
     }
 
     /// DECRQSS (`DCS $ q <request> ST`) -- request status string. Replies
@@ -1563,6 +1638,9 @@ impl Grid {
                 self.g0_charset = Charset::Ascii;
                 self.g1_charset = Charset::Ascii;
                 self.shifted_to_g1 = false;
+                self.link_table.clear();
+                self.active_link_id = 0;
+                self.published_links = 0;
             }
             // SCS — designate G0 charset (`ESC ( X`). `0` = DEC Special
             // Graphics (line-drawing); anything else (`B` = US-ASCII, `A` =

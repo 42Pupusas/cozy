@@ -64,6 +64,8 @@
 //! height      = 28                 # bar thickness in logical pixels
 //! font_path   = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf" # defaults to [font].path
 //! font_size   = 12                 # points; defaults to [font].size
+//! emoji_path  = "/path/to/emoji-font.ttf" # defaults to [font].emoji_path
+//! opacity     = 1.0                # defaults to [window].opacity
 //! ```
 
 #![allow(clippy::doc_markdown)]
@@ -336,7 +338,7 @@ pub struct Keybind {
 /// [`Config::palette`]) -- see [`Config::bar_background`] etc., which
 /// resolve the mirroring. This struct only holds the raw overrides actually
 /// present in the file.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BarConfig {
     /// Background color override. `None` mirrors `[colors].background`.
     pub background: Option<Color>,
@@ -350,6 +352,12 @@ pub struct BarConfig {
     pub font_path: Option<String>,
     /// Font point size override. `None` mirrors `[font].size`.
     pub font_size: Option<u32>,
+    /// Emoji fallback face override. `None` mirrors `[font].emoji_path`
+    /// (which itself may be unset -- see `FontConfig::emoji_path`).
+    pub emoji_path: Option<String>,
+    /// Background opacity override, `0.0`-`1.0`. `None` mirrors
+    /// `[window].opacity`.
+    pub opacity: Option<f64>,
 }
 
 // ── Root config ───────────────────────────────────────────────────────────────
@@ -659,6 +667,18 @@ impl Config {
         )? {
             self.bar.font_size = Some(u32::try_from(n).unwrap_or(12));
         }
+        if let Some(s) = bar.get_str("emoji_path") {
+            self.bar.emoji_path = Some(s.to_owned());
+        }
+        if let Some(n) = bar.get_float_range(
+            "opacity",
+            "bar.opacity",
+            0.0,
+            1.0,
+            "must be between 0.0 and 1.0",
+        )? {
+            self.bar.opacity = Some(n);
+        }
         Ok(())
     }
 
@@ -710,5 +730,23 @@ impl Config {
     #[allow(clippy::cast_precision_loss)]
     pub fn bar_font_px_size(&self) -> f32 {
         self.bar_font_size() as f32 * FontConfig::DPI / 72.0
+    }
+
+    /// The status bar's emoji fallback face: `[bar].emoji_path` if set,
+    /// otherwise mirrors `[font].emoji_path` (which itself may be `None` --
+    /// see [`FontConfig::emoji_path`]).
+    #[must_use]
+    pub fn bar_emoji_path(&self) -> Option<&str> {
+        self.bar
+            .emoji_path
+            .as_deref()
+            .or(self.font.emoji_path.as_deref())
+    }
+
+    /// The status bar's background opacity, `0.0`-`1.0`: `[bar].opacity` if
+    /// set, otherwise mirrors `[window].opacity`.
+    #[must_use]
+    pub fn bar_opacity(&self) -> f64 {
+        self.bar.opacity.unwrap_or(self.window.opacity)
     }
 }

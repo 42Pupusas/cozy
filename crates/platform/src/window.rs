@@ -502,6 +502,13 @@ pub struct TermWindow {
     /// clean on the next frame before the (possibly moved/cleared) selection
     /// is re-tinted, so highlight never lingers after deselect or drag.
     prev_selection_rows: Vec<u16>,
+    /// `link_id` of the cell the pointer is over while Ctrl is held (`0` for
+    /// "none"), and the viewport row that hover-underline was last drawn on
+    /// (so the next frame knows what to repaint clean before redrawing or
+    /// removing it). Set from pointer motion in `handle_pointer`; consumed by
+    /// [`Self::apply_link_hover_underline`] in the present path.
+    hover_link_id: u32,
+    prev_hover_row: Option<u16>,
     /// Viewport rows the cursor overlay touched on the previous frame.
     /// Repainted clean before drawing the cursor at its new (possibly
     /// mid-slide) position, the same idempotent scheme as
@@ -754,6 +761,8 @@ impl TermWindow {
             paste_rx,
             focus_serial: 0,
             prev_selection_rows: Vec::new(),
+            hover_link_id: 0,
+            prev_hover_row: None,
             prev_cursor_rows: Vec::new(),
             cursor_anim: crate::cursor_anim::CursorAnimator::new(cursor_cfg),
             last_tick: std::time::Instant::now(),
@@ -801,6 +810,38 @@ impl TermWindow {
     #[must_use]
     pub fn selected_text(&self) -> Option<String> {
         self.selection.selected_text()
+    }
+
+    /// The OSC 8 `link_id` of the cell at viewport `(col, row)`, from the same
+    /// on-screen cell mirror `selected_text` reads -- `0` ("no link") if the
+    /// cell is out of bounds, blank, or genuinely unlinked. Used to decide
+    /// whether a Ctrl+click should open a URL, and to drive the
+    /// hover-underline.
+    #[must_use]
+    pub fn link_id_at(&self, col: u16, row: u16) -> u32 {
+        self.selection
+            .mirror()
+            .get(usize::from(row))
+            .and_then(|line| line.get(usize::from(col)))
+            .map_or(0, |cell| cell.link_id)
+    }
+
+    /// Recompute which link (if any) is under the pointer given the current
+    /// Ctrl state, and mark the window dirty if that changed the on-screen
+    /// hover-underline (either a different link, or Ctrl toggled while over
+    /// the same one). Called on every pointer motion and every modifier
+    /// change, since either can start or end a hover.
+    fn update_hover_link(&mut self, col: u16, row: u16) {
+        // XKB modifier index 2 (bit 0x04) is Ctrl -- same bit `press_left`'s
+        // shift check above reads for its own index (0x01).
+        let ctrl = (self.modifiers.depressed | self.modifiers.latched | self.modifiers.locked)
+            & 0x04
+            != 0;
+        let new = if ctrl { self.link_id_at(col, row) } else { 0 };
+        if new != self.hover_link_id {
+            self.hover_link_id = new;
+            self.dirty = true;
+        }
     }
 
     /// Copy the current selection to the system clipboard (Ctrl+Shift+C).
@@ -1261,6 +1302,7 @@ impl TermWindow {
                         if self.selection.drag_to((cc, i32::from(cr))) {
                             self.dirty = true;
                         }
+                        self.update_hover_link(cc, cr);
                         // VT mouse reporting: forward every motion report:
                         // the `Encoder` (which knows the negotiated tracking
                         // granularity) decides whether a bare hover
@@ -1418,6 +1460,11 @@ impl TermWindow {
                             locked: ev.arg(3),
                             group: ev.arg(4),
                         };
+                        // Ctrl toggling while the pointer sits over a link
+                        // must start/stop the hover-underline immediately,
+                        // not wait for the next pointer motion.
+                        let (cc, cr) = self.pointer_cell();
+                        self.update_hover_link(cc, cr);
                     }
                     _ => {}
                 }
@@ -1657,6 +1704,55 @@ impl TermWindow {
         }
     }
 
+    /// Draw a one-pixel underline across the hovered link's row-span (the
+    /// contiguous run of cells sharing `hover_link_id` that includes the
+    /// pointer's column), so the user gets the familiar "this is clickable"
+    /// feedback before committing to the Ctrl+click. `None` when nothing is
+    /// hovered -- the caller is responsible for repainting `prev_hover_row`
+    /// clean first (same pattern as the selection highlight).
+    fn apply_link_hover_underline(&mut self) {
+        if self.hover_link_id == 0 {
+            return;
+        }
+        let (_, row) = self.pointer_cell();
+        let Some(line) = self.selection.mirror().get(usize::from(row)) else {
+            return;
+        };
+        // Find the contiguous run of cells sharing the hovered link id.
+        // (`line` came straight from `row` above, so no need to re-check it.)
+        let id = self.hover_link_id;
+        let mut lo = None;
+        let mut hi = None;
+        for (col, cell) in line.iter().enumerate() {
+            if cell.link_id == id {
+                lo.get_or_insert(col);
+                hi = Some(col);
+            }
+        }
+        let (Some(lo), Some(hi)) = (lo, hi) else {
+            return;
+        };
+        let y = usize::from(row) * self.cell_h as usize + self.cell_h as usize - 1;
+        let buf_w = self.width as usize;
+        if y >= self.height as usize {
+            return;
+        }
+        let x0 = lo * self.cell_w as usize;
+        let x1 = ((hi + 1) * self.cell_w as usize).min(buf_w);
+        // Light blue underline, preserving whatever alpha byte the pixel
+        // already carried (top byte, only meaningful on a translucent
+        // window -- see `Renderer::pack_bg`).
+        const UNDERLINE_RGB: u32 = 0x00A0_C0FF;
+        let base = y * buf_w;
+        for x in x0..x1 {
+            let idx = base + x;
+            if idx < self.backbuffer.len() {
+                self.backbuffer[idx] = (self.backbuffer[idx] & 0xFF00_0000) | UNDERLINE_RGB;
+            }
+        }
+        self.prev_hover_row = Some(row);
+    }
+
     /// Draw the cursor overlay at its current animated (possibly
     /// mid-slide, possibly mid-blink-fade) position, on top of whatever
     /// [`Self::apply_selection_highlight`] just painted. Returns the whole-
@@ -1736,6 +1832,7 @@ impl TermWindow {
                         attrs,
                         wide: false,
                         spacer: false,
+                        link_id: 0,
                     };
                     self.renderer
                         .blit_cell(&mut canvas, start_col + i as u16, 0, &cell);
@@ -1936,6 +2033,17 @@ impl TermWindow {
                 rows_to_repaint.push(r);
             }
         }
+        if let Some(r) = self.prev_hover_row.take()
+            && !rows_to_repaint.contains(&r)
+        {
+            rows_to_repaint.push(r);
+        }
+        if self.hover_link_id != 0 {
+            let (_, row) = self.pointer_cell();
+            if !rows_to_repaint.contains(&row) {
+                rows_to_repaint.push(row);
+            }
+        }
         for r in std::mem::take(&mut self.prev_cursor_rows) {
             if !rows_to_repaint.contains(&r) {
                 rows_to_repaint.push(r);
@@ -1951,6 +2059,10 @@ impl TermWindow {
         self.apply_selection_highlight();
         touched_rows.extend(self.selection_rows());
         self.prev_selection_rows = self.selection_rows();
+        self.apply_link_hover_underline();
+        if let Some(r) = self.prev_hover_row {
+            touched_rows.push(r);
+        }
         let new_cursor_rows = self.draw_cursor_overlay();
         touched_rows.extend_from_slice(&new_cursor_rows);
         self.prev_cursor_rows = new_cursor_rows;

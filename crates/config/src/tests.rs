@@ -342,6 +342,35 @@ fn bar_height_out_of_range_rejected() {
     assert!(err.contains("bar.height"));
 }
 
+#[test]
+fn bar_emoji_and_opacity_mirror_terminal_settings() {
+    let cfg = Config::parse("[font]\nemoji_path = \"/x/emoji.ttf\"\n[window]\nopacity = 0.75\n");
+    assert_eq!(cfg.bar_emoji_path(), Some("/x/emoji.ttf"));
+    assert!((cfg.bar_opacity() - 0.75).abs() < 1e-9);
+}
+
+#[test]
+fn bar_emoji_and_opacity_overrides_win() {
+    let cfg = Config::parse(
+        "[font]\nemoji_path = \"/terminal-emoji.ttf\"\n[window]\nopacity = 0.75\n[bar]\nemoji_path = \"/bar-emoji.ttf\"\nopacity = 0.5\n",
+    );
+    assert_eq!(cfg.bar_emoji_path(), Some("/bar-emoji.ttf"));
+    assert!((cfg.bar_opacity() - 0.5).abs() < 1e-9);
+}
+
+#[test]
+fn bar_emoji_path_none_and_opacity_defaults_when_unconfigured() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.bar_emoji_path(), None);
+    assert!((cfg.bar_opacity() - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn bar_opacity_out_of_range_rejected() {
+    let err = Config::fail("[bar]\nopacity = 1.5\n");
+    assert!(err.contains("bar.opacity"));
+}
+
 // ── ConfigError ───────────────────────────────────────────────────────────
 
 #[test]

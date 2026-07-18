@@ -108,6 +108,15 @@ pub struct BarWindow {
     /// [`BarWindow::set_background`] (mirrors `[bar] background` / the
     /// terminal's own `[colors] background` -- see `config::Config::bar_background`).
     background: Color,
+    /// Alpha applied to background pixels, `0-255` (`255` = opaque). Mirrors
+    /// `platform::Renderer`'s `bg_alpha` -- `255` packs plain XRGB8888
+    /// (byte-identical to the pre-transparency path), anything less packs
+    /// premultiplied ARGB8888 per `wl_shm`'s wire format. Set via
+    /// [`BarWindow::set_opacity`]; the buffer format (`Argb8888` vs.
+    /// `Xrgb8888`) is fixed at construction from the same value (see
+    /// [`BarWindow::new`]) since it determines which `wl_shm` format we
+    /// negotiate and that can't change after the pool/buffers exist.
+    bg_alpha: u8,
     dirty: bool,
     frame_ready: bool,
     frame_cb: Option<platform::id::CallbackId>,
@@ -136,8 +145,13 @@ struct Globals {
 
 impl BarWindow {
     /// Open a layer-shell bar `height` pixels thick, docked at `edge`, and
-    /// reserving that much exclusive space.
-    pub fn new(edge: Edge, height: i32, wake: waker::Waker) -> Result<Self> {
+    /// reserving that much exclusive space, with the given background
+    /// `opacity` (`0.0` fully transparent .. `1.0` opaque -- mirrors
+    /// `config::Config::bar_opacity`/the terminal's own `[window] opacity`).
+    /// The buffer format (`Argb8888` for `opacity < 1.0`, else the cheaper
+    /// `Xrgb8888`) is fixed for the window's whole lifetime from this value,
+    /// matching `platform::TermWindow`'s `needs_alpha` split.
+    pub fn new(edge: Edge, height: i32, opacity: f64, wake: waker::Waker) -> Result<Self> {
         let (mut sender, reader, _repeat_timer) = Conn::connect()?;
         let (producer, mut events) =
             RingBuffer::<RawEvent>::new(Capacity::exact(EVENT_RING_CAP)).split();
@@ -166,7 +180,15 @@ impl BarWindow {
         };
 
         let px_height = height * scale;
-        let buf_format = Format::Xrgb8888;
+        let bg_alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
+        // A translucent bar (opacity < 1.0) needs per-pixel alpha (Argb8888);
+        // an opaque one keeps the cheaper Xrgb8888 the compositor doesn't
+        // have to blend -- same split as `platform::TermWindow::new`.
+        let buf_format = if bg_alpha == 255 {
+            Format::Xrgb8888
+        } else {
+            Format::Argb8888
+        };
 
         // Create the shm pool + initial frame pair *before* any layer-shell
         // setup — matching TermWindow's ordering, and the ordering the
@@ -255,6 +277,7 @@ impl BarWindow {
             buf_format,
             backbuffer: vec![Color::BLACK.to_xrgb8888(); (INITIAL_WIDTH * px_height) as usize],
             background: Color::rgb(0x1e, 0x1e, 0x2e),
+            bg_alpha,
             dirty: false,
             frame_ready: true,
             frame_cb: None,
@@ -475,6 +498,18 @@ impl BarWindow {
         Ok((frames, shm_mem, pool))
     }
 
+    /// Pack `self.background` for this window's fixed buffer format: plain
+    /// XRGB8888 when opaque (byte-identical to the pre-transparency path),
+    /// or premultiplied ARGB8888 at `bg_alpha` otherwise -- mirrors
+    /// `platform::Renderer::pack_bg`.
+    fn pack_bg(&self) -> u32 {
+        if self.bg_alpha == 255 {
+            self.background.to_xrgb8888()
+        } else {
+            self.background.premultiplied_argb8888(self.bg_alpha)
+        }
+    }
+
     fn present(&mut self, paint: &mut impl FnMut(&mut Canvas)) -> Result<()> {
         let Some(slot) = self.frames.iter().position(|f| f.free) else {
             return Ok(());
@@ -482,8 +517,11 @@ impl BarWindow {
         self.frames[slot].free = false;
 
         {
+            let bg_packed = self.pack_bg();
+            for p in &mut self.backbuffer {
+                *p = bg_packed;
+            }
             let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height);
-            canvas.fill_rect(canvas.bounds(), self.background);
             paint(&mut canvas);
         }
 

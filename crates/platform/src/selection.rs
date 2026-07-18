@@ -498,6 +498,21 @@ mod tests {
     }
 
     #[test]
+    fn mirror_carries_link_id_through_for_hover_lookup() {
+        // TermWindow::link_id_at reads straight through `mirror()` -- verify
+        // a snapshot's link_id survives the ingest so a hover-underline can
+        // find the cell it's over.
+        let mut sel = SelectionTracker::new();
+        let cells = vec![
+            Cell { ch: 'a', link_id: 0, ..Cell::default() },
+            Cell { ch: 'b', link_id: 7, ..Cell::default() },
+        ];
+        sel.ingest_snapshot(&incremental(vec![DirtyRow { row: 0, cells }], 0));
+        assert_eq!(sel.mirror()[0][0].link_id, 0);
+        assert_eq!(sel.mirror()[0][1].link_id, 7);
+    }
+
+    #[test]
     fn zero_delta_scroll_band_snapshot_still_updates_the_mirror() {
         // A scroll_span carried alongside an incremental snapshot must not
         // disturb the model beyond content_delta; the mirror still updates.

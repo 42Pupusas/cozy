@@ -220,6 +220,9 @@ enum UiEvent {
     /// mirrors these into its own id->URI table so a click handler never has
     /// to reach across to the parser-thread-owned `Grid` to resolve one.
     Link(u32, String),
+    /// A decoded OSC 52 clipboard write (`ESC ] 52 ; c ; <base64> BEL`) --
+    /// the application asked to put this text on the system clipboard.
+    Clipboard(String),
 }
 
 // ── Entry ──────────────────────────────────────────────────────────────────────
@@ -709,6 +712,9 @@ impl ParserSession {
             for (id, uri) in self.grid.take_new_links() {
                 self.ui_events.lock().unwrap().push(UiEvent::Link(id, uri));
             }
+            if let Some(text) = self.grid.take_clipboard() {
+                self.ui_events.lock().unwrap().push(UiEvent::Clipboard(text));
+            }
 
             self.publish();
         }
@@ -821,6 +827,7 @@ impl UiWorker<'_> {
                     UiEvent::Link(id, uri) => {
                         links.insert(id, uri);
                     }
+                    UiEvent::Clipboard(text) => win.write_clipboard(text),
                 }
                 did_work = true;
             }

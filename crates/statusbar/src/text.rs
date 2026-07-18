@@ -28,21 +28,22 @@ pub struct FaceRenderer {
     ascender: f32,
     /// Line height in pixels -- used to vertically center text in the bar.
     cell_height: f32,
-    /// Fallback face (e.g. Noto Emoji) consulted for codepoints `face`
-    /// doesn't cover -- mirrors `platform::render`'s `GlyphCache`. `None`
-    /// when no emoji font is configured (or it failed to load), in which
-    /// case an uncovered codepoint rasterizes `face`'s own `.notdef`.
-    fallback: Option<FontFace>,
+    /// Fallback faces (e.g. Noto Emoji, a Nerd Font for icon glyphs)
+    /// consulted in order for codepoints `face` doesn't cover -- mirrors
+    /// `platform::render`'s `GlyphCache`. Empty when no fallback fonts are
+    /// configured (or all failed to load), in which case an uncovered
+    /// codepoint rasterizes `face`'s own `.notdef`.
+    fallbacks: Vec<FontFace>,
 }
 
 impl TextRenderer {
     /// Load `path` at `px_size`; falls back to the embedded bitmap font
     /// (with a diagnostic on stderr) if `path` is `None` or fails to load.
     ///
-    /// Equivalent to `Self::load_with_emoji(path, None, px_size)`.
+    /// Equivalent to `Self::load_with_fallbacks(path, &[], px_size)`.
     #[must_use]
     pub fn load(path: Option<&str>, px_size: f32) -> Self {
-        Self::load_with_emoji(path, None, px_size)
+        Self::load_with_fallbacks(path, &[], px_size)
     }
 
     /// Load `path` at `px_size`, with an optional `emoji_path` fallback face
@@ -52,8 +53,22 @@ impl TextRenderer {
     /// diagnostic on stderr) if `path` is `None` or fails to load; a bad or
     /// missing `emoji_path` just means no fallback (also diagnosed), not a
     /// hard failure.
+    ///
+    /// Equivalent to `Self::load_with_fallbacks(path, &[emoji_path], px_size)`.
     #[must_use]
     pub fn load_with_emoji(path: Option<&str>, emoji_path: Option<&str>, px_size: f32) -> Self {
+        Self::load_with_fallbacks(path, &[emoji_path], px_size)
+    }
+
+    /// Load `path` at `px_size`, consulting `fallback_paths` in order for
+    /// codepoints `path`'s face doesn't cover -- e.g. an emoji font and a
+    /// Nerd Font for icon glyphs, mirroring waybar's PUA icon set (see
+    /// `modules.rs`). `None` entries in `fallback_paths` are skipped. Falls
+    /// back to the embedded bitmap font (with a diagnostic on stderr) if
+    /// `path` is `None` or fails to load; a bad or missing fallback path
+    /// just means one less fallback (also diagnosed), not a hard failure.
+    #[must_use]
+    pub fn load_with_fallbacks(path: Option<&str>, fallback_paths: &[Option<&str>], px_size: f32) -> Self {
         let Some(path) = path else {
             return Self::Bitmap;
         };
@@ -62,14 +77,17 @@ impl TextRenderer {
                 let ascender = face.line.ascender;
                 let cell_height = face.line.cell_height;
                 let (atlas, map) = face.build_ascii_atlas(2048);
-                let fallback = Self::load_fallback(emoji_path, px_size);
+                let fallbacks = fallback_paths
+                    .iter()
+                    .filter_map(|p| Self::load_fallback(*p, px_size))
+                    .collect();
                 Self::Face(Box::new(FaceRenderer {
                     face,
                     atlas,
                     map,
                     ascender,
                     cell_height,
-                    fallback,
+                    fallbacks,
                 }))
             }
             Err(e) => {
@@ -81,16 +99,16 @@ impl TextRenderer {
         }
     }
 
-    /// Load the emoji fallback face, if `emoji_path` is set. Diagnoses (but
-    /// doesn't abort on) a bad path, same treatment as the primary face's
-    /// own failure handling.
-    fn load_fallback(emoji_path: Option<&str>, px_size: f32) -> Option<FontFace> {
-        let path = emoji_path?;
+    /// Load one fallback face, if `path` is set. Diagnoses (but doesn't
+    /// abort on) a bad path, same treatment as the primary face's own
+    /// failure handling.
+    fn load_fallback(path: Option<&str>, px_size: f32) -> Option<FontFace> {
+        let path = path?;
         match FontFace::load(path, px_size) {
             Ok(f) => Some(f),
             Err(e) => {
                 eprintln!(
-                    "statusbar: failed to load emoji font {path:?}: {e} — emoji will render as tofu"
+                    "statusbar: failed to load fallback font {path:?}: {e} — its glyphs will render as tofu"
                 );
                 None
             }
@@ -212,15 +230,13 @@ impl FaceRenderer {
         if let Some(e) = self.map.get(&codepoint) {
             return Some(*e);
         }
-        // Consult the fallback face only when the primary genuinely lacks
-        // the glyph -- cheap cmap-only check, same pattern as
-        // `platform::render::GlyphCache::entry`.
-        let use_fallback = !self.face.has_glyph(codepoint) && self.fallback.is_some();
-        let g = if use_fallback {
-            self.fallback
-                .as_mut()
-                .expect("use_fallback implies fallback.is_some()")
-                .rasterize(codepoint)
+        // Consult the fallback faces, in order, only when the primary
+        // genuinely lacks the glyph -- cheap cmap-only check, same pattern
+        // as `platform::render::GlyphCache::entry`.
+        let g = if self.face.has_glyph(codepoint) {
+            self.face.rasterize(codepoint)
+        } else if let Some(f) = self.fallbacks.iter_mut().find(|f| f.has_glyph(codepoint)) {
+            f.rasterize(codepoint)
         } else {
             self.face.rasterize(codepoint)
         };

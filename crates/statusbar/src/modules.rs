@@ -46,14 +46,26 @@ pub fn battery() -> Option<String> {
         let path = entry.path();
         let cap = read_trim(path.join("capacity"))?;
         let status = read_trim(path.join("status")).unwrap_or_else(|| "Unknown".into());
+        let cap_n: u32 = cap.parse().unwrap_or(0);
         let icon = match status.as_str() {
-            "Charging" => "⚡",
-            "Full" => "=",
-            _ => "",
+            "Charging" => "󰂄",
+            "Full" | "Not charging" if cap_n >= 95 => "󰚥",
+            _ => battery_ramp_icon(cap_n),
         };
-        return Some(format!("{icon}{cap}%"));
+        return Some(format!("{icon} {cap}%"));
     }
     None
+}
+
+/// Battery-level ramp icon for a plain (not charging/full) capacity
+/// percentage -- an 11-step Nerd Font ramp, matching waybar's own
+/// `battery.format-icons` list.
+fn battery_ramp_icon(cap: u32) -> &'static str {
+    const RAMP: [&str; 11] = [
+        "󰂎", "󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹",
+    ];
+    let idx = ((cap as usize) * (RAMP.len() - 1)) / 100;
+    RAMP[idx.min(RAMP.len() - 1)]
 }
 
 /// CPU package/core temperature in °C, from the first

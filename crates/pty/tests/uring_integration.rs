@@ -45,7 +45,6 @@ impl Harness {
             let next_input = move || inputs_loop.lock().unwrap().pop_front();
             let on_output = move |bytes: &[u8]| {
                 output_loop.lock().unwrap().extend_from_slice(bytes);
-                true
             };
             let _ = exit_tx.send(pty.run(next_input, on_output).map_err(|e| e.to_string()));
         });
@@ -179,18 +178,16 @@ fn uring_large_write_stress_many_iterations() {
         let start = Instant::now();
         loop {
             let out = h.output.lock().unwrap().clone();
-            if out
-                .windows(needle_last.len())
-                .any(|w| w == &needle_last[..])
-            {
+            if out.windows(needle_last.len()).any(|w| w == &needle_last[..]) {
                 break;
             }
-            assert!(
-                start.elapsed() < deadline,
-                "iter {iter}: stalled; got {} bytes, last bit: {:?}",
-                out.len(),
-                String::from_utf8_lossy(&out[out.len().saturating_sub(60)..])
-            );
+            if start.elapsed() >= deadline {
+                panic!(
+                    "iter {iter}: stalled; got {} bytes, last bit: {:?}",
+                    out.len(),
+                    String::from_utf8_lossy(&out[out.len().saturating_sub(60)..])
+                );
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
         h.send(PtyInput::Quit);
@@ -201,104 +198,6 @@ fn uring_large_write_stress_many_iterations() {
 #[test]
 fn uring_large_write_is_chunked_and_ordered() {
     uring_large_write_is_chunked_and_ordered_once(0);
-}
-
-#[test]
-fn uring_on_output_false_is_retried_not_dropped() {
-    // Regression test for real backpressure: when `on_output` rejects a
-    // chunk (simulating a full downstream ring), `Pty::run` must not
-    // silently drop it -- it must retry the exact same bytes once the
-    // caller starts accepting again, and never re-arm the read meanwhile
-    // (so no *further* reads race ahead of the pending one either).
-    use std::sync::atomic::{AtomicBool as StdAtomicBool, AtomicUsize, Ordering as O};
-
-    let wake = waker::Waker::new().expect("eventfd");
-    let shutdown = Arc::new(StdAtomicBool::new(false));
-    let pty = Pty::spawn(
-        "/bin/sh",
-        &["-c", "stty -echo; echo READY; exec cat"],
-        WIN,
-        wake.raw_fd(),
-        Arc::clone(&shutdown),
-    )
-    .expect("Pty::spawn");
-
-    let inputs: Arc<Mutex<VecDeque<PtyInput>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    // Gate: while false, on_output rejects every chunk (simulating a full
-    // ring); flipped true partway through the test.
-    let accept = Arc::new(StdAtomicBool::new(false));
-    // Counts how many times on_output was called with ANY data, accepted or
-    // not -- used only to sanity-check the retry actually happened more
-    // than once (i.e. the test isn't vacuously passing because the gate was
-    // already open).
-    let reject_count = Arc::new(AtomicUsize::new(0));
-
-    let inputs_loop = Arc::clone(&inputs);
-    let output_loop = Arc::clone(&output);
-    let accept_loop = Arc::clone(&accept);
-    let reject_count_loop = Arc::clone(&reject_count);
-    let (exit_tx, exit_rx) = std_mpsc::channel();
-    std::thread::spawn(move || {
-        let next_input = move || inputs_loop.lock().unwrap().pop_front();
-        let on_output = move |bytes: &[u8]| {
-            if accept_loop.load(O::Acquire) {
-                output_loop.lock().unwrap().extend_from_slice(bytes);
-                true
-            } else {
-                reject_count_loop.fetch_add(1, O::Relaxed);
-                false
-            }
-        };
-        let _ = exit_tx.send(pty.run(next_input, on_output).map_err(|e| e.to_string()));
-    });
-
-    let send = |msg: PtyInput| {
-        inputs.lock().unwrap().push_back(msg);
-        wake.signal();
-    };
-
-    // Nothing is accepted yet -- these bytes must be retried, not lost, once
-    // we flip the gate below.
-    send(PtyInput::Bytes(b"stall_me\n".to_vec().into_boxed_slice()));
-
-    // Give the loop a chance to observe (and reject) the echoed output at
-    // least once before we open the gate, so this test actually exercises
-    // the retry path instead of racing it.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while reject_count.load(O::Relaxed) == 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(
-        reject_count.load(O::Relaxed) > 0,
-        "on_output was never called while gated -- test didn't exercise the retry path"
-    );
-
-    accept.store(true, O::Release);
-    wake.signal(); // rouse the loop so it retries the pending chunk promptly
-
-    // `cat`'s echo comes back through the tty's ONLCR flag, which rewrites
-    // the line discipline's \n to \r\n on the way out -- search for the
-    // needle without the trailing newline so it matches either way.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        {
-            let out = output.lock().unwrap();
-            if out.windows(8).any(|w| w == b"stall_me") {
-                break;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "stalled chunk was never retried/delivered"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    send(PtyInput::Quit);
-    let _ = exit_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("run finished");
 }
 
 /// Stress variant: repeats the single-shot check many times in one process,

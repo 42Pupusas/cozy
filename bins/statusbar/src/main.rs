@@ -221,7 +221,11 @@ fn main() {
     // pixel density so it renders crisp on HiDPI, matching
     // `platform::Renderer::with_scale`'s convention.
     let px_size = cfg.bar_font_px_size() * scale as f32;
-    let mut text = TextRenderer::load_with_emoji(cfg.bar_font_path(), cfg.bar_emoji_path(), px_size);
+    let mut text = TextRenderer::load_with_fallbacks(
+        cfg.bar_font_path(),
+        &[cfg.bar_emoji_path(), cfg.bar_icon_path()],
+        px_size,
+    );
 
     let mut modules = Modules::new();
     let bar_height = window.height();

@@ -34,6 +34,7 @@
 //!                                             └──spsc DirtySnapshot──► renderer-thread
 //! ```
 
+mod base64;
 mod cell;
 mod cursor;
 mod dirty;
@@ -264,6 +265,10 @@ pub struct Grid {
     /// handed to the UI thread; the next call only reports the suffix past
     /// this index.
     published_links: usize,
+    /// A decoded OSC 52 clipboard write pending delivery to the UI thread's
+    /// `wl_data_source` publish, if any since the last [`Grid::take_clipboard`].
+    /// One-shot, same pattern as `pending_title`.
+    pending_clipboard: Option<String>,
 }
 
 /// A designated character set slot (G0/G1). Only the two xterm/VT100
@@ -438,6 +443,7 @@ impl Grid {
             link_table: Vec::new(),
             active_link_id: 0,
             published_links: 0,
+            pending_clipboard: None,
         }
     }
 
@@ -1458,13 +1464,41 @@ impl Grid {
         self.pending_title.take()
     }
 
+    /// A decoded OSC 52 clipboard write the application made, if any since
+    /// the last call, clearing it. Polled by the UI thread (same pattern as
+    /// `take_title`) to publish the text via the platform's existing
+    /// `wl_data_source` clipboard machinery.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.pending_clipboard.take()
+    }
+
     fn osc(&mut self, cmd: &OscCmd) {
         match cmd {
             OscCmd::SetTitle(title) => {
                 self.pending_title = Some((*title).to_string());
             }
             OscCmd::Hyperlink { uri } => self.set_active_link(uri),
+            OscCmd::Clipboard { selection, data } => self.set_clipboard(selection, data),
             _ => {}
+        }
+    }
+
+    /// OSC 52 handler: `ESC ] 52 ; <selection> ; <base64> ST`. Only a write to
+    /// the system clipboard (`c`) or the combined primary+clipboard selector
+    /// (`s`) is honoured -- `p`/`q` (primary/secondary X selections) have no
+    /// Wayland equivalent worth modeling, and `data == "?"` (a read-back
+    /// query) is deliberately not answered: echoing arbitrary clipboard
+    /// contents back to *any* program that asks is the exact vector real
+    /// terminals had to walk back after early over-eager OSC 52 support
+    /// turned into a fingerprinting/exfiltration primitive. A blank/invalid
+    /// payload is silently ignored rather than clearing the clipboard --
+    /// matching xterm's own tolerance for malformed OSC 52.
+    fn set_clipboard(&mut self, selection: &str, data: &str) {
+        if data == "?" || !(selection.is_empty() || selection == "c" || selection == "s") {
+            return;
+        }
+        if let Some(text) = base64::decode_to_string(data) {
+            self.pending_clipboard = Some(text);
         }
     }
 

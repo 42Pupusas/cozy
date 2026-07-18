@@ -65,6 +65,11 @@
 //! font_path   = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf" # defaults to [font].path
 //! font_size   = 12                 # points; defaults to [font].size
 //! emoji_path  = "/path/to/emoji-font.ttf" # defaults to [font].emoji_path
+//! icon_path   = "/path/to/NerdFont.ttf"    # optional: fallback face for
+//!                                           # icon glyphs (network/battery/
+//!                                           # volume symbols etc, matching
+//!                                           # waybar's icon set). unset = no
+//!                                           # icon fallback, no icons drawn.
 //! opacity     = 1.0                # defaults to [window].opacity
 //! ```
 
@@ -355,6 +360,13 @@ pub struct BarConfig {
     /// Emoji fallback face override. `None` mirrors `[font].emoji_path`
     /// (which itself may be unset -- see `FontConfig::emoji_path`).
     pub emoji_path: Option<String>,
+    /// Icon fallback face -- typically a Nerd Font, consulted for the
+    /// private-use-area glyphs modules render (network/battery/volume
+    /// icons etc, matching waybar's icon set -- see `statusbar::modules`).
+    /// `None` (the default) means no icon fallback; those codepoints render
+    /// as `.notdef` on `font_path`'s face. No terminal-side setting to
+    /// mirror -- the main terminal has no use for a PUA icon font.
+    pub icon_path: Option<String>,
     /// Background opacity override, `0.0`-`1.0`. `None` mirrors
     /// `[window].opacity`.
     pub opacity: Option<f64>,
@@ -670,6 +682,9 @@ impl Config {
         if let Some(s) = bar.get_str("emoji_path") {
             self.bar.emoji_path = Some(s.to_owned());
         }
+        if let Some(s) = bar.get_str("icon_path") {
+            self.bar.icon_path = Some(s.to_owned());
+        }
         if let Some(n) = bar.get_float_range(
             "opacity",
             "bar.opacity",
@@ -741,6 +756,15 @@ impl Config {
             .emoji_path
             .as_deref()
             .or(self.font.emoji_path.as_deref())
+    }
+
+    /// The status bar's icon fallback face -- typically a Nerd Font,
+    /// consulted for the private-use-area glyphs modules render (see
+    /// `BarConfig::icon_path`). `None` if `[bar].icon_path` isn't set; no
+    /// terminal-side setting to mirror.
+    #[must_use]
+    pub fn bar_icon_path(&self) -> Option<&str> {
+        self.bar.icon_path.as_deref()
     }
 
     /// The status bar's background opacity, `0.0`-`1.0`: `[bar].opacity` if

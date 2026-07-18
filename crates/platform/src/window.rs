@@ -855,6 +855,18 @@ impl TermWindow {
         if text.is_empty() {
             return;
         }
+        self.write_clipboard(text);
+    }
+
+    /// Publish arbitrary `text` to the system clipboard, the same way
+    /// [`Self::copy_selection`] publishes the visual selection. Split out so
+    /// OSC 52 (`ESC ] 52 ; c ; <base64> BEL`, decoded by the caller) can push
+    /// a program-requested clipboard write through the identical
+    /// `wl_data_source` plumbing instead of duplicating it.
+    pub fn write_clipboard(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
         self.clipboard_text = text;
         let Some((mgr, dev)) = self.data_device else {
             return;

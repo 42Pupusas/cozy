@@ -301,6 +301,36 @@ fn ris_clears_the_link_table() {
 }
 
 #[test]
+fn osc52_clipboard_write_decodes_base64_and_is_taken_once() {
+    let mut g = Grid::new(20, 3);
+    assert_eq!(g.take_clipboard(), None);
+    feed(&mut g, b"\x1b]52;c;aGVsbG8=\x07"); // "hello"
+    assert_eq!(g.take_clipboard(), Some("hello".to_string()));
+    assert_eq!(g.take_clipboard(), None, "take_clipboard must clear the pending value");
+}
+
+#[test]
+fn osc52_query_is_not_answered() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]52;c;?\x07");
+    assert_eq!(g.take_clipboard(), None);
+}
+
+#[test]
+fn osc52_primary_selection_is_ignored() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]52;p;aGVsbG8=\x07");
+    assert_eq!(g.take_clipboard(), None);
+}
+
+#[test]
+fn osc52_empty_selector_defaults_to_clipboard() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]52;;aGVsbG8=\x07");
+    assert_eq!(g.take_clipboard(), Some("hello".to_string()));
+}
+
+#[test]
 fn combining_acute_accent_composes_onto_the_previous_letter() {
     let mut g = Grid::new(20, 3);
     feed(&mut g, "e\u{301}".as_bytes()); // 'e' + COMBINING ACUTE ACCENT

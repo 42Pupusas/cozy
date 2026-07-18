@@ -1,4 +1,4 @@
-//! Text segmentation, BiDi metadata, line-breaking, and layout.
+//! Text segmentation, `BiDi` metadata, line-breaking, and layout.
 //!
 //! Pure-Rust port of [`pretext`](https://github.com/chenglou/pretext) by
 //! Cheng Lou, adapted for a native terminal emulator context.
@@ -10,7 +10,7 @@
 //! | `analysis.ts`      | [`analysis`]        | Segmentation; uses our UAX #29     |
 //! | `measurement.ts`   | [`measurement`]     | Width via UAX #11 East Asian Width |
 //! | `line_break.ts`    | [`line_break`]      | Pure arithmetic walk, 1:1 port     |
-//! | `bidi.ts`          | [`bidi`]            | BiDi range tables + state machine  |
+//! | `bidi.ts`          | [`bidi`]            | `BiDi` range tables + state machine  |
 //! | `layout.ts`        | [`layout`]          | Public API tying it all together   |
 //!
 //! ## Terminal vs. browser measurement
@@ -26,7 +26,6 @@
 #![warn(clippy::nursery)]
 #![warn(clippy::perf)]
 #![warn(clippy::style)]
-#![allow(clippy::module_name_repetitions, clippy::doc_markdown)]
 
 pub mod analysis;
 pub mod bidi;

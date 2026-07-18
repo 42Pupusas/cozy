@@ -52,7 +52,7 @@ pub fn battery() -> Option<String> {
             "Full" | "Not charging" if cap_n >= 95 => "󰚥",
             _ => battery_ramp_icon(cap_n),
         };
-        return Some(format!("{icon} {cap:>3}%"));
+        return Some(format!("{cap:>3}% {icon}"));
     }
     None
 }
@@ -61,9 +61,7 @@ pub fn battery() -> Option<String> {
 /// percentage -- an 11-step Nerd Font ramp, matching waybar's own
 /// `battery.format-icons` list.
 fn battery_ramp_icon(cap: u32) -> &'static str {
-    const RAMP: [&str; 11] = [
-        "󰂎", "󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹",
-    ];
+    const RAMP: [&str; 11] = ["󰂎", "󰁺", "󰁻", "󰁼", "󰁽", "󰁾", "󰁿", "󰂀", "󰂁", "󰂂", "󰁹"];
     let idx = ((cap as usize) * (RAMP.len() - 1)) / 100;
     RAMP[idx.min(RAMP.len() - 1)]
 }
@@ -142,7 +140,12 @@ pub fn memory() -> Option<String> {
 }
 
 fn parse_kb(s: &str) -> Option<u64> {
-    s.trim().strip_suffix(" kB").unwrap_or(s.trim()).trim().parse().ok()
+    s.trim()
+        .strip_suffix(" kB")
+        .unwrap_or(s.trim())
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// Connected Wi-Fi SSID + a signal-strength percentage, via `iw`. `None` when

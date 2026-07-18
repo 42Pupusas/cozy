@@ -1,4 +1,3 @@
-#![allow(clippy::missing_const_for_fn)]
 //! CSI / DCS parameter accumulator.
 //!
 //! Stores up to 16 numeric parameters (semicolon-separated), each up to
@@ -39,7 +38,7 @@ impl Params {
     }
 
     /// Reset for a new sequence.
-    pub(crate) fn clear(&mut self) {
+    pub(crate) const fn clear(&mut self) {
         self.buf = [0; MAX_PARAMS];
         self.len = 0;
         self.cur = 0;
@@ -80,7 +79,7 @@ impl Params {
     }
 
     /// Terminate the current parameter and start a new one (`;` separator).
-    pub(crate) fn next_param(&mut self) {
+    pub(crate) const fn next_param(&mut self) {
         if self.cur + 1 < MAX_PARAMS {
             self.cur += 1;
         }
@@ -94,7 +93,7 @@ impl Params {
     /// new slot is flagged so [`Self::is_sub`] can tell `SGR` decoding it's a
     /// colon-joined continuation of the previous slot, not an independent
     /// attribute.
-    pub(crate) fn next_subparam(&mut self) {
+    pub(crate) const fn next_subparam(&mut self) {
         self.next_param();
         if self.cur < MAX_PARAMS {
             self.colon |= 1 << self.cur;
@@ -104,13 +103,13 @@ impl Params {
     /// Whether slot `i` was reached via a `:` separator (a sub-parameter of
     /// slot `i - 1`) rather than `;`.
     #[must_use]
-    pub fn is_sub(&self, i: usize) -> bool {
+    pub const fn is_sub(&self, i: usize) -> bool {
         i < MAX_PARAMS && self.colon & (1 << i) != 0
     }
 
     /// Number of parameters accumulated.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         // len == 0 means no parameters at all.
         // len >= 1 after at least one digit or separator.
         self.len
@@ -118,13 +117,13 @@ impl Params {
 
     /// True when no parameters have been seen.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 
     /// Get parameter `i`, returning `default` if missing or zero.
     #[must_use]
-    pub fn get_or(&self, i: usize, default: u16) -> u16 {
+    pub const fn get_or(&self, i: usize, default: u16) -> u16 {
         if i < self.len && self.buf[i] != 0 {
             self.buf[i]
         } else {
@@ -134,7 +133,7 @@ impl Params {
 
     /// Get parameter `i` raw (0 if missing — use for params where 0 is valid).
     #[must_use]
-    pub fn get_raw(&self, i: usize) -> u16 {
+    pub const fn get_raw(&self, i: usize) -> u16 {
         if i < self.len { self.buf[i] } else { 0 }
     }
 

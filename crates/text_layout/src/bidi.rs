@@ -1,6 +1,6 @@
-//! Simplified Unicode BiDi metadata — port of `bidi.ts` from pretext.
+//! Simplified Unicode `BiDi` metadata — port of `bidi.ts` from pretext.
 //!
-//! We implement the **paragraph-level** BiDi algorithm (Unicode UAX #9 §3.3
+//! We implement the **paragraph-level** `BiDi` algorithm (Unicode UAX #9 §3.3
 //! P1–P3) and per-character strong-type detection.  We do **not** implement
 //! the full Level Run / Isolate / Bracket pairing algorithm — that is not
 //! needed for terminal rendering where the PTY outputs pre-shaped bytes.
@@ -9,7 +9,7 @@
 
 use crate::codepoint::CodePoint;
 
-/// Unicode BiDi character type — simplified to the categories we act on.
+/// Unicode `BiDi` character type — simplified to the categories we act on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum BidiClass {
     /// Strong left-to-right (L).
@@ -31,7 +31,7 @@ pub enum Direction {
 }
 
 impl BidiClass {
-    /// Classify `c`'s BiDi type (P2/P3 strong-type test).
+    /// Classify `c`'s `BiDi` type (P2/P3 strong-type test).
     ///
     /// This used to be written out twice -- once as a `BidiChar::bidi_class`
     /// trait method on `char`, once again as a free `bidi_class(c)` function
@@ -62,7 +62,7 @@ impl BidiClass {
 /// Delegates to [`BidiClass::of`] -- the non-const trait method exists
 /// purely for method-call ergonomics at non-const call sites.
 pub trait BidiChar {
-    /// The BiDi class of `self` (P2/P3 strong-type test).
+    /// The `BiDi` class of `self` (P2/P3 strong-type test).
     fn bidi_class(&self) -> BidiClass;
 }
 

@@ -727,8 +727,9 @@ impl Parser {
     }
 
     fn dispatch_dcs(&self) -> TermEvent<'_> {
-        let data = core::str::from_utf8(&self.dcs_buf[..self.dcs_len])
-            .unwrap_or_else(|e| core::str::from_utf8(&self.dcs_buf[..e.valid_up_to()]).unwrap_or(""));
+        let data = core::str::from_utf8(&self.dcs_buf[..self.dcs_len]).unwrap_or_else(|e| {
+            core::str::from_utf8(&self.dcs_buf[..e.valid_up_to()]).unwrap_or("")
+        });
         if !self.in_dcs {
             // SOS/PM/APC: no request-string convention, always Unknown.
             return TermEvent::Dcs(DcsCmd::Unknown(data));

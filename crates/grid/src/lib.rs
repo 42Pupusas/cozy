@@ -744,7 +744,8 @@ impl Grid {
         // shift. So fold the scroll band back in; the next take_dirty re-emits
         // it (composing with any scroll since), and the renderer shifts then.
         if let Some(b) = snap.scroll_span() {
-            self.pending_repaint.accumulate_scroll(b.top, b.bot, b.delta);
+            self.pending_repaint
+                .accumulate_scroll(b.top, b.bot, b.delta);
         }
         if snap.cursor_changed {
             self.force_cursor_changed = true;
@@ -1650,7 +1651,12 @@ impl Grid {
         let out: Vec<(u32, String)> = self.link_table[start..]
             .iter()
             .enumerate()
-            .map(|(i, uri)| (u32::try_from(start + i + 1).unwrap_or(u32::MAX), uri.clone()))
+            .map(|(i, uri)| {
+                (
+                    u32::try_from(start + i + 1).unwrap_or(u32::MAX),
+                    uri.clone(),
+                )
+            })
             .collect();
         self.published_links = self.link_table.len();
         out

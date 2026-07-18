@@ -1,11 +1,6 @@
 //! Coverage for `Grid::apply_sgr` (CSI `m`) — every attribute on/off toggle,
 //! every color mode, and the multi-attribute-in-one-sequence path.
 
-// Test bodies convert small, already-range-checked SGR param deltas (e.g.
-// `n - 30` for a loop over `n in 30..=37`) into `u8` color indices --
-// genuinely always in range, so the pedantic truncation lint is noise here.
-#![allow(clippy::cast_possible_truncation)]
-
 use grid::{Color, Grid, UnderlineStyle};
 use vt_parser::Parser;
 
@@ -163,7 +158,11 @@ fn fg_standard_color_0_through_7() {
     for n in 30u16..=37 {
         let seq = format!("\x1b[{n}m");
         let a = attrs_after(seq.as_bytes());
-        assert_eq!(a.fg, Color::Indexed((n - 30) as u8), "code {n}");
+        assert_eq!(
+            a.fg,
+            Color::Indexed(u8::try_from(n - 30).unwrap()),
+            "code {n}"
+        );
     }
 }
 
@@ -172,7 +171,11 @@ fn bg_standard_color_0_through_7() {
     for n in 40u16..=47 {
         let seq = format!("\x1b[{n}m");
         let a = attrs_after(seq.as_bytes());
-        assert_eq!(a.bg, Color::Indexed((n - 40) as u8), "code {n}");
+        assert_eq!(
+            a.bg,
+            Color::Indexed(u8::try_from(n - 40).unwrap()),
+            "code {n}"
+        );
     }
 }
 
@@ -181,7 +184,11 @@ fn fg_bright_color_90_through_97_offsets_by_8() {
     for n in 90u16..=97 {
         let seq = format!("\x1b[{n}m");
         let a = attrs_after(seq.as_bytes());
-        assert_eq!(a.fg, Color::Indexed((n - 90 + 8) as u8), "code {n}");
+        assert_eq!(
+            a.fg,
+            Color::Indexed(u8::try_from(n - 90 + 8).unwrap()),
+            "code {n}"
+        );
     }
 }
 
@@ -190,7 +197,11 @@ fn bg_bright_color_100_through_107_offsets_by_8() {
     for n in 100u16..=107 {
         let seq = format!("\x1b[{n}m");
         let a = attrs_after(seq.as_bytes());
-        assert_eq!(a.bg, Color::Indexed((n - 100 + 8) as u8), "code {n}");
+        assert_eq!(
+            a.bg,
+            Color::Indexed(u8::try_from(n - 100 + 8).unwrap()),
+            "code {n}"
+        );
     }
 }
 

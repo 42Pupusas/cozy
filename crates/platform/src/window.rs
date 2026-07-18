@@ -834,9 +834,8 @@ impl TermWindow {
     fn update_hover_link(&mut self, col: u16, row: u16) {
         // XKB modifier index 2 (bit 0x04) is Ctrl -- same bit `press_left`'s
         // shift check above reads for its own index (0x01).
-        let ctrl = (self.modifiers.depressed | self.modifiers.latched | self.modifiers.locked)
-            & 0x04
-            != 0;
+        let ctrl =
+            (self.modifiers.depressed | self.modifiers.latched | self.modifiers.locked) & 0x04 != 0;
         let new = if ctrl { self.link_id_at(col, row) } else { 0 };
         if new != self.hover_link_id {
             self.hover_link_id = new;
@@ -1067,7 +1066,8 @@ impl TermWindow {
             return;
         }
         self.autoscroll_last = Some(now);
-        self.input_queue.push_back(InputEvent::Scroll { lines: dir });
+        self.input_queue
+            .push_back(InputEvent::Scroll { lines: dir });
         let (cc, cr) = self.pointer_cell();
         if self.selection.drag_to((cc, i32::from(cr))) {
             self.dirty = true;
@@ -1139,9 +1139,8 @@ impl TermWindow {
     /// (see [`Self::bell`]) knows what to restore afterward.
     pub fn set_title(&mut self, title: &str) {
         self.base_title = title.to_string();
-        self.window_tx.request(
-            MessageBuilder::new(self.toplevel, ToplevelRequest::SetTitle).string(title),
-        );
+        self.window_tx
+            .request(MessageBuilder::new(self.toplevel, ToplevelRequest::SetTitle).string(title));
     }
 
     /// BEL (C0 0x07): visual bell. xdg-shell's core protocol has no
@@ -1387,7 +1386,8 @@ impl TermWindow {
                                 PointerButton::Right => MouseButton::Right,
                                 PointerButton::Middle => MouseButton::Middle,
                             };
-                            self.mouse_pressed = matches!(state, ButtonState::Pressed).then_some(mb);
+                            self.mouse_pressed =
+                                matches!(state, ButtonState::Pressed).then_some(mb);
                             self.input_queue.push_back(InputEvent::Mouse {
                                 button: mb,
                                 kind: if matches!(state, ButtonState::Pressed) {

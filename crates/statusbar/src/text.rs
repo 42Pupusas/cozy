@@ -68,7 +68,11 @@ impl TextRenderer {
     /// `path` is `None` or fails to load; a bad or missing fallback path
     /// just means one less fallback (also diagnosed), not a hard failure.
     #[must_use]
-    pub fn load_with_fallbacks(path: Option<&str>, fallback_paths: &[Option<&str>], px_size: f32) -> Self {
+    pub fn load_with_fallbacks(
+        path: Option<&str>,
+        fallback_paths: &[Option<&str>],
+        px_size: f32,
+    ) -> Self {
         let Some(path) = path else {
             return Self::Bitmap;
         };
@@ -151,7 +155,15 @@ impl TextRenderer {
     /// row (face font) at `(x, y)`, over an already-painted `bg` (needed for
     /// anti-aliased edge blending on the face path -- the bitmap path
     /// ignores it, being 1-bit). Returns the x just past the last glyph.
-    pub fn draw_text(&mut self, canvas: &mut Canvas, text: &str, x: i32, y: i32, fg: Color, bg: Color) -> i32 {
+    pub fn draw_text(
+        &mut self,
+        canvas: &mut Canvas,
+        text: &str,
+        x: i32,
+        y: i32,
+        fg: Color,
+        bg: Color,
+    ) -> i32 {
         self.draw_text_alpha(canvas, text, x, y, fg, bg, 255)
     }
 

@@ -108,7 +108,11 @@ fn main() {
 
     let cell_w = renderer.cell_w();
     let cell_h = renderer.cell_h();
-    let cols = ROWS.iter().map(|r| r.text.chars().count()).max().unwrap_or(1) as i32;
+    let cols = ROWS
+        .iter()
+        .map(|r| r.text.chars().count())
+        .max()
+        .unwrap_or(1) as i32;
     let rows = ROWS.len() as i32;
     let bw = (cols * cell_w).max(1);
     let bh = (rows * cell_h).max(1);

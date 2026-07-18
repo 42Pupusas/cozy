@@ -89,7 +89,9 @@ impl Channel {
     }
 
     fn from_name(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|c| c.name().eq_ignore_ascii_case(s))
+        Self::ALL
+            .into_iter()
+            .find(|c| c.name().eq_ignore_ascii_case(s))
     }
 }
 

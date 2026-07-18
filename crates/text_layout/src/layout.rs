@@ -1,6 +1,6 @@
 //! Public layout API — port of `layout.ts` from pretext.
 //!
-//! Ties segmentation, measurement, BiDi detection, and line-breaking together
+//! Ties segmentation, measurement, `BiDi` detection, and line-breaking together
 //! into a single `Layouter::layout` call that returns a `Vec<LayoutLine>`.
 
 use crate::analysis::Segmenter;

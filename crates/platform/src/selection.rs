@@ -14,8 +14,6 @@
 //! keeps the selection logically glued to its text (scroll back down and it's
 //! still selected). Consumers clamp to the visible range before drawing.
 
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-
 /// A `(col, row)` selection endpoint; `row` is a signed viewport row.
 type Endpoint = (u16, i32);
 
@@ -468,7 +466,7 @@ mod tests {
         // Two lines of new output push the text up by two rows.
         sel.ingest_snapshot(&incremental(vec![], 2));
         // The selection followed its text into scrollback (now row -1).
-        assert_eq!(sel.range().unwrap().0 .1, -1);
+        assert_eq!(sel.range().unwrap().0.1, -1);
         // Still glued to its text; the row is off-screen so no visible rows.
         assert!(sel.visible_rows(24).is_empty());
     }
@@ -480,7 +478,7 @@ mod tests {
         sel.drag_to((5, 0));
         // Wheel-scroll up into history by 3 lines: text appears to move down.
         sel.ingest_snapshot(&viewport(vec![], 3, 0));
-        assert_eq!(sel.range().unwrap().0 .1, 3);
+        assert_eq!(sel.range().unwrap().0.1, 3);
     }
 
     #[test]
@@ -504,8 +502,16 @@ mod tests {
         // find the cell it's over.
         let mut sel = SelectionTracker::new();
         let cells = vec![
-            Cell { ch: 'a', link_id: 0, ..Cell::default() },
-            Cell { ch: 'b', link_id: 7, ..Cell::default() },
+            Cell {
+                ch: 'a',
+                link_id: 0,
+                ..Cell::default()
+            },
+            Cell {
+                ch: 'b',
+                link_id: 7,
+                ..Cell::default()
+            },
         ];
         sel.ingest_snapshot(&incremental(vec![DirtyRow { row: 0, cells }], 0));
         assert_eq!(sel.mirror()[0][0].link_id, 0);

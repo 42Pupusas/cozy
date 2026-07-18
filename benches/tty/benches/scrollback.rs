@@ -80,19 +80,17 @@ fn primed_grid() -> Grid {
 #[divan::bench]
 fn snapshot_only(bencher: divan::Bencher) {
     let grid = RefCell::new(primed_grid());
-    bencher
-        .counter(ItemsCount::new(1usize))
-        .bench_local(|| {
-            let mut g = grid.borrow_mut();
-            // One line per frame, the smallest (worst-case-frequency) wheel
-            // step. Reset to a mid-history offset when we near the top so we
-            // never clamp (which would emit a no-op frame and skew the mean).
-            if g.viewport_offset() >= SCROLLBACK_LINES - 8 {
-                g.scroll_viewport(-((SCROLLBACK_LINES / 2) as i32));
-            }
-            g.scroll_viewport(1);
-            divan::black_box(g.take_dirty());
-        });
+    bencher.counter(ItemsCount::new(1usize)).bench_local(|| {
+        let mut g = grid.borrow_mut();
+        // One line per frame, the smallest (worst-case-frequency) wheel
+        // step. Reset to a mid-history offset when we near the top so we
+        // never clamp (which would emit a no-op frame and skew the mean).
+        if g.viewport_offset() >= SCROLLBACK_LINES - 8 {
+            g.scroll_viewport(-((SCROLLBACK_LINES / 2) as i32));
+        }
+        g.scroll_viewport(1);
+        divan::black_box(g.take_dirty());
+    });
 }
 
 /// Renderer work only: blit a pre-built one-step scroll frame repeatedly.
@@ -112,12 +110,10 @@ fn blit_only(bencher: divan::Bencher) {
     grid.scroll_viewport(1);
     let snap = grid.take_dirty();
 
-    bencher
-        .counter(ItemsCount::new(1usize))
-        .bench_local(|| {
-            let mut canvas = Canvas::new(&mut backbuffer, bw as i32, bh as i32);
-            renderer.blit_snapshot(&mut canvas, divan::black_box(&snap));
-        });
+    bencher.counter(ItemsCount::new(1usize)).bench_local(|| {
+        let mut canvas = Canvas::new(&mut backbuffer, bw as i32, bh as i32);
+        renderer.blit_snapshot(&mut canvas, divan::black_box(&snap));
+    });
 }
 
 /// Honest end-to-end per-frame present cost: wheel one step, snapshot, blit.
@@ -131,17 +127,15 @@ fn present_cycle(bencher: divan::Bencher) {
     let bh = ROWS as usize * cell_h;
     let backbuffer = RefCell::new(vec![0u32; bw * bh]);
 
-    bencher
-        .counter(ItemsCount::new(1usize))
-        .bench_local(|| {
-            let mut g = grid.borrow_mut();
-            if g.viewport_offset() >= SCROLLBACK_LINES - 8 {
-                g.scroll_viewport(-((SCROLLBACK_LINES / 2) as i32));
-            }
-            g.scroll_viewport(1);
-            let snap: DirtySnapshot = g.take_dirty();
-            let mut bb = backbuffer.borrow_mut();
-            let mut canvas = Canvas::new(&mut bb, bw as i32, bh as i32);
-            renderer.blit_snapshot(&mut canvas, divan::black_box(&snap));
-        });
+    bencher.counter(ItemsCount::new(1usize)).bench_local(|| {
+        let mut g = grid.borrow_mut();
+        if g.viewport_offset() >= SCROLLBACK_LINES - 8 {
+            g.scroll_viewport(-((SCROLLBACK_LINES / 2) as i32));
+        }
+        g.scroll_viewport(1);
+        let snap: DirtySnapshot = g.take_dirty();
+        let mut bb = backbuffer.borrow_mut();
+        let mut canvas = Canvas::new(&mut bb, bw as i32, bh as i32);
+        renderer.blit_snapshot(&mut canvas, divan::black_box(&snap));
+    });
 }

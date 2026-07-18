@@ -1,4 +1,3 @@
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 //! Software terminal renderer: blit grid cells into a `u32` pixel buffer.
 //!
 //! Two glyph sources are supported, chosen at startup by [`Renderer::new`]:
@@ -390,6 +389,9 @@ impl Renderer {
     /// resampling; `cell_w`/`cell_h` here come out already in physical
     /// pixels so the window-sizing math downstream doesn't need to know
     /// about scale at all.
+    // output_scale is a small integer scale factor (1, 2, 3...) -- always
+    // exactly representable as f32, no precision loss possible.
+    #[allow(clippy::cast_precision_loss)]
     #[must_use]
     pub fn with_scale(theme: Theme, font_cfg: &config::FontConfig, output_scale: i32) -> Self {
         let output_scale = output_scale.max(1);
@@ -649,7 +651,14 @@ impl Renderer {
     /// cell's vertical middle, in the glyph's own (already-resolved)
     /// foreground. `wide` extends it across both columns of a wide glyph's
     /// cell pair, matching how the glyph itself spans them.
-    fn draw_strikethrough(&self, canvas: &mut Canvas<'_>, cx: u16, cy: u16, wide: bool, fg: DrawColor) {
+    fn draw_strikethrough(
+        &self,
+        canvas: &mut Canvas<'_>,
+        cx: u16,
+        cy: u16,
+        wide: bool,
+        fg: DrawColor,
+    ) {
         let px = if self.bg_alpha == 255 {
             fg.to_xrgb8888()
         } else {
@@ -926,8 +935,7 @@ impl Renderer {
         // `[col_lo, col_hi)` is a per-glyph constant. Same for rows via
         // `glyph_y0`. Empty span => nothing on screen.
         let col_lo = (-glyph_x0).max(0) as u32;
-        let col_hi = (i64::from(buf_width) - glyph_x0)
-            .clamp(0, i64::from(entry.width)) as u32;
+        let col_hi = (i64::from(buf_width) - glyph_x0).clamp(0, i64::from(entry.width)) as u32;
         let row_lo = (-glyph_y0).max(0) as u32;
         let row_hi = (buf_h - glyph_y0).clamp(0, i64::from(entry.height)) as u32;
         if col_lo >= col_hi {
@@ -1149,6 +1157,9 @@ impl Renderer {
     /// there rather than overwriting it, so the glyph underneath stays
     /// legible through a translucent or mid-fade cursor (matching
     /// Ghostty/WezTerm's default look).
+    // cell_w/cell_h/buf_w/buf_h are pixel dimensions, always far below the
+    // 2^24 exact-integer range of f32 -- no precision loss possible.
+    #[allow(clippy::cast_precision_loss)]
     pub fn draw_cursor(
         &self,
         canvas: &mut Canvas<'_>,
@@ -1230,6 +1241,9 @@ impl Renderer {
     /// (`0.0` = just landed, `1.0` = fully gone) advances. Used after a long
     /// cursor jump (e.g. a multi-line paste) settles, to draw the eye to
     /// where the cursor ended up.
+    // Same rationale as `draw_cursor`: cell/buffer pixel dimensions never
+    // approach f32's 2^24 exact-integer limit.
+    #[allow(clippy::cast_precision_loss)]
     pub fn draw_cursor_pulse(
         &self,
         canvas: &mut Canvas<'_>,
@@ -1342,11 +1356,17 @@ mod tests {
             link_id: 0,
         };
         renderer.blit_cell(&mut canvas, 0, 0, &c);
-        let fg_px = renderer.theme.resolve(Color::Default, DrawColor::rgb(0xcc, 0xcc, 0xcc)).to_xrgb8888();
+        let fg_px = renderer
+            .theme
+            .resolve(Color::Default, DrawColor::rgb(0xcc, 0xcc, 0xcc))
+            .to_xrgb8888();
         let y = (renderer.cell_h - 1) as usize;
         let row_start = y * renderer.cell_w as usize;
         let row = &buf[row_start..row_start + renderer.cell_w as usize];
-        assert!(row.iter().all(|&p| p == fg_px), "bottom row must be solid underline color");
+        assert!(
+            row.iter().all(|&p| p == fg_px),
+            "bottom row must be solid underline color"
+        );
     }
 
     #[test]
@@ -1386,11 +1406,17 @@ mod tests {
             link_id: 0,
         };
         renderer.blit_cell(&mut canvas, 0, 0, &c);
-        let fg_px = renderer.theme.resolve(Color::Default, DrawColor::rgb(0xcc, 0xcc, 0xcc)).to_xrgb8888();
+        let fg_px = renderer
+            .theme
+            .resolve(Color::Default, DrawColor::rgb(0xcc, 0xcc, 0xcc))
+            .to_xrgb8888();
         let y = (renderer.cell_h / 2) as usize;
         let row_start = y * renderer.cell_w as usize;
         let row = &buf[row_start..row_start + renderer.cell_w as usize];
-        assert!(row.iter().all(|&p| p == fg_px), "middle row must be solid strikethrough color");
+        assert!(
+            row.iter().all(|&p| p == fg_px),
+            "middle row must be solid strikethrough color"
+        );
     }
 
     #[test]
@@ -1449,7 +1475,10 @@ mod tests {
             r.blit_row(&mut canvas, 0, &cells);
         }
 
-        assert_eq!(batched, reference, "batched blit_row diverged from per-cell");
+        assert_eq!(
+            batched, reference,
+            "batched blit_row diverged from per-cell"
+        );
     }
 
     #[test]
@@ -1764,7 +1793,10 @@ mod tests {
             assert_eq!(r.blit_snapshot(&mut canvas, &snap), None);
         }
 
-        assert_eq!(fast, reference, "viewport up-scroll shift diverged from full repaint");
+        assert_eq!(
+            fast, reference,
+            "viewport up-scroll shift diverged from full repaint"
+        );
     }
 
     #[test]
@@ -1805,7 +1837,10 @@ mod tests {
             r.blit_snapshot(&mut canvas, &snap);
         }
 
-        assert_eq!(fast, reference, "viewport down-scroll shift diverged from full repaint");
+        assert_eq!(
+            fast, reference,
+            "viewport down-scroll shift diverged from full repaint"
+        );
     }
 
     #[test]
@@ -1821,7 +1856,10 @@ mod tests {
         let snap = viewport_snap(cols, rows, 20, 20, None);
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
         assert_eq!(r.blit_snapshot(&mut canvas, &snap), None);
-        assert!(pixels.iter().any(|&p| p != 0), "full repaint painted nothing");
+        assert!(
+            pixels.iter().any(|&p| p != 0),
+            "full repaint painted nothing"
+        );
     }
 
     #[test]
@@ -2026,6 +2064,8 @@ mod tests {
         assert_eq!(r.bg_packed(), r.bg_xrgb());
     }
 
+    // cols/rows are tiny test fixture values, nowhere near f32's precision limit.
+    #[allow(clippy::cast_precision_loss)]
     #[test]
     fn cursor_pulse_does_not_paint_past_the_grid_aligned_area() {
         // A buffer size that is NOT an exact multiple of the cell size --
@@ -2206,8 +2246,7 @@ mod tests {
             assert_eq!(
                 renderer.last_rasterized_rows, 1,
                 "step {step}: only the one revealed edge row may be rasterized, \
-                 not the whole screen ({} rows)",
-                rows
+                 not the whole screen ({rows} rows)"
             );
         }
     }

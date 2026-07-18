@@ -454,8 +454,7 @@ mod tests {
         for from in [0u8, 1, 63, 127, 128, 200, 254, 255] {
             for to in [0u8, 1, 63, 127, 128, 200, 254, 255] {
                 for a in 0u32..=255 {
-                    let num =
-                        u32::from(from) * (255 - a) + u32::from(to) * a;
+                    let num = u32::from(from) * (255 - a) + u32::from(to) * a;
                     let packed = Color::rgb(from, from, from)
                         .blend_opaque_to(Color::rgb(to, to, to), a as u8);
                     let ch = packed & 0xff;

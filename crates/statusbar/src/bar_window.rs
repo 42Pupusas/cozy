@@ -225,8 +225,7 @@ impl BarWindow {
                 .i32(height),
         )?;
         sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetExclusiveZone)
-                .i32(height),
+            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetExclusiveZone).i32(height),
         )?;
         sender.request(
             MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetMargin)
@@ -236,11 +235,8 @@ impl BarWindow {
                 .i32(0),
         )?;
         sender.request(
-            MessageBuilder::new(
-                layer_surface,
-                LayerSurfaceRequest::SetKeyboardInteractivity,
-            )
-            .u32(KeyboardInteractivity::None as u32),
+            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetKeyboardInteractivity)
+                .u32(KeyboardInteractivity::None as u32),
         )?;
         // First commit carries no buffer -- this is what solicits the initial
         // `configure`, which tells us the real (output-width) pixel size.

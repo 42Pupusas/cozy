@@ -1,4 +1,3 @@
-#![allow(clippy::missing_const_for_fn, clippy::manual_range_patterns)]
 //! Terminal event types emitted by the parser.
 
 use crate::params::Params;
@@ -30,13 +29,13 @@ pub enum C0 {
 }
 
 impl C0 {
-    pub(crate) fn from_byte(b: u8) -> Self {
+    pub(crate) const fn from_byte(b: u8) -> Self {
         match b {
             0x00 => Self::Null,
             0x07 => Self::Bell,
             0x08 => Self::Backspace,
             0x09 => Self::Tab,
-            0x0A | 0x0B | 0x0C => Self::LineFeed,
+            0x0A..=0x0C => Self::LineFeed,
             0x0D => Self::CarriageReturn,
             0x0E => Self::ShiftOut,
             0x0F => Self::ShiftIn,
@@ -112,7 +111,7 @@ impl SgrAttrs {
         len: 0,
     };
 
-    pub(crate) fn push(&mut self, attr: SgrAttr) {
+    pub(crate) const fn push(&mut self, attr: SgrAttr) {
         if self.len < MAX_SGR_ATTRS {
             self.buf[self.len] = attr;
             self.len += 1;

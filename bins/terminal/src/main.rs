@@ -26,8 +26,6 @@
 //! free-list recycle ring.
 //! Config is loaded from `$XDG_CONFIG_HOME/terminal/config.toml` at startup.
 
-#![allow(clippy::cast_possible_truncation)]
-
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
@@ -712,10 +710,8 @@ impl ParserSession {
             // Publish the rest of the negotiated terminal modes (mouse
             // tracking/SGR, keyboard protocol, app-cursor/keypad, focus
             // events) for the UI thread's `Encoder`.
-            self.term_modes.store(
-                TermModes::from_grid(&self.grid).pack(),
-                Ordering::Relaxed,
-            );
+            self.term_modes
+                .store(TermModes::from_grid(&self.grid).pack(), Ordering::Relaxed);
 
             // Drain one-shot bell/title events into the shared queue for
             // the UI thread. Unlike the level-triggered state above, these
@@ -731,7 +727,10 @@ impl ParserSession {
                 self.ui_events.lock().unwrap().push(UiEvent::Link(id, uri));
             }
             if let Some(text) = self.grid.take_clipboard() {
-                self.ui_events.lock().unwrap().push(UiEvent::Clipboard(text));
+                self.ui_events
+                    .lock()
+                    .unwrap()
+                    .push(UiEvent::Clipboard(text));
             }
 
             self.publish();
@@ -1008,7 +1007,9 @@ impl UiWorker<'_> {
                                 == MouseMode::Off
                         {
                             let link_id = win.link_id_at(col, row);
-                            if link_id != 0 && let Some(uri) = links.get(&link_id) {
+                            if link_id != 0
+                                && let Some(uri) = links.get(&link_id)
+                            {
                                 let _ = std::process::Command::new("xdg-open").arg(uri).spawn();
                                 continue;
                             }
@@ -1019,9 +1020,7 @@ impl UiWorker<'_> {
                                 platform::window::MouseButton::Middle => MouseButton::Middle,
                                 platform::window::MouseButton::Right => MouseButton::Right,
                                 platform::window::MouseButton::WheelUp => MouseButton::WheelUp,
-                                platform::window::MouseButton::WheelDown => {
-                                    MouseButton::WheelDown
-                                }
+                                platform::window::MouseButton::WheelDown => MouseButton::WheelDown,
                                 platform::window::MouseButton::None => MouseButton::None,
                             },
                             state: match kind {
@@ -1197,7 +1196,8 @@ mod live_reload_tests {
     /// event header size/layout, name padding/NUL-trimming -- not a mock.
     #[test]
     fn detects_a_save_to_the_watched_file() {
-        let dir = std::env::temp_dir().join(format!("terminal-live-reload-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("terminal-live-reload-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("config.toml");
         std::fs::write(&file, "initial").unwrap();

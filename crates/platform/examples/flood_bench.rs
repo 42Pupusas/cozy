@@ -96,7 +96,9 @@ fn main() {
     // Optional `font=/path/to.ttf` arg selects the real TTF Face path
     // (blit_cell_face) instead of the embedded Bitmap fallback -- this is the
     // code the live app actually runs, and the only way this bench touches it.
-    let font_path = args.iter().find_map(|a| a.strip_prefix("font=").map(String::from));
+    let font_path = args
+        .iter()
+        .find_map(|a| a.strip_prefix("font=").map(String::from));
     let mut renderer = font_path.as_ref().map_or_else(
         || Renderer::builtin(Theme::builtin()),
         |path| {
@@ -110,7 +112,11 @@ fn main() {
     );
     eprintln!(
         "renderer: {} ({}x{} cell)",
-        if font_path.is_some() { "FACE/ttf" } else { "BITMAP" },
+        if font_path.is_some() {
+            "FACE/ttf"
+        } else {
+            "BITMAP"
+        },
         renderer.cell_w(),
         renderer.cell_h()
     );

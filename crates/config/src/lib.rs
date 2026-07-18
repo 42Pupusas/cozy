@@ -73,8 +73,6 @@
 //! opacity     = 1.0                # defaults to [window].opacity
 //! ```
 
-#![allow(clippy::doc_markdown)]
-
 mod color;
 mod extract;
 mod tests;
@@ -235,7 +233,7 @@ pub struct FontConfig {
     /// face lacks render as `.notdef` (tofu), same as before emoji fallback
     /// support existed. There is no bundled/embedded emoji font -- point
     /// this at a real one (e.g. Noto Emoji, Noto Color Emoji if/when color
-    /// glyphs are supported, OpenMoji, …) to get emoji rendering.
+    /// glyphs are supported, `OpenMoji`, …) to get emoji rendering.
     pub emoji_path: Option<String>,
 }
 
@@ -659,13 +657,9 @@ impl Config {
                 reason: "invalid #rrggbb hex color",
             })?);
         }
-        if let Some(n) = bar.get_int_range(
-            "height",
-            "bar.height",
-            1,
-            512,
-            "must be between 1 and 512",
-        )? {
+        if let Some(n) =
+            bar.get_int_range("height", "bar.height", 1, 512, "must be between 1 and 512")?
+        {
             self.bar.height = Some(u32::try_from(n).unwrap_or(28));
         }
         if let Some(s) = bar.get_str("font_path") {
@@ -727,10 +721,7 @@ impl Config {
     /// embedded bitmap font -- same fallback the terminal uses).
     #[must_use]
     pub fn bar_font_path(&self) -> Option<&str> {
-        self.bar
-            .font_path
-            .as_deref()
-            .or(self.font.path.as_deref())
+        self.bar.font_path.as_deref().or(self.font.path.as_deref())
     }
 
     /// The status bar's font point size: `[bar].font_size` if set, otherwise

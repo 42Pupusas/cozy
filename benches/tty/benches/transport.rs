@@ -31,8 +31,8 @@
 //!   cargo bench -p tty-benches --bench transport
 //!   cargo bench -p tty-benches --bench transport -- --timer tsc
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use divan::counter::{BytesCount, ItemsCount};
 use grid::Grid;
@@ -111,8 +111,7 @@ fn consume_with(parser: &mut Parser, grid: &mut Grid, bytes: &[u8]) -> u64 {
 // ── OLD: PtyChunk data ring + chunk_free recycle ring ───────────────────────
 
 fn run_old(throttle: bool) -> u64 {
-    let (data_tx, mut data_rx) =
-        RingBuffer::<PtyChunk>::new(Capacity::exact(RING_CAP)).split();
+    let (data_tx, mut data_rx) = RingBuffer::<PtyChunk>::new(Capacity::exact(RING_CAP)).split();
     let (free_tx, mut free_rx) =
         RingBuffer::<Box<[u8; PTY_BUF]>>::new(Capacity::exact(RING_CAP * 2)).split();
     let done = Arc::new(AtomicBool::new(false));
@@ -124,7 +123,11 @@ fn run_old(throttle: bool) -> u64 {
         let mut acc = 0u64;
         loop {
             if let Some(chunk) = data_rx.pop() {
-                acc = acc.wrapping_add(consume_with(&mut parser, &mut grid, &chunk.buf[..chunk.len]));
+                acc = acc.wrapping_add(consume_with(
+                    &mut parser,
+                    &mut grid,
+                    &chunk.buf[..chunk.len],
+                ));
                 // Return the spent buffer for the producer to recycle.
                 let _ = free_tx.push(chunk.buf);
                 if throttle {
@@ -233,9 +236,15 @@ fn run_new(throttle: bool) -> u64 {
 // production `ParserMsg::Data`); boxing it would defeat the measurement.
 #[allow(clippy::large_enum_variant)]
 enum Msg {
-    Data { buf: [u8; PTY_BUF], len: usize },
+    Data {
+        buf: [u8; PTY_BUF],
+        len: usize,
+    },
     #[allow(dead_code)]
-    Resize { cols: u16, rows: u16 },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
 }
 
 fn run_inline(throttle: bool) -> u64 {

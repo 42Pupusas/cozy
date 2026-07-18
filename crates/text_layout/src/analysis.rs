@@ -184,7 +184,7 @@ trait CharExt {
     /// True if this char is a CJK / wide ideograph (each is an independent
     /// break point).
     fn is_cjk(&self) -> bool;
-    /// The [`Direction`] this char's strong BiDi class implies.
+    /// The [`Direction`] this char's strong `BiDi` class implies.
     fn bidi_dir(&self) -> Direction;
 }
 

@@ -257,14 +257,21 @@ fn osc_title_is_captured_and_take_clears_it() {
     assert_eq!(g.take_title(), None);
     feed(&mut g, b"\x1b]0;hello world\x07");
     assert_eq!(g.take_title(), Some("hello world".to_string()));
-    assert_eq!(g.take_title(), None, "take_title must clear the pending value");
+    assert_eq!(
+        g.take_title(),
+        None,
+        "take_title must clear the pending value"
+    );
 }
 
 #[test]
 fn osc8_hyperlink_stamps_cells_with_a_link_id_resolvable_to_its_uri() {
     let mut g = Grid::new(20, 3);
     assert_eq!(g.screen().get_cell(0, 0).link_id, 0);
-    feed(&mut g, b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07plain");
+    feed(
+        &mut g,
+        b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07plain",
+    );
     let linked = g.screen().get_cell(0, 0);
     assert_ne!(linked.link_id, 0);
     assert_eq!(g.link_uri(linked.link_id), Some("https://example.com"));
@@ -280,7 +287,10 @@ fn osc8_repeated_same_uri_reuses_the_link_id() {
     let id1 = g.screen().get_cell(0, 0).link_id;
     feed(&mut g, b"\x1b]8;;https://a\x07b\x1b]8;;\x07");
     let id2 = g.screen().get_cell(1, 0).link_id;
-    assert_eq!(id1, id2, "re-opening the same URI right after closing it should reuse the id");
+    assert_eq!(
+        id1, id2,
+        "re-opening the same URI right after closing it should reuse the id"
+    );
 }
 
 #[test]
@@ -306,7 +316,11 @@ fn osc52_clipboard_write_decodes_base64_and_is_taken_once() {
     assert_eq!(g.take_clipboard(), None);
     feed(&mut g, b"\x1b]52;c;aGVsbG8=\x07"); // "hello"
     assert_eq!(g.take_clipboard(), Some("hello".to_string()));
-    assert_eq!(g.take_clipboard(), None, "take_clipboard must clear the pending value");
+    assert_eq!(
+        g.take_clipboard(),
+        None,
+        "take_clipboard must clear the pending value"
+    );
 }
 
 #[test]
@@ -333,7 +347,10 @@ fn osc52_empty_selector_defaults_to_clipboard() {
 #[test]
 fn osc10_query_replies_with_configured_foreground() {
     let mut g = Grid::new(20, 3);
-    g.set_default_colors(grid::Color::Rgb(0xaa, 0xbb, 0xcc), grid::Color::Rgb(0x11, 0x22, 0x33));
+    g.set_default_colors(
+        grid::Color::Rgb(0xaa, 0xbb, 0xcc),
+        grid::Color::Rgb(0x11, 0x22, 0x33),
+    );
     feed(&mut g, b"\x1b]10;?\x07");
     let replies = g.take_replies();
     assert_eq!(replies, b"\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\");
@@ -342,7 +359,10 @@ fn osc10_query_replies_with_configured_foreground() {
 #[test]
 fn osc11_query_replies_with_configured_background() {
     let mut g = Grid::new(20, 3);
-    g.set_default_colors(grid::Color::Rgb(0xaa, 0xbb, 0xcc), grid::Color::Rgb(0x11, 0x22, 0x33));
+    g.set_default_colors(
+        grid::Color::Rgb(0xaa, 0xbb, 0xcc),
+        grid::Color::Rgb(0x11, 0x22, 0x33),
+    );
     feed(&mut g, b"\x1b]11;?\x07");
     let replies = g.take_replies();
     assert_eq!(replies, b"\x1b]11;rgb:1111/2222/3333\x1b\\");
@@ -360,7 +380,10 @@ fn osc10_defaults_are_sane_without_set_default_colors() {
     let mut g = Grid::new(20, 3);
     feed(&mut g, b"\x1b]10;?\x07");
     let replies = g.take_replies();
-    assert!(!replies.is_empty(), "must reply even with no explicit theme set");
+    assert!(
+        !replies.is_empty(),
+        "must reply even with no explicit theme set"
+    );
 }
 
 #[test]
@@ -368,14 +391,22 @@ fn combining_acute_accent_composes_onto_the_previous_letter() {
     let mut g = Grid::new(20, 3);
     feed(&mut g, "e\u{301}".as_bytes()); // 'e' + COMBINING ACUTE ACCENT
     assert_eq!(g.screen().get_cell(0, 0).ch, '\u{e9}'); // precomposed 'e' with acute
-    assert_eq!(g.cursor(), (1, 0), "combining mark must not advance the cursor");
+    assert_eq!(
+        g.cursor(),
+        (1, 0),
+        "combining mark must not advance the cursor"
+    );
 }
 
 #[test]
 fn combining_mark_with_no_table_entry_is_dropped_not_corrupting() {
     let mut g = Grid::new(20, 3);
     feed(&mut g, "z\u{323}".as_bytes()); // 'z' + COMBINING DOT BELOW (not in our table)
-    assert_eq!(g.screen().get_cell(0, 0).ch, 'z', "base letter left untouched");
+    assert_eq!(
+        g.screen().get_cell(0, 0).ch,
+        'z',
+        "base letter left untouched"
+    );
 }
 
 #[test]
@@ -462,7 +493,10 @@ fn rep_after_control_byte_is_a_noop() {
 #[test]
 fn ris_resets_all_negotiated_modes() {
     let mut g = Grid::new(80, 24);
-    feed(&mut g, b"\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b[?7l\x1b[?6h\x1b[?1004h\x1b[>5u");
+    feed(
+        &mut g,
+        b"\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b[?7l\x1b[?6h\x1b[?1004h\x1b[>5u",
+    );
     feed(&mut g, b"\x1bc"); // RIS
     assert_eq!(g.mouse_mode(), MouseMode::Off);
     assert!(!g.app_cursor());

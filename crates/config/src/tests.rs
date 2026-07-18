@@ -371,6 +371,18 @@ fn bar_opacity_out_of_range_rejected() {
     assert!(err.contains("bar.opacity"));
 }
 
+#[test]
+fn bar_icon_path_none_by_default() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.bar_icon_path(), None);
+}
+
+#[test]
+fn bar_icon_path_set_from_bar_table() {
+    let cfg = Config::parse("[bar]\nicon_path = \"/nerd.ttf\"\n");
+    assert_eq!(cfg.bar_icon_path(), Some("/nerd.ttf"));
+}
+
 // ── ConfigError ───────────────────────────────────────────────────────────
 
 #[test]

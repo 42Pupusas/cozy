@@ -244,11 +244,7 @@ fn pactl_volume(target: &str) -> Option<String> {
     let muted = String::from_utf8(mute_out.stdout)
         .unwrap_or_default()
         .contains("yes");
-    Some(if muted {
-        format!("🔇 {pct}%")
-    } else {
-        format!("🔊 {pct}%")
-    })
+    Some(format_volume(target.contains("SOURCE"), pct, muted))
 }
 
 fn amixer_volume(control: &str) -> Option<String> {
@@ -266,12 +262,36 @@ fn amixer_volume(control: &str) -> Option<String> {
         .parse::<u32>()
         .ok()?;
     let muted = line.contains("[off]");
-    Some(if muted {
-        format!("🔇 {pct}%")
-    } else {
-        format!("🔊 {pct}%")
-    })
+    Some(format_volume(control == "Capture", pct, muted))
 }
+
+fn format_volume(is_source: bool, pct: u32, muted: bool) -> String {
+    let icon = pick_volume_icon(is_source, pct, muted);
+    format!("{icon} {pct}%")
+}
+
+fn pick_volume_icon(is_source: bool, pct: u32, muted: bool) -> &'static str {
+    if is_source {
+        return if muted { MIC_MUTED } else { MIC_ON };
+    }
+    if muted {
+        return VOL_MUTED;
+    }
+    if pct < 33 {
+        VOL_LOW
+    } else if pct < 66 {
+        VOL_MED
+    } else {
+        VOL_HIGH
+    }
+}
+
+const MIC_ON: &str = "󰍬";
+const MIC_MUTED: &str = "󰍭";
+const VOL_LOW: &str = "󰕿";
+const VOL_MED: &str = "󰖀";
+const VOL_HIGH: &str = "󰕾";
+const VOL_MUTED: &str = "󰝟";
 
 /// Screen backlight brightness percentage, from the first
 /// `/sys/class/backlight/*` device.
@@ -286,7 +306,7 @@ pub fn brightness() -> Option<String> {
             continue;
         }
         let pct = (cur / max * 100.0).round() as u32;
-        return Some(format!("☀ {pct}%"));
+        return Some(format!("󰃠 {pct}%"));
     }
     None
 }

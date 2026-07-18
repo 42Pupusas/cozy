@@ -8,5 +8,7 @@ workspace = true
 
 [dependencies]
 platform     = { path = "../platform" }
+font         = { path = "../font" }
+config       = { path = "../config" }
 waker        = { path = "../waker" }
 quetzalcoatl = { workspace = true }

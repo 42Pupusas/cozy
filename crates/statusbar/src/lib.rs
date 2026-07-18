@@ -30,5 +30,7 @@
 
 pub mod bar_window;
 pub mod modules;
+pub mod text;
 
 pub use bar_window::{BarWindow, Edge};
+pub use text::TextRenderer;

@@ -298,6 +298,50 @@ fn full_document() {
     assert_eq!(cfg.keybinds.len(), 2);
 }
 
+// ── [bar] ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn bar_defaults_mirror_terminal_settings() {
+    let cfg = Config::parse(
+        "[font]\npath = \"/x/y.ttf\"\nsize = 16\n[colors]\nforeground = \"#111111\"\nbackground = \"#222222\"\n",
+    );
+    assert_eq!(cfg.bar_font_path(), Some("/x/y.ttf"));
+    assert_eq!(cfg.bar_font_size(), 16);
+    assert_eq!(cfg.bar_background(), Color::parse_hex("#222222").unwrap());
+    assert_eq!(cfg.bar_foreground(), Color::parse_hex("#111111").unwrap());
+    assert_eq!(cfg.bar_height(), 28);
+}
+
+#[test]
+fn bar_overrides_win_over_mirrored_terminal_settings() {
+    let cfg = Config::parse(
+        "[font]\npath = \"/terminal.ttf\"\nsize = 16\n[colors]\nforeground = \"#111111\"\nbackground = \"#222222\"\n[bar]\nbackground = \"#abcdef\"\nforeground = \"#fedcba\"\nheight = 32\nfont_path = \"/bar.ttf\"\nfont_size = 11\n",
+    );
+    assert_eq!(cfg.bar_font_path(), Some("/bar.ttf"));
+    assert_eq!(cfg.bar_font_size(), 11);
+    assert_eq!(cfg.bar_background(), Color::parse_hex("#abcdef").unwrap());
+    assert_eq!(cfg.bar_foreground(), Color::parse_hex("#fedcba").unwrap());
+    assert_eq!(cfg.bar_height(), 32);
+}
+
+#[test]
+fn bar_font_path_none_when_neither_bar_nor_terminal_font_configured() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.bar_font_path(), None);
+}
+
+#[test]
+fn bar_bad_color_is_a_validation_error() {
+    let err = Config::fail("[bar]\nbackground = \"not-a-color\"\n");
+    assert!(err.contains("bar.background"));
+}
+
+#[test]
+fn bar_height_out_of_range_rejected() {
+    let err = Config::fail("[bar]\nheight = 0\n");
+    assert!(err.contains("bar.height"));
+}
+
 // ── ConfigError ───────────────────────────────────────────────────────────
 
 #[test]

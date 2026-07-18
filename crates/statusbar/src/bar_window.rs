@@ -103,6 +103,11 @@ pub struct BarWindow {
     buf_format: Format,
 
     backbuffer: Vec<u32>,
+    /// Background the canvas is cleared to before each frame's `paint`
+    /// closure runs. Defaults to a dark slate; set via
+    /// [`BarWindow::set_background`] (mirrors `[bar] background` / the
+    /// terminal's own `[colors] background` -- see `config::Config::bar_background`).
+    background: Color,
     dirty: bool,
     frame_ready: bool,
     frame_cb: Option<platform::id::CallbackId>,
@@ -249,6 +254,7 @@ impl BarWindow {
             pool,
             buf_format,
             backbuffer: vec![Color::BLACK.to_xrgb8888(); (INITIAL_WIDTH * px_height) as usize],
+            background: Color::rgb(0x1e, 0x1e, 0x2e),
             dirty: false,
             frame_ready: true,
             frame_cb: None,
@@ -270,6 +276,14 @@ impl BarWindow {
 
     /// Mark the bar dirty so the next `tick` repaints and presents.
     pub fn request_redraw(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Set the color the canvas is cleared to before each frame's `paint`
+    /// closure runs, and request a redraw so the change is visible
+    /// immediately.
+    pub fn set_background(&mut self, color: Color) {
+        self.background = color;
         self.dirty = true;
     }
 
@@ -469,7 +483,7 @@ impl BarWindow {
 
         {
             let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height);
-            canvas.fill_rect(canvas.bounds(), Color::rgb(0x1e, 0x1e, 0x2e));
+            canvas.fill_rect(canvas.bounds(), self.background);
             paint(&mut canvas);
         }
 

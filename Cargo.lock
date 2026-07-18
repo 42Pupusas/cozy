@@ -208,6 +208,8 @@ version = "0.1.0"
 name = "statusbar"
 version = "0.1.0"
 dependencies = [
+ "config",
+ "font",
  "platform",
  "quetzalcoatl",
  "waker",
@@ -217,6 +219,7 @@ dependencies = [
 name = "statusbar-bin"
 version = "0.1.0"
 dependencies = [
+ "config",
  "platform",
  "statusbar",
  "waker",

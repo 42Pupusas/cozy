@@ -2,6 +2,7 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
     clippy::doc_markdown,
     clippy::duration_suboptimal_units,
     clippy::unchecked_time_subtraction
@@ -19,11 +20,7 @@
 use std::time::{Duration, Instant};
 
 use platform::draw::{Canvas, Color};
-use statusbar::bar_window::{draw_text, draw_text_right, text_baseline_y};
-use statusbar::{BarWindow, Edge};
-
-/// Bar thickness in logical pixels (pre-scale).
-const BAR_HEIGHT: i32 = 28;
+use statusbar::{BarWindow, Edge, TextRenderer};
 
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
@@ -160,16 +157,21 @@ impl Modules {
     }
 }
 
-fn paint(canvas: &mut Canvas, modules: &Modules, bar_height: i32, scale: i32) {
-    let fg = Color::rgb(0xcc, 0xcc, 0xcc);
-    let dim = Color::rgb(0x66, 0x66, 0x77);
-    let y = text_baseline_y(bar_height);
+fn paint(
+    canvas: &mut Canvas,
+    modules: &Modules,
+    text: &mut TextRenderer,
+    fg: Color,
+    bg: Color,
+    bar_height: i32,
+    scale: i32,
+) {
+    let y = text.baseline_y(bar_height);
     let pad = 8 * scale;
     let gap = 16 * scale;
 
     // Left: nothing wired up yet (workspaces/window-title would land here
     // once a sway-IPC client is added) — leave the gutter clear.
-    let _ = fg;
 
     // Right-to-left layout: draw each segment ending `gap` to the left of
     // the previous one's start.
@@ -178,20 +180,21 @@ fn paint(canvas: &mut Canvas, modules: &Modules, bar_height: i32, scale: i32) {
         if seg.is_empty() {
             continue;
         }
-        draw_text_right(canvas, &seg, right_edge, y, fg);
-        let w = seg.chars().count() as i32 * platform::font::GLYPH_W;
+        text.draw_text_right(canvas, &seg, right_edge, y, fg, bg);
+        let w = text.measure(&seg);
         right_edge -= w + gap;
     }
-
-    // A faint divider line under the bar (top edge only, no-op if the bar
-    // sits at the very edge already).
-    let _ = draw_text; // keep the re-export's import alive if segments ever move left
-    let _ = dim;
 }
 
 fn main() {
+    let cfg = config::Config::load().unwrap_or_else(|e| {
+        eprintln!("statusbar: config error: {e} — using defaults");
+        config::Config::default()
+    });
+
     let wake = waker::Waker::new().expect("create waker");
-    let mut window = match BarWindow::new(Edge::Top, BAR_HEIGHT, wake) {
+    let bar_height = cfg.bar_height() as i32;
+    let mut window = match BarWindow::new(Edge::Top, bar_height, wake) {
         Ok(w) => w,
         Err(e) => {
             eprintln!("statusbar: failed to open layer-shell window: {e}");
@@ -199,16 +202,33 @@ fn main() {
         }
     };
 
+    let scale = window.scale();
+    let bg = {
+        let c = cfg.bar_background();
+        Color::rgb(c.r, c.g, c.b)
+    };
+    let fg = {
+        let c = cfg.bar_foreground();
+        Color::rgb(c.r, c.g, c.b)
+    };
+    window.set_background(bg);
+
+    // Font size is a point size (like the terminal's own `[font] size`);
+    // convert to pixels at 96 DPI, then scale by the output's physical
+    // pixel density so it renders crisp on HiDPI, matching
+    // `platform::Renderer::with_scale`'s convention.
+    let px_size = cfg.bar_font_px_size() * scale as f32;
+    let mut text = TextRenderer::load(cfg.bar_font_path(), px_size);
+
     let mut modules = Modules::new();
     let bar_height = window.height();
-    let scale = window.scale();
 
     loop {
         let changed = modules.refresh();
         if changed {
             window.request_redraw();
         }
-        match window.tick(|canvas| paint(canvas, &modules, bar_height, scale)) {
+        match window.tick(|canvas| paint(canvas, &modules, &mut text, fg, bg, bar_height, scale)) {
             Ok(true) => {}
             Ok(false) => break,
             Err(e) => {

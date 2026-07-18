@@ -54,6 +54,16 @@
 //! [keybinds]
 //! # "Ctrl+Shift+C" = "copy"
 //! # "Ctrl+Shift+V" = "paste"
+//!
+//! [bar]
+//! # Everything here is optional and defaults to *mirroring* the terminal's
+//! # own [font]/[colors] above -- set any of these only to make the bar
+//! # diverge from the terminal's look.
+//! background  = "#181818"          # defaults to [colors].background
+//! foreground  = "#d8d8d8"          # defaults to [colors].foreground
+//! height      = 28                 # bar thickness in logical pixels
+//! font_path   = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf" # defaults to [font].path
+//! font_size   = 12                 # points; defaults to [font].size
 //! ```
 
 #![allow(clippy::doc_markdown)]
@@ -227,7 +237,7 @@ impl FontConfig {
     /// for the rasterizer. 96 DPI is the universal web/desktop-Linux default
     /// (and what Alacritty assumes absent real monitor DPI info), so a given
     /// point size renders at the same pixel size other terminals show it at.
-    const DPI: f32 = 96.0;
+    pub(crate) const DPI: f32 = 96.0;
 
     /// This config's font size in pixels, as consumed by [`FontFace::load`](../font/struct.FontFace.html#method.load).
     ///
@@ -319,6 +329,29 @@ pub struct Keybind {
     pub action: Action,
 }
 
+/// Status-bar configuration.
+///
+/// Every field is optional in the TOML `[bar]` table and, when unset,
+/// *mirrors* the corresponding terminal setting ([`Config::font`] /
+/// [`Config::palette`]) -- see [`Config::bar_background`] etc., which
+/// resolve the mirroring. This struct only holds the raw overrides actually
+/// present in the file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BarConfig {
+    /// Background color override. `None` mirrors `[colors].background`.
+    pub background: Option<Color>,
+    /// Foreground (text) color override. `None` mirrors `[colors].foreground`.
+    pub foreground: Option<Color>,
+    /// Bar thickness in logical pixels. `None` defaults to 28.
+    pub height: Option<u32>,
+    /// Font file override. `None` mirrors `[font].path` (and, if that's also
+    /// unset, the bar falls back to the embedded bitmap font same as the
+    /// terminal does).
+    pub font_path: Option<String>,
+    /// Font point size override. `None` mirrors `[font].size`.
+    pub font_size: Option<u32>,
+}
+
 // ── Root config ───────────────────────────────────────────────────────────────
 
 /// The validated, fully-resolved terminal configuration.
@@ -335,6 +368,7 @@ pub struct Config {
     pub cursor: CursorConfig,
     pub palette: Palette,
     pub keybinds: Vec<Keybind>,
+    pub bar: BarConfig,
 }
 
 impl Default for Config {
@@ -348,6 +382,7 @@ impl Default for Config {
             cursor: CursorConfig::default(),
             palette: Palette::default(),
             keybinds: Vec::new(),
+            bar: BarConfig::default(),
         }
     }
 }
@@ -411,6 +446,7 @@ impl Config {
         cfg.apply_cursor(&table)?;
         cfg.apply_colors(&table)?;
         cfg.apply_keybinds(&table);
+        cfg.apply_bar(&table)?;
         Ok(cfg)
     }
 
@@ -578,5 +614,101 @@ impl Config {
                 });
             }
         }
+    }
+
+    /// Apply the `[bar]` table, if present. Every key is an *override* --
+    /// leaving one unset means the status bar mirrors the corresponding
+    /// terminal setting; see [`Config::bar_background`] /
+    /// [`Config::bar_foreground`] / [`Config::bar_font_path`] /
+    /// [`Config::bar_font_size`] for the resolved (mirrored-or-overridden)
+    /// values consumers should actually read.
+    fn apply_bar(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(bar) = table.get_table("bar") else {
+            return Ok(());
+        };
+        if let Some(s) = bar.get_str("background") {
+            self.bar.background = Some(Color::parse_hex(s).ok_or(ConfigError::InvalidValue {
+                field: "bar.background",
+                reason: "invalid #rrggbb hex color",
+            })?);
+        }
+        if let Some(s) = bar.get_str("foreground") {
+            self.bar.foreground = Some(Color::parse_hex(s).ok_or(ConfigError::InvalidValue {
+                field: "bar.foreground",
+                reason: "invalid #rrggbb hex color",
+            })?);
+        }
+        if let Some(n) = bar.get_int_range(
+            "height",
+            "bar.height",
+            1,
+            512,
+            "must be between 1 and 512",
+        )? {
+            self.bar.height = Some(u32::try_from(n).unwrap_or(28));
+        }
+        if let Some(s) = bar.get_str("font_path") {
+            self.bar.font_path = Some(s.to_owned());
+        }
+        if let Some(n) = bar.get_int_range(
+            "font_size",
+            "bar.font_size",
+            1,
+            256,
+            "must be between 1 and 256",
+        )? {
+            self.bar.font_size = Some(u32::try_from(n).unwrap_or(12));
+        }
+        Ok(())
+    }
+
+    /// The status bar's background color: `[bar].background` if set,
+    /// otherwise mirrors `[colors].background` (the terminal's own
+    /// background) -- so a bare bar `[bar]` table with no keys, or no
+    /// `[bar]` table at all, gives a bar that matches the terminal by
+    /// default.
+    #[must_use]
+    pub fn bar_background(&self) -> Color {
+        self.bar.background.unwrap_or(self.palette.background)
+    }
+
+    /// The status bar's text color: `[bar].foreground` if set, otherwise
+    /// mirrors `[colors].foreground`.
+    #[must_use]
+    pub fn bar_foreground(&self) -> Color {
+        self.bar.foreground.unwrap_or(self.palette.foreground)
+    }
+
+    /// The status bar's thickness in logical pixels: `[bar].height` if set,
+    /// otherwise `28`.
+    #[must_use]
+    pub fn bar_height(&self) -> u32 {
+        self.bar.height.unwrap_or(28)
+    }
+
+    /// The status bar's font file: `[bar].font_path` if set, otherwise
+    /// mirrors `[font].path` (which itself may be `None`, meaning the
+    /// embedded bitmap font -- same fallback the terminal uses).
+    #[must_use]
+    pub fn bar_font_path(&self) -> Option<&str> {
+        self.bar
+            .font_path
+            .as_deref()
+            .or(self.font.path.as_deref())
+    }
+
+    /// The status bar's font point size: `[bar].font_size` if set, otherwise
+    /// mirrors `[font].size`.
+    #[must_use]
+    pub fn bar_font_size(&self) -> u32 {
+        self.bar.font_size.unwrap_or(self.font.size)
+    }
+
+    /// [`Config::bar_font_size`] converted to a pixel size the same way
+    /// [`FontConfig::px_size`] does (96 DPI), for the bar's own font loader.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn bar_font_px_size(&self) -> f32 {
+        self.bar_font_size() as f32 * FontConfig::DPI / 72.0
     }
 }

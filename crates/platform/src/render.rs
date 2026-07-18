@@ -22,12 +22,6 @@ use crate::font::{FIRST, GLYPH_H, GLYPH_W, LAST};
 
 pub use crate::font::FONT;
 
-/// Monochrome-outline emoji font bundled straight into this binary (Noto
-/// Emoji, OFL-licensed — see `assets/NotoEmoji-OFL.txt` next to it) so emoji
-/// render out of the box with zero configuration. Used by
-/// [`Renderer::load_emoji_fallback`] unless `[font] emoji_path` overrides it.
-static EMBEDDED_EMOJI_FONT: &[u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
-
 // ── xterm 256-color palette ──────────────────────────────────────────────────
 
 /// xterm 256-color palette: indices 0–255 → (r, g, b).
@@ -445,30 +439,20 @@ impl Renderer {
         }
     }
 
-    /// Load the emoji fallback face for [`Self::with_scale`]'s `GlyphCache`:
-    /// `font_cfg.emoji_path` if set, otherwise the monochrome Noto Emoji font
-    /// bundled into this binary (see [`EMBEDDED_EMOJI_FONT`]) so emoji render
-    /// with zero configuration. `None` if loading fails either way (a
-    /// diagnostic is printed but the primary face still renders fine --
-    /// codepoints it lacks just fall back to `.notdef`, same as before
-    /// fallback support existed).
+    /// Load the emoji fallback face for [`Self::with_scale`]'s `GlyphCache`
+    /// from `font_cfg.emoji_path`. There is no bundled/embedded fallback --
+    /// if the user hasn't configured `[font] emoji_path`, this returns
+    /// `None` and emoji-range codepoints the primary face lacks just render
+    /// as `.notdef` (same as before fallback support existed). If a path
+    /// IS configured but fails to load, a diagnostic is printed and this
+    /// also returns `None` rather than aborting startup.
     fn load_emoji_fallback(font_cfg: &config::FontConfig, px_size: f32) -> Option<font::FontFace> {
-        if let Some(path) = &font_cfg.emoji_path {
-            return match font::FontFace::load(path, px_size) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    eprintln!(
-                        "platform: failed to load emoji font {path:?}: {e} — emoji will render as tofu"
-                    );
-                    None
-                }
-            };
-        }
-        match font::FontFace::from_bytes(EMBEDDED_EMOJI_FONT.to_vec(), px_size) {
+        let path = font_cfg.emoji_path.as_ref()?;
+        match font::FontFace::load(path, px_size) {
             Ok(f) => Some(f),
             Err(e) => {
                 eprintln!(
-                    "platform: failed to parse bundled emoji font: {e} — emoji will render as tofu"
+                    "platform: failed to load emoji font {path:?}: {e} — emoji will render as tofu"
                 );
                 None
             }

@@ -15,8 +15,11 @@
 //! path = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf"
 //! size = 14                        # point size, like Alacritty/most terminals
 //!                                   # (rendered at 96 DPI: 1pt = 96/72 px)
-//! emoji_path  = "/path/to/emoji-font.ttf"  # optional: overrides the bundled
-//!                                           # monochrome Noto Emoji fallback
+//! emoji_path  = "/path/to/emoji-font.ttf"  # optional: fallback face consulted
+//!                                           # for codepoints `path` lacks (in
+//!                                           # practice, almost always emoji).
+//!                                           # unset = no fallback; those
+//!                                           # codepoints render as .notdef.
 //!
 //! [window]
 //! opacity     = 1.0                # 0.0 (fully transparent) .. 1.0 (opaque)
@@ -211,10 +214,11 @@ pub struct FontConfig {
     /// Path to a fallback TTF/OTF file consulted for codepoints the primary
     /// `path` face doesn't cover -- in practice, almost always emoji
     /// (monospace programming fonts essentially never ship them). `None`
-    /// (the default) uses the bundled monochrome Noto Emoji font baked into
-    /// the `platform` crate, so emoji render out of the box with zero
-    /// configuration; set this to override with a different emoji/symbol
-    /// font instead.
+    /// (the default) means no fallback is loaded: codepoints the primary
+    /// face lacks render as `.notdef` (tofu), same as before emoji fallback
+    /// support existed. There is no bundled/embedded emoji font -- point
+    /// this at a real one (e.g. Noto Emoji, Noto Color Emoji if/when color
+    /// glyphs are supported, OpenMoji, …) to get emoji rendering.
     pub emoji_path: Option<String>,
 }
 

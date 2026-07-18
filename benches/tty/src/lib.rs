@@ -71,6 +71,11 @@ pub const CORPORA: &[Corpus] = &[
         generate: osc_titles,
         default_n: 2000,
     },
+    Corpus {
+        name: "control_heavy",
+        generate: control_heavy,
+        default_n: 500,
+    },
 ];
 
 /// Raw throughput / scroll stress. Mirrors `scripts/stress/scroll_flood.sh`:
@@ -197,6 +202,46 @@ pub fn osc_titles(_cols: u16, _rows: u16, n: usize) -> Vec<u8> {
     for i in 0..n {
         out.extend_from_slice(format!("\x1b]0;window title #{i} - some/path/here\x07").as_bytes());
         out.extend_from_slice(format!("line {i}\r\n").as_bytes());
+    }
+    out
+}
+
+/// Mode-negotiation / control-sequence stress.
+///
+/// Exercises everything wired up in the terminal-emulator audit that the
+/// other corpora never touch, since they're all Print/SGR/scroll-heavy.
+/// Cycles through mouse tracking (1000/1002/1003/1006), DECCKM/DECAWM/
+/// DECOM/focus-events (1004), Kitty keyboard flag push/pop/set, DECSCUSR
+/// cursor styles, HTS/TBC/CHT/CBT tab stops, DEC Special Graphics (SO/SI)
+/// line drawing, combining accents, BEL, and a DECRQSS round trip -- one
+/// repeating burst per `i`, with a little Print text between bursts so the
+/// parser also does real grid work. Mirrors no single `scripts/stress/*.sh`
+/// script (none of them exercise this control surface) -- this is the
+/// missing coverage those scripts don't provide.
+#[must_use]
+pub fn control_heavy(_cols: u16, _rows: u16, n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        // Mouse tracking mode churn.
+        out.extend_from_slice(b"\x1b[?1000h\x1b[?1006h\x1b[?1000l\x1b[?1002h\x1b[?1003h");
+        // DECCKM / DECAWM / DECOM / focus events.
+        out.extend_from_slice(b"\x1b[?1h\x1b[?7l\x1b[?7h\x1b[?6h\x1b[?6l\x1b[?1004h");
+        // Kitty keyboard flag stack: push, OR, AND, replace, pop.
+        out.extend_from_slice(b"\x1b[>5u\x1b[=2;2u\x1b[=1;3u\x1b[=9;1u\x1b[<1u");
+        // DECSCUSR cursor styles.
+        out.extend_from_slice(b"\x1b[1 q\x1b[3 q\x1b[5 q\x1b[0 q");
+        // Tab stops: set, jump, clear-all, forward/backward tab.
+        out.extend_from_slice(b"\x1bH\t\x1b[3g\x1b[2I\x1b[1Z");
+        // DEC Special Graphics line drawing via SO/SI.
+        out.extend_from_slice(b"\x1b(0lqk\x1b(B\x1b)0\x0eqqq\x0f");
+        // Combining accent onto the previous letter.
+        out.extend_from_slice("e\u{301}".as_bytes());
+        // Bell.
+        out.extend_from_slice(b"\x07");
+        // DECRQSS round trip for SGR, DECSTBM, and DECSCUSR.
+        out.extend_from_slice(b"\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\");
+        // A little real text + scroll so the corpus does grid work too.
+        out.extend_from_slice(format!("line {i} some ordinary text\r\n").as_bytes());
     }
     out
 }

@@ -20,6 +20,13 @@ platform` (renderer), plus `text_layout` and `input` on the side.
 - `benches/input.rs` — `input::Encoder::encode_key` across all three
   keyboard modes.
 
+`CORPORA` also includes `control_heavy`, which has no `scripts/stress/*.sh`
+analogue: it cycles mouse-tracking mode changes, DECCKM/DECAWM/DECOM/focus-
+events, the Kitty keyboard flag stack, DECSCUSR, tab stops (HTS/TBC/CHT/CBT),
+DEC Special Graphics (SO/SI) line drawing, combining accents, BEL, and a
+DECRQSS round trip -- the mode-negotiation/DCS surface the other corpora
+(all Print/SGR/scroll-heavy) never touch.
+
 ## Why parser and pipeline are separate benches
 
 `vt_parser::TermEvent` borrows from the parser's internal buffers (OSC text in

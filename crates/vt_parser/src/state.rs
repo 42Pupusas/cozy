@@ -350,6 +350,13 @@ impl Parser {
                 self.state = State::CsiParam;
                 None
             }
+            // Colon (sub-parameter separator, e.g. `CSI 4:3 m` curly
+            // underline or `CSI 38:2:r:g:b m` colon-form truecolor).
+            b':' => {
+                self.params.next_subparam();
+                self.state = State::CsiParam;
+                None
+            }
             // DEC private marker or similar (? ! > =)
             0x3C..=0x3F => {
                 self.intermediate = Some(byte);
@@ -376,6 +383,10 @@ impl Parser {
             }
             b';' => {
                 self.params.next_param();
+                None
+            }
+            b':' => {
+                self.params.next_subparam();
                 None
             }
             // Another intermediate — e.g. the SP in `CSI Ps SP q` (DECSCUSR).
@@ -530,6 +541,15 @@ impl Parser {
                 1 => SgrAttr::Bold,
                 2 => SgrAttr::Dim,
                 3 => SgrAttr::Italic,
+                // `CSI 4 m` (bare) is always straight underline; `CSI 4:n m`
+                // (colon sub-parameter) selects a style -- `is_sub(i + 1)`
+                // is what distinguishes it from `CSI 4;n m`, which is just
+                // "underline, then attribute n" (two independent SGRs).
+                4 if p.is_sub(i + 1) => {
+                    let style = p.get_raw(i + 1) as u8;
+                    i += 1;
+                    SgrAttr::UnderlineStyle(style)
+                }
                 4 => SgrAttr::Underline,
                 5 => SgrAttr::Blink,
                 6 => SgrAttr::RapidBlink,
@@ -577,6 +597,22 @@ impl Parser {
                     _ => SgrAttr::BgDefault,
                 },
                 49 => SgrAttr::BgDefault,
+                58 => match p.get_raw(i + 1) {
+                    5 => {
+                        let idx = p.get_raw(i + 2) as u8;
+                        i += 2;
+                        SgrAttr::UnderlineColor256(idx)
+                    }
+                    2 => {
+                        let r = p.get_raw(i + 2) as u8;
+                        let g = p.get_raw(i + 3) as u8;
+                        let b = p.get_raw(i + 4) as u8;
+                        i += 4;
+                        SgrAttr::UnderlineColorRgb(r, g, b)
+                    }
+                    _ => SgrAttr::UnderlineColorDefault,
+                },
+                59 => SgrAttr::UnderlineColorDefault,
                 90..=97 => SgrAttr::FgStandard((val - 90 + 8) as u8),
                 100..=107 => SgrAttr::BgStandard((val - 100 + 8) as u8),
                 _ => {
@@ -781,6 +817,86 @@ mod tests {
             }
         });
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn sgr_colon_underline_style_is_distinct_from_semicolon_form() {
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[4:3m", |ev| {
+            if let TermEvent::Csi(CsiAction::Sgr(attrs)) = ev {
+                assert!(attrs.contains(&SgrAttr::UnderlineStyle(3)));
+                assert!(!attrs.contains(&SgrAttr::Underline));
+                count += 1;
+            } else {
+                panic!("expected SGR event, got {ev:?}");
+            }
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn sgr_semicolon_4_then_3_is_underline_then_italic_not_a_style() {
+        // `CSI 4;3 m` -- two independent SGRs (underline, italic), NOT the
+        // colon-form "underline style 3" -- must not be conflated.
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[4;3m", |ev| {
+            if let TermEvent::Csi(CsiAction::Sgr(attrs)) = ev {
+                assert!(attrs.contains(&SgrAttr::Underline));
+                assert!(attrs.contains(&SgrAttr::Italic));
+                assert!(!attrs.contains(&SgrAttr::UnderlineStyle(3)));
+                count += 1;
+            } else {
+                panic!("expected SGR event, got {ev:?}");
+            }
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn sgr_underline_color_256_and_rgb_and_default() {
+        let mut p = Parser::new();
+        let mut seen: Vec<SgrAttr> = Vec::new();
+        p.feed(b"\x1b[58;5;9m", |ev| {
+            if let TermEvent::Csi(CsiAction::Sgr(attrs)) = ev {
+                seen.extend(attrs.iter());
+            }
+        });
+        assert_eq!(seen, vec![SgrAttr::UnderlineColor256(9)]);
+
+        seen.clear();
+        p.feed(b"\x1b[58;2;10;20;30m", |ev| {
+            if let TermEvent::Csi(CsiAction::Sgr(attrs)) = ev {
+                seen.extend(attrs.iter());
+            }
+        });
+        assert_eq!(seen, vec![SgrAttr::UnderlineColorRgb(10, 20, 30)]);
+
+        seen.clear();
+        p.feed(b"\x1b[59m", |ev| {
+            if let TermEvent::Csi(CsiAction::Sgr(attrs)) = ev {
+                seen.extend(attrs.iter());
+            }
+        });
+        assert_eq!(seen, vec![SgrAttr::UnderlineColorDefault]);
+    }
+
+    #[test]
+    fn sgr_colon_form_truecolor_still_decodes() {
+        // `CSI 38:2:r:g:b m` -- ITU-T colon form of truecolor, seen from
+        // some emitters (e.g. some tmux configurations) alongside the more
+        // common semicolon form. Since `decode_sgr` reads sub-fields via
+        // `get_raw` regardless of which separator produced them, this must
+        // decode identically to the semicolon form.
+        let mut p = Parser::new();
+        let mut seen: Vec<SgrAttr> = Vec::new();
+        p.feed(b"\x1b[38:2:10:20:30m", |ev| {
+            if let TermEvent::Csi(CsiAction::Sgr(attrs)) = ev {
+                seen.extend(attrs.iter());
+            }
+        });
+        assert_eq!(seen, vec![SgrAttr::FgRgb(10, 20, 30)]);
     }
 
     #[test]

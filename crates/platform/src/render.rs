@@ -571,6 +571,107 @@ impl Renderer {
                 );
             }
         }
+        if cell.attrs.underline() {
+            self.draw_underline(canvas, cx, cy, cell.attrs, fg);
+        }
+        if cell.attrs.strikethrough() {
+            self.draw_strikethrough(canvas, cx, cy, cell.wide, fg);
+        }
+    }
+
+    /// Draw the underline decoration for one cell: a horizontal line (or,
+    /// for [`grid::UnderlineStyle::Double`]/`Dotted`/`Dashed`, a small
+    /// pattern of one) one pixel above the cell's bottom edge, in the
+    /// glyph's own foreground unless `SGR 58` overrode it
+    /// (`attrs.underline_color`). Runs after the glyph so it always sits on
+    /// top, matching every other terminal's underline-over-descender look.
+    fn draw_underline(
+        &self,
+        canvas: &mut Canvas<'_>,
+        cx: u16,
+        cy: u16,
+        attrs: Attrs,
+        fg: DrawColor,
+    ) {
+        let color = if matches!(attrs.underline_color, Color::Default) {
+            fg
+        } else {
+            self.theme.resolve(attrs.underline_color, fg)
+        };
+        let px = if self.bg_alpha == 255 {
+            color.to_xrgb8888()
+        } else {
+            color.premultiplied_argb8888(255)
+        };
+        let buf_w = canvas.width() as u32;
+        let buf_h = canvas.height() as u32;
+        let cell_w = self.cell_w as u32;
+        let cell_h = self.cell_h as u32;
+        let x0 = u32::from(cx) * cell_w;
+        let y_base = u32::from(cy) * cell_h + cell_h.saturating_sub(1);
+        if x0 >= buf_w || y_base >= buf_h {
+            return;
+        }
+        let x1 = (x0 + cell_w).min(buf_w);
+        let pixels = canvas.pixels_mut();
+        let mut plot_row = |y: u32, dashed: bool| {
+            if y >= buf_h {
+                return;
+            }
+            let base = (y * buf_w) as usize;
+            for (i, x) in (x0..x1).enumerate() {
+                // Dashed/dotted: skip every other pixel (dotted) or every
+                // third (dashed) for a visibly broken line; curly reuses the
+                // solid single-row look here (a true sine-wave underline
+                // needs sub-pixel row placement this simple integer path
+                // doesn't have room for -- solid is still a clear, distinct
+                // "styled" signal from `Single`).
+                if dashed && i % 3 == 2 {
+                    continue;
+                }
+                if let Some(p) = pixels.get_mut(base + x as usize) {
+                    *p = px;
+                }
+            }
+        };
+        use grid::UnderlineStyle;
+        match attrs.underline_style {
+            UnderlineStyle::Double if y_base >= 1 => {
+                plot_row(y_base, false);
+                plot_row(y_base - 1, false);
+            }
+            UnderlineStyle::Dotted | UnderlineStyle::Dashed => plot_row(y_base, true),
+            _ => plot_row(y_base, false),
+        }
+    }
+
+    /// Draw the strikethrough decoration: a horizontal line through the
+    /// cell's vertical middle, in the glyph's own (already-resolved)
+    /// foreground. `wide` extends it across both columns of a wide glyph's
+    /// cell pair, matching how the glyph itself spans them.
+    fn draw_strikethrough(&self, canvas: &mut Canvas<'_>, cx: u16, cy: u16, wide: bool, fg: DrawColor) {
+        let px = if self.bg_alpha == 255 {
+            fg.to_xrgb8888()
+        } else {
+            fg.premultiplied_argb8888(255)
+        };
+        let buf_w = canvas.width() as u32;
+        let buf_h = canvas.height() as u32;
+        let cell_w = self.cell_w as u32 * if wide { 2 } else { 1 };
+        let cell_h = self.cell_h as u32;
+        let x0 = u32::from(cx) * self.cell_w as u32;
+        let y = u32::from(cy) * cell_h + cell_h / 2;
+        if x0 >= buf_w || y >= buf_h {
+            return;
+        }
+        let x1 = (x0 + cell_w).min(buf_w);
+        let pixels = canvas.pixels_mut();
+        let base = (y * buf_w) as usize;
+        for x in x0..x1 {
+            if let Some(p) = pixels.get_mut(base + x as usize) {
+                *p = px;
+            }
+        }
     }
 
     /// Blit one dirty row, **batching the background fill** across runs of
@@ -637,11 +738,17 @@ impl Renderer {
 
         // ── Pass 2: glyphs only ─────────────────────────────────────────────
         for (col, cell) in cells.iter().enumerate() {
-            // Blank cells owe nothing once the background is down. Skipping
-            // them here also skips their `theme.effective` + glyph lookup --
-            // the whole point on a mostly-space screen. `invisible()` forces a
-            // blank glyph, so it is blank too.
-            if cell.spacer || cell.ch == ' ' || cell.attrs.invisible() {
+            // A blank space cell owes nothing once the background is down,
+            // UNLESS it's underlined/struck-through (e.g. underlined
+            // trailing whitespace from a search-highlight or a styled
+            // prompt) -- those decorations still need painting even though
+            // there's no glyph. `invisible()` forces a blank glyph AND
+            // suppresses decorations (matches real terminals: invisible text
+            // has no visible underline either).
+            if cell.spacer || cell.attrs.invisible() {
+                continue;
+            }
+            if cell.ch == ' ' && !cell.attrs.underline() && !cell.attrs.strikethrough() {
                 continue;
             }
             self.blit_cell_inner(canvas, col as u16, cy, cell, false);
@@ -1218,6 +1325,72 @@ mod tests {
             spacer: false,
             link_id: 0,
         }
+    }
+
+    #[test]
+    fn underline_paints_a_pixel_row_at_the_cell_bottom() {
+        let mut renderer = Renderer::new(Theme::builtin(), &config::FontConfig::default());
+        let mut buf = vec![0u32; (renderer.cell_w * renderer.cell_h) as usize];
+        let mut canvas = Canvas::new(&mut buf, renderer.cell_w, renderer.cell_h);
+        let mut attrs = Attrs::default();
+        attrs.set_underline(true);
+        let c = Cell {
+            ch: 'X',
+            attrs,
+            wide: false,
+            spacer: false,
+            link_id: 0,
+        };
+        renderer.blit_cell(&mut canvas, 0, 0, &c);
+        let fg_px = renderer.theme.resolve(Color::Default, DrawColor::rgb(0xcc, 0xcc, 0xcc)).to_xrgb8888();
+        let y = (renderer.cell_h - 1) as usize;
+        let row_start = y * renderer.cell_w as usize;
+        let row = &buf[row_start..row_start + renderer.cell_w as usize];
+        assert!(row.iter().all(|&p| p == fg_px), "bottom row must be solid underline color");
+    }
+
+    #[test]
+    fn underline_color_override_is_used_instead_of_foreground() {
+        let mut renderer = Renderer::new(Theme::builtin(), &config::FontConfig::default());
+        let mut buf = vec![0u32; (renderer.cell_w * renderer.cell_h) as usize];
+        let mut canvas = Canvas::new(&mut buf, renderer.cell_w, renderer.cell_h);
+        let mut attrs = Attrs::default();
+        attrs.set_underline(true);
+        attrs.underline_color = grid::Color::Rgb(1, 2, 3);
+        let c = Cell {
+            ch: ' ',
+            attrs,
+            wide: false,
+            spacer: false,
+            link_id: 0,
+        };
+        renderer.blit_cell(&mut canvas, 0, 0, &c);
+        let expect = DrawColor::rgb(1, 2, 3).to_xrgb8888();
+        let y = (renderer.cell_h - 1) as usize;
+        let row_start = y * renderer.cell_w as usize;
+        assert_eq!(buf[row_start], expect);
+    }
+
+    #[test]
+    fn strikethrough_paints_a_pixel_row_through_the_middle() {
+        let mut renderer = Renderer::new(Theme::builtin(), &config::FontConfig::default());
+        let mut buf = vec![0u32; (renderer.cell_w * renderer.cell_h) as usize];
+        let mut canvas = Canvas::new(&mut buf, renderer.cell_w, renderer.cell_h);
+        let mut attrs = Attrs::default();
+        attrs.set_strikethrough(true);
+        let c = Cell {
+            ch: 'X',
+            attrs,
+            wide: false,
+            spacer: false,
+            link_id: 0,
+        };
+        renderer.blit_cell(&mut canvas, 0, 0, &c);
+        let fg_px = renderer.theme.resolve(Color::Default, DrawColor::rgb(0xcc, 0xcc, 0xcc)).to_xrgb8888();
+        let y = (renderer.cell_h / 2) as usize;
+        let row_start = y * renderer.cell_w as usize;
+        let row = &buf[row_start..row_start + renderer.cell_w as usize];
+        assert!(row.iter().all(|&p| p == fg_px), "middle row must be solid strikethrough color");
     }
 
     #[test]

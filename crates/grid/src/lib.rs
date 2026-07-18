@@ -41,7 +41,7 @@ mod dirty;
 mod screen;
 mod selection;
 
-pub use cell::{Attrs, Cell, Color};
+pub use cell::{Attrs, Cell, Color, UnderlineStyle};
 pub use cursor::{Cursor, CursorShape};
 pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand, SnapshotKind};
 pub use screen::Screen;
@@ -1229,6 +1229,18 @@ impl Grid {
             SgrAttr::Bg256(n) => self.attrs.bg = Color::Indexed(*n),
             SgrAttr::FgRgb(r, g, b) => self.attrs.fg = Color::Rgb(*r, *g, *b),
             SgrAttr::BgRgb(r, g, b) => self.attrs.bg = Color::Rgb(*r, *g, *b),
+            SgrAttr::UnderlineStyle(n) => {
+                self.attrs.underline_style = crate::cell::UnderlineStyle::from_sgr(*n);
+                // A style of 0 ("CSI 4:0 m") is the colon-form way to turn
+                // underline off entirely -- everything else implies it's on
+                // (mirrors how a bare `CSI 4 m` always turns it on).
+                self.attrs.set_underline(*n != 0);
+            }
+            SgrAttr::UnderlineColor256(n) => self.attrs.underline_color = Color::Indexed(*n),
+            SgrAttr::UnderlineColorRgb(r, g, b) => {
+                self.attrs.underline_color = Color::Rgb(*r, *g, *b);
+            }
+            SgrAttr::UnderlineColorDefault => self.attrs.underline_color = Color::Default,
         }
     }
 

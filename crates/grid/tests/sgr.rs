@@ -6,7 +6,7 @@
 // genuinely always in range, so the pedantic truncation lint is noise here.
 #![allow(clippy::cast_possible_truncation)]
 
-use grid::{Color, Grid};
+use grid::{Color, Grid, UnderlineStyle};
 use vt_parser::Parser;
 
 fn feed(grid: &mut Grid, bytes: &[u8]) {
@@ -67,6 +67,46 @@ fn invisible_on() {
 #[test]
 fn strikethrough_on() {
     assert!(attrs_after(b"\x1b[9m").strikethrough());
+}
+
+#[test]
+fn plain_underline_is_single_style() {
+    let a = attrs_after(b"\x1b[4m");
+    assert!(a.underline());
+    assert_eq!(a.underline_style, UnderlineStyle::Single);
+}
+
+#[test]
+fn colon_underline_style_selects_curly() {
+    let a = attrs_after(b"\x1b[4:3m");
+    assert!(a.underline());
+    assert_eq!(a.underline_style, UnderlineStyle::Curly);
+}
+
+#[test]
+fn colon_underline_style_zero_turns_underline_off() {
+    let a = attrs_after(b"\x1b[4m\x1b[4:0m");
+    assert!(!a.underline());
+}
+
+#[test]
+fn underline_color_256_and_rgb_and_default() {
+    let a = attrs_after(b"\x1b[58;5;9m");
+    assert_eq!(a.underline_color, Color::Indexed(9));
+
+    let a = attrs_after(b"\x1b[58;2;10;20;30m");
+    assert_eq!(a.underline_color, Color::Rgb(10, 20, 30));
+
+    let a = attrs_after(b"\x1b[58;5;9;59m");
+    assert_eq!(a.underline_color, Color::Default);
+}
+
+#[test]
+fn reset_clears_underline_style_and_color() {
+    let a = attrs_after(b"\x1b[4:3;58;5;9;0m");
+    assert!(!a.underline());
+    assert_eq!(a.underline_style, UnderlineStyle::Single);
+    assert_eq!(a.underline_color, Color::Default);
 }
 
 #[test]

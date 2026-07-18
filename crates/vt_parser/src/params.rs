@@ -19,6 +19,13 @@ pub struct Params {
     /// field (e.g. the row in `CSI ;5H`) doesn't get overwritten by the
     /// digits of the *next* field.
     cur: usize,
+    /// Bit `i` set means slot `i` was reached via a `:` separator (a
+    /// colon-delimited sub-parameter of slot `i-1`) rather than `;`. Needed
+    /// by SGR decoding to tell `CSI 4:3 m` (underline, style 3 = curly)
+    /// apart from `CSI 4;3 m` (underline, then italic) -- both parse to the
+    /// same flat `[4, 3]` param list, but mean different things depending on
+    /// which separator joined them. `u16` comfortably covers `MAX_PARAMS`.
+    colon: u16,
 }
 
 impl Params {
@@ -27,6 +34,7 @@ impl Params {
             buf: [0; MAX_PARAMS],
             len: 0,
             cur: 0,
+            colon: 0,
         }
     }
 
@@ -35,6 +43,7 @@ impl Params {
         self.buf = [0; MAX_PARAMS];
         self.len = 0;
         self.cur = 0;
+        self.colon = 0;
     }
 
     /// Feed a digit character into the current parameter.
@@ -70,7 +79,7 @@ impl Params {
         self.buf[self.cur] = v;
     }
 
-    /// Terminate the current parameter and start a new one.
+    /// Terminate the current parameter and start a new one (`;` separator).
     pub(crate) fn next_param(&mut self) {
         if self.cur + 1 < MAX_PARAMS {
             self.cur += 1;
@@ -78,6 +87,25 @@ impl Params {
         if self.len <= self.cur {
             self.len = self.cur + 1;
         }
+    }
+
+    /// Terminate the current parameter and start a new *sub*-parameter
+    /// (`:` separator) -- same slot advance as [`Self::next_param`], but the
+    /// new slot is flagged so [`Self::is_sub`] can tell `SGR` decoding it's a
+    /// colon-joined continuation of the previous slot, not an independent
+    /// attribute.
+    pub(crate) fn next_subparam(&mut self) {
+        self.next_param();
+        if self.cur < MAX_PARAMS {
+            self.colon |= 1 << self.cur;
+        }
+    }
+
+    /// Whether slot `i` was reached via a `:` separator (a sub-parameter of
+    /// slot `i - 1`) rather than `;`.
+    #[must_use]
+    pub fn is_sub(&self, i: usize) -> bool {
+        i < MAX_PARAMS && self.colon & (1 << i) != 0
     }
 
     /// Number of parameters accumulated.

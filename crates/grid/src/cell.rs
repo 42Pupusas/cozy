@@ -26,6 +26,42 @@ pub struct Attrs {
     pub fg: Color,
     pub bg: Color,
     flags: u8,
+    /// Underline color override (`SGR 58`/`59`). `Color::Default` means
+    /// "use the glyph's own foreground" -- the universal default and the
+    /// common case, so this costs nothing extra to check.
+    pub underline_color: Color,
+    /// Underline style (`SGR 4:n`). Only meaningful when `underline()` is
+    /// set; a plain `SGR 4` (no colon sub-parameter) always means
+    /// [`UnderlineStyle::Single`].
+    pub underline_style: UnderlineStyle,
+}
+
+/// Underline rendering style, from the `CSI 4:n m` colon sub-parameter.
+/// `Default` (`Single`) matches a bare `CSI 4 m` with no style selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnderlineStyle {
+    #[default]
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
+}
+
+impl UnderlineStyle {
+    /// Map an `SGR 4:n` style number to its style, defaulting unrecognised
+    /// values to [`Self::Single`] rather than being dropped -- matching how
+    /// unknown SGR codes elsewhere in the parser degrade gracefully.
+    #[must_use]
+    pub const fn from_sgr(n: u8) -> Self {
+        match n {
+            2 => Self::Double,
+            3 => Self::Curly,
+            4 => Self::Dotted,
+            5 => Self::Dashed,
+            _ => Self::Single,
+        }
+    }
 }
 
 /// Bit positions for the packed SGR flags. Private -- callers go through the
@@ -75,7 +111,13 @@ impl Attrs {
     /// syntax.
     #[must_use]
     pub const fn with_colors(fg: Color, bg: Color) -> Self {
-        Self { fg, bg, flags: 0 }
+        Self {
+            fg,
+            bg,
+            flags: 0,
+            underline_color: Color::Default,
+            underline_style: UnderlineStyle::Single,
+        }
     }
 
     flag_accessors! {
@@ -119,12 +161,17 @@ pub struct Cell {
 #[cfg(test)]
 mod size_tests {
     #[test]
-    fn cell_is_20_bytes() {
-        // Grew from 16 to 20 bytes when `link_id: u32` was added for OSC 8
-        // hyperlink support -- still a plain memcpy-able POD, just one word
-        // wider, so `fill`/`copy_within`/snapshot/blit stay cheap memsets.
-        assert_eq!(std::mem::size_of::<super::Cell>(), 20);
-        assert_eq!(std::mem::size_of::<super::Attrs>(), 9);
+    fn cell_size_is_tracked() {
+        // Grew 16 -> 20 bytes when `link_id: u32` was added for OSC 8
+        // hyperlink support, then 20 -> 24 when `Attrs` grew an
+        // `underline_color: Color` (4 bytes) + `underline_style` (1 byte,
+        // padded) for SGR 4:n/58/59 underline styling. Still a plain
+        // memcpy-able POD, just wider, so `fill`/`copy_within`/snapshot/blit
+        // stay cheap memsets -- this assertion exists so a future field
+        // addition is a deliberate, visible size bump rather than a silent
+        // one.
+        assert_eq!(std::mem::size_of::<super::Cell>(), 24);
+        assert_eq!(std::mem::size_of::<super::Attrs>(), 14);
     }
 }
 

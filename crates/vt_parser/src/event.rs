@@ -81,6 +81,19 @@ pub enum SgrAttr {
     FgRgb(u8, u8, u8),
     /// Background 24-bit RGB (48;2;r;g;b).
     BgRgb(u8, u8, u8),
+    /// Underline style (`CSI 4:n m` colon form only -- a bare `CSI 4 m` is
+    /// [`Self::Underline`], always style 1/straight). `n`: 0 = none (same as
+    /// `NoUnderline`), 1 = straight, 2 = double, 3 = curly, 4 = dotted,
+    /// 5 = dashed. Any other value falls back to straight (1) rather than
+    /// being dropped, matching how unknown SGR numeric codes elsewhere in
+    /// this enum degrade gracefully instead of erroring.
+    UnderlineStyle(u8),
+    /// Underline color, standard/256-index form (`CSI 58;5;n m`).
+    UnderlineColor256(u8),
+    /// Underline color, 24-bit RGB form (`CSI 58;2;r;g;b m`).
+    UnderlineColorRgb(u8, u8, u8),
+    /// Underline color reset to the glyph's own foreground (`CSI 59 m`).
+    UnderlineColorDefault,
 }
 
 /// Fixed-capacity stack buffer of decoded SGR attributes for one `CSI … m`.

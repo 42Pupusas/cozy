@@ -142,101 +142,128 @@ fn main() {
         Config::default()
     });
 
-    if let Err(e) = run(&cfg) {
+    if let Err(e) = App::new(&cfg).run() {
         eprintln!("terminal: {e}");
         std::process::exit(1);
     }
 }
 
-fn run(cfg: &Config) -> platform::Result<()> {
-    // Block SIGCHLD before any thread exists so every thread inherits the
-    // mask — the PTY thread's signalfd only sees *blocked* signals, and an
-    // unblocked SIGCHLD delivered to some other thread would be lost.
-    if let Err(e) = pty::RawPty::block_sigchld() {
-        eprintln!("terminal: sigprocmask failed: {e} — child exit may not be detected");
+/// The application itself: the composition root that owns the process-wide
+/// shared state spanning all three worker threads and drives the whole
+/// lifecycle (wire rings → spawn workers → run the UI on this thread → join).
+///
+/// Was a free `run(cfg)` function -- the one part of the topology that wasn't
+/// yet an object even though every thread already is (`PtyWorker`,
+/// `ParserWorker`, `UiWorker`). The rings are transient wiring built and
+/// consumed within [`run`], so they stay locals; the two `Arc<AtomicBool>`s
+/// are genuinely app-wide state (every thread reads or writes them), so they
+/// are fields.
+struct App<'cfg> {
+    cfg: &'cfg Config,
+    /// Set once by whichever thread first decides to exit; every worker loop
+    /// polls it to unwind. Cloned into each worker.
+    quit: Arc<AtomicBool>,
+    /// Bracketed-paste mode (DECSET 2004): written on the parser thread
+    /// (owns the grid), read on the UI thread (wraps clipboard paste).
+    bracketed_paste: Arc<AtomicBool>,
+}
+
+impl<'cfg> App<'cfg> {
+    fn new(cfg: &'cfg Config) -> Self {
+        Self {
+            cfg,
+            quit: Arc::new(AtomicBool::new(false)),
+            bracketed_paste: Arc::new(AtomicBool::new(false)),
+        }
     }
 
-    // ── Rings ───────────────────────────────────────────────────────────────
-    // parser_in is MPSC: the pty thread pushes shell output, the ui thread
-    // pushes resizes. The ring's own park/unpark wakes the parked parser when
-    // either producer pushes — so resizes wake the grid directly (no eventfd).
-    let (parser_data_tx, parser_in_rx) =
-        mpsc::RingBuffer::<ParserMsg>::new(Capacity::exact(RING_PARSER_IN)).split();
-    let parser_resize_tx = parser_data_tx.clone();
-    let (dirty_tx, dirty_rx) =
-        RingBuffer::<DirtySnapshot>::new(Capacity::exact(RING_DIRTY)).split();
-    // input is MPSC too: the ui thread (keystrokes / resize / quit) and the
-    // parser/grid thread (CPR/DA responses written back to the shell) both feed
-    // the single PTY consumer.
-    let (input_tx, input_rx) =
-        mpsc::RingBuffer::<InputMsg>::new(Capacity::exact(RING_INPUT)).split();
-    let reply_tx = input_tx.clone();
+    fn run(&self) -> platform::Result<()> {
+        // Block SIGCHLD before any thread exists so every thread inherits the
+        // mask — the PTY thread's signalfd only sees *blocked* signals, and an
+        // unblocked SIGCHLD delivered to some other thread would be lost.
+        if let Err(e) = pty::RawPty::block_sigchld() {
+            eprintln!("terminal: sigprocmask failed: {e} — child exit may not be detected");
+        }
 
-    // ── Shared quit flag ────────────────────────────────────────────────────
-    let quit = Arc::new(AtomicBool::new(false));
-    let quit_pty = Arc::clone(&quit);
-    let quit_parser = Arc::clone(&quit);
+        // ── Rings ───────────────────────────────────────────────────────────────
+        // parser_in is MPSC: the pty thread pushes shell output, the ui thread
+        // pushes resizes. The ring's own park/unpark wakes the parked parser when
+        // either producer pushes — so resizes wake the grid directly (no eventfd).
+        let (parser_data_tx, parser_in_rx) =
+            mpsc::RingBuffer::<ParserMsg>::new(Capacity::exact(RING_PARSER_IN)).split();
+        let parser_resize_tx = parser_data_tx.clone();
+        let (dirty_tx, dirty_rx) =
+            RingBuffer::<DirtySnapshot>::new(Capacity::exact(RING_DIRTY)).split();
+        // input is MPSC too: the ui thread (keystrokes / resize / quit) and the
+        // parser/grid thread (CPR/DA responses written back to the shell) both feed
+        // the single PTY consumer.
+        let (input_tx, input_rx) =
+            mpsc::RingBuffer::<InputMsg>::new(Capacity::exact(RING_INPUT)).split();
+        let reply_tx = input_tx.clone();
 
-    // Bracketed-paste mode (DECSET 2004) is set by the app on the parser
-    // thread (which owns the grid) but read on the UI thread (which writes
-    // clipboard paste to the PTY). Published via a shared atomic.
-    let bracketed_paste = Arc::new(AtomicBool::new(false));
-    let bracketed_paste_parser = Arc::clone(&bracketed_paste);
-    let bracketed_paste_ui = Arc::clone(&bracketed_paste);
+        // ── Shared, app-owned cross-thread state ─────────────────────────────────
+        // `quit` and `bracketed_paste` are fields of the App (they outlive any one
+        // thread and every thread touches them); each worker gets its own cloned
+        // handle. See the struct doc for who reads vs. writes each.
+        let quit_pty = Arc::clone(&self.quit);
+        let quit_parser = Arc::clone(&self.quit);
+        let bracketed_paste_parser = Arc::clone(&self.bracketed_paste);
+        let bracketed_paste_ui = Arc::clone(&self.bracketed_paste);
 
-    // ── Cross-thread wakeups (eventfd + poll) ────────────────────────────────
-    // Each thread that waits on more than one source blocks in poll(2) on an
-    // eventfd instead of busy-spinning. `ui_wake` is owned by the window (the
-    // Wayland reader signals it); the parser also signals it after a snapshot.
-    // `pty_wake` lets the UI thread rouse the PTY thread when it queues input.
-    let ui_wake = platform::Waker::new().expect("create ui waker");
-    let pty_wake = waker::Waker::new().expect("create pty waker");
-    let parser_ui_wake = ui_wake.clone();
-    let parser_pty_wake = pty_wake.clone();
-    let ui_pty_wake = pty_wake.clone();
+        // ── Cross-thread wakeups (eventfd + poll) ────────────────────────────────
+        // Each thread that waits on more than one source blocks in poll(2) on an
+        // eventfd instead of busy-spinning. `ui_wake` is owned by the window (the
+        // Wayland reader signals it); the parser also signals it after a snapshot.
+        // `pty_wake` lets the UI thread rouse the PTY thread when it queues input.
+        let ui_wake = platform::Waker::new().expect("create ui waker");
+        let pty_wake = waker::Waker::new().expect("create pty waker");
+        let parser_ui_wake = ui_wake.clone();
+        let parser_pty_wake = pty_wake.clone();
+        let ui_pty_wake = pty_wake.clone();
 
-    // ── Spawn PTY thread ────────────────────────────────────────────────────
-    let shell = cfg.shell.clone();
-    let pty_handle = PtyWorker {
-        shell,
-        parser_tx: parser_data_tx,
-        input_rx,
-        input_wake: pty_wake,
-        quit: quit_pty,
+        // ── Spawn PTY thread ────────────────────────────────────────────────────
+        let shell = self.cfg.shell.clone();
+        let pty_handle = PtyWorker {
+            shell,
+            parser_tx: parser_data_tx,
+            input_rx,
+            input_wake: pty_wake,
+            quit: quit_pty,
+        }
+        .spawn();
+
+        // ── Spawn parser + grid thread ──────────────────────────────────────────
+        let parser_handle = ParserWorker {
+            cols: COLS,
+            rows: ROWS,
+            parser_rx: parser_in_rx,
+            dirty_tx,
+            reply_tx,
+            ui_wake: parser_ui_wake,
+            pty_wake: parser_pty_wake,
+            bracketed_paste: bracketed_paste_parser,
+            quit: quit_parser,
+        }
+        .spawn();
+
+        // ── UI thread (main thread) ─────────────────────────────────────────────
+        UiWorker {
+            cfg: self.cfg,
+            dirty_rx,
+            input_tx,
+            resize_tx: parser_resize_tx.clone(),
+            scroll_tx: parser_resize_tx,
+            ui_wake,
+            pty_wake: ui_pty_wake,
+            bracketed_paste: &bracketed_paste_ui,
+            quit: &self.quit,
+        }
+        .run()?;
+
+        pty_handle.join().ok();
+        parser_handle.join().ok();
+        Ok(())
     }
-    .spawn();
-
-    // ── Spawn parser + grid thread ──────────────────────────────────────────
-    let parser_handle = ParserWorker {
-        cols: COLS,
-        rows: ROWS,
-        parser_rx: parser_in_rx,
-        dirty_tx,
-        reply_tx,
-        ui_wake: parser_ui_wake,
-        pty_wake: parser_pty_wake,
-        bracketed_paste: bracketed_paste_parser,
-        quit: quit_parser,
-    }
-    .spawn();
-
-    // ── UI thread (main thread) ─────────────────────────────────────────────
-    UiWorker {
-        cfg,
-        dirty_rx,
-        input_tx,
-        resize_tx: parser_resize_tx.clone(),
-        scroll_tx: parser_resize_tx,
-        ui_wake,
-        pty_wake: ui_pty_wake,
-        bracketed_paste: &bracketed_paste_ui,
-        quit: &quit,
-    }
-    .run()?;
-
-    pty_handle.join().ok();
-    parser_handle.join().ok();
-    Ok(())
 }
 
 // ── PTY thread ────────────────────────────────────────────────────────────────
@@ -454,7 +481,8 @@ impl ParserSession {
         match msg {
             ParserMsg::Data(chunk) => {
                 let grid = &mut self.grid;
-                self.parser.feed(&chunk.buf[..chunk.len], |ev| grid.apply(&ev));
+                self.parser
+                    .feed(&chunk.buf[..chunk.len], |ev| grid.apply(&ev));
             }
             ParserMsg::Resize { cols, rows } => self.grid.resize(cols, rows),
             ParserMsg::Scroll { delta } => self.grid.scroll_viewport(delta),

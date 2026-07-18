@@ -213,8 +213,8 @@ pub fn osc_titles(_cols: u16, _rows: u16, n: usize) -> Vec<u8> {
 /// Cycles through mouse tracking (1000/1002/1003/1006), DECCKM/DECAWM/
 /// DECOM/focus-events (1004), Kitty keyboard flag push/pop/set, DECSCUSR
 /// cursor styles, HTS/TBC/CHT/CBT tab stops, DEC Special Graphics (SO/SI)
-/// line drawing, combining accents, BEL, and a DECRQSS round trip -- one
-/// repeating burst per `i`, with a little Print text between bursts so the
+/// line drawing, combining accents, BEL, a DECRQSS round trip, and REP --
+/// one repeating burst per `i`, with a little Print text between bursts so the
 /// parser also does real grid work. Mirrors no single `scripts/stress/*.sh`
 /// script (none of them exercise this control surface) -- this is the
 /// missing coverage those scripts don't provide.
@@ -240,6 +240,8 @@ pub fn control_heavy(_cols: u16, _rows: u16, n: usize) -> Vec<u8> {
         out.extend_from_slice(b"\x07");
         // DECRQSS round trip for SGR, DECSTBM, and DECSCUSR.
         out.extend_from_slice(b"\x1bP$qm\x1b\\\x1bP$qr\x1b\\\x1bP$q q\x1b\\");
+        // REP -- repeat the last printed char a handful of times.
+        out.extend_from_slice(b"=\x1b[8b");
         // A little real text + scroll so the corpus does grid work too.
         out.extend_from_slice(format!("line {i} some ordinary text\r\n").as_bytes());
     }

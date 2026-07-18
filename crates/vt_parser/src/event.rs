@@ -201,6 +201,8 @@ pub enum CsiAction {
     DeviceAttributes(u8),
     /// ICH — insert characters (@).
     InsertChars(u16),
+    /// REP — repeat the preceding graphic character `Ps` times (`CSI Ps b`).
+    RepeatChar(u16),
     /// DECSCUSR — set cursor style (`CSI Ps SP q`).
     CursorStyle(u16),
     /// TBC — tab clear (`CSI Ps g`). `0` = clear stop at cursor, `3` = clear all.

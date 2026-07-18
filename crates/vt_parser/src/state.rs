@@ -469,6 +469,8 @@ impl Parser {
             (None, b'X') => CsiAction::EraseChars(p.get_or(0, 1)),
             // ICH
             (None, b'@') => CsiAction::InsertChars(p.get_or(0, 1)),
+            // REP
+            (None, b'b') => CsiAction::RepeatChar(p.get_or(0, 1)),
             // HVP
             (None, b'f') => CsiAction::HorizVertPos {
                 row: p.get_or(0, 1),
@@ -1068,6 +1070,21 @@ mod tests {
             i += 1;
         });
         assert_eq!(i, 3);
+    }
+
+    #[test]
+    fn repeat_char_default_and_explicit_count() {
+        let mut p = Parser::new();
+        let mut i = 0;
+        p.feed(b"\x1b[b\x1b[5b", |ev| {
+            match i {
+                0 => assert_eq!(ev, TermEvent::Csi(CsiAction::RepeatChar(1))),
+                1 => assert_eq!(ev, TermEvent::Csi(CsiAction::RepeatChar(5))),
+                _ => panic!("unexpected extra event"),
+            }
+            i += 1;
+        });
+        assert_eq!(i, 2);
     }
 
     #[test]

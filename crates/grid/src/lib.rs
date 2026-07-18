@@ -167,6 +167,12 @@ pub struct Grid {
     /// move clears it instead — so a newline ending a full-width line leaves
     /// that line correctly *unwrapped* (no false stitch on resize).
     pending_wrap: bool,
+    /// The last graphic character printed via [`Grid::print`] (post charset
+    /// translation), for REP (`CSI Ps b`) to repeat. Cleared to `None` by
+    /// any control/escape sequence that isn't itself a repeat, matching
+    /// xterm: REP only repeats a character that was the *immediately*
+    /// preceding thing printed.
+    last_printed: Option<char>,
     /// The cursor info last handed out in a [`DirtySnapshot`] -- compared
     /// against the live cursor in [`Grid::take_dirty`] so a snapshot's
     /// `cursor_changed` flag is set whenever the cursor moved or toggled
@@ -432,6 +438,7 @@ impl Grid {
             content_delta: 0,
             replies: Vec::new(),
             pending_wrap: false,
+            last_printed: None,
             last_cursor: CursorInfo::default(),
             force_cursor_changed: false,
             mouse_mode: MouseMode::Off,
@@ -836,6 +843,7 @@ impl Grid {
             self.cursor_down(1, true);
         }
 
+        self.last_printed = Some(ch);
         let col = self.cursor.col;
         let row = self.cursor.row;
         let attrs = self.attrs;
@@ -918,6 +926,13 @@ impl Grid {
     }
 
     fn control(&mut self, c0: C0) {
+        // Any control byte other than the ones that are themselves no-ops
+        // for cursor/character state breaks the "immediately preceding
+        // print" chain REP relies on -- matches xterm, which only repeats
+        // a character that was the very last thing printed.
+        if !matches!(c0, C0::Bell | C0::Null | C0::Other(_)) {
+            self.last_printed = None;
+        }
         match c0 {
             C0::Bell => self.bell_pending = true,
             C0::Backspace => {
@@ -993,6 +1008,18 @@ impl Grid {
             CsiAction::Sgr(_) | CsiAction::DeviceStatusReport(_) | CsiAction::DeviceAttributes(_)
         ) {
             self.pending_wrap = false;
+        }
+        // Same "only right after a print" rule as C0 controls -- everything
+        // except REP itself (which reads it) and the same pure attribute/
+        // query actions that leave pending_wrap alone.
+        if !matches!(
+            action,
+            CsiAction::RepeatChar(_)
+                | CsiAction::Sgr(_)
+                | CsiAction::DeviceStatusReport(_)
+                | CsiAction::DeviceAttributes(_)
+        ) {
+            self.last_printed = None;
         }
         match action {
             CsiAction::CursorUp(n) => {
@@ -1110,6 +1137,17 @@ impl Grid {
                 let (col, row) = (self.cursor.col, self.cursor.row);
                 self.active_screen_mut().insert_chars(col, row, *n);
                 self.dirty.mark_row(row);
+            }
+            CsiAction::RepeatChar(n) => {
+                // REP -- repeat the last printed graphic character `n`
+                // times, as if it had been sent again that many times. No
+                // preceding character (freshly reset, or last thing was a
+                // control/escape sequence) is a no-op, matching xterm.
+                if let Some(ch) = self.last_printed {
+                    for _ in 0..*n {
+                        self.print(ch);
+                    }
+                }
             }
             CsiAction::EraseChars(n) => {
                 let (col, row) = (self.cursor.col, self.cursor.row);
@@ -1739,6 +1777,7 @@ impl Grid {
                 self.link_table.clear();
                 self.active_link_id = 0;
                 self.published_links = 0;
+                self.last_printed = None;
             }
             // SCS — designate G0 charset (`ESC ( X`). `0` = DEC Special
             // Graphics (line-drawing); anything else (`B` = US-ASCII, `A` =

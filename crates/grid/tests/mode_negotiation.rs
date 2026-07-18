@@ -425,6 +425,41 @@ fn decrqss_unsupported_request_gets_invalid_reply() {
 }
 
 #[test]
+fn rep_repeats_last_printed_char() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"A\x1b[4b"); // print 'A', then REP x4 -> AAAAA
+    for col in 0..5 {
+        assert_eq!(g.screen().get_cell(col, 0).ch, 'A');
+    }
+    assert_eq!(g.screen().get_cell(5, 0).ch, ' ');
+}
+
+#[test]
+fn rep_default_count_is_one() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"x\x1b[b");
+    assert_eq!(g.screen().get_cell(0, 0).ch, 'x');
+    assert_eq!(g.screen().get_cell(1, 0).ch, 'x');
+    assert_eq!(g.screen().get_cell(2, 0).ch, ' ');
+}
+
+#[test]
+fn rep_with_no_preceding_print_is_a_noop() {
+    let mut g = Grid::new(20, 3);
+    // Cursor move breaks the chain -- REP right after a CUP has nothing to repeat.
+    feed(&mut g, b"\x1b[2;5H\x1b[3b");
+    assert_eq!(g.cursor(), (4, 1), "cursor unmoved, nothing printed");
+}
+
+#[test]
+fn rep_after_control_byte_is_a_noop() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"A\r\x1b[3b"); // print 'A', CR resets chain, REP no-ops
+    assert_eq!(g.screen().get_cell(0, 0).ch, 'A');
+    assert_eq!(g.screen().get_cell(1, 0).ch, ' ');
+}
+
+#[test]
 fn ris_resets_all_negotiated_modes() {
     let mut g = Grid::new(80, 24);
     feed(&mut g, b"\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b[?7l\x1b[?6h\x1b[?1004h\x1b[>5u");

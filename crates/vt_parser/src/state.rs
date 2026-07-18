@@ -14,7 +14,7 @@
 //! Reference: <https://vt100.net/emu/dec_ansi_parser>
 
 use crate::TermEvent;
-use crate::event::{C0, CsiAction, OscCmd, SgrAttr, SgrAttrs};
+use crate::event::{C0, CsiAction, DcsCmd, OscCmd, SgrAttr, SgrAttrs};
 use crate::params::Params;
 
 /// DEC ANSI parser states.
@@ -43,6 +43,11 @@ enum State {
 /// Maximum OSC string length we buffer.
 const OSC_BUF_MAX: usize = 512;
 
+/// Maximum DCS payload length we buffer (DECRQSS requests and other DCS
+/// payloads are short; Sixel/terminfo-query bodies that exceed this are
+/// truncated rather than growing the heap -- same tradeoff as `OSC_BUF_MAX`).
+const DCS_BUF_MAX: usize = 256;
+
 /// The stateful VT/ANSI byte-stream parser.
 ///
 /// Feed bytes one at a time via [`Parser::advance`], or a whole slice via
@@ -58,6 +63,15 @@ pub struct Parser {
     /// OSC string accumulation buffer.
     osc_buf: [u8; OSC_BUF_MAX],
     osc_len: usize,
+    /// DCS payload accumulation buffer (used for `DcsPassthrough` and
+    /// `SosPmApcString` alike -- both just collect bytes until ST).
+    dcs_buf: [u8; DCS_BUF_MAX],
+    dcs_len: usize,
+    /// Set when entering a DCS (vs. SOS/PM/APC) sequence, so the terminator
+    /// knows whether to look for a DECRQSS prefix (`$q`) in the buffered
+    /// payload -- SOS/PM/APC have no such convention and always dispatch as
+    /// `DcsCmd::Unknown`.
+    in_dcs: bool,
 }
 
 impl Parser {
@@ -71,6 +85,9 @@ impl Parser {
             esc_intermediate: None,
             osc_buf: [0u8; OSC_BUF_MAX],
             osc_len: 0,
+            dcs_buf: [0u8; DCS_BUF_MAX],
+            dcs_len: 0,
+            in_dcs: false,
         }
     }
 
@@ -263,11 +280,15 @@ impl Parser {
             }
             // DCS introducer
             b'P' => {
+                self.dcs_len = 0;
+                self.in_dcs = true;
                 self.state = State::DcsEntry;
                 None
             }
             // SOS / PM / APC
             b'X' | b'^' | b'_' => {
+                self.dcs_len = 0;
+                self.in_dcs = false;
                 self.state = State::SosPmApcString;
                 None
             }
@@ -650,14 +671,36 @@ impl Parser {
 
     // ── DCS / SOS / PM / APC ─────────────────────────────────────────────
 
-    fn dcs_or_sos(&mut self, byte: u8) -> Option<TermEvent<'static>> {
+    fn dcs_or_sos(&mut self, byte: u8) -> Option<TermEvent<'_>> {
         // ST (0x9C) or ESC \ terminates these sequences.
         if byte == 0x9C || byte == b'\\' {
             self.state = State::Ground;
-            return Some(TermEvent::Dcs);
+            return Some(self.dispatch_dcs());
         }
-        // Otherwise consume silently.
+        // Otherwise accumulate the payload (truncated past DCS_BUF_MAX --
+        // DECRQSS requests and other DCS bodies we care about are short;
+        // Sixel/terminfo-query payloads that overflow this just lose their
+        // tail, matching the OSC buffer's truncation behavior).
+        if self.dcs_len < DCS_BUF_MAX {
+            self.dcs_buf[self.dcs_len] = byte;
+            self.dcs_len += 1;
+        }
         None
+    }
+
+    fn dispatch_dcs(&self) -> TermEvent<'_> {
+        let data = core::str::from_utf8(&self.dcs_buf[..self.dcs_len])
+            .unwrap_or_else(|e| core::str::from_utf8(&self.dcs_buf[..e.valid_up_to()]).unwrap_or(""));
+        if !self.in_dcs {
+            // SOS/PM/APC: no request-string convention, always Unknown.
+            return TermEvent::Dcs(DcsCmd::Unknown(data));
+        }
+        // DECRQSS: `$q<request>` -- e.g. "$qm" (SGR), "$q q" (DECSCUSR),
+        // "$qr" (DECSTBM). Anything else falls through to Unknown.
+        let cmd = data
+            .strip_prefix("$q")
+            .map_or(DcsCmd::Unknown(data), DcsCmd::RequestStatusString);
+        TermEvent::Dcs(cmd)
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────
@@ -764,6 +807,61 @@ mod tests {
                 ev,
                 TermEvent::Osc(OscCmd::SetTitle("My Terminal"))
             ));
+            count += 1;
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn decrqss_sgr_request_recognised() {
+        // Terminated by the bare C1 ST byte (0x9C) -- an actual ESC byte
+        // would win the parser's "anywhere" rule and re-enter Escape state
+        // before `dcs_or_sos` ever saw it (see
+        // `dcs_sequence_terminated_by_esc_backslash_yields_esc_event_not_dcs`
+        // in advance_coverage.rs).
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1bP$qm", |_| {});
+        p.feed(&[0x9C], |ev| {
+            assert_eq!(ev, TermEvent::Dcs(DcsCmd::RequestStatusString("m")));
+            count += 1;
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn decrqss_decscusr_request_recognised() {
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1bP$q q", |_| {});
+        p.feed(&[0x9C], |ev| {
+            assert_eq!(ev, TermEvent::Dcs(DcsCmd::RequestStatusString(" q")));
+            count += 1;
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn dcs_without_request_prefix_is_unknown() {
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1bPnot-a-request", |_| {});
+        p.feed(&[0x9C], |ev| {
+            assert_eq!(ev, TermEvent::Dcs(DcsCmd::Unknown("not-a-request")));
+            count += 1;
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn sos_pm_apc_dcs_payload_is_always_unknown() {
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1bX$qm", |_| {});
+        p.feed(&[0x9C], |ev| {
+            // SOS/PM/APC share the accumulation logic but never treat their
+            // payload as a DECRQSS request -- that convention is DCS-only.
+            assert_eq!(ev, TermEvent::Dcs(DcsCmd::Unknown("$qm")));
             count += 1;
         });
         assert_eq!(count, 1);

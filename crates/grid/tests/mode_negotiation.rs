@@ -283,6 +283,45 @@ fn combining_mark_at_column_zero_is_a_harmless_noop() {
 }
 
 #[test]
+fn decrqss_sgr_reports_current_attributes() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b[1;31m"); // bold, fg red
+    feed(&mut g, b"\x1bP$qm\x9c"); // DECRQSS m, terminated by bare ST
+    let replies = g.take_replies();
+    let s = std::str::from_utf8(&replies).unwrap();
+    assert_eq!(s, "\x1bP1$r0;1;31m\x1b\\");
+}
+
+#[test]
+fn decrqss_decstbm_reports_scroll_region() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[5;20r");
+    feed(&mut g, b"\x1bP$qr\x9c");
+    let replies = g.take_replies();
+    let s = std::str::from_utf8(&replies).unwrap();
+    assert_eq!(s, "\x1bP1$r5;20r\x1b\\");
+}
+
+#[test]
+fn decrqss_decscusr_reports_cursor_style() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b[4 q"); // steady underline
+    feed(&mut g, b"\x1bP$q q\x9c");
+    let replies = g.take_replies();
+    let s = std::str::from_utf8(&replies).unwrap();
+    assert_eq!(s, "\x1bP1$r4 q\x1b\\");
+}
+
+#[test]
+fn decrqss_unsupported_request_gets_invalid_reply() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1bP$qX\x9c");
+    let replies = g.take_replies();
+    let s = std::str::from_utf8(&replies).unwrap();
+    assert_eq!(s, "\x1bP0$r\x1b\\");
+}
+
+#[test]
 fn ris_resets_all_negotiated_modes() {
     let mut g = Grid::new(80, 24);
     feed(&mut g, b"\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b[?7l\x1b[?6h\x1b[?1004h\x1b[>5u");

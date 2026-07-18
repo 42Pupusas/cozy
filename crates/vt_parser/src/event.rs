@@ -246,6 +246,23 @@ pub enum OscCmd<'a> {
     Unknown { ps: u8, data: &'a str },
 }
 
+/// Parsed DCS command. Payloads borrow from the parser's internal DCS
+/// accumulation buffer, same lifetime discipline as [`OscCmd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DcsCmd<'a> {
+    /// DECRQSS (`DCS $ q <request> ST`) -- request status string. `request`
+    /// is the CSI-final-byte(s) identifying which setting is being asked
+    /// about (e.g. `"m"` for SGR, `"r"` for DECSTBM, `" q"` for DECSCUSR).
+    /// The terminal must reply `DCS 1 $ r <value> <request> ST` (valid) or
+    /// `DCS 0 $ r ST` (invalid/unsupported).
+    RequestStatusString(&'a str),
+    /// Any other DCS payload (Sixel graphics, terminfo queries via
+    /// `DCS + q`, ...) -- not handled, but the raw bytes are still surfaced
+    /// rather than silently discarded, so a caller that *does* want to look
+    /// can.
+    Unknown(&'a str),
+}
+
 /// A terminal event emitted by the parser. Borrows from the parser's
 /// internal buffers (see [`OscCmd`]), so it's only valid for the duration of
 /// the [`Parser::feed`] callback that produced it.
@@ -271,8 +288,9 @@ pub enum TermEvent<'a> {
     Csi(CsiAction),
     /// A fully parsed OSC sequence.
     Osc(OscCmd<'a>),
-    /// DCS / APC / PM / SOS — ignored for now, emitted as raw bytes.
-    Dcs,
+    /// A DCS sequence (APC/PM/SOS are folded in as `Unknown` -- they share
+    /// the same accumulate-until-ST shape but have no handler yet).
+    Dcs(DcsCmd<'a>),
     /// Parser encountered data it doesn't handle; bytes were consumed cleanly.
     Ignored,
 }

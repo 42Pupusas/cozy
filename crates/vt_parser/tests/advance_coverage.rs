@@ -118,7 +118,7 @@ fn dcs_sequence_terminated_by_bare_st_byte() {
     let mut saw_dcs = false;
     p.feed(b"\x1bPpayload", |_| {});
     p.feed(&[0x9C], |ev| {
-        if matches!(ev, TermEvent::Dcs) {
+        if matches!(ev, TermEvent::Dcs(_)) {
             saw_dcs = true;
         }
     });
@@ -146,7 +146,7 @@ fn sos_pm_apc_sequences_all_terminate_on_bare_st_byte() {
         p.feed(&[0x1b, intro], |_| {});
         p.feed(b"payload", |_| {});
         p.feed(&[0x9C], |ev| {
-            if matches!(ev, TermEvent::Dcs) {
+            if matches!(ev, TermEvent::Dcs(_)) {
                 saw_dcs = true;
             }
         });

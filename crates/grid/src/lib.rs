@@ -47,7 +47,7 @@ pub use screen::Screen;
 pub use selection::{Point as SelPoint, Selection};
 
 use input::{KeyboardMode, MouseMode};
-use vt_parser::{C0, CsiAction, OscCmd, SgrAttr, TermEvent};
+use vt_parser::{C0, CsiAction, DcsCmd, OscCmd, SgrAttr, TermEvent};
 
 /// Scrollback limit (lines above the visible area).
 pub const SCROLLBACK_MAX: usize = 10_000;
@@ -509,7 +509,8 @@ impl Grid {
             } => {
                 self.esc(*intermediate, *final_byte);
             }
-            TermEvent::Dcs | TermEvent::Ignored => {}
+            TermEvent::Dcs(cmd) => self.dcs(cmd),
+            TermEvent::Ignored => {}
         }
     }
 
@@ -1442,6 +1443,96 @@ impl Grid {
             }
             _ => {}
         }
+    }
+
+    /// DECRQSS (`DCS $ q <request> ST`) -- request status string. Replies
+    /// `DCS 1 $ r <value> <request> ST` for the handful of settings this
+    /// terminal actually models (SGR, DECSTBM scroll region, DECSCUSR cursor
+    /// style); anything else gets the "invalid request" form
+    /// (`DCS 0 $ r ST`), matching real terminals rather than staying silent
+    /// (silence reads as a hang to a well-behaved app polling for it).
+    fn dcs(&mut self, cmd: &DcsCmd) {
+        use std::io::Write as _;
+        let DcsCmd::RequestStatusString(request) = cmd else {
+            return;
+        };
+        let dcs_prefix = "\x1bP";
+        let dcs_suffix = "\x1b\\";
+        match *request {
+            "m" => {
+                let sgr = self.sgr_report_string();
+                let _ = write!(self.replies, "{dcs_prefix}1$r{sgr}m{dcs_suffix}");
+            }
+            "r" => {
+                let (top, bot) = self.active_screen().scroll_region();
+                let _ = write!(
+                    self.replies,
+                    "{dcs_prefix}1$r{};{}r{dcs_suffix}",
+                    top + 1,
+                    bot + 1
+                );
+            }
+            " q" => {
+                let style: u8 = match self.cursor.shape {
+                    CursorShape::Block => 2,
+                    CursorShape::Underline => 4,
+                    CursorShape::Bar => 6,
+                };
+                let _ = write!(self.replies, "{dcs_prefix}1$r{style} q{dcs_suffix}");
+            }
+            _ => {
+                let _ = write!(self.replies, "{dcs_prefix}0$r{dcs_suffix}");
+            }
+        }
+    }
+
+    /// Render the cursor's current SGR attributes as a CSI parameter string
+    /// (without the leading CSI / trailing `m`), for DECRQSS's `m` request.
+    /// Always leads with `0` (reset) so replaying it reproduces the exact
+    /// attribute set instead of merging onto whatever the requester's state
+    /// already was.
+    fn sgr_report_string(&self) -> String {
+        let a = self.attrs;
+        let mut parts = vec!["0".to_string()];
+        if a.bold() {
+            parts.push("1".to_string());
+        }
+        if a.dim() {
+            parts.push("2".to_string());
+        }
+        if a.italic() {
+            parts.push("3".to_string());
+        }
+        if a.underline() {
+            parts.push("4".to_string());
+        }
+        if a.blink() {
+            parts.push("5".to_string());
+        }
+        if a.inverse() {
+            parts.push("7".to_string());
+        }
+        if a.invisible() {
+            parts.push("8".to_string());
+        }
+        if a.strikethrough() {
+            parts.push("9".to_string());
+        }
+        match a.fg {
+            Color::Default => {}
+            Color::Indexed(n) if n < 8 => parts.push((30 + n).to_string()),
+            Color::Indexed(n) if n < 16 => parts.push((90 + n - 8).to_string()),
+            Color::Indexed(n) => parts.push(format!("38;5;{n}")),
+            Color::Rgb(r, g, b) => parts.push(format!("38;2;{r};{g};{b}")),
+        }
+        match a.bg {
+            Color::Default => {}
+            Color::Indexed(n) if n < 8 => parts.push((40 + n).to_string()),
+            Color::Indexed(n) if n < 16 => parts.push((100 + n - 8).to_string()),
+            Color::Indexed(n) => parts.push(format!("48;5;{n}")),
+            Color::Rgb(r, g, b) => parts.push(format!("48;2;{r};{g};{b}")),
+        }
+        parts.join(";")
     }
 
     fn esc(&mut self, intermediate: Option<u8>, final_byte: u8) {

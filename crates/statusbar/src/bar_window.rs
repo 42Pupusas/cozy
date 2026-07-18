@@ -145,18 +145,6 @@ impl BarWindow {
         // Debug: try creating the shm pool right here, immediately after
         // discovery (matching TermWindow's ordering) instead of after the
         // layer-surface Configure round-trip.
-        {
-            let px_height_dbg = height * scale;
-            let (dbg_frames, dbg_shm_mem, dbg_pool) =
-                Self::create_frame_pair(&mut sender, shm, 1920, px_height_dbg, Format::Xrgb8888)?;
-            eprintln!(
-                "statusbar: EARLY create_frame_pair (w=1920) succeeded, pool={} frames={:?}",
-                dbg_pool.raw(),
-                dbg_frames.map(|f| f.buffer.raw())
-            );
-            drop(dbg_shm_mem);
-        }
-
         let surface: SurfaceId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
@@ -213,6 +201,35 @@ impl BarWindow {
         // `configure`, which tells us the real (output-width) pixel size.
         sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
         eprintln!("statusbar: commit ok");
+
+        // Debug: try create_frame_pair here, right after the first (buffer-less)
+        // commit, to bisect exactly which prior request flips the compositor
+        // into rejecting create_pool.
+        {
+            let px_height_dbg = height * scale;
+            match Self::create_frame_pair(&mut sender, shm, 1920, px_height_dbg, Format::Xrgb8888) {
+                Ok((f, m, p)) => {
+                    eprintln!(
+                        "statusbar: POST-COMMIT create_frame_pair OK pool={} frames={:?}",
+                        p.raw(),
+                        f.map(|x| x.buffer.raw())
+                    );
+                    drop(m);
+                }
+                Err(e) => eprintln!("statusbar: POST-COMMIT create_frame_pair FAILED: {e}"),
+            }
+            match Self::create_frame_pair(&mut sender, shm, 1920, px_height_dbg, Format::Xrgb8888) {
+                Ok((f, m, p)) => {
+                    eprintln!(
+                        "statusbar: SECOND create_frame_pair OK pool={} frames={:?}",
+                        p.raw(),
+                        f.map(|x| x.buffer.raw())
+                    );
+                    drop(m);
+                }
+                Err(e) => eprintln!("statusbar: SECOND create_frame_pair FAILED: {e}"),
+            }
+        }
 
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<platform::conn::WindowRequest>::new(Capacity::exact(64)).split();
@@ -373,10 +390,16 @@ impl BarWindow {
                     let serial = ev.arg(0);
                     let w = ev.arg(1) as i32 * self.scale;
                     eprintln!("statusbar: configure serial={serial} w={w}");
-                    self.window_tx.request(
-                        MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
+                    self.sender
+                        .request(
+                            MessageBuilder::new(
+                                self.layer_surface,
+                                LayerSurfaceRequest::AckConfigure,
+                            )
                             .u32(serial),
-                    );
+                        )
+                        .map_err(Error::Conn)?;
+                    eprintln!("statusbar: ack_configure sent synchronously");
                     if w > 0 {
                         eprintln!("statusbar: resizing to {w}");
                         self.resize(w)?;

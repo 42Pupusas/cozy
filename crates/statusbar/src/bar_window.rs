@@ -283,6 +283,7 @@ impl BarWindow {
                             "statusbar: pending bytes event object={} opcode={}",
                             wire.object_id, wire.opcode
                         );
+                        eprintln!("statusbar: raw error event bytes = {bytes:?}");
                         if wire.object_id == platform::id::DisplayId(1).raw()
                             && DisplayEvent::from_opcode(wire.opcode) == Some(DisplayEvent::Error)
                         {

@@ -204,6 +204,63 @@ fn kitty_keyboard_query_replies_with_current_flags() {
 }
 
 #[test]
+fn dec_special_graphics_translates_line_drawing_bytes() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b(0"); // designate G0 = DEC Special Graphics
+    feed(&mut g, b"lqk"); // top-left corner, horizontal line, top-right corner
+    assert_eq!(g.screen().get_cell(0, 0).ch, '\u{250c}');
+    assert_eq!(g.screen().get_cell(1, 0).ch, '\u{2500}');
+    assert_eq!(g.screen().get_cell(2, 0).ch, '\u{2510}');
+}
+
+#[test]
+fn shift_out_in_switches_between_g1_and_g0() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b)0"); // designate G1 = DEC Special Graphics
+    feed(&mut g, b"\x0e"); // SO -- invoke G1
+    feed(&mut g, b"q");
+    assert_eq!(g.screen().get_cell(0, 0).ch, '\u{2500}');
+    feed(&mut g, b"\x0f"); // SI -- back to G0 (plain ASCII)
+    feed(&mut g, b"q");
+    assert_eq!(g.screen().get_cell(1, 0).ch, 'q');
+}
+
+#[test]
+fn designating_a_non_special_charset_is_plain_ascii() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b(B"); // US-ASCII -- explicit, should be a no-op
+    feed(&mut g, b"q");
+    assert_eq!(g.screen().get_cell(0, 0).ch, 'q');
+}
+
+#[test]
+fn ris_resets_charset_state() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b(0\x0e"); // G0 = special graphics, SO to G1 (still ascii)
+    feed(&mut g, b"\x1bc"); // RIS
+    feed(&mut g, b"q");
+    assert_eq!(g.screen().get_cell(0, 0).ch, 'q');
+}
+
+#[test]
+fn bell_c0_sets_pending_flag_and_take_clears_it() {
+    let mut g = Grid::new(20, 3);
+    assert!(!g.take_bell());
+    feed(&mut g, b"\x07");
+    assert!(g.take_bell());
+    assert!(!g.take_bell(), "take_bell must clear the flag");
+}
+
+#[test]
+fn osc_title_is_captured_and_take_clears_it() {
+    let mut g = Grid::new(20, 3);
+    assert_eq!(g.take_title(), None);
+    feed(&mut g, b"\x1b]0;hello world\x07");
+    assert_eq!(g.take_title(), Some("hello world".to_string()));
+    assert_eq!(g.take_title(), None, "take_title must clear the pending value");
+}
+
+#[test]
 fn ris_resets_all_negotiated_modes() {
     let mut g = Grid::new(80, 24);
     feed(&mut g, b"\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b[?7l\x1b[?6h\x1b[?1004h\x1b[>5u");

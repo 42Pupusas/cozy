@@ -68,6 +68,10 @@ const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_milli
 /// outside the window.
 const AUTOSCROLL_MARGIN_PX: i32 = 12;
 
+/// How long a bell's title-bar flash (see [`TermWindow::bell`]) stays up
+/// before [`TermWindow::tick`] reverts it to the real title.
+const BELL_FLASH: std::time::Duration = std::time::Duration::from_millis(600);
+
 /// A keyboard/pointer input event from the compositor.
 ///
 /// Produced by [`TermWindow`] for the caller to encode into PTY bytes (M5).
@@ -523,6 +527,13 @@ pub struct TermWindow {
     /// move off the edge resets it so the next edge-pin starts its own
     /// pacing window rather than firing immediately off a stale timestamp.
     autoscroll_last: Option<std::time::Instant>,
+
+    /// The real window title, as last set via [`Self::set_title`] (OSC 0/2).
+    /// Restored after a bell flash (see [`Self::bell`]) expires.
+    base_title: String,
+    /// Deadline for the current bell title-flash, if one is showing; `None`
+    /// when no bell is pending/active. Checked once per [`Self::tick`].
+    bell_until: Option<std::time::Instant>,
 }
 
 impl Drop for TermWindow {
@@ -750,6 +761,8 @@ impl TermWindow {
             frame_stats: FrameStats::new(),
             prev_fps_rows: Vec::new(),
             autoscroll_last: None,
+            base_title: title.to_string(),
+            bell_until: None,
         })
     }
 
@@ -909,6 +922,18 @@ impl TermWindow {
             self.input_queue.push_back(InputEvent::Paste(bytes));
         }
 
+        // Revert a bell's title-bar flash once it's had its moment.
+        if self
+            .bell_until
+            .is_some_and(|until| std::time::Instant::now() >= until)
+        {
+            self.bell_until = None;
+            let title = self.base_title.clone();
+            self.window_tx.request(
+                MessageBuilder::new(self.toplevel, ToplevelRequest::SetTitle).string(&title),
+            );
+        }
+
         self.advance_autoscroll();
         self.advance_cursor_anim();
         self.maybe_present()?;
@@ -1003,6 +1028,35 @@ impl TermWindow {
     pub fn notify_activity(&mut self) {
         self.cursor_anim.on_activity();
         self.dirty = true;
+    }
+
+    /// Set the window title (OSC 0/2: `ESC ] 0 ; text BEL` /
+    /// `ESC ] 2 ; text BEL`). Best-effort -- a request-send failure just
+    /// means the compositor doesn't see the new title, not a fatal error for
+    /// the terminal. Remembers `title` as the base title so a bell flash
+    /// (see [`Self::bell`]) knows what to restore afterward.
+    pub fn set_title(&mut self, title: &str) {
+        self.base_title = title.to_string();
+        self.window_tx.request(
+            MessageBuilder::new(self.toplevel, ToplevelRequest::SetTitle).string(title),
+        );
+    }
+
+    /// BEL (C0 0x07): visual bell. xdg-shell's core protocol has no
+    /// urgency-hint/attention-demand request, so this is implemented as a
+    /// brief title-bar flash (prefixing a bell glyph), which the compositor
+    /// and any taskbar/dock surfaces it -- the same fallback approach other
+    /// terminals take absent a native urgency hint. [`Self::tick`] reverts
+    /// it after [`BELL_FLASH`]. Repeated bells while one is already showing
+    /// just restart the timer rather than stacking indicators.
+    pub fn bell(&mut self) {
+        if self.bell_until.is_none() {
+            let flash = format!("\u{1f514} {}", self.base_title);
+            self.window_tx.request(
+                MessageBuilder::new(self.toplevel, ToplevelRequest::SetTitle).string(&flash),
+            );
+        }
+        self.bell_until = Some(std::time::Instant::now() + BELL_FLASH);
     }
 
     /// Block for the next Wayland event, then drain all queued events.

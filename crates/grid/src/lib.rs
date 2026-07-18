@@ -231,6 +231,83 @@ pub struct Grid {
     /// CBT), HTS and TBC all operate on this instead of assuming a fixed
     /// stride.
     tab_stops: Vec<u16>,
+    /// G0 charset, designated by `ESC ( X`.
+    g0_charset: Charset,
+    /// G1 charset, designated by `ESC ) X`.
+    g1_charset: Charset,
+    /// Which of G0/G1 is currently invoked: `false` = G0 (the power-on
+    /// default), `true` = G1 (via SO, `C0::ShiftOut`). SI (`C0::ShiftIn`)
+    /// switches back to G0.
+    shifted_to_g1: bool,
+    /// Set by a BEL (C0 0x07) since the last [`Grid::take_bell`]; cleared by
+    /// it. The UI thread polls this (same pattern as `bracketed_paste`) to
+    /// decide whether to flash/notify.
+    bell_pending: bool,
+    /// The most recent OSC 0/2 title the application set, if any, since the
+    /// last [`Grid::take_title`]; cleared by it. `None` when nothing new has
+    /// arrived (the UI thread's window keeps showing whatever title it last
+    /// applied -- this only carries the *change*, not a live mirror).
+    pending_title: Option<String>,
+}
+
+/// A designated character set slot (G0/G1). Only the two xterm/VT100
+/// actually ships (ASCII and DEC Special Graphics -- box-drawing/line art)
+/// are modeled; any other designation (UK, etc.) falls back to ASCII since
+/// we don't have distinct glyphs for them anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Charset {
+    #[default]
+    Ascii,
+    /// DEC Special Graphics (`ESC ( 0`): remaps a handful of ASCII bytes
+    /// (`j`-`~` and a few others) to line-drawing/box glyphs, the classic
+    /// `ncurses`/`vim`/`tmux` border-drawing trick predating Unicode box
+    /// characters.
+    DecSpecialGraphics,
+}
+
+impl Charset {
+    /// Map a printed character through this charset. Only
+    /// `DecSpecialGraphics` does anything; `Ascii` (and any charset we don't
+    /// model) passes everything through unchanged.
+    fn translate(self, ch: char) -> char {
+        if self != Self::DecSpecialGraphics {
+            return ch;
+        }
+        match ch {
+            '`' => '\u{25c6}', // diamond
+            'a' => '\u{2592}', // checkerboard
+            'b' => '\u{2409}', // HT symbol
+            'c' => '\u{240c}', // FF symbol
+            'd' => '\u{240d}', // CR symbol
+            'e' => '\u{240a}', // LF symbol
+            'f' => '\u{00b0}', // degree
+            'g' => '\u{00b1}', // plus/minus
+            'h' => '\u{2424}', // NL symbol
+            'i' => '\u{240b}', // VT symbol
+            'j' => '\u{2518}', // bottom-right corner
+            'k' => '\u{2510}', // top-right corner
+            'l' => '\u{250c}', // top-left corner
+            'm' => '\u{2514}', // bottom-left corner
+            'n' => '\u{253c}', // crossing lines
+            'o' => '\u{23ba}', // scan line 1
+            'p' => '\u{23bb}', // scan line 3
+            'q' => '\u{2500}', // horizontal line
+            'r' => '\u{23bc}', // scan line 7
+            's' => '\u{23bd}', // scan line 9
+            't' => '\u{251c}', // left tee
+            'u' => '\u{2524}', // right tee
+            'v' => '\u{2534}', // bottom tee
+            'w' => '\u{252c}', // top tee
+            'x' => '\u{2502}', // vertical line
+            'y' => '\u{2264}', // less-or-equal
+            'z' => '\u{2265}', // greater-or-equal
+            '{' => '\u{03c0}', // pi
+            '|' => '\u{2260}', // not-equal
+            '}' => '\u{00a3}', // pound sterling
+            '~' => '\u{00b7}', // centered dot
+            _ => ch,
+        }
+    }
 }
 
 impl Grid {
@@ -264,6 +341,11 @@ impl Grid {
             origin_mode: false,
             focus_events: false,
             tab_stops: Self::default_tab_stops(cols),
+            g0_charset: Charset::Ascii,
+            g1_charset: Charset::Ascii,
+            shifted_to_g1: false,
+            bell_pending: false,
+            pending_title: None,
         }
     }
 
@@ -597,6 +679,17 @@ impl Grid {
     }
 
     fn print(&mut self, ch: char) {
+        // Translate through whichever of G0/G1 is currently invoked (SO/SI)
+        // before measuring width -- DEC Special Graphics remaps a handful of
+        // plain ASCII bytes to box-drawing glyphs, which are still
+        // single-width, so translating first doesn't change the width path
+        // below.
+        let active_charset = if self.shifted_to_g1 {
+            self.g1_charset
+        } else {
+            self.g0_charset
+        };
+        let ch = active_charset.translate(ch);
         let width = {
             use text_layout::measurement::CellWidth as _;
             ch.cell_width()
@@ -677,7 +770,7 @@ impl Grid {
 
     fn control(&mut self, c0: C0) {
         match c0 {
-            C0::Bell => { /* TODO: notify platform */ }
+            C0::Bell => self.bell_pending = true,
             C0::Backspace => {
                 self.pending_wrap = false;
                 if self.cursor.col > 0 {
@@ -701,7 +794,11 @@ impl Grid {
                 self.pending_wrap = false;
                 self.cursor.col = 0;
             }
-            C0::ShiftOut | C0::ShiftIn => { /* charset switching — TODO */ }
+            // SO/SI: invoke G1/G0 into the active charset slot printed
+            // characters are translated through (see `Charset::translate`,
+            // called from `print`).
+            C0::ShiftOut => self.shifted_to_g1 = true,
+            C0::ShiftIn => self.shifted_to_g1 = false,
             C0::Null | C0::Other(_) => {}
         }
     }
@@ -1223,10 +1320,24 @@ impl Grid {
         self.focus_events
     }
 
+    /// Whether a BEL (C0 0x07) has rung since the last call, clearing the
+    /// flag. Polled by the UI thread (same pattern as `bracketed_paste`) to
+    /// decide whether to flash/notify.
+    pub fn take_bell(&mut self) -> bool {
+        core::mem::take(&mut self.bell_pending)
+    }
+
+    /// The most recent OSC 0/2 window title the application set, if any
+    /// since the last call, clearing it. `None` means no new title arrived
+    /// (the UI thread's window keeps showing whatever it last applied).
+    pub fn take_title(&mut self) -> Option<String> {
+        self.pending_title.take()
+    }
+
     fn osc(&mut self, cmd: &OscCmd) {
         match cmd {
-            OscCmd::SetTitle(_title) => {
-                // TODO: propagate to platform window title.
+            OscCmd::SetTitle(title) => {
+                self.pending_title = Some((*title).to_string());
             }
             _ => {}
         }
@@ -1257,6 +1368,28 @@ impl Grid {
                 self.focus_events = false;
                 let cols = self.active_screen().cols();
                 self.tab_stops = Self::default_tab_stops(cols);
+                self.g0_charset = Charset::Ascii;
+                self.g1_charset = Charset::Ascii;
+                self.shifted_to_g1 = false;
+            }
+            // SCS — designate G0 charset (`ESC ( X`). `0` = DEC Special
+            // Graphics (line-drawing); anything else (`B` = US-ASCII, `A` =
+            // UK, ...) we don't have distinct glyphs for, so it collapses to
+            // plain ASCII passthrough.
+            (Some(b'('), final_byte) => {
+                self.g0_charset = if final_byte == b'0' {
+                    Charset::DecSpecialGraphics
+                } else {
+                    Charset::Ascii
+                };
+            }
+            // SCS — designate G1 charset (`ESC ) X`), same mapping as G0.
+            (Some(b')'), final_byte) => {
+                self.g1_charset = if final_byte == b'0' {
+                    Charset::DecSpecialGraphics
+                } else {
+                    Charset::Ascii
+                };
             }
             // DECPAM — application keypad mode.
             (None, b'=') => self.app_keypad = true,

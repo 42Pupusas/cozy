@@ -29,7 +29,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -205,6 +205,19 @@ enum InputMsg {
     Quit,
 }
 
+/// Rare, one-shot UI-facing events the grid produces that don't fit the
+/// polled-state pattern `bracketed_paste`/`TermModes` use (those are level-
+/// triggered: the UI thread just re-reads the latest value every batch). A
+/// bell or a title change is edge-triggered -- it must be observed exactly
+/// once, not re-applied every batch -- so it needs a real queue instead of
+/// an atomic. Volume is low (at most one per OSC/BEL the shell emits, never
+/// per-byte), so a `Mutex<VecDeque<_>>` is more than fast enough; this isn't
+/// a hot path like the PTY data rings.
+enum UiEvent {
+    Bell,
+    Title(String),
+}
+
 // ── Entry ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -242,6 +255,9 @@ struct App<'cfg> {
     /// [`TermModes::pack`]: written on the parser thread after every grid
     /// batch, read on the UI thread before encoding each key/mouse event.
     term_modes: Arc<AtomicU32>,
+    /// One-shot bell/title events, queued by the parser thread and drained
+    /// by the UI thread. See [`UiEvent`].
+    ui_events: Arc<Mutex<Vec<UiEvent>>>,
 }
 
 impl<'cfg> App<'cfg> {
@@ -251,6 +267,7 @@ impl<'cfg> App<'cfg> {
             quit: Arc::new(AtomicBool::new(false)),
             bracketed_paste: Arc::new(AtomicBool::new(false)),
             term_modes: Arc::new(AtomicU32::new(0)),
+            ui_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -288,6 +305,8 @@ impl<'cfg> App<'cfg> {
         let bracketed_paste_ui = Arc::clone(&self.bracketed_paste);
         let term_modes_parser = Arc::clone(&self.term_modes);
         let term_modes_ui = Arc::clone(&self.term_modes);
+        let ui_events_parser = Arc::clone(&self.ui_events);
+        let ui_events_ui = Arc::clone(&self.ui_events);
 
         // ── Cross-thread wakeups (eventfd + poll) ────────────────────────────────
         // Each thread that waits on more than one source blocks in poll(2) on an
@@ -322,6 +341,7 @@ impl<'cfg> App<'cfg> {
             pty_wake: parser_pty_wake,
             bracketed_paste: bracketed_paste_parser,
             term_modes: term_modes_parser,
+            ui_events: ui_events_parser,
             quit: quit_parser,
         }
         .spawn();
@@ -337,6 +357,7 @@ impl<'cfg> App<'cfg> {
             pty_wake: ui_pty_wake,
             bracketed_paste: &bracketed_paste_ui,
             term_modes: &term_modes_ui,
+            ui_events: &ui_events_ui,
             quit: &self.quit,
         }
         .run()?;
@@ -486,6 +507,7 @@ struct ParserWorker {
     pty_wake: waker::Waker,
     bracketed_paste: Arc<AtomicBool>,
     term_modes: Arc<AtomicU32>,
+    ui_events: Arc<Mutex<Vec<UiEvent>>>,
     quit: Arc<AtomicBool>,
 }
 
@@ -513,6 +535,7 @@ impl ParserWorker {
             pty_wake,
             bracketed_paste,
             term_modes,
+            ui_events,
             quit,
         } = self;
         ParserSession {
@@ -525,6 +548,7 @@ impl ParserWorker {
             pty_wake,
             bracketed_paste,
             term_modes,
+            ui_events,
             quit,
         }
         .run();
@@ -548,6 +572,7 @@ struct ParserSession {
     pty_wake: waker::Waker,
     bracketed_paste: Arc<AtomicBool>,
     term_modes: Arc<AtomicU32>,
+    ui_events: Arc<Mutex<Vec<UiEvent>>>,
     quit: Arc<AtomicBool>,
 }
 
@@ -667,6 +692,17 @@ impl ParserSession {
                 Ordering::Relaxed,
             );
 
+            // Drain one-shot bell/title events into the shared queue for
+            // the UI thread. Unlike the level-triggered state above, these
+            // must be observed exactly once each, so they're queued rather
+            // than overwritten.
+            if self.grid.take_bell() {
+                self.ui_events.lock().unwrap().push(UiEvent::Bell);
+            }
+            if let Some(title) = self.grid.take_title() {
+                self.ui_events.lock().unwrap().push(UiEvent::Title(title));
+            }
+
             self.publish();
         }
     }
@@ -689,6 +725,7 @@ struct UiWorker<'a> {
     pty_wake: waker::Waker,
     bracketed_paste: &'a AtomicBool,
     term_modes: &'a AtomicU32,
+    ui_events: &'a Mutex<Vec<UiEvent>>,
     quit: &'a AtomicBool,
 }
 
@@ -706,6 +743,7 @@ impl UiWorker<'_> {
             pty_wake,
             bracketed_paste,
             term_modes,
+            ui_events,
             quit,
         } = self;
         let theme = platform::Theme::from_palette(&cfg.palette);
@@ -763,6 +801,15 @@ impl UiWorker<'_> {
             // protocol, app-cursor/keypad, focus events) before encoding any
             // input this iteration produces.
             TermModes::unpack(term_modes.load(Ordering::Relaxed)).apply_to(&mut encoder);
+
+            // Drain one-shot bell/title events the parser thread queued.
+            for ev in ui_events.lock().unwrap().drain(..) {
+                match ev {
+                    UiEvent::Bell => win.bell(),
+                    UiEvent::Title(title) => win.set_title(&title),
+                }
+                did_work = true;
+            }
 
             // Push dirty snapshots into the Wayland renderer.
             while let Some(snap) = dirty_rx.pop() {

@@ -79,8 +79,7 @@ fn coalesce(snaps: &[DirtySnapshot]) -> DirtySnapshot {
         cursor: grid::CursorInfo::default(),
         cursor_changed: false,
         content_delta: 0,
-        viewport_offset: None,
-        scroll_span: None,
+        kind: grid::SnapshotKind::Incremental { scroll_span: None },
     }
 }
 
@@ -98,16 +97,16 @@ fn main() {
     // (blit_cell_face) instead of the embedded Bitmap fallback -- this is the
     // code the live app actually runs, and the only way this bench touches it.
     let font_path = args.iter().find_map(|a| a.strip_prefix("font=").map(String::from));
-    let mut renderer = match &font_path {
-        Some(path) => {
+    let mut renderer = font_path.as_ref().map_or_else(
+        || Renderer::builtin(Theme::builtin()),
+        |path| {
             let cfg = config::FontConfig {
                 path: Some(path.clone()),
                 size: 14,
             };
             Renderer::new(Theme::builtin(), &cfg)
-        }
-        None => Renderer::builtin(Theme::builtin()),
-    };
+        },
+    );
     eprintln!(
         "renderer: {} ({}x{} cell)",
         if font_path.is_some() { "FACE/ttf" } else { "BITMAP" },

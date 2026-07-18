@@ -246,6 +246,7 @@ dependencies = [
  "platform",
  "pty",
  "quetzalcoatl",
+ "ququmatz",
  "tlog",
  "vt_parser",
  "waker",

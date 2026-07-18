@@ -425,7 +425,8 @@ impl Config {
     ///
     /// Was a free `xdg_config_path()` function -- moved onto `Config` since
     /// it only ever feeds `Config::load()`.
-    fn xdg_config_path() -> std::path::PathBuf {
+    #[must_use]
+    pub fn xdg_config_path() -> std::path::PathBuf {
         let base = std::env::var("XDG_CONFIG_HOME").map_or_else(
             |_| {
                 let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_owned());

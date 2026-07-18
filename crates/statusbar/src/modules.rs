@@ -100,7 +100,7 @@ pub fn cpu_usage() -> Option<String> {
     }
     #[allow(clippy::cast_precision_loss)]
     let pct = 100.0 * (1.0 - idle_delta as f64 / total_delta as f64);
-    Some(format!("󴢼 {pct:.0}%"))
+    Some(format!(" {pct:.0}%"))
 }
 
 struct CpuTimes {

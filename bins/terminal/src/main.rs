@@ -822,6 +822,31 @@ impl UiWorker<'_> {
         // pointer's `link_id` without reaching across to the parser thread.
         let mut links: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
 
+        // Config live-reload: watch the config file for writes (most editors
+        // save via rename-into-place, which is `IN_MOVE_SELF`/`IN_ATTRIB` on
+        // the old inode or `IN_CREATE` in the directory depending on the
+        // editor -- watching the *directory* for `CLOSE_WRITE|MOVED_TO` on
+        // any entry and filtering by filename catches every common save
+        // strategy, where watching the file itself would miss an atomic
+        // rename replacing the inode out from under the watch). Best-effort:
+        // if the config dir doesn't exist yet (nothing has ever been saved
+        // there) or inotify setup fails, live-reload is simply unavailable
+        // and the rest of the terminal works exactly as before.
+        let config_path = config::Config::xdg_config_path();
+        let config_watch = config_path.parent().and_then(|dir| {
+            let ino = ququmatz::Inotify::new().ok()?;
+            let dir_c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+            ino.add_watch(
+                &dir_c,
+                ququmatz::WatchMask::CLOSE_WRITE | ququmatz::WatchMask::MOVED_TO,
+            )
+            .ok()?;
+            Some(ino)
+        });
+        let config_file_name = config_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+
         loop {
             if quit.load(Ordering::Relaxed) {
                 break;
@@ -1033,6 +1058,27 @@ impl UiWorker<'_> {
                 pty_wake.signal();
             }
 
+            // Config live-reload: drain any pending inotify events on the
+            // config directory and, if our file was among the touched
+            // names, re-parse and hot-apply what's safe to change without a
+            // restart (theme/palette, font, opacity, cursor style/blink).
+            // `[general]` (shell, scrollback size, ...) and `[keybinds]`
+            // still need a restart -- they're consumed once at process
+            // startup on other threads this loop has no channel to.
+            if let (Some(ino), Some(fname)) = (&config_watch, &config_file_name)
+                && inotify_touched(ino, fname)
+            {
+                match config::Config::load_from(&config_path) {
+                    Ok(new_cfg) => {
+                        apply_live_config(&new_cfg, &mut win);
+                        did_work = true;
+                    }
+                    Err(e) => {
+                        eprintln!("terminal: config reload failed, keeping old config: {e}");
+                    }
+                }
+            }
+
             if !win.tick()? {
                 break;
             }
@@ -1061,6 +1107,129 @@ impl UiWorker<'_> {
 
         quit.store(true, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+// ── Config live-reload ────────────────────────────────────────────────────────────────────
+
+/// Drain every pending inotify event on the config directory's watch and
+/// report whether any of them named `fname` (our config file specifically,
+/// not some unrelated file saved alongside it in the same directory).
+/// Non-blocking -- the fd was opened with `IN_NONBLOCK`, so an empty read
+/// just means "nothing changed", not a stall.
+fn inotify_touched(ino: &ququmatz::Inotify, fname: &str) -> bool {
+    // Sized for a handful of coalesced events; `inotify_event` is 16 bytes
+    // plus each event's (padded) trailing filename, so this comfortably
+    // covers a burst of saves without needing to loop reads.
+    let mut buf = [0u8; 4096];
+    // EAGAIN (nothing pending) or a transient error either way.
+    let Ok(n) = ququmatz::syscall::read(ino.fd(), buf.as_mut_ptr(), buf.len()) else {
+        return false;
+    };
+    let header_size = std::mem::size_of::<ququmatz::InotifyEvent>();
+    let mut touched = false;
+    let mut off = 0usize;
+    while off + header_size <= n {
+        // SAFETY: `buf[off..]` holds at least `header_size` bytes of a kernel-
+        // written `inotify_event`, which is a plain-old-data repr(C) struct
+        // with no padding-sensitive invariants -- an unaligned read is exactly
+        // what the kernel's own byte-packed event stream requires.
+        let ev: ququmatz::InotifyEvent =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) };
+        let name_len = ev.len as usize;
+        let name_start = off + header_size;
+        let name_end = name_start + name_len;
+        if name_end > n {
+            break; // Truncated trailing event -- stop rather than read garbage.
+        }
+        if name_len > 0 {
+            // The kernel pads the name with trailing NULs to the next 4-byte
+            // boundary; trim them before comparing.
+            let raw = &buf[name_start..name_end];
+            let trimmed = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
+            if trimmed == fname.as_bytes() {
+                touched = true;
+            }
+        }
+        off = name_end;
+    }
+    touched
+}
+
+/// Hot-apply the subset of a freshly-reloaded config that's safe to change
+/// without restarting the process: theme/palette, font, window opacity, and
+/// cursor style/blink. Everything else (`[general]`'s shell/scrollback,
+/// `[keybinds]`) is read once at startup on threads this function has no
+/// channel to reach, so it's simply left as-is until the next restart --
+/// consistent with how most terminals scope live-reload to appearance, not
+/// process-lifetime settings.
+fn apply_live_config(cfg: &Config, win: &mut TermWindow) {
+    let theme = platform::Theme::from_palette(&cfg.palette);
+    let renderer = platform::Renderer::with_scale(theme, &cfg.font, win.output_scale())
+        .with_opacity(cfg.window.opacity);
+    if win.needs_alpha_changed(&renderer) {
+        eprintln!(
+            "terminal: config reload: [window] opacity crossed the opaque/translucent boundary -- restart to apply (buffer format is fixed at startup)"
+        );
+        return;
+    }
+    win.set_renderer(renderer);
+    win.set_cursor_config(platform::CursorAnimConfig {
+        shape: match cfg.cursor.style {
+            config::CursorStyle::Block => grid::CursorShape::Block,
+            config::CursorStyle::Beam => grid::CursorShape::Bar,
+            config::CursorStyle::Underline => grid::CursorShape::Underline,
+        },
+        blink: cfg.cursor.blink,
+        #[allow(clippy::cast_precision_loss)]
+        period_ms: (cfg.cursor.blink_rate * 2) as f32,
+    });
+}
+
+#[cfg(test)]
+mod live_reload_tests {
+    use super::inotify_touched;
+
+    /// Write to a file inside a fresh temp dir, watched the same way
+    /// `UiWorker::run` watches the real config directory (`CLOSE_WRITE |
+    /// MOVED_TO` on the directory, filtered by filename), and confirm
+    /// `inotify_touched` reports the save. Exercises the real kernel ABI --
+    /// event header size/layout, name padding/NUL-trimming -- not a mock.
+    #[test]
+    fn detects_a_save_to_the_watched_file() {
+        let dir = std::env::temp_dir().join(format!("terminal-live-reload-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("config.toml");
+        std::fs::write(&file, "initial").unwrap();
+
+        let ino = ququmatz::Inotify::new().expect("inotify_init1");
+        let dir_c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).unwrap();
+        ino.add_watch(
+            &dir_c,
+            ququmatz::WatchMask::CLOSE_WRITE | ququmatz::WatchMask::MOVED_TO,
+        )
+        .expect("add_watch");
+
+        // No event yet -- a fresh watch with nothing written since must report false.
+        assert!(!inotify_touched(&ino, "config.toml"));
+
+        // A write + close (what every editor's "save" does, atomic-rename
+        // editors aside) fires CLOSE_WRITE.
+        std::fs::write(&file, "updated").unwrap();
+        // inotify delivery is asynchronous; give the kernel a moment.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(inotify_touched(&ino, "config.toml"));
+
+        // Already drained -- a second immediate check sees nothing new.
+        assert!(!inotify_touched(&ino, "config.toml"));
+
+        // A save to some other file in the same directory must not be
+        // reported as touching our config file.
+        std::fs::write(dir.join("unrelated.txt"), "noise").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!inotify_touched(&ino, "config.toml"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

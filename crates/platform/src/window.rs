@@ -1083,6 +1083,55 @@ impl TermWindow {
         self.dirty = true;
     }
 
+    /// The `wl_output`-advertised buffer scale this window opened at, for
+    /// rebuilding a [`render::Renderer`] at the right physical pixel density
+    /// (e.g. after a config-file live-reload picks a new font).
+    #[must_use]
+    pub const fn output_scale(&self) -> i32 {
+        self.scale
+    }
+
+    /// Swap in a freshly-built renderer (new theme/font/opacity) and force a
+    /// full repaint so the new theme actually reaches the screen -- without
+    /// this, only the next content change would repaint, leaving already-
+    /// drawn rows showing colors from the *old* theme until they happen to
+    /// scroll or get overwritten. Used by config live-reload; the caller
+    /// builds the new `Renderer` (needs `output_scale()` for HiDPI, and may
+    /// need to reopen a Wayland buffer if opacity's opaque/translucent split
+    /// changed -- see [`Self::needs_alpha_changed`]) and hands it over here.
+    pub fn set_renderer(&mut self, renderer: render::Renderer) {
+        self.renderer = renderer;
+        self.dirty = true;
+        // A full repaint needs every visible row queued as if freshly dirtied,
+        // not just whatever changed since the last frame -- otherwise rows
+        // that haven't changed content-wise (but need their pixels redrawn in
+        // the new theme) are silently skipped by `repaint_rows`.
+        self.pending_dirty.clear();
+        self.stale_rows[0].iter_mut().for_each(|s| *s = true);
+        self.stale_rows[1].iter_mut().for_each(|s| *s = true);
+    }
+
+    /// Whether swapping to `renderer` would change the opaque/translucent
+    /// `wl_shm` buffer format (`Xrgb8888` vs. `Argb8888`) this window was
+    /// opened with. A live-reload that only touches colors never trips this;
+    /// one that changes `[window] opacity` across the 1.0 boundary does, and
+    /// the caller needs to know since the buffer format is otherwise fixed
+    /// for the window's lifetime (see the `buf_format` field doc) --
+    /// switching it live isn't implemented, so that specific edge case still
+    /// needs a restart.
+    #[must_use]
+    pub fn needs_alpha_changed(&self, renderer: &render::Renderer) -> bool {
+        renderer.needs_alpha() != (self.buf_format == Format::Argb8888)
+    }
+
+    /// Update the cursor animation config (shape/blink/period) in place --
+    /// used by config live-reload, which can change `[cursor]` without
+    /// needing a full renderer rebuild.
+    pub fn set_cursor_config(&mut self, cfg: crate::cursor_anim::CursorAnimConfig) {
+        self.cursor_anim.set_config(cfg);
+        self.dirty = true;
+    }
+
     /// Set the window title (OSC 0/2: `ESC ] 0 ; text BEL` /
     /// `ESC ] 2 ; text BEL`). Best-effort -- a request-send failure just
     /// means the compositor doesn't see the new title, not a fatal error for

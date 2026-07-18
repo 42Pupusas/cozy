@@ -16,6 +16,7 @@ tlog         = { path = "../../crates/tlog" }
 vt_parser    = { path = "../../crates/vt_parser" }
 waker        = { path = "../../crates/waker" }
 quetzalcoatl = { workspace = true }
+ququmatz     = { workspace = true }
 
 [features]
 trace = ["tlog/trace", "platform/trace"]

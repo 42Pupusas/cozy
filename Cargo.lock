@@ -102,6 +102,7 @@ version = "0.1.0"
 name = "grid"
 version = "0.1.0"
 dependencies = [
+ "input",
  "quetzalcoatl",
  "text_layout",
  "vt_parser",

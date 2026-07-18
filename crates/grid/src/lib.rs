@@ -46,6 +46,7 @@ pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand, Sn
 pub use screen::Screen;
 pub use selection::{Point as SelPoint, Selection};
 
+use input::{KeyboardMode, MouseMode};
 use vt_parser::{C0, CsiAction, OscCmd, SgrAttr, TermEvent};
 
 /// Scrollback limit (lines above the visible area).
@@ -187,6 +188,49 @@ pub struct Grid {
     /// [`Grid::requeue_snapshot`] if that build turned out to be undeliverable
     /// -- exactly mirroring how `force_cursor_changed` guards `last_cursor`.
     rendered_offset: Option<usize>,
+    /// Negotiated mouse-reporting mode (DECSET 1000/1002/1003 select the
+    /// tracking granularity; 1006 layers SGR encoding on top and is tracked
+    /// separately in `sgr_mouse` since xterm lets an app toggle it
+    /// independently, in either order). Read by the UI thread (via
+    /// [`Grid::mouse_mode`]) to decide whether/how to report pointer events
+    /// down the PTY; the grid itself never touches the pointer.
+    mouse_mode: MouseMode,
+    /// `CSI ? 1006 h/l` — SGR mouse coordinate encoding, layered on top of
+    /// whichever tracking mode `mouse_mode` holds.
+    sgr_mouse: bool,
+    /// Negotiated keyboard-encoding protocol (`Legacy` / `XtermModifyOtherKeys`
+    /// / `Kitty`), set by xterm's modifyOtherKeys CSI or the Kitty
+    /// progressive-enhancement push/pop/set CSIs. Read by the UI thread's
+    /// `Encoder` (via [`Grid::keyboard_mode`]) so keys are encoded the way
+    /// the running application actually asked for.
+    keyboard_mode: KeyboardMode,
+    /// Kitty progressive-enhancement flag stack. The top of the stack (last
+    /// element) is the active flag set; `CSI > flags u` pushes, `CSI < Pn u`
+    /// pops `Pn` entries. Empty stack = flags 0 (all enhancements off).
+    kitty_flag_stack: Vec<u8>,
+    /// DECCKM (`CSI ? 1 h/l`) — application-cursor mode: arrow keys send SS3
+    /// instead of CSI. Read by the UI thread's `Encoder`.
+    app_cursor: bool,
+    /// DECPAM/DECPNM (`ESC =` / `ESC >`) — application-keypad mode.
+    app_keypad: bool,
+    /// DECAWM (`CSI ? 7 h/l`) — autowrap mode. On by default (xterm/VT100
+    /// default); when off, a glyph printed in the last column overwrites it
+    /// instead of wrapping to the next line.
+    autowrap: bool,
+    /// DECOM (`CSI ? 6 h/l`) — origin mode. When on, cursor addressing
+    /// (CUP/HVP) is relative to the scroll region's top margin instead of
+    /// the whole screen, and the cursor is clamped inside the scroll region.
+    origin_mode: bool,
+    /// Focus-event reporting (`CSI ? 1004 h/l`, xterm). When on, the
+    /// terminal must send `CSI I` / `CSI O` on focus in/out -- tracked here
+    /// so the UI thread knows whether to bother encoding+forwarding focus
+    /// changes.
+    focus_events: bool,
+    /// Tab stops (HTS/TBC), stored as a sorted set of 0-indexed columns.
+    /// Starts at the classic every-8-columns default; `CSI Ps I`/`Z` (CHT/
+    /// CBT), HTS and TBC all operate on this instead of assuming a fixed
+    /// stride.
+    tab_stops: Vec<u16>,
 }
 
 impl Grid {
@@ -210,6 +254,16 @@ impl Grid {
             pending_wrap: false,
             last_cursor: CursorInfo::default(),
             force_cursor_changed: false,
+            mouse_mode: MouseMode::Off,
+            sgr_mouse: false,
+            keyboard_mode: KeyboardMode::Legacy,
+            kitty_flag_stack: Vec::new(),
+            app_cursor: false,
+            app_keypad: false,
+            autowrap: true,
+            origin_mode: false,
+            focus_events: false,
+            tab_stops: Self::default_tab_stops(cols),
         }
     }
 
@@ -269,6 +323,18 @@ impl Grid {
 
         self.dirty = DirtyRegion::new(cols, rows);
         self.dirty.mark_all();
+
+        // Tab stops: drop any beyond the new (narrower) width; when
+        // widening, extend with the default every-8-columns stride past
+        // whatever the old width was (matches xterm: a widen doesn't
+        // retroactively add stops inside the old visible area that TBC may
+        // have cleared, only fills in the newly-revealed columns).
+        let old_max = self.tab_stops.last().copied().map_or(0, |c| c + 1);
+        self.tab_stops.retain(|&c| c < cols);
+        if cols > old_max {
+            self.tab_stops
+                .extend((old_max.max(8).next_multiple_of(8)..cols).step_by(8));
+        }
     }
 
     /// Apply a parsed VT event to the grid.
@@ -506,6 +572,12 @@ impl Grid {
         (self.cursor.col, self.cursor.row)
     }
 
+    /// Current cursor visual shape (DECSCUSR, `CSI Ps SP q`).
+    #[must_use]
+    pub fn cursor_shape(&self) -> CursorShape {
+        self.cursor.shape
+    }
+
     // ── private ───────────────────────────────────────────────────────────
 
     fn active_screen(&self) -> &Screen {
@@ -543,7 +615,7 @@ impl Grid {
         }
 
         let cols = self.active_screen().cols();
-        if width == 2 && self.cursor.col + 1 == cols {
+        if width == 2 && self.cursor.col + 1 == cols && self.autowrap {
             let row = self.cursor.row;
             let c = self.cursor.col;
             self.active_screen_mut().set_cell(c, row, Cell::default());
@@ -589,7 +661,10 @@ impl Grid {
             self.cursor.col += advance;
         } else {
             self.cursor.col = cols - 1;
-            self.pending_wrap = true;
+            // DECAWM off: the cursor sticks at the last column instead of
+            // arming a deferred wrap -- the next glyph overwrites it, rather
+            // than wrapping to a new line.
+            self.pending_wrap = self.autowrap;
         }
     }
 
@@ -610,11 +685,11 @@ impl Grid {
                 }
             }
             C0::Tab => {
-                // Advance to next tabstop (every 8 cols).
+                // Advance to the next tab stop (HTS/TBC-aware; falls back to
+                // the screen's right edge if there's no stop beyond the
+                // cursor -- e.g. every stop past the cursor was TBC'd).
                 self.pending_wrap = false;
-                let next = (self.cursor.col / 8 + 1) * 8;
-                let cols = self.active_screen().cols();
-                self.cursor.col = next.min(cols - 1);
+                self.cursor_forward_tab(1);
             }
             C0::LineFeed => {
                 // A newline after a full-width line: the deferred wrap is
@@ -705,7 +780,17 @@ impl Grid {
                 let cols = self.active_screen().cols();
                 let rows = self.active_screen().rows();
                 self.cursor.col = col.saturating_sub(1).min(cols - 1);
-                self.cursor.row = row.saturating_sub(1).min(rows - 1);
+                // DECOM: row is relative to the scroll region's top margin
+                // and clamped to the region's bottom, not the whole screen.
+                if self.origin_mode {
+                    let (top, bot) = self.active_screen().scroll_region();
+                    self.cursor.row = top
+                        .saturating_add(row.saturating_sub(1))
+                        .min(bot)
+                        .min(rows - 1);
+                } else {
+                    self.cursor.row = row.saturating_sub(1).min(rows - 1);
+                }
             }
             CsiAction::EraseDisplay(mode) => {
                 let col = self.cursor.col;
@@ -832,27 +917,59 @@ impl Grid {
                 // that probe capabilities before drawing get an answer.
                 self.replies.extend_from_slice(b"\x1b[?6c");
             }
-            CsiAction::DecSet(mode) | CsiAction::SetMode(mode) => {
-                self.set_mode(*mode, true);
+            CsiAction::DecSet(mode) => self.set_dec_mode(*mode, true),
+            CsiAction::DecRst(mode) => self.set_dec_mode(*mode, false),
+            CsiAction::SetMode(mode) => self.set_ansi_mode(*mode, true),
+            CsiAction::ResetMode(mode) => self.set_ansi_mode(*mode, false),
+            CsiAction::CursorStyle(style) => self.set_cursor_style(*style),
+            CsiAction::TabClear(mode) => self.tab_clear(*mode),
+            CsiAction::CursorForwardTab(n) => self.cursor_forward_tab(*n),
+            CsiAction::CursorBackTab(n) => self.cursor_back_tab(*n),
+            CsiAction::XtermModifyOtherKeys(level) => {
+                // xterm modifyOtherKeys level 2 is the only level that
+                // actually changes wire encoding (level 0 is off, level 1
+                // only affects a handful of already-ambiguous keys we treat
+                // the same as legacy) -- so anything >= 2 switches the
+                // encoder over, and 0/1 fall back to Legacy.
+                self.keyboard_mode = if *level >= 2 {
+                    KeyboardMode::XtermModifyOtherKeys
+                } else {
+                    KeyboardMode::Legacy
+                };
             }
-            CsiAction::DecRst(mode) | CsiAction::ResetMode(mode) => {
-                self.set_mode(*mode, false);
+            CsiAction::KittyKeyboardPush(flags) => {
+                self.kitty_flag_stack.push(*flags);
+                self.keyboard_mode = KeyboardMode::Kitty;
             }
-            // Not yet wired into the grid (DECSCUSR/tab-stop/xterm-modify-
-            // keys/Kitty-keyboard-protocol reporting -- `vt_parser` parses
-            // them but the grid has no cursor-shape/tab-stop model yet) and
-            // unrecognised sequences: both are safely ignorable no-ops for
-            // now rather than a build-breaking non-exhaustive match.
-            CsiAction::CursorStyle(_)
-            | CsiAction::TabClear(_)
-            | CsiAction::CursorForwardTab(_)
-            | CsiAction::CursorBackTab(_)
-            | CsiAction::XtermModifyOtherKeys(_)
-            | CsiAction::KittyKeyboardPush(_)
-            | CsiAction::KittyKeyboardPop(_)
-            | CsiAction::KittyKeyboardSet { .. }
-            | CsiAction::KittyKeyboardQuery
-            | CsiAction::Unknown { .. } => {}
+            CsiAction::KittyKeyboardPop(n) => {
+                let n = usize::from(*n).max(1);
+                let new_len = self.kitty_flag_stack.len().saturating_sub(n);
+                self.kitty_flag_stack.truncate(new_len);
+                if self.kitty_flag_stack.is_empty() {
+                    self.keyboard_mode = KeyboardMode::Legacy;
+                }
+            }
+            CsiAction::KittyKeyboardSet { flags, mode } => {
+                let top = self.kitty_flag_stack.last().copied().unwrap_or(0);
+                let new_top = match mode {
+                    2 => top | flags,
+                    3 => top & !flags,
+                    _ => *flags, // 1 = replace (and anything unrecognised)
+                };
+                if let Some(last) = self.kitty_flag_stack.last_mut() {
+                    *last = new_top;
+                } else {
+                    self.kitty_flag_stack.push(new_top);
+                }
+                self.keyboard_mode = KeyboardMode::Kitty;
+            }
+            CsiAction::KittyKeyboardQuery => {
+                use std::io::Write as _;
+                let flags = self.kitty_flag_stack.last().copied().unwrap_or(0);
+                let _ = write!(self.replies, "\x1b[?{flags}u");
+            }
+            // Unrecognised sequence: safely ignorable no-op.
+            CsiAction::Unknown { .. } => {}
         }
     }
 
@@ -888,10 +1005,45 @@ impl Grid {
         }
     }
 
-    fn set_mode(&mut self, mode: u16, enable: bool) {
+    /// `CSI ? Pm h/l` — DEC private mode set/reset. Everything that isn't a
+    /// plain ANSI `SM`/`RM` mode lives here: cursor visibility, bracketed
+    /// paste, alt-screen, mouse tracking, app-cursor/keypad, autowrap,
+    /// origin mode, and focus events.
+    fn set_dec_mode(&mut self, mode: u16, enable: bool) {
         match mode {
+            // DECCKM — application cursor keys.
+            1 => self.app_cursor = enable,
+            // DECOM — origin mode: cursor addressing becomes relative to the
+            // scroll region's top margin. Also re-homes the cursor to the
+            // (new) origin, matching real terminals' DECOM behavior.
+            6 => {
+                self.origin_mode = enable;
+                self.cursor.col = 0;
+                self.cursor.row = if enable {
+                    self.active_screen().scroll_region().0
+                } else {
+                    0
+                };
+            }
+            // DECAWM — autowrap.
+            7 => self.autowrap = enable,
             // DECTEM — cursor visibility
             25 => self.cursor.visible = enable,
+            // Mouse tracking granularity: X10/Normal/ButtonMotion/AnyEvent.
+            // Only one tracking mode is active at a time; the last one set
+            // wins (matches xterm). Disabling one that isn't active is a
+            // harmless no-op (checked so `?1000l` after `?1002h` doesn't
+            // clobber the more specific mode a well-behaved app already
+            // switched to — mirrors xterm's own behavior).
+            1000 => self.set_mouse_tracking(enable, MouseMode::Normal),
+            1002 => self.set_mouse_tracking(enable, MouseMode::ButtonMotion),
+            1003 => self.set_mouse_tracking(enable, MouseMode::AnyEvent),
+            9 => self.set_mouse_tracking(enable, MouseMode::X10),
+            // SGR mouse coordinate encoding, layered on top of the tracking
+            // mode above.
+            1006 => self.sgr_mouse = enable,
+            // Focus in/out event reporting.
+            1004 => self.focus_events = enable,
             // Bracketed paste — the app wants pasted text wrapped in
             // ESC[200~ … ESC[201~ (read by the driver when pasting).
             2004 => self.bracketed_paste = enable,
@@ -918,11 +1070,155 @@ impl Grid {
         }
     }
 
+    /// Recompute `mouse_mode` after a tracking-granularity DECSET/DECRST.
+    /// Enabling sets it to `which` outright (last-set-wins, matching
+    /// xterm); disabling only clears it if `which` is the mode currently
+    /// active, so e.g. `?1000l` after the app already switched to `?1002h`
+    /// doesn't clobber the newer mode.
+    fn set_mouse_tracking(&mut self, enable: bool, which: MouseMode) {
+        if enable {
+            self.mouse_mode = which;
+        } else if self.mouse_mode == which {
+            self.mouse_mode = MouseMode::Off;
+        }
+    }
+
+    /// `CSI Pm h/l` — plain ANSI set/reset mode (no `?` prefix). Distinct
+    /// mode space from DEC private modes (e.g. ANSI `4` is IRM/insert mode,
+    /// unrelated to DEC private `4`). Nothing in this space is implemented
+    /// yet -- IRM (insert/replace) has no effect on `Grid::print` -- so this
+    /// is currently a documented no-op rather than a silent gap.
+    fn set_ansi_mode(&mut self, _mode: u16, _enable: bool) {}
+
+    /// DECSCUSR (`CSI Ps SP q`) — set cursor shape/blink. `Ps`: 0/1 = blinking
+    /// block, 2 = steady block, 3 = blinking underline, 4 = steady underline,
+    /// 5 = blinking bar, 6 = steady bar. The renderer's own blink animation
+    /// is driven by config (not per-app blink requests), so the odd/even
+    /// blink-vs-steady distinction collapses to shape only.
+    fn set_cursor_style(&mut self, style: u16) {
+        self.cursor.shape = match style {
+            0..=2 => CursorShape::Block,
+            3 | 4 => CursorShape::Underline,
+            5 | 6 => CursorShape::Bar,
+            _ => self.cursor.shape,
+        };
+    }
+
+    /// The default tab stops: every 8 columns, matching classic VT100/xterm
+    /// behavior before any HTS/TBC has run.
+    fn default_tab_stops(cols: u16) -> Vec<u16> {
+        (0..cols).step_by(8).collect()
+    }
+
+    /// HTS (`ESC H`) — set a tab stop at the cursor's current column.
+    fn set_tab_stop(&mut self) {
+        let col = self.cursor.col;
+        if let Err(pos) = self.tab_stops.binary_search(&col) {
+            self.tab_stops.insert(pos, col);
+        }
+    }
+
+    /// TBC (`CSI Ps g`) — tab clear. `0` clears the stop at the cursor
+    /// column (if any); `3` (and xterm's `5`) clears every stop.
+    fn tab_clear(&mut self, mode: u16) {
+        match mode {
+            0 => {
+                let col = self.cursor.col;
+                if let Ok(pos) = self.tab_stops.binary_search(&col) {
+                    self.tab_stops.remove(pos);
+                }
+            }
+            3 | 5 => self.tab_stops.clear(),
+            _ => {}
+        }
+    }
+
+    /// CHT (`CSI Ps I`) — advance the cursor forward by `Ps` tab stops (at
+    /// least 1), clamped to the last column.
+    fn cursor_forward_tab(&mut self, n: u16) {
+        let cols = self.active_screen().cols();
+        let mut col = self.cursor.col;
+        for _ in 0..n.max(1) {
+            if let Some(&s) = self.tab_stops.iter().find(|&&s| s > col) {
+                col = s;
+            } else {
+                col = cols - 1;
+                break;
+            }
+        }
+        self.cursor.col = col.min(cols - 1);
+    }
+
+    /// CBT (`CSI Ps Z`) — retreat the cursor backward by `Ps` tab stops (at
+    /// least 1), clamped to column 0.
+    fn cursor_back_tab(&mut self, n: u16) {
+        let mut col = self.cursor.col;
+        for _ in 0..n.max(1) {
+            if let Some(&s) = self.tab_stops.iter().rev().find(|&&s| s < col) {
+                col = s;
+            } else {
+                col = 0;
+                break;
+            }
+        }
+        self.cursor.col = col;
+    }
+
     /// Whether the application has enabled bracketed paste (DECSET 2004).
     /// Read by the driver when wrapping clipboard paste in ESC[200~ … ESC[201~.
     #[must_use]
     pub fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
+    }
+
+    /// The negotiated mouse-reporting mode, folding in SGR encoding (DECSET
+    /// 1006): `Sgr` is reported whenever `sgr_mouse` is set and tracking
+    /// isn't `Off`, taking priority over the plain X10/Normal/ButtonMotion/
+    /// `AnyEvent` encodings those same DECSET codes would otherwise imply.
+    /// Read by the UI thread to decide whether/how to forward pointer
+    /// events to the PTY.
+    #[must_use]
+    pub fn mouse_mode(&self) -> MouseMode {
+        if self.sgr_mouse && self.mouse_mode != MouseMode::Off {
+            MouseMode::Sgr
+        } else {
+            self.mouse_mode
+        }
+    }
+
+    /// The negotiated keyboard-encoding protocol (xterm modifyOtherKeys /
+    /// Kitty progressive enhancement / legacy). Read by the UI thread's
+    /// `Encoder`.
+    #[must_use]
+    pub fn keyboard_mode(&self) -> KeyboardMode {
+        self.keyboard_mode
+    }
+
+    /// The active Kitty progressive-enhancement flags (top of the negotiated
+    /// stack), meaningful only while `keyboard_mode() == KeyboardMode::Kitty`.
+    #[must_use]
+    pub fn kitty_flags(&self) -> u8 {
+        self.kitty_flag_stack.last().copied().unwrap_or(0)
+    }
+
+    /// DECCKM — application-cursor mode (arrow keys send SS3 instead of CSI).
+    #[must_use]
+    pub fn app_cursor(&self) -> bool {
+        self.app_cursor
+    }
+
+    /// DECPAM/DECPNM — application-keypad mode.
+    #[must_use]
+    pub fn app_keypad(&self) -> bool {
+        self.app_keypad
+    }
+
+    /// Whether the application has enabled focus-event reporting (DECSET
+    /// 1004, xterm). Read by the UI thread to decide whether to encode and
+    /// forward `wl_keyboard` enter/leave as `CSI I` / `CSI O`.
+    #[must_use]
+    pub fn focus_events(&self) -> bool {
+        self.focus_events
     }
 
     fn osc(&mut self, cmd: &OscCmd) {
@@ -948,7 +1244,24 @@ impl Grid {
                 self.attrs = Attrs::default();
                 self.alt_active = false;
                 self.dirty.mark_all();
+                self.mouse_mode = MouseMode::Off;
+                self.sgr_mouse = false;
+                self.keyboard_mode = KeyboardMode::Legacy;
+                self.kitty_flag_stack.clear();
+                self.app_cursor = false;
+                self.app_keypad = false;
+                self.autowrap = true;
+                self.origin_mode = false;
+                self.focus_events = false;
+                let cols = self.active_screen().cols();
+                self.tab_stops = Self::default_tab_stops(cols);
             }
+            // DECPAM — application keypad mode.
+            (None, b'=') => self.app_keypad = true,
+            // DECPNM — normal keypad mode.
+            (None, b'>') => self.app_keypad = false,
+            // HTS — horizontal tab set: set a tab stop at the cursor column.
+            (None, b'H') => self.set_tab_stop(),
             // DECSC — save cursor
             (None, b'7') => {
                 self.saved_cursor = Some((self.cursor.col, self.cursor.row, self.attrs));

@@ -9,4 +9,5 @@ workspace = true
 [dependencies]
 vt_parser    = { path = "../vt_parser" }
 text_layout  = { path = "../text_layout" }
+input        = { path = "../input" }
 quetzalcoatl = { workspace = true }

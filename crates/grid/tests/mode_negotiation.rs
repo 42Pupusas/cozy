@@ -1,0 +1,216 @@
+//! Coverage for the mode-negotiation wiring added on top of the parser's
+//! DECSCUSR / Kitty-keyboard / tab-stop / xterm-modifyOtherKeys support:
+//! mouse tracking (1000/1002/1003/1006), DECCKM/DECAWM/DECOM/1004, tab
+//! stops (HTS/TBC/CHT/CBT), DECSCUSR, and the Kitty keyboard flag stack.
+
+use grid::{CursorShape, Grid};
+use input::{KeyboardMode, MouseMode};
+use vt_parser::Parser;
+
+fn feed(grid: &mut Grid, bytes: &[u8]) {
+    let mut p = Parser::new();
+    p.feed(bytes, |ev| grid.apply(&ev));
+}
+
+#[test]
+fn mouse_mode_starts_off() {
+    let g = Grid::new(80, 24);
+    assert_eq!(g.mouse_mode(), MouseMode::Off);
+}
+
+#[test]
+fn decset_1000_enables_normal_tracking() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[?1000h");
+    assert_eq!(g.mouse_mode(), MouseMode::Normal);
+    feed(&mut g, b"\x1b[?1000l");
+    assert_eq!(g.mouse_mode(), MouseMode::Off);
+}
+
+#[test]
+fn decset_1002_and_1003_select_motion_modes() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[?1002h");
+    assert_eq!(g.mouse_mode(), MouseMode::ButtonMotion);
+    feed(&mut g, b"\x1b[?1003h");
+    assert_eq!(g.mouse_mode(), MouseMode::AnyEvent);
+}
+
+#[test]
+fn decset_1006_layers_sgr_encoding_on_top_of_tracking() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[?1000h\x1b[?1006h");
+    assert_eq!(g.mouse_mode(), MouseMode::Sgr);
+    // Disabling 1006 falls back to the plain tracking-mode encoding.
+    feed(&mut g, b"\x1b[?1006l");
+    assert_eq!(g.mouse_mode(), MouseMode::Normal);
+}
+
+#[test]
+fn disabling_a_non_active_tracking_mode_does_not_clobber_the_active_one() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[?1002h"); // app switches straight to button-motion
+    feed(&mut g, b"\x1b[?1000l"); // stale ?1000l from an old init script
+    assert_eq!(g.mouse_mode(), MouseMode::ButtonMotion);
+}
+
+#[test]
+fn decckm_toggles_app_cursor() {
+    let mut g = Grid::new(80, 24);
+    assert!(!g.app_cursor());
+    feed(&mut g, b"\x1b[?1h");
+    assert!(g.app_cursor());
+    feed(&mut g, b"\x1b[?1l");
+    assert!(!g.app_cursor());
+}
+
+#[test]
+fn decawm_off_disables_wrap_and_sticks_cursor_at_right_edge() {
+    let mut g = Grid::new(10, 3);
+    feed(&mut g, b"\x1b[?7l"); // DECAWM off
+    feed(&mut g, b"0123456789ABC"); // would wrap onto row 1 with autowrap on
+    assert_eq!(g.cursor(), (9, 0), "cursor sticks at the last column");
+    // The last column keeps getting overwritten by each subsequent glyph
+    // instead of wrapping.
+    assert_eq!(g.screen().get_cell(9, 0).ch, 'C');
+}
+
+#[test]
+fn decawm_on_by_default_still_wraps() {
+    let mut g = Grid::new(10, 3);
+    feed(&mut g, b"0123456789A");
+    assert_eq!(g.cursor(), (1, 1));
+}
+
+#[test]
+fn decom_homes_cursor_to_scroll_region_top_and_makes_cup_relative() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[5;20r"); // scroll region rows 5..=20 (1-based)
+    feed(&mut g, b"\x1b[?6h"); // DECOM on -- re-homes cursor to region top
+    assert_eq!(g.cursor(), (0, 4));
+    // CUP row 1 now means "row 1 of the region" = absolute row 4 (0-based).
+    feed(&mut g, b"\x1b[1;1H");
+    assert_eq!(g.cursor(), (0, 4));
+    // CUP row 3 = absolute row 6.
+    feed(&mut g, b"\x1b[3;1H");
+    assert_eq!(g.cursor(), (0, 6));
+}
+
+#[test]
+fn decom_off_restores_absolute_addressing() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[5;20r\x1b[?6h\x1b[?6l");
+    assert_eq!(g.cursor(), (0, 0));
+    feed(&mut g, b"\x1b[10;1H");
+    assert_eq!(g.cursor(), (0, 9));
+}
+
+#[test]
+fn focus_events_flag_tracked() {
+    let mut g = Grid::new(80, 24);
+    assert!(!g.focus_events());
+    feed(&mut g, b"\x1b[?1004h");
+    assert!(g.focus_events());
+    feed(&mut g, b"\x1b[?1004l");
+    assert!(!g.focus_events());
+}
+
+#[test]
+fn decscusr_sets_cursor_shape() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[3 q"); // blinking underline
+    assert_eq!(g.cursor_shape(), CursorShape::Underline);
+    feed(&mut g, b"\x1b[5 q"); // blinking bar
+    assert_eq!(g.cursor_shape(), CursorShape::Bar);
+    feed(&mut g, b"\x1b[1 q"); // blinking block
+    assert_eq!(g.cursor_shape(), CursorShape::Block);
+}
+
+#[test]
+fn hts_sets_a_custom_tab_stop() {
+    let mut g = Grid::new(40, 3);
+    feed(&mut g, b"\x1b[1;6H"); // column 5 (0-based)
+    feed(&mut g, b"\x1bH"); // HTS at column 5
+    feed(&mut g, b"\x1b[1;1H\t"); // tab from col 0 should land on col 5, not 8
+    assert_eq!(g.cursor(), (5, 0));
+}
+
+#[test]
+fn tbc_clears_all_tab_stops_so_tab_jumps_to_the_right_edge() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b[3g"); // TBC all
+    feed(&mut g, b"\t");
+    assert_eq!(g.cursor(), (19, 0));
+}
+
+#[test]
+fn cht_advances_by_multiple_tab_stops() {
+    let mut g = Grid::new(40, 3);
+    feed(&mut g, b"\x1b[2I"); // CHT 2 -- default stops at 8, 16
+    assert_eq!(g.cursor(), (16, 0));
+}
+
+#[test]
+fn cbt_retreats_by_a_tab_stop() {
+    let mut g = Grid::new(40, 3);
+    feed(&mut g, b"\x1b[1;20H"); // column 19 (0-based)
+    feed(&mut g, b"\x1b[1Z"); // CBT 1 -- default stop at 16
+    assert_eq!(g.cursor(), (16, 0));
+}
+
+#[test]
+fn xterm_modify_other_keys_level_2_switches_keyboard_mode() {
+    let mut g = Grid::new(80, 24);
+    assert_eq!(g.keyboard_mode(), KeyboardMode::Legacy);
+    feed(&mut g, b"\x1b[>4;2m");
+    assert_eq!(g.keyboard_mode(), KeyboardMode::XtermModifyOtherKeys);
+    feed(&mut g, b"\x1b[>4;0m");
+    assert_eq!(g.keyboard_mode(), KeyboardMode::Legacy);
+}
+
+#[test]
+fn kitty_keyboard_push_pop_switches_mode_and_flags() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[>5u"); // push flags=5
+    assert_eq!(g.keyboard_mode(), KeyboardMode::Kitty);
+    assert_eq!(g.kitty_flags(), 5);
+    feed(&mut g, b"\x1b[<1u"); // pop 1 -- stack empties, mode falls back
+    assert_eq!(g.keyboard_mode(), KeyboardMode::Legacy);
+    assert_eq!(g.kitty_flags(), 0);
+}
+
+#[test]
+fn kitty_keyboard_set_replace_or_and_and_modes() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[>1u"); // push flags=1
+    feed(&mut g, b"\x1b[=2;2u"); // OR in flag 2 -> 3
+    assert_eq!(g.kitty_flags(), 3);
+    feed(&mut g, b"\x1b[=1;3u"); // AND out flag 1 -> 2
+    assert_eq!(g.kitty_flags(), 2);
+    feed(&mut g, b"\x1b[=9;1u"); // replace -> 9
+    assert_eq!(g.kitty_flags(), 9);
+}
+
+#[test]
+fn kitty_keyboard_query_replies_with_current_flags() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[>7u");
+    feed(&mut g, b"\x1b[?u");
+    let replies = g.take_replies();
+    assert_eq!(replies, b"\x1b[?7u");
+}
+
+#[test]
+fn ris_resets_all_negotiated_modes() {
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b[?7l\x1b[?6h\x1b[?1004h\x1b[>5u");
+    feed(&mut g, b"\x1bc"); // RIS
+    assert_eq!(g.mouse_mode(), MouseMode::Off);
+    assert!(!g.app_cursor());
+    assert!(!g.focus_events());
+    assert_eq!(g.keyboard_mode(), KeyboardMode::Legacy);
+    // DECAWM back to on (default).
+    let mut g2 = Grid::new(10, 3);
+    feed(&mut g2, b"\x1b[?7l\x1bc0123456789A");
+    assert_eq!(g2.cursor(), (1, 1), "autowrap restored by RIS");
+}

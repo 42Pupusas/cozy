@@ -140,12 +140,15 @@ impl BarWindow {
             Some(o) => Self::output_scale(&mut sender, &mut events, o),
             None => 1,
         };
+        eprintln!("statusbar: scale={scale}");
 
         let surface: SurfaceId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
         )?;
+        eprintln!("statusbar: create_surface ok, id={}", surface.raw());
         sender.request(MessageBuilder::new(surface, SurfaceRequest::SetBufferScale).i32(scale))?;
+        eprintln!("statusbar: set_buffer_scale ok");
 
         let layer_surface: LayerSurfaceId = sender.alloc_id();
         sender.request(
@@ -156,21 +159,25 @@ impl BarWindow {
                 .u32(Layer::Top as u32)
                 .string(APP_ID),
         )?;
+        eprintln!("statusbar: get_layer_surface ok, id={}", layer_surface.raw());
 
         let px_height = height * scale;
         sender.request(
             MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetAnchor)
                 .u32(edge.anchor_bits()),
         )?;
+        eprintln!("statusbar: set_anchor ok");
         sender.request(
             MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetSize)
                 .i32(0)
                 .i32(height),
         )?;
+        eprintln!("statusbar: set_size ok");
         sender.request(
             MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetExclusiveZone)
                 .i32(height),
         )?;
+        eprintln!("statusbar: set_exclusive_zone ok");
         sender.request(
             MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetMargin)
                 .i32(0)
@@ -178,6 +185,7 @@ impl BarWindow {
                 .i32(0)
                 .i32(0),
         )?;
+        eprintln!("statusbar: set_margin ok");
         sender.request(
             MessageBuilder::new(
                 layer_surface,
@@ -185,9 +193,11 @@ impl BarWindow {
             )
             .u32(KeyboardInteractivity::None as u32),
         )?;
+        eprintln!("statusbar: set_keyboard_interactivity ok");
         // First commit carries no buffer -- this is what solicits the initial
         // `configure`, which tells us the real (output-width) pixel size.
         sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
+        eprintln!("statusbar: commit ok");
 
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<platform::conn::WindowRequest>::new(Capacity::exact(64)).split();
@@ -264,9 +274,30 @@ impl BarWindow {
         if self.closing {
             return Ok(false);
         }
-        self.sender
-            .drain_requests(&mut self.request_rx)
-            .map_err(Error::Conn)?;
+        if let Err(e) = self.sender.drain_requests(&mut self.request_rx) {
+            eprintln!("statusbar: drain_requests failed: {e}; checking for a pending protocol error before bailing");
+            while let Some(ev) = self.events.pop() {
+                if let RawEvent::Bytes(ref bytes) = ev {
+                    if let Some((mut wire, _)) = WireEvent::parse(bytes) {
+                        eprintln!(
+                            "statusbar: pending bytes event object={} opcode={}",
+                            wire.object_id, wire.opcode
+                        );
+                        if wire.object_id == platform::id::DisplayId(1).raw()
+                            && DisplayEvent::from_opcode(wire.opcode) == Some(DisplayEvent::Error)
+                        {
+                            let obj = wire.u32();
+                            let code = wire.u32();
+                            let msg = wire.string();
+                            eprintln!(
+                                "statusbar: PROTOCOL ERROR object={obj} code={code} msg={msg}"
+                            );
+                        }
+                    }
+                }
+            }
+            return Err(Error::Conn(e));
+        }
 
         while let Some(ev) = self.events.pop() {
             self.handle_event(ev)?;
@@ -325,24 +356,33 @@ impl BarWindow {
                 Some(LayerSurfaceEvent::Configure) => {
                     let serial = ev.arg(0);
                     let w = ev.arg(1) as i32 * self.scale;
+                    eprintln!("statusbar: configure serial={serial} w={w}");
                     self.window_tx.request(
                         MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
                             .u32(serial),
                     );
                     if w > 0 {
+                        eprintln!("statusbar: resizing to {w}");
                         self.resize(w)?;
+                        eprintln!("statusbar: resize ok");
                     }
                     self.configured = true;
                     self.dirty = true;
                     return Ok(());
                 }
                 Some(LayerSurfaceEvent::Closed) => {
+                    eprintln!("statusbar: layer_surface CLOSED by compositor");
                     self.closing = true;
                     return Ok(());
                 }
                 None => {}
             }
         }
+        eprintln!(
+            "statusbar: unhandled event object={} opcode={}",
+            ev.object_id(),
+            ev.opcode()
+        );
         Ok(())
     }
 
@@ -371,11 +411,24 @@ impl BarWindow {
             .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
         let stride = width * 4;
         let pool: PoolId = sender.alloc_id();
+        eprintln!(
+            "statusbar: create_pool shm={} pool={} size={} width={width} height={height} stride={stride}",
+            shm.raw(),
+            pool.raw(),
+            shm_mem.size_bytes()
+        );
         let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
             .new_id(pool)
             .i32(shm_mem.size_bytes() as i32)
             .finish();
-        sender.send_with_fds(msg, &[shm_mem.fd()])?;
+        eprintln!("statusbar: create_pool msg bytes = {msg:?}");
+        let fd = shm_mem.fd();
+        eprintln!(
+            "statusbar: about to send_with_fds, fd raw={}",
+            std::os::fd::AsRawFd::as_raw_fd(&fd)
+        );
+        sender.send_with_fds(msg, &[fd])?;
+        eprintln!("statusbar: send_with_fds returned Ok");
         let mut frames = [Frame {
             buffer: BufferId(0),
             free: true,
@@ -397,13 +450,17 @@ impl BarWindow {
     }
 
     fn present(&mut self, paint: &mut impl FnMut(&mut Canvas)) -> Result<()> {
+        eprintln!("statusbar: present enter");
         let (Some(frames), Some(shm_mem)) = (self.frames.as_mut(), self.shm_mem.as_mut()) else {
+            eprintln!("statusbar: present: no frames yet");
             return Ok(());
         };
         let Some(slot) = frames.iter().position(|f| f.free) else {
+            eprintln!("statusbar: present: no free frame");
             return Ok(());
         };
         frames[slot].free = false;
+        eprintln!("statusbar: present: slot={slot}");
 
         {
             let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height);
@@ -413,6 +470,7 @@ impl BarWindow {
 
         let dst = shm_mem.pixels(slot);
         dst.copy_from_slice(&self.backbuffer);
+        eprintln!("statusbar: present: copied to shm");
 
         let buffer = frames[slot].buffer;
         self.window_tx.request(
@@ -421,6 +479,7 @@ impl BarWindow {
                 .i32(0)
                 .i32(0),
         );
+        eprintln!("statusbar: present: attach queued");
         self.window_tx.request(
             MessageBuilder::new(self.surface, SurfaceRequest::Damage)
                 .i32(0)
@@ -428,12 +487,15 @@ impl BarWindow {
                 .i32(self.width)
                 .i32(self.height),
         );
+        eprintln!("statusbar: present: damage queued");
         let cb: platform::id::CallbackId = self.window_tx.alloc_id();
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Frame).new_id(cb));
         self.frame_cb = Some(cb);
+        eprintln!("statusbar: present: frame queued");
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
+        eprintln!("statusbar: present: commit queued");
         self.frame_ready = false;
         self.dirty = false;
         Ok(())
@@ -476,6 +538,7 @@ impl BarWindow {
                 let name = ev.u32();
                 let interface = ev.string();
                 let version = ev.u32();
+                eprintln!("statusbar: global {name} {interface} v{version}");
                 match interface.as_str() {
                     s if s == proto::WL_COMPOSITOR.name && compositor.is_none() => {
                         let v = proto::WL_COMPOSITOR.version.min(version);

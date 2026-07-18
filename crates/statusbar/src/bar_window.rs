@@ -6,6 +6,15 @@
 //! pixel `Canvas`), but anchored via `zwlr_layer_shell_v1` instead of
 //! `xdg_wm_base`, with no PTY/grid/selection/clipboard machinery: a bar just
 //! redraws a row of text modules on a timer or content change.
+//!
+//! The `wl_shm_pool` is created exactly once, at construction, matching
+//! `TermWindow`'s pattern: **the pool is a factory object, not a
+//! frame-sized resource** — the compositor rejects a second
+//! `wl_shm.create_pool` from a client with `invalid arguments` once a layer
+//! surface has gone through its first `ack_configure`/commit round-trip (at
+//! least on niri/wlroots), so every subsequent resize must reuse the
+//! existing pool via `wl_shm_pool.resize` (grow-only, lazy-shrink) and only
+//! recreate the two `wl_buffer`s carved out of it.
 
 use platform::conn::{Conn, ConnError, Sender, WindowSender};
 use platform::draw::{Canvas, Color};
@@ -16,10 +25,10 @@ use platform::id::{
     ShmId, SurfaceId,
 };
 use platform::protocol::{
-    self as proto, Anchor, BufferEvent, CallbackEvent, CompositorRequest, DisplayEvent,
-    DisplayRequest, Format, KeyboardInteractivity, Layer, LayerShellRequest, LayerSurfaceEvent,
-    LayerSurfaceRequest, RegistryEvent, RegistryRequest, ShmPoolRequest, ShmRequest,
-    SurfaceRequest,
+    self as proto, Anchor, BufferEvent, BufferRequest, CallbackEvent, CompositorRequest,
+    DisplayEvent, DisplayRequest, Format, KeyboardInteractivity, Layer, LayerShellRequest,
+    LayerSurfaceEvent, LayerSurfaceRequest, RegistryEvent, RegistryRequest, ShmPoolRequest,
+    ShmRequest, SurfaceRequest,
 };
 use platform::sys::ShmBuffer;
 use platform::wire::{MessageBuilder, WireEvent};
@@ -30,6 +39,14 @@ use quetzalcoatl::spsc::{Consumer, RingBuffer};
 
 const EVENT_RING_CAP: usize = 256;
 const APP_ID: &str = "statusbar";
+
+/// Placeholder width the pool is first sized at, before the compositor's
+/// initial `configure` tells us the real (output-width) size. Matches
+/// `TermWindow`'s "size known before first commit" ordering closely enough
+/// that we never hit the "second create_pool" rejection — the *first* frame
+/// pair (buffers + pool) is created up front, and every later size change
+/// reuses the same pool via `resize`.
+const INITIAL_WIDTH: i32 = 1;
 
 /// Which edge of the output the bar docks to.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -66,7 +83,6 @@ pub struct BarWindow {
 
     #[allow(dead_code)]
     compositor: CompositorId,
-    shm: ShmId,
     #[allow(dead_code)]
     layer_shell: LayerShellId,
     surface: SurfaceId,
@@ -78,9 +94,12 @@ pub struct BarWindow {
     scale: i32,
 
     width: i32,
-    frames: Option<[Frame; 2]>,
-    shm_mem: Option<ShmBuffer>,
-    pool: Option<PoolId>,
+    frames: [Frame; 2],
+    shm_mem: ShmBuffer,
+    /// The `wl_shm_pool` backing `frames`, created once in [`BarWindow::new`]
+    /// and reused for the window's whole lifetime — see the module doc for
+    /// why a second `create_pool` gets rejected.
+    pool: PoolId,
     buf_format: Format,
 
     backbuffer: Vec<u32>,
@@ -140,18 +159,24 @@ impl BarWindow {
             Some(o) => Self::output_scale(&mut sender, &mut events, o),
             None => 1,
         };
-        eprintln!("statusbar: scale={scale}");
 
-        // Debug: try creating the shm pool right here, immediately after
-        // discovery (matching TermWindow's ordering) instead of after the
-        // layer-surface Configure round-trip.
+        let px_height = height * scale;
+        let buf_format = Format::Xrgb8888;
+
+        // Create the shm pool + initial frame pair *before* any layer-shell
+        // setup — matching TermWindow's ordering, and the ordering the
+        // compositor apparently requires (a `create_pool` issued after the
+        // layer surface's first configure/commit round-trip gets rejected
+        // with "invalid arguments" on niri/wlroots). The real width arrives
+        // via the first `configure`; `resize` grows this same pool in place.
+        let (frames, shm_mem, pool) =
+            Self::create_frame_pair(&mut sender, shm, INITIAL_WIDTH, px_height, buf_format)?;
+
         let surface: SurfaceId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
         )?;
-        eprintln!("statusbar: create_surface ok, id={}", surface.raw());
         sender.request(MessageBuilder::new(surface, SurfaceRequest::SetBufferScale).i32(scale))?;
-        eprintln!("statusbar: set_buffer_scale ok");
 
         let layer_surface: LayerSurfaceId = sender.alloc_id();
         sender.request(
@@ -162,25 +187,20 @@ impl BarWindow {
                 .u32(Layer::Top as u32)
                 .string(APP_ID),
         )?;
-        eprintln!("statusbar: get_layer_surface ok, id={}", layer_surface.raw());
 
-        let px_height = height * scale;
         sender.request(
             MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetAnchor)
                 .u32(edge.anchor_bits()),
         )?;
-        eprintln!("statusbar: set_anchor ok");
         sender.request(
             MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetSize)
                 .i32(0)
                 .i32(height),
         )?;
-        eprintln!("statusbar: set_size ok");
         sender.request(
             MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetExclusiveZone)
                 .i32(height),
         )?;
-        eprintln!("statusbar: set_exclusive_zone ok");
         sender.request(
             MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetMargin)
                 .i32(0)
@@ -188,7 +208,6 @@ impl BarWindow {
                 .i32(0)
                 .i32(0),
         )?;
-        eprintln!("statusbar: set_margin ok");
         sender.request(
             MessageBuilder::new(
                 layer_surface,
@@ -196,40 +215,9 @@ impl BarWindow {
             )
             .u32(KeyboardInteractivity::None as u32),
         )?;
-        eprintln!("statusbar: set_keyboard_interactivity ok");
         // First commit carries no buffer -- this is what solicits the initial
         // `configure`, which tells us the real (output-width) pixel size.
         sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
-        eprintln!("statusbar: commit ok");
-
-        // Debug: try create_frame_pair here, right after the first (buffer-less)
-        // commit, to bisect exactly which prior request flips the compositor
-        // into rejecting create_pool.
-        {
-            let px_height_dbg = height * scale;
-            match Self::create_frame_pair(&mut sender, shm, 1920, px_height_dbg, Format::Xrgb8888) {
-                Ok((f, m, p)) => {
-                    eprintln!(
-                        "statusbar: POST-COMMIT create_frame_pair OK pool={} frames={:?}",
-                        p.raw(),
-                        f.map(|x| x.buffer.raw())
-                    );
-                    drop(m);
-                }
-                Err(e) => eprintln!("statusbar: POST-COMMIT create_frame_pair FAILED: {e}"),
-            }
-            match Self::create_frame_pair(&mut sender, shm, 1920, px_height_dbg, Format::Xrgb8888) {
-                Ok((f, m, p)) => {
-                    eprintln!(
-                        "statusbar: SECOND create_frame_pair OK pool={} frames={:?}",
-                        p.raw(),
-                        f.map(|x| x.buffer.raw())
-                    );
-                    drop(m);
-                }
-                Err(e) => eprintln!("statusbar: SECOND create_frame_pair FAILED: {e}"),
-            }
-        }
 
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<platform::conn::WindowRequest>::new(Capacity::exact(64)).split();
@@ -249,19 +237,18 @@ impl BarWindow {
             reader: Some(reader_handle),
             wake,
             compositor,
-            shm,
             layer_shell,
             surface,
             layer_surface,
             edge,
             height: px_height,
             scale,
-            width: 0,
-            frames: None,
-            shm_mem: None,
-            pool: None,
-            buf_format: Format::Xrgb8888,
-            backbuffer: Vec::new(),
+            width: INITIAL_WIDTH,
+            frames,
+            shm_mem,
+            pool,
+            buf_format,
+            backbuffer: vec![Color::BLACK.to_xrgb8888(); (INITIAL_WIDTH * px_height) as usize],
             dirty: false,
             frame_ready: true,
             frame_cb: None,
@@ -306,31 +293,9 @@ impl BarWindow {
         if self.closing {
             return Ok(false);
         }
-        if let Err(e) = self.sender.drain_requests(&mut self.request_rx) {
-            eprintln!("statusbar: drain_requests failed: {e}; checking for a pending protocol error before bailing");
-            while let Some(ev) = self.events.pop() {
-                if let RawEvent::Bytes(ref bytes) = ev {
-                    if let Some((mut wire, _)) = WireEvent::parse(bytes) {
-                        eprintln!(
-                            "statusbar: pending bytes event object={} opcode={}",
-                            wire.object_id, wire.opcode
-                        );
-                        eprintln!("statusbar: raw error event bytes = {bytes:?}");
-                        if wire.object_id == platform::id::DisplayId(1).raw()
-                            && DisplayEvent::from_opcode(wire.opcode) == Some(DisplayEvent::Error)
-                        {
-                            let obj = wire.u32();
-                            let code = wire.u32();
-                            let msg = wire.string();
-                            eprintln!(
-                                "statusbar: PROTOCOL ERROR object={obj} code={code} msg={msg}"
-                            );
-                        }
-                    }
-                }
-            }
-            return Err(Error::Conn(e));
-        }
+        self.sender
+            .drain_requests(&mut self.request_rx)
+            .map_err(Error::Conn)?;
 
         while let Some(ev) = self.events.pop() {
             self.handle_event(ev)?;
@@ -367,13 +332,11 @@ impl BarWindow {
             return Ok(());
         }
 
-        if let Some(frames) = &mut self.frames {
-            if let Some(frame) = frames.iter_mut().find(|f| ev.is(f.buffer)) {
-                if ev.event::<BufferEvent>() == Some(BufferEvent::Release) {
-                    frame.free = true;
-                }
-                return Ok(());
+        if let Some(frame) = self.frames.iter_mut().find(|f| ev.is(f.buffer)) {
+            if ev.event::<BufferEvent>() == Some(BufferEvent::Release) {
+                frame.free = true;
             }
+            return Ok(());
         }
 
         if let Some(cb) = self.frame_cb {
@@ -389,56 +352,79 @@ impl BarWindow {
                 Some(LayerSurfaceEvent::Configure) => {
                     let serial = ev.arg(0);
                     let w = ev.arg(1) as i32 * self.scale;
-                    eprintln!("statusbar: configure serial={serial} w={w}");
-                    self.sender
-                        .request(
-                            MessageBuilder::new(
-                                self.layer_surface,
-                                LayerSurfaceRequest::AckConfigure,
-                            )
+                    self.window_tx.request(
+                        MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
                             .u32(serial),
-                        )
-                        .map_err(Error::Conn)?;
-                    eprintln!("statusbar: ack_configure sent synchronously");
+                    );
                     if w > 0 {
-                        eprintln!("statusbar: resizing to {w}");
                         self.resize(w)?;
-                        eprintln!("statusbar: resize ok");
                     }
                     self.configured = true;
                     self.dirty = true;
                     return Ok(());
                 }
                 Some(LayerSurfaceEvent::Closed) => {
-                    eprintln!("statusbar: layer_surface CLOSED by compositor");
                     self.closing = true;
                     return Ok(());
                 }
                 None => {}
             }
         }
-        eprintln!(
-            "statusbar: unhandled event object={} opcode={}",
-            ev.object_id(),
-            ev.opcode()
-        );
         Ok(())
     }
 
+    /// Resize to `width` (physical pixels; height is fixed for the bar's
+    /// lifetime). Reuses the existing `wl_shm_pool` — grows it in place via
+    /// `ftruncate`/`mremap`/`wl_shm_pool.resize` when the new size doesn't
+    /// fit, lazily keeps it oversized on a shrink — and only tears down and
+    /// recreates the two `wl_buffer`s. Never issues a second
+    /// `wl_shm.create_pool` (see the module doc for why that gets rejected).
     fn resize(&mut self, width: i32) -> Result<()> {
-        if width == self.width && self.frames.is_some() {
+        if width == self.width {
             return Ok(());
         }
         self.width = width;
-        let (frames, shm_mem, pool) =
-            Self::create_frame_pair(&mut self.sender, self.shm, width, self.height, self.buf_format)?;
-        self.frames = Some(frames);
-        self.shm_mem = Some(shm_mem);
-        self.pool = Some(pool);
+
+        for frame in &self.frames {
+            self.window_tx
+                .request(MessageBuilder::new(frame.buffer, BufferRequest::Destroy));
+        }
+
+        let grew = self
+            .shm_mem
+            .resize(width as usize, self.height as usize)
+            .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
+        let stride = width * 4;
+
+        if let Some(new_cap) = grew {
+            self.window_tx.request(
+                MessageBuilder::new(self.pool, ShmPoolRequest::Resize).i32(new_cap as i32),
+            );
+        }
+
+        for (i, frame) in self.frames.iter_mut().enumerate() {
+            let buffer: BufferId = self.window_tx.alloc_id();
+            self.window_tx.request(
+                MessageBuilder::new(self.pool, ShmPoolRequest::CreateBuffer)
+                    .new_id(buffer)
+                    .i32(self.shm_mem.frame_offset(i) as i32)
+                    .i32(width)
+                    .i32(self.height)
+                    .i32(stride)
+                    .u32(self.buf_format.code()),
+            );
+            frame.buffer = buffer;
+            frame.free = true;
+        }
+
         self.backbuffer = vec![Color::BLACK.to_xrgb8888(); (width * self.height) as usize];
         Ok(())
     }
 
+    /// Build a fresh `wl_shm_pool` plus the two `wl_buffer`s carved out of
+    /// it. Called exactly once, from [`BarWindow::new`] — every later resize
+    /// goes through [`BarWindow::resize`] instead, which reuses this same
+    /// pool.
     fn create_frame_pair(
         sender: &mut Sender,
         shm: ShmId,
@@ -450,27 +436,11 @@ impl BarWindow {
             .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
         let stride = width * 4;
         let pool: PoolId = sender.alloc_id();
-        eprintln!(
-            "statusbar: create_pool shm={} pool={} size={} width={width} height={height} stride={stride}",
-            shm.raw(),
-            pool.raw(),
-            shm_mem.size_bytes()
-        );
         let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
             .new_id(pool)
             .i32(shm_mem.size_bytes() as i32)
             .finish();
-        eprintln!("statusbar: create_pool msg bytes = {msg:?}");
-        let fd = shm_mem.fd();
-        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-        eprintln!("statusbar: about to send_with_fds, fd raw={raw}");
-        if let Ok(meta) = std::fs::metadata(format!("/proc/self/fd/{raw}")) {
-            eprintln!("statusbar: fd {raw} backing file len={}", meta.len());
-        } else {
-            eprintln!("statusbar: fd {raw} /proc lookup failed");
-        }
-        sender.send_with_fds(msg, &[fd])?;
-        eprintln!("statusbar: send_with_fds returned Ok");
+        sender.send_with_fds(msg, &[shm_mem.fd()])?;
         let mut frames = [Frame {
             buffer: BufferId(0),
             free: true,
@@ -492,17 +462,10 @@ impl BarWindow {
     }
 
     fn present(&mut self, paint: &mut impl FnMut(&mut Canvas)) -> Result<()> {
-        eprintln!("statusbar: present enter");
-        let (Some(frames), Some(shm_mem)) = (self.frames.as_mut(), self.shm_mem.as_mut()) else {
-            eprintln!("statusbar: present: no frames yet");
+        let Some(slot) = self.frames.iter().position(|f| f.free) else {
             return Ok(());
         };
-        let Some(slot) = frames.iter().position(|f| f.free) else {
-            eprintln!("statusbar: present: no free frame");
-            return Ok(());
-        };
-        frames[slot].free = false;
-        eprintln!("statusbar: present: slot={slot}");
+        self.frames[slot].free = false;
 
         {
             let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height);
@@ -510,18 +473,16 @@ impl BarWindow {
             paint(&mut canvas);
         }
 
-        let dst = shm_mem.pixels(slot);
+        let dst = self.shm_mem.pixels(slot);
         dst.copy_from_slice(&self.backbuffer);
-        eprintln!("statusbar: present: copied to shm");
 
-        let buffer = frames[slot].buffer;
+        let buffer = self.frames[slot].buffer;
         self.window_tx.request(
             MessageBuilder::new(self.surface, SurfaceRequest::Attach)
                 .object(buffer)
                 .i32(0)
                 .i32(0),
         );
-        eprintln!("statusbar: present: attach queued");
         self.window_tx.request(
             MessageBuilder::new(self.surface, SurfaceRequest::Damage)
                 .i32(0)
@@ -529,15 +490,12 @@ impl BarWindow {
                 .i32(self.width)
                 .i32(self.height),
         );
-        eprintln!("statusbar: present: damage queued");
         let cb: platform::id::CallbackId = self.window_tx.alloc_id();
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Frame).new_id(cb));
         self.frame_cb = Some(cb);
-        eprintln!("statusbar: present: frame queued");
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
-        eprintln!("statusbar: present: commit queued");
         self.frame_ready = false;
         self.dirty = false;
         Ok(())
@@ -580,31 +538,22 @@ impl BarWindow {
                 let name = ev.u32();
                 let interface = ev.string();
                 let version = ev.u32();
-                eprintln!("statusbar: global {name} {interface} v{version}");
                 match interface.as_str() {
                     s if s == proto::WL_COMPOSITOR.name && compositor.is_none() => {
                         let v = proto::WL_COMPOSITOR.version.min(version);
-                        let id: CompositorId = Self::bind(sender, registry, name, &interface, v)?;
-                        eprintln!("statusbar: bound compositor id={}", id.raw());
-                        compositor = Some(id);
+                        compositor = Some(Self::bind(sender, registry, name, &interface, v)?);
                     }
                     s if s == proto::WL_SHM.name && shm.is_none() => {
                         let v = proto::WL_SHM.version.min(version);
-                        let id: ShmId = Self::bind(sender, registry, name, &interface, v)?;
-                        eprintln!("statusbar: bound shm id={}", id.raw());
-                        shm = Some(id);
+                        shm = Some(Self::bind(sender, registry, name, &interface, v)?);
                     }
                     s if s == proto::ZWLR_LAYER_SHELL_V1.name && layer_shell.is_none() => {
                         let v = proto::ZWLR_LAYER_SHELL_V1.version.min(version);
-                        let id: LayerShellId = Self::bind(sender, registry, name, &interface, v)?;
-                        eprintln!("statusbar: bound layer_shell id={}", id.raw());
-                        layer_shell = Some(id);
+                        layer_shell = Some(Self::bind(sender, registry, name, &interface, v)?);
                     }
                     s if s == proto::WL_OUTPUT.name && output.is_none() => {
                         let v = proto::WL_OUTPUT.version.min(version);
-                        let id: OutputId = Self::bind(sender, registry, name, &interface, v)?;
-                        eprintln!("statusbar: bound output id={}", id.raw());
-                        output = Some(id);
+                        output = Some(Self::bind(sender, registry, name, &interface, v)?);
                     }
                     _ => {}
                 }

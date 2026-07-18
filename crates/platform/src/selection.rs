@@ -73,6 +73,15 @@ impl SelectionTracker {
         self.range.is_some()
     }
 
+    /// Whether the left button is currently held with a selection drag in
+    /// progress. Used by the window to drive edge-of-screen autoscroll only
+    /// while an actual drag is live (not e.g. after release, or before any
+    /// press).
+    #[must_use]
+    pub fn is_dragging(&self) -> bool {
+        self.left_held
+    }
+
     /// The mirrored on-screen content, indexed `[row][col]`.
     #[must_use]
     pub fn mirror(&self) -> &[Vec<grid::Cell>] {
@@ -359,6 +368,18 @@ mod tests {
         sel.press_left((0, 0), false);
         assert!(sel.drag_to((5, 0)));
         assert_eq!(sel.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn is_dragging_tracks_button_state() {
+        let mut sel = with_two_rows();
+        assert!(!sel.is_dragging());
+        sel.press_left((0, 0), false);
+        assert!(sel.is_dragging());
+        sel.drag_to((5, 0));
+        assert!(sel.is_dragging());
+        sel.release_left();
+        assert!(!sel.is_dragging());
     }
 
     #[test]

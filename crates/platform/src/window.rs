@@ -52,6 +52,22 @@ const APP_ID: &str = "forfun.terminal";
 const DEFAULT_REPEAT_RATE: u32 = 25;
 const DEFAULT_REPEAT_DELAY: u32 = 600;
 
+/// Minimum interval between edge-of-window autoscroll steps while a
+/// selection drag sits pinned to the top/bottom edge of the content area.
+/// Paces the scroll speed independent of how often `tick()` happens to run
+/// (which can be much more often than this while animations are in flight).
+const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// How close to the top/bottom edge of the content area (in pixels) the
+/// pointer must be, while dragging a selection, to trigger autoscroll.
+/// Deliberately a fixed pixel band rather than fractions-of-a-cell: Wayland
+/// stops delivering `wl_pointer.motion` the instant the pointer crosses our
+/// surface boundary (no cross-surface grab), so "drag past the edge" can
+/// only ever be observed as "drag to the last few pixels *inside* the
+/// edge" -- there's no coordinate to read once the pointer is actually
+/// outside the window.
+const AUTOSCROLL_MARGIN_PX: i32 = 12;
+
 /// A keyboard/pointer input event from the compositor.
 ///
 /// Produced by [`TermWindow`] for the caller to encode into PTY bytes (M5).
@@ -451,6 +467,14 @@ pub struct TermWindow {
     /// clean before redrawing it, the same idempotent scheme as
     /// `prev_cursor_rows`/`prev_selection_rows`.
     prev_fps_rows: Vec<u16>,
+
+    /// Wall-clock instant of the last edge-of-window autoscroll step taken
+    /// while a selection drag's pointer sits pinned to the top/bottom edge
+    /// of the content area. `None` when not currently autoscrolling (no
+    /// drag, or the pointer isn't at an edge) -- a fresh press or a pointer
+    /// move off the edge resets it so the next edge-pin starts its own
+    /// pacing window rather than firing immediately off a stale timestamp.
+    autoscroll_last: Option<std::time::Instant>,
 }
 
 impl Drop for TermWindow {
@@ -676,6 +700,7 @@ impl TermWindow {
             debug_fps: DebugFps::from_env(),
             frame_stats: FrameStats::new(),
             prev_fps_rows: Vec::new(),
+            autoscroll_last: None,
         })
     }
 
@@ -835,6 +860,7 @@ impl TermWindow {
             self.input_queue.push_back(InputEvent::Paste(bytes));
         }
 
+        self.advance_autoscroll();
         self.advance_cursor_anim();
         self.maybe_present()?;
         Ok(true)
@@ -861,10 +887,64 @@ impl TermWindow {
 
     /// Whether the caller should keep polling at animation-frame-rate
     /// (~60fps) instead of blocking on [`Self::wait`]'s full timeout -- true
-    /// while the cursor is mid-slide, or blinking and visible.
+    /// while the cursor is mid-slide, blinking and visible, or a selection
+    /// drag is pinned at the top/bottom edge and needs to keep autoscrolling
+    /// (see [`Self::advance_autoscroll`]) -- without this the UI loop would
+    /// happily block up to 100ms between autoscroll steps, into a wait that
+    /// nothing but a wall-clock timer wakes it from.
     #[must_use]
     pub fn wants_animation_frame(&self) -> bool {
-        self.cursor_anim.is_animating()
+        self.cursor_anim.is_animating() || self.autoscroll_active()
+    }
+
+    /// Whether the pointer currently sits within [`AUTOSCROLL_MARGIN_PX`] of
+    /// the top or bottom edge of the content area while a selection drag is
+    /// held -- the condition [`Self::advance_autoscroll`] acts on. Checked
+    /// against a margin band (not the literal edge) since Wayland never
+    /// reports pointer coordinates outside our surface -- see
+    /// [`AUTOSCROLL_MARGIN_PX`].
+    fn autoscroll_active(&self) -> bool {
+        self.selection.is_dragging()
+            && (self.pointer_pos.y < AUTOSCROLL_MARGIN_PX
+                || self.pointer_pos.y >= self.height - AUTOSCROLL_MARGIN_PX)
+    }
+
+    /// Edge-of-window autoscroll: while a selection drag's pointer sits
+    /// pinned above the top or below the bottom of the content area (e.g. the
+    /// user dragged past the window edge without releasing), keep scrolling
+    /// the viewport a line at a time -- paced by [`AUTOSCROLL_INTERVAL`] so it
+    /// doesn't fly by at tick-rate -- and re-pin the selection head to
+    /// whichever row is now at that edge. Re-pinning matters because a
+    /// viewport scroll's `shift()` (see [`crate::selection::SelectionTracker`])
+    /// keeps the *existing* head glued to its text, sliding it away from the
+    /// edge as new rows appear there; calling `drag_to` again every step pulls
+    /// it back to the edge, so the net effect is the selection keeps biting
+    /// into freshly revealed rows for as long as the pointer stays pinned --
+    /// exactly like continuing to drag past the edge would, without the
+    /// pointer actually having to move there.
+    fn advance_autoscroll(&mut self) {
+        if !self.autoscroll_active() {
+            self.autoscroll_last = None;
+            return;
+        }
+        let dir = if self.pointer_pos.y < AUTOSCROLL_MARGIN_PX {
+            1
+        } else {
+            -1
+        };
+        let now = std::time::Instant::now();
+        if self
+            .autoscroll_last
+            .is_some_and(|last| now.duration_since(last) < AUTOSCROLL_INTERVAL)
+        {
+            return;
+        }
+        self.autoscroll_last = Some(now);
+        self.input_queue.push_back(InputEvent::Scroll { lines: dir });
+        let (cc, cr) = self.pointer_cell();
+        if self.selection.drag_to((cc, i32::from(cr))) {
+            self.dirty = true;
+        }
     }
 
     /// Notify the cursor animator of user activity (a keystroke): resets the

@@ -393,6 +393,22 @@ impl Renderer {
 
     /// Blit a single cell into the canvas at cell column/row `cx`/`cy`.
     pub fn blit_cell(&mut self, canvas: &mut Canvas<'_>, cx: u16, cy: u16, cell: &Cell) {
+        self.blit_cell_inner(canvas, cx, cy, cell, true);
+    }
+
+    /// Core of [`Self::blit_cell`]. `fill_bg` controls whether the cell paints
+    /// its own background rectangle first: `true` for standalone single-cell
+    /// callers (cursor imprint restore, status line), `false` when
+    /// [`Self::blit_row`] has already laid down the background for the whole
+    /// row in one batched pass and only the glyph is still owed.
+    fn blit_cell_inner(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        cx: u16,
+        cy: u16,
+        cell: &Cell,
+        fill_bg: bool,
+    ) {
         // Spacer cells are the trailing (invisible) half of a wide glyph: the
         // lead cell paints both columns already, so drawing here would just
         // stamp a redundant blank over it (harmless but wasteful) -- skip.
@@ -416,7 +432,7 @@ impl Renderer {
 
         match &mut self.glyphs {
             GlyphSource::Bitmap => {
-                Self::blit_cell_bitmap(canvas, cx, cy, cell.wide, ch, fg_px, bg_px);
+                Self::blit_cell_bitmap(canvas, cx, cy, cell.wide, ch, fg_px, bg_px, fill_bg);
             }
             GlyphSource::Face(cache) => {
                 Self::blit_cell_face(
@@ -431,8 +447,84 @@ impl Renderer {
                     fg,
                     bg,
                     self.bg_alpha,
+                    fill_bg,
                 );
             }
+        }
+    }
+
+    /// Blit one dirty row, **batching the background fill** across runs of
+    /// cells that share a packed background color into a single wide `fill`
+    /// per scanline, then painting only the glyphs on top.
+    ///
+    /// The old per-cell path filled each cell's background separately -- for a
+    /// mostly-blank row (the common case under a scroll flood) that was one
+    /// narrow `fill` per cell per scanline, ~173 tiny fills per scanline where
+    /// one wide fill suffices. Here pass 1 coalesces equal-background columns
+    /// (wide-glyph spacer columns inherit their lead's background, matching the
+    /// old two-column fill) and pass 2 skips blank cells entirely -- a space
+    /// or invisible cell owes nothing once its background is down, so the
+    /// glyph pass (and its per-cell `theme.effective`) is never entered for
+    /// it.
+    fn blit_row(&mut self, canvas: &mut Canvas<'_>, cy: u16, cells: &[Cell]) {
+        let cell_w = self.cell_w as u32;
+        let cell_h = self.cell_h as u32;
+        let buf_width = canvas.width() as u32;
+        let py0 = u32::from(cy) * cell_h;
+
+        // ── Pass 1: batched background ──────────────────────────────────────
+        {
+            let mut c = 0usize;
+            while c < cells.len() {
+                let (_, bg) = self.theme.effective(&cells[c].attrs);
+                let base_bg = Self::pack_bg(bg, self.bg_alpha);
+                let start = c;
+                c += 1;
+                // Extend the run while the background matches. A spacer column
+                // (trailing half of a wide glyph) always belongs to its lead's
+                // run, so it never breaks it -- this reproduces the old path,
+                // where the wide lead filled both of its columns' backgrounds
+                // and the spacer filled nothing.
+                while c < cells.len() {
+                    let next_bg = if cells[c].spacer {
+                        base_bg
+                    } else {
+                        let (_, bg) = self.theme.effective(&cells[c].attrs);
+                        Self::pack_bg(bg, self.bg_alpha)
+                    };
+                    if next_bg != base_bg {
+                        break;
+                    }
+                    c += 1;
+                }
+
+                let px_start = start as u32 * cell_w;
+                if px_start >= buf_width {
+                    continue;
+                }
+                let px_end = (c as u32 * cell_w).min(buf_width);
+                let w = (px_end - px_start) as usize;
+                let pixels = canvas.pixels_mut();
+                for row in 0..cell_h {
+                    let py = py0 + row;
+                    let base = (py * buf_width + px_start) as usize;
+                    if let Some(slice) = pixels.get_mut(base..base + w) {
+                        slice.fill(base_bg);
+                    }
+                }
+            }
+        }
+
+        // ── Pass 2: glyphs only ─────────────────────────────────────────────
+        for (col, cell) in cells.iter().enumerate() {
+            // Blank cells owe nothing once the background is down. Skipping
+            // them here also skips their `theme.effective` + glyph lookup --
+            // the whole point on a mostly-space screen. `invisible()` forces a
+            // blank glyph, so it is blank too.
+            if cell.spacer || cell.ch == ' ' || cell.attrs.invisible() {
+                continue;
+            }
+            self.blit_cell_inner(canvas, col as u16, cy, cell, false);
         }
     }
 
@@ -450,6 +542,7 @@ impl Renderer {
     /// 0xff`), matching the pre-M9 renderer's "tofu" glyph -- this is
     /// deliberately different from [`Canvas::draw_char`], which leaves
     /// unknown chars blank.
+    #[allow(clippy::too_many_arguments)]
     fn blit_cell_bitmap(
         canvas: &mut Canvas<'_>,
         cx: u16,
@@ -458,6 +551,7 @@ impl Renderer {
         ch: char,
         fg_px: u32,
         bg_px: u32,
+        fill_bg: bool,
     ) {
         let buf_width = canvas.width() as u32;
         let px0 = u32::from(cx) * GLYPH_W as u32;
@@ -495,7 +589,9 @@ impl Renderer {
             let Some(row_slice) = pixels.get_mut(row_start..row_end) else {
                 continue;
             };
-            row_slice.fill(bg_px);
+            if fill_bg {
+                row_slice.fill(bg_px);
+            }
 
             let mask: u8 = glyph.map_or(0xff, |g| g[row as usize]);
             if mask == 0 {
@@ -537,6 +633,7 @@ impl Renderer {
         fg: DrawColor,
         bg: DrawColor,
         bg_alpha: u8,
+        fill_bg: bool,
     ) {
         let buf_width = canvas.width() as u32;
         let fg_px = if bg_alpha == 255 {
@@ -562,7 +659,7 @@ impl Renderer {
             } else {
                 cell_px_w.min(buf_width - px0)
             };
-            if clipped_w > 0 {
+            if fill_bg && clipped_w > 0 {
                 for row in 0..cell_h as u32 {
                     let py = py0 + row;
                     let row_start = (py * buf_width + px0) as usize;
@@ -702,9 +799,7 @@ impl Renderer {
             if u32::from(row.row) >= buf_rows {
                 continue;
             }
-            for (col, cell) in row.cells.iter().enumerate() {
-                self.blit_cell(canvas, col as u16, row.row, cell);
-            }
+            self.blit_row(canvas, row.row, &row.cells);
         }
         scrolled
     }
@@ -894,6 +989,64 @@ mod tests {
             wide: false,
             spacer: false,
         }
+    }
+
+    #[test]
+    fn batched_row_fill_is_byte_identical_to_per_cell_fill() {
+        // The batched `blit_row` path (one wide fill per background run, glyphs
+        // stamped on top) must produce exactly the same pixels the old
+        // per-cell path did (each cell filled its own bg, then its glyph). We
+        // prove it by painting the same row two ways into two buffers and
+        // asserting byte equality -- across a mix of glyphs, spaces, and
+        // differing backgrounds (so multiple runs exist), plus a wide glyph
+        // with its trailing spacer (which must inherit the lead's background).
+        let mut red = Attrs::default();
+        red.bg = grid::Color::Indexed(1);
+        let mut blue = Attrs::default();
+        blue.bg = grid::Color::Indexed(4);
+
+        let attr_cell = |ch: char, a: &Attrs, wide: bool, spacer: bool| Cell {
+            ch,
+            attrs: *a,
+            wide,
+            spacer,
+        };
+        let def = Attrs::default();
+        let cells = vec![
+            attr_cell('H', &def, false, false),
+            attr_cell('i', &def, false, false),
+            attr_cell(' ', &red, false, false), // bg run change
+            attr_cell('X', &red, false, false),
+            attr_cell(' ', &def, false, false), // back to default bg
+            attr_cell('W', &blue, true, false), // wide lead
+            attr_cell(' ', &blue, false, true), // spacer inherits blue bg
+            attr_cell('!', &def, false, false),
+        ];
+
+        let cols = cells.len() as u32;
+        let bw = cols * GLYPH_W as u32;
+        let bh = GLYPH_H as u32;
+
+        // Reference: force the old per-cell path (fill_bg = true for every
+        // cell, no batching, no blank-skip).
+        let mut reference = vec![0u32; (bw * bh) as usize];
+        {
+            let mut r = Renderer::builtin(Theme::builtin());
+            let mut canvas = Canvas::new(&mut reference, bw as i32, bh as i32);
+            for (col, c) in cells.iter().enumerate() {
+                r.blit_cell_inner(&mut canvas, col as u16, 0, c, true);
+            }
+        }
+
+        // Batched path under test.
+        let mut batched = vec![0u32; (bw * bh) as usize];
+        {
+            let mut r = Renderer::builtin(Theme::builtin());
+            let mut canvas = Canvas::new(&mut batched, bw as i32, bh as i32);
+            r.blit_row(&mut canvas, 0, &cells);
+        }
+
+        assert_eq!(batched, reference, "batched blit_row diverged from per-cell");
     }
 
     #[test]

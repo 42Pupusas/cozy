@@ -88,6 +88,7 @@ fn coalesce_last_writer_wins(snaps: &[DirtySnapshot]) -> DirtySnapshot {
         cursor: grid::CursorInfo::default(),
         cursor_changed: false,
         content_delta: 0,
-        kind: grid::SnapshotKind::Incremental { scroll_span: None },
+        viewport_offset: None,
+        scroll_span: None,
     }
 }

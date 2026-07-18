@@ -17,7 +17,8 @@
 //!                                   # (rendered at 96 DPI: 1pt = 96/72 px)
 //!
 //! [window]
-//! opacity = 1.0                    # 0.0 (fully transparent) .. 1.0 (opaque)
+//! opacity     = 1.0                # 0.0 (fully transparent) .. 1.0 (opaque)
+//! target_fps  = 60                 # animation poll target; raise for high-Hz displays
 //!
 //! [cursor]
 //! style       = "block"            # block | beam | underline
@@ -219,6 +220,7 @@ impl FontConfig {
     /// `size` is validated to `1..=256` points; the result comfortably fits
     /// `f32` with no precision loss.
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn px_size(&self) -> f32 {
         self.size as f32 * Self::DPI / 72.0
     }
@@ -244,11 +246,22 @@ pub struct WindowConfig {
     /// compositor that composites transparent surfaces (most Wayland ones
     /// do); on one that doesn't, this has no visible effect.
     pub opacity: f64,
+    /// Target frame rate, in frames per second, for the animation poll loop
+    /// (cursor slide/blink). This is only a *target* poll cadence, not a
+    /// guaranteed present rate: the compositor's own vsync (`wl_callback`)
+    /// is the real ceiling, so setting this above your display's refresh
+    /// rate just spends a bit more CPU polling without visible benefit.
+    /// Default `60` matches most displays; bump to `120`/`144`/etc. on a
+    /// high refresh-rate output for smoother cursor animation.
+    pub target_fps: u32,
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
-        Self { opacity: 1.0 }
+        Self {
+            opacity: 1.0,
+            target_fps: 60,
+        }
     }
 }
 
@@ -443,6 +456,15 @@ impl Config {
             "must be between 0.0 and 1.0",
         )? {
             self.window.opacity = n;
+        }
+        if let Some(n) = window.get_int_range(
+            "target_fps",
+            "window.target_fps",
+            1,
+            1000,
+            "must be between 1 and 1000",
+        )? {
+            self.window.target_fps = u32::try_from(n).unwrap_or(self.window.target_fps);
         }
         Ok(())
     }

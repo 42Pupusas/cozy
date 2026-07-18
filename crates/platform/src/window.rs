@@ -683,7 +683,7 @@ impl TermWindow {
             // text appear to move DOWN, so the selection moves down too —
             // the opposite sign of a content scroll. Reset the mirror (a
             // full-frame snapshot repaints every visible row below).
-            if let Some(new_off) = snap.viewport_offset() {
+            if let Some(new_off) = snap.viewport_offset {
                 let new_off = i32::from(new_off);
                 // Distinguish a genuine user wheel-scroll from an output-driven
                 // snap back to the bottom (offset -> 0 with new content). Only
@@ -1438,15 +1438,15 @@ impl TermWindow {
     /// current selection and after clearing one, so the highlight is
     /// idempotent (never compounds across frames) and fully reversible.
     /// Remap overlay-tracking row indices through the pixel-scrolls that
-    /// `blit_snapshot` performed this frame. Each scroll band shifted the
-    /// backbuffer scanlines for rows `top..=bot` up by `delta`, so a tracked
-    /// row `r` in that band now lives at `r - delta`. A row that scrolled
-    /// above `top` (i.e. `r - delta < top`) is gone from the visible
+    /// `blit_snapshot` performed this frame. Each scroll `(top, bot, delta)`
+    /// shifted the backbuffer scanlines for rows `top..=bot` up by `delta`, so
+    /// a tracked row `r` in that band now lives at `r - delta`. A row that
+    /// scrolled above `top` (i.e. `r - delta < top`) is gone from the visible
     /// backbuffer entirely and needs no cleanup; drop it. Rows outside the
     /// band are untouched. Applied in the same order the scrolls happened so
     /// multiple scrolls in one frame compose correctly.
-    fn shift_overlay_rows(rows: &mut Vec<u16>, scrolls: &[grid::ScrollBand]) {
-        for &grid::ScrollBand { top, bot, delta } in scrolls {
+    fn shift_overlay_rows(rows: &mut Vec<u16>, scrolls: &[(u16, u16, u16)]) {
+        for &(top, bot, delta) in scrolls {
             rows.retain_mut(|r| {
                 if *r >= top && *r <= bot {
                     if *r < top + delta {
@@ -1465,8 +1465,8 @@ impl TermWindow {
     /// frame slots aren't scrolled -- they're the actually-presented pixels --
     /// so each moved row must be copied backbuffer->shm and damaged this frame,
     /// even though only the new bottom rows appear in the snapshot's dirty set.
-    fn extend_with_scrolled_bands(touched: &mut Vec<u16>, scrolls: &[grid::ScrollBand]) {
-        for &grid::ScrollBand { top, bot, .. } in scrolls {
+    fn extend_with_scrolled_bands(touched: &mut Vec<u16>, scrolls: &[(u16, u16, u16)]) {
+        for &(top, bot, _delta) in scrolls {
             touched.extend(top..=bot);
         }
     }
@@ -1758,7 +1758,7 @@ impl TermWindow {
             }
         }
         let mut touched_rows: Vec<u16> = Vec::new();
-        let mut scrolls: Vec<grid::ScrollBand> = Vec::new();
+        let mut scrolls: Vec<(u16, u16, u16)> = Vec::new();
         let mut painted_rows: usize = 0;
         let mut painted_cells: usize = 0;
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
@@ -2238,11 +2238,6 @@ impl Registry {
 mod tests {
     use super::TermWindow;
 
-    /// Terse `ScrollBand` for the pixel-scroll tests below.
-    fn band(top: u16, bot: u16, delta: u16) -> grid::ScrollBand {
-        grid::ScrollBand { top, bot, delta }
-    }
-
     #[test]
     fn scrolled_band_marks_every_moved_row_touched_not_just_new_ones() {
         // Regression: a fast-scroll frame's snapshot only lists the genuinely-
@@ -2252,7 +2247,7 @@ mod tests {
         // must be re-copied. If only the new rows were marked, the screen would
         // freeze all but the bottom few lines -- the reported flood artifact.
         let mut touched = vec![9u16, 10, 11]; // the 3 new bottom rows
-        TermWindow::extend_with_scrolled_bands(&mut touched, &[band(0, 11, 3)]);
+        TermWindow::extend_with_scrolled_bands(&mut touched, &[(0, 11, 3)]);
         touched.sort_unstable();
         touched.dedup();
         // The full band 0..=11 must now be present, not just 9,10,11.
@@ -2265,7 +2260,7 @@ mod tests {
         // (rows 0..=9) pixel-scrolled up by 1, so the imprint now lives at
         // row 4 -- that's where we must repaint clean, not row 5.
         let mut rows = vec![5u16];
-        TermWindow::shift_overlay_rows(&mut rows, &[band(0, 9, 1)]);
+        TermWindow::shift_overlay_rows(&mut rows, &[(0, 9, 1)]);
         assert_eq!(rows, vec![4]);
     }
 
@@ -2274,7 +2269,7 @@ mod tests {
         // A row inside the shifted band but within `delta` of its top scrolled
         // off-screen entirely; there's nothing left to clean, so it's dropped.
         let mut rows = vec![0u16, 1, 2];
-        TermWindow::shift_overlay_rows(&mut rows, &[band(0, 9, 2)]);
+        TermWindow::shift_overlay_rows(&mut rows, &[(0, 9, 2)]);
         // row 0,1 scrolled off (0-2 < 0, 1-2 < 0); row 2 -> 0.
         assert_eq!(rows, vec![0]);
     }
@@ -2284,7 +2279,7 @@ mod tests {
         // Only rows 3..=6 scrolled; a tracked row above/below the band keeps
         // its position.
         let mut rows = vec![1u16, 5, 8];
-        TermWindow::shift_overlay_rows(&mut rows, &[band(3, 6, 1)]);
+        TermWindow::shift_overlay_rows(&mut rows, &[(3, 6, 1)]);
         assert_eq!(rows, vec![1, 4, 8]);
     }
 
@@ -2292,7 +2287,7 @@ mod tests {
     fn shift_overlay_rows_composes_multiple_scrolls_in_order() {
         // Two scrolls in one frame compose: row 7 -> 6 -> 5.
         let mut rows = vec![7u16];
-        TermWindow::shift_overlay_rows(&mut rows, &[band(0, 9, 1), band(0, 9, 1)]);
+        TermWindow::shift_overlay_rows(&mut rows, &[(0, 9, 1), (0, 9, 1)]);
         assert_eq!(rows, vec![5]);
     }
 

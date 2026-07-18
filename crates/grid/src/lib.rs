@@ -42,7 +42,7 @@ mod selection;
 
 pub use cell::{Attrs, Cell, Color};
 pub use cursor::{Cursor, CursorShape};
-pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand};
+pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand, SnapshotKind};
 pub use screen::Screen;
 pub use selection::{Point as SelPoint, Selection};
 
@@ -340,15 +340,17 @@ impl Grid {
         snap.cursor = cur;
         snap.cursor_changed = cursor_changed;
         snap.content_delta = self.content_delta;
-        snap.viewport_offset = None;
         // Hand the renderer the exact scrolled band so it can pixel-shift then
         // paint the precise dirty rows on top. The (0,0,0) sentinel (mixed
         // regions) and any zero-delta collapse to None: no shift, just repaint
-        // the dirty rows directly.
+        // the dirty rows directly. `take_snapshot` already stamped this as
+        // Incremental { scroll_span: None }; fill in the band.
         let PendingRepaint::Incremental(band) = core::mem::take(&mut self.pending_repaint) else {
             unreachable!("handled by the Viewport branch above");
         };
-        snap.scroll_span = band.filter(|b| b.is_active());
+        snap.kind = SnapshotKind::Incremental {
+            scroll_span: band.filter(|b| b.is_active()),
+        };
         self.content_delta = 0;
         snap
     }
@@ -364,7 +366,7 @@ impl Grid {
     /// snapshot and this call). The cursor-changed flag and content-scroll
     /// delta — both consumed/reset by that `take_dirty` — are restored too.
     pub fn requeue_snapshot(&mut self, snap: &DirtySnapshot) {
-        if let Some(offset) = snap.viewport_offset {
+        if let Some(offset) = snap.viewport_offset() {
             // A full-frame viewport snapshot: nothing incremental to
             // re-mark, just re-arm the viewport repaint so the next
             // take_dirty rebuilds the same full frame.
@@ -381,7 +383,7 @@ impl Grid {
         // include the shifted-but-unchanged rows -- those still rely on the
         // shift. So fold the scroll band back in; the next take_dirty re-emits
         // it (composing with any scroll since), and the renderer shifts then.
-        if let Some(b) = snap.scroll_span {
+        if let Some(b) = snap.scroll_span() {
             self.pending_repaint.accumulate_scroll(b.top, b.bot, b.delta);
         }
         if snap.cursor_changed {
@@ -924,7 +926,7 @@ mod tests {
 
         // The whole screen shifted up by 1.
         assert_eq!(
-            snap.scroll_span,
+            snap.scroll_span(),
             Some(ScrollBand {
                 top: 0,
                 bot: 3,

@@ -141,8 +141,7 @@ impl DirtyRegion {
             cursor: CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: None,
+            kind: SnapshotKind::Incremental { scroll_span: None },
         }
     }
 
@@ -210,6 +209,35 @@ impl ScrollBand {
     }
 }
 
+/// Which kind of repaint a [`DirtySnapshot`] carries.
+///
+/// The two are mutually exclusive by construction -- a viewport repaint
+/// redraws every visible row from scratch, which makes any incremental scroll
+/// band moot -- and this enum makes that unrepresentable-when-wrong: you
+/// cannot hold a viewport offset and a scroll band at once. Replaces a pair
+/// of fields (`viewport_offset: Option<u16>` + `scroll_span: Option<ScrollBand>`)
+/// that the renderer had to test *together* to recover the same choice, with
+/// the illegal `(Some, Some)` state reachable but meaningless.
+///
+/// `content_delta` is deliberately *not* in here: it tracks text-vs-view
+/// selection drift and is carried by both kinds, so it stays a plain field.
+#[derive(Debug, Clone, Copy)]
+pub enum SnapshotKind {
+    /// Incremental repaint: `rows` lists the exact changed rows. `scroll_span`
+    /// is `Some(band)` when everything in `[band.top, band.bot]` also shifted
+    /// up by `band.delta`, letting the renderer `copy_within`-shift that pixel
+    /// band and paint only the true dirty rows on top -- at their post-scroll
+    /// positions, so an in-place edit batched alongside the scroll lands
+    /// correctly. `None` when nothing scrolled or the fast path was abandoned
+    /// (dirty rows are painted directly, no shift).
+    Incremental { scroll_span: Option<ScrollBand> },
+    /// Full-frame viewport repaint: `rows` covers every visible row, viewed
+    /// `offset` lines up into scrollback (`0` = live bottom). Emitted when the
+    /// view window moves through history: the content is fixed but every row's
+    /// glyphs change, so an incremental dirty set can't express it.
+    Viewport { offset: u16 },
+}
+
 /// Snapshot of all rows that changed since the last render.
 ///
 /// Sent from the grid-thread to the renderer-thread via SPSC ring.
@@ -229,24 +257,11 @@ pub struct DirtySnapshot {
     /// snapshot (new output pushing lines into scrollback). The renderer
     /// shifts its selection and cell mirror up by this so a highlight stays
     /// glued to the *text*, not the viewport position, as output streams in.
-    /// `0` on the alternate screen and on full-frame (viewport) snapshots.
+    /// `0` on the alternate screen. Carried by both snapshot kinds.
     pub content_delta: u16,
-    /// `Some(k)` when this is a full-frame viewport snapshot (the view is
-    /// scrolled `k` lines into scrollback); `None` for a normal live-bottom
-    /// snapshot. Lets the renderer shift its selection/mirror with the text
-    /// as the user wheel-scrolls through history — the content is fixed but
-    /// the view window moves, the opposite transform of `content_delta`.
-    pub viewport_offset: Option<u16>,
-    /// `Some(band)` when the content in rows `[band.top, band.bot]` moved
-    /// up by `band.delta` since the last snapshot. The renderer `copy_within`-
-    /// shifts that pixel band up, then paints only the snapshot's dirty rows
-    /// on top -- which now sit at their true post-scroll positions. This
-    /// replaces the old scheme of inferring the scroll from the dirty-row
-    /// span (which forced the whole region to be marked dirty and lost any
-    /// in-place edit batched alongside the scroll). `None` when nothing
-    /// scrolled or the fast path was abandoned (dirty rows are then painted
-    /// directly, no shift).
-    pub scroll_span: Option<ScrollBand>,
+    /// Incremental (dirty-row) vs. full-frame viewport repaint -- and, for the
+    /// incremental case, the optional pixel-scroll band. See [`SnapshotKind`].
+    pub kind: SnapshotKind,
 }
 
 impl DirtySnapshot {
@@ -274,8 +289,30 @@ impl DirtySnapshot {
             cursor: CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: Some(viewport_offset.min(u16::MAX as usize) as u16),
-            scroll_span: None,
+            kind: SnapshotKind::Viewport {
+                offset: viewport_offset.min(u16::MAX as usize) as u16,
+            },
+        }
+    }
+
+    /// The pixel-scroll band, if this is an incremental snapshot carrying one.
+    /// `None` for viewport snapshots and for incremental ones that didn't
+    /// scroll.
+    #[must_use]
+    pub fn scroll_span(&self) -> Option<ScrollBand> {
+        match self.kind {
+            SnapshotKind::Incremental { scroll_span } => scroll_span,
+            SnapshotKind::Viewport { .. } => None,
+        }
+    }
+
+    /// The scrollback offset when this is a full-frame viewport snapshot;
+    /// `None` for incremental (live-bottom) snapshots.
+    #[must_use]
+    pub fn viewport_offset(&self) -> Option<u16> {
+        match self.kind {
+            SnapshotKind::Viewport { offset } => Some(offset),
+            SnapshotKind::Incremental { .. } => None,
         }
     }
 
@@ -305,7 +342,7 @@ impl DirtySnapshot {
         // Full-frame viewport snapshots repaint everything from scratch; a
         // geometry change means the row indices aren't comparable. Neither
         // composes -- bail so the caller flushes.
-        if self.viewport_offset.is_some() || next.viewport_offset.is_some() {
+        if self.viewport_offset().is_some() || next.viewport_offset().is_some() {
             return false;
         }
         if self.cols != next.cols {
@@ -314,7 +351,7 @@ impl DirtySnapshot {
         // The composed scroll band. Same-band shifts add; a scroll on only one
         // side carries through; two *different* bands can't be expressed as one
         // shift, so refuse.
-        let band = match (self.scroll_span, next.scroll_span) {
+        let band = match (self.scroll_span(), next.scroll_span()) {
             (existing, None) => existing,
             (None, Some(b)) => Some(b),
             (Some(a), Some(b)) => {
@@ -335,7 +372,7 @@ impl DirtySnapshot {
         // outside the band are untouched. A BTreeMap keeps the result sorted
         // ascending, as the `rows` invariant requires.
         let mut map: BTreeMap<u16, DirtyRow> = BTreeMap::new();
-        if let Some(ScrollBand { top, bot, delta }) = next.scroll_span {
+        if let Some(ScrollBand { top, bot, delta }) = next.scroll_span() {
             for row in self.rows.drain(..) {
                 let r = row.row;
                 if r >= top && r <= bot {
@@ -365,7 +402,9 @@ impl DirtySnapshot {
             map.insert(row.row, row.clone());
         }
         self.rows = map.into_values().collect();
-        self.scroll_span = band;
+        // Both sides are Incremental here (viewport bailed above), so this
+        // preserves the kind and just updates the composed band.
+        self.kind = SnapshotKind::Incremental { scroll_span: band };
         self.cursor = next.cursor;
         self.cursor_changed = self.cursor_changed || next.cursor_changed;
         self.content_delta = self.content_delta.saturating_add(next.content_delta);
@@ -453,8 +492,9 @@ mod tests {
             cursor: CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: scroll.map(|(t, b, d)| band(t, b, d)),
+            kind: SnapshotKind::Incremental {
+                scroll_span: scroll.map(|(t, b, d)| band(t, b, d)),
+            },
         }
     }
 
@@ -469,7 +509,7 @@ mod tests {
         let mut a = snap(4, Some((0, 7, 2)), &[(6, 'a'), (7, 'b')]);
         let b = snap(4, Some((0, 7, 3)), &[(5, 'c'), (6, 'd'), (7, 'e')]);
         assert!(a.compose(&b));
-        assert_eq!(a.scroll_span, Some(band(0, 7, 5)));
+        assert_eq!(a.scroll_span(), Some(band(0, 7, 5)));
         // a's freshly-painted rows 6,7 drag up by b's delta 3 -> rows 3,4;
         // b's rows 5,6,7 sit on top. All sorted ascending.
         assert_eq!(
@@ -495,7 +535,7 @@ mod tests {
         let b = snap(4, None, &[(3, 'n'), (4, 'n')]);
         assert!(a.compose(&b));
         assert_eq!(row_map(&a), vec![(2, 'o'), (3, 'n'), (4, 'n')]);
-        assert_eq!(a.scroll_span, None);
+        assert_eq!(a.scroll_span(), None);
     }
 
     #[test]
@@ -509,7 +549,7 @@ mod tests {
     fn compose_refuses_viewport_and_geometry_changes() {
         let a = snap(4, None, &[(0, 'a')]);
         let mut vp = snap(4, None, &[(0, 'b')]);
-        vp.viewport_offset = Some(3);
+        vp.kind = SnapshotKind::Viewport { offset: 3 };
         assert!(!a.clone().compose(&vp));
         assert!(!vp.compose(&a));
         // geometry change (different cols)
@@ -524,7 +564,7 @@ mod tests {
         let mut a = snap(4, None, &[(5, 'a')]);
         let b = snap(4, Some((0, 7, 2)), &[(7, 'b')]);
         assert!(a.compose(&b));
-        assert_eq!(a.scroll_span, Some(band(0, 7, 2)));
+        assert_eq!(a.scroll_span(), Some(band(0, 7, 2)));
         assert_eq!(row_map(&a), vec![(3, 'a'), (7, 'b')]);
     }
 }

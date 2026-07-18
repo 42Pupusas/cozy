@@ -683,7 +683,7 @@ impl TermWindow {
             // text appear to move DOWN, so the selection moves down too —
             // the opposite sign of a content scroll. Reset the mirror (a
             // full-frame snapshot repaints every visible row below).
-            if let Some(new_off) = snap.viewport_offset {
+            if let Some(new_off) = snap.viewport_offset() {
                 let new_off = i32::from(new_off);
                 // Distinguish a genuine user wheel-scroll from an output-driven
                 // snap back to the bottom (offset -> 0 with new content). Only

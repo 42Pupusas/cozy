@@ -79,8 +79,7 @@ fn coalesce(snaps: &[DirtySnapshot]) -> DirtySnapshot {
         cursor: grid::CursorInfo::default(),
         cursor_changed: false,
         content_delta: 0,
-        viewport_offset: None,
-        scroll_span: None,
+        kind: grid::SnapshotKind::Incremental { scroll_span: None },
     }
 }
 

@@ -773,8 +773,8 @@ impl Renderer {
         // in-place edit batched alongside a scroll is painted correctly instead
         // of being clobbered by a whole-region re-blit or a bad shift.
         let mut scrolled: Option<ScrollBand> = None;
-        if snap.viewport_offset.is_none() {
-            if let Some(band) = snap.scroll_span {
+        if snap.viewport_offset().is_none() {
+            if let Some(band) = snap.scroll_span() {
                 let top = u32::from(band.top);
                 let bot = u32::from(band.bot);
                 let delta = u32::from(band.delta);
@@ -1068,8 +1068,7 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: None,
+            kind: grid::SnapshotKind::Incremental { scroll_span: None },
         };
         let theme = Theme::builtin();
         let bg = theme.bg_xrgb();
@@ -1126,8 +1125,7 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: None,
+            kind: grid::SnapshotKind::Incremental { scroll_span: None },
         };
         {
             let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
@@ -1165,12 +1163,13 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 1,
-            viewport_offset: None,
-            scroll_span: Some(ScrollBand {
-                top: 0,
-                bot: 3,
-                delta: 1,
-            }),
+            kind: grid::SnapshotKind::Incremental {
+                scroll_span: Some(ScrollBand {
+                    top: 0,
+                    bot: 3,
+                    delta: 1,
+                }),
+            },
         };
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
         renderer.blit_snapshot(&mut canvas, &scrolled);
@@ -1210,15 +1209,16 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: delta,
-            viewport_offset: None,
-            scroll_span: if delta > 0 {
-                Some(ScrollBand {
-                    top: 0,
-                    bot: rows - 1,
-                    delta,
-                })
-            } else {
-                None
+            kind: grid::SnapshotKind::Incremental {
+                scroll_span: if delta > 0 {
+                    Some(ScrollBand {
+                        top: 0,
+                        bot: rows - 1,
+                        delta,
+                    })
+                } else {
+                    None
+                },
             },
         }
     }
@@ -1319,8 +1319,7 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: None,
+            kind: grid::SnapshotKind::Incremental { scroll_span: None },
         };
         {
             let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
@@ -1351,12 +1350,13 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 1,
-            viewport_offset: None,
-            scroll_span: Some(ScrollBand {
-                top: 0,
-                bot: 3,
-                delta: 1,
-            }),
+            kind: grid::SnapshotKind::Incremental {
+                scroll_span: Some(ScrollBand {
+                    top: 0,
+                    bot: 3,
+                    delta: 1,
+                }),
+            },
         };
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
         // Rows 0..=3 shifted up by 1.
@@ -1385,8 +1385,7 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: None,
+            kind: grid::SnapshotKind::Incremental { scroll_span: None },
         };
         let mut renderer = Renderer::builtin(Theme::builtin());
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);

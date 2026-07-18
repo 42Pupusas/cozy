@@ -52,7 +52,7 @@ pub fn battery() -> Option<String> {
             "Full" | "Not charging" if cap_n >= 95 => "󰚥",
             _ => battery_ramp_icon(cap_n),
         };
-        return Some(format!("{icon} {cap}%"));
+        return Some(format!("{icon} {cap:>3}%"));
     }
     None
 }
@@ -77,7 +77,7 @@ pub fn temperature() -> Option<String> {
         let path = entry.path().join("temp");
         if let Some(raw) = read_trim(path) {
             if let Ok(milli) = raw.parse::<i64>() {
-                return Some(format!("󰃈 {:.0}°C", milli as f64 / 1000.0));
+                return Some(format!("󰃈 {:>3.0}°C", milli as f64 / 1000.0));
             }
         }
     }
@@ -100,7 +100,7 @@ pub fn cpu_usage() -> Option<String> {
     }
     #[allow(clippy::cast_precision_loss)]
     let pct = 100.0 * (1.0 - idle_delta as f64 / total_delta as f64);
-    Some(format!(" {pct:.0}%"))
+    Some(format!(" {pct:>3.0}%"))
 }
 
 struct CpuTimes {
@@ -138,7 +138,7 @@ pub fn memory() -> Option<String> {
     let (total, avail) = (total_kb?, avail_kb?);
     let used_gib = (total - avail) as f64 / 1024.0 / 1024.0;
     let total_gib = total as f64 / 1024.0 / 1024.0;
-    Some(format!("󰅛 {used_gib:.1}/{total_gib:.1}GiB"))
+    Some(format!("󰅛 {used_gib:>4.1}/{total_gib:>4.1}GiB"))
 }
 
 fn parse_kb(s: &str) -> Option<u64> {
@@ -267,7 +267,7 @@ fn amixer_volume(control: &str) -> Option<String> {
 
 fn format_volume(is_source: bool, pct: u32, muted: bool) -> String {
     let icon = pick_volume_icon(is_source, pct, muted);
-    format!("{icon} {pct}%")
+    format!("{icon} {pct:>3}%")
 }
 
 fn pick_volume_icon(is_source: bool, pct: u32, muted: bool) -> &'static str {
@@ -306,7 +306,7 @@ pub fn brightness() -> Option<String> {
             continue;
         }
         let pct = (cur / max * 100.0).round() as u32;
-        return Some(format!("󰃠 {pct}%"));
+        return Some(format!("󰃠 {pct:>3}%"));
     }
     None
 }

@@ -290,7 +290,7 @@ fn paint(
 ) {
     let y = text.baseline_y(bar_height);
     let pad = 8 * scale;
-    let gap = 16 * scale;
+    let gap = 28 * scale;
 
     // Left: left-to-right layout, each segment starting `gap` past the
     // previous one's end.

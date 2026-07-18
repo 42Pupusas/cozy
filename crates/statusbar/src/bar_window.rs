@@ -142,6 +142,21 @@ impl BarWindow {
         };
         eprintln!("statusbar: scale={scale}");
 
+        // Debug: try creating the shm pool right here, immediately after
+        // discovery (matching TermWindow's ordering) instead of after the
+        // layer-surface Configure round-trip.
+        {
+            let px_height_dbg = height * scale;
+            let (dbg_frames, dbg_shm_mem, dbg_pool) =
+                Self::create_frame_pair(&mut sender, shm, 1920, px_height_dbg, Format::Xrgb8888)?;
+            eprintln!(
+                "statusbar: EARLY create_frame_pair (w=1920) succeeded, pool={} frames={:?}",
+                dbg_pool.raw(),
+                dbg_frames.map(|f| f.buffer.raw())
+            );
+            drop(dbg_shm_mem);
+        }
+
         let surface: SurfaceId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),

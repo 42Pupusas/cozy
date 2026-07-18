@@ -310,6 +310,79 @@ impl Charset {
     }
 }
 
+/// Compose a base character with a following zero-width combining mark into
+/// its precomposed (NFC) form, covering the combining marks a real keyboard
+/// or IME actually produces over a Latin base letter (acute, grave,
+/// circumflex, tilde, diaeresis, ring above, cedilla). Returns `None` for
+/// any pair not in the table -- most emoji ZWJ sequences, combining marks
+/// over non-Latin letters, or marks stacked more than once (this only
+/// handles a single mark following a plain base, matching what `Cell`, with
+/// no cluster storage, can represent at all).
+///
+/// Deliberately a lookup table, not a call into a Unicode normalization
+/// crate: this crate has zero external dependencies beyond its sibling
+/// crates, and the realistic terminal input (typed accents, not arbitrary
+/// decomposed text) only ever exercises this small, fixed set.
+fn compose_precomposed(base: char, mark: char) -> Option<char> {
+    Some(match (base, mark) {
+        ('a', '\u{301}') => '\u{e1}',
+        ('a', '\u{300}') => '\u{e0}',
+        ('a', '\u{302}') => '\u{e2}',
+        ('a', '\u{303}') => '\u{e3}',
+        ('a', '\u{308}') => '\u{e4}',
+        ('a', '\u{30a}') => '\u{e5}',
+        ('A', '\u{301}') => '\u{c1}',
+        ('A', '\u{300}') => '\u{c0}',
+        ('A', '\u{302}') => '\u{c2}',
+        ('A', '\u{303}') => '\u{c3}',
+        ('A', '\u{308}') => '\u{c4}',
+        ('A', '\u{30a}') => '\u{c5}',
+        ('e', '\u{301}') => '\u{e9}',
+        ('e', '\u{300}') => '\u{e8}',
+        ('e', '\u{302}') => '\u{ea}',
+        ('e', '\u{308}') => '\u{eb}',
+        ('E', '\u{301}') => '\u{c9}',
+        ('E', '\u{300}') => '\u{c8}',
+        ('E', '\u{302}') => '\u{ca}',
+        ('E', '\u{308}') => '\u{cb}',
+        ('i', '\u{301}') => '\u{ed}',
+        ('i', '\u{300}') => '\u{ec}',
+        ('i', '\u{302}') => '\u{ee}',
+        ('i', '\u{308}') => '\u{ef}',
+        ('I', '\u{301}') => '\u{cd}',
+        ('I', '\u{300}') => '\u{cc}',
+        ('I', '\u{302}') => '\u{ce}',
+        ('I', '\u{308}') => '\u{cf}',
+        ('o', '\u{301}') => '\u{f3}',
+        ('o', '\u{300}') => '\u{f2}',
+        ('o', '\u{302}') => '\u{f4}',
+        ('o', '\u{303}') => '\u{f5}',
+        ('o', '\u{308}') => '\u{f6}',
+        ('O', '\u{301}') => '\u{d3}',
+        ('O', '\u{300}') => '\u{d2}',
+        ('O', '\u{302}') => '\u{d4}',
+        ('O', '\u{303}') => '\u{d5}',
+        ('O', '\u{308}') => '\u{d6}',
+        ('u', '\u{301}') => '\u{fa}',
+        ('u', '\u{300}') => '\u{f9}',
+        ('u', '\u{302}') => '\u{fb}',
+        ('u', '\u{308}') => '\u{fc}',
+        ('U', '\u{301}') => '\u{da}',
+        ('U', '\u{300}') => '\u{d9}',
+        ('U', '\u{302}') => '\u{db}',
+        ('U', '\u{308}') => '\u{dc}',
+        ('n', '\u{303}') => '\u{f1}',
+        ('N', '\u{303}') => '\u{d1}',
+        ('c', '\u{327}') => '\u{e7}',
+        ('C', '\u{327}') => '\u{c7}',
+        ('y', '\u{301}') => '\u{fd}',
+        ('y', '\u{308}') => '\u{ff}',
+        ('Y', '\u{301}') => '\u{dd}',
+        ('Y', '\u{308}') => '\u{178}',
+        _ => return None,
+    })
+}
+
 impl Grid {
     /// Create a new grid with the given dimensions.
     #[must_use]
@@ -695,7 +768,7 @@ impl Grid {
             ch.cell_width()
         };
         if width == 0 {
-            self.combine_onto_previous();
+            self.combine_onto_previous(ch);
             return;
         }
 
@@ -761,11 +834,39 @@ impl Grid {
         }
     }
 
-    fn combine_onto_previous(&mut self) {
-        // No grapheme-cluster storage yet: a zero-width combining mark is
-        // dropped rather than corrupting an unrelated cell. This still keeps
-        // the cursor from mis-advancing on ZWJ emoji sequences, accents, etc.
-        // (documented degradation until Cell stores a cluster string).
+    /// A zero-width combining mark arrived (e.g. typed as base letter plus
+    /// U+0301 COMBINING ACUTE ACCENT, rather than a precomposed character).
+    /// `Cell` has no grapheme-cluster storage, so full general composition
+    /// isn't possible -- but the common case (a Latin base letter plus one
+    /// of the handful of combining diacritics real keyboards/IMEs actually
+    /// produce) is handled by rewriting the previous cell's glyph to its
+    /// precomposed NFC form via [`compose_precomposed`]. Anything outside
+    /// that table (emoji ZWJ sequences, combining marks over non-Latin base
+    /// characters, ...) is dropped as before -- silently ignored rather than
+    /// corrupting an unrelated cell, since we can't store the cluster.
+    fn combine_onto_previous(&mut self, mark: char) {
+        // Walk back over a wide glyph's spacer to find the actual base cell,
+        // and don't step left past column 0 (a combining mark at the very
+        // start of a line has nothing to combine with).
+        if self.cursor.col == 0 {
+            return;
+        }
+        let row = self.cursor.row;
+        let c = self.cursor.col - 1;
+        let screen = self.active_screen();
+        let base_col = if screen.get_cell(c, row).spacer && c > 0 {
+            c - 1
+        } else {
+            c
+        };
+        let base = self.active_screen().get_cell(base_col, row);
+        let Some(composed) = compose_precomposed(base.ch, mark) else {
+            return;
+        };
+        let mut cell = base;
+        cell.ch = composed;
+        self.active_screen_mut().set_cell(base_col, row, cell);
+        self.dirty.mark(base_col, row);
     }
 
     fn control(&mut self, c0: C0) {

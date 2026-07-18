@@ -261,6 +261,28 @@ fn osc_title_is_captured_and_take_clears_it() {
 }
 
 #[test]
+fn combining_acute_accent_composes_onto_the_previous_letter() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, "e\u{301}".as_bytes()); // 'e' + COMBINING ACUTE ACCENT
+    assert_eq!(g.screen().get_cell(0, 0).ch, '\u{e9}'); // precomposed 'e' with acute
+    assert_eq!(g.cursor(), (1, 0), "combining mark must not advance the cursor");
+}
+
+#[test]
+fn combining_mark_with_no_table_entry_is_dropped_not_corrupting() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, "z\u{323}".as_bytes()); // 'z' + COMBINING DOT BELOW (not in our table)
+    assert_eq!(g.screen().get_cell(0, 0).ch, 'z', "base letter left untouched");
+}
+
+#[test]
+fn combining_mark_at_column_zero_is_a_harmless_noop() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, "\u{301}".as_bytes()); // bare combining mark, nothing before it
+    assert_eq!(g.cursor(), (0, 0));
+}
+
+#[test]
 fn ris_resets_all_negotiated_modes() {
     let mut g = Grid::new(80, 24);
     feed(&mut g, b"\x1b[?1000h\x1b[?1006h\x1b[?1h\x1b[?7l\x1b[?6h\x1b[?1004h\x1b[>5u");

@@ -331,6 +331,39 @@ fn osc52_empty_selector_defaults_to_clipboard() {
 }
 
 #[test]
+fn osc10_query_replies_with_configured_foreground() {
+    let mut g = Grid::new(20, 3);
+    g.set_default_colors(grid::Color::Rgb(0xaa, 0xbb, 0xcc), grid::Color::Rgb(0x11, 0x22, 0x33));
+    feed(&mut g, b"\x1b]10;?\x07");
+    let replies = g.take_replies();
+    assert_eq!(replies, b"\x1b]10;rgb:aaaa/bbbb/cccc\x1b\\");
+}
+
+#[test]
+fn osc11_query_replies_with_configured_background() {
+    let mut g = Grid::new(20, 3);
+    g.set_default_colors(grid::Color::Rgb(0xaa, 0xbb, 0xcc), grid::Color::Rgb(0x11, 0x22, 0x33));
+    feed(&mut g, b"\x1b]11;?\x07");
+    let replies = g.take_replies();
+    assert_eq!(replies, b"\x1b]11;rgb:1111/2222/3333\x1b\\");
+}
+
+#[test]
+fn osc10_set_request_is_ignored_not_replied() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]10;rgb:ff/ff/ff\x07");
+    assert!(g.take_replies().is_empty());
+}
+
+#[test]
+fn osc10_defaults_are_sane_without_set_default_colors() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]10;?\x07");
+    let replies = g.take_replies();
+    assert!(!replies.is_empty(), "must reply even with no explicit theme set");
+}
+
+#[test]
 fn combining_acute_accent_composes_onto_the_previous_letter() {
     let mut g = Grid::new(20, 3);
     feed(&mut g, "e\u{301}".as_bytes()); // 'e' + COMBINING ACUTE ACCENT

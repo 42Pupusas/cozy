@@ -269,6 +269,15 @@ pub struct Grid {
     /// `wl_data_source` publish, if any since the last [`Grid::take_clipboard`].
     /// One-shot, same pattern as `pending_title`.
     pending_clipboard: Option<String>,
+    /// The terminal's own default foreground/background, as configured by
+    /// the driver at startup from the resolved theme (see
+    /// [`Grid::set_default_colors`]). Used only to answer OSC 10/11 queries
+    /// (`ESC ] 10 ; ? ST` etc.) -- TUIs poll these to detect a light vs. dark
+    /// theme. Defaults to a dark theme's usual fg/bg so a reply is still
+    /// sane even if the driver never calls the setter (tests, an
+    /// unconfigured embedding, ...).
+    default_fg: Color,
+    default_bg: Color,
 }
 
 /// A designated character set slot (G0/G1). Only the two xterm/VT100
@@ -444,7 +453,17 @@ impl Grid {
             active_link_id: 0,
             published_links: 0,
             pending_clipboard: None,
+            default_fg: Color::Rgb(0xcc, 0xcc, 0xcc),
+            default_bg: Color::Rgb(0x1e, 0x1e, 0x2e),
         }
+    }
+
+    /// Set the default fg/bg colors OSC 10/11 replies report, from the
+    /// driver's resolved theme. Call once after construction (the theme is
+    /// fixed for the terminal's lifetime; there's no live-reload path yet).
+    pub fn set_default_colors(&mut self, fg: Color, bg: Color) {
+        self.default_fg = fg;
+        self.default_bg = bg;
     }
 
     /// Scroll the viewport by `delta` lines (positive = up into scrollback,
@@ -1491,8 +1510,41 @@ impl Grid {
             }
             OscCmd::Hyperlink { uri } => self.set_active_link(uri),
             OscCmd::Clipboard { selection, data } => self.set_clipboard(selection, data),
+            OscCmd::ForegroundColor(query) => self.reply_default_color(10, query, self.default_fg),
+            OscCmd::BackgroundColor(query) => self.reply_default_color(11, query, self.default_bg),
             _ => {}
         }
+    }
+
+    /// OSC 10/11 handler: `ESC ] <ps> ; ? ST` queries the terminal's default
+    /// fg/bg, replying in the same OSC form the query arrived in
+    /// (`ESC ] <ps> ; rgb:rrrr/gggg/bbbb ST`) -- what fzf, some vim
+    /// colorschemes, and other light/dark-aware TUIs poll for at startup.
+    /// Any payload other than a bare `?` is a *set* request (`ESC ] 10 ;
+    /// <spec> ST`); we don't support changing the theme at runtime, so
+    /// that's silently ignored rather than erroring -- matches how a set
+    /// request for something else unsupported would be handled elsewhere in
+    /// this parser.
+    fn reply_default_color(&mut self, ps: u8, query: &str, color: Color) {
+        use std::io::Write as _;
+        if query != "?" {
+            return;
+        }
+        let (r, g, b) = match color {
+            Color::Rgb(r, g, b) => (r, g, b),
+            Color::Indexed(_) | Color::Default => (0xcc, 0xcc, 0xcc),
+        };
+        // Each channel is reported as a 16-bit value (xterm convention);
+        // an 8-bit channel `c` maps to `c * 0x101` so `0xff` -> `0xffff`
+        // (exact endpoints) rather than a naive `<< 8` which would leave
+        // `0xff00` short of white.
+        let _ = write!(
+            self.replies,
+            "\x1b]{ps};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+            u16::from(r) * 0x101,
+            u16::from(g) * 0x101,
+            u16::from(b) * 0x101,
+        );
     }
 
     /// OSC 52 handler: `ESC ] 52 ; <selection> ; <base64> ST`. Only a write to

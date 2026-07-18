@@ -341,6 +341,16 @@ impl<'cfg> App<'cfg> {
         let parser_handle = ParserWorker {
             cols: COLS,
             rows: ROWS,
+            default_fg: grid::Color::Rgb(
+                self.cfg.palette.foreground.r,
+                self.cfg.palette.foreground.g,
+                self.cfg.palette.foreground.b,
+            ),
+            default_bg: grid::Color::Rgb(
+                self.cfg.palette.background.r,
+                self.cfg.palette.background.g,
+                self.cfg.palette.background.b,
+            ),
             parser_rx: parser_in_rx,
             dirty_tx,
             reply_tx,
@@ -507,6 +517,10 @@ impl PtyWorker {
 struct ParserWorker {
     cols: u16,
     rows: u16,
+    /// Resolved theme fg/bg, seeded into the grid at construction so it can
+    /// answer OSC 10/11 queries. See [`Grid::set_default_colors`].
+    default_fg: grid::Color,
+    default_bg: grid::Color,
     parser_rx: mpsc::Consumer<ParserMsg>,
     dirty_tx: quetzalcoatl::spsc::Producer<DirtySnapshot>,
     reply_tx: mpsc::Producer<InputMsg>,
@@ -535,6 +549,8 @@ impl ParserWorker {
         let Self {
             cols,
             rows,
+            default_fg,
+            default_bg,
             parser_rx,
             dirty_tx,
             reply_tx,
@@ -545,8 +561,10 @@ impl ParserWorker {
             ui_events,
             quit,
         } = self;
+        let mut grid = Grid::new(cols, rows);
+        grid.set_default_colors(default_fg, default_bg);
         ParserSession {
-            grid: Grid::new(cols, rows),
+            grid,
             parser: Parser::new(),
             parser_rx,
             dirty_tx,

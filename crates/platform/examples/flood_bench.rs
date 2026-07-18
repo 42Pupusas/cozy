@@ -36,8 +36,8 @@ use platform::draw::Canvas;
 use platform::{Renderer, Theme};
 use vt_parser::Parser;
 
-const COLS: u16 = 80;
-const ROWS: u16 = 24;
+const COLS: u16 = 173;
+const ROWS: u16 = 41;
 // Snapshots produced per simulated vsync interval. Under a real flood the
 // parser batch cap (64 chunks / 5 ms) publishes faster than the ~16 ms vsync,
 // so a handful pile up per present. 6 is a representative middle.
@@ -94,7 +94,26 @@ fn main() {
         _ => scroll_line,
     };
 
-    let mut renderer = Renderer::builtin(Theme::builtin());
+    // Optional `font=/path/to.ttf` arg selects the real TTF Face path
+    // (blit_cell_face) instead of the embedded Bitmap fallback -- this is the
+    // code the live app actually runs, and the only way this bench touches it.
+    let font_path = args.iter().find_map(|a| a.strip_prefix("font=").map(String::from));
+    let mut renderer = match &font_path {
+        Some(path) => {
+            let cfg = config::FontConfig {
+                path: Some(path.clone()),
+                size: 14,
+            };
+            Renderer::new(Theme::builtin(), &cfg)
+        }
+        None => Renderer::builtin(Theme::builtin()),
+    };
+    eprintln!(
+        "renderer: {} ({}x{} cell)",
+        if font_path.is_some() { "FACE/ttf" } else { "BITMAP" },
+        renderer.cell_w(),
+        renderer.cell_h()
+    );
     let cell_w = renderer.cell_w() as usize;
     let cell_h = renderer.cell_h() as usize;
     let bw = COLS as usize * cell_w;

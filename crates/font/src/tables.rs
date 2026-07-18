@@ -87,59 +87,100 @@ impl Maxp {
     }
 }
 
-// ── cmap (format 4 — the universal BMP subtable) ─────────────────────────────
+// ── cmap (format 4 — BMP-only; format 12 — full 32-bit Unicode) ─────────────
+//
+// Format 4's 16-bit char codes can only address the Basic Multilingual
+// Plane (U+0000..=U+FFFF). Emoji live almost entirely in the astral planes
+// (U+1F300 "GRAPE" and friends start at U+1F000+), so a font that wants to
+// map them needs a format-12 "segmented coverage" subtable, whose group
+// entries carry full 32-bit `startCharCode`/`endCharCode`. Without this, any
+// codepoint above U+FFFF silently resolves to `.notdef` even when the font
+// (e.g. Noto Emoji) has the glyph -- exactly the bug that made emoji render
+// as tofu/blank before this was added.
 
-/// Map a Unicode codepoint → glyph id.
+/// Map a Unicode codepoint → glyph id. Wraps whichever subtable format
+/// [`Self::find_subtable`] selected (4 or 12); [`Self::glyph_id`] dispatches
+/// on the format recorded at construction time.
 pub struct Cmap<'a> {
-    data: &'a [u8], // the format-4 subtable slice
+    data: &'a [u8], // the chosen subtable slice (format 4 or 12)
+    format: u16,
 }
 
 impl<'a> Cmap<'a> {
     pub fn parse(ff: &FontFile<'a>) -> Result<Self, ParseError> {
         let d = ff.require(TAG_CMAP, "cmap")?;
         let sub_off = Self::find_subtable(d)?;
-        Ok(Self {
-            data: &d[sub_off..],
-        })
+        Ok(Self::from_subtable(&d[sub_off..]))
     }
 
-    /// Wrap an already-located format-4 subtable slice (no directory walk).
+    /// Wrap an already-located subtable slice (no directory walk). The
+    /// subtable's own `format` field (first `u16`) is read to decide how
+    /// [`Self::glyph_id`] interprets the rest of the bytes -- unlike the
+    /// pre-format-12 version, this can no longer be a `const fn` (format is
+    /// discovered at runtime, not baked in by the caller).
     #[must_use]
-    pub const fn from_subtable(data: &'a [u8]) -> Self {
-        Self { data }
+    pub fn from_subtable(data: &'a [u8]) -> Self {
+        let format = data.u16_at(0).unwrap_or(0);
+        Self { data, format }
     }
 
-    /// Locate the best format-4 subtable within a whole `cmap` table.
+    /// Locate the best cmap subtable within a whole `cmap` table, preferring
+    /// (in order) a format-12 full-Unicode subtable — needed for astral-plane
+    /// codepoints like emoji — then the universal format-4 BMP subtable.
     /// Returns the offset of the subtable relative to the `cmap` table start.
     ///
     /// # Errors
-    /// [`ParseError`] if no usable format-4 subtable is present.
+    /// [`ParseError`] if no usable format-4/format-12 subtable is present.
     pub fn find_subtable(d: &[u8]) -> Result<usize, ParseError> {
         let num_tables = d.u16_at(2).ok_or(ParseError::TooShort)? as usize;
 
-        // Walk encoding records looking for a (3,1) or (0,*) format-4 subtable.
-        let mut chosen: Option<usize> = None;
+        let mut best: Option<(u8, usize)> = None;
         for i in 0..num_tables {
             let base = 4 + i * 8;
             let platform = d.u16_at(base).ok_or(ParseError::TooShort)?;
             let encoding = d.u16_at(base + 2).ok_or(ParseError::TooShort)?;
             let offset = d.u32_at(base + 4).ok_or(ParseError::TooShort)? as usize;
-            // Prefer Windows/Unicode BMP (3,1), fallback to Unicode (0,*)
             let format = d.u16_at(offset).ok_or(ParseError::TooShort)?;
-            if format == 4 && ((platform == 3 && encoding == 1) || platform == 0) {
-                chosen = Some(offset);
-                if platform == 3 {
-                    break;
-                } // best match
+            if let Some(r) = Self::rank_subtable(format, platform, encoding)
+                && best.is_none_or(|(br, _)| r > br)
+            {
+                best = Some((r, offset));
             }
         }
 
-        chosen.ok_or(ParseError::MissingTable("cmap format 4"))
+        best.map(|(_, off)| off)
+            .ok_or(ParseError::MissingTable("cmap format 4/12"))
+    }
+
+    /// Rank a candidate cmap subtable; higher wins, `None` if unusable.
+    /// Format 12 outranks format 4 (it's a superset — BMP codepoints resolve
+    /// identically, astral ones only resolve via format 12), and within a
+    /// format the Windows-platform encoding is preferred as most
+    /// interoperable.
+    const fn rank_subtable(format: u16, platform: u16, encoding: u16) -> Option<u8> {
+        match (format, platform, encoding) {
+            (12, 3, 10) => Some(4),
+            (12, 0, 4 | 6) => Some(3),
+            (4, 3, 1) => Some(2),
+            (4, 0, _) => Some(1),
+            _ => None,
+        }
     }
 
     /// Map a Unicode scalar to a glyph index (`GlyphId::NOTDEF` if unmapped).
     #[must_use]
     pub fn glyph_id(&self, codepoint: u32) -> GlyphId {
+        match self.format {
+            12 => self.glyph_id_fmt12(codepoint),
+            _ => self.glyph_id_fmt4(codepoint),
+        }
+    }
+
+    /// Format 4 (segment mapping to delta values): the universal BMP
+    /// subtable. `codepoint` is truncated to 16 bits — any caller routing
+    /// an astral-plane codepoint here instead of a format-12 subtable will
+    /// simply miss (by construction: format 4 has no 17th bit to match).
+    fn glyph_id_fmt4(&self, codepoint: u32) -> GlyphId {
         let d = self.data;
         // format=4, length, language already consumed; seg_count_x2 at offset 6
         let seg_count = match d.u16_at(6) {
@@ -197,6 +238,56 @@ impl<'a> Cmap<'a> {
             return GlyphId(((i32::from(raw) + delta) & 0xFFFF) as u16);
         }
         GlyphId::NOTDEF
+    }
+
+    /// Format 12 (segmented coverage): groups of
+    /// `(startCharCode, endCharCode, startGlyphID)` as full 32-bit values —
+    /// the only cmap format that can address codepoints above U+FFFF, which
+    /// is where the overwhelming majority of emoji live (U+1F300+).
+    ///
+    /// Layout after the 16-bit `format`/`reserved` fields: `length: u32`,
+    /// `language: u32`, `numGroups: u32`, then `numGroups` groups of three
+    /// `u32`s each (12 bytes/group).
+    fn glyph_id_fmt12(&self, codepoint: u32) -> GlyphId {
+        let d = self.data;
+        let num_groups = match d.u32_at(12) {
+            Some(v) => v as usize,
+            None => return GlyphId::NOTDEF,
+        };
+        let groups_off = 16;
+
+        // Binary search groups by endCharCode (groups are sorted, non-overlapping).
+        let mut lo = 0usize;
+        let mut hi = num_groups;
+        while lo < hi {
+            let mid = usize::midpoint(lo, hi);
+            let base = groups_off + mid * 12;
+            let end = d.u32_at(base + 4).unwrap_or(0);
+            if codepoint > end {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo >= num_groups {
+            return GlyphId::NOTDEF;
+        }
+
+        let base = groups_off + lo * 12;
+        let start = d.u32_at(base).unwrap_or(u32::MAX);
+        if codepoint < start {
+            return GlyphId::NOTDEF;
+        }
+        let start_glyph = d.u32_at(base + 8).unwrap_or(0);
+        // Real-world fonts (including Noto Emoji, ~900 glyphs) stay well
+        // under 65536 glyphs; GlyphId is u16 throughout this crate (loca /
+        // hmtx / glyf all index with it), so truncate rather than widen the
+        // type crate-wide for a case that doesn't occur in practice.
+        let gid = start_glyph + (codepoint - start);
+        if gid > u32::from(u16::MAX) {
+            return GlyphId::NOTDEF;
+        }
+        GlyphId(gid as u16)
     }
 }
 

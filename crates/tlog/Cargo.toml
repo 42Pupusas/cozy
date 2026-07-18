@@ -1,0 +1,15 @@
+[package]
+name    = "tlog"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Compile-time gate for every tlog::trace! call site across the workspace.
+# Off (the default): each call site becomes a dead `if false` branch -- its
+# format args are still type-checked, but no env var is ever read and no
+# code runs. On: channels are independently selected at runtime via the
+# TERMINAL_LOG env var (see crate docs).
+trace = []

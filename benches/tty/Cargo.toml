@@ -34,6 +34,10 @@ name    = "blit"
 harness = false
 
 [[bench]]
+name    = "scrollback"
+harness = false
+
+[[bench]]
 name    = "layout"
 harness = false
 

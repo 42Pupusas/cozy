@@ -6,6 +6,12 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Compile-in extra render observability (e.g. the scrollback pixel-shift
+# counters on `Renderer`, read by regression tests and the FPS debug log).
+# Off by default so release builds carry zero extra per-frame state.
+trace = []
+
 [dependencies]
 grid         = { path = "../grid" }
 vt_parser    = { path = "../vt_parser" }

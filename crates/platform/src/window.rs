@@ -149,6 +149,16 @@ struct FrameStats {
 /// How many recent presents [`FrameStats`] keeps around to average over.
 const FRAME_STATS_CAP: usize = 120;
 
+/// Presents older than this (relative to the newest present) are dropped
+/// from the stats window. Without an age bound the average spans idle gaps:
+/// while scrolled into history the cursor is hidden, so the blink heartbeat
+/// stops presenting, and every pause between wheel detents stays inside the
+/// 120-present window — the readout sagged to ~40 and then froze there while
+/// idling in scrollback, even though each presented frame was full-rate. An
+/// age bound makes fps() mean "presents per second over the last second of
+/// activity", which is what the overlay claims to show.
+const FRAME_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl FrameStats {
     fn new() -> Self {
         Self {
@@ -159,6 +169,21 @@ impl FrameStats {
             max_backlog_since_log: 0,
             skipped_no_slot: 0,
             skipped_not_ready: 0,
+        }
+    }
+
+    /// Drop presents older than [`FRAME_STATS_MAX_AGE`] relative to `now`.
+    /// Called both when a present is recorded AND before every read of
+    /// [`Self::fps`] (overlay/log), so an idle stretch (no presents while
+    /// parked in scrollback) decays the reading to 0 instead of freezing the
+    /// last sagged average on screen forever.
+    fn prune(&mut self, now: std::time::Instant) {
+        while self
+            .times
+            .front()
+            .is_some_and(|&t| now.duration_since(t) > FRAME_STATS_MAX_AGE)
+        {
+            self.times.pop_front();
         }
     }
 
@@ -199,6 +224,10 @@ impl FrameStats {
         while self.times.len() > FRAME_STATS_CAP {
             self.times.pop_front();
         }
+        // Age-bound the window so idle gaps (no presents while parked in
+        // scrollback — the hidden cursor stops the blink heartbeat) don't
+        // get averaged into the next reading as phantom slowness.
+        self.prune(now);
     }
 
     /// Presented frames per second, averaged over the retained window.
@@ -1289,6 +1318,28 @@ impl TermWindow {
         }
     }
 
+    /// Remap overlay-tracking row indices through a viewport (scrollback)
+    /// pixel-scroll, whose shift is signed and spans the whole screen `[0,
+    /// rows)`. `s > 0` lifted the backbuffer up (content moved toward the
+    /// bottom), so a tracked row `r` now lives at `r - s`; `s < 0` pushed it
+    /// down to `r + |s|`. A row shifted outside `[0, rows)` scrolled off the
+    /// visible backbuffer and needs no cleanup -- drop it. Applied in order so
+    /// several shifts in one frame compose. The distinct upward-only
+    /// [`Self::shift_overlay_rows`] handles the incremental content-scroll band;
+    /// this handles the full-screen signed view scroll.
+    fn shift_overlay_rows_signed(rows: &mut Vec<u16>, shifts: &[i32], row_count: u16) {
+        for &s in shifts {
+            rows.retain_mut(|r| {
+                let moved = i64::from(*r) - i64::from(s);
+                if moved < 0 || moved >= i64::from(row_count) {
+                    return false;
+                }
+                *r = moved as u16;
+                true
+            });
+        }
+    }
+
     /// Add every row of each pixel-scrolled band `[top, bot]` to `touched`.
     /// A `copy_within` in the backbuffer rewrote all those rows, but the shm
     /// frame slots aren't scrolled -- they're the actually-presented pixels --
@@ -1445,6 +1496,7 @@ impl TermWindow {
             // into the backbuffer here.
             DebugFps::Log => Vec::new(),
             DebugFps::Overlay => {
+                self.frame_stats.prune(std::time::Instant::now());
                 let text = format!("{:.1} fps", self.frame_stats.fps());
                 let cols = (self.width / self.cell_w).max(1) as u16;
                 let text_cols = text.chars().count() as u16;
@@ -1500,6 +1552,7 @@ impl TermWindow {
             return;
         }
         self.frame_stats.last_log = now;
+        self.frame_stats.prune(now);
         let fps = self.frame_stats.fps();
         let busy_us = self.frame_stats.drain_busy_us();
         // Frame interval at this fps, in microseconds. `busy_us` is CPU time
@@ -1580,12 +1633,27 @@ impl TermWindow {
         }
         let mut touched_rows: Vec<u16> = Vec::new();
         let mut scrolls: Vec<grid::ScrollBand> = Vec::new();
+        // Signed whole-screen shifts from viewport (scrollback) pixel-scrolls
+        // that `blit_snapshot` performed this frame. Unlike `scrolls` (an
+        // upward-only band), these are signed and cover the full screen, so
+        // baked overlays (fps readout, a resting cursor/selection) get dragged
+        // by the memmove and their row trackers must be remapped to match.
+        let mut viewport_shifts: Vec<i32> = Vec::new();
         let mut painted_rows: usize = 0;
         let mut painted_cells: usize = 0;
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
         for snap in &folded {
             if let Some(scroll) = self.renderer.blit_snapshot(&mut canvas, snap) {
                 scrolls.push(scroll);
+            }
+            // A viewport frame that actually pixel-shifted carries a signed
+            // shift AND an offset (a full-frame repaint carries `shift: None`).
+            if snap.viewport_offset().is_some() {
+                if let Some(s) = snap.viewport_shift() {
+                    if s != 0 {
+                        viewport_shifts.push(s);
+                    }
+                }
             }
             painted_rows += snap.rows.len();
             painted_cells += snap.rows.iter().map(|r| r.cells.len()).sum::<usize>();
@@ -1609,6 +1677,18 @@ impl TermWindow {
         // lists that tell us where to repaint those clean now point one screen-
         // position too low, so remap them by the same shift before use, or the
         // dragged-up overlay pixels get left behind as a static imprint.
+        // A viewport pixel-scroll `copy_within`-shifted the whole backbuffer by
+        // a signed amount, dragging any baked overlay with it. Remap the
+        // overlay-row trackers the same way so last frame's imprint is cleaned
+        // at its NEW position, not its old one. The full row set already made
+        // `touched_rows` span the screen, so the shm re-copy needs nothing
+        // extra here (unlike the incremental band, which must extend it).
+        if !viewport_shifts.is_empty() {
+            let rows = (self.height / self.cell_h).max(1) as u16;
+            Self::shift_overlay_rows_signed(&mut self.prev_cursor_rows, &viewport_shifts, rows);
+            Self::shift_overlay_rows_signed(&mut self.prev_selection_rows, &viewport_shifts, rows);
+            Self::shift_overlay_rows_signed(&mut self.prev_fps_rows, &viewport_shifts, rows);
+        }
         if !scrolls.is_empty() {
             Self::shift_overlay_rows(&mut self.prev_cursor_rows, &scrolls);
             Self::shift_overlay_rows(&mut self.prev_selection_rows, &scrolls);
@@ -2122,5 +2202,43 @@ mod tests {
         let mut rows = vec![2u16, 4];
         TermWindow::shift_overlay_rows(&mut rows, &[]);
         assert_eq!(rows, vec![2, 4]);
+    }
+
+    #[test]
+    fn shift_overlay_rows_signed_positive_lifts_imprint_up() {
+        // A viewport scroll-back toward the bottom shifted the whole 10-row
+        // screen up by 3 (s = +3): an overlay at row 7 now lives at row 4.
+        let mut rows = vec![7u16];
+        TermWindow::shift_overlay_rows_signed(&mut rows, &[3], 10);
+        assert_eq!(rows, vec![4]);
+    }
+
+    #[test]
+    fn shift_overlay_rows_signed_negative_pushes_imprint_down() {
+        // Scroll up into history shifted the screen DOWN by 2 (s = -2): an
+        // overlay at row 4 now lives at row 6.
+        let mut rows = vec![4u16];
+        TermWindow::shift_overlay_rows_signed(&mut rows, &[-2], 10);
+        assert_eq!(rows, vec![6]);
+    }
+
+    #[test]
+    fn shift_overlay_rows_signed_drops_rows_shifted_off_either_edge() {
+        // s = +3 lifts everything up 3: rows 0,1,2 fall off the top; row 9 -> 6.
+        let mut rows = vec![0u16, 2, 9];
+        TermWindow::shift_overlay_rows_signed(&mut rows, &[3], 10);
+        assert_eq!(rows, vec![6]);
+        // s = -3 pushes down 3: rows 8,9 fall off the bottom; row 1 -> 4.
+        let mut rows = vec![1u16, 8, 9];
+        TermWindow::shift_overlay_rows_signed(&mut rows, &[-3], 10);
+        assert_eq!(rows, vec![4]);
+    }
+
+    #[test]
+    fn shift_overlay_rows_signed_composes_multiple_shifts_in_order() {
+        // Two shifts in one frame compose: row 8 -(+2)-> 6 -(+2)-> 4.
+        let mut rows = vec![8u16];
+        TermWindow::shift_overlay_rows_signed(&mut rows, &[2, 2], 10);
+        assert_eq!(rows, vec![4]);
     }
 }

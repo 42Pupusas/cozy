@@ -4,11 +4,18 @@ use crate::{
     atlas::Atlas,
     face::FontFace,
     parse::{FontFile, ParseError},
-    tables::{Cmap, Head, Hhea, Hmtx, Loca, Maxp},
+    tables::{Cmap, GlyphId, Head, Hhea, Hmtx, Loca, Maxp},
 };
 
 const JBM: &str = "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf";
 const PX: f32 = 16.0;
+
+/// Monochrome emoji fixture (Noto Emoji), checked into `assets/fonts/` -- used
+/// to regression-test cmap format-12 (astral-plane) lookups, which the
+/// JetBrains Mono fixture above can't exercise (it's BMP-only). Path is
+/// relative to this crate's manifest dir (`crates/font/`).
+const NOTO_EMOJI: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../assets/fonts/NotoEmoji-Regular.ttf");
 
 /// The one test fixture font (`JetBrains` Mono), namespaced as a zero-sized
 /// marker type rather than a bare `load_bytes()` function -- reads as
@@ -231,6 +238,49 @@ fn atlas_inserts_blank_glyph_as_zero_size() {
     assert_eq!(entry.width, 0);
     assert_eq!(entry.height, 0);
     assert_eq!(entry.advance, 500);
+}
+
+// ── cmap format 12 / emoji ───────────────────────────────────────────────────
+
+#[test]
+fn cmap_format12_resolves_astral_plane_emoji() {
+    // Regression for the bug that made every emoji render as tofu: format 4
+    // (the only subtable this crate parsed before) can't address codepoints
+    // above U+FFFF, and virtually every emoji lives above it (U+1F300+).
+    let data = std::fs::read(NOTO_EMOJI).expect("NotoEmoji-Regular.ttf missing -- see assets/fonts/");
+    let ff = FontFile::parse(&data).unwrap();
+    let cmap = Cmap::parse(&ff).unwrap();
+
+    // GRINNING FACE, SLIGHTLY SMILING FACE, THUMBS UP -- all astral-plane.
+    for cp in [0x1F600u32, 0x1F642, 0x1F44D] {
+        let gid = cmap.glyph_id(cp);
+        assert_ne!(gid, GlyphId::NOTDEF, "U+{cp:04X} resolved to .notdef");
+    }
+}
+
+#[test]
+fn cmap_format12_still_resolves_bmp_codepoints() {
+    // HEAVY BLACK HEART (U+2764) is in the BMP -- format 12's groups cover the
+    // whole space, not just astral codepoints, so BMP lookups must still work
+    // once format 12 is chosen over format 4.
+    let data = std::fs::read(NOTO_EMOJI).expect("NotoEmoji-Regular.ttf missing -- see assets/fonts/");
+    let ff = FontFile::parse(&data).unwrap();
+    let cmap = Cmap::parse(&ff).unwrap();
+    let gid = cmap.glyph_id(0x2764);
+    assert_ne!(gid, GlyphId::NOTDEF, "U+2764 (BMP) resolved to .notdef");
+}
+
+#[test]
+fn fontface_rasterizes_emoji_glyph() {
+    // End-to-end: load the emoji face, rasterize a real emoji codepoint
+    // through the full FontFace API (cmap -> loca -> glyf -> outline ->
+    // bitmap), and check it actually produced ink -- not just a non-.notdef
+    // glyph id.
+    let mut face = FontFace::load(NOTO_EMOJI, PX).unwrap();
+    let g = face.rasterize(0x1F600); // grinning face
+    assert!(g.metrics.advance > 0.0, "emoji glyph has zero advance");
+    let nonzero = g.bitmap.data.iter().filter(|&&v| v > 0).count();
+    assert!(nonzero > 0, "rasterized emoji bitmap is all-zero");
 }
 
 // x_min/x_max vs y_min/y_max are the idiomatic names for a glyph bounding

@@ -208,6 +208,18 @@ impl FontFace {
         &self.data[o..o + l]
     }
 
+    /// Whether this face has a real (non-`.notdef`) glyph for `codepoint`.
+    ///
+    /// Used by the renderer's font-fallback chain to decide whether a
+    /// codepoint should be drawn from the primary face or handed to a
+    /// fallback face (e.g. an emoji font) instead of silently rasterizing
+    /// `.notdef`'s "tofu" box for every codepoint the primary face lacks.
+    /// Cheap: just a cmap lookup, no rasterization or cache mutation.
+    #[must_use]
+    pub fn has_glyph(&self, codepoint: u32) -> bool {
+        self.cmap().glyph_id(codepoint) != crate::tables::GlyphId::NOTDEF
+    }
+
     /// Rasterize a Unicode codepoint and return the result (cached).
     pub fn rasterize(&mut self, codepoint: u32) -> &RasterizedGlyph {
         if !self.cache.contains_key(&codepoint) {

@@ -22,6 +22,12 @@ use crate::font::{FIRST, GLYPH_H, GLYPH_W, LAST};
 
 pub use crate::font::FONT;
 
+/// Monochrome-outline emoji font bundled straight into this binary (Noto
+/// Emoji, OFL-licensed — see `assets/NotoEmoji-OFL.txt` next to it) so emoji
+/// render out of the box with zero configuration. Used by
+/// [`Renderer::load_emoji_fallback`] unless `[font] emoji_path` overrides it.
+static EMBEDDED_EMOJI_FONT: &[u8] = include_bytes!("../assets/NotoEmoji-Regular.ttf");
+
 // ── xterm 256-color palette ──────────────────────────────────────────────────
 
 /// xterm 256-color palette: indices 0–255 → (r, g, b).
@@ -144,8 +150,33 @@ impl Theme {
     }
 
     fn effective(&self, attrs: &Attrs) -> (DrawColor, DrawColor) {
-        let fg = self.resolve(attrs.fg, self.fg);
+        let mut fg = self.resolve(attrs.fg, self.fg);
         let bg = self.resolve(attrs.bg, self.bg);
+        // Intensity attributes fold into the resolved foreground:
+        //   * `dim`  (SGR 2) → lerp fg ~40% toward bg, the conventional
+        //     "faint" look. Used by pagers, `ls` metadata, diff context, etc.
+        //   * `bold` (SGR 1) with a *palette* color → promote 0–7 to the
+        //     bright 8–15 slot (the classic xterm "bold is bright"), leaving
+        //     truecolor/default fg untouched. Real weight selection would need
+        //     a bold face in the atlas; brightening is the widely-expected
+        //     fallback and is what makes bold text visibly pop.
+        // `dim` wins if somehow both are set (SGR 1;2 is contradictory; most
+        // terminals let the later-applied intensity stand, and grid clears
+        // both on NormalIntensity, so this only bites pathological input).
+        if attrs.bold() && !attrs.dim() {
+            if let Color::Indexed(n) = attrs.fg {
+                if n < 8 {
+                    fg = self.resolve(Color::Indexed(n + 8), self.fg);
+                }
+            }
+        }
+        if attrs.dim() {
+            // 60% of the way from fg toward bg: `blend_opaque_to` lerps
+            // `self → to` by `alpha/255`, so start from bg and pull toward fg
+            // by ~40% to land a faint-but-legible grey.
+            let faint = bg.blend_opaque_to(fg, 102);
+            fg = DrawColor::rgb((faint >> 16) as u8, (faint >> 8) as u8, faint as u8);
+        }
         if attrs.inverse() { (bg, fg) } else { (fg, bg) }
     }
 }
@@ -155,12 +186,28 @@ impl Theme {
 /// A real TTF/OTF face plus its glyph atlas, growing on demand as new
 /// codepoints are drawn. Pre-seeded with printable ASCII + box-drawing so the
 /// common case never rasterizes at paint time.
+///
+/// Optionally chained to a `fallback` face (see [`Self::with_fallback`]):
+/// codepoints the primary `face` doesn't cover (most commonly emoji --
+/// monospace programming fonts essentially never ship them) are rasterized
+/// from `fallback` instead of coming out as the primary face's `.notdef`
+/// "tofu" box. Both faces share one atlas/map keyed by codepoint, and every
+/// glyph -- regardless of which face produced it -- is positioned against
+/// this cache's *own* `ascender` (the primary face's line metrics), so a
+/// fallback glyph still sits on the same baseline as its neighbors instead
+/// of using the fallback font's unrelated line metrics.
 struct GlyphCache {
     face: font::FontFace,
     atlas: font::Atlas,
     map: HashMap<u32, font::GlyphEntry>,
     /// Distance from the top of the cell to the baseline, in pixels.
     ascender: f32,
+    /// Fallback face consulted when `face` lacks a glyph for some codepoint
+    /// -- see the struct doc. `None` when no fallback font is configured
+    /// (or the fallback failed to load), in which case an uncovered
+    /// codepoint rasterizes `face`'s own `.notdef` glyph, same as before
+    /// fallback support existed.
+    fallback: Option<font::FontFace>,
 }
 
 impl GlyphCache {
@@ -172,7 +219,16 @@ impl GlyphCache {
             atlas,
             map,
             ascender,
+            fallback: None,
         }
+    }
+
+    /// Attach a fallback face (e.g. an emoji font) consulted for codepoints
+    /// the primary face doesn't cover. `None` leaves the cache unchanged
+    /// (no fallback configured / load failed upstream).
+    fn with_fallback(mut self, fallback: Option<font::FontFace>) -> Self {
+        self.fallback = fallback;
+        self
     }
 
     /// Look up (rasterizing + atlas-inserting on first use) the glyph entry
@@ -182,9 +238,24 @@ impl GlyphCache {
         if let Some(e) = self.map.get(&codepoint) {
             return Some(*e);
         }
-        // `self.face` and `self.atlas` are disjoint fields, so this doesn't
-        // fight the borrow checker despite the mutable + immutable overlap.
-        let g = self.face.rasterize(codepoint);
+        // Route to the fallback face only when the primary face genuinely
+        // lacks the glyph -- `has_glyph` is a cheap cmap-only check, so this
+        // costs nothing on the overwhelmingly common case (primary face has
+        // it) and only consults the emoji font for codepoints it can't.
+        //
+        // `self.face`/`self.fallback` and `self.atlas` are disjoint fields,
+        // so borrowing one of the two former (whichever branch runs) and
+        // then `self.atlas` below doesn't fight the borrow checker despite
+        // the mutable + immutable overlap.
+        let use_fallback = !self.face.has_glyph(codepoint) && self.fallback.is_some();
+        let g = if use_fallback {
+            self.fallback
+                .as_mut()
+                .expect("use_fallback implies fallback.is_some()")
+                .rasterize(codepoint)
+        } else {
+            self.face.rasterize(codepoint)
+        };
         let entry = self.atlas.insert(
             &g.bitmap,
             g.metrics.bearing_x.round() as i32,
@@ -235,6 +306,28 @@ pub struct Renderer {
     /// always packed fully opaque, matching Alacritty's default "background
     /// glass, text solid" look (`transparent_background_colors = false`).
     bg_alpha: u8,
+    /// The scrollback viewport offset the backbuffer currently shows, as far
+    /// as the *renderer* knows -- `None` until the first viewport frame lands.
+    /// This is the ground truth for computing a scroll-back pixel-shift: it
+    /// advances ONLY when a viewport frame is actually blitted here, so a
+    /// snapshot the parser thread built but never delivered (requeued on a
+    /// full ring) can't desync it. The parser's own optimistic guess
+    /// (`Grid::rendered_offset`) tears under load precisely because it assumes
+    /// 1:1 delivery; owning the offset on the side that does the blit removes
+    /// that whole class of bug.
+    last_viewport_offset: Option<usize>,
+    /// Observability for the scrollback pixel-shift path: how many rows the
+    /// last `blit_snapshot` actually rasterized (vs. moved by `copy_within`),
+    /// and the signed shift it applied (`0` = full repaint / not a viewport
+    /// frame). The whole point of the optimization is that a wheel step
+    /// rasterizes only the freshly-revealed edge rows, so these let a
+    /// regression test assert the shift is engaging instead of silently
+    /// falling back to a full-screen repaint (the fps cliff). Behind `trace`
+    /// so release builds carry zero extra per-frame state.
+    #[cfg(feature = "trace")]
+    pub last_rasterized_rows: usize,
+    #[cfg(feature = "trace")]
+    pub last_viewport_shift: i32,
 }
 
 impl Renderer {
@@ -249,6 +342,11 @@ impl Renderer {
             cell_h: GLYPH_H,
             output_scale: 1,
             bg_alpha: 255,
+            last_viewport_offset: None,
+            #[cfg(feature = "trace")]
+            last_rasterized_rows: 0,
+            #[cfg(feature = "trace")]
+            last_viewport_shift: 0,
         }
     }
 
@@ -317,13 +415,21 @@ impl Renderer {
             Ok(face) => {
                 let cell_w = face.cell_width.round().max(1.0) as i32;
                 let cell_h = face.line.cell_height.round().max(1.0) as i32;
+                let fallback = Self::load_emoji_fallback(font_cfg, px_size);
                 Self {
                     theme,
-                    glyphs: GlyphSource::Face(Box::new(GlyphCache::new(face))),
+                    glyphs: GlyphSource::Face(Box::new(
+                        GlyphCache::new(face).with_fallback(fallback),
+                    )),
                     cell_w,
                     cell_h,
                     output_scale,
                     bg_alpha: 255,
+                    last_viewport_offset: None,
+                    #[cfg(feature = "trace")]
+                    last_rasterized_rows: 0,
+                    #[cfg(feature = "trace")]
+                    last_viewport_shift: 0,
                 }
             }
             Err(e) => {
@@ -335,6 +441,36 @@ impl Renderer {
                 r.cell_w *= output_scale;
                 r.cell_h *= output_scale;
                 r
+            }
+        }
+    }
+
+    /// Load the emoji fallback face for [`Self::with_scale`]'s `GlyphCache`:
+    /// `font_cfg.emoji_path` if set, otherwise the monochrome Noto Emoji font
+    /// bundled into this binary (see [`EMBEDDED_EMOJI_FONT`]) so emoji render
+    /// with zero configuration. `None` if loading fails either way (a
+    /// diagnostic is printed but the primary face still renders fine --
+    /// codepoints it lacks just fall back to `.notdef`, same as before
+    /// fallback support existed).
+    fn load_emoji_fallback(font_cfg: &config::FontConfig, px_size: f32) -> Option<font::FontFace> {
+        if let Some(path) = &font_cfg.emoji_path {
+            return match font::FontFace::load(path, px_size) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    eprintln!(
+                        "platform: failed to load emoji font {path:?}: {e} — emoji will render as tofu"
+                    );
+                    None
+                }
+            };
+        }
+        match font::FontFace::from_bytes(EMBEDDED_EMOJI_FONT.to_vec(), px_size) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!(
+                    "platform: failed to parse bundled emoji font: {e} — emoji will render as tofu"
+                );
+                None
             }
         }
     }
@@ -766,6 +902,109 @@ impl Renderer {
         let buf_width = canvas.width() as u32;
         let buf_rows = (canvas.pixels_mut().len() as u32 / buf_width.max(1)) / self.cell_h as u32;
 
+        // Viewport (scrollback) pixel-scroll. A wheel/page step moves the whole
+        // view by `shift` rows through history; the previous frame's pixels are
+        // still valid, just at a new screen position. `copy_within`-shift the
+        // entire backbuffer by that signed amount and rasterize ONLY the
+        // freshly-revealed edge rows -- the interior survives the memmove
+        // untouched. This is the fix for the scroll-back fps cliff: the old
+        // path re-rasterized every glyph on screen for each scroll frame.
+        //
+        // The snapshot still carries the full row set (so requeue/compose and
+        // the shm re-copy stay simple); we simply skip the expensive glyph
+        // blit for the interior rows the shift already moved into place.
+        //
+        // Overlay imprints dragged by this shift are cleaned by the caller,
+        // which reads `snap.viewport_shift()` and remaps its overlay-row
+        // trackers by the same signed amount -- so `blit_snapshot` returns
+        // `None` here (no *incremental* scroll band to report).
+        if let Some(cur_offset) = snap.viewport_offset() {
+            let cur_offset = usize::from(cur_offset);
+            // Compute the pixel-shift from the RENDERER's own record of what
+            // its backbuffer shows -- not the grid's `viewport_shift()` hint,
+            // which is computed on the parser thread against an optimistic
+            // `rendered_offset` that desyncs the moment a frame is requeued
+            // (full ring) instead of delivered. `last_viewport_offset` only
+            // advances when we actually blit below, so a dropped frame simply
+            // leaves it where it was and the next delivered frame shifts by the
+            // correct total. Gated on `content_delta == 0`: any new output
+            // changed the buffer contents, so shifting the old pixels wouldn't
+            // reproduce them (an output-driven snap-to-bottom must full-repaint).
+            let shift = match self.last_viewport_offset {
+                Some(prev) if snap.content_delta == 0 => {
+                    let s = prev as i64 - cur_offset as i64;
+                    (s != 0 && buf_rows > 0 && (s.unsigned_abs() as u32) < buf_rows)
+                        .then_some(s as i32)
+                }
+                _ => None,
+            };
+            if let Some(s) = shift {
+                let row_words = buf_width as usize * self.cell_h as usize;
+                let mag = s.unsigned_abs() as usize;
+                let keep = buf_rows as usize - mag;
+                let pixels = canvas.pixels_mut();
+                // s > 0: content moves up (view toward bottom) -- reveal at the
+                // bottom, so lift rows [mag, buf_rows) to [0, keep).
+                // s < 0: content moves down (view into history) -- reveal at the
+                // top, so push rows [0, keep) down to [mag, buf_rows).
+                if s > 0 {
+                    let src_off = mag * row_words;
+                    pixels.copy_within(src_off..src_off + keep * row_words, 0);
+                } else {
+                    let dst_off = mag * row_words;
+                    pixels.copy_within(0..keep * row_words, dst_off);
+                }
+                // Rasterize only the revealed edge rows; the rest were shifted
+                // into place by the memmove above.
+                let (edge_lo, edge_hi) = if s > 0 {
+                    (buf_rows as usize - mag, buf_rows as usize)
+                } else {
+                    (0usize, mag)
+                };
+                #[cfg(feature = "trace")]
+                let mut rasterized = 0usize;
+                for row in &snap.rows {
+                    let r = usize::from(row.row);
+                    if r >= edge_lo && r < edge_hi && (r as u32) < buf_rows {
+                        self.blit_row(canvas, row.row, &row.cells);
+                        #[cfg(feature = "trace")]
+                        {
+                            rasterized += 1;
+                        }
+                    }
+                }
+                self.last_viewport_offset = Some(cur_offset);
+                #[cfg(feature = "trace")]
+                {
+                    self.last_rasterized_rows = rasterized;
+                    self.last_viewport_shift = s;
+                }
+                return None;
+            }
+            // Full-frame viewport repaint (first scroll, a jump too large to
+            // reuse anything, or an output-driven snap-to-bottom): rasterize
+            // every row. Falls through to the shared paint loop below.
+            #[cfg(feature = "trace")]
+            let mut rasterized = 0usize;
+            for row in &snap.rows {
+                if u32::from(row.row) >= buf_rows {
+                    continue;
+                }
+                self.blit_row(canvas, row.row, &row.cells);
+                #[cfg(feature = "trace")]
+                {
+                    rasterized += 1;
+                }
+            }
+            self.last_viewport_offset = Some(cur_offset);
+            #[cfg(feature = "trace")]
+            {
+                self.last_rasterized_rows = rasterized;
+                self.last_viewport_shift = 0;
+            }
+            return None;
+        }
+
         // Explicit scroll band: the grid tells us exactly which rows moved up
         // and by how much, decoupled from which rows are dirty. Pixel-shift the
         // band, then fall through to paint the snapshot's precise dirty rows on
@@ -774,6 +1013,11 @@ impl Renderer {
         // of being clobbered by a whole-region re-blit or a bad shift.
         let mut scrolled: Option<ScrollBand> = None;
         if snap.viewport_offset().is_none() {
+            // An incremental frame is always the live bottom (new output snaps
+            // the viewport to 0 before dirty rows accrue), so the backbuffer
+            // now shows offset 0. Record it so the next scroll-back step shifts
+            // from the correct baseline.
+            self.last_viewport_offset = Some(0);
             if let Some(band) = snap.scroll_span() {
                 let top = u32::from(band.top);
                 let bot = u32::from(band.bot);
@@ -1285,6 +1529,142 @@ mod tests {
         );
     }
 
+    // A full-frame viewport (scrollback) snapshot: every visible row shows a
+    // slice of history starting at logical line `base_line`, at scrollback
+    // `offset`. The renderer derives the pixel-shift from consecutive frames'
+    // `offset`s (via its own `last_viewport_offset`), so the two frames of a
+    // scroll must carry offsets whose difference equals the intended shift --
+    // exactly as the live grid emits them (`shift = prev_offset - cur_offset`).
+    // `shift` is retained only to mirror what the grid would stamp; the
+    // renderer no longer reads it.
+    fn viewport_snap(
+        cols: u16,
+        rows: u16,
+        base_line: u32,
+        offset: u16,
+        shift: Option<i32>,
+    ) -> DirtySnapshot {
+        let dirty = (0..rows)
+            .map(|r| {
+                let line = base_line + u32::from(r);
+                let ch = char::from(b'a' + (line % 26) as u8);
+                DirtyRow {
+                    row: r,
+                    cells: (0..cols).map(|_| cell(ch)).collect(),
+                }
+            })
+            .collect();
+        DirtySnapshot {
+            cols,
+            rows: dirty,
+            cursor: grid::CursorInfo::default(),
+            cursor_changed: false,
+            content_delta: 0,
+            kind: grid::SnapshotKind::Viewport { offset, shift },
+        }
+    }
+
+    #[test]
+    fn viewport_pixel_shift_up_into_history_matches_full_repaint() {
+        // Scrolling up into history reveals rows at the TOP (shift < 0). The
+        // fast signed copy_within + edge-row rasterization must be byte-
+        // identical to a full repaint of the same revealed content.
+        let cols = 4u16;
+        let rows = 8u16;
+        let bw = cols as u32 * GLYPH_W as u32;
+        let bh = rows as u32 * GLYPH_H as u32;
+
+        // Showing lines [50,57]; scroll up into history -> show [47,54].
+        // View moves down on screen (reveal at top) => shift = -3. Scrolling up
+        // into history RAISES the offset, so the final frame's offset is the
+        // seed's + 3 (renderer computes shift = prev - cur = -3).
+        let seed_base = 50u32;
+        let step = 3u32;
+        let final_base = seed_base - step;
+        let seed_offset = 10u16;
+        let final_offset = seed_offset + step as u16;
+
+        let mut reference = vec![0u32; (bw * bh) as usize];
+        {
+            let mut r = Renderer::builtin(Theme::builtin());
+            let full = viewport_snap(cols, rows, final_base, final_offset, None);
+            let mut canvas = Canvas::new(&mut reference, bw as i32, bh as i32);
+            assert_eq!(r.blit_snapshot(&mut canvas, &full), None);
+        }
+
+        let mut fast = vec![0u32; (bw * bh) as usize];
+        let mut r = Renderer::builtin(Theme::builtin());
+        {
+            let seed = viewport_snap(cols, rows, seed_base, seed_offset, None);
+            let mut canvas = Canvas::new(&mut fast, bw as i32, bh as i32);
+            r.blit_snapshot(&mut canvas, &seed);
+        }
+        {
+            let snap = viewport_snap(cols, rows, final_base, final_offset, Some(-(step as i32)));
+            let mut canvas = Canvas::new(&mut fast, bw as i32, bh as i32);
+            assert_eq!(r.blit_snapshot(&mut canvas, &snap), None);
+        }
+
+        assert_eq!(fast, reference, "viewport up-scroll shift diverged from full repaint");
+    }
+
+    #[test]
+    fn viewport_pixel_shift_down_toward_bottom_matches_full_repaint() {
+        // Scrolling back toward the live bottom reveals rows at the BOTTOM
+        // (shift > 0). Same byte-identity requirement, opposite direction.
+        let cols = 4u16;
+        let rows = 8u16;
+        let bw = cols as u32 * GLYPH_W as u32;
+        let bh = rows as u32 * GLYPH_H as u32;
+
+        // Scrolling back toward the bottom LOWERS the offset, so the final
+        // frame's offset is the seed's - 3 (renderer computes shift = +3).
+        let seed_base = 47u32;
+        let step = 3u32;
+        let final_base = seed_base + step;
+        let seed_offset = 10u16;
+        let final_offset = seed_offset - step as u16;
+
+        let mut reference = vec![0u32; (bw * bh) as usize];
+        {
+            let mut r = Renderer::builtin(Theme::builtin());
+            let full = viewport_snap(cols, rows, final_base, final_offset, None);
+            let mut canvas = Canvas::new(&mut reference, bw as i32, bh as i32);
+            r.blit_snapshot(&mut canvas, &full);
+        }
+
+        let mut fast = vec![0u32; (bw * bh) as usize];
+        let mut r = Renderer::builtin(Theme::builtin());
+        {
+            let seed = viewport_snap(cols, rows, seed_base, seed_offset, None);
+            let mut canvas = Canvas::new(&mut fast, bw as i32, bh as i32);
+            r.blit_snapshot(&mut canvas, &seed);
+        }
+        {
+            let snap = viewport_snap(cols, rows, final_base, final_offset, Some(step as i32));
+            let mut canvas = Canvas::new(&mut fast, bw as i32, bh as i32);
+            r.blit_snapshot(&mut canvas, &snap);
+        }
+
+        assert_eq!(fast, reference, "viewport down-scroll shift diverged from full repaint");
+    }
+
+    #[test]
+    fn viewport_full_repaint_when_shift_is_none() {
+        // A viewport snapshot with shift=None (first scroll, or a jump too big
+        // to reuse anything) must repaint every row and report no scroll band.
+        let cols = 3u16;
+        let rows = 5u16;
+        let bw = cols as u32 * GLYPH_W as u32;
+        let bh = rows as u32 * GLYPH_H as u32;
+        let mut pixels = vec![0u32; (bw * bh) as usize];
+        let mut r = Renderer::builtin(Theme::builtin());
+        let snap = viewport_snap(cols, rows, 20, 20, None);
+        let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
+        assert_eq!(r.blit_snapshot(&mut canvas, &snap), None);
+        assert!(pixels.iter().any(|&p| p != 0), "full repaint painted nothing");
+    }
+
     #[test]
     fn pixel_scroll_reports_shifted_band_for_overlay_cleanup() {
         // The pixel-scroll path must tell the caller which rows it shifted and
@@ -1529,5 +1909,226 @@ mod tests {
         let alpha = packed >> 24;
         // 0.5 * 255 rounds to 128 (127.5 -> 128).
         assert_eq!(alpha, 128);
+    }
+
+    #[test]
+    fn effective_plain_fg_is_the_resolved_color() {
+        let theme = Theme::builtin();
+        let mut a = Attrs::default();
+        a.fg = grid::Color::Rgb(200, 100, 50);
+        let (fg, _bg) = theme.effective(&a);
+        assert_eq!(fg, DrawColor::rgb(200, 100, 50));
+    }
+
+    #[test]
+    fn effective_dim_pulls_fg_toward_bg() {
+        // Dim (SGR 2) must land the fg strictly between bg and the full fg --
+        // fish pagers / `ls` metadata rely on faint text being visibly muted
+        // but not invisible. Pure-white fg on pure-black bg makes the
+        // direction unambiguous.
+        let mut theme = Theme::builtin();
+        theme.fg = DrawColor::rgb(255, 255, 255);
+        theme.bg = DrawColor::rgb(0, 0, 0);
+        let mut a = Attrs::default(); // fg/bg default -> theme fg/bg
+        let (full, _) = theme.effective(&a);
+        assert_eq!(full, DrawColor::rgb(255, 255, 255));
+        a.set_dim(true);
+        let (faint, _) = theme.effective(&a);
+        assert!(
+            faint.r > 0 && faint.r < 255,
+            "dim fg must be a muted grey, got {faint:?}"
+        );
+        assert!(faint.r < full.r, "dim must darken toward bg");
+    }
+
+    #[test]
+    fn effective_bold_promotes_low_palette_to_bright() {
+        // Bold (SGR 1) on a palette color 0..=7 promotes it to the bright
+        // 8..=15 slot -- the classic xterm "bold is bright". Index 1 (red)
+        // -> index 9 (bright red).
+        let theme = Theme::builtin();
+        let mut a = Attrs::default();
+        a.fg = grid::Color::Indexed(1);
+        a.set_bold(true);
+        let (fg, _) = theme.effective(&a);
+        let (r, g, b) = theme.ansi[9];
+        assert_eq!(fg, DrawColor::rgb(r, g, b));
+    }
+
+    #[test]
+    fn effective_bold_leaves_truecolor_fg_untouched() {
+        // Only palette indices 0..=7 get brightened; a truecolor fg has no
+        // "bright" sibling, so bold must leave it exactly as-is.
+        let theme = Theme::builtin();
+        let mut a = Attrs::default();
+        a.fg = grid::Color::Rgb(10, 20, 30);
+        a.set_bold(true);
+        let (fg, _) = theme.effective(&a);
+        assert_eq!(fg, DrawColor::rgb(10, 20, 30));
+    }
+
+    #[test]
+    fn effective_brblack_autosuggestion_is_visible_against_bg() {
+        // fish paints its inline autosuggestions in `brblack` (SGR 90 ->
+        // palette index 8), NOT dim. Whatever else is true, that color must
+        // resolve to something distinct from the background or the suggestion
+        // is invisible. Check both the builtin theme and the config default
+        // palette (the two backgrounds a real run can have).
+        for theme in [
+            Theme::builtin(),
+            Theme::from_palette(&config::Palette::default()),
+        ] {
+            let mut a = Attrs::default();
+            a.fg = grid::Color::Indexed(8); // brblack
+            let (fg, bg) = theme.effective(&a);
+            assert_ne!(fg, bg, "brblack autosuggestion fg must differ from bg");
+        }
+    }
+
+    /// End-to-end reproduction of the interactive scroll-back path: a real
+    /// `Grid` drives a real `Renderer` through the exact live sequence
+    /// (`scroll_viewport` -> `take_dirty` -> `blit_snapshot`) that the present
+    /// loop runs each frame. Asserts the pixel-shift ENGAGES -- i.e. each
+    /// small wheel step rasterizes only the freshly revealed edge rows, not
+    /// the whole screen. This is the headless equivalent of watching the
+    /// `RASTERIZED N shift S` debug line while wheeling through history, so we
+    /// never have to eyeball it in a live run again. Needs the `trace`
+    /// feature, which compiles in the per-frame rasterized-row counters.
+    #[cfg(feature = "trace")]
+    #[test]
+    fn scrollback_wheel_step_pixel_shifts_instead_of_full_repaint() {
+        use grid::Grid;
+
+        let cols = 40u16;
+        let rows = 24u16;
+        let mut g = Grid::new(cols, rows);
+        // Prime a deep scrollback, exactly like the live session.
+        let mut p = vt_parser::Parser::new();
+        for i in 0..400 {
+            let line = format!("line {i}: the quick brown fox jumps over 0123456789\r\n");
+            p.feed(line.as_bytes(), |ev| g.apply(&ev));
+        }
+        // Drain the output-driven frame so we start clean at offset 0 with
+        // rendered_offset = Some(0) -- the baseline a wheel-scroll shifts from.
+        let mut renderer = Renderer::builtin(Theme::builtin());
+        let cell_w = renderer.cell_w() as usize;
+        let cell_h = renderer.cell_h() as usize;
+        let bw = cols as usize * cell_w;
+        let bh = rows as usize * cell_h;
+        let mut backbuffer = vec![0u32; bw * bh];
+
+        // Blit the output-driven frame (as the present loop does) so the
+        // renderer's `last_viewport_offset` is primed to Some(0) -- the live
+        // baseline a wheel-scroll shifts away from.
+        {
+            let snap = g.take_dirty();
+            let mut canvas = Canvas::new(&mut backbuffer, bw as i32, bh as i32);
+            renderer.blit_snapshot(&mut canvas, &snap);
+        }
+
+        // Every wheel step should now pixel-shift, rasterizing only the single
+        // revealed edge row, never the full `rows` set.
+        for step in 0..8 {
+            g.scroll_viewport(1);
+            let snap = g.take_dirty();
+            assert_eq!(
+                snap.viewport_shift(),
+                Some(-1),
+                "step {step}: a one-line wheel step must emit shift -1"
+            );
+            {
+                let mut canvas = Canvas::new(&mut backbuffer, bw as i32, bh as i32);
+                renderer.blit_snapshot(&mut canvas, &snap);
+            }
+            assert_eq!(
+                renderer.last_viewport_shift, -1,
+                "step {step}: blit must take the pixel-shift branch"
+            );
+            assert_eq!(
+                renderer.last_rasterized_rows, 1,
+                "step {step}: only the one revealed edge row may be rasterized, \
+                 not the whole screen ({} rows)",
+                rows
+            );
+        }
+    }
+
+    /// Regression: `requeue_snapshot` (fired when the SPSC dirty ring is full,
+    /// i.e. the UI thread is behind -- which it IS at 3ms/frame during a TTF
+    /// full repaint) used to force a full repaint every frame, because the
+    /// grid's optimistic `rendered_offset` got reset to `None` on requeue.
+    /// That made a self-sustaining cliff: full repaint -> UI lags -> ring full
+    /// -> requeue -> full repaint... matching "stays slow while parked, only
+    /// recovers at the bottom." The fix moved offset ownership into the
+    /// renderer (`last_viewport_offset`), which only advances when a frame is
+    /// ACTUALLY blitted -- so a requeued (undelivered) frame can't desync it.
+    /// This test now asserts the shift STILL engages under a full-ring storm.
+    /// Needs the `trace` feature for the per-frame rasterized-row counters.
+    #[cfg(feature = "trace")]
+    #[test]
+    fn scrollback_requeue_every_frame_defeats_the_pixel_shift() {
+        use grid::Grid;
+        let cols = 40u16;
+        let rows = 24u16;
+        let mut g = Grid::new(cols, rows);
+        let mut p = vt_parser::Parser::new();
+        for i in 0..400 {
+            let line = format!("line {i}: the quick brown fox jumps over 0123456789\r\n");
+            p.feed(line.as_bytes(), |ev| g.apply(&ev));
+        }
+        let mut renderer = Renderer::builtin(Theme::builtin());
+        let cell_w = renderer.cell_w() as usize;
+        let cell_h = renderer.cell_h() as usize;
+        let bw = cols as usize * cell_w;
+        let bh = rows as usize * cell_h;
+        let mut backbuffer = vec![0u32; bw * bh];
+
+        // Blit the output-driven frame so the renderer's offset is primed to
+        // Some(0) -- the live baseline (present loop always blits it).
+        {
+            let snap = g.take_dirty();
+            let mut canvas = Canvas::new(&mut backbuffer, bw as i32, bh as i32);
+            renderer.blit_snapshot(&mut canvas, &snap);
+        }
+
+        let mut shifted = 0;
+        for _ in 0..8 {
+            g.scroll_viewport(1);
+            let snap = g.take_dirty();
+            // Simulate the ring being full: the parser requeues the snapshot it
+            // just built instead of the UI consuming it. The grid's own hint is
+            // now distrusted, but the RENDERER's offset is untouched (nothing
+            // was blitted), so the eventually-delivered frame still shifts.
+            g.requeue_snapshot(&snap);
+            // Next frame the parser rebuilds and (this time) delivers it.
+            let snap = g.take_dirty();
+            {
+                let mut canvas = Canvas::new(&mut backbuffer, bw as i32, bh as i32);
+                renderer.blit_snapshot(&mut canvas, &snap);
+            }
+            // Each delivered frame advanced the viewport by one net line since
+            // the last blit, so the renderer shifts by -1 -- never a full
+            // repaint, no matter how many frames were requeued in between.
+            if renderer.last_viewport_shift == -1 && renderer.last_rasterized_rows == 1 {
+                shifted += 1;
+            }
+        }
+        assert_eq!(
+            shifted, 8,
+            "FIX: renderer-owned offset keeps the pixel-shift engaged even when \
+             every frame is requeued (ring full)"
+        );
+    }
+
+    #[test]
+    fn effective_inverse_still_swaps_fg_and_bg() {
+        let mut theme = Theme::builtin();
+        theme.fg = DrawColor::rgb(1, 2, 3);
+        theme.bg = DrawColor::rgb(9, 8, 7);
+        let mut a = Attrs::default();
+        a.set_inverse(true);
+        let (fg, bg) = theme.effective(&a);
+        assert_eq!(fg, DrawColor::rgb(9, 8, 7));
+        assert_eq!(bg, DrawColor::rgb(1, 2, 3));
     }
 }

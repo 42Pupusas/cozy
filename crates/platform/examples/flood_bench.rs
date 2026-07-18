@@ -103,6 +103,7 @@ fn main() {
             let cfg = config::FontConfig {
                 path: Some(path.clone()),
                 size: 14,
+                emoji_path: None,
             };
             Renderer::new(Theme::builtin(), &cfg)
         },

@@ -480,9 +480,14 @@ impl ParserSession {
     fn feed(&mut self, msg: ParserMsg) {
         match msg {
             ParserMsg::Data(chunk) => {
+                let bytes = &chunk.buf[..chunk.len];
+                // TERMINAL_LOG=pty (needs --features trace) dumps every raw
+                // PTY output chunk with escapes made visible -- the ground
+                // truth for "what did the shell actually send", e.g. how fish
+                // draws its dim autosuggestion and repositions the cursor.
+                tlog::trace!(Pty, "{}", tlog::Escaped(bytes));
                 let grid = &mut self.grid;
-                self.parser
-                    .feed(&chunk.buf[..chunk.len], |ev| grid.apply(&ev));
+                self.parser.feed(bytes, |ev| grid.apply(&ev));
             }
             ParserMsg::Resize { cols, rows } => self.grid.resize(cols, rows),
             ParserMsg::Scroll { delta } => self.grid.scroll_viewport(delta),

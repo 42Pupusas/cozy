@@ -119,7 +119,8 @@ terminal/
 │   ├── renderer/               ← GPU/software draw: grid → pixels
 │   ├── platform/               ← window + event loop (built on paint scaffold)
 │   ├── input/                  ← keyboard/mouse → terminal byte sequences
-│   └── config/                 ← TOML config (font, colors, shell, keybinds)
+│   ├── config/                 ← TOML config (font, colors, shell, keybinds)
+│   └── tlog/                   ← compile-time-gated, runtime-selectable tracing
 └── benches/
     └── …                       ← criterion suites per hot-path crate
 ```
@@ -352,6 +353,34 @@ it exists in the tooling workspace — TBD).
   iteration of its loop, no locks required
 
 **Deps (tooling):** `ququmatz` (`Inotify`), `quetzalcoatl` (broadcast ring).
+
+---
+
+### `crates/tlog`
+
+Compile-time-gated, runtime-selectable tracing, replacing one bespoke
+`std::env::var("TERMINAL_DEBUG_X")` check per subsystem with a single facility
+every crate can use.
+
+- **Compile time:** the `trace` Cargo feature. Off (the default, and what
+  every release/normal build uses): every `tlog::trace!` call site compiles to
+  nothing but a type-check of its format arguments — no env read, no branch,
+  no call.
+- **Runtime:** once compiled in, `TERMINAL_LOG=pty,render` (or `=all`) picks
+  which named `Channel`s (`pty`, `parser`, `grid`, `render`, `input`,
+  `platform`, `config`, `fps`) actually emit. An unselected channel costs one
+  atomic load; its `format_args!` is never evaluated.
+- Output goes to stderr, or to a file named by `TERMINAL_LOG_FILE` — handy for
+  high-volume channels like raw PTY bytes, which would otherwise interleave
+  with the very terminal being debugged. `tlog::Escaped` renders control bytes
+  visibly (`ESC` → `\e`, etc.) for exactly that use.
+
+Deliberately separate from `TERMINAL_DEBUG_FPS` (`crates/platform/src/window.rs`):
+that's an already-zero-cost, documented on-screen overlay with its own
+established workflow (`scripts/stress/README.md`) and doesn't fit the
+"named channel, formatted line" shape here.
+
+**Deps:** none.
 
 ---
 

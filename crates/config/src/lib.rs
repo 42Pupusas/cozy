@@ -15,6 +15,8 @@
 //! path = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf"
 //! size = 14                        # point size, like Alacritty/most terminals
 //!                                   # (rendered at 96 DPI: 1pt = 96/72 px)
+//! emoji_path  = "/path/to/emoji-font.ttf"  # optional: overrides the bundled
+//!                                           # monochrome Noto Emoji fallback
 //!
 //! [window]
 //! opacity     = 1.0                # 0.0 (fully transparent) .. 1.0 (opaque)
@@ -206,6 +208,14 @@ pub struct FontConfig {
     /// *not* pixels). Converted to a pixel size for rasterization assuming
     /// the standard 96 DPI (`px = pt * 96 / 72`); see [`FontConfig::px_size`].
     pub size: u32,
+    /// Path to a fallback TTF/OTF file consulted for codepoints the primary
+    /// `path` face doesn't cover -- in practice, almost always emoji
+    /// (monospace programming fonts essentially never ship them). `None`
+    /// (the default) uses the bundled monochrome Noto Emoji font baked into
+    /// the `platform` crate, so emoji render out of the box with zero
+    /// configuration; set this to override with a different emoji/symbol
+    /// font instead.
+    pub emoji_path: Option<String>,
 }
 
 impl FontConfig {
@@ -231,6 +241,7 @@ impl Default for FontConfig {
         Self {
             path: None,
             size: 14, // points, matching Alacritty's default-ish size
+            emoji_path: None,
         }
     }
 }
@@ -439,6 +450,9 @@ impl Config {
             font.get_int_range("size", "font.size", 1, 256, "must be between 1 and 256")?
         {
             self.font.size = u32::try_from(n).unwrap_or(self.font.size);
+        }
+        if let Some(s) = font.get_str("emoji_path") {
+            self.font.emoji_path = Some(s.to_owned());
         }
         Ok(())
     }

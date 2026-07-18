@@ -176,6 +176,17 @@ pub struct Grid {
     /// happens to already equal `last_cursor` (which was optimistically
     /// updated when the lost snapshot was taken).
     force_cursor_changed: bool,
+    /// The viewport offset the renderer's backbuffer currently shows, used to
+    /// compute the signed whole-screen pixel-shift for a scroll-back step.
+    /// `Some(0)` after any incremental (live-bottom) frame; `Some(k)` after a
+    /// viewport frame at offset `k`; `None` when it can't be trusted (a
+    /// viewport frame was dropped by a full ring, so the next one must repaint
+    /// in full rather than shift from a frame that never landed).
+    ///
+    /// Set optimistically when a snapshot is *built*; rolled back to `None` by
+    /// [`Grid::requeue_snapshot`] if that build turned out to be undeliverable
+    /// -- exactly mirroring how `force_cursor_changed` guards `last_cursor`.
+    rendered_offset: Option<usize>,
 }
 
 impl Grid {
@@ -192,6 +203,7 @@ impl Grid {
             dirty: DirtyRegion::new(cols, rows),
             saved_cursor: None,
             viewport_offset: 0,
+            rendered_offset: Some(0),
             pending_repaint: PendingRepaint::default(),
             content_delta: 0,
             replies: Vec::new(),
@@ -294,13 +306,39 @@ impl Grid {
     fn viewport_snapshot(&self) -> DirtySnapshot {
         let cols = self.primary.cols();
         let rows = self.primary.rows();
+        let cur = self.viewport_offset;
+        // We deliberately carry the *full* row set even when a pixel-shift is
+        // possible: it keeps `compose`/`requeue_snapshot` trivial (a dropped
+        // frame just re-marks every row) and makes the renderer's shm re-copy
+        // and overlay repaint correct for free, since `touched_rows` already
+        // spans the screen. The `shift` hint only lets the renderer skip the
+        // expensive part -- rasterizing the surviving interior rows' glyphs.
         let mut out = Vec::with_capacity(usize::from(rows));
         for row in 0..rows {
             let cells: Vec<Cell> = (0..cols)
-                .map(|col| self.primary.get_viewport_cell(col, row, self.viewport_offset))
+                .map(|col| self.primary.get_viewport_cell(col, row, cur))
                 .collect();
             out.push(DirtyRow { row, cells });
         }
+        // Signed whole-screen pixel-shift for the common small wheel/page step.
+        // Emitted only when (1) the previously-rendered frame is trusted
+        // (`Some`), (2) this is a *pure* view move -- new output means the
+        // buffer itself changed, so shifting the old frame wouldn't reproduce
+        // it (`content_delta == 0`), and (3) the step is small enough that some
+        // of the screen survives the shift (`|s| < rows`); a larger jump has
+        // nothing to reuse, so a full repaint is emitted instead.
+        //
+        // Sign convention (see `SnapshotKind::Viewport`): negative = view moved
+        // up into history (reveal at the top); positive = toward the bottom
+        // (reveal at the bottom). Scrolling up into history *raises* the
+        // offset, so `shift = prev - cur`.
+        let shift = match self.rendered_offset {
+            Some(prev) if self.content_delta == 0 => {
+                let s = prev as i64 - cur as i64;
+                (s != 0 && s.unsigned_abs() < u64::from(rows)).then_some(s as i32)
+            }
+            _ => None,
+        };
         DirtySnapshot {
             rows: out,
             cols,
@@ -308,8 +346,8 @@ impl Grid {
             cursor_changed: false,
             content_delta: 0,
             kind: SnapshotKind::Viewport {
-                offset: self.viewport_offset.min(u16::MAX as usize) as u16,
-                shift: None,
+                offset: cur.min(u16::MAX as usize) as u16,
+                shift,
             },
         }
     }
@@ -358,6 +396,12 @@ impl Grid {
             // there's no content delta, so this is 0 there anyway.
             snap.content_delta = self.content_delta;
             self.content_delta = 0;
+            // Optimistically record what the renderer's backbuffer will show
+            // once this frame lands, so the *next* scroll step can compute its
+            // shift against it. Rolled back to `None` in `requeue_snapshot` if
+            // the ring rejects this frame (shifting from a frame that never
+            // arrived would tear).
+            self.rendered_offset = Some(self.viewport_offset);
             // A viewport (full-frame) snapshot repaints everything, so any
             // accumulated scroll band -- there wasn't one anyway, since
             // `pending_repaint` can only hold one variant at a time -- is moot.
@@ -384,6 +428,11 @@ impl Grid {
             scroll_span: band.filter(|b| b.is_active()),
         };
         self.content_delta = 0;
+        // An incremental frame is always the live bottom (the viewport can't be
+        // scrolled while dirty rows accrue -- new output snaps it to 0 first),
+        // so the backbuffer now shows offset 0. Record it as the baseline the
+        // next scroll-back step shifts away from.
+        self.rendered_offset = Some(0);
         snap
     }
 
@@ -404,6 +453,12 @@ impl Grid {
             // take_dirty rebuilds the same full frame.
             self.viewport_offset = usize::from(offset);
             self.pending_repaint = PendingRepaint::Viewport;
+            // This frame never reached the renderer, so its backbuffer still
+            // shows whatever it did before -- which we can no longer name
+            // (the optimistic update in take_dirty assumed delivery). Distrust
+            // it: the re-armed frame will repaint in full (shift = None)
+            // rather than pixel-shift from a frame that never landed.
+            self.rendered_offset = None;
         } else {
             for row in &snap.rows {
                 self.dirty.mark_row(row.row);
@@ -1304,6 +1359,75 @@ mod tests {
         assert_eq!(g.viewport_offset(), 2);
         g.scroll_viewport(-5); // overshoot the bottom
         assert_eq!(g.viewport_offset(), 0);
+    }
+
+    #[test]
+    fn viewport_snapshot_emits_signed_pixel_shift_for_small_steps() {
+        let mut g = Grid::new(20, 4);
+        for i in 0..20 {
+            apply_str(&mut g, format!("line{i}\r\n").as_bytes());
+        }
+        // Drain the output frame (as the render loop does every vsync) so the
+        // accumulated content_delta resets and rendered_offset is 0 -- the
+        // baseline a pure wheel-scroll shifts away from.
+        let _ = g.take_dirty();
+        // First scroll from the live bottom (rendered_offset = 0): a small step
+        // up into history reveals rows at the top => shift = 0 - 2 = -2.
+        g.scroll_viewport(2);
+        let snap = g.take_dirty();
+        assert_eq!(snap.viewport_offset(), Some(2));
+        assert_eq!(snap.viewport_shift(), Some(-2));
+        assert_eq!(snap.rows.len(), 4, "full row set is still carried");
+
+        // Scroll one more line up: 2 -> 3, shift = 2 - 3 = -1.
+        g.scroll_viewport(1);
+        let snap = g.take_dirty();
+        assert_eq!(snap.viewport_shift(), Some(-1));
+
+        // Scroll back down toward the bottom: 3 -> 1, reveal at bottom,
+        // shift = 3 - 1 = +2.
+        g.scroll_viewport(-2);
+        let snap = g.take_dirty();
+        assert_eq!(snap.viewport_offset(), Some(1));
+        assert_eq!(snap.viewport_shift(), Some(2));
+    }
+
+    #[test]
+    fn viewport_snapshot_full_repaint_when_step_exceeds_screen() {
+        let mut g = Grid::new(20, 4);
+        for i in 0..40 {
+            apply_str(&mut g, format!("line{i}\r\n").as_bytes());
+        }
+        let _ = g.take_dirty();
+        // A jump larger than the screen height (4) leaves nothing to reuse, so
+        // no shift is emitted -- a full repaint.
+        g.scroll_viewport(10);
+        let snap = g.take_dirty();
+        assert_eq!(snap.viewport_offset(), Some(10));
+        assert_eq!(snap.viewport_shift(), None);
+    }
+
+    #[test]
+    fn requeued_viewport_snapshot_distrusts_rendered_frame_and_repaints_full() {
+        let mut g = Grid::new(20, 4);
+        for i in 0..20 {
+            apply_str(&mut g, format!("line{i}\r\n").as_bytes());
+        }
+        let _ = g.take_dirty();
+        g.scroll_viewport(2);
+        let snap = g.take_dirty();
+        assert_eq!(snap.viewport_shift(), Some(-2));
+        // Pretend the ring rejected it: requeue must distrust the (never
+        // delivered) frame, so the re-armed snapshot repaints fully.
+        g.requeue_snapshot(&snap);
+        let snap2 = g.take_dirty();
+        assert_eq!(snap2.viewport_offset(), Some(2));
+        assert_eq!(
+            snap2.viewport_shift(),
+            None,
+            "must not pixel-shift from a frame that never landed"
+        );
+        assert_eq!(snap2.rows.len(), 4);
     }
 
     #[test]

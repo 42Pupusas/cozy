@@ -1759,11 +1759,15 @@ impl TermWindow {
         }
         let mut touched_rows: Vec<u16> = Vec::new();
         let mut scrolls: Vec<(u16, u16, u16)> = Vec::new();
+        let mut painted_rows: usize = 0;
+        let mut painted_cells: usize = 0;
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
         for snap in &folded {
             if let Some(scroll) = self.renderer.blit_snapshot(&mut canvas, snap) {
                 scrolls.push(scroll);
             }
+            painted_rows += snap.rows.len();
+            painted_cells += snap.rows.iter().map(|r| r.cells.len()).sum::<usize>();
             touched_rows.extend(snap.rows.iter().map(|r| r.row));
         }
         // `Canvas` borrows `self.backbuffer` mutably and holds no resources of
@@ -1771,6 +1775,14 @@ impl TermWindow {
         // below can use `self` again; `drop()` here is a borrow-checker nudge,
         // not resource cleanup.
         let _ = canvas;
+        // Sub-phase timers (only read when DebugFps::Log fires below on a slow
+        // present): `t_blit` = the coalesce+blit_snapshot loop, the only phase
+        // the `blit` bench covers. The gap to `t_overlay` is overlay repaint;
+        // the gap from there to the end is the stale-row shm memcpy + Wayland
+        // Attach/Damage/Commit submission -- the phases the bench never sees,
+        // and the prime suspects for the ~16ms `present-busy` spikes.
+        let t_blit = present_start.elapsed();
+        let folded_len = folded.len();
         // A pixel-scroll `copy_within` shifted the backbuffer up -- and with it
         // any overlay we baked last frame (cursor, selection, fps). The row
         // lists that tell us where to repaint those clean now point one screen-
@@ -1828,6 +1840,7 @@ impl TermWindow {
         let new_fps_rows = self.draw_fps_overlay();
         touched_rows.extend_from_slice(&new_fps_rows);
         self.prev_fps_rows = new_fps_rows;
+        let t_overlay = present_start.elapsed();
 
         // Every row touched this frame is now stale relative to *both* shm
         // slots (whichever one isn't presented into this time still needs
@@ -1910,7 +1923,26 @@ impl TermWindow {
 
         self.frame_ready = false;
         self.dirty = false;
-        self.frame_stats.record_busy(present_start.elapsed());
+        let total = present_start.elapsed();
+        self.frame_stats.record_busy(total);
+        // On a slow present (>5ms -- never the 60fps steady state, always the
+        // spikes we're chasing), break the timed region into its three phases
+        // so we can see WHICH one owns the ~16ms. Gated behind DebugFps::Log so
+        // it's free otherwise. `submit` includes the stale-row shm memcpy plus
+        // the Attach/Damage/Commit ring writes -- if the socket is applying
+        // backpressure (compositor can't drain), the write blocks here and this
+        // phase, not blit, will own the time.
+        if self.debug_fps == DebugFps::Log && total.as_micros() > 5_000 {
+            let blit_us = t_blit.as_micros();
+            let overlay_us = t_overlay.saturating_sub(t_blit).as_micros();
+            let submit_us = total.saturating_sub(t_overlay).as_micros();
+            eprintln!(
+                "terminal:   slow present {}us = blit {blit_us}us ({folded_len} folded, \
+                 {painted_rows} rows / {painted_cells} cells) \
+                 + overlay {overlay_us}us + shm-copy/submit {submit_us}us",
+                total.as_micros()
+            );
+        }
         Ok(())
     }
 

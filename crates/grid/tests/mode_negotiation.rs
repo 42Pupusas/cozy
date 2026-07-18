@@ -40,10 +40,13 @@ fn decset_1002_and_1003_select_motion_modes() {
 fn decset_1006_layers_sgr_encoding_on_top_of_tracking() {
     let mut g = Grid::new(80, 24);
     feed(&mut g, b"\x1b[?1000h\x1b[?1006h");
-    assert_eq!(g.mouse_mode(), MouseMode::Sgr);
-    // Disabling 1006 falls back to the plain tracking-mode encoding.
+    // Tracking granularity is unaffected by 1006 -- it's an independent flag.
+    assert_eq!(g.mouse_mode(), MouseMode::Normal);
+    assert!(g.sgr_mouse());
+    // Disabling 1006 leaves the tracking mode as-is; only the encoding changes.
     feed(&mut g, b"\x1b[?1006l");
     assert_eq!(g.mouse_mode(), MouseMode::Normal);
+    assert!(!g.sgr_mouse());
 }
 
 #[test]

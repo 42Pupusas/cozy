@@ -91,6 +91,49 @@ pub enum InputEvent {
     /// Clipboard text read from another client, to be written to the PTY
     /// (a paste). Carries the raw clipboard bytes.
     Paste(Vec<u8>),
+    /// A pointer press/release/motion over the content area, for VT mouse
+    /// reporting (`CSI M ...` / SGR). Emitted for every button event
+    /// regardless of whether the app negotiated mouse tracking -- the
+    /// consumer (the `Encoder`) is what decides whether/how to encode it,
+    /// same division of labor as `InputEvent::Key`.
+    Mouse {
+        button: MouseButton,
+        kind: MouseEventKind,
+        /// 0-indexed column of the cell under the pointer.
+        col: u16,
+        /// 0-indexed row of the cell under the pointer.
+        row: u16,
+        modifiers: Modifiers,
+    },
+    /// Keyboard focus gained/lost (`wl_keyboard.enter`/`leave`), for xterm
+    /// focus-event reporting (DECSET 1004: `CSI I` / `CSI O`).
+    Focus(bool),
+}
+
+/// Mouse button identity, mirroring [`crate::protocol::PointerButton`] plus
+/// the wheel/no-button cases `wl_pointer.axis`/motion-with-no-press need.
+/// Kept distinct from `protocol::PointerButton` (which only models the wire
+/// button codes) so `InputEvent::Mouse` can also carry wheel-scroll and
+/// bare-hover reports.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+    /// No button involved -- a bare motion report under any-event tracking.
+    None,
+}
+
+/// Whether an [`InputEvent::Mouse`] is a fresh press, a release, or a motion
+/// report (drag while a button is held, or bare hover under any-event
+/// tracking).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MouseEventKind {
+    Press,
+    Release,
+    Motion,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -403,6 +446,11 @@ pub struct TermWindow {
     cell_h: i32,
 
     pointer_pos: Point,
+    /// The button currently held down, if any -- carried on `Motion` events
+    /// so `ButtonMotion`/`AnyEvent` mouse reporting knows which button (if
+    /// any) is down during a drag. `wl_pointer.motion` itself carries no
+    /// button info, so this is the only way to know.
+    mouse_pressed: Option<MouseButton>,
     dirty: bool,
     frame_ready: bool,
     frame_cb: Option<CallbackId>,
@@ -677,6 +725,7 @@ impl TermWindow {
             cell_w,
             cell_h,
             pointer_pos: Point::new(0, 0),
+            mouse_pressed: None,
             dirty: true,
             frame_ready: true,
             frame_cb: None,
@@ -1158,10 +1207,42 @@ impl TermWindow {
                         if self.selection.drag_to((cc, i32::from(cr))) {
                             self.dirty = true;
                         }
+                        // VT mouse reporting: forward every motion report:
+                        // the `Encoder` (which knows the negotiated tracking
+                        // granularity) decides whether a bare hover
+                        // (`mouse_pressed == None`) or only a drag gets
+                        // encoded -- same division of labor as `Key`.
+                        self.input_queue.push_back(InputEvent::Mouse {
+                            button: self.mouse_pressed.unwrap_or(MouseButton::None),
+                            kind: MouseEventKind::Motion,
+                            col: cc,
+                            row: cr,
+                            modifiers: self.modifiers,
+                        });
                     }
                     Some(PointerEvent::Button) => {
                         let button = PointerButton::from_code(ev.arg(2));
                         let state = ButtonState::from_raw(ev.arg(3));
+                        if let (Some(button), Some(state)) = (button, state) {
+                            let (cc, cr) = self.pointer_cell();
+                            let mb = match button {
+                                PointerButton::Left => MouseButton::Left,
+                                PointerButton::Right => MouseButton::Right,
+                                PointerButton::Middle => MouseButton::Middle,
+                            };
+                            self.mouse_pressed = matches!(state, ButtonState::Pressed).then_some(mb);
+                            self.input_queue.push_back(InputEvent::Mouse {
+                                button: mb,
+                                kind: if matches!(state, ButtonState::Pressed) {
+                                    MouseEventKind::Press
+                                } else {
+                                    MouseEventKind::Release
+                                },
+                                col: cc,
+                                row: cr,
+                                modifiers: self.modifiers,
+                            });
+                        }
                         match (button, state) {
                             (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
                                 let shift = (self.modifiers.depressed
@@ -1219,6 +1300,7 @@ impl TermWindow {
                         // Keyboard focus gained: arg(0) is the serial we must
                         // present to `set_selection` to prove we own focus.
                         self.focus_serial = ev.arg(0);
+                        self.input_queue.push_back(InputEvent::Focus(true));
                     }
                     Some(KeyboardEvent::Key) => {
                         let physical = Key::from_code(ev.arg(2));
@@ -1273,6 +1355,7 @@ impl TermWindow {
                         if let Err(e) = self.repeat_timer.disarm() {
                             eprintln!("platform: failed to disarm key-repeat timer: {e}");
                         }
+                        self.input_queue.push_back(InputEvent::Focus(false));
                     }
                     Some(KeyboardEvent::Modifiers) => {
                         self.modifiers = Modifiers {

@@ -423,10 +423,13 @@ impl BarWindow {
             .finish();
         eprintln!("statusbar: create_pool msg bytes = {msg:?}");
         let fd = shm_mem.fd();
-        eprintln!(
-            "statusbar: about to send_with_fds, fd raw={}",
-            std::os::fd::AsRawFd::as_raw_fd(&fd)
-        );
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+        eprintln!("statusbar: about to send_with_fds, fd raw={raw}");
+        if let Ok(meta) = std::fs::metadata(format!("/proc/self/fd/{raw}")) {
+            eprintln!("statusbar: fd {raw} backing file len={}", meta.len());
+        } else {
+            eprintln!("statusbar: fd {raw} /proc lookup failed");
+        }
         sender.send_with_fds(msg, &[fd])?;
         eprintln!("statusbar: send_with_fds returned Ok");
         let mut frames = [Frame {
@@ -542,19 +545,27 @@ impl BarWindow {
                 match interface.as_str() {
                     s if s == proto::WL_COMPOSITOR.name && compositor.is_none() => {
                         let v = proto::WL_COMPOSITOR.version.min(version);
-                        compositor = Some(Self::bind(sender, registry, name, &interface, v)?);
+                        let id: CompositorId = Self::bind(sender, registry, name, &interface, v)?;
+                        eprintln!("statusbar: bound compositor id={}", id.raw());
+                        compositor = Some(id);
                     }
                     s if s == proto::WL_SHM.name && shm.is_none() => {
                         let v = proto::WL_SHM.version.min(version);
-                        shm = Some(Self::bind(sender, registry, name, &interface, v)?);
+                        let id: ShmId = Self::bind(sender, registry, name, &interface, v)?;
+                        eprintln!("statusbar: bound shm id={}", id.raw());
+                        shm = Some(id);
                     }
                     s if s == proto::ZWLR_LAYER_SHELL_V1.name && layer_shell.is_none() => {
                         let v = proto::ZWLR_LAYER_SHELL_V1.version.min(version);
-                        layer_shell = Some(Self::bind(sender, registry, name, &interface, v)?);
+                        let id: LayerShellId = Self::bind(sender, registry, name, &interface, v)?;
+                        eprintln!("statusbar: bound layer_shell id={}", id.raw());
+                        layer_shell = Some(id);
                     }
                     s if s == proto::WL_OUTPUT.name && output.is_none() => {
                         let v = proto::WL_OUTPUT.version.min(version);
-                        output = Some(Self::bind(sender, registry, name, &interface, v)?);
+                        let id: OutputId = Self::bind(sender, registry, name, &interface, v)?;
+                        eprintln!("statusbar: bound output id={}", id.raw());
+                        output = Some(id);
                     }
                     _ => {}
                 }

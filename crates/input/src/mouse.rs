@@ -12,10 +12,16 @@ pub enum MouseButton {
     WheelDown,
     /// Extended button 4–7 (side buttons, etc.).
     Extended(u8),
+    /// No button held — a bare pointer move under `AnyEvent` tracking
+    /// (`CSI ? 1003 h`), which reports motion even without a button down.
+    None,
 }
 
 impl MouseButton {
-    /// Raw X10 button code (before modifier bits are OR'd in).
+    /// Raw X10 button code (before modifier bits are OR'd in). `None` uses
+    /// the same code (3) the wire protocol reserves for "no button"
+    /// (release events use it too, but always via the `Released` override in
+    /// the encoder, not through this path).
     #[must_use]
     pub const fn x10_code(self) -> u8 {
         match self {
@@ -25,15 +31,20 @@ impl MouseButton {
             Self::WheelUp => 64,
             Self::WheelDown => 65,
             Self::Extended(n) => 128 + n,
+            Self::None => 3,
         }
     }
 }
 
-/// Whether the button was pressed or released.
+/// Whether the button was pressed, released, or this is a motion report.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ButtonState {
     Pressed,
     Released,
+    /// Pointer moved while this button was held (`ButtonMotion`/`AnyEvent`
+    /// tracking). `button` is `MouseButton::None` when no button is held
+    /// (only reported under `AnyEvent`).
+    Moved,
 }
 
 /// A complete mouse event from the platform layer.

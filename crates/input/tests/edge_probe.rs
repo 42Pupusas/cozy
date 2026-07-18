@@ -248,3 +248,88 @@ fn xterm_modify_with_ctrl_uses_csi27_form() {
     let s = std::str::from_utf8(&out).unwrap();
     assert_eq!(s, "\x1b[27;5;97~");
 }
+
+/// Plain `Normal` (1000) tracking must NOT report bare motion — only
+/// press/release.
+#[test]
+fn normal_mode_drops_motion_reports() {
+    let mut e = Encoder::new();
+    e.mouse_mode = MouseMode::Normal;
+    let ev = MouseEvent {
+        button: MouseButton::Left,
+        state: ButtonState::Moved,
+        col: 5,
+        row: 5,
+        mods: Modifiers::NONE,
+    };
+    let mut b = [0u8; 16];
+    assert!(e.encode_mouse(ev, &mut b).is_none());
+}
+
+/// `ButtonMotion` (1002) reports motion while a button is held...
+#[test]
+fn button_motion_mode_reports_drag_with_button_held() {
+    let mut e = Encoder::new();
+    e.mouse_mode = MouseMode::ButtonMotion;
+    let ev = MouseEvent {
+        button: MouseButton::Left,
+        state: ButtonState::Moved,
+        col: 5,
+        row: 5,
+        mods: Modifiers::NONE,
+    };
+    let mut b = [0u8; 16];
+    assert!(e.encode_mouse(ev, &mut b).is_some());
+}
+
+/// ...but NOT bare hover with no button held.
+#[test]
+fn button_motion_mode_drops_hover_with_no_button() {
+    let mut e = Encoder::new();
+    e.mouse_mode = MouseMode::ButtonMotion;
+    let ev = MouseEvent {
+        button: MouseButton::None,
+        state: ButtonState::Moved,
+        col: 5,
+        row: 5,
+        mods: Modifiers::NONE,
+    };
+    let mut b = [0u8; 16];
+    assert!(e.encode_mouse(ev, &mut b).is_none());
+}
+
+/// `AnyEvent` (1003) reports motion even with no button held.
+#[test]
+fn any_event_mode_reports_bare_hover() {
+    let mut e = Encoder::new();
+    e.mouse_mode = MouseMode::AnyEvent;
+    let ev = MouseEvent {
+        button: MouseButton::None,
+        state: ButtonState::Moved,
+        col: 5,
+        row: 5,
+        mods: Modifiers::NONE,
+    };
+    let mut b = [0u8; 16];
+    assert!(e.encode_mouse(ev, &mut b).is_some());
+}
+
+/// `sgr_mouse` layers SGR encoding on top of a plain tracking mode
+/// independent of `mouse_mode` itself.
+#[test]
+fn sgr_mouse_flag_layers_sgr_encoding_over_normal_tracking() {
+    let mut e = Encoder::new();
+    e.mouse_mode = MouseMode::Normal;
+    e.sgr_mouse = true;
+    let ev = MouseEvent {
+        button: MouseButton::Left,
+        state: ButtonState::Pressed,
+        col: 0,
+        row: 0,
+        mods: Modifiers::NONE,
+    };
+    let mut b = [0u8; 32];
+    let n = e.encode_mouse(ev, &mut b).unwrap();
+    let s = std::str::from_utf8(&b[..n]).unwrap();
+    assert_eq!(s, "\x1b[<0;1;1M");
+}

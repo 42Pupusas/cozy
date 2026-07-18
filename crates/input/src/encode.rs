@@ -19,11 +19,45 @@ pub enum KeyboardMode {
     Kitty,
 }
 
+impl KeyboardMode {
+    /// Pack into one byte for cross-thread transport (e.g. an `AtomicU8`
+    /// shuttling the grid's negotiated mode to the UI thread's `Encoder`).
+    #[must_use]
+    pub const fn to_u8(self) -> u8 {
+        match self {
+            Self::Legacy => 0,
+            Self::XtermModifyOtherKeys => 1,
+            Self::Kitty => 2,
+        }
+    }
+
+    /// Inverse of [`Self::to_u8`]. Any unrecognized byte decodes to `Legacy`
+    /// (fail safe -- worst case keys are encoded more conservatively than
+    /// the app asked for, never less).
+    #[must_use]
+    pub const fn from_u8(b: u8) -> Self {
+        match b {
+            1 => Self::XtermModifyOtherKeys,
+            2 => Self::Kitty,
+            _ => Self::Legacy,
+        }
+    }
+}
+
 /// Stateful encoder: holds negotiated protocol flags and produces byte sequences.
 #[derive(Clone, Debug, Default)]
 pub struct Encoder {
     pub keyboard_mode: KeyboardMode,
+    /// Tracking granularity: `Off`/`X10`/`Normal`/`ButtonMotion`/`AnyEvent`.
+    /// Setting this directly to `MouseMode::Sgr` is also accepted (kept for
+    /// backward compatibility with callers that don't track granularity and
+    /// encoding separately) and is treated the same as `Normal` for motion
+    /// gating, always SGR-encoded regardless of `sgr_mouse`.
     pub mouse_mode: MouseMode,
+    /// SGR coordinate encoding (`CSI ? 1006 h`), layered independently on
+    /// top of `mouse_mode`'s tracking granularity -- xterm lets an app
+    /// toggle this without changing which events are tracked at all.
+    pub sgr_mouse: bool,
     /// Application-cursor mode (`CSI ? 1 h`): arrow keys send `SS3` instead of `CSI`.
     pub app_cursor: bool,
     /// Application-keypad mode (`CSI = h`): keypad sends application sequences.
@@ -135,12 +169,31 @@ impl Encoder {
     }
 
     /// Encode a mouse event into `buf`.  Returns the number of bytes written,
-    /// or `None` if mouse reporting is off.
+    /// or `None` if mouse reporting is off, or if this is a motion report
+    /// the negotiated tracking mode doesn't ask for (plain `Normal`/`X10`
+    /// only report press/release; `ButtonMotion` adds drag; `AnyEvent` adds
+    /// bare hover too).
     pub fn encode_mouse(&self, ev: MouseEvent, buf: &mut [u8]) -> Option<usize> {
-        match self.mouse_mode {
-            MouseMode::Off => None,
-            MouseMode::Sgr => Some(Self::encode_mouse_sgr(ev, buf)),
-            _ => Some(self.encode_mouse_x10(ev, buf)),
+        if matches!(ev.state, ButtonState::Moved) {
+            let wants_motion = match self.mouse_mode {
+                MouseMode::AnyEvent => true,
+                // ButtonMotion (and Sgr, kept as a granularity alias) only
+                // reports motion while some button is held.
+                MouseMode::ButtonMotion | MouseMode::Sgr => {
+                    !matches!(ev.button, crate::mouse::MouseButton::None)
+                }
+                MouseMode::Off | MouseMode::X10 | MouseMode::Normal => false,
+            };
+            if !wants_motion {
+                return None;
+            }
+        } else if matches!(self.mouse_mode, MouseMode::Off) {
+            return None;
+        }
+        if self.sgr_mouse || matches!(self.mouse_mode, MouseMode::Sgr) {
+            Some(Self::encode_mouse_sgr(ev, buf))
+        } else {
+            Some(self.encode_mouse_x10(ev, buf))
         }
     }
 
@@ -467,6 +520,11 @@ impl Encoder {
         if matches!(ev.state, ButtonState::Released) && !matches!(self.mouse_mode, MouseMode::X10) {
             btn = 3;
         }
+        // Motion bit (bit 5 / 0x20) marks a `ButtonMotion`/`AnyEvent` drag or
+        // hover report rather than a fresh press/release.
+        if matches!(ev.state, ButtonState::Moved) {
+            btn |= 0x20;
+        }
         // Clamp to 223 (max encodable in 1 byte + 32).
         let col = (ev.col + 1).min(223) as u8;
         let row = (ev.row + 1).min(223) as u8;
@@ -492,8 +550,15 @@ impl Encoder {
         if ev.mods.ctrl() {
             btn |= 0x10;
         }
+        if matches!(ev.state, ButtonState::Moved) {
+            btn |= 0x20;
+        }
         let final_byte: u8 = match ev.state {
-            ButtonState::Pressed => b'M',
+            // SGR has no separate "motion" terminator -- a moved report
+            // still ends in 'M' (only a genuine release uses 'm'); the
+            // motion bit above is what tells the app it wasn't a fresh
+            // press.
+            ButtonState::Pressed | ButtonState::Moved => b'M',
             ButtonState::Released => b'm',
         };
         let mut w = SeqWriter::new(buf);

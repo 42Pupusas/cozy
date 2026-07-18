@@ -1171,19 +1171,21 @@ impl Grid {
         self.bracketed_paste
     }
 
-    /// The negotiated mouse-reporting mode, folding in SGR encoding (DECSET
-    /// 1006): `Sgr` is reported whenever `sgr_mouse` is set and tracking
-    /// isn't `Off`, taking priority over the plain X10/Normal/ButtonMotion/
-    /// `AnyEvent` encodings those same DECSET codes would otherwise imply.
-    /// Read by the UI thread to decide whether/how to forward pointer
-    /// events to the PTY.
+    /// The negotiated mouse tracking granularity (`Off`/`X10`/`Normal`/
+    /// `ButtonMotion`/`AnyEvent`), independent of SGR encoding (see
+    /// [`Grid::sgr_mouse`]). Read by the UI thread's `Encoder` to decide
+    /// whether/which pointer events to forward to the PTY.
     #[must_use]
     pub fn mouse_mode(&self) -> MouseMode {
-        if self.sgr_mouse && self.mouse_mode != MouseMode::Off {
-            MouseMode::Sgr
-        } else {
-            self.mouse_mode
-        }
+        self.mouse_mode
+    }
+
+    /// Whether SGR mouse coordinate encoding (DECSET 1006) is active,
+    /// layered independently on top of [`Grid::mouse_mode`]'s tracking
+    /// granularity.
+    #[must_use]
+    pub fn sgr_mouse(&self) -> bool {
+        self.sgr_mouse
     }
 
     /// The negotiated keyboard-encoding protocol (xterm modifyOtherKeys /

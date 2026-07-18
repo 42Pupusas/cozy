@@ -30,19 +30,90 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use config::Config;
 use grid::{DirtySnapshot, Grid};
-use input::{Encoder, Key, KeyState, Modifiers};
+use input::{Encoder, Key, KeyState, KeyboardMode, Modifiers, MouseButton, MouseEvent, MouseMode};
 use platform::{InputEvent, TermWindow};
 use pty::{Pty, PtyInput, WinSize};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc;
 use quetzalcoatl::spsc::RingBuffer;
 use vt_parser::Parser;
+
+/// The grid's negotiated terminal modes, packed into one `u32` for cheap
+/// lock-free cross-thread transport (parser thread writes after every grid
+/// batch, UI thread reads before encoding each key/mouse event) -- the same
+/// pattern `bracketed_paste` already uses via a plain `AtomicBool`, extended
+/// to more than one bit of state.
+///
+/// Bit layout (low to high): `mouse_mode` (3 bits, [`MouseMode::to_u8`]),
+/// `sgr_mouse` (1 bit), `keyboard_mode` (2 bits, [`KeyboardMode::to_u8`]),
+/// `kitty_flags` (8 bits), `app_cursor` (1 bit), `app_keypad` (1 bit),
+/// `focus_events` (1 bit).
+#[allow(clippy::struct_excessive_bools)] // each bool is an independent negotiated flag, not a state machine
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct TermModes {
+    mouse_mode: MouseMode,
+    sgr_mouse: bool,
+    keyboard_mode: KeyboardMode,
+    kitty_flags: u8,
+    app_cursor: bool,
+    app_keypad: bool,
+    focus_events: bool,
+}
+
+impl TermModes {
+    fn pack(self) -> u32 {
+        let mut v = u32::from(self.mouse_mode.to_u8());
+        v |= u32::from(self.sgr_mouse) << 3;
+        v |= u32::from(self.keyboard_mode.to_u8()) << 4;
+        v |= u32::from(self.kitty_flags) << 6;
+        v |= u32::from(self.app_cursor) << 14;
+        v |= u32::from(self.app_keypad) << 15;
+        v |= u32::from(self.focus_events) << 16;
+        v
+    }
+
+    const fn unpack(v: u32) -> Self {
+        Self {
+            mouse_mode: MouseMode::from_u8((v & 0b111) as u8),
+            sgr_mouse: (v >> 3) & 1 != 0,
+            keyboard_mode: KeyboardMode::from_u8(((v >> 4) & 0b11) as u8),
+            kitty_flags: ((v >> 6) & 0xFF) as u8,
+            app_cursor: (v >> 14) & 1 != 0,
+            app_keypad: (v >> 15) & 1 != 0,
+            focus_events: (v >> 16) & 1 != 0,
+        }
+    }
+
+    /// Snapshot the grid's current negotiated modes (called on the parser
+    /// thread, which owns the grid).
+    fn from_grid(grid: &Grid) -> Self {
+        Self {
+            mouse_mode: grid.mouse_mode(),
+            sgr_mouse: grid.sgr_mouse(),
+            keyboard_mode: grid.keyboard_mode(),
+            kitty_flags: grid.kitty_flags(),
+            app_cursor: grid.app_cursor(),
+            app_keypad: grid.app_keypad(),
+            focus_events: grid.focus_events(),
+        }
+    }
+
+    /// Apply to an `Encoder` (called on the UI thread before encoding).
+    const fn apply_to(self, enc: &mut Encoder) {
+        enc.mouse_mode = self.mouse_mode;
+        enc.sgr_mouse = self.sgr_mouse;
+        enc.keyboard_mode = self.keyboard_mode;
+        enc.kitty_flags = self.kitty_flags;
+        enc.app_cursor = self.app_cursor;
+        enc.app_keypad = self.app_keypad;
+    }
+}
 
 /// Initial terminal dimensions (cells).
 const COLS: u16 = 80;
@@ -166,6 +237,11 @@ struct App<'cfg> {
     /// Bracketed-paste mode (DECSET 2004): written on the parser thread
     /// (owns the grid), read on the UI thread (wraps clipboard paste).
     bracketed_paste: Arc<AtomicBool>,
+    /// The grid's other negotiated terminal modes (mouse tracking/SGR,
+    /// keyboard protocol, app-cursor/keypad, focus events), packed via
+    /// [`TermModes::pack`]: written on the parser thread after every grid
+    /// batch, read on the UI thread before encoding each key/mouse event.
+    term_modes: Arc<AtomicU32>,
 }
 
 impl<'cfg> App<'cfg> {
@@ -174,6 +250,7 @@ impl<'cfg> App<'cfg> {
             cfg,
             quit: Arc::new(AtomicBool::new(false)),
             bracketed_paste: Arc::new(AtomicBool::new(false)),
+            term_modes: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -209,6 +286,8 @@ impl<'cfg> App<'cfg> {
         let quit_parser = Arc::clone(&self.quit);
         let bracketed_paste_parser = Arc::clone(&self.bracketed_paste);
         let bracketed_paste_ui = Arc::clone(&self.bracketed_paste);
+        let term_modes_parser = Arc::clone(&self.term_modes);
+        let term_modes_ui = Arc::clone(&self.term_modes);
 
         // ── Cross-thread wakeups (eventfd + poll) ────────────────────────────────
         // Each thread that waits on more than one source blocks in poll(2) on an
@@ -242,6 +321,7 @@ impl<'cfg> App<'cfg> {
             ui_wake: parser_ui_wake,
             pty_wake: parser_pty_wake,
             bracketed_paste: bracketed_paste_parser,
+            term_modes: term_modes_parser,
             quit: quit_parser,
         }
         .spawn();
@@ -256,6 +336,7 @@ impl<'cfg> App<'cfg> {
             ui_wake,
             pty_wake: ui_pty_wake,
             bracketed_paste: &bracketed_paste_ui,
+            term_modes: &term_modes_ui,
             quit: &self.quit,
         }
         .run()?;
@@ -404,6 +485,7 @@ struct ParserWorker {
     ui_wake: waker::Waker,
     pty_wake: waker::Waker,
     bracketed_paste: Arc<AtomicBool>,
+    term_modes: Arc<AtomicU32>,
     quit: Arc<AtomicBool>,
 }
 
@@ -430,6 +512,7 @@ impl ParserWorker {
             ui_wake,
             pty_wake,
             bracketed_paste,
+            term_modes,
             quit,
         } = self;
         ParserSession {
@@ -441,6 +524,7 @@ impl ParserWorker {
             ui_wake,
             pty_wake,
             bracketed_paste,
+            term_modes,
             quit,
         }
         .run();
@@ -463,6 +547,7 @@ struct ParserSession {
     ui_wake: waker::Waker,
     pty_wake: waker::Waker,
     bracketed_paste: Arc<AtomicBool>,
+    term_modes: Arc<AtomicU32>,
     quit: Arc<AtomicBool>,
 }
 
@@ -574,6 +659,14 @@ impl ParserSession {
             self.bracketed_paste
                 .store(self.grid.bracketed_paste(), Ordering::Relaxed);
 
+            // Publish the rest of the negotiated terminal modes (mouse
+            // tracking/SGR, keyboard protocol, app-cursor/keypad, focus
+            // events) for the UI thread's `Encoder`.
+            self.term_modes.store(
+                TermModes::from_grid(&self.grid).pack(),
+                Ordering::Relaxed,
+            );
+
             self.publish();
         }
     }
@@ -595,6 +688,7 @@ struct UiWorker<'a> {
     ui_wake: platform::Waker,
     pty_wake: waker::Waker,
     bracketed_paste: &'a AtomicBool,
+    term_modes: &'a AtomicU32,
     quit: &'a AtomicBool,
 }
 
@@ -611,6 +705,7 @@ impl UiWorker<'_> {
             ui_wake,
             pty_wake,
             bracketed_paste,
+            term_modes,
             quit,
         } = self;
         let theme = platform::Theme::from_palette(&cfg.palette);
@@ -636,7 +731,7 @@ impl UiWorker<'_> {
         let mut win = TermWindow::new("terminal", COLS, ROWS, ui_wake, cursor_cfg, move |scale| {
             platform::Renderer::with_scale(theme, &font, scale).with_opacity(opacity)
         })?;
-        let encoder = Encoder::new();
+        let mut encoder = Encoder::new();
 
         // Idle poll cap while an animation (cursor slide/blink) is in flight, in
         // milliseconds -- derived from `[window] target_fps`. This is a *target*
@@ -662,6 +757,12 @@ impl UiWorker<'_> {
             let mut did_work = false;
             // True if we pushed input the PTY thread must be roused for.
             let mut sent_input = false;
+
+            // Pick up whatever mode changes the parser thread negotiated
+            // since the last iteration (mouse tracking/SGR, keyboard
+            // protocol, app-cursor/keypad, focus events) before encoding any
+            // input this iteration produces.
+            TermModes::unpack(term_modes.load(Ordering::Relaxed)).apply_to(&mut encoder);
 
             // Push dirty snapshots into the Wayland renderer.
             while let Some(snap) = dirty_rx.pop() {
@@ -772,6 +873,51 @@ impl UiWorker<'_> {
                             // full opacity -- it should never be caught mid-fade
                             // by what you just typed.
                             win.notify_activity();
+                        }
+                    }
+                    InputEvent::Mouse {
+                        button,
+                        kind,
+                        col,
+                        row,
+                        modifiers,
+                    } => {
+                        use platform::window::MouseEventKind;
+                        let mev = MouseEvent {
+                            button: match button {
+                                platform::window::MouseButton::Left => MouseButton::Left,
+                                platform::window::MouseButton::Middle => MouseButton::Middle,
+                                platform::window::MouseButton::Right => MouseButton::Right,
+                                platform::window::MouseButton::WheelUp => MouseButton::WheelUp,
+                                platform::window::MouseButton::WheelDown => {
+                                    MouseButton::WheelDown
+                                }
+                                platform::window::MouseButton::None => MouseButton::None,
+                            },
+                            state: match kind {
+                                MouseEventKind::Press => input::mouse::ButtonState::Pressed,
+                                MouseEventKind::Release => input::mouse::ButtonState::Released,
+                                MouseEventKind::Motion => input::mouse::ButtonState::Moved,
+                            },
+                            col,
+                            row,
+                            mods: modifiers.to_input(),
+                        };
+                        let mut mbuf = [0u8; 32];
+                        if let Some(n) = encoder.encode_mouse(mev, &mut mbuf) {
+                            let _ = input_tx.push(InputMsg::Bytes(mbuf[..n].into()));
+                            sent_input = true;
+                        }
+                    }
+                    InputEvent::Focus(gained) => {
+                        // DECSET 1004: report focus in/out as CSI I / CSI O.
+                        // Gated on the negotiated flag so a plain shell
+                        // (which never asked for this) doesn't see stray
+                        // escapes land on its prompt.
+                        if TermModes::unpack(term_modes.load(Ordering::Relaxed)).focus_events {
+                            let bytes: &[u8] = if gained { b"\x1b[I" } else { b"\x1b[O" };
+                            let _ = input_tx.push(InputMsg::Bytes(bytes.into()));
+                            sent_input = true;
                         }
                     }
                 }

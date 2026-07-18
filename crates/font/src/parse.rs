@@ -64,6 +64,10 @@ pub enum ParseError {
     TooShort,
     BadSfntVersion,
     MissingTable(&'static str),
+    /// A `ttcf` (`TrueType` Collection) header claimed zero fonts -- a
+    /// well-formed TTC always has `numFonts >= 1`; this is corrupt/truncated
+    /// data, not a font this parser simply doesn't support.
+    EmptyCollection,
 }
 
 impl std::fmt::Display for ParseError {
@@ -72,6 +76,7 @@ impl std::fmt::Display for ParseError {
             Self::TooShort => write!(f, "font data too short"),
             Self::BadSfntVersion => write!(f, "not a TTF/OTF file (bad sfnt version)"),
             Self::MissingTable(t) => write!(f, "required table missing: {t}"),
+            Self::EmptyCollection => write!(f, "TrueType collection (ttcf) has zero fonts"),
         }
     }
 }
@@ -121,29 +126,58 @@ impl ByteSliceExt for [u8] {
 // ── Parser ────────────────────────────────────────────────────────────────────
 
 impl<'a> FontFile<'a> {
-    /// Parse the offset table and table directory from raw TTF/OTF bytes.
+    /// Parse the offset table and table directory from raw TTF/OTF/TTC bytes.
+    ///
+    /// Transparently unwraps a `ttcf` (`TrueType` Collection, e.g. Noto's
+    /// `NotoSansCJK-Regular.ttc`) by reading its header's first font offset
+    /// and parsing the sfnt table directory found there -- i.e. this always
+    /// loads the *first* face in a collection. `.ttc` files bundle several
+    /// weights/scripts of one family behind one `ttcf` wrapper purely to
+    /// dedupe shared glyph outlines on disk; sub-font 0 is a real, complete,
+    /// independently-usable font like any other -- there's no "combined"
+    /// font to pick instead.
     pub fn parse(data: &'a [u8]) -> Result<Self, ParseError> {
         if data.len() < 12 {
             return Err(ParseError::TooShort);
         }
-
-        // sfnt version: 0x00010000 = TrueType, 0x4F54544F = 'OTTO' (CFF)
         let sfnt = data.u32_at(0).ok_or(ParseError::TooShort)?;
+        if sfnt == TTC_TAG {
+            let num_fonts = data.u32_at(8).ok_or(ParseError::TooShort)?;
+            if num_fonts == 0 {
+                return Err(ParseError::EmptyCollection);
+            }
+            // TableDirectory offsets array starts right after the 12-byte
+            // TTC header (version-independent: v1 and v2 share this prefix).
+            let sub_offset = data.u32_at(12).ok_or(ParseError::TooShort)? as usize;
+            return Self::parse_sfnt_at(data, sub_offset);
+        }
+        Self::parse_sfnt_at(data, 0)
+    }
+
+    /// Parse one sfnt table directory (offset table + records) starting at
+    /// byte `base` in `data` -- `0` for a bare TTF/OTF, or a sub-font's
+    /// offset for a `ttcf` collection (see [`Self::parse`]). Table record
+    /// offsets in the directory are absolute (from the start of `data`),
+    /// same in both cases, so nothing downstream needs to know which case
+    /// it came from.
+    fn parse_sfnt_at(data: &'a [u8], base: usize) -> Result<Self, ParseError> {
+        let sfnt = data.u32_at(base).ok_or(ParseError::TooShort)?;
+        // sfnt version: 0x00010000 = TrueType, 0x4F54544F = 'OTTO' (CFF)
         if sfnt != 0x0001_0000 && sfnt != 0x4F54_544F {
             return Err(ParseError::BadSfntVersion);
         }
 
-        let num_tables = data.u16_at(4).ok_or(ParseError::TooShort)? as usize;
-        if data.len() < 12 + num_tables * 16 {
+        let num_tables = data.u16_at(base + 4).ok_or(ParseError::TooShort)? as usize;
+        if data.len() < base + 12 + num_tables * 16 {
             return Err(ParseError::TooShort);
         }
 
         let mut tables = [None::<TableRecord>; 16];
         for i in 0..num_tables {
-            let base = 12 + i * 16;
-            let tag: [u8; 4] = data[base..base + 4].try_into().unwrap();
-            let offset = data.u32_at(base + 8).ok_or(ParseError::TooShort)? as usize;
-            let length = data.u32_at(base + 12).ok_or(ParseError::TooShort)? as usize;
+            let rec = base + 12 + i * 16;
+            let tag: [u8; 4] = data[rec..rec + 4].try_into().unwrap();
+            let offset = data.u32_at(rec + 8).ok_or(ParseError::TooShort)? as usize;
+            let length = data.u32_at(rec + 12).ok_or(ParseError::TooShort)? as usize;
             if let Some(idx) = Tag(tag).index() {
                 tables[idx] = Some(TableRecord { offset, length });
             }

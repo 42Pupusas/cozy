@@ -79,6 +79,29 @@ sh scripts/stress/paste_flood.sh    # paste a big buffer into the window
    rendering, but good for completeness — the round trip goes through the
    `input`/`InputMsg` ring in `bins/terminal/src/main.rs`).
 
+## Glyph rendering smoke test
+
+Unlike the scenarios above (which need a live window + your eyes), font
+coverage/rasterization can be checked headlessly with a small standalone
+example that drives the real `platform::Renderer` pipeline
+(`crates/font` + `crates/platform/src/render.rs`) with no window/Wayland at
+all:
+
+```sh
+cargo run -p platform --example glyph_render_check -- \
+    /usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf \
+    assets/fonts/NotoEmoji-Regular.ttf
+```
+
+It renders one row each of ASCII, box-drawing, CJK, and emoji through
+`Renderer::blit_cell`, cross-checks `font::FontFace::has_glyph` coverage
+against which cells actually got non-background pixels (so a `.notdef`/tofu
+regression can't hide behind "some pixel changed"), and writes
+`glyph_render_check.ppm` so you can eyeball the result too. Exits nonzero if
+ASCII, box-drawing, or emoji have a gap; CJK is reported but not required
+(no CJK fallback is wired up by default — pass a CJK-covering font as either
+argument to also cover it).
+
 ## `vtebench` (Alacritty's benchmark tool)
 
 For a more rigorous, industry-standard comparison against other terminals,

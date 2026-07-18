@@ -25,8 +25,13 @@ type Endpoint = (u16, i32);
 /// semantics, scroll-following, and text extraction — lives in one testable
 /// place. The window drives it from pointer/keyboard events and reads back the
 /// range, the mirror, and the highlighted rows when painting.
+///
+/// Named `SelectionTracker` (not `Selection`) to stay distinct from
+/// [`grid::Selection`], which is the pure `(start, end)` value type in absolute
+/// buffer coordinates. This is the stateful UI-thread *controller* that tracks
+/// a drag in signed viewport rows and follows scrolling.
 #[derive(Default)]
-pub struct Selection {
+pub struct SelectionTracker {
     /// Active selection as `(anchor, head)` endpoints, or `None` when nothing
     /// is selected. The anchor is the fixed end; the head is what a drag or
     /// shift+click moves.
@@ -49,7 +54,7 @@ pub struct Selection {
     left_held: bool,
 }
 
-impl Selection {
+impl SelectionTracker {
     /// A fresh, empty selection.
     #[must_use]
     pub fn new() -> Self {
@@ -319,8 +324,8 @@ mod tests {
     }
 
     /// A selection with two mirrored rows of text and a range spanning them.
-    fn with_two_rows() -> Selection {
-        let mut sel = Selection::new();
+    fn with_two_rows() -> SelectionTracker {
+        let mut sel = SelectionTracker::new();
         sel.ingest_snapshot(&incremental(
             vec![text_row(0, "hello world"), text_row(1, "second line")],
             0,
@@ -330,7 +335,7 @@ mod tests {
 
     #[test]
     fn new_selection_is_empty() {
-        let sel = Selection::new();
+        let sel = SelectionTracker::new();
         assert!(!sel.is_active());
         assert_eq!(sel.selected_text(), None);
         assert!(sel.visible_rows(24).is_empty());
@@ -472,7 +477,7 @@ mod tests {
     fn zero_delta_scroll_band_snapshot_still_updates_the_mirror() {
         // A scroll_span carried alongside an incremental snapshot must not
         // disturb the model beyond content_delta; the mirror still updates.
-        let mut sel = Selection::new();
+        let mut sel = SelectionTracker::new();
         let snap = DirtySnapshot {
             rows: vec![text_row(0, "abc")],
             cols: 80,

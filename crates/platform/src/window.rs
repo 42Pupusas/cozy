@@ -383,8 +383,8 @@ pub struct TermWindow {
     /// The text-selection model: what's selected, the on-screen cell mirror it
     /// selects from, and the drag/scroll-follow state. Extracted from this
     /// struct so the selection logic lives (and is tested) in one place; see
-    /// [`crate::selection::Selection`].
-    selection: crate::selection::Selection,
+    /// [`crate::selection::SelectionTracker`].
+    selection: crate::selection::SelectionTracker,
     /// Set when a `data_source.send` just arrived; the next `RawEvent::Fd` is the
     /// pipe to write our clipboard text into.
     awaiting_send_fd: bool,
@@ -635,7 +635,7 @@ impl TermWindow {
             clipboard_source: None,
             clipboard_text: String::new(),
             clipboard_offer: None,
-            selection: crate::selection::Selection::new(),
+            selection: crate::selection::SelectionTracker::new(),
             awaiting_send_fd: false,
             paste_tx,
             paste_rx,

@@ -53,6 +53,112 @@ struct Modules {
 
 const DASH: &str = "—";
 
+/// Kanagawa Dragon accents, lifted verbatim from waybar's own
+/// `~/.config/waybar/style.css` `@define-color` block -- so our bar's
+/// per-module colors match waybar's exactly, not just the shape of the
+/// idea. `fg`/`bg` aren't here: those already come from `[bar]`/`[colors]`
+/// (see `cfg.bar_foreground`/`bar_background` in `main`), since unlike
+/// waybar's hardcoded stylesheet, ours mirrors the terminal's configured
+/// theme by default.
+mod palette {
+    use platform::draw::Color;
+
+    pub const FG_DARK: Color = Color::rgb(0xa6, 0xa6, 0x9c);
+    pub const RED: Color = Color::rgb(0xc4, 0x74, 0x6e);
+    pub const ORANGE: Color = Color::rgb(0xb6, 0x92, 0x7b);
+    pub const YELLOW: Color = Color::rgb(0xc4, 0xb2, 0x8a);
+    pub const GREEN: Color = Color::rgb(0x8a, 0x9a, 0x7b);
+    pub const BLUE: Color = Color::rgb(0x8b, 0xa4, 0xb0);
+    pub const PURPLE: Color = Color::rgb(0xa2, 0x92, 0xa3);
+    pub const TEAL: Color = Color::rgb(0x8e, 0xa4, 0xa2);
+}
+
+/// Which module a rendered segment came from -- just enough to pick its
+/// color in `module_color`; not otherwise used for layout.
+#[derive(Clone, Copy)]
+enum ModuleKind {
+    Clock,
+    Date,
+    Wifi,
+    Bluetooth,
+    Battery,
+    Temp,
+    Cpu,
+    Mem,
+    VolOut,
+    VolIn,
+    Brightness,
+}
+
+/// Per-module foreground color, matching waybar's `style.css` rules
+/// (`#clock`, `#battery.warning`, `#network.disconnected`, etc.) -- state
+/// is read straight off the icon glyph each module already picked
+/// (`modules.rs`'s icons are unique per state: disconnected/muted/charging
+/// all use a different glyph), so this needs no extra plumbing back to the
+/// raw sensor data. Codepoints below were pulled with a throwaway probe
+/// binary reading `modules.rs`'s actual string literals, not hand-copied,
+/// after a hand-transcribed `\u{...}` escape caused a tofu regression once
+/// already (see the CPU icon fix in this same commit).
+fn module_color(kind: ModuleKind, text: &str) -> Color {
+    use palette::{BLUE, FG_DARK, GREEN, ORANGE, PURPLE, RED, TEAL, YELLOW};
+    match kind {
+        ModuleKind::Clock | ModuleKind::Date => PURPLE,
+        ModuleKind::Wifi => {
+            if text.starts_with('\u{f092d}') {
+                RED // waybar's #network.disconnected
+            } else {
+                BLUE
+            }
+        }
+        ModuleKind::Bluetooth => {
+            if text.starts_with('\u{f00b2}') {
+                FG_DARK // waybar's #bluetooth.off/.disabled
+            } else {
+                PURPLE
+            }
+        }
+        ModuleKind::Battery => {
+            if text.starts_with('\u{f0084}') || text.starts_with('\u{f06a5}') {
+                GREEN // waybar's #battery.charging/.plugged
+            } else if let Some(pct) = trailing_percent(text) {
+                if pct < 15 {
+                    RED // waybar's #battery.critical
+                } else if pct < 30 {
+                    YELLOW // waybar's #battery.warning
+                } else {
+                    GREEN
+                }
+            } else {
+                GREEN
+            }
+        }
+        ModuleKind::Temp => ORANGE,
+        ModuleKind::Cpu => GREEN,
+        ModuleKind::Mem => BLUE,
+        ModuleKind::VolOut => {
+            if text.starts_with('\u{f075f}') {
+                FG_DARK // waybar's #pulseaudio.muted
+            } else {
+                TEAL
+            }
+        }
+        ModuleKind::VolIn => {
+            if text.starts_with('\u{f036d}') {
+                FG_DARK
+            } else {
+                ORANGE // waybar's #pulseaudio.microphone
+            }
+        }
+        ModuleKind::Brightness => YELLOW,
+    }
+}
+
+/// The percentage number at the end of a module string like "X 87%", if
+/// any -- used for battery's warning/critical color thresholds.
+fn trailing_percent(text: &str) -> Option<u32> {
+    text.trim_end_matches('%').rsplit(' ').next()?.parse().ok()
+}
+
 impl Modules {
     fn new() -> Self {
         let now = Instant::now();
@@ -140,12 +246,12 @@ impl Modules {
 
     /// Left section, left-to-right draw order: clock + date lead, followed
     /// by the always-visible connectivity cluster.
-    fn left_segments(&self) -> Vec<String> {
+    fn left_segments(&self) -> Vec<(ModuleKind, String)> {
         vec![
-            self.clock.clone(),
-            self.date.clone(),
-            self.wifi.clone(),
-            self.bluetooth.clone(),
+            (ModuleKind::Clock, self.clock.clone()),
+            (ModuleKind::Date, self.date.clone()),
+            (ModuleKind::Wifi, self.wifi.clone()),
+            (ModuleKind::Bluetooth, self.bluetooth.clone()),
         ]
     }
 
@@ -153,21 +259,21 @@ impl Modules {
     /// three-section layout is exercised even with nothing docked there;
     /// a sway-IPC workspace/window-title module would land here).
     #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
-    fn center_segments(&self) -> Vec<String> {
+    fn center_segments(&self) -> Vec<(ModuleKind, String)> {
         Vec::new()
     }
 
     /// Right section, right-to-left draw order (rightmost module first):
     /// everything not claimed by `left_segments`.
-    fn right_segments(&self) -> Vec<String> {
+    fn right_segments(&self) -> Vec<(ModuleKind, String)> {
         vec![
-            self.battery.clone(),
-            self.temp.clone(),
-            self.cpu.clone(),
-            self.mem.clone(),
-            self.vol_out.clone(),
-            self.vol_in.clone(),
-            self.brightness.clone(),
+            (ModuleKind::Battery, self.battery.clone()),
+            (ModuleKind::Temp, self.temp.clone()),
+            (ModuleKind::Cpu, self.cpu.clone()),
+            (ModuleKind::Mem, self.mem.clone()),
+            (ModuleKind::VolOut, self.vol_out.clone()),
+            (ModuleKind::VolIn, self.vol_in.clone()),
+            (ModuleKind::Brightness, self.brightness.clone()),
         ]
     }
 }
@@ -177,7 +283,6 @@ fn paint(
     canvas: &mut Canvas,
     modules: &Modules,
     text: &mut TextRenderer,
-    fg: Color,
     bg: Color,
     bg_alpha: u8,
     bar_height: i32,
@@ -190,11 +295,12 @@ fn paint(
     // Left: left-to-right layout, each segment starting `gap` past the
     // previous one's end.
     let mut left_edge = pad;
-    for seg in modules.left_segments() {
+    for (kind, seg) in modules.left_segments() {
         if seg.is_empty() {
             continue;
         }
-        text.draw_text_alpha(canvas, &seg, left_edge, y, fg, bg, bg_alpha);
+        let color = module_color(kind, &seg);
+        text.draw_text_alpha(canvas, &seg, left_edge, y, color, bg, bg_alpha);
         let w = text.measure(&seg);
         left_edge += w + gap;
     }
@@ -203,15 +309,16 @@ fn paint(
     // `gap`), regardless of what the left/right sections are doing.
     let center = modules.center_segments();
     if !center.is_empty() {
-        let joined_w: i32 = center.iter().map(|s| text.measure(s)).sum::<i32>()
+        let joined_w: i32 = center.iter().map(|(_, s)| text.measure(s)).sum::<i32>()
             + gap * (center.len() as i32 - 1).max(0);
         let mut x = (canvas.width() - joined_w) / 2;
-        for seg in &center {
+        for (kind, seg) in &center {
             if seg.is_empty() {
                 continue;
             }
+            let color = module_color(*kind, seg);
             let w = text.measure(seg);
-            text.draw_text_alpha(canvas, seg, x, y, fg, bg, bg_alpha);
+            text.draw_text_alpha(canvas, seg, x, y, color, bg, bg_alpha);
             x += w + gap;
         }
     }
@@ -219,11 +326,12 @@ fn paint(
     // Right-to-left layout: draw each segment ending `gap` to the left of
     // the previous one's start.
     let mut right_edge = canvas.width() - pad;
-    for seg in modules.right_segments() {
+    for (kind, seg) in modules.right_segments() {
         if seg.is_empty() {
             continue;
         }
-        text.draw_text_right_alpha(canvas, &seg, right_edge, y, fg, bg, bg_alpha);
+        let color = module_color(kind, &seg);
+        text.draw_text_right_alpha(canvas, &seg, right_edge, y, color, bg, bg_alpha);
         let w = text.measure(&seg);
         right_edge -= w + gap;
     }
@@ -250,10 +358,6 @@ fn main() {
         let c = cfg.bar_background();
         Color::rgb(c.r, c.g, c.b)
     };
-    let fg = {
-        let c = cfg.bar_foreground();
-        Color::rgb(c.r, c.g, c.b)
-    };
     let bg_alpha = (cfg.bar_opacity().clamp(0.0, 1.0) * 255.0).round() as u8;
     window.set_background(bg);
 
@@ -277,7 +381,7 @@ fn main() {
             window.request_redraw();
         }
         match window.tick(|canvas| {
-            paint(canvas, &modules, &mut text, fg, bg, bg_alpha, bar_height, scale);
+            paint(canvas, &modules, &mut text, bg, bg_alpha, bar_height, scale);
         }) {
             Ok(true) => {}
             Ok(false) => break,

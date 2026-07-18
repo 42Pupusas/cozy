@@ -130,6 +130,12 @@ pub struct Pty {
     wake_buf: Box<[u8; 8]>,
     /// Set by the caller (or another thread) to request a graceful shutdown.
     shutdown: Arc<AtomicBool>,
+    /// Length of a completed read that `on_output` rejected (consumer ring
+    /// full), still sitting in `read_buf` awaiting retry. While `Some`, the
+    /// master-fd read SQE is deliberately left un-armed: not reading keeps
+    /// the kernel's pty output buffer full, which back-pressures the child's
+    /// `write(2)` for free instead of us silently dropping bytes.
+    read_pending: Option<usize>,
 }
 
 impl Pty {
@@ -178,6 +184,7 @@ impl Pty {
             wake_fd: ququmatz::RawFd::from_raw(wake_fd as usize),
             wake_buf: Box::new([0u8; 8]),
             shutdown,
+            read_pending: None,
         })
     }
 
@@ -202,7 +209,14 @@ impl Pty {
     /// interactive resize drag doesn't storm the shell with `SIGWINCH`es.
     ///
     /// `on_output` receives each chunk of PTY output, at most
-    /// [`READ_BUF_SIZE`] bytes per call, in order.
+    /// [`READ_BUF_SIZE`] bytes per call, in order. It returns `true` if the
+    /// chunk was accepted, `false` if the caller's downstream ring is full.
+    /// On rejection the master-fd read SQE is **not** re-armed: the loop
+    /// retries the very same chunk (via [`Pty::retry_output`]-style logic on
+    /// the next wakeup, e.g. the wake eventfd firing once the consumer has
+    /// drained) instead of dropping bytes. Leaving the read un-armed lets the
+    /// kernel's pty output buffer fill up and naturally throttle the child's
+    /// `write(2)` calls — real backpressure instead of silent data loss.
     ///
     /// Returns the child's exit code on success (0 when the loop was
     /// stopped before the child exited).
@@ -213,7 +227,7 @@ impl Pty {
     pub fn run<I, O>(mut self, mut next_input: I, mut on_output: O) -> Result<i32, PtyError>
     where
         I: FnMut() -> Option<PtyInput>,
-        O: FnMut(&[u8]),
+        O: FnMut(&[u8]) -> bool,
     {
         self.arm_read()?;
         self.arm_signal()?;
@@ -237,7 +251,23 @@ impl Pty {
                 break 'event_loop;
             }
 
-            // Park in the kernel until at least one CQE is ready.
+            // A previous chunk was rejected by the consumer ring — retry it
+            // before parking. Cheap, and closes the race where the wake
+            // signal that unblocks us below arrived because the consumer
+            // just freed the space this very chunk needs.
+            if let Some(len) = self.read_pending
+                && on_output(&self.read_buf[..len])
+            {
+                self.read_pending = None;
+                self.arm_read()?;
+            }
+
+            // Park in the kernel until at least one CQE is ready. Note: if
+            // `read_pending` is still `Some`, no read SQE is armed, so this
+            // can only wake on the signalfd or the wake eventfd — exactly
+            // the throttle we want (the kernel's pty buffer backpressures
+            // the child meanwhile). The producer side must signal the wake
+            // eventfd once it frees ring space so this doesn't stall.
             self.queue
                 .submit_and_wait(1)
                 .map_err(PtyError::UringEnter)?;
@@ -255,8 +285,15 @@ impl Pty {
             for action in &actions {
                 match *action {
                     CqeAction::ReadOk(len) => {
-                        on_output(&self.read_buf[..len]);
-                        self.arm_read()?;
+                        // If on_output rejects (consumer ring full), leave
+                        // the read un-armed and remember the chunk for a
+                        // retry — the kernel's pty buffer then throttles the
+                        // child's writes instead of us dropping data.
+                        if on_output(&self.read_buf[..len]) {
+                            self.arm_read()?;
+                        } else {
+                            self.read_pending = Some(len);
+                        }
                     }
                     CqeAction::ReadEof => {
                         // EOF or EIO on the master fd: the child closed the
@@ -392,16 +429,31 @@ impl Pty {
     }
 
     /// Handle a write CQE: requeue the unwritten tail of a short write (in
-    /// front of anything still pending, preserving byte order) or drop the
-    /// buffer on error (an errored master-fd write means the child is gone —
-    /// requeueing would spin forever on EIO).
+    /// front of anything still pending, preserving byte order).
+    ///
+    /// A negative result is a raw `-errno`. Transient errnos — `EAGAIN`
+    /// (the PTY line discipline's input queue is momentarily full, which a
+    /// large burst write routinely hits) and `EINTR` — mean *zero* bytes of
+    /// this SQE were actually written, so the whole buffer must be requeued
+    /// or those bytes vanish silently (this was a real bug: a large write
+    /// into a slow reader could drop a whole in-flight chunk and never
+    /// surface an error). Only a fatal errno (`EIO`/`EBADF`/etc — the
+    /// child/slave side is actually gone) drops the buffer, since requeueing
+    /// that would spin forever.
     fn complete_write(&mut self, result: i32) {
+        const EAGAIN: i32 = 11;
+        const EINTR: i32 = 4;
         if result >= 0 {
             let written = result as usize;
             if written < self.write_len {
                 for i in (written..self.write_len).rev() {
                     self.pending_write.push_front(self.write_buf[i]);
                 }
+            }
+        } else if result == -EAGAIN || result == -EINTR {
+            // Nothing was written — requeue the entire buffer in order.
+            for i in (0..self.write_len).rev() {
+                self.pending_write.push_front(self.write_buf[i]);
             }
         }
         self.write_in_flight = false;

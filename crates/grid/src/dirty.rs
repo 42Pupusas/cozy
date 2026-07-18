@@ -231,11 +231,22 @@ pub enum SnapshotKind {
     /// correctly. `None` when nothing scrolled or the fast path was abandoned
     /// (dirty rows are painted directly, no shift).
     Incremental { scroll_span: Option<ScrollBand> },
-    /// Full-frame viewport repaint: `rows` covers every visible row, viewed
-    /// `offset` lines up into scrollback (`0` = live bottom). Emitted when the
-    /// view window moves through history: the content is fixed but every row's
-    /// glyphs change, so an incremental dirty set can't express it.
-    Viewport { offset: u16 },
+    /// Viewport repaint: the view window moved through scrollback to `offset`
+    /// lines up from the live bottom (`0` = bottom).
+    ///
+    /// `shift` is the pixel-scroll optimization for the common case of a small
+    /// wheel/page step: the whole screen shifted by `shift` rows (signed --
+    /// negative = view moved up into history, revealing rows at the *top*;
+    /// positive = view moved back toward the bottom, revealing rows at the
+    /// *bottom*), and `rows` carries *only* the freshly-revealed edge rows. The
+    /// renderer `copy_within`-shifts the previous viewport frame and repaints
+    /// just those, instead of re-rasterizing every glyph on screen -- the whole
+    /// reason scrolling back stayed at full-repaint cost before.
+    ///
+    /// `shift: None` is a full-frame repaint: `rows` covers every visible row.
+    /// Used for the first scroll, a jump too large to shift (`|shift| >= rows`,
+    /// nothing on screen survives), or a snap back to the bottom on new output.
+    Viewport { offset: u16, shift: Option<i32> },
 }
 
 /// Snapshot of all rows that changed since the last render.
@@ -267,7 +278,8 @@ pub struct DirtySnapshot {
 impl DirtySnapshot {
     /// The pixel-scroll band, if this is an incremental snapshot carrying one.
     /// `None` for viewport snapshots and for incremental ones that didn't
-    /// scroll.
+    /// scroll. (Compose relies on this being incremental-only; a viewport
+    /// shift is exposed separately via [`Self::pixel_shift`].)
     #[must_use]
     pub fn scroll_span(&self) -> Option<ScrollBand> {
         match self.kind {
@@ -276,12 +288,25 @@ impl DirtySnapshot {
         }
     }
 
-    /// The scrollback offset when this is a full-frame viewport snapshot;
-    /// `None` for incremental (live-bottom) snapshots.
+    /// The signed whole-screen shift for a viewport (scrollback) snapshot, if
+    /// it carries the pixel-scroll optimization. Negative = view moved up into
+    /// history (reveal at top); positive = view moved toward the bottom (reveal
+    /// at bottom). `None` for full-frame viewport repaints and for every
+    /// incremental snapshot (which use [`Self::scroll_span`] instead).
+    #[must_use]
+    pub fn viewport_shift(&self) -> Option<i32> {
+        match self.kind {
+            SnapshotKind::Viewport { shift, .. } => shift,
+            SnapshotKind::Incremental { .. } => None,
+        }
+    }
+
+    /// The scrollback offset when this is a viewport snapshot; `None` for
+    /// incremental (live-bottom) snapshots.
     #[must_use]
     pub fn viewport_offset(&self) -> Option<u16> {
         match self.kind {
-            SnapshotKind::Viewport { offset } => Some(offset),
+            SnapshotKind::Viewport { offset, .. } => Some(offset),
             SnapshotKind::Incremental { .. } => None,
         }
     }
@@ -519,7 +544,10 @@ mod tests {
     fn compose_refuses_viewport_and_geometry_changes() {
         let a = snap(4, None, &[(0, 'a')]);
         let mut vp = snap(4, None, &[(0, 'b')]);
-        vp.kind = SnapshotKind::Viewport { offset: 3 };
+        vp.kind = SnapshotKind::Viewport {
+            offset: 3,
+            shift: None,
+        };
         assert!(!a.clone().compose(&vp));
         assert!(!vp.compose(&a));
         // geometry change (different cols)

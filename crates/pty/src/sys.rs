@@ -801,7 +801,7 @@ mod tests {
 
     #[test]
     fn wait_status_high_bits_ignored_for_signal_number() {
-        assert_eq!(WaitStatus::from_raw(0x80 | 11), WaitStatus::Signaled(11));
+        assert_eq!(WaitStatus::from_raw(0x80 | 0x0b), WaitStatus::Signaled(11));
     }
 
     #[test]

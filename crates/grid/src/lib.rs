@@ -309,6 +309,7 @@ impl Grid {
             content_delta: 0,
             kind: SnapshotKind::Viewport {
                 offset: self.viewport_offset.min(u16::MAX as usize) as u16,
+                shift: None,
             },
         }
     }

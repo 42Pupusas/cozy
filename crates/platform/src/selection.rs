@@ -319,7 +319,10 @@ mod tests {
             cursor: CursorInfo::default(),
             cursor_changed: false,
             content_delta,
-            kind: SnapshotKind::Viewport { offset },
+            kind: SnapshotKind::Viewport {
+                offset,
+                shift: None,
+            },
         }
     }
 

@@ -357,10 +357,17 @@ impl PtyWorker {
 
 // ── Parser + grid thread ──────────────────────────────────────────────────────
 
-/// Owns every ring endpoint the parser/grid thread touches, plus the grid and
-/// VT parser state it drives once running. Was a ten-argument free function
-/// (`parser_thread`) with a sibling free helper (`feed_parser`); both are now
-/// naturally scoped as this worker's state and methods.
+/// The parser/grid thread's **spawn payload**: the ring endpoints, wakers and
+/// shared flags the coordinator wires up on the main thread and hands over,
+/// plus the startup geometry. Deliberately *not* the running state -- the
+/// grid and VT parser are born on the parser thread inside [`run`], because
+/// `Grid::new` eagerly allocates and zero-fills a ~38 MB scrollback buffer
+/// that must not land on the main thread's startup path. Once `run` moves
+/// this payload onto its thread it becomes a [`ParserSession`], which owns
+/// everything and drives the loop.
+///
+/// Was a ten-argument free function (`parser_thread`) with a sibling free
+/// helper (`feed_parser`).
 struct ParserWorker {
     cols: u16,
     rows: u16,
@@ -382,6 +389,57 @@ impl ParserWorker {
             .expect("spawn parser thread")
     }
 
+    /// Bring the running state to life *on the parser thread* and drive the
+    /// loop to quit. The `Grid`/`Parser` allocation happens here, not in the
+    /// coordinator that built `self`, so the big scrollback buffer never
+    /// touches the main thread's startup path.
+    fn run(self) {
+        let Self {
+            cols,
+            rows,
+            parser_rx,
+            dirty_tx,
+            reply_tx,
+            ui_wake,
+            pty_wake,
+            bracketed_paste,
+            quit,
+        } = self;
+        ParserSession {
+            grid: Grid::new(cols, rows),
+            parser: Parser::new(),
+            parser_rx,
+            dirty_tx,
+            reply_tx,
+            ui_wake,
+            pty_wake,
+            bracketed_paste,
+            quit,
+        }
+        .run();
+    }
+}
+
+/// The parser/grid thread's **running state**: the [`Grid`] and VT [`Parser`]
+/// it drives, alongside the ring endpoints, wakers and flags moved in from
+/// the [`ParserWorker`] spawn payload. Because the grid and parser are now
+/// fields, the per-message helpers (`feed`, `flush_replies`, `publish`) are
+/// plain `&mut self` methods operating on `self.grid` / `self.parser` /
+/// `self.dirty_tx` -- no state threaded through as arguments, and no method
+/// that borrows `self` without using it.
+struct ParserSession {
+    grid: Grid,
+    parser: Parser,
+    parser_rx: mpsc::Consumer<ParserMsg>,
+    dirty_tx: quetzalcoatl::spsc::Producer<DirtySnapshot>,
+    reply_tx: mpsc::Producer<InputMsg>,
+    ui_wake: waker::Waker,
+    pty_wake: waker::Waker,
+    bracketed_paste: Arc<AtomicBool>,
+    quit: Arc<AtomicBool>,
+}
+
+impl ParserSession {
     /// Feed one parser message to the grid, applying it immediately. Order
     /// matters: a Resize must take effect before any Data that follows it
     /// (the shell's post-SIGWINCH repaint must land on the already-reflowed
@@ -392,26 +450,21 @@ impl ParserWorker {
     /// simply dropped and its ring slot becomes free for the pty thread to
     /// write the next read into -- no buffer hand-back, because the ring
     /// slot *is* the buffer.
-    //
-    // Takes `&self` for symmetry with its peer methods (`flush_replies`,
-    // `publish`) even though it no longer needs worker state now that the
-    // free-list hand-back is gone -- keeping the `self.feed(...)` call shape
-    // reads better than a lone associated function.
-    #[allow(clippy::unused_self)]
-    fn feed(&self, grid: &mut Grid, parser: &mut Parser, msg: ParserMsg) {
+    fn feed(&mut self, msg: ParserMsg) {
         match msg {
             ParserMsg::Data(chunk) => {
-                parser.feed(&chunk.buf[..chunk.len], |ev| grid.apply(&ev));
+                let grid = &mut self.grid;
+                self.parser.feed(&chunk.buf[..chunk.len], |ev| grid.apply(&ev));
             }
-            ParserMsg::Resize { cols, rows } => grid.resize(cols, rows),
-            ParserMsg::Scroll { delta } => grid.scroll_viewport(delta),
+            ParserMsg::Resize { cols, rows } => self.grid.resize(cols, rows),
+            ParserMsg::Scroll { delta } => self.grid.scroll_viewport(delta),
         }
     }
 
     /// Push any host-bound replies the grid produced (CPR/DA) to the PTY
     /// thread.
-    fn flush_replies(&self, grid: &mut Grid) {
-        let replies = grid.take_replies();
+    fn flush_replies(&mut self) {
+        let replies = self.grid.take_replies();
         if !replies.is_empty() {
             let _ = self
                 .reply_tx
@@ -427,22 +480,19 @@ impl ParserWorker {
     /// the *next* `take_dirty` emits them instead -- the renderer only ever
     /// needs the newest complete picture, and this guarantees no row
     /// silently vanishes.
-    fn publish(&self, grid: &mut Grid) {
-        let snap = grid.take_dirty();
+    fn publish(&mut self) {
+        let snap = self.grid.take_dirty();
         if snap.is_empty() {
             return;
         }
         if let Err(unsent) = self.dirty_tx.push(snap) {
-            grid.requeue_snapshot(&unsent);
+            self.grid.requeue_snapshot(&unsent);
         } else {
             self.ui_wake.signal(); // UI polls an eventfd, not this ring
         }
     }
 
     fn run(mut self) {
-        let mut grid = Grid::new(self.cols, self.rows);
-        let mut parser = Parser::new();
-
         while !self.quit.load(Ordering::Relaxed) {
             // Block for the next message, then drain whatever else is queued
             // so a burst is handled in one batch — but strictly in arrival
@@ -460,14 +510,14 @@ impl ParserWorker {
             let Some(first) = self.parser_rx.pop_block() else {
                 break;
             };
-            self.feed(&mut grid, &mut parser, first);
+            self.feed(first);
             let batch_start = Instant::now();
             let mut batched = 1usize;
             while batched < BATCH_CHUNK_CAP && batch_start.elapsed() < BATCH_TIME_CAP {
                 let Some(msg) = self.parser_rx.pop() else {
                     break;
                 };
-                self.feed(&mut grid, &mut parser, msg);
+                self.feed(msg);
                 batched += 1;
             }
 
@@ -483,15 +533,15 @@ impl ParserWorker {
             // actually throttled.
             self.pty_wake.signal();
 
-            self.flush_replies(&mut grid);
+            self.flush_replies();
 
             // Publish bracketed-paste mode for the UI thread (it wraps
             // clipboard paste in the 200~/201~ markers when the app asked
             // for it).
             self.bracketed_paste
-                .store(grid.bracketed_paste(), Ordering::Relaxed);
+                .store(self.grid.bracketed_paste(), Ordering::Relaxed);
 
-            self.publish(&mut grid);
+            self.publish();
         }
     }
 }

@@ -380,23 +380,11 @@ pub struct TermWindow {
     clipboard_text: String,
     /// The clipboard offer from another client (for paste), with its MIME types.
     clipboard_offer: Option<DataOfferId>,
-    /// Mirror of the latest grid content the renderer has drawn, used to
-    /// extract selection text and paint the highlight — entirely on the UI
-    /// thread, no round-trip to the parser-owned grid. Indexed `[row][col]`,
-    /// only the visible viewport.
-    cell_mirror: Vec<Vec<grid::Cell>>,
-    /// Active mouse-drag selection as `(col, row)` endpoints. `row` is a
-    /// *signed* viewport row: it can go negative when the selected text
-    /// scrolls off the top into scrollback, which keeps the selection
-    /// logically anchored to its text (scrolling back down reveals it still
-    /// selected) instead of being cleared. Renderers/extractors clamp to the
-    /// visible range.
-    selection: Option<((u16, i32), (u16, i32))>,
-    /// Current viewport offset (lines scrolled into scrollback; 0 = live
-    /// bottom). Tracked so a wheel-scroll shifts the selection with the text:
-    /// the content is fixed but the view window moves, so a selection at
-    /// viewport row R must move by the offset change to stay on its text.
-    view_offset: i32,
+    /// The text-selection model: what's selected, the on-screen cell mirror it
+    /// selects from, and the drag/scroll-follow state. Extracted from this
+    /// struct so the selection logic lives (and is tested) in one place; see
+    /// [`crate::selection::Selection`].
+    selection: crate::selection::Selection,
     /// Set when a `data_source.send` just arrived; the next `RawEvent::Fd` is the
     /// pipe to write our clipboard text into.
     awaiting_send_fd: bool,
@@ -413,15 +401,6 @@ pub struct TermWindow {
     /// valid for the whole focused period. Using a stale serial is exactly
     /// what triggers the compositor's "invalid arguments" protocol error.
     focus_serial: u32,
-    /// Whether the current press has moved enough to count as a drag.
-    ///
-    /// A press + release with no motion is a *click*, which clears the
-    /// selection; a drag sets it. Set on press, tested on release.
-    drag_moved: bool,
-    /// Whether the left mouse button is currently held down. Motion only
-    /// extends a selection while this is true — releasing the button ends the
-    /// drag for good (the selection itself stays visible).
-    left_held: bool,
     /// Viewport rows that carried a highlight on the previous frame. Repainted
     /// clean on the next frame before the (possibly moved/cleared) selection
     /// is re-tinted, so highlight never lingers after deselect or drag.
@@ -656,15 +635,11 @@ impl TermWindow {
             clipboard_source: None,
             clipboard_text: String::new(),
             clipboard_offer: None,
-            cell_mirror: Vec::new(),
-            selection: None,
-            view_offset: 0,
+            selection: crate::selection::Selection::new(),
             awaiting_send_fd: false,
             paste_tx,
             paste_rx,
             focus_serial: 0,
-            drag_moved: false,
-            left_held: false,
             prev_selection_rows: Vec::new(),
             prev_cursor_rows: Vec::new(),
             cursor_anim: crate::cursor_anim::CursorAnimator::new(cursor_cfg),
@@ -678,59 +653,10 @@ impl TermWindow {
     /// Queue a dirty snapshot to be blitted on the next frame.
     pub fn push_dirty(&mut self, snap: grid::DirtySnapshot) {
         if !snap.is_empty() {
-            // Wheel-scroll of the viewport: the content is fixed but the view
-            // window moved. Scrolling UP into history (offset grows) makes the
-            // text appear to move DOWN, so the selection moves down too —
-            // the opposite sign of a content scroll. Reset the mirror (a
-            // full-frame snapshot repaints every visible row below).
-            if let Some(new_off) = snap.viewport_offset {
-                let new_off = i32::from(new_off);
-                // Distinguish a genuine user wheel-scroll from an output-driven
-                // snap back to the bottom (offset -> 0 with new content). Only
-                // the former shifts the selection with the text; the latter is
-                // just the view jumping home, so the selection keeps its rows
-                // (the content-scroll branch below shifts it for the output).
-                let is_snap_to_bottom = new_off == 0 && snap.content_delta > 0;
-                let view_delta = new_off - self.view_offset;
-                self.view_offset = new_off;
-                if view_delta != 0 && !is_snap_to_bottom {
-                    self.shift_selection(view_delta);
-                }
-                self.cell_mirror.clear();
-            } else if self.view_offset != 0 {
-                // A live-bottom snapshot while we thought we were scrolled —
-                // output snapped the view back to the bottom without a
-                // viewport frame. Resync so the next wheel-scroll shifts
-                // from the right base.
-                self.view_offset = 0;
-            }
-            // Content scrolled up (new output pushed lines into scrollback):
-            // the text physically moved up, so the selection moves up too.
-            // Rows that scrolled off the top simply go negative (text is now
-            // in scrollback) — the selection stays anchored to it.
-            let delta = i32::from(snap.content_delta);
-            if delta > 0 {
-                self.shift_selection(-delta);
-                if !self.cell_mirror.is_empty() {
-                    let d = (delta as usize).min(self.cell_mirror.len());
-                    self.cell_mirror.drain(..d);
-                }
-            }
-            // Keep the cell mirror in sync so selection/highlight/extraction
-            // always reflect the latest drawn content. `clone_from` (rather
-            // than `row.cells.clone()` + assign) reuses the existing row
-            // Vec's heap allocation when its capacity already fits -- the
-            // overwhelmingly common case, since a row's width doesn't change
-            // between snapshots -- instead of allocating a fresh Vec and
-            // dropping the old one on every single dirty row of every
-            // snapshot.
-            for row in &snap.rows {
-                let r = usize::from(row.row);
-                if self.cell_mirror.len() <= r {
-                    self.cell_mirror.resize(r + 1, Vec::new());
-                }
-                self.cell_mirror[r].clone_from(&row.cells);
-            }
+            // Fold the snapshot into the selection model: it scroll-follows the
+            // selection (both viewport and content scrolls) and keeps its cell
+            // mirror in sync with the latest drawn rows.
+            self.selection.ingest_snapshot(&snap);
             // Feed the cursor animator the grid's authoritative cursor state
             // -- this is what lets it start a slide even on a frame where no
             // cell content changed (a bare cursor-move escape).
@@ -746,34 +672,6 @@ impl TermWindow {
         self.input_queue.pop_front()
     }
 
-    /// Shift+click range extension: keep the selection's anchor fixed and move
-    /// the head to `cell`, so repeated shift+clicks (or a shift+click then a
-    /// drag) keep growing/shrinking the same range. The anchor is the end
-    /// that was *not* most recently moved — we track that as the first tuple
-    /// element, and always replace the second.
-    fn extend_selection(&mut self, cell: (u16, i32)) {
-        if let Some((anchor, _head)) = self.selection {
-            self.selection = Some((anchor, cell));
-        } else {
-            self.selection = Some((cell, cell));
-        }
-        self.dirty = true;
-    }
-
-    /// Add `d` to both selection row endpoints (signed; rows may go negative
-    /// = the selected text is currently above the visible area, still
-    /// anchored). Used with opposite signs for the two scroll kinds:
-    ///   • content scroll  → text moved up   → `shift_selection(-delta)`
-    ///   • viewport scroll → text appears to move down → `shift_selection(+delta)`
-    /// Never clears — the selection stays glued to its text.
-    fn shift_selection(&mut self, d: i32) {
-        let Some(((ac, ar), (bc, br))) = self.selection else {
-            return;
-        };
-        self.selection = Some(((ac, ar + d), (bc, br + d)));
-        self.dirty = true;
-    }
-
     /// The grid cell under the pointer, in viewport coordinates, or `(0,0)`
     /// when the pointer is outside the content area.
     fn pointer_cell(&self) -> (u16, u16) {
@@ -786,43 +684,7 @@ impl TermWindow {
     /// mirror. `None` if there's no non-empty selection.
     #[must_use]
     pub fn selected_text(&self) -> Option<String> {
-        let ((ac, ar), (bc, br)) = self.selection?;
-        if (ac, ar) == (bc, br) {
-            return None;
-        }
-        let ((sc, sr), (ec, er)) = if (ar, ac) <= (br, bc) {
-            ((ac, ar), (bc, br))
-        } else {
-            ((bc, br), (ac, ar))
-        };
-        let mut out = String::new();
-        for row in sr..=er {
-            // Rows above/below the visible area (negative or past the mirror)
-            // hold no extractable text — skip them; the selection itself stays
-            // anchored and yields its text again once scrolled back on-screen.
-            if row < 0 {
-                continue;
-            }
-            let line = self.cell_mirror.get(row as usize)?;
-            let c0 = if row == sr { usize::from(sc) } else { 0 };
-            let c1 = if row == er {
-                usize::from(ec)
-            } else {
-                line.len().saturating_sub(1)
-            };
-            let mut s = String::new();
-            let end = c1.min(line.len().saturating_sub(1));
-            for cell in &line[c0..=end] {
-                if !cell.spacer {
-                    s.push(cell.ch);
-                }
-            }
-            out.push_str(s.trim_end());
-            if row != er {
-                out.push('\n');
-            }
-        }
-        Some(out)
+        self.selection.selected_text()
     }
 
     /// Copy the current selection to the system clipboard (Ctrl+Shift+C).
@@ -1183,16 +1045,9 @@ impl TermWindow {
                         self.pointer_pos = ev.point(1, 2);
                         // Extend the selection only while the left button is
                         // held — releasing ends the drag.
-                        if self.left_held {
-                            if let Some((anchor, _)) = self.selection {
-                                let (cc, cr) = self.pointer_cell();
-                                let cell = (cc, i32::from(cr));
-                                if cell != anchor {
-                                    self.selection = Some((anchor, cell));
-                                    self.drag_moved = true;
-                                    self.dirty = true;
-                                }
-                            }
+                        let (cc, cr) = self.pointer_cell();
+                        if self.selection.drag_to((cc, i32::from(cr))) {
+                            self.dirty = true;
                         }
                     }
                     Some(PointerEvent::Button) => {
@@ -1200,46 +1055,22 @@ impl TermWindow {
                         let state = ButtonState::from_raw(ev.arg(3));
                         match (button, state) {
                             (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
-                                self.left_held = true;
                                 let shift = (self.modifiers.depressed
                                     | self.modifiers.latched
                                     | self.modifiers.locked)
                                     & 0x01
                                     != 0;
                                 let (cc, cr) = self.pointer_cell();
-                                let cell = (cc, i32::from(cr));
-                                if shift && self.selection.is_some() {
-                                    // Shift+click extends the existing
-                                    // selection from its anchor to the clicked
-                                    // cell (kitty/xterm range-extension),
-                                    // merging rather than clearing.
-                                    self.extend_selection(cell);
-                                    self.drag_moved = true;
-                                } else if self.selection.is_some() {
-                                    // A press while a selection is visible is
-                                    // a dismiss-click: clear it and don't
-                                    // start a new one. The user starts a fresh
-                                    // selection with a press on empty space.
-                                    self.selection = None;
-                                    self.drag_moved = false;
-                                } else {
-                                    // Begin a potential selection at the
-                                    // pointer cell; whether it becomes a real
-                                    // selection or a no-op click is decided by
-                                    // whether the pointer moves before release.
-                                    self.selection = Some((cell, cell));
-                                    self.drag_moved = false;
-                                }
+                                // Press semantics (shift-extend / dismiss-click /
+                                // begin-potential-selection) live in the model.
+                                self.selection.press_left((cc, i32::from(cr)), shift);
                                 self.dirty = true;
                             }
                             (Some(PointerButton::Left), Some(ButtonState::Released)) => {
-                                self.left_held = false;
                                 // Release ends the drag. If the pointer never
                                 // moved since press, this was a bare click on
                                 // empty space — nothing to keep.
-                                if !self.drag_moved {
-                                    self.selection = None;
-                                }
+                                self.selection.release_left();
                                 self.dirty = true;
                             }
                             _ => {}
@@ -1313,12 +1144,10 @@ impl TermWindow {
                         }
                         // Esc clears any active selection (and still passes
                         // through to the application as a normal Esc).
-                        if logical == Some(Key::Esc)
-                            && state == Some(KeyState::Pressed)
-                            && self.selection.is_some()
-                        {
-                            self.selection = None;
-                            self.dirty = true;
+                        if logical == Some(Key::Esc) && state == Some(KeyState::Pressed) {
+                            if self.selection.clear() {
+                                self.dirty = true;
+                            }
                         }
                         self.input_queue.push_back(InputEvent::Key {
                             key: logical,
@@ -1438,15 +1267,15 @@ impl TermWindow {
     /// current selection and after clearing one, so the highlight is
     /// idempotent (never compounds across frames) and fully reversible.
     /// Remap overlay-tracking row indices through the pixel-scrolls that
-    /// `blit_snapshot` performed this frame. Each scroll `(top, bot, delta)`
-    /// shifted the backbuffer scanlines for rows `top..=bot` up by `delta`, so
-    /// a tracked row `r` in that band now lives at `r - delta`. A row that
-    /// scrolled above `top` (i.e. `r - delta < top`) is gone from the visible
+    /// `blit_snapshot` performed this frame. Each scroll band shifted the
+    /// backbuffer scanlines for rows `top..=bot` up by `delta`, so a tracked
+    /// row `r` in that band now lives at `r - delta`. A row that scrolled
+    /// above `top` (i.e. `r - delta < top`) is gone from the visible
     /// backbuffer entirely and needs no cleanup; drop it. Rows outside the
     /// band are untouched. Applied in the same order the scrolls happened so
     /// multiple scrolls in one frame compose correctly.
-    fn shift_overlay_rows(rows: &mut Vec<u16>, scrolls: &[(u16, u16, u16)]) {
-        for &(top, bot, delta) in scrolls {
+    fn shift_overlay_rows(rows: &mut Vec<u16>, scrolls: &[grid::ScrollBand]) {
+        for &grid::ScrollBand { top, bot, delta } in scrolls {
             rows.retain_mut(|r| {
                 if *r >= top && *r <= bot {
                     if *r < top + delta {
@@ -1465,8 +1294,8 @@ impl TermWindow {
     /// frame slots aren't scrolled -- they're the actually-presented pixels --
     /// so each moved row must be copied backbuffer->shm and damaged this frame,
     /// even though only the new bottom rows appear in the snapshot's dirty set.
-    fn extend_with_scrolled_bands(touched: &mut Vec<u16>, scrolls: &[(u16, u16, u16)]) {
-        for &(top, bot, _delta) in scrolls {
+    fn extend_with_scrolled_bands(touched: &mut Vec<u16>, scrolls: &[grid::ScrollBand]) {
+        for &grid::ScrollBand { top, bot, .. } in scrolls {
             touched.extend(top..=bot);
         }
     }
@@ -1475,7 +1304,7 @@ impl TermWindow {
         let cols = (self.width / self.cell_w).max(1) as u16;
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
         for &row in rows {
-            let Some(line) = self.cell_mirror.get(usize::from(row)) else {
+            let Some(line) = self.selection.mirror().get(usize::from(row)) else {
                 continue;
             };
             // Clone the row's cells so we don't hold a borrow on `self` while
@@ -1492,16 +1321,8 @@ impl TermWindow {
     /// (selected text scrolled into scrollback); only the on-screen span is
     /// returned, since off-screen rows need no repaint.
     fn selection_rows(&self) -> Vec<u16> {
-        let Some(((_, ar), (_, br))) = self.selection else {
-            return Vec::new();
-        };
         let rows = (self.height / self.cell_h).max(1);
-        let lo = ar.min(br).max(0);
-        let hi = ar.max(br).min(rows - 1);
-        if lo > hi {
-            return Vec::new();
-        }
-        (lo..=hi).map(|r| r as u16).collect()
+        self.selection.visible_rows(rows)
     }
 
     /// Overlay the selection highlight onto the backbuffer: each selected
@@ -1510,7 +1331,7 @@ impl TermWindow {
     /// disturbing glyph pixels' relative contrast. Assumes the affected rows
     /// were just repainted clean (see [`Self::repaint_rows`]).
     fn apply_selection_highlight(&mut self) {
-        let Some(((ac, ar), (bc, br))) = self.selection else {
+        let Some(((ac, ar), (bc, br))) = self.selection.range() else {
             return;
         };
         if (ac, ar) == (bc, br) {
@@ -1758,7 +1579,7 @@ impl TermWindow {
             }
         }
         let mut touched_rows: Vec<u16> = Vec::new();
-        let mut scrolls: Vec<(u16, u16, u16)> = Vec::new();
+        let mut scrolls: Vec<grid::ScrollBand> = Vec::new();
         let mut painted_rows: usize = 0;
         let mut painted_cells: usize = 0;
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
@@ -2238,6 +2059,11 @@ impl Registry {
 mod tests {
     use super::TermWindow;
 
+    /// Terse `ScrollBand` for the pixel-scroll tests below.
+    fn band(top: u16, bot: u16, delta: u16) -> grid::ScrollBand {
+        grid::ScrollBand { top, bot, delta }
+    }
+
     #[test]
     fn scrolled_band_marks_every_moved_row_touched_not_just_new_ones() {
         // Regression: a fast-scroll frame's snapshot only lists the genuinely-
@@ -2247,7 +2073,7 @@ mod tests {
         // must be re-copied. If only the new rows were marked, the screen would
         // freeze all but the bottom few lines -- the reported flood artifact.
         let mut touched = vec![9u16, 10, 11]; // the 3 new bottom rows
-        TermWindow::extend_with_scrolled_bands(&mut touched, &[(0, 11, 3)]);
+        TermWindow::extend_with_scrolled_bands(&mut touched, &[band(0, 11, 3)]);
         touched.sort_unstable();
         touched.dedup();
         // The full band 0..=11 must now be present, not just 9,10,11.
@@ -2260,7 +2086,7 @@ mod tests {
         // (rows 0..=9) pixel-scrolled up by 1, so the imprint now lives at
         // row 4 -- that's where we must repaint clean, not row 5.
         let mut rows = vec![5u16];
-        TermWindow::shift_overlay_rows(&mut rows, &[(0, 9, 1)]);
+        TermWindow::shift_overlay_rows(&mut rows, &[band(0, 9, 1)]);
         assert_eq!(rows, vec![4]);
     }
 
@@ -2269,7 +2095,7 @@ mod tests {
         // A row inside the shifted band but within `delta` of its top scrolled
         // off-screen entirely; there's nothing left to clean, so it's dropped.
         let mut rows = vec![0u16, 1, 2];
-        TermWindow::shift_overlay_rows(&mut rows, &[(0, 9, 2)]);
+        TermWindow::shift_overlay_rows(&mut rows, &[band(0, 9, 2)]);
         // row 0,1 scrolled off (0-2 < 0, 1-2 < 0); row 2 -> 0.
         assert_eq!(rows, vec![0]);
     }
@@ -2279,7 +2105,7 @@ mod tests {
         // Only rows 3..=6 scrolled; a tracked row above/below the band keeps
         // its position.
         let mut rows = vec![1u16, 5, 8];
-        TermWindow::shift_overlay_rows(&mut rows, &[(3, 6, 1)]);
+        TermWindow::shift_overlay_rows(&mut rows, &[band(3, 6, 1)]);
         assert_eq!(rows, vec![1, 4, 8]);
     }
 
@@ -2287,7 +2113,7 @@ mod tests {
     fn shift_overlay_rows_composes_multiple_scrolls_in_order() {
         // Two scrolls in one frame compose: row 7 -> 6 -> 5.
         let mut rows = vec![7u16];
-        TermWindow::shift_overlay_rows(&mut rows, &[(0, 9, 1), (0, 9, 1)]);
+        TermWindow::shift_overlay_rows(&mut rows, &[band(0, 9, 1), band(0, 9, 1)]);
         assert_eq!(rows, vec![5]);
     }
 

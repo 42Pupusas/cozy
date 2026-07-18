@@ -64,6 +64,7 @@ pub mod wire;
 pub mod xcursor;
 
 mod render;
+pub mod selection;
 pub mod window;
 
 pub use cursor_anim::{CursorAnimConfig, CursorAnimator};

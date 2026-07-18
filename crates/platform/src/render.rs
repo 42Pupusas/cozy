@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use grid::{Attrs, Cell, Color, DirtySnapshot};
+use grid::{Attrs, Cell, Color, DirtySnapshot, ScrollBand};
 
 use crate::draw::{Canvas, Color as DrawColor};
 use crate::font::{FIRST, GLYPH_H, GLYPH_W, LAST};
@@ -759,7 +759,7 @@ impl Renderer {
         &mut self,
         canvas: &mut Canvas<'_>,
         snap: &DirtySnapshot,
-    ) -> Option<(u16, u16, u16)> {
+    ) -> Option<ScrollBand> {
         // Rows of the glyph grid that fit in this buffer. A stale snapshot from a
         // taller geometry may carry rows past the bottom; clip them rather than let
         // them paint into the wrong pixels.
@@ -772,12 +772,12 @@ impl Renderer {
         // top -- those now sit at their true post-scroll positions, so an
         // in-place edit batched alongside a scroll is painted correctly instead
         // of being clobbered by a whole-region re-blit or a bad shift.
-        let mut scrolled: Option<(u16, u16, u16)> = None;
-        if snap.viewport_offset.is_none() {
-            if let Some((top, bot, delta)) = snap.scroll_span {
-                let top = u32::from(top);
-                let bot = u32::from(bot);
-                let delta = u32::from(delta);
+        let mut scrolled: Option<ScrollBand> = None;
+        if snap.viewport_offset().is_none() {
+            if let Some(band) = snap.scroll_span() {
+                let top = u32::from(band.top);
+                let bot = u32::from(band.bot);
+                let delta = u32::from(band.delta);
                 if delta > 0 && delta <= bot - top && bot < buf_rows {
                     let row_scanlines = self.cell_h as usize;
                     let row_words = buf_width as usize * row_scanlines;
@@ -787,7 +787,7 @@ impl Renderer {
                     let src_off = src_row * row_words;
                     let pixels = canvas.pixels_mut();
                     pixels.copy_within(src_off..src_off + keep_rows * row_words, dst_off);
-                    scrolled = Some((top as u16, bot as u16, delta as u16));
+                    scrolled = Some(band);
                 }
             }
         }
@@ -1068,8 +1068,7 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: None,
+            kind: grid::SnapshotKind::Incremental { scroll_span: None },
         };
         let theme = Theme::builtin();
         let bg = theme.bg_xrgb();
@@ -1126,8 +1125,7 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: None,
+            kind: grid::SnapshotKind::Incremental { scroll_span: None },
         };
         {
             let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
@@ -1165,8 +1163,13 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 1,
-            viewport_offset: None,
-            scroll_span: Some((0, 3, 1)),
+            kind: grid::SnapshotKind::Incremental {
+                scroll_span: Some(ScrollBand {
+                    top: 0,
+                    bot: 3,
+                    delta: 1,
+                }),
+            },
         };
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
         renderer.blit_snapshot(&mut canvas, &scrolled);
@@ -1206,11 +1209,16 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: delta,
-            viewport_offset: None,
-            scroll_span: if delta > 0 {
-                Some((0, rows - 1, delta))
-            } else {
-                None
+            kind: grid::SnapshotKind::Incremental {
+                scroll_span: if delta > 0 {
+                    Some(ScrollBand {
+                        top: 0,
+                        bot: rows - 1,
+                        delta,
+                    })
+                } else {
+                    None
+                },
             },
         }
     }
@@ -1311,8 +1319,7 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: None,
+            kind: grid::SnapshotKind::Incremental { scroll_span: None },
         };
         {
             let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
@@ -1343,14 +1350,23 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 1,
-            viewport_offset: None,
-            scroll_span: Some((0, 3, 1)),
+            kind: grid::SnapshotKind::Incremental {
+                scroll_span: Some(ScrollBand {
+                    top: 0,
+                    bot: 3,
+                    delta: 1,
+                }),
+            },
         };
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);
         // Rows 0..=3 shifted up by 1.
         assert_eq!(
             renderer.blit_snapshot(&mut canvas, &scrolled),
-            Some((0, 3, 1))
+            Some(ScrollBand {
+                top: 0,
+                bot: 3,
+                delta: 1
+            })
         );
     }
 
@@ -1369,8 +1385,7 @@ mod tests {
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
             content_delta: 0,
-            viewport_offset: None,
-            scroll_span: None,
+            kind: grid::SnapshotKind::Incremental { scroll_span: None },
         };
         let mut renderer = Renderer::builtin(Theme::builtin());
         let mut canvas = Canvas::new(&mut pixels, bw as i32, bh as i32);

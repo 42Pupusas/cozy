@@ -64,10 +64,30 @@ struct Modules {
     /// that window so the displayed value still catches up quickly once
     /// scrolling pauses.
     last_control_refresh: Instant,
+    /// Coalesces scroll-wheel adjustments: raw wheel units accumulated
+    /// since the last time we actually spawned `pactl`/`brightnessctl`
+    /// (`None` when nothing's pending), plus which control they're for.
+    /// A single physical scroll gesture -- especially kinetic/smooth
+    /// scrolling on a touchpad or a high-resolution mouse wheel -- delivers
+    /// many tiny `wl_pointer.axis` events in quick succession, and the
+    /// reader thread wakes the main loop on *every one* of them. Applying
+    /// a full `SCROLL_STEP_PCT` step (and spawning a process) per individual
+    /// micro-event, as the first version of this did, meant a single smooth
+    /// gesture fired a burst of dozens of process spawns and the displayed
+    /// value jumped in a full step each time -- that burst of synchronous
+    /// spawn() calls back-to-back, not the scroll-handling logic itself, was
+    /// the actual jank. Now wheel deltas just accumulate here; `main`'s loop
+    /// applies (and clears) the accumulator at most once per
+    /// `SCROLL_APPLY_DEBOUNCE_MS`.
+    pending_scroll: Option<(ModuleKind, i32)>,
+    last_scroll_apply: Instant,
 }
 
 /// Minimum spacing between `force_refresh_controls` calls, in milliseconds.
 const CONTROL_REFRESH_DEBOUNCE_MS: u64 = 150;
+/// Minimum spacing between actually spawning a `pactl`/`brightnessctl`
+/// *adjustment* while scrolling -- see `Modules::pending_scroll`'s doc.
+const SCROLL_APPLY_DEBOUNCE_MS: u64 = 60;
 
 const DASH: &str = "—";
 
@@ -93,7 +113,7 @@ mod palette {
 
 /// Which module a rendered segment came from -- just enough to pick its
 /// color in `module_color`; not otherwise used for layout.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Cpu/Mem: disabled in right_segments() per user request, kept for easy re-enable
 enum ModuleKind {
     Clock,
@@ -202,6 +222,8 @@ impl Modules {
             last_slow: stale,
             last_cpu: stale,
             last_control_refresh: stale,
+            pending_scroll: None,
+            last_scroll_apply: stale,
         }
     }
 
@@ -296,6 +318,45 @@ impl Modules {
         }
     }
 
+    /// Accumulate a wheel-scroll delta (in already-signed `SCROLL_STEP_PCT`
+    /// units) for `kind` without touching the mixer/backlight yet -- see
+    /// `pending_scroll`'s doc for why. Switching which control is being
+    /// scrolled resets the accumulator to just the new delta rather than
+    /// summing across controls.
+    fn queue_scroll(&mut self, kind: ModuleKind, delta: i32) {
+        match &mut self.pending_scroll {
+            Some((k, acc)) if *k == kind => *acc += delta,
+            _ => self.pending_scroll = Some((kind, delta)),
+        }
+    }
+
+    /// Apply the accumulated scroll delta (if any and if the debounce
+    /// window has elapsed), spawning exactly one `pactl`/`brightnessctl`
+    /// call for however much the wheel actually moved since the last
+    /// apply, then immediately re-reads just that control. Returns `true`
+    /// if a redraw is warranted.
+    fn apply_pending_scroll(&mut self) -> bool {
+        let Some((kind, delta)) = self.pending_scroll else {
+            return false;
+        };
+        let now = Instant::now();
+        if now.duration_since(self.last_scroll_apply) < Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS) {
+            return false;
+        }
+        self.pending_scroll = None;
+        self.last_scroll_apply = now;
+        if delta != 0 {
+            match kind {
+                ModuleKind::VolOut => statusbar::modules::adjust_volume_out(delta),
+                ModuleKind::VolIn => statusbar::modules::adjust_volume_in(delta),
+                ModuleKind::Brightness => statusbar::modules::adjust_brightness(delta),
+                _ => {}
+            }
+        }
+        self.force_refresh_control(kind);
+        true
+    }
+
     /// Left section, left-to-right draw order: the always-visible
     /// connectivity cluster (clock/date live in `right_segments` now).
     fn left_segments(&self) -> Vec<(ModuleKind, String)> {
@@ -345,6 +406,13 @@ fn paint(
     let y = text.baseline_y(bar_height);
     let pad = 20 * scale;
     let gap = 18 * scale;
+    // Scroll/click hit-testing only cares about x-ranges, not glyph pixels,
+    // so pad each segment's interactive rect out by half the inter-segment
+    // gap on each side -- glyph-tight hit boxes made it fiddly to land the
+    // pointer precisely on vol-out/vol-in/brightness to scroll them. Half
+    // the gap on each side means neighboring segments' padded rects meet
+    // exactly at the gap's midpoint without overlapping.
+    let hit_pad = gap / 2;
 
     // Left: left-to-right layout, each segment starting `gap` past the
     // previous one's end.
@@ -356,7 +424,7 @@ fn paint(
         let color = module_color(kind, &seg);
         text.draw_text_alpha(canvas, &seg, left_edge, y, color, bg, bg_alpha);
         let w = text.measure(&seg);
-        segment_rects.push((kind, left_edge, left_edge + w));
+        segment_rects.push((kind, left_edge - hit_pad, left_edge + w + hit_pad));
         left_edge += w + gap;
     }
 
@@ -374,7 +442,7 @@ fn paint(
             let color = module_color(*kind, seg);
             let w = text.measure(seg);
             text.draw_text_alpha(canvas, seg, x, y, color, bg, bg_alpha);
-            segment_rects.push((*kind, x, x + w));
+            segment_rects.push((*kind, x - hit_pad, x + w + hit_pad));
             x += w + gap;
         }
     }
@@ -389,7 +457,7 @@ fn paint(
         let color = module_color(kind, &seg);
         text.draw_text_right_alpha(canvas, &seg, right_edge, y, color, bg, bg_alpha);
         let w = text.measure(&seg);
-        segment_rects.push((kind, right_edge - w, right_edge));
+        segment_rects.push((kind, right_edge - w - hit_pad, right_edge + hit_pad));
         right_edge -= w + gap;
     }
 }
@@ -459,9 +527,14 @@ fn main() {
         }
 
         // Scroll-to-adjust: a wheel event over the vol-out/vol-in/brightness
-        // segment nudges that control by a fixed step per detent, then
-        // forces an immediate module refresh so the change is visible right
-        // away instead of waiting out that module's poll period.
+        // segment queues a delta for that control -- it does NOT spawn
+        // `pactl`/`brightnessctl` directly here. A single physical scroll
+        // gesture (especially kinetic/smooth scrolling) delivers many small
+        // `wl_pointer.axis` events in a burst; spawning a process per event
+        // was the actual source of the reported jank. `queue_scroll` just
+        // sums the deltas; `apply_pending_scroll` below drains the
+        // accumulator into a single subprocess spawn, at most once per
+        // `SCROLL_APPLY_DEBOUNCE_MS`.
         let scrolls = window.take_scroll();
         if !scrolls.is_empty() {
             let px = window.pointer_pos().x;
@@ -481,25 +554,31 @@ fn main() {
                 // convention and the usual volume-knob feel (push up = louder).
                 let delta = -steps * SCROLL_STEP_PCT;
                 let kind = *kind;
-                match kind {
-                    ModuleKind::VolOut => statusbar::modules::adjust_volume_out(delta),
-                    ModuleKind::VolIn => statusbar::modules::adjust_volume_in(delta),
-                    ModuleKind::Brightness => statusbar::modules::adjust_brightness(delta),
-                    _ => {}
-                }
                 if matches!(
                     kind,
                     ModuleKind::VolOut | ModuleKind::VolIn | ModuleKind::Brightness
                 ) {
-                    modules.force_refresh_control(kind);
-                    window.request_redraw();
+                    modules.queue_scroll(kind, delta);
                 }
             }
+        }
+        if modules.apply_pending_scroll() {
+            window.request_redraw();
         }
 
         // Poll at ~10fps when idle -- modules refresh on their own slower
         // cadences above; this just keeps the Wayland event loop responsive
-        // (resize/output changes) without busy-spinning.
-        window.wait(100);
+        // (resize/output changes) without busy-spinning. While a scroll
+        // adjustment is queued, poll at the apply-debounce granularity
+        // instead so it doesn't sit un-applied until the next unrelated
+        // wakeup (a wheel event does wake us via the pointer axis event
+        // itself, but the trailing queued remainder after scrolling stops
+        // needs its own timely wakeup to actually flush).
+        let wait_ms = if modules.pending_scroll.is_some() {
+            SCROLL_APPLY_DEBOUNCE_MS as i32
+        } else {
+            100
+        };
+        window.wait(wait_ms);
     }
 }

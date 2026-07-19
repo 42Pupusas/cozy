@@ -106,7 +106,13 @@ fn submit_and_wait_retry(ring: &mut IoUring, min_complete: u32) -> Result<u32, C
     loop {
         match ring.submit_and_wait(min_complete) {
             Ok(n) => return Ok(n),
-            Err(ququmatz::Error::Submit(ququmatz::SubmitError::Syscall(errno)))
+            // `submit_and_wait` calls `io_uring_enter` directly and `?`s the
+            // raw `Errno` through `From<Errno> for ququmatz::Error`, so an
+            // interrupted enter surfaces as the bare `Error::Syscall(errno)`
+            // variant -- *not* `Error::Submit(SubmitError::Syscall(..))` (that
+            // shape only comes from `push`'s queue-full path). Matching only
+            // the wrong shape meant this retry never actually fired.
+            Err(ququmatz::Error::Syscall(errno) | ququmatz::Error::Submit(ququmatz::SubmitError::Syscall(errno)))
                 if errno.raw() == EINTR => {}
             Err(e) => return Err(ConnError::Submit(e)),
         }

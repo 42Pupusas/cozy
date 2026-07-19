@@ -11,7 +11,7 @@
 //! renders that slot as an em-dash instead of erroring the whole process.
 
 use std::fs;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Wall-clock `HH:MM:SS`, local time — via `date`, not a chrono dependency
@@ -244,14 +244,28 @@ fn adjust_volume(pactl_target: &str, amixer_control: &str, delta_pct: i32) {
     };
     let sign = if delta_pct >= 0 { "+" } else { "-" };
     let arg = format!("{sign}{}%", delta_pct.abs());
-    let ok = Command::new("pactl")
+    // `spawn` + drop the child, not `status`/`output`: this runs on the bar's
+    // single render thread, and a rapid wheel scroll fires this once per
+    // detent -- blocking on a `pactl`/`amixer` round-trip (process spawn +
+    // exec + a D-Bus/PulseAudio IPC hop, easily tens of ms) each time is
+    // exactly what made scrolling feel janky: the whole paint loop stalled
+    // on process I/O every tick instead of just kicking it off.  We don't
+    // need the exit status here -- the very next module poll re-reads
+    // whatever the mixer actually landed on regardless of whether this
+    // particular command succeeded.
+    let spawned = Command::new("pactl")
         .args([kind, pactl_target, &arg])
-        .status()
-        .is_ok_and(|s| s.success());
-    if !ok {
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if spawned.is_err() {
         let _ = Command::new("amixer")
             .args(["set", amixer_control, &format!("{}%{sign}", delta_pct.abs())])
-            .status();
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
     }
 }
 
@@ -356,11 +370,20 @@ pub fn brightness() -> Option<String> {
 pub fn adjust_brightness(delta_pct: i32) {
     let sign = if delta_pct >= 0 { "+" } else { "-" };
     let arg = format!("{sign}{}%", delta_pct.abs());
-    let ok = Command::new("brightnessctl")
+    // `spawn`, not `status`: see the comment in `adjust_volume` -- blocking
+    // the render thread on a subprocess round-trip per wheel detent is what
+    // made scrolling janky. If `brightnessctl` isn't even on PATH, `spawn`
+    // fails immediately (no fork/exec attempted) and we fall through to the
+    // sysfs write below; if it *is* on PATH we don't wait to find out
+    // whether it actually changed anything -- the next poll re-reads the
+    // real value regardless.
+    let spawned = Command::new("brightnessctl")
         .args(["set", &arg])
-        .status()
-        .is_ok_and(|s| s.success());
-    if ok {
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    if spawned.is_ok() {
         return;
     }
     let Ok(dir) = fs::read_dir("/sys/class/backlight") else {

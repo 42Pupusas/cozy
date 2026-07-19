@@ -53,7 +53,21 @@ struct Modules {
     last_fast: Instant,
     last_slow: Instant,
     last_cpu: Instant,
+    /// Debounce gate for `force_refresh_controls`: a rapid burst of wheel
+    /// detents (the common case -- a single physical scroll gesture fires
+    /// many discrete axis events) used to trigger one blocking
+    /// `pactl get-*`/`brightnessctl` round-trip *per event*, stalling the
+    /// paint loop on process I/O every tick -- that was the actual source
+    /// of the reported jank, not the (non-blocking) `set-*-volume` nudge
+    /// itself. Now a refresh only actually runs once this many ms have
+    /// passed since the last one; the mixer/backlight settles well within
+    /// that window so the displayed value still catches up quickly once
+    /// scrolling pauses.
+    last_control_refresh: Instant,
 }
+
+/// Minimum spacing between `force_refresh_controls` calls, in milliseconds.
+const CONTROL_REFRESH_DEBOUNCE_MS: u64 = 150;
 
 const DASH: &str = "—";
 
@@ -187,6 +201,7 @@ impl Modules {
             last_fast: stale,
             last_slow: stale,
             last_cpu: stale,
+            last_control_refresh: stale,
         }
     }
 
@@ -249,14 +264,36 @@ impl Modules {
         changed
     }
 
-    /// Immediately recompute vol-out/vol-in/brightness (skipping
-    /// `SLOW_PERIOD`'s cooldown) -- called right after a scroll-wheel
-    /// adjustment so the new value is visible on the very next frame
-    /// instead of waiting out the rest of that module's poll period.
-    fn force_refresh_controls(&mut self) {
-        self.vol_out = statusbar::modules::volume_out().unwrap_or_else(|| DASH.into());
-        self.vol_in = statusbar::modules::volume_in().unwrap_or_else(|| DASH.into());
-        self.brightness = statusbar::modules::brightness().unwrap_or_else(|| DASH.into());
+    /// Immediately recompute just the one control `kind` was scrolled on
+    /// (skipping `SLOW_PERIOD`'s cooldown) so the new value is visible
+    /// without waiting out the rest of that module's poll period --
+    /// debounced to at most once per [`CONTROL_REFRESH_DEBOUNCE_MS`] so a
+    /// burst of wheel-detent events (one physical scroll gesture routinely
+    /// fires many) doesn't run a blocking `pactl get-*`/`brightnessctl`
+    /// subprocess round-trip on every single tick of the paint loop -- that
+    /// synchronous stall, not the (already non-blocking) volume/brightness
+    /// *set* itself, was the actual source of scrolling feeling janky.
+    /// Only reads one module (not all three) since scrolling one control
+    /// doesn't change the others.
+    fn force_refresh_control(&mut self, kind: ModuleKind) {
+        let now = Instant::now();
+        if now.duration_since(self.last_control_refresh) < Duration::from_millis(CONTROL_REFRESH_DEBOUNCE_MS)
+        {
+            return;
+        }
+        self.last_control_refresh = now;
+        match kind {
+            ModuleKind::VolOut => {
+                self.vol_out = statusbar::modules::volume_out().unwrap_or_else(|| DASH.into());
+            }
+            ModuleKind::VolIn => {
+                self.vol_in = statusbar::modules::volume_in().unwrap_or_else(|| DASH.into());
+            }
+            ModuleKind::Brightness => {
+                self.brightness = statusbar::modules::brightness().unwrap_or_else(|| DASH.into());
+            }
+            _ => {}
+        }
     }
 
     /// Left section, left-to-right draw order: the always-visible
@@ -443,6 +480,7 @@ fn main() {
                 // decrease -- matches the terminal's own scroll-up-goes-back
                 // convention and the usual volume-knob feel (push up = louder).
                 let delta = -steps * SCROLL_STEP_PCT;
+                let kind = *kind;
                 match kind {
                     ModuleKind::VolOut => statusbar::modules::adjust_volume_out(delta),
                     ModuleKind::VolIn => statusbar::modules::adjust_volume_in(delta),
@@ -453,7 +491,7 @@ fn main() {
                     kind,
                     ModuleKind::VolOut | ModuleKind::VolIn | ModuleKind::Brightness
                 ) {
-                    modules.force_refresh_controls();
+                    modules.force_refresh_control(kind);
                     window.request_redraw();
                 }
             }

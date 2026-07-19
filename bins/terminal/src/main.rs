@@ -21,13 +21,18 @@
 //!
 //! Rings are quetzalcoatl SPSC/MPSC (MPSC where two threads fan in: pty+ui
 //! into the parser, ui+parser into the pty) — no mutexes, no async runtime.
+//! A fourth, unlabeled SPSC ring (parser → ui, [`UiEvent`]s: bell/title/
+//! link/clipboard) runs alongside the `DirtySnapshot` one in the diagram
+//! above; both are exactly one producer to one consumer, so neither needs
+//! anything heavier than the lock-free SPSC ring every other channel here
+//! uses.
 //! The pty→parser `Data` message carries its 4 KiB read buffer inline, so the
 //! ring's slots are the buffer pool: no per-chunk heap allocation and no
 //! free-list recycle ring.
 //! Config is loaded from `$XDG_CONFIG_HOME/terminal/config.toml` at startup.
 
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -140,6 +145,11 @@ const PTY_BUF: usize = 4096;
 const RING_PARSER_IN: usize = 64; // ParserMsg slots     pty+ui → parser
 const RING_DIRTY: usize = 16; // DirtySnapshot slots parser → ui
 const RING_INPUT: usize = 64; // InputMsg slots      ui+parser → pty
+/// `UiEvent` slots, parser → ui. Small: these are one-shot, edge-triggered
+/// events (bell/title/link/clipboard), at most one per OSC/BEL the shell
+/// emits, never per-byte -- nothing like the PTY data rate the other rings
+/// carry.
+const RING_UI_EVENTS: usize = 32;
 
 /// Cap on how many `ParserMsg`s the parser thread folds into one grid batch
 /// before publishing a dirty snapshot and re-entering the loop. Without this,
@@ -208,9 +218,18 @@ enum InputMsg {
 /// triggered: the UI thread just re-reads the latest value every batch). A
 /// bell or a title change is edge-triggered -- it must be observed exactly
 /// once, not re-applied every batch -- so it needs a real queue instead of
-/// an atomic. Volume is low (at most one per OSC/BEL the shell emits, never
-/// per-byte), so a `Mutex<VecDeque<_>>` is more than fast enough; this isn't
-/// a hot path like the PTY data rings.
+/// an atomic.
+///
+/// Carried over a single-producer/single-consumer `quetzalcoatl::spsc`
+/// ring (parser thread produces, UI thread consumes) -- see
+/// [`RING_UI_EVENTS`] -- matching the lock-free-everywhere contract every
+/// other cross-thread channel in this file already follows (`ParserMsg`,
+/// `InputMsg`, `DirtySnapshot`). This used to be an `Arc<Mutex<Vec<_>>>`,
+/// the one lock in an otherwise lock-free pipeline: exactly one producer
+/// and exactly one consumer, so a lock bought nothing a lock-free SPSC ring
+/// doesn't already give for free, and it meant a panic on either side while
+/// holding the lock would poison it and wedge the other thread's next
+/// access too.
 enum UiEvent {
     Bell,
     Title(String),
@@ -281,9 +300,6 @@ struct App<'cfg> {
     /// [`TermModes::pack`]: written on the parser thread after every grid
     /// batch, read on the UI thread before encoding each key/mouse event.
     term_modes: Arc<AtomicU32>,
-    /// One-shot bell/title events, queued by the parser thread and drained
-    /// by the UI thread. See [`UiEvent`].
-    ui_events: Arc<Mutex<Vec<UiEvent>>>,
 }
 
 impl<'cfg> App<'cfg> {
@@ -293,7 +309,6 @@ impl<'cfg> App<'cfg> {
             quit: Arc::new(AtomicBool::new(false)),
             bracketed_paste: Arc::new(AtomicBool::new(false)),
             term_modes: Arc::new(AtomicU32::new(0)),
-            ui_events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -314,6 +329,11 @@ impl<'cfg> App<'cfg> {
         let parser_resize_tx = parser_data_tx.clone();
         let (dirty_tx, dirty_rx) =
             RingBuffer::<DirtySnapshot>::new(Capacity::exact(RING_DIRTY)).split();
+        // ui_events is SPSC: exactly one producer (parser thread) and one
+        // consumer (UI thread) -- see `UiEvent`'s doc for why this replaced
+        // an `Arc<Mutex<Vec<_>>>`.
+        let (ui_events_tx, ui_events_rx) =
+            RingBuffer::<UiEvent>::new(Capacity::exact(RING_UI_EVENTS)).split();
         // input is MPSC too: the ui thread (keystrokes / resize / quit) and the
         // parser/grid thread (CPR/DA responses written back to the shell) both feed
         // the single PTY consumer.
@@ -331,8 +351,6 @@ impl<'cfg> App<'cfg> {
         let bracketed_paste_ui = Arc::clone(&self.bracketed_paste);
         let term_modes_parser = Arc::clone(&self.term_modes);
         let term_modes_ui = Arc::clone(&self.term_modes);
-        let ui_events_parser = Arc::clone(&self.ui_events);
-        let ui_events_ui = Arc::clone(&self.ui_events);
 
         // ── Cross-thread wakeups (eventfd + poll) ────────────────────────────────
         // Each thread that waits on more than one source blocks in poll(2) on an
@@ -380,7 +398,7 @@ impl<'cfg> App<'cfg> {
             pty_wake: parser_pty_wake,
             bracketed_paste: bracketed_paste_parser,
             term_modes: term_modes_parser,
-            ui_events: ui_events_parser,
+            ui_events_tx,
             quit: quit_parser,
         }
         .spawn();
@@ -420,7 +438,7 @@ impl<'cfg> App<'cfg> {
                 pty_wake: ui_pty_wake,
                 bracketed_paste: &bracketed_paste_ui,
                 term_modes: &term_modes_ui,
-                ui_events: &ui_events_ui,
+                ui_events_rx,
                 quit: &self.quit,
             }
             .run()
@@ -590,7 +608,7 @@ struct ParserWorker {
     pty_wake: waker::Waker,
     bracketed_paste: Arc<AtomicBool>,
     term_modes: Arc<AtomicU32>,
-    ui_events: Arc<Mutex<Vec<UiEvent>>>,
+    ui_events_tx: quetzalcoatl::spsc::Producer<UiEvent>,
     quit: Arc<AtomicBool>,
 }
 
@@ -620,7 +638,7 @@ impl ParserWorker {
             pty_wake,
             bracketed_paste,
             term_modes,
-            ui_events,
+            ui_events_tx,
             quit,
         } = self;
         // Guarantees `quit` flips even if this thread panics below -- see
@@ -638,7 +656,7 @@ impl ParserWorker {
             pty_wake,
             bracketed_paste,
             term_modes,
-            ui_events,
+            ui_events_tx,
             quit,
         }
         .run();
@@ -662,7 +680,7 @@ struct ParserSession {
     pty_wake: waker::Waker,
     bracketed_paste: Arc<AtomicBool>,
     term_modes: Arc<AtomicU32>,
-    ui_events: Arc<Mutex<Vec<UiEvent>>>,
+    ui_events_tx: quetzalcoatl::spsc::Producer<UiEvent>,
     quit: Arc<AtomicBool>,
 }
 
@@ -692,6 +710,21 @@ impl ParserSession {
             ParserMsg::Resize { cols, rows } => self.grid.resize(cols, rows),
             ParserMsg::Scroll { delta } => self.grid.scroll_viewport(delta),
         }
+    }
+
+    /// Push a one-shot bell/title/link/clipboard event to the UI thread
+    /// over the SPSC `ui_events_tx` ring, waking it the same way `publish`
+    /// wakes it for a dirty snapshot. Drops the event (with a debug log,
+    /// not a panic) if the small `RING_UI_EVENTS` ring is momentarily full
+    /// -- these are advisory UI niceties (bell/title/link/clipboard), not
+    /// grid content, so an extremely rare drop under a pathological burst
+    /// is preferable to blocking the parser thread or growing the ring
+    /// unbounded.
+    fn push_ui_event(&self, ev: UiEvent) {
+        if self.ui_events_tx.push(ev).is_err() {
+            tlog::trace!(Parser, "ui_events ring full, dropping a UiEvent");
+        }
+        self.ui_wake.signal();
     }
 
     /// Push any host-bound replies the grid produced (CPR/DA) to the PTY
@@ -780,24 +813,21 @@ impl ParserSession {
             self.term_modes
                 .store(TermModes::from_grid(&self.grid).pack(), Ordering::Relaxed);
 
-            // Drain one-shot bell/title events into the shared queue for
-            // the UI thread. Unlike the level-triggered state above, these
-            // must be observed exactly once each, so they're queued rather
-            // than overwritten.
+            // Queue one-shot bell/title events for the UI thread over the
+            // SPSC ui_events ring. Unlike the level-triggered state above,
+            // these must be observed exactly once each, so they're queued
+            // rather than overwritten.
             if self.grid.take_bell() {
-                self.ui_events.lock().unwrap().push(UiEvent::Bell);
+                self.push_ui_event(UiEvent::Bell);
             }
             if let Some(title) = self.grid.take_title() {
-                self.ui_events.lock().unwrap().push(UiEvent::Title(title));
+                self.push_ui_event(UiEvent::Title(title));
             }
             for (id, uri) in self.grid.take_new_links() {
-                self.ui_events.lock().unwrap().push(UiEvent::Link(id, uri));
+                self.push_ui_event(UiEvent::Link(id, uri));
             }
             if let Some(text) = self.grid.take_clipboard() {
-                self.ui_events
-                    .lock()
-                    .unwrap()
-                    .push(UiEvent::Clipboard(text));
+                self.push_ui_event(UiEvent::Clipboard(text));
             }
 
             self.publish();
@@ -822,7 +852,7 @@ struct UiWorker<'a> {
     pty_wake: waker::Waker,
     bracketed_paste: &'a AtomicBool,
     term_modes: &'a AtomicU32,
-    ui_events: &'a Mutex<Vec<UiEvent>>,
+    ui_events_rx: quetzalcoatl::spsc::Consumer<UiEvent>,
     quit: &'a AtomicBool,
 }
 
@@ -840,7 +870,7 @@ impl UiWorker<'_> {
             pty_wake,
             bracketed_paste,
             term_modes,
-            ui_events,
+            mut ui_events_rx,
             quit,
         } = self;
         let theme = platform::Theme::from_palette(&cfg.palette);
@@ -928,8 +958,9 @@ impl UiWorker<'_> {
             // input this iteration produces.
             TermModes::unpack(term_modes.load(Ordering::Relaxed)).apply_to(&mut encoder);
 
-            // Drain one-shot bell/title events the parser thread queued.
-            for ev in ui_events.lock().unwrap().drain(..) {
+            // Drain one-shot bell/title events the parser thread queued
+            // over the SPSC ui_events_rx ring.
+            while let Some(ev) = ui_events_rx.pop() {
                 match ev {
                     UiEvent::Bell => win.bell(),
                     UiEvent::Title(title) => win.set_title(&title),
@@ -1077,7 +1108,20 @@ impl UiWorker<'_> {
                             if link_id != 0
                                 && let Some(uri) = links.get(&link_id)
                             {
-                                let _ = std::process::Command::new("xdg-open").arg(uri).spawn();
+                                // `spawn()` alone leaves a zombie once
+                                // xdg-open exits -- dropping a `Child`
+                                // does not reap it, and nothing here ever
+                                // calls `wait()` on repeated Ctrl+clicks.
+                                // Reap it on a throwaway thread instead of
+                                // blocking the UI loop on `wait()`
+                                // ourselves.
+                                if let Ok(mut child) =
+                                    std::process::Command::new("xdg-open").arg(uri).spawn()
+                                {
+                                    std::thread::spawn(move || {
+                                        let _ = child.wait();
+                                    });
+                                }
                                 continue;
                             }
                         }

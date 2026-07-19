@@ -93,6 +93,26 @@ impl From<SysError> for ConnError {
     }
 }
 
+/// `submit_and_wait`, transparently retrying on `EINTR`.
+///
+/// A signal landing on whichever thread happens to be parked in
+/// `io_uring_enter` -- most commonly `SIGCHLD` when the process elsewhere
+/// spawns a subprocess (e.g. the statusbar's module readers shelling out to
+/// `pactl`/`brightnessctl`/`iw`) -- unparks the syscall with `-EINTR` even
+/// though nothing is actually wrong with the ring. Treat it the same way
+/// `pty::Pty`'s write path already does: not an error, just retry.
+fn submit_and_wait_retry(ring: &mut IoUring, min_complete: u32) -> Result<u32, ConnError> {
+    const EINTR: i32 = 4;
+    loop {
+        match ring.submit_and_wait(min_complete) {
+            Ok(n) => return Ok(n),
+            Err(ququmatz::Error::Submit(ququmatz::SubmitError::Syscall(errno)))
+                if errno.raw() == EINTR => {}
+            Err(e) => return Err(ConnError::Submit(e)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod error_tests {
     use super::*;
@@ -362,7 +382,7 @@ impl Sender {
     /// callers only ever pass the send ring here.
     fn run_one(ring: &mut IoUring, sqe: Sqe) -> Result<i32, ConnError> {
         ring.push(sqe).map_err(ConnError::Submit)?;
-        ring.submit_and_wait(1).map_err(ConnError::Submit)?;
+        submit_and_wait_retry(ring, 1)?;
         let cqe = ring.complete().ok_or(ConnError::NoCompletion)?;
         Ok(cqe.result)
     }
@@ -421,7 +441,7 @@ impl Sender {
         // pointer to `hdr`. We block until completion below, so all stay alive.
         let sqe = unsafe { Sqe::sendmsg_ptr(self.sock, &hdr, MsgFlags::NOSIGNAL) };
         self.ring.push(sqe).map_err(ConnError::Submit)?;
-        self.ring.submit_and_wait(1).map_err(ConnError::Submit)?;
+        submit_and_wait_retry(&mut self.ring, 1)?;
         let cqe = self.ring.complete().ok_or(ConnError::NoCompletion)?;
         let _keep_alive = (&hdr, &out, &msg);
         if cqe.result < 0 {
@@ -523,7 +543,16 @@ impl Reader {
 
         loop {
             // Submit the (re-)arms and block for the next completion(s).
-            self.ring.submit_and_wait(1).map_err(ConnError::Submit)?;
+            //
+            // `EINTR` (errno 4) is not a real failure -- any signal delivered
+            // to this thread while it's parked in `io_uring_enter` (e.g.
+            // `SIGCHLD` from a subprocess a caller spawned elsewhere, such as
+            // the statusbar's `pactl`/`brightnessctl` module readers) unparks
+            // the syscall with `-EINTR` even though the ring itself is fine.
+            // `pty::Pty::run`'s write path already treats `EINTR` as
+            // "nothing happened, retry" for the same reason; do the same
+            // here instead of tearing down the whole connection.
+            submit_and_wait_retry(&mut self.ring, 1)?;
 
             let mut closed = false;
             let mut pushed = false;

@@ -362,30 +362,25 @@ pub fn brightness() -> Option<String> {
 }
 
 /// Nudge screen backlight brightness by `delta_pct` percentage points
-/// (negative to dim), via `brightnessctl` if installed, else a direct
-/// `/sys/class/backlight/*/brightness` write (works without root when a
-/// udev rule grants the `video` group write access, which is the common
-/// desktop default -- e.g. `73-seat-backlight.rules` upstream udev/systemd).
-/// Fire-and-forget, same posture as [`adjust_volume_out`].
+/// (negative to dim) via a direct `/sys/class/backlight/*/brightness`
+/// read-modify-write (works without root when a udev rule grants the
+/// `video` group write access, which is the common desktop default -- e.g.
+/// `73-seat-backlight.rules` upstream udev/systemd). Not `brightnessctl`:
+/// its relative-delta syntax is asymmetric (`+N%` to raise but `N%-`, not
+/// `-N%`, to lower) and got this wrong in an earlier version, silently
+/// no-opping every dim adjustment.
 pub fn adjust_brightness(delta_pct: i32) {
-    let sign = if delta_pct >= 0 { "+" } else { "-" };
-    let arg = format!("{sign}{}%", delta_pct.abs());
-    // `spawn`, not `status`: see the comment in `adjust_volume` -- blocking
-    // the render thread on a subprocess round-trip per wheel detent is what
-    // made scrolling janky. If `brightnessctl` isn't even on PATH, `spawn`
-    // fails immediately (no fork/exec attempted) and we fall through to the
-    // sysfs write below; if it *is* on PATH we don't wait to find out
-    // whether it actually changed anything -- the next poll re-reads the
-    // real value regardless.
-    let spawned = Command::new("brightnessctl")
-        .args(["set", &arg])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    if spawned.is_ok() {
-        return;
-    }
+    // `brightnessctl`'s relative-delta syntax puts the sign in different
+    // places depending on direction: `+10%` to raise, but `10%-` (sign
+    // *trailing*, magnitude first) to lower -- `-10%` is not valid and
+    // brightnessctl rejects it as a bad argument, which combined with
+    // stderr being nulled made every dim-scroll a silent no-op. Rather than
+    // rely on getting that asymmetric syntax right (and on brightnessctl
+    // being installed at all), just do the sysfs read-modify-write
+    // directly -- it's a couple of small file reads/writes, cheap enough
+    // to not need `spawn`'s fire-and-forget treatment, and it's already
+    // `brightness()`'s own read path so behavior stays consistent between
+    // the two.
     let Ok(dir) = fs::read_dir("/sys/class/backlight") else {
         return;
     };

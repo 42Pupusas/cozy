@@ -64,21 +64,20 @@ struct Modules {
     /// that window so the displayed value still catches up quickly once
     /// scrolling pauses.
     last_control_refresh: Instant,
-    /// Coalesces scroll-wheel adjustments: raw wheel units accumulated
-    /// since the last time we actually spawned `pactl`/`brightnessctl`
-    /// (`None` when nothing's pending), plus which control they're for.
-    /// A single physical scroll gesture -- especially kinetic/smooth
-    /// scrolling on a touchpad or a high-resolution mouse wheel -- delivers
-    /// many tiny `wl_pointer.axis` events in quick succession, and the
-    /// reader thread wakes the main loop on *every one* of them. Applying
-    /// a full `SCROLL_STEP_PCT` step (and spawning a process) per individual
-    /// micro-event, as the first version of this did, meant a single smooth
-    /// gesture fired a burst of dozens of process spawns and the displayed
-    /// value jumped in a full step each time -- that burst of synchronous
-    /// spawn() calls back-to-back, not the scroll-handling logic itself, was
-    /// the actual jank. Now wheel deltas just accumulate here; `main`'s loop
-    /// applies (and clears) the accumulator at most once per
-    /// `SCROLL_APPLY_DEBOUNCE_MS`.
+    /// Coalesces scroll-wheel adjustments: **raw wl_fixed-derived pixels**
+    /// (not yet converted to a percentage step) accumulated since the last
+    /// time we actually spawned `pactl`/`brightnessctl` (`None` when
+    /// nothing's pending), plus which control they're for. Keeping this in
+    /// raw pixels rather than pre-rounded steps matters: a single physical
+    /// scroll gesture -- especially kinetic/smooth scrolling on a touchpad
+    /// or a high-resolution mouse wheel -- delivers many *small*
+    /// `wl_pointer.axis` events, each well under one detent (~15px) on its
+    /// own. Rounding every individual event up to at least one step (the
+    /// first version of this) meant a gentle scroll fired a burst of
+    /// spawns and jumped the value around inconsistently. Now sub-detent
+    /// deltas just accumulate here fractionally; `apply_pending_scroll`
+    /// only converts (and drains) whole detents' worth into an actual
+    /// step, leaving any remainder under one detent queued for next time.
     pending_scroll: Option<(ModuleKind, i32)>,
     last_scroll_apply: Instant,
 }
@@ -88,6 +87,12 @@ const CONTROL_REFRESH_DEBOUNCE_MS: u64 = 150;
 /// Minimum spacing between actually spawning a `pactl`/`brightnessctl`
 /// *adjustment* while scrolling -- see `Modules::pending_scroll`'s doc.
 const SCROLL_APPLY_DEBOUNCE_MS: u64 = 60;
+/// Raw wheel pixels (`wl_fixed`-derived, from `BarWindow::take_scroll`)
+/// per one logical scroll "step" / detent. Matches a typical physical mouse
+/// wheel click; touchpad/hi-res-wheel micro-events accumulate fractionally
+/// toward this in `Modules::pending_scroll` rather than each counting as a
+/// full step on their own.
+const SCROLL_PX_PER_STEP: i32 = 15;
 
 const DASH: &str = "—";
 
@@ -318,40 +323,54 @@ impl Modules {
         }
     }
 
-    /// Accumulate a wheel-scroll delta (in already-signed `SCROLL_STEP_PCT`
-    /// units) for `kind` without touching the mixer/backlight yet -- see
-    /// `pending_scroll`'s doc for why. Switching which control is being
-    /// scrolled resets the accumulator to just the new delta rather than
-    /// summing across controls.
-    fn queue_scroll(&mut self, kind: ModuleKind, delta: i32) {
+    /// Accumulate a raw wheel-pixel delta (see `pending_scroll`'s doc) for
+    /// `kind` without touching the mixer/backlight yet. Switching which
+    /// control is being scrolled resets the accumulator to just the new
+    /// delta rather than summing across controls (and drops any leftover
+    /// sub-detent remainder from the previous control -- it's stale once
+    /// the pointer's moved to a different segment).
+    fn queue_scroll(&mut self, kind: ModuleKind, raw_px: i32) {
         match &mut self.pending_scroll {
-            Some((k, acc)) if *k == kind => *acc += delta,
-            _ => self.pending_scroll = Some((kind, delta)),
+            Some((k, acc)) if *k == kind => *acc += raw_px,
+            _ => self.pending_scroll = Some((kind, raw_px)),
         }
     }
 
-    /// Apply the accumulated scroll delta (if any and if the debounce
-    /// window has elapsed), spawning exactly one `pactl`/`brightnessctl`
-    /// call for however much the wheel actually moved since the last
-    /// apply, then immediately re-reads just that control. Returns `true`
-    /// if a redraw is warranted.
+    /// Convert whatever whole detents' worth of raw pixels have
+    /// accumulated into one `pactl`/`brightnessctl` spawn (if any, and if
+    /// the debounce window has elapsed), then immediately re-reads just
+    /// that control. Any leftover fractional pixels under one detent stay
+    /// queued rather than being dropped, so a slow/gentle scroll still
+    /// adds up correctly instead of needing to individually clear the
+    /// detent threshold each event. Returns `true` if a redraw is
+    /// warranted.
     fn apply_pending_scroll(&mut self) -> bool {
-        let Some((kind, delta)) = self.pending_scroll else {
+        let Some((kind, raw_px)) = self.pending_scroll else {
             return false;
         };
         let now = Instant::now();
         if now.duration_since(self.last_scroll_apply) < Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS) {
             return false;
         }
-        self.pending_scroll = None;
         self.last_scroll_apply = now;
-        if delta != 0 {
-            match kind {
-                ModuleKind::VolOut => statusbar::modules::adjust_volume_out(delta),
-                ModuleKind::VolIn => statusbar::modules::adjust_volume_in(delta),
-                ModuleKind::Brightness => statusbar::modules::adjust_brightness(delta),
-                _ => {}
-            }
+        // Truncate toward zero -- whole detents only; keep the remainder
+        // queued for next time instead of resetting to 0 every apply.
+        let steps = raw_px / SCROLL_PX_PER_STEP;
+        if steps == 0 {
+            // Nothing to apply yet, but don't churn force_refresh_control
+            // on sub-detent noise -- just wait for more to accumulate.
+            return false;
+        }
+        self.pending_scroll = Some((kind, raw_px - steps * SCROLL_PX_PER_STEP));
+        // Wheel up (negative raw px) = increase; wheel down (positive) =
+        // decrease -- matches the terminal's own scroll-up-goes-back
+        // convention and the usual volume-knob feel (push up = louder).
+        let delta = -steps * SCROLL_STEP_PCT;
+        match kind {
+            ModuleKind::VolOut => statusbar::modules::adjust_volume_out(delta),
+            ModuleKind::VolIn => statusbar::modules::adjust_volume_in(delta),
+            ModuleKind::Brightness => statusbar::modules::adjust_brightness(delta),
+            _ => {}
         }
         self.force_refresh_control(kind);
         true
@@ -542,23 +561,24 @@ fn main() {
                 .iter()
                 .find(|(_, x0, x1)| px >= *x0 && px < *x1)
             {
-                let steps: i32 = scrolls
-                    .iter()
-                    .map(|v| {
-                        let s = ((v.abs() + 7) / 15).max(1);
-                        if *v < 0 { -s.max(1) } else { s.max(1) }
-                    })
-                    .sum();
-                // Wheel up (negative) = increase; wheel down (positive) =
-                // decrease -- matches the terminal's own scroll-up-goes-back
-                // convention and the usual volume-knob feel (push up = louder).
-                let delta = -steps * SCROLL_STEP_PCT;
+                // Sum raw wheel pixels first, THEN convert to steps once --
+                // converting per-event with a `.max(1)` floor (the previous
+                // version) meant every individual micro-event out of a
+                // smooth/kinetic scroll gesture (touchpads and hi-res mouse
+                // wheels routinely fire many small ones per gesture) got
+                // rounded *up* to a full detent, so a single gentle scroll
+                // could register as a dozen-plus steps -- that's what made
+                // the volume jump around inconsistently. A detent is ~15
+                // wl_fixed-derived pixels; anything smaller now stays
+                // fractional in `queue_scroll`'s px accumulator and only
+                // turns into an actual step once enough of it has built up.
+                let raw_px: i32 = scrolls.iter().sum();
                 let kind = *kind;
                 if matches!(
                     kind,
                     ModuleKind::VolOut | ModuleKind::VolIn | ModuleKind::Brightness
                 ) {
-                    modules.queue_scroll(kind, delta);
+                    modules.queue_scroll(kind, raw_px);
                 }
             }
         }

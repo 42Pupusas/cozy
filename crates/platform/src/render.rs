@@ -309,6 +309,16 @@ pub struct Renderer {
     /// 1:1 delivery; owning the offset on the side that does the blit removes
     /// that whole class of bug.
     last_viewport_offset: Option<usize>,
+    /// Per-row scratch cache of `theme.effective(cell.attrs)` results, keyed
+    /// by column, reused across every `blit_row` call to avoid a Vec
+    /// allocation per row. `blit_row`'s background pass (pass 1) computes
+    /// each visible cell's `(fg, bg)` exactly once and stores it here; the
+    /// glyph pass (pass 2) reads it back instead of recomputing -- resolving
+    /// a cell's effective colors means a palette/indexed lookup plus, for
+    /// bold/dim, an extra branch and lerp, so doing it twice per cell (as
+    /// the pre-cache code did: once in each pass) was pure waste on the
+    /// `blit` hot path. Grows to fit the widest row seen; never shrinks.
+    row_color_cache: Vec<(DrawColor, DrawColor)>,
     /// Observability for the scrollback pixel-shift path: how many rows the
     /// last `blit_snapshot` actually rasterized (vs. moved by `copy_within`),
     /// and the signed shift it applied (`0` = full repaint / not a viewport
@@ -336,6 +346,7 @@ impl Renderer {
             output_scale: 1,
             bg_alpha: 255,
             last_viewport_offset: None,
+            row_color_cache: Vec::new(),
             #[cfg(feature = "trace")]
             last_rasterized_rows: 0,
             #[cfg(feature = "trace")]
@@ -422,6 +433,7 @@ impl Renderer {
                     output_scale,
                     bg_alpha: 255,
                     last_viewport_offset: None,
+                    row_color_cache: Vec::new(),
                     #[cfg(feature = "trace")]
                     last_rasterized_rows: 0,
                     #[cfg(feature = "trace")]
@@ -539,6 +551,27 @@ impl Renderer {
         }
 
         let (fg, bg) = self.theme.effective(&cell.attrs);
+        self.blit_cell_with_colors(canvas, cx, cy, cell, fill_bg, fg, bg);
+    }
+
+    /// Same as [`Self::blit_cell_inner`], but takes an already-resolved
+    /// `(fg, bg)` pair instead of calling `theme.effective` itself. Lets
+    /// [`Self::blit_row`]'s glyph pass reuse the colors its background pass
+    /// already computed per column, instead of resolving them twice per
+    /// visible cell (a palette/indexed lookup plus, for bold/dim, an extra
+    /// branch and lerp -- measurable on the `blit` bench's dense-cells
+    /// corpus, where every cell has a distinct color).
+    #[allow(clippy::too_many_arguments)]
+    fn blit_cell_with_colors(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        cx: u16,
+        cy: u16,
+        cell: &Cell,
+        fill_bg: bool,
+        fg: DrawColor,
+        bg: DrawColor,
+    ) {
         // Glyph ink is always fully opaque, regardless of window opacity —
         // matching Alacritty's default "translucent glass, solid text" look.
         // `premultiplied_argb8888(255)` degenerates to plain packed RGB (top
@@ -702,12 +735,18 @@ impl Renderer {
         let buf_width = canvas.width() as u32;
         let py0 = u32::from(cy) * cell_h;
 
+        if self.row_color_cache.len() < cells.len() {
+            self.row_color_cache
+                .resize(cells.len(), (self.theme.fg, self.theme.bg));
+        }
+
         // ── Pass 1: batched background ──────────────────────────────────────
         {
             let mut c = 0usize;
             while c < cells.len() {
-                let (_, bg) = self.theme.effective(&cells[c].attrs);
-                let base_bg = Self::pack_bg(bg, self.bg_alpha);
+                let colors = self.theme.effective(&cells[c].attrs);
+                self.row_color_cache[c] = colors;
+                let base_bg = Self::pack_bg(colors.1, self.bg_alpha);
                 let start = c;
                 c += 1;
                 // Extend the run while the background matches. A spacer column
@@ -717,10 +756,12 @@ impl Renderer {
                 // and the spacer filled nothing.
                 while c < cells.len() {
                     let next_bg = if cells[c].spacer {
+                        self.row_color_cache[c] = colors;
                         base_bg
                     } else {
-                        let (_, bg) = self.theme.effective(&cells[c].attrs);
-                        Self::pack_bg(bg, self.bg_alpha)
+                        let next_colors = self.theme.effective(&cells[c].attrs);
+                        self.row_color_cache[c] = next_colors;
+                        Self::pack_bg(next_colors.1, self.bg_alpha)
                     };
                     if next_bg != base_bg {
                         break;
@@ -760,7 +801,8 @@ impl Renderer {
             if cell.ch == ' ' && !cell.attrs.underline() && !cell.attrs.strikethrough() {
                 continue;
             }
-            self.blit_cell_inner(canvas, col as u16, cy, cell, false);
+            let (fg, bg) = self.row_color_cache[col];
+            self.blit_cell_with_colors(canvas, col as u16, cy, cell, false, fg, bg);
         }
     }
 

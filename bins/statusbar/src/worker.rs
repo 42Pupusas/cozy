@@ -15,7 +15,7 @@ const FAST_PERIOD: Duration = Duration::from_secs(2); // battery, temp, mem
 const SLOW_PERIOD: Duration = Duration::from_secs(5); // wifi, bluetooth, volume, brightness
 /// `cpu_usage` samples twice ~120ms apart, so give it its own slightly
 /// longer period rather than sharing `FAST_PERIOD`. Currently unused --
-/// see the comment where it would be called in `Modules::refresh`.
+/// see the comment where it would be called in `State::refresh`.
 #[allow(dead_code)]
 const CPU_PERIOD: Duration = Duration::from_millis(2000);
 
@@ -89,8 +89,9 @@ impl Snapshot {
 }
 
 /// Last real (`pactl`/sysfs) reading for a scroll-adjustable control,
-/// cached so a scroll detent can apply an *optimistic* delta and re-render
-/// instantly instead of waiting on the next throttled real read-back.
+/// cached so a scroll detent can paint an *optimistic* delta and re-render
+/// instantly instead of waiting on the next throttled real read-back --
+/// see `State::apply_optimistic`.
 #[derive(Clone, Copy, Default)]
 struct KnownPct {
     pct: u32,
@@ -215,7 +216,11 @@ impl State {
     /// (skipping `SLOW_PERIOD`'s cooldown), debounced to at most once per
     /// `CONTROL_REFRESH_DEBOUNCE_MS` so a burst of wheel-detent events
     /// doesn't run a `pactl get-*`/sysfs read on every single accumulator
-    /// drain. Returns whether the snapshot changed.
+    /// drain. Only needed as a periodic correction against whatever
+    /// `apply_optimistic` already painted (external volume changes, the
+    /// mixer clamping at 0/100, ...) -- see `apply_optimistic`'s doc for
+    /// why the *visible* number no longer waits on this. Returns whether
+    /// the snapshot changed.
     fn force_refresh_control(&mut self, kind: ModuleKind) -> bool {
         let now = Instant::now();
         if now.duration_since(self.last_control_refresh) < Duration::from_millis(CONTROL_REFRESH_DEBOUNCE_MS)
@@ -225,28 +230,47 @@ impl State {
         self.last_control_refresh = now;
         match kind {
             ModuleKind::VolOut => {
-                let v = statusbar::modules::volume_out().unwrap_or_else(|| DASH.into());
-                let changed = self.snap.vol_out != v;
-                self.snap.vol_out = v;
-                changed
+                if let Some((s, pct, muted)) = statusbar::modules::volume_out_raw() {
+                    let changed = self.snap.vol_out != s;
+                    self.snap.vol_out = s;
+                    self.vol_out_known = Some(KnownPct { pct, muted });
+                    changed
+                } else {
+                    false
+                }
             }
             ModuleKind::VolIn => {
-                let v = statusbar::modules::volume_in().unwrap_or_else(|| DASH.into());
-                let changed = self.snap.vol_in != v;
-                self.snap.vol_in = v;
-                changed
+                if let Some((s, pct, muted)) = statusbar::modules::volume_in_raw() {
+                    let changed = self.snap.vol_in != s;
+                    self.snap.vol_in = s;
+                    self.vol_in_known = Some(KnownPct { pct, muted });
+                    changed
+                } else {
+                    false
+                }
             }
             ModuleKind::Brightness => {
-                let v = statusbar::modules::brightness().unwrap_or_else(|| DASH.into());
-                let changed = self.snap.brightness != v;
-                self.snap.brightness = v;
-                changed
+                if let Some((s, pct)) = statusbar::modules::brightness_raw() {
+                    let changed = self.snap.brightness != s;
+                    self.snap.brightness = s;
+                    self.brightness_known = Some(KnownPct { pct, muted: false });
+                    changed
+                } else {
+                    false
+                }
             }
             _ => false,
         }
     }
 
-    fn queue_scroll(&mut self, kind: ModuleKind, raw_px: i32) {
+    /// Queue a raw scroll delta AND immediately paint an optimistic
+    /// percentage for it -- see `apply_optimistic`'s doc for why the two
+    /// are split: this only touches in-memory state (accumulator math +
+    /// string formatting, no I/O), so it can run on every scroll event with
+    /// zero debounce, while the actual mixer/backlight mutation stays
+    /// throttled in `apply_pending_scroll`. Returns whether the snapshot
+    /// changed.
+    fn queue_scroll(&mut self, kind: ModuleKind, raw_px: i32) -> bool {
         match &mut self.pending_scroll {
             Some((k, acc)) if *k == kind => acc.add(raw_px),
             _ => {
@@ -254,6 +278,73 @@ impl State {
                 acc.add(raw_px);
                 self.pending_scroll = Some((kind, acc));
             }
+        }
+        self.apply_optimistic(kind)
+    }
+
+    /// Paint the *display* percentage for `kind` immediately from whatever
+    /// whole detents are pending right now (without draining them --
+    /// `apply_pending_scroll` still owns draining, since it's the one that
+    /// actually fires the throttled `pactl`/sysfs mutation).
+    ///
+    /// This exists because before it, the number on screen only moved once
+    /// every `SCROLL_APPLY_DEBOUNCE_MS` *and* only after a real
+    /// `pactl`/sysfs round trip finished -- correct, but perceptibly behind
+    /// the wheel next to waybar (whose module UI isn't coupled to a
+    /// synchronous backend read on every scroll event either). We already
+    /// know the *current* value from the last real read (`*_known`); a
+    /// whole detent's percentage delta is always `+-SCROLL_STEP_PCT`
+    /// regardless of what pactl/sysfs eventually settles on, so painting
+    /// `known.pct + delta` the instant a detent completes -- without
+    /// waiting for the real mutation to even be spawned -- closes that gap.
+    /// `force_refresh_control`'s throttled real read-back still runs
+    /// afterwards and corrects any drift (clamping at 0/100, another
+    /// process changing the mixer concurrently, etc).
+    fn apply_optimistic(&mut self, kind: ModuleKind) -> bool {
+        let Some((_, acc)) = &self.pending_scroll else {
+            return false;
+        };
+        // Peek the step count this delta would produce without consuming it
+        // -- draining happens once, in `apply_pending_scroll`, so the real
+        // mutation still only fires per whole detent exactly as before.
+        let mut peek = *acc;
+        let steps = peek.take_steps();
+        if steps == 0 {
+            return false;
+        }
+        let delta = steps_to_delta_pct(steps, SCROLL_STEP_PCT);
+        match kind {
+            ModuleKind::VolOut => {
+                let Some(known) = self.vol_out_known else {
+                    return false;
+                };
+                let pct = (known.pct as i32 + delta).clamp(0, 100) as u32;
+                let s = statusbar::modules::format_volume(false, pct, known.muted);
+                let changed = self.snap.vol_out != s;
+                self.snap.vol_out = s;
+                changed
+            }
+            ModuleKind::VolIn => {
+                let Some(known) = self.vol_in_known else {
+                    return false;
+                };
+                let pct = (known.pct as i32 + delta).clamp(0, 100) as u32;
+                let s = statusbar::modules::format_volume(true, pct, known.muted);
+                let changed = self.snap.vol_in != s;
+                self.snap.vol_in = s;
+                changed
+            }
+            ModuleKind::Brightness => {
+                let Some(known) = self.brightness_known else {
+                    return false;
+                };
+                let pct = (known.pct as i32 + delta).clamp(0, 100) as u32;
+                let s = statusbar::modules::format_brightness(pct);
+                let changed = self.snap.brightness != s;
+                self.snap.brightness = s;
+                changed
+            }
+            _ => false,
         }
     }
 
@@ -302,7 +393,9 @@ pub fn run(snapshot_tx: &Sender<Snapshot>, scroll_rx: &Receiver<(ModuleKind, i32
         // waiting out an idle poll interval -- `recv_timeout` still
         // returns on its own after `wait_ms` so module timers keep firing
         // when nothing's scrolling. Drain every already-queued delta once
-        // one arrives, same coalescing behavior as before.
+        // one arrives (each one repaints the optimistic percentage as it
+        // goes -- see `queue_scroll`), same coalescing behavior as before
+        // for the real mutation.
         let wait_ms = if state.pending_scroll.is_some() {
             SCROLL_APPLY_DEBOUNCE_MS
         } else {
@@ -310,10 +403,10 @@ pub fn run(snapshot_tx: &Sender<Snapshot>, scroll_rx: &Receiver<(ModuleKind, i32
         };
         match scroll_rx.recv_timeout(Duration::from_millis(wait_ms)) {
             Ok((kind, raw_px)) => {
-                state.queue_scroll(kind, raw_px);
+                changed |= state.queue_scroll(kind, raw_px);
                 loop {
                     match scroll_rx.try_recv() {
-                        Ok((kind, raw_px)) => state.queue_scroll(kind, raw_px),
+                        Ok((kind, raw_px)) => changed |= state.queue_scroll(kind, raw_px),
                         Err(TryRecvError::Empty) => break,
                         Err(TryRecvError::Disconnected) => return,
                     }

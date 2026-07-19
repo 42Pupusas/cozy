@@ -87,6 +87,15 @@ pub struct CursorAnimator {
     blink_phase_ms: f32,
 
     visible: bool,
+
+    /// Whether this window currently holds keyboard focus. Unfocused windows
+    /// draw no cursor at all (and stop blinking) -- with two windows open
+    /// side by side, a cursor blinking in *both* makes it impossible to
+    /// tell which one is actually receiving keystrokes; only the focused
+    /// window's cursor should ever be visible. Defaults to `true` so a
+    /// freshly-created window (which hasn't seen an explicit focus event
+    /// yet, e.g. some compositors send `Enter` late) still shows a cursor.
+    focused: bool,
 }
 
 impl CursorAnimator {
@@ -120,6 +129,7 @@ impl CursorAnimator {
             pulse_elapsed_ms: PULSE_MS, // start "at rest", no pulse in flight
             blink_phase_ms: 0.0,
             visible: true,
+            focused: true,
         }
     }
 
@@ -171,6 +181,24 @@ impl CursorAnimator {
         self.blink_phase_ms = 0.0;
     }
 
+    /// Set whether this window currently holds keyboard focus. Losing focus
+    /// hides the cursor entirely (see [`Self::alpha`]) and stops the blink
+    /// from animating; regaining it snaps the blink phase back to full
+    /// opacity (via [`Self::on_activity`]) so the cursor reappears solid
+    /// instead of wherever the sine wave happened to leave off.
+    pub fn set_focused(&mut self, focused: bool) {
+        if focused && !self.focused {
+            self.on_activity();
+        }
+        self.focused = focused;
+    }
+
+    /// Whether this window currently holds keyboard focus.
+    #[must_use]
+    pub const fn is_focused(&self) -> bool {
+        self.focused
+    }
+
     /// Advance the animation by `dt_ms` of wall-clock time. Returns `true` if
     /// another frame should be scheduled soon (a slide is still in flight, or
     /// blink is enabled and the cursor is visible) — the caller uses this to
@@ -195,7 +223,7 @@ impl CursorAnimator {
                 animating = true;
             }
         }
-        if self.cfg.blink && self.visible {
+        if self.cfg.blink && self.visible && self.focused {
             self.blink_phase_ms += dt_ms;
             if self.cfg.period_ms > 0.0 {
                 self.blink_phase_ms %= self.cfg.period_ms;
@@ -224,7 +252,7 @@ impl CursorAnimator {
     /// always `1.0` when blink is disabled.
     #[must_use]
     pub fn alpha(&self) -> f32 {
-        if !self.visible {
+        if !self.visible || !self.focused {
             return 0.0;
         }
         if !self.cfg.blink || self.cfg.period_ms <= 0.0 {
@@ -252,7 +280,7 @@ impl CursorAnimator {
     pub fn is_animating(&self) -> bool {
         let sliding = self.slide_elapsed_ms < self.slide_ms;
         let pulsing = self.pulse_elapsed_ms < PULSE_MS;
-        let blinking = self.cfg.blink && self.visible;
+        let blinking = self.cfg.blink && self.visible && self.focused;
         sliding || pulsing || blinking
     }
 
@@ -512,6 +540,40 @@ mod tests {
         // ...but the long one should not have arrived yet.
         long.advance(SLIDE_MS);
         assert_ne!(long.visual_pos(), (35.0, 0.0));
+    }
+
+    #[test]
+    fn unfocused_window_hides_cursor_and_stops_blinking() {
+        let mut a = CursorAnimator::new(cfg(true));
+        a.set_target(0, 0, true);
+        a.set_focused(false);
+        assert_eq!(a.alpha(), 0.0, "unfocused cursor must be fully hidden");
+        assert!(
+            !a.advance(5000.0),
+            "unfocused blink must not keep the animator alive"
+        );
+        assert!(!a.is_animating());
+    }
+
+    #[test]
+    fn regaining_focus_snaps_back_to_full_opacity() {
+        let mut a = CursorAnimator::new(cfg(true));
+        a.set_target(0, 0, true);
+        a.advance(500.0); // dimmest point
+        a.set_focused(false);
+        // Let simulated time pass while unfocused -- must not affect phase.
+        a.set_focused(true);
+        let al = a.alpha();
+        assert!(
+            (al - 1.0).abs() < 1e-6,
+            "regaining focus must snap to full opacity, got {al}"
+        );
+    }
+
+    #[test]
+    fn focused_defaults_true_on_new() {
+        let a = CursorAnimator::new(cfg(true));
+        assert!(a.is_focused());
     }
 
     #[test]

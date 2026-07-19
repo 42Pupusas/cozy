@@ -33,7 +33,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -304,6 +304,11 @@ struct App<'cfg> {
     /// [`TermModes::pack`]: written on the parser thread after every grid
     /// batch, read on the UI thread before encoding each key/mouse event.
     term_modes: Arc<AtomicU32>,
+    /// PID of the forked shell child, `0` until the PTY thread finishes
+    /// spawning it. Lets the UI thread implement "open a new terminal here"
+    /// (Ctrl+Shift+Enter) by resolving `/proc/<pid>/cwd` directly -- no
+    /// window-manager IPC or external script needed.
+    shell_pid: Arc<AtomicI32>,
 }
 
 impl<'cfg> App<'cfg> {
@@ -313,6 +318,7 @@ impl<'cfg> App<'cfg> {
             quit: Arc::new(AtomicBool::new(false)),
             bracketed_paste: Arc::new(AtomicBool::new(false)),
             term_modes: Arc::new(AtomicU32::new(0)),
+            shell_pid: Arc::new(AtomicI32::new(0)),
         }
     }
 
@@ -351,6 +357,8 @@ impl<'cfg> App<'cfg> {
         // handle. See the struct doc for who reads vs. writes each.
         let quit_pty = Arc::clone(&self.quit);
         let quit_parser = Arc::clone(&self.quit);
+        let shell_pid_pty = Arc::clone(&self.shell_pid);
+        let shell_pid_ui = Arc::clone(&self.shell_pid);
         let bracketed_paste_parser = Arc::clone(&self.bracketed_paste);
         let bracketed_paste_ui = Arc::clone(&self.bracketed_paste);
         let term_modes_parser = Arc::clone(&self.term_modes);
@@ -378,6 +386,7 @@ impl<'cfg> App<'cfg> {
             input_rx,
             input_wake: pty_wake,
             quit: quit_pty,
+            shell_pid: shell_pid_pty,
         }
         .spawn();
 
@@ -444,6 +453,7 @@ impl<'cfg> App<'cfg> {
                 term_modes: &term_modes_ui,
                 ui_events_rx,
                 quit: &self.quit,
+                shell_pid: &shell_pid_ui,
             }
             .run()
         }));
@@ -482,6 +492,9 @@ struct PtyWorker {
     input_rx: mpsc::Consumer<InputMsg>,
     input_wake: waker::Waker,
     quit: Arc<AtomicBool>,
+    /// Written once, right after the shell is forked -- see the field doc
+    /// on `App::shell_pid`.
+    shell_pid: Arc<AtomicI32>,
 }
 
 impl PtyWorker {
@@ -500,6 +513,7 @@ impl PtyWorker {
             mut input_rx,
             input_wake,
             quit,
+            shell_pid,
         } = self;
         // Guarantees `quit` flips even if this thread panics below -- see
         // `QuitGuard`'s doc.
@@ -525,6 +539,7 @@ impl PtyWorker {
                 return;
             }
         };
+        shell_pid.store(pty.child_pid(), Ordering::Relaxed);
 
         // Adapter: our MPSC ring messages → PtyInput. Quit also raises the
         // shared flag so the parser/UI threads stop too.
@@ -861,6 +876,9 @@ struct UiWorker<'a> {
     term_modes: &'a AtomicU32,
     ui_events_rx: quetzalcoatl::spsc::Consumer<UiEvent>,
     quit: &'a AtomicBool,
+    /// See `App::shell_pid`. Read on Ctrl+Shift+Enter to resolve where to
+    /// open the new terminal window.
+    shell_pid: &'a AtomicI32,
 }
 
 impl UiWorker<'_> {
@@ -879,6 +897,7 @@ impl UiWorker<'_> {
             term_modes,
             mut ui_events_rx,
             quit,
+            shell_pid,
         } = self;
         let theme = platform::Theme::from_palette(&cfg.palette);
         let font = cfg.font.clone();
@@ -1076,6 +1095,10 @@ impl UiWorker<'_> {
                                 }
                                 Key::Char('v') => {
                                     win.request_paste();
+                                    continue;
+                                }
+                                Key::Enter => {
+                                    open_terminal_here(shell_pid.load(Ordering::Relaxed));
                                     continue;
                                 }
                                 _ => {}
@@ -1302,6 +1325,56 @@ fn apply_live_config(cfg: &Config, win: &mut TermWindow) {
         #[allow(clippy::cast_precision_loss)]
         period_ms: (cfg.cursor.blink_rate * 2) as f32,
     });
+}
+
+// ── Ctrl+Shift+Enter: open a new terminal in the same CWD ─────────────────────
+
+/// Walk down from `pid` to its deepest living child (the PTY's foreground
+/// job -- usually the shell itself, or whatever command is currently
+/// running in it), following `/proc/<pid>/task/<pid>/children`.
+fn deepest_child(pid: i32) -> i32 {
+    let mut cur = pid;
+    while let Ok(raw) = std::fs::read_to_string(format!("/proc/{cur}/task/{cur}/children")) {
+        let Some(last) = raw.split_ascii_whitespace().next_back() else {
+            break;
+        };
+        let Ok(next) = last.parse::<i32>() else {
+            break;
+        };
+        cur = next;
+    }
+    cur
+}
+
+/// Ctrl+Shift+Enter: spawn a new instance of this terminal, `cd`'d into
+/// wherever the current one's shell (or its foreground job) is sitting --
+/// matching the "open a new window in the same directory" convention most
+/// terminals bind to this chord. `shell_pid` is `0` if the PTY thread
+/// hasn't finished forking yet (a vanishingly small startup window); in
+/// that case this is a harmless no-op.
+///
+/// Implemented terminal-side rather than by a window-manager keybind
+/// because we already own the one piece of state this needs -- the PTY's
+/// child PID -- with no IPC or `/proc`-scraping-some-other-window's-app-id
+/// required.
+fn open_terminal_here(shell_pid: i32) {
+    if shell_pid <= 0 {
+        return;
+    }
+    let target_pid = deepest_child(shell_pid);
+    let cwd = std::fs::read_link(format!("/proc/{target_pid}/cwd")).ok();
+    let exe = std::env::current_exe().unwrap_or_else(|_| "mera-terminal".into());
+    let mut cmd = std::process::Command::new(exe);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    // Same zombie-avoidance as the OSC 8 Ctrl+click spawn: reap on a
+    // throwaway thread instead of leaking a `Child` or blocking the UI loop.
+    if let Ok(mut child) = cmd.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
 }
 
 #[cfg(test)]

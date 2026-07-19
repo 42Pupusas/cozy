@@ -1471,6 +1471,11 @@ impl TermWindow {
                         // Keyboard focus gained: arg(0) is the serial we must
                         // present to `set_selection` to prove we own focus.
                         self.focus_serial = ev.arg(0);
+                        // Gaining focus makes the cursor solid (not
+                        // mid-fade) immediately, then lets it resume
+                        // blinking -- see `set_focused`.
+                        self.cursor_anim.set_focused(true);
+                        self.dirty = true;
                         self.input_queue.push_back(InputEvent::Focus(true));
                     }
                     Some(KeyboardEvent::Key) => {
@@ -1526,6 +1531,12 @@ impl TermWindow {
                         if let Err(e) = self.repeat_timer.disarm() {
                             eprintln!("platform: failed to disarm key-repeat timer: {e}");
                         }
+                        // Losing focus freezes the cursor fully hidden so it
+                        // stops blinking -- the classic "which window is
+                        // focused" cue: only the focused window's cursor is
+                        // ever visible.
+                        self.cursor_anim.set_focused(false);
+                        self.dirty = true;
                         self.input_queue.push_back(InputEvent::Focus(false));
                     }
                     Some(KeyboardEvent::Modifiers) => {

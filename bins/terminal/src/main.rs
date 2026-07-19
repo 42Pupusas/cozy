@@ -323,6 +323,9 @@ impl<'cfg> App<'cfg> {
         let parser_ui_wake = ui_wake.clone();
         let parser_pty_wake = pty_wake.clone();
         let ui_pty_wake = pty_wake.clone();
+        // Kept for the always-run teardown after the UI loop returns (see
+        // below) -- `pty_wake` itself is moved into `PtyWorker` shortly.
+        let shutdown_pty_wake = pty_wake.clone();
 
         // ── Spawn PTY thread ────────────────────────────────────────────────────
         let shell = self.cfg.shell.clone();
@@ -362,7 +365,19 @@ impl<'cfg> App<'cfg> {
         .spawn();
 
         // ── UI thread (main thread) ─────────────────────────────────────────────
-        UiWorker {
+        // A shutdown handle kept *outside* the UiWorker: whatever happens to
+        // the UI loop (clean quit, or an early `Err` return e.g. the
+        // compositor tearing down the Wayland connection on Alt+F4 instead
+        // of sending a polite `xdg_toplevel.close`), this lets us always
+        // signal the PTY thread to hang up the shell and join every worker
+        // before the process exits. Without this, an error return from
+        // `UiWorker::run` used to skip straight past the `quit`/join tail
+        // below via `?`, leaking the forked shell as an orphan: `main`
+        // exiting kills this process's *threads*, but the shell is a
+        // separate forked *process*, so nothing ever reaped or SIGHUP'd it.
+        let shutdown_input_tx = input_tx.clone();
+
+        let ui_result = UiWorker {
             cfg: self.cfg,
             dirty_rx,
             input_tx,
@@ -375,11 +390,19 @@ impl<'cfg> App<'cfg> {
             ui_events: &ui_events_ui,
             quit: &self.quit,
         }
-        .run()?;
+        .run();
+
+        // Always tear down, regardless of whether the UI loop exited
+        // cleanly or with an error: set the shared quit flag, push a Quit
+        // message the PTY thread's `next_input` will observe, and wake it
+        // in case it's parked in `io_uring_enter`.
+        self.quit.store(true, Ordering::Relaxed);
+        let _ = shutdown_input_tx.push(InputMsg::Quit);
+        shutdown_pty_wake.signal();
 
         pty_handle.join().ok();
         parser_handle.join().ok();
-        Ok(())
+        ui_result
     }
 }
 

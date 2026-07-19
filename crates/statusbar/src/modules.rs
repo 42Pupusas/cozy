@@ -75,7 +75,7 @@ pub fn temperature() -> Option<String> {
         let path = entry.path().join("temp");
         if let Some(raw) = read_trim(path) {
             if let Ok(milli) = raw.parse::<i64>() {
-                return Some(format!("󰃈 {:>3.0}°C", milli as f64 / 1000.0));
+                return Some(format!("{:>3.0}°C", milli as f64 / 1000.0));
             }
         }
     }

@@ -105,6 +105,14 @@ pub struct BarWindow {
     /// event; positive = wheel down, negative = wheel up (same sign
     /// convention as `platform::TermWindow`'s scroll handling).
     pending_scroll: Vec<i32>,
+    /// Sub-pixel remainder accumulator, in raw wl_fixed 24.8 units: a
+    /// touchpad or hi-res mouse wheel routinely sends many axis events
+    /// whose magnitude is under one whole pixel, and `Fixed::to_pixels`
+    /// truncates -- converting per-event before accumulating silently
+    /// discarded those (a slow/gentle scroll could produce nothing but
+    /// zeros, forever). This carries the truncated fraction forward so it
+    /// isn't lost, added back in before the next event's own truncation.
+    scroll_fixed_remainder: i32,
 
     width: i32,
     frames: [Frame; 2],
@@ -285,6 +293,7 @@ impl BarWindow {
             pointer: None,
             pointer_pos: Point::new(0, 0),
             pending_scroll: Vec::new(),
+            scroll_fixed_remainder: 0,
             width: INITIAL_WIDTH,
             frames,
             shm_mem,
@@ -444,9 +453,29 @@ impl BarWindow {
                         // value is wl_fixed (24.8) -- positive = wheel down,
                         // negative = wheel up, same convention as
                         // `platform::TermWindow`'s scroll handling.
+                        //
+                        // Touchpad/hi-res-wheel scrolling sends many small
+                        // axis events, routinely under one whole pixel each
+                        // (wl_fixed's 8 fractional bits mean e.g. 0.3px is a
+                        // real, distinct value on the wire). Converting each
+                        // event to pixels independently via `to_pixels()`
+                        // (plain truncating integer division) rounded every
+                        // such sub-pixel event down to exactly 0 and threw
+                        // it away -- a slow, gentle scroll gesture could
+                        // legitimately produce nothing but zeros forever,
+                        // which is why brightness/volume scrolling felt
+                        // broken or wildly inconsistent depending on scroll
+                        // speed. Instead accumulate in raw fixed-point units
+                        // and only truncate to pixels once enough has built
+                        // up, carrying the leftover fraction forward.
                         let axis = ev.arg(1);
                         if axis == 0 {
-                            self.pending_scroll.push(ev.fixed(2).to_pixels());
+                            let raw = self.scroll_fixed_remainder + ev.fixed(2).0;
+                            let px = raw / 256;
+                            self.scroll_fixed_remainder = raw - px * 256;
+                            if px != 0 {
+                                self.pending_scroll.push(px);
+                            }
                         }
                     }
                     _ => {}

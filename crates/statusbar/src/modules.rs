@@ -98,7 +98,7 @@ pub fn cpu_usage() -> Option<String> {
     }
     #[allow(clippy::cast_precision_loss)]
     let pct = 100.0 * (1.0 - idle_delta as f64 / total_delta as f64);
-    Some(format!(" {pct:>3.0}%"))
+    Some(format!("{pct:>3.0}% "))
 }
 
 struct CpuTimes {
@@ -136,7 +136,7 @@ pub fn memory() -> Option<String> {
     let (total, avail) = (total_kb?, avail_kb?);
     let used_gib = (total - avail) as f64 / 1024.0 / 1024.0;
     let total_gib = total as f64 / 1024.0 / 1024.0;
-    Some(format!("󰅛 {used_gib:>4.1}/{total_gib:>4.1}GiB"))
+    Some(format!("{used_gib:>4.1}/{total_gib:>4.1}GiB 󰅛"))
 }
 
 fn parse_kb(s: &str) -> Option<u64> {
@@ -174,7 +174,7 @@ pub fn wifi() -> Option<String> {
         .find_map(|l| l.trim().strip_prefix("SSID: "))
         .unwrap_or("?")
         .to_string();
-    Some(format!("󰤨 {ssid}"))
+    Some(format!("{ssid} 󰤨"))
 }
 
 /// Whether Bluetooth is powered and how many devices are connected, via
@@ -199,7 +199,7 @@ pub fn bluetooth() -> Option<String> {
     if n == 0 {
         Some("󰂯".into())
     } else {
-        Some(format!("󰂱 {n}"))
+        Some(format!("{n} 󰂱"))
     }
 }
 
@@ -270,7 +270,7 @@ fn amixer_volume(control: &str) -> Option<String> {
 
 fn format_volume(is_source: bool, pct: u32, muted: bool) -> String {
     let icon = pick_volume_icon(is_source, pct, muted);
-    format!("{icon} {pct:>3}%")
+    format!("{pct:>3}% {icon}")
 }
 
 fn pick_volume_icon(is_source: bool, pct: u32, muted: bool) -> &'static str {
@@ -309,7 +309,7 @@ pub fn brightness() -> Option<String> {
             continue;
         }
         let pct = (cur / max * 100.0).round() as u32;
-        return Some(format!("󰃠 {pct:>3}%"));
+        return Some(format!("{pct:>3}% 󰃠"));
     }
     None
 }

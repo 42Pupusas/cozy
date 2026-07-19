@@ -118,7 +118,7 @@ fn module_color(kind: ModuleKind, text: &str) -> Color {
             }
         }
         ModuleKind::Battery => {
-            if text.starts_with('\u{f0084}') || text.starts_with('\u{f06a5}') {
+            if text.ends_with('\u{f0084}') || text.ends_with('\u{f06a5}') {
                 GREEN // waybar's #battery.charging/.plugged
             } else if let Some(pct) = trailing_percent(text) {
                 if pct < 15 {
@@ -136,14 +136,14 @@ fn module_color(kind: ModuleKind, text: &str) -> Color {
         ModuleKind::Cpu => GREEN,
         ModuleKind::Mem => BLUE,
         ModuleKind::VolOut => {
-            if text.starts_with('\u{f075f}') {
+            if text.ends_with('\u{f075f}') {
                 FG_DARK // waybar's #pulseaudio.muted
             } else {
                 TEAL
             }
         }
         ModuleKind::VolIn => {
-            if text.starts_with('\u{f036d}') {
+            if text.ends_with('\u{f036d}') {
                 FG_DARK
             } else {
                 ORANGE // waybar's #pulseaudio.microphone

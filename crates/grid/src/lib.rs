@@ -43,9 +43,9 @@ mod screen;
 mod selection;
 
 pub use cell::{Attrs, Cell, Color, UnderlineStyle};
-pub use palette::{XTERM_256, parse_color_spec};
 pub use cursor::{Cursor, CursorShape};
 pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand, SnapshotKind};
+pub use palette::{XTERM_256, parse_color_spec};
 pub use screen::Screen;
 pub use selection::{Point as SelPoint, Selection};
 

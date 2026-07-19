@@ -23,7 +23,10 @@ pub fn settings_page(kind: ModuleKind) -> Option<&'static str> {
         ModuleKind::Battery => Some("power"),
         ModuleKind::Brightness => Some("displays"),
         ModuleKind::VolOut | ModuleKind::VolIn => Some("sound"),
-        ModuleKind::Clock | ModuleKind::Date | ModuleKind::Temp | ModuleKind::Cpu
+        ModuleKind::Clock
+        | ModuleKind::Date
+        | ModuleKind::Temp
+        | ModuleKind::Cpu
         | ModuleKind::Mem => None,
     }
 }

@@ -143,7 +143,11 @@ impl SelectionTracker {
         };
         self.range = Some(((ac, ar + d), (bc, br + d)));
         if d != 0 && !self.history.is_empty() {
-            self.history = self.history.drain().map(|(row, cells)| (row + d, cells)).collect();
+            self.history = self
+                .history
+                .drain()
+                .map(|(row, cells)| (row + d, cells))
+                .collect();
         }
     }
 

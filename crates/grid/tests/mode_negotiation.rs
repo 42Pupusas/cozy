@@ -389,7 +389,11 @@ fn osc10_defaults_are_sane_without_set_default_colors() {
 #[test]
 fn osc4_set_single_index_overrides_palette_color() {
     let mut g = Grid::new(20, 3);
-    assert_eq!(g.palette_color(1), (128, 0, 0), "index 1 starts as default red");
+    assert_eq!(
+        g.palette_color(1),
+        (128, 0, 0),
+        "index 1 starts as default red"
+    );
     feed(&mut g, b"\x1b]4;1;#ff0000\x07");
     assert_eq!(g.palette_color(1), (0xff, 0, 0));
 }

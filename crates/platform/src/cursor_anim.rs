@@ -543,6 +543,9 @@ mod tests {
     }
 
     #[test]
+    // `alpha()` returns a hard `0.0` sentinel when hidden (not a computed
+    // value that could carry float error), so an exact compare is correct.
+    #[allow(clippy::float_cmp)]
     fn unfocused_window_hides_cursor_and_stops_blinking() {
         let mut a = CursorAnimator::new(cfg(true));
         a.set_target(0, 0, true);

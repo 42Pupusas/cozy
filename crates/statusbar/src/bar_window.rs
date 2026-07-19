@@ -25,10 +25,10 @@ use platform::id::{
     RegistryId, SeatId, ShmId, SurfaceId,
 };
 use platform::protocol::{
-    self as proto, Anchor, ButtonState, BufferRequest,
-    CompositorRequest, DisplayEvent, DisplayRequest, Format, KeyboardInteractivity, Layer,
-    LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest, PointerButton, PointerEvent,
-    RegistryEvent, SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest, SurfaceRequest,
+    self as proto, Anchor, BufferRequest, ButtonState, CompositorRequest, DisplayEvent,
+    DisplayRequest, Format, KeyboardInteractivity, Layer, LayerShellRequest, LayerSurfaceEvent,
+    LayerSurfaceRequest, PointerButton, PointerEvent, RegistryEvent, SeatCapability, SeatEvent,
+    SeatRequest, ShmPoolRequest, SurfaceRequest,
 };
 use platform::sys::ShmBuffer;
 use platform::wire::{MessageBuilder, WireEvent};

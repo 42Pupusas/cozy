@@ -270,5 +270,3 @@ impl FaceRenderer {
         entry
     }
 }
-
-

@@ -158,7 +158,10 @@ mod tests {
     #[test]
     fn clock_and_date_are_purple() {
         assert_eq!(module_color(ModuleKind::Clock, "12:00:00"), palette::PURPLE);
-        assert_eq!(module_color(ModuleKind::Date, "2024-01-01"), palette::PURPLE);
+        assert_eq!(
+            module_color(ModuleKind::Date, "2024-01-01"),
+            palette::PURPLE
+        );
     }
 
     #[test]
@@ -193,25 +196,40 @@ mod tests {
 
     #[test]
     fn battery_critical_is_red() {
-        assert_eq!(module_color(ModuleKind::Battery, " 10% \u{f007a}"), palette::RED);
+        assert_eq!(
+            module_color(ModuleKind::Battery, " 10% \u{f007a}"),
+            palette::RED
+        );
     }
 
     #[test]
     fn battery_warning_is_yellow() {
-        assert_eq!(module_color(ModuleKind::Battery, " 20% \u{f007a}"), palette::YELLOW);
+        assert_eq!(
+            module_color(ModuleKind::Battery, " 20% \u{f007a}"),
+            palette::YELLOW
+        );
     }
 
     #[test]
     fn battery_healthy_is_green() {
-        assert_eq!(module_color(ModuleKind::Battery, " 80% \u{f0079}"), palette::GREEN);
+        assert_eq!(
+            module_color(ModuleKind::Battery, " 80% \u{f0079}"),
+            palette::GREEN
+        );
     }
 
     #[test]
     fn battery_threshold_boundaries_are_exclusive_upper() {
         // pct < 15 -> red; pct == 15 -> not red (yellow band).
-        assert_eq!(module_color(ModuleKind::Battery, " 15% \u{f007a}"), palette::YELLOW);
+        assert_eq!(
+            module_color(ModuleKind::Battery, " 15% \u{f007a}"),
+            palette::YELLOW
+        );
         // pct < 30 -> yellow; pct == 30 -> green.
-        assert_eq!(module_color(ModuleKind::Battery, " 30% \u{f007a}"), palette::GREEN);
+        assert_eq!(
+            module_color(ModuleKind::Battery, " 30% \u{f007a}"),
+            palette::GREEN
+        );
     }
 
     #[test]
@@ -243,6 +261,9 @@ mod tests {
         assert_eq!(module_color(ModuleKind::Temp, " 50°C"), palette::ORANGE);
         assert_eq!(module_color(ModuleKind::Cpu, " 50%"), palette::GREEN);
         assert_eq!(module_color(ModuleKind::Mem, "1.0/2.0GiB"), palette::BLUE);
-        assert_eq!(module_color(ModuleKind::Brightness, " 50%"), palette::YELLOW);
+        assert_eq!(
+            module_color(ModuleKind::Brightness, " 50%"),
+            palette::YELLOW
+        );
     }
 }

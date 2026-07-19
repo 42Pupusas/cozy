@@ -276,7 +276,11 @@ fn adjust_volume(pactl_target: &str, amixer_control: &str, delta_pct: i32) {
         .spawn();
     if spawned.is_err() {
         let _ = Command::new("amixer")
-            .args(["set", amixer_control, &format!("{}%{sign}", delta_pct.abs())])
+            .args([
+                "set",
+                amixer_control,
+                &format!("{}%{sign}", delta_pct.abs()),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -437,7 +441,11 @@ pub fn adjust_brightness(delta_pct: i32) {
             continue;
         }
         let magnitude = (max * i64::from(delta_pct.abs()) / 100).max(1);
-        let step = if delta_pct >= 0 { magnitude } else { -magnitude };
+        let step = if delta_pct >= 0 {
+            magnitude
+        } else {
+            -magnitude
+        };
         let new_val = (cur + step).clamp(0, max);
         let _ = fs::write(path.join("brightness"), new_val.to_string());
         return;

@@ -236,7 +236,8 @@ impl State {
     #[allow(dead_code)]
     fn force_refresh_control(&mut self, kind: ModuleKind) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.last_control_refresh) < Duration::from_millis(CONTROL_REFRESH_DEBOUNCE_MS)
+        if now.duration_since(self.last_control_refresh)
+            < Duration::from_millis(CONTROL_REFRESH_DEBOUNCE_MS)
         {
             return false;
         }
@@ -410,7 +411,9 @@ impl State {
             return false;
         };
         let now = Instant::now();
-        if now.duration_since(self.last_scroll_apply) < Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS) {
+        if now.duration_since(self.last_scroll_apply)
+            < Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS)
+        {
             return false;
         }
         self.last_scroll_apply = now;

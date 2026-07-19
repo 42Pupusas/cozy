@@ -20,9 +20,7 @@ use crate::conn::{Conn, ConnError, Sender, WindowSender};
 use crate::draw::Color as DrawColor;
 use crate::error::{Error, Result};
 use crate::event::RawEvent;
-use crate::id::{
-    BufferId, CallbackId, DisplayId, ObjectId, OutputId, PoolId, RegistryId, ShmId,
-};
+use crate::id::{BufferId, CallbackId, DisplayId, ObjectId, OutputId, PoolId, RegistryId, ShmId};
 use crate::protocol::{
     BufferEvent, CallbackEvent, DisplayEvent, DisplayRequest, Format, OutputEvent, RegistryRequest,
     ShmPoolRequest, ShmRequest,

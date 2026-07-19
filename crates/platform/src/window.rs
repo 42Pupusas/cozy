@@ -30,13 +30,12 @@ use crate::id::{
 use crate::keymap;
 use crate::protocol::Modifiers;
 use crate::protocol::{
-    self as proto, BufferRequest, ButtonState, CompositorRequest,
-    DataDeviceEvent, DataDeviceManagerRequest, DataDeviceRequest, DataOfferEvent, DataOfferRequest,
-    DataSourceEvent, DataSourceRequest, DisplayEvent, DisplayRequest, Format, Key, KeyState,
-    KeyboardEvent, PointerButton, PointerEvent, PointerRequest, RegistryEvent,
-    SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest,
-    SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent, WmBaseRequest, XdgSurfaceEvent,
-    XdgSurfaceRequest,
+    self as proto, BufferRequest, ButtonState, CompositorRequest, DataDeviceEvent,
+    DataDeviceManagerRequest, DataDeviceRequest, DataOfferEvent, DataOfferRequest, DataSourceEvent,
+    DataSourceRequest, DisplayEvent, DisplayRequest, Format, Key, KeyState, KeyboardEvent,
+    PointerButton, PointerEvent, PointerRequest, RegistryEvent, SeatCapability, SeatEvent,
+    SeatRequest, ShmPoolRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent,
+    WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
 };
 use crate::render;
 use crate::sys::{RepeatTimer, ShmBuffer};

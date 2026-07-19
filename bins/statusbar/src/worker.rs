@@ -88,6 +88,15 @@ impl Snapshot {
     }
 }
 
+/// Last real (`pactl`/sysfs) reading for a scroll-adjustable control,
+/// cached so a scroll detent can apply an *optimistic* delta and re-render
+/// instantly instead of waiting on the next throttled real read-back.
+#[derive(Clone, Copy, Default)]
+struct KnownPct {
+    pct: u32,
+    muted: bool,
+}
+
 struct State {
     snap: Snapshot,
     last_clock: Instant,
@@ -98,6 +107,9 @@ struct State {
     last_control_refresh: Instant,
     pending_scroll: Option<(ModuleKind, ScrollAccumulator)>,
     last_scroll_apply: Instant,
+    vol_out_known: Option<KnownPct>,
+    vol_in_known: Option<KnownPct>,
+    brightness_known: Option<KnownPct>,
 }
 
 impl State {
@@ -116,6 +128,9 @@ impl State {
             last_control_refresh: stale,
             pending_scroll: None,
             last_scroll_apply: stale,
+            vol_out_known: None,
+            vol_in_known: None,
+            brightness_known: None,
         }
     }
 
@@ -164,15 +179,33 @@ impl State {
             let bt = statusbar::modules::bluetooth().unwrap_or_else(|| DASH.into());
             changed |= self.snap.bluetooth != bt;
             self.snap.bluetooth = bt;
-            let vo = statusbar::modules::volume_out().unwrap_or_else(|| DASH.into());
-            changed |= self.snap.vol_out != vo;
-            self.snap.vol_out = vo;
-            let vi = statusbar::modules::volume_in().unwrap_or_else(|| DASH.into());
-            changed |= self.snap.vol_in != vi;
-            self.snap.vol_in = vi;
-            let br = statusbar::modules::brightness().unwrap_or_else(|| DASH.into());
-            changed |= self.snap.brightness != br;
-            self.snap.brightness = br;
+            if let Some((s, pct, muted)) = statusbar::modules::volume_out_raw() {
+                changed |= self.snap.vol_out != s;
+                self.snap.vol_out = s;
+                self.vol_out_known = Some(KnownPct { pct, muted });
+            } else {
+                changed |= self.snap.vol_out != DASH;
+                self.snap.vol_out = DASH.into();
+                self.vol_out_known = None;
+            }
+            if let Some((s, pct, muted)) = statusbar::modules::volume_in_raw() {
+                changed |= self.snap.vol_in != s;
+                self.snap.vol_in = s;
+                self.vol_in_known = Some(KnownPct { pct, muted });
+            } else {
+                changed |= self.snap.vol_in != DASH;
+                self.snap.vol_in = DASH.into();
+                self.vol_in_known = None;
+            }
+            if let Some((s, pct)) = statusbar::modules::brightness_raw() {
+                changed |= self.snap.brightness != s;
+                self.snap.brightness = s;
+                self.brightness_known = Some(KnownPct { pct, muted: false });
+            } else {
+                changed |= self.snap.brightness != DASH;
+                self.snap.brightness = DASH.into();
+                self.brightness_known = None;
+            }
         }
 
         changed

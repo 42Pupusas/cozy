@@ -23,56 +23,11 @@ pub use crate::font::FONT;
 
 // ── xterm 256-color palette ──────────────────────────────────────────────────
 
-/// xterm 256-color palette: indices 0–255 → (r, g, b).
-/// We generate the classic xterm table at compile time.
-static PALETTE: [(u8, u8, u8); 256] = {
-    let mut t = [(0u8, 0u8, 0u8); 256];
-    // 0–7: standard colors
-    t[0] = (0, 0, 0);
-    t[1] = (128, 0, 0);
-    t[2] = (0, 128, 0);
-    t[3] = (128, 128, 0);
-    t[4] = (0, 0, 128);
-    t[5] = (128, 0, 128);
-    t[6] = (0, 128, 128);
-    t[7] = (192, 192, 192);
-    // 8–15: bright colors
-    t[8] = (128, 128, 128);
-    t[9] = (255, 0, 0);
-    t[10] = (0, 255, 0);
-    t[11] = (255, 255, 0);
-    t[12] = (0, 0, 255);
-    t[13] = (255, 0, 255);
-    t[14] = (0, 255, 255);
-    t[15] = (255, 255, 255);
-    // 16–231: 6×6×6 color cube
-    let mut i = 16usize;
-    let mut r = 0u8;
-    while r < 6 {
-        let mut g = 0u8;
-        while g < 6 {
-            let mut b = 0u8;
-            while b < 6 {
-                let rv = if r == 0 { 0 } else { r * 40 + 55 };
-                let gv = if g == 0 { 0 } else { g * 40 + 55 };
-                let bv = if b == 0 { 0 } else { b * 40 + 55 };
-                t[i] = (rv, gv, bv);
-                i += 1;
-                b += 1;
-            }
-            g += 1;
-        }
-        r += 1;
-    }
-    // 232–255: grayscale ramp
-    let mut j = 0u8;
-    while j < 24 {
-        let v = j * 10 + 8;
-        t[232 + j as usize] = (v, v, v);
-        j += 1;
-    }
-    t
-};
+/// xterm 256-color palette: indices 0–255 → (r, g, b). Re-exported from
+/// `grid` (the single source of truth -- see `grid::palette` for why this
+/// used to be a second copy living here alone, before OSC 4 needed the grid
+/// thread to know the same table too).
+use grid::XTERM_256 as PALETTE;
 
 /// Built-in default fg/bg (used when no config theme is supplied).
 const DEFAULT_FG: DrawColor = DrawColor::rgb(0xcc, 0xcc, 0xcc);
@@ -87,6 +42,17 @@ pub struct Theme {
     ansi: [(u8, u8, u8); 16],
     fg: DrawColor,
     bg: DrawColor,
+    /// OSC 4 live palette overrides for indices 16–255 (the cube/grayscale
+    /// range not covered by `ansi`). `None` means "still the static
+    /// `PALETTE` default". Boxed for the same reason `grid::Grid` boxes its
+    /// copy of this: 256 `Option<(u8,u8,u8)>` slots is ~1KB, too big to want
+    /// inline in a struct that's cloned on every config live-reload.
+    /// Indices 0–15 route through `ansi` instead (already independently
+    /// overridable via config, and merging the two would mean every
+    /// `resolve()` call -- the actual per-cell hot path -- pays for an extra
+    /// branch that's dead 100% of the time outside of an active OSC 4
+    /// session).
+    cube_overrides: Box<[Option<(u8, u8, u8)>; 256]>,
 }
 
 impl Theme {
@@ -103,6 +69,7 @@ impl Theme {
             ansi,
             fg: DEFAULT_FG,
             bg: DEFAULT_BG,
+            cube_overrides: Box::new([None; 256]),
         }
     }
 
@@ -118,6 +85,21 @@ impl Theme {
             ansi,
             fg: DrawColor::rgb(p.foreground.r, p.foreground.g, p.foreground.b),
             bg: DrawColor::rgb(p.background.r, p.background.g, p.background.b),
+            cube_overrides: Box::new([None; 256]),
+        }
+    }
+
+    /// Live-patch palette index `n` (an OSC 4 write) without rebuilding the
+    /// whole theme. `n < 16` updates `ansi` (config-overridable ANSI
+    /// colors); `n >= 16` updates `cube_overrides`. The caller (the UI
+    /// thread, draining `Grid::take_palette_changes`) is responsible for
+    /// forcing a repaint afterwards -- this only changes what a *future*
+    /// `resolve()` call returns, it doesn't touch anything already painted.
+    pub fn set_palette_color(&mut self, n: u8, rgb: (u8, u8, u8)) {
+        if n < 16 {
+            self.ansi[n as usize] = rgb;
+        } else {
+            self.cube_overrides[n as usize] = Some(rgb);
         }
     }
 
@@ -135,7 +117,7 @@ impl Theme {
                 DrawColor::rgb(r, g, b)
             }
             Color::Indexed(n) => {
-                let (r, g, b) = PALETTE[n as usize];
+                let (r, g, b) = self.cube_overrides[n as usize].unwrap_or(PALETTE[n as usize]);
                 DrawColor::rgb(r, g, b)
             }
             Color::Rgb(r, g, b) => DrawColor::rgb(r, g, b),
@@ -370,6 +352,14 @@ impl Renderer {
     #[must_use]
     pub const fn needs_alpha(&self) -> bool {
         self.bg_alpha < 255
+    }
+
+    /// Live-patch one palette index (an OSC 4 write from the grid thread)
+    /// without rebuilding the renderer. The caller still owes a full repaint
+    /// after this -- see [`crate::window::TermWindow::apply_palette_change`],
+    /// which is the only real caller and does exactly that.
+    pub fn set_palette_color(&mut self, n: u8, rgb: (u8, u8, u8)) {
+        self.theme.set_palette_color(n, rgb);
     }
 
     /// Build a renderer from config: tries to load `font_cfg.path` at

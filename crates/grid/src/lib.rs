@@ -38,10 +38,12 @@ mod base64;
 mod cell;
 mod cursor;
 mod dirty;
+mod palette;
 mod screen;
 mod selection;
 
 pub use cell::{Attrs, Cell, Color, UnderlineStyle};
+pub use palette::{XTERM_256, parse_color_spec};
 pub use cursor::{Cursor, CursorShape};
 pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand, SnapshotKind};
 pub use screen::Screen;
@@ -284,6 +286,21 @@ pub struct Grid {
     /// unconfigured embedding, ...).
     default_fg: Color,
     default_bg: Color,
+    /// OSC 4 palette overrides: `Some((r,g,b))` at index `n` means index `n`
+    /// was remapped away from the built-in [`XTERM_256`] entry; `None` means
+    /// still default. Boxed to a fixed 256-slot array (1KB) rather than a
+    /// sparse map -- OSC 4 addresses the full `u8` index space and a plain
+    /// array read/write is cheaper than a hashmap lookup for the vanishingly
+    /// rare case this is even touched (colorscheme-switcher scripts, a
+    /// handful of calls once at shell startup, never in the render hot path).
+    palette_overrides: Box<[Option<(u8, u8, u8)>; 256]>,
+    /// Indices of `palette_overrides` [`Grid::take_palette_changes`] hasn't
+    /// yet reported to the UI thread, in the order they were written. Same
+    /// one-shot-drain contract as `pending_clipboard`/`take_new_links`: OSC 4
+    /// changes must repaint the whole screen (any cell using that index looks
+    /// different now), so the UI thread needs to *see* every change, not just
+    /// the latest value.
+    pending_palette_changes: Vec<u8>,
 }
 
 /// A designated character set slot (G0/G1). Only the two xterm/VT100
@@ -462,6 +479,8 @@ impl Grid {
             pending_clipboard: None,
             default_fg: Color::Rgb(0xcc, 0xcc, 0xcc),
             default_bg: Color::Rgb(0x1e, 0x1e, 0x2e),
+            palette_overrides: Box::new([None; 256]),
+            pending_palette_changes: Vec::new(),
         }
     }
 
@@ -1542,6 +1561,92 @@ impl Grid {
         self.pending_clipboard.take()
     }
 
+    /// The effective color (override if OSC 4 set one, else the built-in
+    /// `XTERM_256` default) for palette index `n`. What an OSC 4 query
+    /// replies with, and what a driver should paint index `n` as -- so the
+    /// renderer and the query-reply path can never disagree with each other.
+    #[must_use]
+    pub fn palette_color(&self, n: u8) -> (u8, u8, u8) {
+        self.palette_overrides[n as usize].unwrap_or(XTERM_256[n as usize])
+    }
+
+    /// Palette indices `osc()` has changed (via OSC 4 or OSC 104) since the
+    /// last call, draining the queue. The UI thread mirrors these into its
+    /// renderer's theme and forces a full repaint -- any cell using one of
+    /// these indices now paints differently.
+    pub fn take_palette_changes(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.pending_palette_changes)
+    }
+
+    fn set_palette_override(&mut self, n: u8, rgb: (u8, u8, u8)) {
+        self.palette_overrides[n as usize] = Some(rgb);
+        self.pending_palette_changes.push(n);
+    }
+
+    fn reset_palette_override(&mut self, n: u8) {
+        if self.palette_overrides[n as usize].take().is_some() {
+            self.pending_palette_changes.push(n);
+        }
+    }
+
+    fn reset_all_palette_overrides(&mut self) {
+        for n in 0..256u16 {
+            self.reset_palette_override(n as u8);
+        }
+    }
+
+    /// OSC 4 handler: `ESC ] 4 ; index ; spec [ ; index ; spec ... ] ST`.
+    /// Each pair is either a query (a bare `?` spec, replies with the
+    /// current color in the same `rgb:rrrr/gggg/bbbb` form OSC 10/11 use) or
+    /// a set (any parseable color spec). A malformed pair (odd count,
+    /// unparseable spec, out-of-range index text) is skipped -- matches how
+    /// a set request for something else unsupported is handled elsewhere in
+    /// this parser: best-effort, never an error reply.
+    fn osc_set_color(&mut self, pairs: &str) {
+        use std::io::Write as _;
+        let mut parts = pairs.split(';');
+        while let Some(idx_s) = parts.next() {
+            let Some(spec) = parts.next() else { break };
+            let Ok(idx) = idx_s.parse::<u16>() else {
+                continue;
+            };
+            if idx > 255 {
+                continue;
+            }
+            let idx = idx as u8;
+            if spec == "?" {
+                let (r, g, b) = self.palette_color(idx);
+                let _ = write!(
+                    self.replies,
+                    "\x1b]4;{idx};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+                    u16::from(r) * 0x101,
+                    u16::from(g) * 0x101,
+                    u16::from(b) * 0x101,
+                );
+            } else if let Some(rgb) = parse_color_spec(spec) {
+                self.set_palette_override(idx, rgb);
+            }
+        }
+    }
+
+    /// OSC 104 handler: `ESC ] 104 [ ; index [ ; index ... ] ] ST`. An empty
+    /// Pt resets every overridden index; otherwise each `;`-separated index
+    /// is reset individually (non-numeric/out-of-range entries are skipped,
+    /// same best-effort policy as `osc_set_color`).
+    fn osc_reset_color(&mut self, ps: &str) {
+        if ps.is_empty() {
+            self.reset_all_palette_overrides();
+            return;
+        }
+        for idx_s in ps.split(';') {
+            if let Ok(idx) = idx_s.parse::<u16>()
+                && idx <= 255
+            {
+                self.reset_palette_override(idx as u8);
+            }
+        }
+    }
+
     fn osc(&mut self, cmd: &OscCmd) {
         match cmd {
             OscCmd::SetTitle(title) => {
@@ -1551,6 +1656,8 @@ impl Grid {
             OscCmd::Clipboard { selection, data } => self.set_clipboard(selection, data),
             OscCmd::ForegroundColor(query) => self.reply_default_color(10, query, self.default_fg),
             OscCmd::BackgroundColor(query) => self.reply_default_color(11, query, self.default_bg),
+            OscCmd::SetColor { pairs } => self.osc_set_color(pairs),
+            OscCmd::ResetColor { ps } => self.osc_reset_color(ps),
             _ => {}
         }
     }
@@ -1784,6 +1891,7 @@ impl Grid {
                 self.active_link_id = 0;
                 self.published_links = 0;
                 self.last_printed = None;
+                self.reset_all_palette_overrides();
             }
             // SCS — designate G0 charset (`ESC ( X`). `0` = DEC Special
             // Graphics (line-drawing); anything else (`B` = US-ASCII, `A` =

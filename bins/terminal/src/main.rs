@@ -240,6 +240,10 @@ enum UiEvent {
     /// A decoded OSC 52 clipboard write (`ESC ] 52 ; c ; <base64> BEL`) --
     /// the application asked to put this text on the system clipboard.
     Clipboard(String),
+    /// An OSC 4/104 palette change: `(index, rgb)`. Applied to the live
+    /// renderer's theme and forces a full repaint -- any on-screen cell
+    /// using this index now paints a different color.
+    PaletteColor(u8, (u8, u8, u8)),
 }
 
 /// Stores `true` into a shared quit flag when dropped -- including when the
@@ -829,6 +833,9 @@ impl ParserSession {
             if let Some(text) = self.grid.take_clipboard() {
                 self.push_ui_event(UiEvent::Clipboard(text));
             }
+            for idx in self.grid.take_palette_changes() {
+                self.push_ui_event(UiEvent::PaletteColor(idx, self.grid.palette_color(idx)));
+            }
 
             self.publish();
         }
@@ -968,6 +975,7 @@ impl UiWorker<'_> {
                         links.insert(id, uri);
                     }
                     UiEvent::Clipboard(text) => win.write_clipboard(text),
+                    UiEvent::PaletteColor(idx, rgb) => win.apply_palette_change(idx, rgb),
                 }
                 did_work = true;
             }

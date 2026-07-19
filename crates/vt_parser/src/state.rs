@@ -691,6 +691,8 @@ impl Parser {
                 let uri = pt.splitn(2, ';').nth(1).unwrap_or(pt);
                 OscCmd::Hyperlink { uri }
             }
+            4 => OscCmd::SetColor { pairs: pt },
+            104 => OscCmd::ResetColor { ps: pt },
             10 => OscCmd::ForegroundColor(pt),
             11 => OscCmd::BackgroundColor(pt),
             52 => {
@@ -1131,6 +1133,44 @@ mod tests {
         assert!(seen[1].contains("BackgroundColor"));
         assert!(seen[2].contains("Clipboard"));
         assert!(seen[3].contains("ShellIntegration"));
+    }
+
+    #[test]
+    fn osc_4_set_color_recognised() {
+        let mut p = Parser::new();
+        let mut seen = None;
+        p.feed(b"\x1b]4;1;#ff0000\x07", |ev| seen = Some(format!("{ev:?}")));
+        let seen = seen.unwrap();
+        assert!(seen.contains("SetColor"));
+        assert!(seen.contains("1;#ff0000"));
+    }
+
+    #[test]
+    fn osc_4_multi_pair_and_query_recognised() {
+        let mut p = Parser::new();
+        let mut seen = None;
+        p.feed(b"\x1b]4;0;?;1;?\x07", |ev| seen = Some(format!("{ev:?}")));
+        let seen = seen.unwrap();
+        assert!(seen.contains("SetColor"));
+        assert!(seen.contains("0;?;1;?"));
+    }
+
+    #[test]
+    fn osc_104_reset_color_recognised() {
+        let mut p = Parser::new();
+        let mut seen = None;
+        p.feed(b"\x1b]104;5\x07", |ev| seen = Some(format!("{ev:?}")));
+        let seen = seen.unwrap();
+        assert!(seen.contains("ResetColor"));
+        assert!(seen.contains('5'));
+    }
+
+    #[test]
+    fn osc_104_bare_reset_all_recognised() {
+        let mut p = Parser::new();
+        let mut seen = None;
+        p.feed(b"\x1b]104\x07", |ev| seen = Some(format!("{ev:?}")));
+        assert!(seen.unwrap().contains("ResetColor"));
     }
 
     #[test]

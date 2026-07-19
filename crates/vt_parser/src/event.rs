@@ -237,8 +237,17 @@ pub enum CsiAction {
 pub enum OscCmd<'a> {
     /// OSC 0 / 2 — set window title.
     SetTitle(&'a str),
-    /// OSC 4 — set color.
-    SetColor { index: u8, spec: &'a str },
+    /// OSC 4 — query/set one or more palette colors. `pairs` is the raw Pt
+    /// after the leading `4;`: `index ; spec [; index ; spec ...]`, e.g.
+    /// `0;#1e1e2e;1;rgb:ff/00/00`. Each `spec` of `?` is a query for that
+    /// index (colorscheme tools send `4;N;?` to read a color back); anything
+    /// else is a set request. Multiple pairs in one sequence is how most
+    /// base16/colorscheme scripts push a whole palette in a single OSC 4.
+    SetColor { pairs: &'a str },
+    /// OSC 104 — reset one or more palette colors to their default. `ps` is
+    /// the raw Pt: empty resets the whole 256-color palette, otherwise a
+    /// `;`-separated list of indices.
+    ResetColor { ps: &'a str },
     /// OSC 8 — hyperlink.
     Hyperlink { uri: &'a str },
     /// OSC 10 — query/set the default foreground color. `?` asks the

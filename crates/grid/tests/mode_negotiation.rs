@@ -387,6 +387,88 @@ fn osc10_defaults_are_sane_without_set_default_colors() {
 }
 
 #[test]
+fn osc4_set_single_index_overrides_palette_color() {
+    let mut g = Grid::new(20, 3);
+    assert_eq!(g.palette_color(1), (128, 0, 0), "index 1 starts as default red");
+    feed(&mut g, b"\x1b]4;1;#ff0000\x07");
+    assert_eq!(g.palette_color(1), (0xff, 0, 0));
+}
+
+#[test]
+fn osc4_set_multiple_pairs_in_one_sequence() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]4;0;#111111;2;#222222\x07");
+    assert_eq!(g.palette_color(0), (0x11, 0x11, 0x11));
+    assert_eq!(g.palette_color(2), (0x22, 0x22, 0x22));
+}
+
+#[test]
+fn osc4_query_replies_with_current_color() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]4;1;?\x07");
+    let replies = g.take_replies();
+    assert_eq!(replies, b"\x1b]4;1;rgb:8080/0000/0000\x1b\\");
+}
+
+#[test]
+fn osc4_query_after_override_reports_the_new_color() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]4;1;#ff0000\x07");
+    g.take_replies();
+    feed(&mut g, b"\x1b]4;1;?\x07");
+    assert_eq!(g.take_replies(), b"\x1b]4;1;rgb:ffff/0000/0000\x1b\\");
+}
+
+#[test]
+fn osc4_set_publishes_a_pending_palette_change() {
+    let mut g = Grid::new(20, 3);
+    assert!(g.take_palette_changes().is_empty());
+    feed(&mut g, b"\x1b]4;5;#abcdef\x07");
+    assert_eq!(g.take_palette_changes(), vec![5]);
+    assert!(
+        g.take_palette_changes().is_empty(),
+        "take_palette_changes must drain the queue"
+    );
+}
+
+#[test]
+fn osc4_malformed_pair_is_skipped_not_panicking() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]4;1;notacolor\x07");
+    assert_eq!(g.palette_color(1), (128, 0, 0), "malformed spec is a no-op");
+}
+
+#[test]
+fn osc104_resets_a_single_overridden_index() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]4;3;#ffffff\x07");
+    assert_eq!(g.palette_color(3), (0xff, 0xff, 0xff));
+    g.take_palette_changes();
+    feed(&mut g, b"\x1b]104;3\x07");
+    assert_eq!(g.palette_color(3), (128, 128, 0), "back to xterm default");
+    assert_eq!(g.take_palette_changes(), vec![3]);
+}
+
+#[test]
+fn osc104_bare_resets_every_overridden_index() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]4;1;#ffffff;2;#ffffff\x07");
+    g.take_palette_changes();
+    feed(&mut g, b"\x1b]104\x07");
+    assert_eq!(g.palette_color(1), (128, 0, 0));
+    assert_eq!(g.palette_color(2), (0, 128, 0));
+}
+
+#[test]
+fn ris_resets_palette_overrides() {
+    let mut g = Grid::new(20, 3);
+    feed(&mut g, b"\x1b]4;1;#ffffff\x07");
+    assert_eq!(g.palette_color(1), (0xff, 0xff, 0xff));
+    feed(&mut g, b"\x1bc");
+    assert_eq!(g.palette_color(1), (128, 0, 0));
+}
+
+#[test]
 fn combining_acute_accent_composes_onto_the_previous_letter() {
     let mut g = Grid::new(20, 3);
     feed(&mut g, "e\u{301}".as_bytes()); // 'e' + COMBINING ACUTE ACCENT

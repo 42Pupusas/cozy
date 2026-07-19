@@ -1111,6 +1111,20 @@ impl TermWindow {
         self.stale_rows[1].iter_mut().for_each(|s| *s = true);
     }
 
+    /// Live-patch one palette index (an OSC 4 write) and force a full
+    /// repaint, same as [`Self::set_renderer`] but without rebuilding the
+    /// font/glyph atlas -- OSC 4 only ever changes color, never the font, so
+    /// there's no reason to pay atlas-rebuild cost for it. Any cell already
+    /// on screen using index `n` needs repainting in the new color, hence
+    /// the same "mark every row stale" dance `set_renderer` does.
+    pub fn apply_palette_change(&mut self, n: u8, rgb: (u8, u8, u8)) {
+        self.renderer.set_palette_color(n, rgb);
+        self.dirty = true;
+        self.pending_dirty.clear();
+        self.stale_rows[0].iter_mut().for_each(|s| *s = true);
+        self.stale_rows[1].iter_mut().for_each(|s| *s = true);
+    }
+
     /// Whether swapping to `renderer` would change the opaque/translucent
     /// `wl_shm` buffer format (`Xrgb8888` vs. `Argb8888`) this window was
     /// opened with. A live-reload that only touches colors never trips this;

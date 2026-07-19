@@ -216,6 +216,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "statusbar-benches"
+version = "0.1.0"
+dependencies = [
+ "divan",
+ "platform",
+ "quetzalcoatl",
+ "statusbar",
+]
+
+[[package]]
 name = "statusbar-bin"
 version = "0.1.0"
 dependencies = [

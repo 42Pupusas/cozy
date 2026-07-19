@@ -20,7 +20,7 @@
 use std::time::{Duration, Instant};
 
 use platform::draw::{Canvas, Color};
-use statusbar::{BarWindow, Edge, TextRenderer};
+use statusbar::{BarWindow, Edge, ModuleKind, ScrollAccumulator, TextRenderer, module_color, steps_to_delta_pct};
 
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
@@ -78,7 +78,9 @@ struct Modules {
     /// deltas just accumulate here fractionally; `apply_pending_scroll`
     /// only converts (and drains) whole detents' worth into an actual
     /// step, leaving any remainder under one detent queued for next time.
-    pending_scroll: Option<(ModuleKind, i32)>,
+    /// The accumulation math itself lives in `statusbar::scroll` (unit
+    /// tested there); this just pairs it with which control it's for.
+    pending_scroll: Option<(ModuleKind, ScrollAccumulator)>,
     last_scroll_apply: Instant,
 }
 
@@ -87,121 +89,8 @@ const CONTROL_REFRESH_DEBOUNCE_MS: u64 = 150;
 /// Minimum spacing between actually spawning a `pactl`/`brightnessctl`
 /// *adjustment* while scrolling -- see `Modules::pending_scroll`'s doc.
 const SCROLL_APPLY_DEBOUNCE_MS: u64 = 60;
-/// Raw wheel pixels (`wl_fixed`-derived, from `BarWindow::take_scroll`)
-/// per one logical scroll "step" / detent. Matches a typical physical mouse
-/// wheel click; touchpad/hi-res-wheel micro-events accumulate fractionally
-/// toward this in `Modules::pending_scroll` rather than each counting as a
-/// full step on their own.
-const SCROLL_PX_PER_STEP: i32 = 15;
 
 const DASH: &str = "—";
-
-/// Kanagawa Dragon accents, lifted verbatim from waybar's own
-/// `~/.config/waybar/style.css` `@define-color` block -- so our bar's
-/// per-module colors match waybar's exactly, not just the shape of the
-/// idea. `fg`/`bg` aren't here: those already come from `[bar]`/`[colors]`
-/// (see `cfg.bar_foreground`/`bar_background` in `main`), since unlike
-/// waybar's hardcoded stylesheet, ours mirrors the terminal's configured
-/// theme by default.
-mod palette {
-    use platform::draw::Color;
-
-    pub const FG_DARK: Color = Color::rgb(0xa6, 0xa6, 0x9c);
-    pub const RED: Color = Color::rgb(0xc4, 0x74, 0x6e);
-    pub const ORANGE: Color = Color::rgb(0xb6, 0x92, 0x7b);
-    pub const YELLOW: Color = Color::rgb(0xc4, 0xb2, 0x8a);
-    pub const GREEN: Color = Color::rgb(0x8a, 0x9a, 0x7b);
-    pub const BLUE: Color = Color::rgb(0x8b, 0xa4, 0xb0);
-    pub const PURPLE: Color = Color::rgb(0xa2, 0x92, 0xa3);
-    pub const TEAL: Color = Color::rgb(0x8e, 0xa4, 0xa2);
-}
-
-/// Which module a rendered segment came from -- just enough to pick its
-/// color in `module_color`; not otherwise used for layout.
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Cpu/Mem: disabled in right_segments() per user request, kept for easy re-enable
-enum ModuleKind {
-    Clock,
-    Date,
-    Wifi,
-    Bluetooth,
-    Battery,
-    Temp,
-    Cpu,
-    Mem,
-    VolOut,
-    VolIn,
-    Brightness,
-}
-
-/// Per-module foreground color, matching waybar's `style.css` rules
-/// (`#clock`, `#battery.warning`, `#network.disconnected`, etc.) -- state
-/// is read straight off the icon glyph each module already picked
-/// (`modules.rs`'s icons are unique per state: disconnected/muted/charging
-/// all use a different glyph), so this needs no extra plumbing back to the
-/// raw sensor data. Codepoints below were pulled with a throwaway probe
-/// binary reading `modules.rs`'s actual string literals, not hand-copied,
-/// after a hand-transcribed `\u{...}` escape caused a tofu regression once
-/// already (see the CPU icon fix in this same commit).
-fn module_color(kind: ModuleKind, text: &str) -> Color {
-    use palette::{BLUE, FG_DARK, GREEN, ORANGE, PURPLE, RED, TEAL, YELLOW};
-    match kind {
-        ModuleKind::Clock | ModuleKind::Date => PURPLE,
-        ModuleKind::Wifi => {
-            if text.starts_with('\u{f092d}') {
-                RED // waybar's #network.disconnected
-            } else {
-                BLUE
-            }
-        }
-        ModuleKind::Bluetooth => {
-            if text.starts_with('\u{f00b2}') {
-                FG_DARK // waybar's #bluetooth.off/.disabled
-            } else {
-                PURPLE
-            }
-        }
-        ModuleKind::Battery => {
-            if text.ends_with('\u{f0084}') || text.ends_with('\u{f06a5}') {
-                GREEN // waybar's #battery.charging/.plugged
-            } else if let Some(pct) = trailing_percent(text) {
-                if pct < 15 {
-                    RED // waybar's #battery.critical
-                } else if pct < 30 {
-                    YELLOW // waybar's #battery.warning
-                } else {
-                    GREEN
-                }
-            } else {
-                GREEN
-            }
-        }
-        ModuleKind::Temp => ORANGE,
-        ModuleKind::Cpu => GREEN,
-        ModuleKind::Mem => BLUE,
-        ModuleKind::VolOut => {
-            if text.ends_with('\u{f075f}') {
-                FG_DARK // waybar's #pulseaudio.muted
-            } else {
-                TEAL
-            }
-        }
-        ModuleKind::VolIn => {
-            if text.ends_with('\u{f036d}') {
-                FG_DARK
-            } else {
-                ORANGE // waybar's #pulseaudio.microphone
-            }
-        }
-        ModuleKind::Brightness => YELLOW,
-    }
-}
-
-/// The percentage number at the end of a module string like "X 87%", if
-/// any -- used for battery's warning/critical color thresholds.
-fn trailing_percent(text: &str) -> Option<u32> {
-    text.trim_end_matches('%').rsplit(' ').next()?.parse().ok()
-}
 
 impl Modules {
     fn new() -> Self {
@@ -331,8 +220,12 @@ impl Modules {
     /// the pointer's moved to a different segment).
     fn queue_scroll(&mut self, kind: ModuleKind, raw_px: i32) {
         match &mut self.pending_scroll {
-            Some((k, acc)) if *k == kind => *acc += raw_px,
-            _ => self.pending_scroll = Some((kind, raw_px)),
+            Some((k, acc)) if *k == kind => acc.add(raw_px),
+            _ => {
+                let mut acc = ScrollAccumulator::new();
+                acc.add(raw_px);
+                self.pending_scroll = Some((kind, acc));
+            }
         }
     }
 
@@ -345,7 +238,7 @@ impl Modules {
     /// detent threshold each event. Returns `true` if a redraw is
     /// warranted.
     fn apply_pending_scroll(&mut self) -> bool {
-        let Some((kind, raw_px)) = self.pending_scroll else {
+        let Some((kind, mut acc)) = self.pending_scroll else {
             return false;
         };
         let now = Instant::now();
@@ -353,19 +246,14 @@ impl Modules {
             return false;
         }
         self.last_scroll_apply = now;
-        // Truncate toward zero -- whole detents only; keep the remainder
-        // queued for next time instead of resetting to 0 every apply.
-        let steps = raw_px / SCROLL_PX_PER_STEP;
+        let steps = acc.take_steps();
+        self.pending_scroll = Some((kind, acc));
         if steps == 0 {
             // Nothing to apply yet, but don't churn force_refresh_control
             // on sub-detent noise -- just wait for more to accumulate.
             return false;
         }
-        self.pending_scroll = Some((kind, raw_px - steps * SCROLL_PX_PER_STEP));
-        // Wheel up (negative raw px) = increase; wheel down (positive) =
-        // decrease -- matches the terminal's own scroll-up-goes-back
-        // convention and the usual volume-knob feel (push up = louder).
-        let delta = -steps * SCROLL_STEP_PCT;
+        let delta = steps_to_delta_pct(steps, SCROLL_STEP_PCT);
         match kind {
             ModuleKind::VolOut => statusbar::modules::adjust_volume_out(delta),
             ModuleKind::VolIn => statusbar::modules::adjust_volume_in(delta),

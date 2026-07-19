@@ -418,3 +418,103 @@ pub fn now_secs() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // battery_ramp_icon
+
+    #[test]
+    fn battery_ramp_bottom_and_top_are_distinct_and_stable() {
+        // Regression guard rather than a hand-copied codepoint fixture (an
+        // earlier attempt at this exact test hand-transcribed the ramp
+        // array and got it wrong -- see the CPU/wifi icon bugs this crate
+        // has already shipped from the same mistake). 0% and 100% must map
+        // to *some* two distinct, stable icons.
+        let bottom = battery_ramp_icon(0);
+        let top = battery_ramp_icon(100);
+        assert_ne!(bottom, top);
+        assert_eq!(battery_ramp_icon(0), bottom, "not deterministic");
+        assert_eq!(battery_ramp_icon(100), top, "not deterministic");
+    }
+
+    #[test]
+    fn battery_ramp_is_monotonic_by_index() {
+        // The ramp must never regress to an *earlier* icon as capacity
+        // rises -- walk the 0..=100 domain and check each new icon we see
+        // is either the same as the last or the next one, never a jump
+        // backward to one we'd already left behind.
+        let mut seen_order: Vec<&str> = Vec::new();
+        for cap in 0..=100u32 {
+            let icon = battery_ramp_icon(cap);
+            if seen_order.last() != Some(&icon) {
+                assert!(
+                    !seen_order.contains(&icon),
+                    "ramp regressed to an earlier icon at cap={cap}"
+                );
+                seen_order.push(icon);
+            }
+        }
+        // 11-step ramp: expect to actually traverse a nontrivial number of
+        // distinct icons across the full range, not get stuck on one.
+        assert!(seen_order.len() >= 8, "ramp barely moves: {seen_order:?}");
+    }
+
+    #[test]
+    fn battery_ramp_never_panics_past_100() {
+        // Defensive: cap should never exceed 100 in practice (it's a sysfs
+        // percentage), but the `.min(RAMP.len() - 1)` clamp should hold even
+        // if it somehow does.
+        let _ = battery_ramp_icon(255);
+    }
+
+    // parse_kb
+
+    #[test]
+    fn parse_kb_strips_suffix_and_whitespace() {
+        assert_eq!(parse_kb("   16384000 kB"), Some(16_384_000));
+        assert_eq!(parse_kb("1024 kB"), Some(1024));
+    }
+
+    #[test]
+    fn parse_kb_without_suffix_still_parses() {
+        assert_eq!(parse_kb("  2048  "), Some(2048));
+    }
+
+    #[test]
+    fn parse_kb_garbage_is_none() {
+        assert_eq!(parse_kb("not a number"), None);
+        assert_eq!(parse_kb(""), None);
+    }
+
+    // pick_volume_icon / format_volume
+
+    #[test]
+    fn pick_volume_icon_sink_thresholds() {
+        assert_eq!(pick_volume_icon(false, 0, false), "\u{f057f}");
+        assert_eq!(pick_volume_icon(false, 32, false), "\u{f057f}");
+        assert_eq!(pick_volume_icon(false, 33, false), "\u{f0580}");
+        assert_eq!(pick_volume_icon(false, 65, false), "\u{f0580}");
+        assert_eq!(pick_volume_icon(false, 66, false), "\u{f057e}");
+        assert_eq!(pick_volume_icon(false, 100, false), "\u{f057e}");
+    }
+
+    #[test]
+    fn pick_volume_icon_muted_overrides_level() {
+        assert_eq!(pick_volume_icon(false, 100, true), "\u{f075f}");
+    }
+
+    #[test]
+    fn pick_volume_icon_source_ignores_level_thresholds() {
+        assert_eq!(pick_volume_icon(true, 5, false), "\u{f036c}");
+        assert_eq!(pick_volume_icon(true, 100, false), "\u{f036c}");
+        assert_eq!(pick_volume_icon(true, 50, true), "\u{f036d}");
+    }
+
+    #[test]
+    fn format_volume_pads_to_three_digits() {
+        assert_eq!(format_volume(false, 7, false), "  7% \u{f057f}");
+        assert_eq!(format_volume(false, 100, false), "100% \u{f057e}");
+    }
+}

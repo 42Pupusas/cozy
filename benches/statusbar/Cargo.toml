@@ -1,0 +1,27 @@
+[package]
+name        = "statusbar-benches"
+version     = "0.1.0"
+edition.workspace = true
+publish     = false
+description = "divan micro-benchmarks for the statusbar crate's hot spots: text rasterization/atlas, layout, and scroll/color logic"
+
+[lints]
+workspace = true
+
+[dependencies]
+statusbar    = { path = "../../crates/statusbar" }
+platform     = { path = "../../crates/platform" }
+quetzalcoatl = { workspace = true }
+divan        = "0.1"
+
+[[bench]]
+name    = "text"
+harness = false
+
+[[bench]]
+name    = "scroll"
+harness = false
+
+[[bench]]
+name    = "colors"
+harness = false

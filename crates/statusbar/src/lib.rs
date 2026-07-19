@@ -29,8 +29,12 @@
 //!     lays out left/center/right and draws with the embedded bitmap font.
 
 pub mod bar_window;
+pub mod colors;
 pub mod modules;
+pub mod scroll;
 pub mod text;
 
 pub use bar_window::{BarWindow, Edge};
+pub use colors::{ModuleKind, module_color};
+pub use scroll::{ScrollAccumulator, steps_to_delta_pct};
 pub use text::TextRenderer;

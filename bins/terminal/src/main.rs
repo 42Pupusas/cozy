@@ -223,6 +223,27 @@ enum UiEvent {
     Clipboard(String),
 }
 
+/// Stores `true` into a shared quit flag when dropped -- including when the
+/// stack is unwinding from a panic, not just on a normal return.
+///
+/// Without this, a panic on the PTY or parser thread (a bug, an unexpected
+/// `unwrap`/index-out-of-bounds, whatever) skips straight past that thread's
+/// own `quit.store(true, ...)` tail (it never runs -- the unwind jumps clean
+/// over it), so the *other* threads never learn anything died. They just
+/// keep polling a `quit` flag that's permanently stuck at `false`: the
+/// window stops updating, the shell stops echoing, and the process sits
+/// there looking hung forever instead of exiting with the panic message
+/// already printed to stderr by the default hook. Held for the whole
+/// duration of a worker's `run`, this guarantees the flag flips regardless
+/// of *how* that function stops running.
+struct QuitGuard(Arc<AtomicBool>);
+
+impl Drop for QuitGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 // ── Entry ──────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -377,32 +398,49 @@ impl<'cfg> App<'cfg> {
         // separate forked *process*, so nothing ever reaped or SIGHUP'd it.
         let shutdown_input_tx = input_tx.clone();
 
-        let ui_result = UiWorker {
-            cfg: self.cfg,
-            dirty_rx,
-            input_tx,
-            resize_tx: parser_resize_tx.clone(),
-            scroll_tx: parser_resize_tx,
-            ui_wake,
-            pty_wake: ui_pty_wake,
-            bracketed_paste: &bracketed_paste_ui,
-            term_modes: &term_modes_ui,
-            ui_events: &ui_events_ui,
-            quit: &self.quit,
-        }
-        .run();
+        // Same teardown guarantee as `QuitGuard` (see its doc), applied here
+        // via `catch_unwind` instead of `Drop` because this is the main
+        // thread itself: an *unhandled* panic on `main` normally unwinds
+        // straight past any code sequentially after the panicking call --
+        // including the quit-flag/join tail below -- and terminates the
+        // process without ever signalling the PTY thread. That leaves the
+        // forked shell running as an orphan exactly like the `?`-propagation
+        // bug this replaced, just triggered by a panic instead of an `Err`
+        // return. Catching it here, tearing down regardless, then
+        // re-throwing via `resume_unwind` preserves the original panic
+        // (message, exit code, backtrace) while still guaranteeing cleanup.
+        let ui_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            UiWorker {
+                cfg: self.cfg,
+                dirty_rx,
+                input_tx,
+                resize_tx: parser_resize_tx.clone(),
+                scroll_tx: parser_resize_tx,
+                ui_wake,
+                pty_wake: ui_pty_wake,
+                bracketed_paste: &bracketed_paste_ui,
+                term_modes: &term_modes_ui,
+                ui_events: &ui_events_ui,
+                quit: &self.quit,
+            }
+            .run()
+        }));
 
         // Always tear down, regardless of whether the UI loop exited
-        // cleanly or with an error: set the shared quit flag, push a Quit
-        // message the PTY thread's `next_input` will observe, and wake it
-        // in case it's parked in `io_uring_enter`.
+        // cleanly, with an error, or by panicking: set the shared quit flag,
+        // push a Quit message the PTY thread's `next_input` will observe,
+        // and wake it in case it's parked in `io_uring_enter`.
         self.quit.store(true, Ordering::Relaxed);
         let _ = shutdown_input_tx.push(InputMsg::Quit);
         shutdown_pty_wake.signal();
 
         pty_handle.join().ok();
         parser_handle.join().ok();
-        ui_result
+
+        match ui_outcome {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }
 
@@ -441,6 +479,9 @@ impl PtyWorker {
             input_wake,
             quit,
         } = self;
+        // Guarantees `quit` flips even if this thread panics below -- see
+        // `QuitGuard`'s doc.
+        let _quit_guard = QuitGuard(Arc::clone(&quit));
 
         // All PTY I/O goes through io_uring: the master fd, the SIGCHLD
         // signalfd, and the input-wake eventfd each keep one read SQE armed,
@@ -582,6 +623,9 @@ impl ParserWorker {
             ui_events,
             quit,
         } = self;
+        // Guarantees `quit` flips even if this thread panics below -- see
+        // `QuitGuard`'s doc.
+        let _quit_guard = QuitGuard(Arc::clone(&quit));
         let mut grid = Grid::new(cols, rows);
         grid.set_default_colors(default_fg, default_bg);
         ParserSession {

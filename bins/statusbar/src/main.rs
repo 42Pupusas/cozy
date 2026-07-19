@@ -156,9 +156,10 @@ fn main() {
     // whole detent's built up, turns into a debounced `pactl`/sysfs nudge.
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<Snapshot>();
     let (scroll_tx, scroll_rx) = mpsc::channel::<(ModuleKind, i32)>();
+    let (click_tx, click_rx) = mpsc::channel::<ModuleKind>();
     std::thread::Builder::new()
         .name("statusbar-worker".into())
-        .spawn(move || worker::run(&snapshot_tx, &scroll_rx, &wake))
+        .spawn(move || worker::run(&snapshot_tx, &scroll_rx, &click_rx, &wake))
         .expect("spawn statusbar worker thread");
 
     let bar_height = window.height();
@@ -217,6 +218,21 @@ fn main() {
                 ) {
                     let _ = scroll_tx.send((kind, raw_px));
                 }
+            }
+        }
+
+        // Left-click: open the module's COSMIC settings page (mirrors
+        // waybar's own "on-click": "cosmic-popup <page>" bindings -- see
+        // `statusbar::click::settings_page`). Same hit-test as scroll;
+        // the actual `cosmic-settings`/`cosmic-popup` spawn happens on the
+        // worker thread so a slow launch never stalls the Wayland pump.
+        if window.take_click() {
+            let px = window.pointer_pos().x;
+            if let Some((kind, ..)) = segment_rects
+                .iter()
+                .find(|(_, x0, x1)| px >= *x0 && px < *x1)
+            {
+                let _ = click_tx.send(*kind);
             }
         }
 

@@ -16,7 +16,7 @@
 //! existing pool via `wl_shm_pool.resize` (grow-only, lazy-shrink) and only
 //! recreate the two `wl_buffer`s carved out of it.
 
-use platform::conn::{Conn, ConnError, Sender, WindowSender};
+use platform::conn::{ConnError, Sender, WindowSender};
 use platform::draw::{Canvas, Color, Point};
 use platform::event::RawEvent;
 use platform::font;
@@ -25,17 +25,17 @@ use platform::id::{
     RegistryId, SeatId, ShmId, SurfaceId,
 };
 use platform::protocol::{
-    self as proto, Anchor, BufferEvent, BufferRequest, CallbackEvent, CompositorRequest,
-    DisplayEvent, DisplayRequest, Format, KeyboardInteractivity, Layer, LayerShellRequest,
-    LayerSurfaceEvent, LayerSurfaceRequest, PointerEvent, RegistryEvent, RegistryRequest,
-    SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest, ShmRequest, SurfaceRequest,
+    self as proto, Anchor, ButtonState, BufferRequest,
+    CompositorRequest, DisplayEvent, DisplayRequest, Format, KeyboardInteractivity, Layer,
+    LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest, PointerButton, PointerEvent,
+    RegistryEvent, SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest, SurfaceRequest,
 };
 use platform::sys::ShmBuffer;
 use platform::wire::{MessageBuilder, WireEvent};
 use platform::{Error, Result};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc;
-use quetzalcoatl::spsc::{Consumer, RingBuffer};
+use quetzalcoatl::spsc::Consumer;
 
 const EVENT_RING_CAP: usize = 256;
 const APP_ID: &str = "statusbar";
@@ -64,11 +64,7 @@ impl Edge {
     }
 }
 
-#[derive(Copy, Clone)]
-struct Frame {
-    buffer: BufferId,
-    free: bool,
-}
+use platform::surface::{self, Frame};
 
 /// A layer-shell status-bar window: anchors to a screen edge, reserves an
 /// exclusive zone, and blits whatever [`BarWindow::draw`] paints.
@@ -113,6 +109,16 @@ pub struct BarWindow {
     /// zeros, forever). This carries the truncated fraction forward so it
     /// isn't lost, added back in before the next event's own truncation.
     scroll_fixed_remainder: i32,
+    /// Set on a left-button *press*, cleared and reported on the matching
+    /// *release* -- only a clean press-then-release at (roughly) the same
+    /// spot counts as a click, same convention as everything else that
+    /// distinguishes a click from the start of a drag. A bar has nothing to
+    /// drag, so this never needs to track motion, just press/release
+    /// pairing.
+    left_pressed: bool,
+    /// Set true on a qualifying left-click release, drained by
+    /// [`BarWindow::take_click`] once per `tick`.
+    pending_click: bool,
 
     width: i32,
     frames: [Frame; 2],
@@ -174,20 +180,11 @@ impl BarWindow {
     /// `Xrgb8888`) is fixed for the window's whole lifetime from this value,
     /// matching `platform::TermWindow`'s `needs_alpha` split.
     pub fn new(edge: Edge, height: i32, opacity: f64, wake: waker::Waker) -> Result<Self> {
-        let (mut sender, reader, _repeat_timer) = Conn::connect()?;
-        let (producer, mut events) =
-            RingBuffer::<RawEvent>::new(Capacity::exact(EVENT_RING_CAP)).split();
-        let reader_wake = wake.clone();
-        let reader_handle = std::thread::Builder::new()
-            .name("statusbar-wayland-reader".into())
-            .spawn(move || {
-                let r = reader.run(producer, Some(reader_wake)).map_err(Error::Conn);
-                if let Err(e) = &r {
-                    eprintln!("statusbar: reader error: {e}");
-                }
-                r
-            })
-            .map_err(Error::ReaderSpawn)?;
+        // Same reader-thread + event-ring bootstrap `platform::TermWindow`
+        // uses; the `_repeat_timer` is unused here (a bar has no keyboard) but
+        // kept alive so its fd stays valid for the reader's poll.
+        let (mut sender, _repeat_timer, mut events, reader_handle) =
+            surface::connect(EVENT_RING_CAP, "statusbar-wayland-reader", &wake)?;
 
         let Globals {
             compositor,
@@ -294,6 +291,8 @@ impl BarWindow {
             pointer_pos: Point::new(0, 0),
             pending_scroll: Vec::new(),
             scroll_fixed_remainder: 0,
+            left_pressed: false,
+            pending_click: false,
             width: INITIAL_WIDTH,
             frames,
             shm_mem,
@@ -339,6 +338,12 @@ impl BarWindow {
     /// pixels (a typical detent is ~15).
     pub fn take_scroll(&mut self) -> Vec<i32> {
         std::mem::take(&mut self.pending_scroll)
+    }
+
+    /// Consume a pending left-click (press + matching release since the
+    /// last call), if any -- `true` at most once per genuine click.
+    pub fn take_click(&mut self) -> bool {
+        std::mem::take(&mut self.pending_click)
     }
 
     /// Set the color the canvas is cleared to before each frame's `paint`
@@ -387,40 +392,20 @@ impl BarWindow {
     }
 
     fn handle_event(&mut self, ev: RawEvent) -> Result<()> {
-        if let RawEvent::Bytes(ref bytes) = ev {
-            let (mut wire, _) = WireEvent::parse(bytes).ok_or(Error::ReaderStopped)?;
-            if wire.object_id == platform::id::DisplayId(1).raw() {
-                match DisplayEvent::from_opcode(wire.opcode) {
-                    Some(DisplayEvent::Error) => {
-                        return Err(Error::Protocol {
-                            object: wire.u32(),
-                            code: wire.u32(),
-                            message: wire.string(),
-                        });
-                    }
-                    Some(DisplayEvent::DeleteId) => {
-                        self.window_tx.recycle_id(wire.u32());
-                        return Ok(());
-                    }
-                    None => {}
-                }
-            }
-            return Ok(());
-        }
-
-        if let Some(frame) = self.frames.iter_mut().find(|f| ev.is(f.buffer)) {
-            if ev.event::<BufferEvent>() == Some(BufferEvent::Release) {
-                frame.free = true;
-            }
-            return Ok(());
-        }
-
-        if let Some(cb) = self.frame_cb {
-            if ev.is(cb) && ev.event::<CallbackEvent>() == Some(CallbackEvent::Done) {
-                self.frame_ready = true;
-                self.frame_cb = None;
-                return Ok(());
-            }
+        // The `wl_display` error/delete_id routing, `wl_buffer.release`, and
+        // frame callback are handled identically to `platform::TermWindow` via
+        // the shared `surface::route_common`; only the bar-specific seat /
+        // pointer / layer-surface events below differ.
+        match surface::route_common(
+            &ev,
+            &mut self.window_tx,
+            &mut self.frames,
+            &mut self.frame_ready,
+            &mut self.frame_cb,
+        ) {
+            surface::Routed::Fatal(e) => return Err(e),
+            surface::Routed::Handled => return Ok(()),
+            surface::Routed::Passthrough => {}
         }
 
         // wl_seat.capabilities
@@ -447,6 +432,27 @@ impl BarWindow {
                     }
                     Some(PointerEvent::Motion) => {
                         self.pointer_pos = ev.point(1, 2);
+                    }
+                    Some(PointerEvent::Button) => {
+                        // Args: (serial, time, button, state). A click is a
+                        // press immediately followed by a release with
+                        // nothing else of interest in between -- a bar has
+                        // no drag/selection to distinguish, so press just
+                        // arms it and release (while armed) reports it.
+                        let button = PointerButton::from_code(ev.arg(2));
+                        let state = ButtonState::from_raw(ev.arg(3));
+                        match (button, state) {
+                            (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
+                                self.left_pressed = true;
+                            }
+                            (Some(PointerButton::Left), Some(ButtonState::Released)) => {
+                                if self.left_pressed {
+                                    self.pending_click = true;
+                                }
+                                self.left_pressed = false;
+                            }
+                            _ => {}
+                        }
                     }
                     Some(PointerEvent::Axis) => {
                         // Axis args: (time, axis, value). axis 0 = vertical;
@@ -562,6 +568,8 @@ impl BarWindow {
     /// it. Called exactly once, from [`BarWindow::new`] — every later resize
     /// goes through [`BarWindow::resize`] instead, which reuses this same
     /// pool.
+    /// Delegates to the role-agnostic [`platform::surface::Frame::create_pair`],
+    /// shared with `platform::TermWindow`.
     fn create_frame_pair(
         sender: &mut Sender,
         shm: ShmId,
@@ -569,45 +577,14 @@ impl BarWindow {
         height: i32,
         format: Format,
     ) -> Result<([Frame; 2], ShmBuffer, PoolId)> {
-        let shm_mem = ShmBuffer::new(width as usize, height as usize, 2)
-            .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
-        let stride = width * 4;
-        let pool: PoolId = sender.alloc_id();
-        let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
-            .new_id(pool)
-            .i32(shm_mem.size_bytes() as i32)
-            .finish();
-        sender.send_with_fds(msg, &[shm_mem.fd()])?;
-        let mut frames = [Frame {
-            buffer: BufferId(0),
-            free: true,
-        }; 2];
-        for (i, slot) in frames.iter_mut().enumerate() {
-            let buffer: BufferId = sender.alloc_id();
-            sender.request(
-                MessageBuilder::new(pool, ShmPoolRequest::CreateBuffer)
-                    .new_id(buffer)
-                    .i32(shm_mem.frame_offset(i) as i32)
-                    .i32(width)
-                    .i32(height)
-                    .i32(stride)
-                    .u32(format.code()),
-            )?;
-            slot.buffer = buffer;
-        }
-        Ok((frames, shm_mem, pool))
+        Frame::create_pair(sender, shm, width, height, format)
     }
 
-    /// Pack `self.background` for this window's fixed buffer format: plain
-    /// XRGB8888 when opaque (byte-identical to the pre-transparency path),
-    /// or premultiplied ARGB8888 at `bg_alpha` otherwise -- mirrors
-    /// `platform::Renderer::pack_bg`.
+    /// Pack `self.background` for this window's fixed buffer format via the
+    /// role-agnostic [`platform::surface::pack_bg`] -- the single source of
+    /// truth shared with `platform::Renderer`.
     fn pack_bg(&self) -> u32 {
-        if self.bg_alpha == 255 {
-            self.background.to_xrgb8888()
-        } else {
-            self.background.premultiplied_argb8888(self.bg_alpha)
-        }
+        surface::pack_bg(self.background, self.bg_alpha)
     }
 
     fn present(&mut self, paint: &mut impl FnMut(&mut Canvas)) -> Result<()> {
@@ -725,47 +702,14 @@ impl BarWindow {
         })
     }
 
+    /// Delegates to the role-agnostic [`platform::surface::output_scale`],
+    /// shared with `platform::TermWindow`.
     fn output_scale(sender: &mut Sender, events: &mut Consumer<RawEvent>, output: OutputId) -> i32 {
-        let cb: platform::id::CallbackId = sender.alloc_id();
-        if sender
-            .request(
-                MessageBuilder::new(platform::id::DisplayId(1), DisplayRequest::Sync).new_id(cb),
-            )
-            .is_err()
-        {
-            return 1;
-        }
-        let mut scale = 1i32;
-        loop {
-            let Some(event) = events.pop_block() else {
-                return scale;
-            };
-            match event {
-                RawEvent::Bytes(bytes) => {
-                    let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
-                        continue;
-                    };
-                    if ev.object_id == output.raw()
-                        && proto::OutputEvent::from_opcode(ev.opcode)
-                            == Some(proto::OutputEvent::Scale)
-                    {
-                        scale = ev.i32();
-                    }
-                }
-                RawEvent::Wire {
-                    object_id, opcode, ..
-                } => {
-                    if object_id == cb.raw()
-                        && CallbackEvent::from_opcode(opcode) == Some(CallbackEvent::Done)
-                    {
-                        return scale;
-                    }
-                }
-                RawEvent::Repeat | RawEvent::Fd(_) => {}
-            }
-        }
+        surface::output_scale(sender, events, output)
     }
 
+    /// Delegates to the role-agnostic [`platform::surface::bind`], shared
+    /// with `platform::TermWindow`.
     fn bind<T: ObjectId>(
         sender: &mut Sender,
         registry: RegistryId,
@@ -773,15 +717,7 @@ impl BarWindow {
         interface: &str,
         version: u32,
     ) -> Result<T> {
-        let new_obj: T = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(registry, RegistryRequest::Bind)
-                .u32(name)
-                .string(interface)
-                .u32(version)
-                .new_id(new_obj),
-        )?;
-        Ok(new_obj)
+        surface::bind(sender, registry, name, interface, version)
     }
 }
 

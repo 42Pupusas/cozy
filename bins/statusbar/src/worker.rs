@@ -5,7 +5,7 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use statusbar::{ModuleKind, ScrollAccumulator, steps_to_delta_pct};
+use statusbar::{ModuleKind, ScrollAccumulator, settings_page, steps_to_delta_pct};
 
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
@@ -30,6 +30,10 @@ const SCROLL_APPLY_DEBOUNCE_MS: u64 = 60;
 /// Idle poll granularity when nothing's due and no scroll is queued --
 /// matches the render thread's own idle cadence.
 const IDLE_POLL_MS: u64 = 100;
+/// Minimum spacing between spawning `cosmic-settings` for a click, so a
+/// double-click (or two clicks landing in the same channel-drain batch)
+/// only opens one window instead of two racing to grab focus.
+const CLICK_DEBOUNCE_MS: u64 = 400;
 
 const DASH: &str = "—";
 
@@ -108,6 +112,7 @@ struct State {
     last_control_refresh: Instant,
     pending_scroll: Option<(ModuleKind, ScrollAccumulator)>,
     last_scroll_apply: Instant,
+    last_click_spawn: Instant,
     vol_out_known: Option<KnownPct>,
     vol_in_known: Option<KnownPct>,
     brightness_known: Option<KnownPct>,
@@ -129,6 +134,7 @@ impl State {
             last_control_refresh: stale,
             pending_scroll: None,
             last_scroll_apply: stale,
+            last_click_spawn: stale,
             vol_out_known: None,
             vol_in_known: None,
             brightness_known: None,
@@ -425,6 +431,42 @@ impl State {
         // `advance_known`'s doc.
         self.advance_known(kind, delta)
     }
+
+    /// Open the COSMIC settings page for `kind`, if it has one (see
+    /// `statusbar::click::settings_page` -- mirrors the user's own
+    /// `~/.config/waybar/config` `on-click` bindings), debounced so a
+    /// double-click doesn't race two `cosmic-settings` instances for
+    /// focus. Fire-and-forget, same posture as the volume/brightness
+    /// mutations: spawn and immediately let go, never block the worker
+    /// loop on it.
+    fn handle_click(&mut self, kind: ModuleKind) {
+        let Some(page) = settings_page(kind) else {
+            return;
+        };
+        let now = Instant::now();
+        if now.duration_since(self.last_click_spawn) < Duration::from_millis(CLICK_DEBOUNCE_MS) {
+            return;
+        }
+        self.last_click_spawn = now;
+        // Prefer the user's own `cosmic-popup` wrapper (auto-closes the
+        // settings window on focus loss, exactly like waybar's binding
+        // does) when it's on PATH; fall back to bare `cosmic-settings`
+        // otherwise so this still works without that convenience script.
+        let spawned = std::process::Command::new("cosmic-popup")
+            .arg(page)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if spawned.is_err() {
+            let _ = std::process::Command::new("cosmic-settings")
+                .arg(page)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
 }
 
 /// Run forever: refresh modules on their timers, drain queued scroll deltas
@@ -433,10 +475,19 @@ impl State {
 /// changes. All the blocking work (process spawns, `/proc` reads, the
 /// deliberate ~120ms `cpu_usage` sample window) lives entirely on this
 /// thread -- see `main.rs`'s module doc.
-pub fn run(snapshot_tx: &Sender<Snapshot>, scroll_rx: &Receiver<(ModuleKind, i32)>, wake: &waker::Waker) {
+pub fn run(
+    snapshot_tx: &Sender<Snapshot>,
+    scroll_rx: &Receiver<(ModuleKind, i32)>,
+    click_rx: &Receiver<ModuleKind>,
+    wake: &waker::Waker,
+) {
     let mut state = State::new();
     loop {
         let mut changed = state.refresh();
+
+        while let Ok(kind) = click_rx.try_recv() {
+            state.handle_click(kind);
+        }
 
         // Block on the scroll channel itself (not a plain sleep) so a
         // wheel event is picked up the instant it arrives instead of

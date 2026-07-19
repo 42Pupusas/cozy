@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use font::{Atlas, FontFace, GlyphEntry};
 use platform::draw::{Canvas, Color};
 use platform::font as bitmap_font;
+use platform::text::blit_glyph;
 
 /// Chosen once at bar startup from `[bar] font_path`/`font_size` (mirroring
 /// `[font]` when unset) -- see `config::Config::bar_font_path`.
@@ -194,9 +195,10 @@ impl TextRenderer {
                     let Some(entry) = f.entry(ch as u32) else {
                         continue;
                     };
-                    if entry.width > 0 && entry.height > 0 {
-                        blit_glyph(canvas, &f.atlas, &entry, pen_x, y, fg, bg, bg_alpha);
-                    }
+                    // `blit_glyph` (shared with `platform::Renderer`) adds the
+                    // glyph's bearing to this pen origin and no-ops on a blank
+                    // glyph, so no width/height guard is needed here.
+                    blit_glyph(canvas, &f.atlas, &entry, pen_x, y, fg, bg, bg_alpha);
                     pen_x += entry.advance;
                 }
                 pen_x
@@ -269,64 +271,4 @@ impl FaceRenderer {
     }
 }
 
-/// Alpha-blend one rasterized glyph from `atlas` onto `canvas` at pen
-/// position `(pen_x, pen_y)` (`pen_y` = the line's top row, matching
-/// `entry.bearing_y`'s convention -- see `font::atlas::GlyphEntry`).
-#[allow(clippy::too_many_arguments)]
-fn blit_glyph(
-    canvas: &mut Canvas,
-    atlas: &Atlas,
-    entry: &GlyphEntry,
-    pen_x: i32,
-    pen_y: i32,
-    fg: Color,
-    bg: Color,
-    bg_alpha: u8,
-) {
-    let buf_width = canvas.width();
-    let buf_height = canvas.height();
-    let glyph_x0 = pen_x + entry.bearing_x;
-    let glyph_top = pen_y + entry.bearing_y;
 
-    let col_lo = (-glyph_x0).max(0);
-    let col_hi = (buf_width - glyph_x0).clamp(0, entry.width as i32);
-    let row_lo = (-glyph_top).max(0);
-    let row_hi = (buf_height - glyph_top).clamp(0, entry.height as i32);
-    if col_lo >= col_hi || row_lo >= row_hi {
-        return;
-    }
-
-    let pixels = canvas.pixels_mut();
-    let atlas_w = atlas.width as i32;
-    // Glyph ink is always fully opaque regardless of window opacity
-    // ("translucent glass, solid text"), matching
-    // `platform::Renderer::blit_cell_face` -- `premultiplied_argb8888(255)`
-    // degenerates to plain packed RGB when the buffer is opaque anyway, so
-    // this is a no-op split from `to_xrgb8888()` only once translucent.
-    let fg_px = if bg_alpha == 255 {
-        fg.to_xrgb8888()
-    } else {
-        fg.premultiplied_argb8888(255)
-    };
-
-    for row in row_lo..row_hi {
-        let py = (glyph_top + row) as usize;
-        let dst_row_base = py * buf_width as usize;
-        let atlas_row_base = ((entry.y as i32 + row) * atlas_w) as usize;
-        for col in col_lo..col_hi {
-            let a = atlas.data[atlas_row_base + (entry.x as i32 + col) as usize];
-            if a == 0 {
-                continue;
-            }
-            let dst_idx = dst_row_base + (glyph_x0 + col) as usize;
-            let Some(dst) = pixels.get_mut(dst_idx) else {
-                continue;
-            };
-            *dst = if a == 255 {
-                fg_px
-            } else {
-                fg.blend_glyph(bg, a, bg_alpha)
-            };
-        }
-    }
-}

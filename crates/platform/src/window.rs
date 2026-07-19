@@ -15,9 +15,9 @@
 
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc;
-use quetzalcoatl::spsc::{Consumer, RingBuffer};
+use quetzalcoatl::spsc::Consumer;
 
-use crate::conn::{Conn, ConnError, Sender, WindowSender};
+use crate::conn::{ConnError, Sender, WindowSender};
 use crate::cursor;
 use crate::draw::Point;
 use crate::error::{Error, Result};
@@ -30,11 +30,11 @@ use crate::id::{
 use crate::keymap;
 use crate::protocol::Modifiers;
 use crate::protocol::{
-    self as proto, BufferEvent, BufferRequest, ButtonState, CallbackEvent, CompositorRequest,
+    self as proto, BufferRequest, ButtonState, CompositorRequest,
     DataDeviceEvent, DataDeviceManagerRequest, DataDeviceRequest, DataOfferEvent, DataOfferRequest,
     DataSourceEvent, DataSourceRequest, DisplayEvent, DisplayRequest, Format, Key, KeyState,
-    KeyboardEvent, OutputEvent, PointerButton, PointerEvent, PointerRequest, RegistryEvent,
-    RegistryRequest, SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest, ShmRequest,
+    KeyboardEvent, PointerButton, PointerEvent, PointerRequest, RegistryEvent,
+    SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest,
     SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent, WmBaseRequest, XdgSurfaceEvent,
     XdgSurfaceRequest,
 };
@@ -173,11 +173,7 @@ impl DebugFps {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-struct Frame {
-    buffer: BufferId,
-    free: bool,
-}
+use crate::surface::Frame;
 
 /// Rolling window of present timestamps, used to compute a live "presented
 /// FPS" figure -- how often [`TermWindow::maybe_present`] actually flips a
@@ -309,49 +305,6 @@ impl FrameStats {
         #[allow(clippy::cast_precision_loss)] // FRAME_STATS_CAP is tiny (120)
         let intervals = (self.times.len() - 1) as f32;
         intervals / span
-    }
-}
-
-impl Frame {
-    /// Allocate a double-buffered shm pool and the two [`Frame`] buffers
-    /// backed by it.
-    ///
-    /// Was a free `create_frames(sender, shm, width, height)` function --
-    /// moved onto `Frame` since it constructs the array of them.
-    fn create_pair(
-        sender: &mut Sender,
-        shm: ShmId,
-        width: i32,
-        height: i32,
-        format: Format,
-    ) -> Result<([Self; 2], ShmBuffer, PoolId)> {
-        let shm_mem = ShmBuffer::new(width as usize, height as usize, 2)
-            .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
-        let stride = width * 4;
-        let pool: PoolId = sender.alloc_id();
-        let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
-            .new_id(pool)
-            .i32(shm_mem.size_bytes() as i32)
-            .finish();
-        sender.send_with_fds(msg, &[shm_mem.fd()])?;
-        let mut frames = [Self {
-            buffer: BufferId(0),
-            free: true,
-        }; 2];
-        for (i, slot) in frames.iter_mut().enumerate() {
-            let buffer: BufferId = sender.alloc_id();
-            sender.request(
-                MessageBuilder::new(pool, ShmPoolRequest::CreateBuffer)
-                    .new_id(buffer)
-                    .i32(shm_mem.frame_offset(i) as i32)
-                    .i32(width)
-                    .i32(height)
-                    .i32(stride)
-                    .u32(format.code()),
-            )?;
-            slot.buffer = buffer;
-        }
-        Ok((frames, shm_mem, pool))
     }
 }
 
@@ -586,22 +539,8 @@ impl TermWindow {
         cursor_cfg: crate::cursor_anim::CursorAnimConfig,
         build_renderer: impl FnOnce(i32) -> render::Renderer,
     ) -> Result<Self> {
-        let (mut sender, reader, repeat_timer) = Conn::connect()?;
-        let (producer, mut events) =
-            RingBuffer::<RawEvent>::new(Capacity::exact(EVENT_RING_CAP)).split();
-        // The reader signals this after pushing events so the UI thread, which
-        // polls instead of blocking on a single ring, wakes.
-        let reader_wake = wake.clone();
-        let reader_handle = std::thread::Builder::new()
-            .name("terminal-wayland-reader".into())
-            .spawn(move || {
-                let r = reader.run(producer, Some(reader_wake)).map_err(Error::Conn);
-                if let Err(e) = &r {
-                    eprintln!("platform: reader error: {e}");
-                }
-                r
-            })
-            .map_err(Error::ReaderSpawn)?;
+        let (mut sender, repeat_timer, mut events, reader_handle) =
+            crate::surface::connect(EVENT_RING_CAP, "terminal-wayland-reader", &wake)?;
 
         let Globals {
             compositor,
@@ -1232,27 +1171,21 @@ impl TermWindow {
             return Ok(());
         }
 
-        // wl_display events arrive as raw bytes (the reader routes object 1 to
-        // `Bytes`). Handle error (fatal) and delete_id (id recycling) here.
-        if let RawEvent::Bytes(ref bytes) = ev {
-            let (mut wire, _) = WireEvent::parse(bytes).ok_or(Error::ReaderStopped)?;
-            if wire.object_id == DisplayId(1).raw() {
-                match DisplayEvent::from_opcode(wire.opcode) {
-                    Some(DisplayEvent::Error) => {
-                        return Err(Error::Protocol {
-                            object: wire.u32(),
-                            code: wire.u32(),
-                            message: wire.string(),
-                        });
-                    }
-                    Some(DisplayEvent::DeleteId) => {
-                        self.window_tx.recycle_id(wire.u32());
-                        return Ok(());
-                    }
-                    None => {}
-                }
-            }
-            return Ok(());
+        // Connection-level events every window handles identically -- the
+        // `wl_display` error/delete_id routing, `wl_buffer.release`, and the
+        // frame callback -- live in `surface::route_common`. `Fatal` is our
+        // protocol error; `Handled` means it's fully dealt with; `Passthrough`
+        // falls through to the terminal-specific dispatch below.
+        match crate::surface::route_common(
+            &ev,
+            &mut self.window_tx,
+            &mut self.frames,
+            &mut self.frame_ready,
+            &mut self.frame_cb,
+        ) {
+            crate::surface::Routed::Fatal(e) => return Err(e),
+            crate::surface::Routed::Handled => return Ok(()),
+            crate::surface::Routed::Passthrough => {}
         }
 
         // Key repeat timer.
@@ -1265,23 +1198,6 @@ impl TermWindow {
                 });
             }
             return Ok(());
-        }
-
-        // wl_buffer.release
-        if let Some(frame) = self.frames.iter_mut().find(|f| ev.is(f.buffer)) {
-            if ev.event::<BufferEvent>() == Some(BufferEvent::Release) {
-                frame.free = true;
-            }
-            return Ok(());
-        }
-
-        // wl_callback.done (frame callback)
-        if let Some(cb) = self.frame_cb {
-            if ev.is(cb) && ev.event::<CallbackEvent>() == Some(CallbackEvent::Done) {
-                self.frame_ready = true;
-                self.frame_cb = None;
-                return Ok(());
-            }
         }
 
         // xdg_wm_base.ping
@@ -2485,52 +2401,14 @@ impl Registry {
     /// compositor happens to send `geometry`/`mode` first. Returns `1` (no
     /// scaling) if the output never reports a scale (some compositors only
     /// send it when it's non-default) or times out.
+    ///
+    /// Delegates to the role-agnostic [`crate::surface::output_scale`].
     fn output_scale(sender: &mut Sender, events: &mut Consumer<RawEvent>, output: OutputId) -> i32 {
-        let cb: CallbackId = sender.alloc_id();
-        if sender
-            .request(MessageBuilder::new(DisplayId(1), DisplayRequest::Sync).new_id(cb))
-            .is_err()
-        {
-            return 1;
-        }
-
-        let mut scale = 1i32;
-        loop {
-            let Some(event) = events.pop_block() else {
-                return scale;
-            };
-            match event {
-                RawEvent::Bytes(bytes) => {
-                    let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
-                        continue;
-                    };
-                    if ev.object_id == output.raw()
-                        && OutputEvent::from_opcode(ev.opcode) == Some(OutputEvent::Scale)
-                    {
-                        scale = ev.i32();
-                    }
-                }
-                RawEvent::Wire {
-                    object_id, opcode, ..
-                } => {
-                    if object_id == cb.raw()
-                        && CallbackEvent::from_opcode(opcode) == Some(CallbackEvent::Done)
-                    {
-                        return scale;
-                    }
-                }
-                RawEvent::Repeat => {}
-                // Fd-carrying events never occur during output-scale probing.
-                RawEvent::Fd(_) => {}
-            }
-        }
+        crate::surface::output_scale(sender, events, output)
     }
 
     /// Bind one global by name/interface/version off the registry.
-    ///
-    /// Was a free `bind(sender, registry, name, interface, version)`
-    /// function -- moved onto `Registry` alongside `discover`, its only
-    /// caller.
+    /// Delegates to the role-agnostic [`crate::surface::bind`].
     fn bind<T: ObjectId>(
         sender: &mut Sender,
         registry: RegistryId,
@@ -2538,15 +2416,7 @@ impl Registry {
         interface: &str,
         version: u32,
     ) -> Result<T> {
-        let new_obj: T = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(registry, RegistryRequest::Bind)
-                .u32(name)
-                .string(interface)
-                .u32(version)
-                .new_id(new_obj),
-        )?;
-        Ok(new_obj)
+        crate::surface::bind(sender, registry, name, interface, version)
     }
 }
 

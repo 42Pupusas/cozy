@@ -39,6 +39,28 @@ pub struct SelectionTracker {
     /// thread, no round-trip to the parser-owned grid. Indexed `[row][col]`,
     /// only the visible viewport.
     mirror: Vec<Vec<grid::Cell>>,
+    /// Rows that scrolled off the top of `mirror` while a selection was
+    /// active, so `selected_text` can still recover them. Keyed by the same
+    /// signed viewport row space as `range`'s endpoints (so a row that left
+    /// the mirror as viewport row `-2` is stored under key `-2`) and kept in
+    /// lockstep: every [`Self::shift`] (content scroll *or* wheel scroll)
+    /// re-keys these entries by the same delta as the selection endpoints,
+    /// so a row found here stays findable no matter how much further
+    /// scrolling happens after it leaves the mirror.
+    ///
+    /// A plain positional buffer ("row -1 is slot 0") doesn't work here:
+    /// `content_delta` can exceed how many rows are actually mirrored (e.g.
+    /// a partial repaint that never touched every row), so the rows that
+    /// scroll off in one step aren't necessarily contiguous down from -1.
+    /// Keying by absolute signed row sidesteps that entirely.
+    ///
+    /// Without this, content arriving mid-drag (or between drag and copy)
+    /// would silently drop whatever text scrolled off-screen from the
+    /// clipboard — the highlight still *looked* right because on-screen
+    /// drawing only ever touches the clamped `visible_rows`, masking the
+    /// loss until copy. Only populated while `range` is `Some`, so an idle
+    /// terminal pays nothing for this.
+    history: std::collections::HashMap<i32, Vec<grid::Cell>>,
     /// Current viewport offset (lines scrolled into scrollback; 0 = live
     /// bottom). Tracked so a wheel-scroll shifts the selection with the text.
     view_offset: i32,
@@ -91,6 +113,7 @@ impl SelectionTracker {
     pub fn clear(&mut self) -> bool {
         if self.range.is_some() {
             self.range = None;
+            self.history.clear();
             true
         } else {
             false
@@ -119,6 +142,9 @@ impl SelectionTracker {
             return;
         };
         self.range = Some(((ac, ar + d), (bc, br + d)));
+        if d != 0 && !self.history.is_empty() {
+            self.history = self.history.drain().map(|(row, cells)| (row + d, cells)).collect();
+        }
     }
 
     /// Handle a left-button press at `cell` (with `shift` held or not).
@@ -138,6 +164,7 @@ impl SelectionTracker {
             self.drag_moved = true;
         } else if self.range.is_some() {
             self.range = None;
+            self.history.clear();
             self.drag_moved = false;
         } else {
             self.range = Some((cell, cell));
@@ -151,6 +178,7 @@ impl SelectionTracker {
         self.left_held = false;
         if !self.drag_moved {
             self.range = None;
+            self.history.clear();
         }
     }
 
@@ -206,11 +234,39 @@ impl SelectionTracker {
         // — the selection stays anchored to it.
         let delta = i32::from(snap.content_delta);
         if delta > 0 {
+            // `shift` runs first so it also re-keys any rows already sitting
+            // in `history` by this same delta, keeping their signed-row keys
+            // in the same coordinate space the freshly-scrolled-off rows
+            // below get stamped with.
             self.shift(-delta);
-            if !self.mirror.is_empty() {
+            if !self.mirror.is_empty() && self.range.is_some() {
+                let d = (delta as usize).min(self.mirror.len());
+                // Stash the rows scrolling off the top into `history`,
+                // keyed by the signed viewport row they now occupy, instead
+                // of dropping them -- so a selection anchored to text that
+                // scrolls away mid-drag can still be copied in full. Only
+                // worth keeping while a selection is active; an idle
+                // terminal (no range) just drops them as before.
+                //
+                // `mirror[i]` sat at viewport row `i` before this snapshot;
+                // `shift(-delta)` just moved every selection endpoint up by
+                // `delta`, so that same text now lives at signed viewport row
+                // `i - delta`. Key by `delta` (the real shift), NOT the
+                // clamped drain count `d`: when `delta > mirror.len()` those
+                // differ, and keying by `d` would stash the row one-or-more
+                // rows too high, so `selected_text`'s `history.get(&row)`
+                // (row from the shifted endpoint) would miss it entirely.
+                for (i, cells) in self.mirror.drain(..d).enumerate() {
+                    let row = i as i32 - delta;
+                    self.history.insert(row, cells);
+                }
+            } else if !self.mirror.is_empty() {
                 let d = (delta as usize).min(self.mirror.len());
                 self.mirror.drain(..d);
             }
+        }
+        if self.range.is_none() {
+            self.history.clear();
         }
         // Keep the cell mirror in sync so selection/highlight/extraction always
         // reflect the latest drawn content. `clone_from` (rather than
@@ -259,13 +315,26 @@ impl SelectionTracker {
         };
         let mut out = String::new();
         for row in sr..=er {
-            // Rows above/below the visible area (negative or past the mirror)
-            // hold no extractable text — skip them; the selection itself stays
-            // anchored and yields its text again once scrolled back on-screen.
-            if row < 0 {
-                continue;
-            }
-            let line = self.mirror.get(row as usize)?;
+            // Rows still on-screen live in `mirror`; rows that scrolled off
+            // the top mid-selection live in `history` (row `-1` ==
+            // `history[0]`, row `-2` == `history[1]`, ...). Only rows that
+            // never made it into either -- scrolled off before the selection
+            // existed, or genuinely below the mirror -- are unrecoverable and
+            // skipped, same as before.
+            let line = if row < 0 {
+                // `history` is keyed by the signed viewport row (see the
+                // field doc + `ingest_snapshot`'s insert at key `i - d`), so
+                // look it up by `row` directly, not a positional index.
+                match self.history.get(&row) {
+                    Some(line) => line,
+                    None => continue,
+                }
+            } else {
+                match self.mirror.get(row as usize) {
+                    Some(line) => line,
+                    None => continue,
+                }
+            };
             let c0 = if row == sr { usize::from(sc) } else { 0 };
             let c1 = if row == er {
                 usize::from(ec)
@@ -273,10 +342,12 @@ impl SelectionTracker {
                 line.len().saturating_sub(1)
             };
             let mut s = String::new();
-            let end = c1.min(line.len().saturating_sub(1));
-            for cell in &line[c0..=end] {
-                if !cell.spacer {
-                    s.push(cell.ch);
+            if !line.is_empty() {
+                let end = c1.min(line.len().saturating_sub(1));
+                for cell in &line[c0.min(end)..=end] {
+                    if !cell.spacer {
+                        s.push(cell.ch);
+                    }
                 }
             }
             out.push_str(s.trim_end());
@@ -456,6 +527,31 @@ mod tests {
         assert_eq!(sel.visible_rows(24), vec![0, 1]);
         // A one-row screen clips the span to its single visible row.
         assert_eq!(sel.visible_rows(1), vec![0]);
+    }
+
+    #[test]
+    fn copy_recovers_full_text_after_content_scrolls_selection_off_screen() {
+        // Regression test: select a line, then let new output push it off
+        // the top of the viewport mid-drag (or between drag and copy) —
+        // the highlight visually vanishes off-screen but the text must
+        // still come back whole on copy, not silently truncated.
+        let mut sel = with_two_rows();
+        sel.press_left((0, 0), false); // anchor at "hello world"
+        sel.drag_to((11, 0));
+        assert_eq!(sel.selected_text().as_deref(), Some("hello world"));
+        // Three lines of new output scroll the selected row off the top.
+        sel.ingest_snapshot(&incremental(
+            vec![
+                text_row(0, "new1"),
+                text_row(1, "new2"),
+                text_row(2, "new3"),
+            ],
+            3,
+        ));
+        sel.release_left();
+        // The row is now off-screen (row -3) but its text must survive.
+        assert!(sel.visible_rows(24).is_empty());
+        assert_eq!(sel.selected_text().as_deref(), Some("hello world"));
     }
 
     #[test]

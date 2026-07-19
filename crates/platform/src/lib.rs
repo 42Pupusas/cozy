@@ -65,10 +65,13 @@ pub mod xcursor;
 
 mod render;
 pub mod selection;
+pub mod surface;
+pub mod text;
 pub mod window;
 
 pub use cursor_anim::{CursorAnimConfig, CursorAnimator};
 pub use error::{Error, Result};
 pub use render::{Renderer, Theme};
+pub use surface::{Frame, Routed};
 pub use waker::Waker;
 pub use window::{InputEvent, TermWindow};

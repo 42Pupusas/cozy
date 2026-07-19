@@ -506,13 +506,11 @@ impl Renderer {
 
     /// Pack a background color at `bg_alpha`: plain XRGB8888 when fully
     /// opaque (byte-identical to the pre-transparency renderer), or
-    /// premultiplied ARGB8888 otherwise.
+    /// premultiplied ARGB8888 otherwise. Delegates to the role-agnostic
+    /// [`crate::surface::pack_bg`], the single source of truth both this
+    /// renderer and `statusbar::BarWindow` share.
     fn pack_bg(bg: DrawColor, bg_alpha: u8) -> u32 {
-        if bg_alpha == 255 {
-            bg.to_xrgb8888()
-        } else {
-            bg.premultiplied_argb8888(bg_alpha)
-        }
+        crate::surface::pack_bg(bg, bg_alpha)
     }
 
     /// Blit a single cell into the canvas at cell column/row `cx`/`cy`.
@@ -904,11 +902,6 @@ impl Renderer {
         fill_bg: bool,
     ) {
         let buf_width = canvas.width() as u32;
-        let fg_px = if bg_alpha == 255 {
-            fg.to_xrgb8888()
-        } else {
-            fg.premultiplied_argb8888(255)
-        };
         let bg_px = Self::pack_bg(bg, bg_alpha);
         let px0 = u32::from(cx) * cell_w as u32;
         let py0 = u32::from(cy) * cell_h as u32;
@@ -942,63 +935,22 @@ impl Renderer {
         let Some(entry) = cache.entry(ch as u32) else {
             return;
         };
-        if entry.width == 0 || entry.height == 0 {
-            return; // blank glyph (space etc.) — background is enough.
-        }
-
-        // `entry.bearing_y` is already the fully-resolved, single-rounded
-        // offset from the cell's top row to the glyph bitmap's top row (see
-        // `FontFace::cell_bearing_y`) -- it is *not* a baseline-relative
-        // value, so it must not be combined with a separately-rounded
-        // ascender here. Do not reintroduce `cache.ascender.round() -
-        // bearing_y`; that was the double-rounding bug that made every
-        // glyph's baseline jitter independently by up to a pixel.
-        let glyph_x0 = px0 as i64 + i64::from(entry.bearing_x);
-        let glyph_y0 = py0 as i64 + i64::from(entry.bearing_y);
-
-        let pixels = canvas.pixels_mut();
-        let atlas_w = cache.atlas.width;
-        let buf_h = (pixels.len() / buf_width.max(1) as usize) as i64;
-
-        // Clip the glyph's column span to the buffer ONCE, not per pixel. The
-        // old inner loop paid a `px < 0 || px >= buf_width` branch on every
-        // glyph pixel (perf: `blit_cell` was 60% of the real Face-path flood);
-        // since `glyph_x0` is row-independent, the valid column range
-        // `[col_lo, col_hi)` is a per-glyph constant. Same for rows via
-        // `glyph_y0`. Empty span => nothing on screen.
-        let col_lo = (-glyph_x0).max(0) as u32;
-        let col_hi = (i64::from(buf_width) - glyph_x0).clamp(0, i64::from(entry.width)) as u32;
-        let row_lo = (-glyph_y0).max(0) as u32;
-        let row_hi = (buf_h - glyph_y0).clamp(0, i64::from(entry.height)) as u32;
-        if col_lo >= col_hi {
-            return;
-        }
-
-        for row in row_lo..row_hi {
-            let py = (glyph_y0 + i64::from(row)) as usize;
-            // Hoist the row base indices out of the column loop: both the
-            // destination row base (`py * buf_width`) and the atlas source
-            // row base (`(entry.y + row) * atlas_w`) are per-row constants,
-            // not per-pixel.
-            let dst_row_base = py * buf_width as usize;
-            let atlas_row_base = ((entry.y + row) * atlas_w) as usize;
-            // Both `px` (via col_lo/col_hi) and `py` (via row_lo/row_hi) are
-            // now provably in-bounds, so the inner loop is a checkless write.
-            let dst_base = dst_row_base + (glyph_x0 + i64::from(col_lo)) as usize;
-            let atlas_base = atlas_row_base + (entry.x + col_lo) as usize;
-            for i in 0..(col_hi - col_lo) as usize {
-                let a = cache.atlas.data[atlas_base + i];
-                if a == 0 {
-                    continue;
-                }
-                let dst = &mut pixels[dst_base + i];
-                *dst = if a == 255 {
-                    fg_px
-                } else {
-                    fg.blend_glyph(bg, a, bg_alpha)
-                };
-            }
-        }
+        // The atlas blend is the shared kernel (see `crate::text::blit_glyph`).
+        // The glyph's pen origin is the cell's top-left (`px0`, `py0`); the
+        // kernel adds `entry.bearing_x`/`bearing_y` -- `bearing_y` is the
+        // already-resolved cell-top-to-glyph-top offset from
+        // `FontFace::cell_bearing_y`, used directly (never recombined with a
+        // separately-rounded ascender, which was the old baseline-jitter bug).
+        crate::text::blit_glyph(
+            canvas,
+            &cache.atlas,
+            &entry,
+            px0 as i32,
+            py0 as i32,
+            fg,
+            bg,
+            bg_alpha,
+        );
     }
 
     /// Blit every dirty row in `snap` into the canvas.

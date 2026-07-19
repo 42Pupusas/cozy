@@ -76,6 +76,7 @@ mod palette {
 /// Which module a rendered segment came from -- just enough to pick its
 /// color in `module_color`; not otherwise used for layout.
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Cpu/Mem: disabled in right_segments() per user request, kept for easy re-enable
 enum ModuleKind {
     Clock,
     Date,
@@ -269,8 +270,8 @@ impl Modules {
         vec![
             (ModuleKind::Battery, self.battery.clone()),
             (ModuleKind::Temp, self.temp.clone()),
-            (ModuleKind::Cpu, self.cpu.clone()),
-            (ModuleKind::Mem, self.mem.clone()),
+            // (ModuleKind::Cpu, self.cpu.clone()), // disabled per user request
+            // (ModuleKind::Mem, self.mem.clone()), // disabled per user request
             (ModuleKind::VolOut, self.vol_out.clone()),
             (ModuleKind::VolIn, self.vol_in.clone()),
             (ModuleKind::Brightness, self.brightness.clone()),

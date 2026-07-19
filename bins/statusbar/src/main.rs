@@ -32,6 +32,10 @@ const SLOW_PERIOD: Duration = Duration::from_secs(5); // wifi, bluetooth, volume
 /// longer period rather than sharing `FAST_PERIOD`.
 const CPU_PERIOD: Duration = Duration::from_millis(2000);
 
+/// Percentage points nudged per wheel detent when scroll-adjusting
+/// vol-out/vol-in/brightness.
+const SCROLL_STEP_PCT: i32 = 5;
+
 struct Modules {
     clock: String,
     date: String,
@@ -245,6 +249,16 @@ impl Modules {
         changed
     }
 
+    /// Immediately recompute vol-out/vol-in/brightness (skipping
+    /// `SLOW_PERIOD`'s cooldown) -- called right after a scroll-wheel
+    /// adjustment so the new value is visible on the very next frame
+    /// instead of waiting out the rest of that module's poll period.
+    fn force_refresh_controls(&mut self) {
+        self.vol_out = statusbar::modules::volume_out().unwrap_or_else(|| DASH.into());
+        self.vol_in = statusbar::modules::volume_in().unwrap_or_else(|| DASH.into());
+        self.brightness = statusbar::modules::brightness().unwrap_or_else(|| DASH.into());
+    }
+
     /// Left section, left-to-right draw order: the always-visible
     /// connectivity cluster (clock/date live in `right_segments` now).
     fn left_segments(&self) -> Vec<(ModuleKind, String)> {
@@ -288,7 +302,9 @@ fn paint(
     bg_alpha: u8,
     bar_height: i32,
     scale: i32,
+    segment_rects: &mut Vec<(ModuleKind, i32, i32)>,
 ) {
+    segment_rects.clear();
     let y = text.baseline_y(bar_height);
     let pad = 20 * scale;
     let gap = 18 * scale;
@@ -303,6 +319,7 @@ fn paint(
         let color = module_color(kind, &seg);
         text.draw_text_alpha(canvas, &seg, left_edge, y, color, bg, bg_alpha);
         let w = text.measure(&seg);
+        segment_rects.push((kind, left_edge, left_edge + w));
         left_edge += w + gap;
     }
 
@@ -320,6 +337,7 @@ fn paint(
             let color = module_color(*kind, seg);
             let w = text.measure(seg);
             text.draw_text_alpha(canvas, seg, x, y, color, bg, bg_alpha);
+            segment_rects.push((*kind, x, x + w));
             x += w + gap;
         }
     }
@@ -334,6 +352,7 @@ fn paint(
         let color = module_color(kind, &seg);
         text.draw_text_right_alpha(canvas, &seg, right_edge, y, color, bg, bg_alpha);
         let w = text.measure(&seg);
+        segment_rects.push((kind, right_edge - w, right_edge));
         right_edge -= w + gap;
     }
 }
@@ -375,6 +394,7 @@ fn main() {
 
     let mut modules = Modules::new();
     let bar_height = window.height();
+    let mut segment_rects: Vec<(ModuleKind, i32, i32)> = Vec::new();
 
     loop {
         let changed = modules.refresh();
@@ -382,7 +402,16 @@ fn main() {
             window.request_redraw();
         }
         match window.tick(|canvas| {
-            paint(canvas, &modules, &mut text, bg, bg_alpha, bar_height, scale);
+            paint(
+                canvas,
+                &modules,
+                &mut text,
+                bg,
+                bg_alpha,
+                bar_height,
+                scale,
+                &mut segment_rects,
+            );
         }) {
             Ok(true) => {}
             Ok(false) => break,
@@ -391,6 +420,45 @@ fn main() {
                 break;
             }
         }
+
+        // Scroll-to-adjust: a wheel event over the vol-out/vol-in/brightness
+        // segment nudges that control by a fixed step per detent, then
+        // forces an immediate module refresh so the change is visible right
+        // away instead of waiting out that module's poll period.
+        let scrolls = window.take_scroll();
+        if !scrolls.is_empty() {
+            let px = window.pointer_pos().x;
+            if let Some((kind, ..)) = segment_rects
+                .iter()
+                .find(|(_, x0, x1)| px >= *x0 && px < *x1)
+            {
+                let steps: i32 = scrolls
+                    .iter()
+                    .map(|v| {
+                        let s = ((v.abs() + 7) / 15).max(1);
+                        if *v < 0 { -s.max(1) } else { s.max(1) }
+                    })
+                    .sum();
+                // Wheel up (negative) = increase; wheel down (positive) =
+                // decrease -- matches the terminal's own scroll-up-goes-back
+                // convention and the usual volume-knob feel (push up = louder).
+                let delta = -steps * SCROLL_STEP_PCT;
+                match kind {
+                    ModuleKind::VolOut => statusbar::modules::adjust_volume_out(delta),
+                    ModuleKind::VolIn => statusbar::modules::adjust_volume_in(delta),
+                    ModuleKind::Brightness => statusbar::modules::adjust_brightness(delta),
+                    _ => {}
+                }
+                if matches!(
+                    kind,
+                    ModuleKind::VolOut | ModuleKind::VolIn | ModuleKind::Brightness
+                ) {
+                    modules.force_refresh_controls();
+                    window.request_redraw();
+                }
+            }
+        }
+
         // Poll at ~10fps when idle -- modules refresh on their own slower
         // cadences above; this just keeps the Wayland event loop responsive
         // (resize/output changes) without busy-spinning.

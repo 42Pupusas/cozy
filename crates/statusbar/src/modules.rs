@@ -222,6 +222,39 @@ pub fn volume_in() -> Option<String> {
     amixer_volume("Capture")
 }
 
+/// Nudge the default sink (output) volume by `delta_pct` percentage points
+/// (negative to lower), via `pactl` (falls back to `amixer`). Clamped to
+/// `0..=100` by the underlying tool, not here. Fire-and-forget: errors are
+/// swallowed since the next module poll will just show whatever the mixer
+/// actually landed on.
+pub fn adjust_volume_out(delta_pct: i32) {
+    adjust_volume("@DEFAULT_SINK@", "Master", delta_pct);
+}
+
+/// Nudge the default source (input/mic) volume -- see [`adjust_volume_out`].
+pub fn adjust_volume_in(delta_pct: i32) {
+    adjust_volume("@DEFAULT_SOURCE@", "Capture", delta_pct);
+}
+
+fn adjust_volume(pactl_target: &str, amixer_control: &str, delta_pct: i32) {
+    let kind = if pactl_target.contains("SOURCE") {
+        "set-source-volume"
+    } else {
+        "set-sink-volume"
+    };
+    let sign = if delta_pct >= 0 { "+" } else { "-" };
+    let arg = format!("{sign}{}%", delta_pct.abs());
+    let ok = Command::new("pactl")
+        .args([kind, pactl_target, &arg])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        let _ = Command::new("amixer")
+            .args(["set", amixer_control, &format!("{}%{sign}", delta_pct.abs())])
+            .status();
+    }
+}
+
 fn pactl_volume(target: &str) -> Option<String> {
     let kind = if target.contains("SOURCE") {
         "get-source-volume"
@@ -312,6 +345,46 @@ pub fn brightness() -> Option<String> {
         return Some(format!("{pct:>3}% 󰃠"));
     }
     None
+}
+
+/// Nudge screen backlight brightness by `delta_pct` percentage points
+/// (negative to dim), via `brightnessctl` if installed, else a direct
+/// `/sys/class/backlight/*/brightness` write (works without root when a
+/// udev rule grants the `video` group write access, which is the common
+/// desktop default -- e.g. `73-seat-backlight.rules` upstream udev/systemd).
+/// Fire-and-forget, same posture as [`adjust_volume_out`].
+pub fn adjust_brightness(delta_pct: i32) {
+    let sign = if delta_pct >= 0 { "+" } else { "-" };
+    let arg = format!("{sign}{}%", delta_pct.abs());
+    let ok = Command::new("brightnessctl")
+        .args(["set", &arg])
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok {
+        return;
+    }
+    let Ok(dir) = fs::read_dir("/sys/class/backlight") else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let path = entry.path();
+        let Some(cur) = read_trim(path.join("brightness")).and_then(|s| s.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let Some(max) = read_trim(path.join("max_brightness")).and_then(|s| s.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if max <= 0 {
+            continue;
+        }
+        let magnitude = (max * i64::from(delta_pct.abs()) / 100).max(1);
+        let step = if delta_pct >= 0 { magnitude } else { -magnitude };
+        let new_val = (cur + step).clamp(0, max);
+        let _ = fs::write(path.join("brightness"), new_val.to_string());
+        return;
+    }
 }
 
 fn read_trim(path: impl AsRef<std::path::Path>) -> Option<String> {

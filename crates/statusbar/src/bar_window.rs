@@ -17,18 +17,18 @@
 //! recreate the two `wl_buffer`s carved out of it.
 
 use platform::conn::{Conn, ConnError, Sender, WindowSender};
-use platform::draw::{Canvas, Color};
+use platform::draw::{Canvas, Color, Point};
 use platform::event::RawEvent;
 use platform::font;
 use platform::id::{
-    BufferId, CompositorId, LayerShellId, LayerSurfaceId, ObjectId, OutputId, PoolId, RegistryId,
-    ShmId, SurfaceId,
+    BufferId, CompositorId, LayerShellId, LayerSurfaceId, ObjectId, OutputId, PointerId, PoolId,
+    RegistryId, SeatId, ShmId, SurfaceId,
 };
 use platform::protocol::{
     self as proto, Anchor, BufferEvent, BufferRequest, CallbackEvent, CompositorRequest,
     DisplayEvent, DisplayRequest, Format, KeyboardInteractivity, Layer, LayerShellRequest,
-    LayerSurfaceEvent, LayerSurfaceRequest, RegistryEvent, RegistryRequest, ShmPoolRequest,
-    ShmRequest, SurfaceRequest,
+    LayerSurfaceEvent, LayerSurfaceRequest, PointerEvent, RegistryEvent, RegistryRequest,
+    SeatCapability, SeatEvent, SeatRequest, ShmPoolRequest, ShmRequest, SurfaceRequest,
 };
 use platform::sys::ShmBuffer;
 use platform::wire::{MessageBuilder, WireEvent};
@@ -93,6 +93,19 @@ pub struct BarWindow {
     height: i32,
     scale: i32,
 
+    seat: SeatId,
+    pointer: Option<PointerId>,
+    /// Latest known pointer position, physical pixels, surface-local
+    /// (`(0,0)` at the bar's top-left) -- updated on Enter/Motion, read by
+    /// [`BarWindow::pointer_pos`] so the caller can hit-test which module
+    /// segment a scroll landed on.
+    pointer_pos: Point,
+    /// Pending scroll deltas from `wl_pointer.axis` (vertical only), drained
+    /// by [`BarWindow::take_scroll`] once per `tick`. One entry per axis
+    /// event; positive = wheel down, negative = wheel up (same sign
+    /// convention as `platform::TermWindow`'s scroll handling).
+    pending_scroll: Vec<i32>,
+
     width: i32,
     frames: [Frame; 2],
     shm_mem: ShmBuffer,
@@ -140,6 +153,7 @@ struct Globals {
     compositor: CompositorId,
     shm: ShmId,
     layer_shell: LayerShellId,
+    seat: SeatId,
     output: Option<OutputId>,
 }
 
@@ -171,6 +185,7 @@ impl BarWindow {
             compositor,
             shm,
             layer_shell,
+            seat,
             output,
         } = Self::discover(&mut sender, &mut events)?;
 
@@ -266,6 +281,10 @@ impl BarWindow {
             edge,
             height: px_height,
             scale,
+            seat,
+            pointer: None,
+            pointer_pos: Point::new(0, 0),
+            pending_scroll: Vec::new(),
             width: INITIAL_WIDTH,
             frames,
             shm_mem,
@@ -296,6 +315,21 @@ impl BarWindow {
     /// Mark the bar dirty so the next `tick` repaints and presents.
     pub fn request_redraw(&mut self) {
         self.dirty = true;
+    }
+
+    /// Latest known pointer position, physical pixels, surface-local
+    /// (`(0,0)` at the bar's top-left).
+    #[must_use]
+    pub fn pointer_pos(&self) -> Point {
+        self.pointer_pos
+    }
+
+    /// Drain and return every scroll delta queued since the last call.
+    /// Positive = wheel down/away, negative = wheel up/toward -- one entry
+    /// per `wl_pointer.axis` event, already converted from `wl_fixed` to
+    /// pixels (a typical detent is ~15).
+    pub fn take_scroll(&mut self) -> Vec<i32> {
+        std::mem::take(&mut self.pending_scroll)
     }
 
     /// Set the color the canvas is cleared to before each frame's `paint`
@@ -376,6 +410,47 @@ impl BarWindow {
             if ev.is(cb) && ev.event::<CallbackEvent>() == Some(CallbackEvent::Done) {
                 self.frame_ready = true;
                 self.frame_cb = None;
+                return Ok(());
+            }
+        }
+
+        // wl_seat.capabilities
+        if ev.is(self.seat) && ev.event::<SeatEvent>() == Some(SeatEvent::Capabilities) {
+            let caps = ev.arg(0);
+            if self.pointer.is_none() && SeatCapability::Pointer.in_mask(caps) {
+                let pointer: PointerId = self.window_tx.alloc_id();
+                self.window_tx.request(
+                    MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer),
+                );
+                self.pointer = Some(pointer);
+            }
+            return Ok(());
+        }
+
+        // wl_pointer.* -- only Enter/Motion (track position) and Axis
+        // (queue a scroll delta) matter for a bar with no
+        // buttons/selection/drag of its own.
+        if let Some(pointer) = self.pointer {
+            if ev.is(pointer) {
+                match ev.event::<PointerEvent>() {
+                    Some(PointerEvent::Enter) => {
+                        self.pointer_pos = ev.point(2, 3);
+                    }
+                    Some(PointerEvent::Motion) => {
+                        self.pointer_pos = ev.point(1, 2);
+                    }
+                    Some(PointerEvent::Axis) => {
+                        // Axis args: (time, axis, value). axis 0 = vertical;
+                        // value is wl_fixed (24.8) -- positive = wheel down,
+                        // negative = wheel up, same convention as
+                        // `platform::TermWindow`'s scroll handling.
+                        let axis = ev.arg(1);
+                        if axis == 0 {
+                            self.pending_scroll.push(ev.fixed(2).to_pixels());
+                        }
+                    }
+                    _ => {}
+                }
                 return Ok(());
             }
         }
@@ -559,9 +634,10 @@ impl BarWindow {
         let mut compositor: Option<CompositorId> = None;
         let mut shm: Option<ShmId> = None;
         let mut layer_shell: Option<LayerShellId> = None;
+        let mut seat: Option<SeatId> = None;
         let mut output: Option<OutputId> = None;
 
-        while compositor.is_none() || shm.is_none() || layer_shell.is_none() {
+        while compositor.is_none() || shm.is_none() || layer_shell.is_none() || seat.is_none() {
             let event = events.pop_block().ok_or(Error::ReaderStopped)?;
             let RawEvent::Bytes(bytes) = event else {
                 continue;
@@ -599,6 +675,10 @@ impl BarWindow {
                         let v = proto::ZWLR_LAYER_SHELL_V1.version.min(version);
                         layer_shell = Some(Self::bind(sender, registry, name, &interface, v)?);
                     }
+                    s if s == proto::WL_SEAT.name && seat.is_none() => {
+                        let v = proto::WL_SEAT.version.min(version);
+                        seat = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
                     s if s == proto::WL_OUTPUT.name && output.is_none() => {
                         let v = proto::WL_OUTPUT.version.min(version);
                         output = Some(Self::bind(sender, registry, name, &interface, v)?);
@@ -611,6 +691,7 @@ impl BarWindow {
             compositor: compositor.ok_or(Error::ReaderStopped)?,
             shm: shm.ok_or(Error::ReaderStopped)?,
             layer_shell: layer_shell.ok_or(Error::ReaderStopped)?,
+            seat: seat.ok_or(Error::ReaderStopped)?,
             output,
         })
     }

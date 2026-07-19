@@ -204,7 +204,8 @@ impl TextRenderer {
         }
     }
 
-    /// Right-align `text` so its last glyph ends at `right_x`.
+    /// Right-align `text` so its last glyph ends at `right_x`. Returns the
+    /// measured width -- see [`Self::draw_text_right_alpha`].
     pub fn draw_text_right(
         &mut self,
         canvas: &mut Canvas,
@@ -213,12 +214,14 @@ impl TextRenderer {
         y: i32,
         fg: Color,
         bg: Color,
-    ) {
-        self.draw_text_right_alpha(canvas, text, right_x, y, fg, bg, 255);
+    ) -> i32 {
+        self.draw_text_right_alpha(canvas, text, right_x, y, fg, bg, 255)
     }
 
     /// [`Self::draw_text_right`] with an explicit background alpha -- see
-    /// [`Self::draw_text_alpha`].
+    /// [`Self::draw_text_alpha`]. Returns the measured width, so callers
+    /// that also need it (e.g. for hit-testing) don't have to pay for a
+    /// second glyph walk via a separate `measure` call.
     #[allow(clippy::too_many_arguments)]
     pub fn draw_text_right_alpha(
         &mut self,
@@ -229,9 +232,10 @@ impl TextRenderer {
         fg: Color,
         bg: Color,
         bg_alpha: u8,
-    ) {
+    ) -> i32 {
         let w = self.measure(text);
         self.draw_text_alpha(canvas, text, right_x - w, y, fg, bg, bg_alpha);
+        w
     }
 }
 

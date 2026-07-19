@@ -20,8 +20,8 @@
 //! one core for the whole window.
 use pty::{Pty, WinSize};
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const WIN: WinSize = WinSize {
@@ -53,7 +53,7 @@ fn process_cpu_ticks() -> u64 {
 /// `sysconf(_SC_CLK_TCK)` is 100 on essentially every Linux system; using
 /// the near-universal constant avoids a libc dependency, with a wide
 /// tolerance margin in the assertion below to absorb any drift.
-fn clock_ticks_per_sec() -> u64 {
+const fn clock_ticks_per_sec() -> u64 {
     100
 }
 
@@ -61,11 +61,11 @@ fn clock_ticks_per_sec() -> u64 {
 fn idle_loop_burns_negligible_cpu() {
     let wake = waker::Waker::new().expect("eventfd");
     let shutdown = Arc::new(AtomicBool::new(false));
-    let pty = Pty::spawn("/bin/cat", &[], WIN, wake.raw_fd(), Arc::clone(&shutdown))
-        .expect("Pty::spawn");
+    let pty =
+        Pty::spawn("/bin/cat", &[], WIN, wake.raw_fd(), Arc::clone(&shutdown)).expect("Pty::spawn");
 
     let handle = std::thread::spawn(move || {
-        let _ = pty.run(|| None, |_output: &[u8]| {});
+        let _ = pty.run(|| None, |_output: &[u8]| true);
     });
 
     // Let the loop settle into (what should be) a parked wait.
@@ -89,6 +89,9 @@ fn idle_loop_burns_negligible_cpu() {
     rx.recv_timeout(Duration::from_secs(5))
         .expect("Pty::run did not exit after shutdown flag was set + wake");
 
+    // Tick counts here are small (a few hundred over a 5s probe window), so
+    // the f64 conversion is exact -- nowhere near the 2^52 precision cliff.
+    #[allow(clippy::cast_precision_loss)]
     let cpu_secs = (ticks_after - ticks_before) as f64 / clock_ticks_per_sec() as f64;
     let wall_secs = wall_elapsed.as_secs_f64();
 

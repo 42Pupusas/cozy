@@ -245,12 +245,10 @@ impl Modules {
         changed
     }
 
-    /// Left section, left-to-right draw order: clock + date lead, followed
-    /// by the always-visible connectivity cluster.
+    /// Left section, left-to-right draw order: the always-visible
+    /// connectivity cluster (clock/date live in `right_segments` now).
     fn left_segments(&self) -> Vec<(ModuleKind, String)> {
         vec![
-            (ModuleKind::Clock, self.clock.clone()),
-            (ModuleKind::Date, self.date.clone()),
             (ModuleKind::Wifi, self.wifi.clone()),
             (ModuleKind::Bluetooth, self.bluetooth.clone()),
         ]
@@ -268,6 +266,8 @@ impl Modules {
     /// everything not claimed by `left_segments`.
     fn right_segments(&self) -> Vec<(ModuleKind, String)> {
         vec![
+            (ModuleKind::Clock, self.clock.clone()),
+            (ModuleKind::Date, self.date.clone()),
             (ModuleKind::Battery, self.battery.clone()),
             (ModuleKind::Temp, self.temp.clone()),
             // (ModuleKind::Cpu, self.cpu.clone()), // disabled per user request

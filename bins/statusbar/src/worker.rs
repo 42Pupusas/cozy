@@ -212,15 +212,22 @@ impl State {
         changed
     }
 
-    /// Immediately recompute just the one control `kind` was scrolled on
+    /// Immediately re-read just the one control `kind` was scrolled on
     /// (skipping `SLOW_PERIOD`'s cooldown), debounced to at most once per
-    /// `CONTROL_REFRESH_DEBOUNCE_MS` so a burst of wheel-detent events
-    /// doesn't run a `pactl get-*`/sysfs read on every single accumulator
-    /// drain. Only needed as a periodic correction against whatever
-    /// `apply_optimistic` already painted (external volume changes, the
-    /// mixer clamping at 0/100, ...) -- see `apply_optimistic`'s doc for
-    /// why the *visible* number no longer waits on this. Returns whether
-    /// the snapshot changed.
+    /// `CONTROL_REFRESH_DEBOUNCE_MS`. NOT called right after firing a
+    /// scroll-triggered mutation any more -- `adjust_volume_out`/etc. spawn
+    /// `pactl`/write sysfs and return immediately without waiting for the
+    /// change to land (deliberately, to keep the worker non-blocking; see
+    /// `modules::adjust_volume`'s doc), so a readback moments later would
+    /// race it and often observe the *pre*-mutation value. `apply_optimistic`
+    /// then keeps compounding its next delta on top of that stale reading,
+    /// which is exactly the drift bug this once caused -- see
+    /// `apply_pending_scroll`, which now advances `*_known` by the applied
+    /// delta directly instead of racing a readback. This is kept only for
+    /// external callers that don't have a just-applied delta to reason
+    /// about (there are none currently -- reserved for future use, e.g. a
+    /// keybind-triggered mute toggle). Returns whether the snapshot changed.
+    #[allow(dead_code)]
     fn force_refresh_control(&mut self, kind: ModuleKind) -> bool {
         let now = Instant::now();
         if now.duration_since(self.last_control_refresh) < Duration::from_millis(CONTROL_REFRESH_DEBOUNCE_MS)
@@ -258,6 +265,46 @@ impl State {
                 } else {
                     false
                 }
+            }
+            _ => false,
+        }
+    }
+
+    /// Advance the cached `*_known` reading for `kind` by `delta_pct`
+    /// (clamped to `0..=100`) and repaint the snapshot from it -- called
+    /// right after actually spawning the real `pactl`/sysfs mutation for
+    /// that same delta, so the cache stays the ground truth for the next
+    /// `apply_optimistic` call without needing a readback that would race
+    /// the (fire-and-forget, non-blocking) mutation. Any drift this misses
+    /// -- the mixer clamping oddly, another process changing it
+    /// concurrently -- gets corrected by the next `SLOW_PERIOD` `refresh`
+    /// (every 5s), same as before this optimistic path existed. Returns
+    /// whether the snapshot changed.
+    fn advance_known(&mut self, kind: ModuleKind, delta_pct: i32) -> bool {
+        match kind {
+            ModuleKind::VolOut => {
+                let known = self.vol_out_known.get_or_insert_with(KnownPct::default);
+                known.pct = (known.pct as i32 + delta_pct).clamp(0, 100) as u32;
+                let s = statusbar::modules::format_volume(false, known.pct, known.muted);
+                let changed = self.snap.vol_out != s;
+                self.snap.vol_out = s;
+                changed
+            }
+            ModuleKind::VolIn => {
+                let known = self.vol_in_known.get_or_insert_with(KnownPct::default);
+                known.pct = (known.pct as i32 + delta_pct).clamp(0, 100) as u32;
+                let s = statusbar::modules::format_volume(true, known.pct, known.muted);
+                let changed = self.snap.vol_in != s;
+                self.snap.vol_in = s;
+                changed
+            }
+            ModuleKind::Brightness => {
+                let known = self.brightness_known.get_or_insert_with(KnownPct::default);
+                known.pct = (known.pct as i32 + delta_pct).clamp(0, 100) as u32;
+                let s = statusbar::modules::format_brightness(known.pct);
+                let changed = self.snap.brightness != s;
+                self.snap.brightness = s;
+                changed
             }
             _ => false,
         }
@@ -373,7 +420,10 @@ impl State {
             ModuleKind::Brightness => statusbar::modules::adjust_brightness(delta),
             _ => {}
         }
-        self.force_refresh_control(kind)
+        // Commit the delta straight into `*_known` instead of racing a
+        // readback against the fire-and-forget mutation above -- see
+        // `advance_known`'s doc.
+        self.advance_known(kind, delta)
     }
 }
 

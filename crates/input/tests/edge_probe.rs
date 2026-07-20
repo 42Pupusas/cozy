@@ -189,9 +189,16 @@ fn kitty_all_modifiers_combine() {
 /// mode, not collapsed into press.
 #[test]
 fn kitty_repeated_state_reports_event_type_2() {
+    // Needs both "report all keys" (0b1000, so a bare letter gets CSI-u form
+    // at all) and "report event types" (0b10, so repeat is distinguishable
+    // from press) -- a freshly pushed Kitty mode with neither flag set
+    // (what most apps, including `fish`, actually leave behind) instead
+    // sends the letter as plain legacy text, indistinguishable from a
+    // fresh press, exactly like legacy mode's own key-repeat.
     let e_kitty = {
         let mut e = Encoder::new();
         e.keyboard_mode = KeyboardMode::Kitty;
+        e.kitty_flags = 0b1000 | 0b10;
         e
     };
     let mut b = [0u8; 32];

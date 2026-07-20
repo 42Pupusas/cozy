@@ -7,6 +7,16 @@
 use crate::key::{Key, KeyState, Modifiers};
 use crate::mouse::{ButtonState, MouseEvent, MouseMode};
 
+// ── Kitty progressive-enhancement flag bits (`CSI = flags ; mode u`) ──────────
+// See <https://sw.kovidgoyal.net/kitty/keyboard-protocol/#progressive-enhancement>.
+
+/// `0b1`: disambiguate escape codes (Esc/alt+key/ctrl+key/... use `CSI u`).
+const KITTY_DISAMBIGUATE: u8 = 0b1;
+/// `0b10`: report key repeat and release events (not just press).
+const KITTY_REPORT_EVENT_TYPES: u8 = 0b10;
+/// `0b1000`: report every key, including plain text keys, as `CSI u`.
+const KITTY_REPORT_ALL_KEYS: u8 = 0b1000;
+
 /// Which keyboard-encoding protocol is active.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum KeyboardMode {
@@ -149,9 +159,16 @@ impl Encoder {
         mods: Modifiers,
         buf: &mut [u8],
     ) -> Option<usize> {
-        // Kitty mode reports all state transitions; legacy only cares about press/repeat.
+        // Legacy/xterm only emit on press/repeat. Kitty emits *release* events
+        // only when the app enabled the "report event types" progressive-
+        // enhancement flag (bit 0b10). Without it, a release must not be sent:
+        // apps that didn't ask for event types (e.g. fish) re-insert the
+        // release as a second press, so every typed key registers twice.
         let report = match self.keyboard_mode {
-            KeyboardMode::Kitty => true,
+            KeyboardMode::Kitty => {
+                matches!(state, KeyState::Pressed | KeyState::Repeated)
+                    || self.kitty_flags & KITTY_REPORT_EVENT_TYPES != 0
+            }
             _ => matches!(state, KeyState::Pressed | KeyState::Repeated),
         };
         if !report {
@@ -469,7 +486,6 @@ impl Encoder {
 
     // ── Kitty protocol ────────────────────────────────────────────────────────
 
-    #[allow(clippy::unused_self)] // method form keeps the encoder API uniform
     fn encode_kitty(
         &self,
         key: Key,
@@ -477,12 +493,70 @@ impl Encoder {
         mods: Modifiers,
         buf: &mut [u8],
     ) -> Option<usize> {
+        // Progressive-enhancement flags that change *which* keys get CSI-u
+        // treatment at all -- distinct from `KITTY_REPORT_EVENT_TYPES`
+        // (already gated in `encode_key`), which only changes whether a
+        // release is reported once we've decided to emit CSI-u.
+        //
+        // Per the kitty spec, without these flags a freshly-pushed Kitty
+        // mode (flags == 0, exactly what `fish` leaves behind for anything
+        // it execs -- fish itself only ever requests 0b1) must still emit
+        // plain legacy bytes for text keys and the functional-key table,
+        // *not* `CSI u` escape codes. Skipping this was the actual bug:
+        // every character, including bare letters typed into a password
+        // prompt, was being wrapped in `CSI <code>;<mod>:<evt>u` -- a raw-
+        // mode reader that only understands single bytes (`sudo`/`getpass`,
+        // which never negotiates Kitty mode itself) saw that escape code as
+        // several bogus keystrokes instead of the one letter that was typed.
+        let report_all_keys = self.kitty_flags & KITTY_REPORT_ALL_KEYS != 0;
+        let disambiguate = self.kitty_flags & KITTY_DISAMBIGUATE != 0;
+        // Text keys only report *release* once "report all keys" is on (a
+        // repeat still just resends the same text, exactly as legacy mode's
+        // key-repeat already does -- only release has no representation of
+        // its own for a key that produces text).
+        let is_bare_text = matches!(key, Key::Char(_)) && !mods.ctrl() && !mods.alt();
+        if is_bare_text && !report_all_keys && matches!(state, KeyState::Released) {
+            return None;
+        }
+        // The legacy text-key algorithm (alt -> ESC prefix, else ctrl -> C0
+        // table, else shift -> shifted glyph, else bare) only ever consults
+        // alt/ctrl/shift. Any other modifier active (super/hyper/meta) has
+        // no legacy representation at all -- "any other combination... is
+        // output as the appropriate CSI u escape code", unconditionally,
+        // not gated behind any progressive-enhancement flag.
+        let legacy_representable = !mods.sup();
+        if !report_all_keys && legacy_representable {
+            // Bare text keys and Enter/Tab/Backspace are *always* sent as
+            // legacy bytes -- the spec's explicit exception, so `reset`
+            // still works after a crashed program leaves Kitty mode enabled
+            // -- and every other key falls back to legacy too unless the
+            // app asked to disambiguate escape codes.
+            let always_legacy = matches!(key, Key::Enter | Key::Backspace | Key::Tab) || is_bare_text;
+            if (always_legacy || !disambiguate)
+                && let Some(n) = self.encode_legacy(key, mods, buf)
+            {
+                return Some(n);
+            }
+            // No legacy representation (PUA-only keys, bare modifiers) --
+            // fall through to CSI-u, the spec's catch-all for anything
+            // outside the legacy table.
+        }
         // Kitty: `CSI <num> ; <modifier> : <event_type> <terminator>`
         // event_type: 1=press 2=repeat 3=release.
         let mod_param = mods.kitty_param().unwrap_or(1);
+        let report_events = self.kitty_flags & KITTY_REPORT_EVENT_TYPES != 0;
         let event_type: u8 = match state {
             KeyState::Pressed => 1,
-            KeyState::Repeated => 2,
+            // Without report-event-types, repeats are indistinguishable from
+            // presses (spec: "key repeat events are treated as key press
+            // events").
+            KeyState::Repeated => {
+                if report_events {
+                    2
+                } else {
+                    1
+                }
+            }
             KeyState::Released => 3,
         };
         let (number, terminator) = match KittyKey::from_key(key)? {
@@ -939,8 +1013,13 @@ mod tests {
 
     #[test]
     fn kitty_mode_plain() {
+        // With "report all keys" (0b1000) even a bare letter gets full CSI-u
+        // form -- this is the mode games/text-UIs opt into explicitly; it is
+        // NOT what a freshly pushed Kitty mode with no flags does (see
+        // `plain_text_keys_stay_legacy_bytes_with_zero_kitty_flags`).
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        e.kitty_flags = 0b1000;
         let mut b = buf();
         let n = e
             .encode_key(Key::Char('a'), KeyState::Pressed, Modifiers::NONE, &mut b)
@@ -953,6 +1032,7 @@ mod tests {
     fn kitty_functional_keys_use_correct_terminators() {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        e.kitty_flags = 0b1;
         // Letter-form functionals: CSI 1 ; <mod> : <evt> <letter>
         assert_eq!(encode(&e, Key::Up, Modifiers::NONE), b"\x1b[1;1:1A");
         assert_eq!(encode(&e, Key::Home, Modifiers::NONE), b"\x1b[1;1:1H");
@@ -981,6 +1061,18 @@ mod tests {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
         let mut b = buf();
+        // Without the "report event types" flag (0b10) a release must NOT be
+        // reported -- apps that didn't ask for it re-insert it as a second
+        // press, doubling every typed key.
+        assert!(
+            e.encode_key(Key::Char('a'), KeyState::Released, Modifiers::NONE, &mut b)
+                .is_none()
+        );
+        // With report-event-types AND report-all-keys, a release of a plain
+        // text key reports full CSI-u event type 3 (report-all-keys is
+        // needed too -- otherwise a release of a text key still has no
+        // CSI-u representation to report release-vs-press *of*).
+        e.kitty_flags = 0b10 | 0b1000;
         let n = e
             .encode_key(Key::Char('a'), KeyState::Released, Modifiers::NONE, &mut b)
             .unwrap();
@@ -1198,6 +1290,7 @@ mod tests {
     fn kitty_unmapped_key_produces_none() {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        e.kitty_flags = 0b1000; // report all keys, so this is genuinely unmapped
         let mut b = buf();
         let r = e.encode_key(Key::KpUp, KeyState::Pressed, Modifiers::NONE, &mut b);
         assert!(r.is_none());
@@ -1207,6 +1300,10 @@ mod tests {
     fn kitty_navigation_letter_form_keys() {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        // Functional/navigation keys get CSI-u treatment once "disambiguate
+        // escape codes" (0b1) is requested -- exactly what fish always asks
+        // for, so this is the realistic baseline for these keys.
+        e.kitty_flags = 0b1;
         assert_eq!(
             kitty(&e, Key::Up, KeyState::Pressed, Modifiers::NONE),
             b"\x1b[1;1:1A"
@@ -1237,6 +1334,7 @@ mod tests {
     fn kitty_tilde_form_keys() {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        e.kitty_flags = 0b1;
         assert_eq!(
             kitty(&e, Key::Insert, KeyState::Pressed, Modifiers::NONE),
             b"\x1b[2;1:1~"
@@ -1259,6 +1357,7 @@ mod tests {
     fn kitty_function_keys_f1_through_f12() {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        e.kitty_flags = 0b1;
         assert_eq!(
             kitty(&e, Key::F(1), KeyState::Pressed, Modifiers::NONE),
             b"\x1b[1;1:1P"
@@ -1313,6 +1412,10 @@ mod tests {
     fn kitty_special_pua_only_keys() {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        // KpEnter has a legacy fallback (`\r`, same as plain Enter) that
+        // takes priority unless the app asked to see it as a distinct key
+        // via "report all keys" -- exercise that mode to see its PUA form.
+        e.kitty_flags = 0b1000;
         assert_eq!(
             kitty(&e, Key::KpEnter, KeyState::Pressed, Modifiers::NONE),
             b"\x1b[57414;1:1u"
@@ -1335,6 +1438,10 @@ mod tests {
     fn kitty_bare_modifier_keys_report_their_own_pua_codepoints() {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        // Modifier-key press events are only reported at all once "report
+        // all keys" is requested (spec: "with this mode, events for pressing
+        // modifier keys are reported").
+        e.kitty_flags = 0b1000;
         assert_eq!(
             kitty(&e, Key::Shift, KeyState::Pressed, Modifiers::NONE),
             b"\x1b[57441;1:1u"
@@ -1357,6 +1464,11 @@ mod tests {
     fn kitty_control_chars_use_their_c0_codepoint() {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        // Enter/Backspace/Tab keep their legacy bytes even with "disambiguate"
+        // on (the spec's explicit `reset`-after-crash exception) -- only
+        // "report all keys" gives them CSI-u form. Esc has no legacy form of
+        // its own under Kitty disambiguation, so it needs only that flag.
+        e.kitty_flags = 0b1000;
         assert_eq!(
             kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE),
             b"\x1b[13;1:1u"
@@ -1376,13 +1488,54 @@ mod tests {
     }
 
     #[test]
+    fn enter_backspace_tab_keep_legacy_bytes_under_disambiguate_alone() {
+        // Without "report all keys", Enter/Backspace/Tab must NOT switch to
+        // CSI-u even once "disambiguate" is on -- this is what lets `reset`
+        // still work at a shell prompt after a crashed program leaves Kitty
+        // mode enabled, and is exactly the case `fish` leaves other programs
+        // in (fish requests only 0b1, never 0b1000).
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        e.kitty_flags = 0b1;
+        assert_eq!(kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE), b"\r");
+        assert_eq!(
+            kitty(&e, Key::Backspace, KeyState::Pressed, Modifiers::NONE),
+            b"\x7f"
+        );
+        assert_eq!(kitty(&e, Key::Tab, KeyState::Pressed, Modifiers::NONE), b"\t");
+    }
+
+    #[test]
+    fn plain_text_keys_stay_legacy_bytes_with_zero_kitty_flags() {
+        // The actual regression this module exists to prevent: a freshly
+        // pushed Kitty mode with no flags set (what `fish` leaves behind for
+        // anything it execs, since fish itself only ever requests 0b1) must
+        // encode a bare letter as its own UTF-8 byte, not `CSI 97;1:1u`.
+        // Getting this wrong meant every keystroke typed into a raw-mode
+        // password reader (which never negotiates Kitty mode itself) showed
+        // up as several bogus characters instead of the one that was typed.
+        let e = {
+            let mut e = enc();
+            e.keyboard_mode = KeyboardMode::Kitty;
+            e
+        };
+        assert_eq!(kitty(&e, Key::Char('a'), KeyState::Pressed, Modifiers::NONE), b"a");
+        assert_eq!(kitty(&e, Key::Char('Z'), KeyState::Pressed, Modifiers::SHIFT), b"Z");
+        assert_eq!(kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE), b"\r");
+    }
+
+    #[test]
     fn kitty_repeat_state_reports_event_type_2_uniformly() {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
+        // report-all-keys so plain 'a' gets CSI-u form, report-event-types
+        // so the repeat is distinguishable (event type 2) from a press.
+        e.kitty_flags = 0b1000 | 0b10;
         assert_eq!(
             kitty(&e, Key::Char('a'), KeyState::Repeated, Modifiers::NONE),
             b"\x1b[97;1:2u"
         );
+        e.kitty_flags = 0b1 | 0b10;
         assert_eq!(
             kitty(&e, Key::Up, KeyState::Repeated, Modifiers::NONE),
             b"\x1b[1;1:2A"

@@ -7,7 +7,20 @@ use crate::{
     tables::{Cmap, GlyphId, Head, Hhea, Hmtx, Loca, Maxp},
 };
 
-const JBM: &str = "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf";
+/// Fixture-font candidates, tried in order. Any glyf-based monospace TTF
+/// with ASCII coverage satisfies these tests; `JetBrains` Mono is preferred
+/// but Debian, Arch, and Fedora all ship it (or a stand-in) at different
+/// paths — same fallback posture as `benches/statusbar/benches/text.rs`.
+const FIXTURE_CANDIDATES: &[&str] = &[
+    "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+    "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
+    "/usr/share/fonts/jetbrains-mono/JetBrainsMono-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+];
 const PX: f32 = 16.0;
 
 /// Monochrome emoji fixture (Noto Emoji), checked into `assets/fonts/` -- used
@@ -27,8 +40,15 @@ const NOTO_EMOJI: &str = concat!(
 struct Jbm;
 
 impl Jbm {
+    fn path() -> &'static str {
+        FIXTURE_CANDIDATES
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .expect("no fixture font found — install fonts-jetbrains-mono (or DejaVu/Noto/Liberation Mono)")
+    }
+
     fn bytes() -> Vec<u8> {
-        std::fs::read(JBM).expect("JetBrains Mono not found — install fonts-jetbrains-mono")
+        std::fs::read(Self::path()).expect("fixture font vanished between exists() and read()")
     }
 }
 
@@ -343,7 +363,7 @@ fn atlas_packs_without_overflow() {
 
 #[test]
 fn fontface_loads_and_has_sane_metrics() {
-    let face = FontFace::load(JBM, PX).unwrap();
+    let face = FontFace::load(Jbm::path(), PX).unwrap();
     assert!(
         face.line.ascender > 0.0,
         "ascender = {}",
@@ -364,7 +384,7 @@ fn fontface_loads_and_has_sane_metrics() {
 
 #[test]
 fn fontface_rasterize_m_nonzero() {
-    let mut face = FontFace::load(JBM, PX).unwrap();
+    let mut face = FontFace::load(Jbm::path(), PX).unwrap();
     let g = face.rasterize('M' as u32);
     assert!(g.metrics.advance > 0.0);
     // Bitmap may be empty for broken glyphs — just check it doesn't panic.
@@ -372,7 +392,7 @@ fn fontface_rasterize_m_nonzero() {
 
 #[test]
 fn fontface_rasterize_cached() {
-    let mut face = FontFace::load(JBM, PX).unwrap();
+    let mut face = FontFace::load(Jbm::path(), PX).unwrap();
     // Call twice — second must hit cache.
     let a = face.rasterize('A' as u32).metrics.advance;
     let b = face.rasterize('A' as u32).metrics.advance;
@@ -381,7 +401,7 @@ fn fontface_rasterize_cached() {
 
 #[test]
 fn fontface_build_ascii_atlas() {
-    let mut face = FontFace::load(JBM, PX).unwrap();
+    let mut face = FontFace::load(Jbm::path(), PX).unwrap();
     let (atlas, map) = face.build_ascii_atlas(512);
     // All printable ASCII glyphs should be in the map.
     for cp in 0x20u32..=0x7E {

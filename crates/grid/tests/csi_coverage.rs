@@ -92,7 +92,7 @@ fn erase_display_mode_1_clears_start_to_cursor() {
 
 #[test]
 fn erase_display_mode_2_and_3_clear_everything() {
-    for mode in [b'2', b'3'] {
+    for mode in *b"23" {
         let mut g = Grid::new(10, 3);
         feed(&mut g, b"aaaaaaaaaa\r\nbbbbbbbbbb\r\ncccccccccc");
         feed(&mut g, b"\x1b[2;5H");

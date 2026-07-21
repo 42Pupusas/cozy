@@ -140,7 +140,7 @@ fn dcs_sequence_terminated_by_esc_backslash_yields_esc_event_not_dcs() {
 
 #[test]
 fn sos_pm_apc_sequences_all_terminate_on_bare_st_byte() {
-    for intro in [b'X', b'^', b'_'] {
+    for intro in *b"X^_" {
         let mut p = Parser::new();
         let mut saw_dcs = false;
         p.feed(&[0x1b, intro], |_| {});

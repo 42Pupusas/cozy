@@ -5,13 +5,13 @@
 )]
 //! The thin layer of raw syscalls and libc FFI we cannot avoid.
 //!
-//! With io_uring (via `ququmatz`) carrying all socket I/O, what's left here is:
+//! With `io_uring` (via `ququmatz`) carrying all socket I/O, what's left here is:
 //!
 //! * **the shared-memory pixel buffer** — `memfd_create` / `ftruncate` / `mmap`.
 //!   `ququmatz` doesn't cover memfd, so this stays as direct libc FFI.
 //! * **ancillary-data construction** — building the `SCM_RIGHTS` control buffer
 //!   that rides on a `sendmsg` to hand the compositor our shm fd. The `sendmsg`
-//!   itself is now an io_uring SQE; we only assemble the bytes here, pointed at
+//!   itself is now an `io_uring` SQE; we only assemble the bytes here, pointed at
 //!   `ququmatz::MsgHdr`.
 //! * **a `sockaddr_un`** for connecting to the Wayland unix socket (`ququmatz`'s
 //!   typed socket API is IPv4-only, so we build the address bytes ourselves).
@@ -47,12 +47,12 @@ pub enum SysError {
 impl fmt::Display for SysError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SysError::Socket(e) => write!(f, "socket() failed: {e}"),
-            SysError::Memfd(e) => write!(f, "memfd_create() failed: {e}"),
-            SysError::Ftruncate(e) => write!(f, "ftruncate() failed: {e}"),
-            SysError::Mmap(e) => write!(f, "mmap() failed: {e}"),
-            SysError::TimerfdCreate(e) => write!(f, "timerfd_create() failed: {e}"),
-            SysError::TimerfdSet(e) => write!(f, "timerfd_settime() failed: {e}"),
+            Self::Socket(e) => write!(f, "socket() failed: {e}"),
+            Self::Memfd(e) => write!(f, "memfd_create() failed: {e}"),
+            Self::Ftruncate(e) => write!(f, "ftruncate() failed: {e}"),
+            Self::Mmap(e) => write!(f, "mmap() failed: {e}"),
+            Self::TimerfdCreate(e) => write!(f, "timerfd_create() failed: {e}"),
+            Self::TimerfdSet(e) => write!(f, "timerfd_settime() failed: {e}"),
         }
     }
 }
@@ -60,12 +60,12 @@ impl fmt::Display for SysError {
 impl std::error::Error for SysError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            SysError::Socket(e)
-            | SysError::Memfd(e)
-            | SysError::Ftruncate(e)
-            | SysError::Mmap(e)
-            | SysError::TimerfdCreate(e)
-            | SysError::TimerfdSet(e) => Some(e),
+            Self::Socket(e)
+            | Self::Memfd(e)
+            | Self::Ftruncate(e)
+            | Self::Mmap(e)
+            | Self::TimerfdCreate(e)
+            | Self::TimerfdSet(e) => Some(e),
         }
     }
 }
@@ -121,7 +121,7 @@ unsafe extern "C" {
 const CLOCK_MONOTONIC: i32 = 1;
 
 /// `struct timespec` (POSIX), the half of an `itimerspec`. Distinct from
-/// ququmatz's io_uring [`Timespec`](ququmatz::types::Timespec) — different ABI,
+/// ququmatz's `io_uring` [`Timespec`](ququmatz::types::Timespec) — different ABI,
 /// different syscall.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -141,8 +141,8 @@ struct Itimerspec {
 
 impl Timespec {
     /// Split milliseconds into the seconds/nanoseconds a timespec wants.
-    fn from_millis(ms: u64) -> Self {
-        Timespec {
+    const fn from_millis(ms: u64) -> Self {
+        Self {
             tv_sec: (ms / 1000) as i64,
             tv_nsec: ((ms % 1000) * 1_000_000) as i64,
         }
@@ -157,12 +157,14 @@ impl Timespec {
 const SOL_SOCKET: i32 = 1;
 const SCM_RIGHTS: i32 = 1;
 
-// `struct cmsghdr` — the header of one ancillary-data item.
+// `struct cmsghdr` — the header of one ancillary-data item. `#[repr(C)]`
+// only pins layout (order/type/size), not names, so the fields drop the
+// shared `cmsg_` prefix the C struct uses.
 #[repr(C)]
 struct CmsgHdr {
-    cmsg_len: size_t,
-    cmsg_level: i32,
-    cmsg_type: i32,
+    len: size_t,
+    level: i32,
+    kind: i32,
 }
 
 const CMSG_HDR_LEN: usize = std::mem::size_of::<CmsgHdr>();
@@ -181,29 +183,30 @@ trait CmsgAlign {
 
 impl CmsgAlign for usize {
     fn cmsg_aligned(self) -> Self {
-        let a = std::mem::size_of::<size_t>();
+        let a = std::mem::size_of::<Self>();
         (self + a - 1) & !(a - 1)
     }
 }
 
-/// A `sendmsg`/`recvmsg` message: a data buffer plus an optional SCM_RIGHTS
-/// control buffer carrying file descriptors. Owns its `iovec` and control
-/// bytes so the pointers in the [`MsgHdr`] it produces stay valid as long as
-/// `self` is alive — the caller must keep it alive until the io_uring SENDMSG
-/// completes.
+/// A `sendmsg`/`recvmsg` message: a data buffer plus an optional `SCM_RIGHTS` control buffer.
+///
+/// Owns its `iovec` and control bytes so the pointers in the [`MsgHdr`] it
+/// produces stay valid as long as `self` is alive — the caller must keep it
+/// alive until the `io_uring` SENDMSG completes.
 pub struct OutgoingMessage {
     iov: IoVec,
     control: Vec<u8>,
 }
 
 impl OutgoingMessage {
-    /// Build a message that sends `bytes`, attaching `fds` as SCM_RIGHTS
+    /// Build a message that sends `bytes`, attaching `fds` as `SCM_RIGHTS`
     /// ancillary data. `bytes` must outlive the message (we borrow it into the
     /// iovec).
+    #[must_use]
     pub fn new(bytes: &[u8], fds: &[BorrowedFd<'_>]) -> Self {
         // SAFETY: `bytes` outlives the message per the contract above; IoVec
         // borrows the pointer/len for the duration of the send.
-        let iov = unsafe { IoVec::new(bytes.as_ptr() as *mut u8, bytes.len()) };
+        let iov = unsafe { IoVec::new(bytes.as_ptr().cast_mut(), bytes.len()) };
 
         let control = if fds.is_empty() {
             Vec::new()
@@ -214,11 +217,17 @@ impl OutgoingMessage {
             // SAFETY: `buf` is sized for the header + fd payload computed above;
             // we write exactly that layout.
             unsafe {
-                let cmsg = buf.as_mut_ptr() as *mut CmsgHdr;
-                (*cmsg).cmsg_len = CMSG_HDR_LEN + fd_bytes;
-                (*cmsg).cmsg_level = SOL_SOCKET;
-                (*cmsg).cmsg_type = SCM_RIGHTS;
-                let data = buf.as_mut_ptr().add(CMSG_HDR_LEN) as *mut RawFd;
+                // The cast itself never gets dereferenced typed -- only fed
+                // to `write_unaligned` below -- so the pointer's alignment
+                // genuinely doesn't matter here.
+                #[allow(clippy::cast_ptr_alignment)]
+                let cmsg = buf.as_mut_ptr().cast::<CmsgHdr>();
+                cmsg.write_unaligned(CmsgHdr {
+                    len: CMSG_HDR_LEN + fd_bytes,
+                    level: SOL_SOCKET,
+                    kind: SCM_RIGHTS,
+                });
+                let data = buf.as_mut_ptr().add(CMSG_HDR_LEN).cast::<RawFd>();
                 for (i, fd) in fds.iter().enumerate() {
                     data.add(i).write(fd.as_raw_fd());
                 }
@@ -234,7 +243,7 @@ impl OutgoingMessage {
     /// send completes.
     pub fn header(&mut self) -> MsgHdr {
         let mut hdr = MsgHdr::default();
-        hdr.msg_iov = &mut self.iov;
+        hdr.msg_iov = &raw mut self.iov;
         hdr.msg_iovlen = 1;
         if self.control.is_empty() {
             hdr.msg_control = std::ptr::null_mut();
@@ -247,7 +256,7 @@ impl OutgoingMessage {
     }
 }
 
-/// The received counterpart to [`OutgoingMessage`]: reading SCM_RIGHTS
+/// The received counterpart to [`OutgoingMessage`]: reading `SCM_RIGHTS`
 /// ancillary data back out of a control (cmsg) region the kernel wrote.
 ///
 /// A zero-sized namespace rather than free functions at module scope -- same
@@ -259,18 +268,20 @@ pub struct IncomingControl;
 
 impl IncomingControl {
     /// The fixed control-region width to reserve on every multishot recvmsg,
-    /// sized to hold one SCM_RIGHTS cmsg carrying up to `max_fds`
+    /// sized to hold one `SCM_RIGHTS` cmsg carrying up to `max_fds`
     /// descriptors. This is the `msg_controllen` set on the persistent recv
     /// `MsgHdr` -- and thus the width of the control region inside each
     /// provided buffer.
+    #[must_use]
     pub fn reserve_len(max_fds: usize) -> usize {
         (CMSG_HDR_LEN + std::mem::size_of::<RawFd>() * max_fds).cmsg_aligned()
     }
 
-    /// Parse SCM_RIGHTS file descriptors out of a received control (cmsg)
+    /// Parse `SCM_RIGHTS` file descriptors out of a received control (cmsg)
     /// region, taking ownership of each. `control` is the control slice the
     /// kernel wrote -- e.g. `RecvmsgParts::control` from a multishot recvmsg
     /// buffer.
+    #[must_use]
     pub fn fds(control: &[u8]) -> Vec<OwnedFd> {
         use std::os::fd::FromRawFd;
         let mut fds = Vec::new();
@@ -279,15 +290,18 @@ impl IncomingControl {
             // valid cmsghdr; we read its fields and, if SCM_RIGHTS, the fd
             // payload behind it (bounded by cmsg_len, which the kernel set).
             unsafe {
-                let cmsg = control.as_ptr() as *const CmsgHdr;
-                if (*cmsg).cmsg_level == SOL_SOCKET
-                    && (*cmsg).cmsg_type == SCM_RIGHTS
-                    && (*cmsg).cmsg_len >= CMSG_HDR_LEN
-                    && (*cmsg).cmsg_len <= control.len()
+                // Same unaligned-read rationale as the write side above.
+                #[allow(clippy::cast_ptr_alignment)]
+                let cmsg = control.as_ptr().cast::<CmsgHdr>();
+                let hdr = cmsg.read_unaligned();
+                if hdr.level == SOL_SOCKET
+                    && hdr.kind == SCM_RIGHTS
+                    && hdr.len >= CMSG_HDR_LEN
+                    && hdr.len <= control.len()
                 {
-                    let payload = (*cmsg).cmsg_len - CMSG_HDR_LEN;
+                    let payload = hdr.len - CMSG_HDR_LEN;
                     let count = payload / std::mem::size_of::<RawFd>();
-                    let data = control.as_ptr().add(CMSG_HDR_LEN) as *const RawFd;
+                    let data = control.as_ptr().add(CMSG_HDR_LEN).cast::<RawFd>();
                     for i in 0..count {
                         fds.push(OwnedFd::from_raw_fd(data.add(i).read()));
                     }
@@ -324,6 +338,7 @@ impl SockAddrUn {
     ///
     /// The valid length is `offsetof(sun_path) + strlen(path) + 1` (the NUL
     /// terminator), which is what `connect` expects for a pathname socket.
+    #[must_use]
     pub fn new(path: &[u8]) -> Self {
         let mut buf = vec![0u8; Self::FAMILY_LEN + Self::SUN_PATH_LEN];
         buf[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
@@ -336,6 +351,7 @@ impl SockAddrUn {
 
     /// The valid `sockaddr_un` bytes (i.e. `buf[..len]`), ready for
     /// `connect(2)`.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len as usize]
     }
@@ -343,8 +359,9 @@ impl SockAddrUn {
 
 // --- shared-memory pixel buffer ------------------------------------------
 
-/// A shared-memory pool holding one or more equally-sized frames the compositor
-/// reads from. We draw into one frame while the compositor displays another
+/// A shared-memory pool holding one or more equally-sized frames the compositor reads from.
+///
+/// We draw into one frame while the compositor displays another
 /// (double-buffering), so it never samples a half-drawn image. All frames live
 /// in a single mapping; `frame` indices select between them.
 pub struct ShmBuffer {
@@ -367,6 +384,11 @@ impl ShmBuffer {
     /// Allocate `frames` back-to-back `width * height` ARGB frames in one
     /// anonymous, page-backed mapping shared via the returned fd.
     pub fn new(width: usize, height: usize, frames: usize) -> Result<Self, SysError> {
+        // `MFD_CLOEXEC` (1): don't leak the shm fd into PTY-shell children. A
+        // child that inherits it keeps the pool alive; combined with a leaked
+        // Wayland socket that's what freezes the window after we exit.
+        const MFD_CLOEXEC: u32 = 0x0001;
+
         use std::os::fd::FromRawFd;
 
         assert!(frames >= 1);
@@ -376,10 +398,6 @@ impl ShmBuffer {
 
         // memfd: an anonymous in-RAM file. Name is purely for debugging.
         let name = b"paint-shm\0";
-        // `MFD_CLOEXEC` (1): don't leak the shm fd into PTY-shell children. A
-        // child that inherits it keeps the pool alive; combined with a leaked
-        // Wayland socket that's what freezes the window after we exit.
-        const MFD_CLOEXEC: u32 = 0x0001;
         // SAFETY: name is a valid NUL-terminated C string.
         let raw = unsafe { memfd_create(name.as_ptr(), MFD_CLOEXEC) };
         if raw < 0 {
@@ -410,8 +428,8 @@ impl ShmBuffer {
             return Err(SysError::Mmap(io::Error::last_os_error()));
         }
 
-        Ok(ShmBuffer {
-            ptr: ptr as *mut u32,
+        Ok(Self {
+            ptr: ptr.cast::<u32>(),
             frame_pixels,
             frame_bytes,
             frames,
@@ -422,7 +440,8 @@ impl ShmBuffer {
 
     /// Number of frames in the pool.
     #[allow(dead_code)] // part of the buffer abstraction; used once N>2 frames.
-    pub fn frames(&self) -> usize {
+    #[must_use]
+    pub const fn frames(&self) -> usize {
         self.frames
     }
 
@@ -438,11 +457,13 @@ impl ShmBuffer {
     }
 
     /// Byte offset of frame `frame` within the pool (for `create_buffer`).
-    pub fn frame_offset(&self, frame: usize) -> usize {
+    #[must_use]
+    pub const fn frame_offset(&self, frame: usize) -> usize {
         frame * self.frame_bytes
     }
 
     /// Borrow the underlying fd to hand to `wl_shm.create_pool`.
+    #[must_use]
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
@@ -459,7 +480,8 @@ impl ShmBuffer {
     /// Total pool size in bytes — the `create_pool` / `wl_shm_pool.resize`
     /// size. This is the *capacity* (grow-only), which after a lazy shrink is
     /// larger than the `frame_bytes * frames` currently in use.
-    pub fn size_bytes(&self) -> usize {
+    #[must_use]
+    pub const fn size_bytes(&self) -> usize {
         self.capacity_bytes
     }
 
@@ -499,7 +521,7 @@ impl ShmBuffer {
         // the kernel relocate it if it can't extend in place.
         let ptr = unsafe {
             mremap(
-                self.ptr as *mut c_void,
+                self.ptr.cast::<c_void>(),
                 self.capacity_bytes,
                 new_cap,
                 MREMAP_MAYMOVE,
@@ -508,7 +530,7 @@ impl ShmBuffer {
         if ptr == MAP_FAILED {
             return Err(SysError::Mmap(io::Error::last_os_error()));
         }
-        self.ptr = ptr as *mut u32;
+        self.ptr = ptr.cast::<u32>();
         self.capacity_bytes = new_cap;
         Ok(Some(new_cap))
     }
@@ -518,7 +540,7 @@ impl Drop for ShmBuffer {
     fn drop(&mut self) {
         // SAFETY: ptr/len came from a successful mmap and are unmapped once.
         unsafe {
-            munmap(self.ptr as *mut c_void, self.size_bytes());
+            munmap(self.ptr.cast::<c_void>(), self.size_bytes());
         }
     }
 }
@@ -534,7 +556,7 @@ impl Drop for ShmBuffer {
 /// `interval`); on release we [`disarm`](Self::disarm) it.
 ///
 /// The fd is owned here but watched by the reader thread, which polls it on its
-/// io_uring ring and turns each expiry into an event. Ownership and timing stay
+/// `io_uring` ring and turns each expiry into an event. Ownership and timing stay
 /// on the main thread; the reader only translates readiness into an [`Event`].
 pub struct RepeatTimer {
     fd: OwnedFd,
@@ -555,7 +577,7 @@ impl RepeatTimer {
         }
         // SAFETY: timerfd_create returned a fresh, owned fd.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        Ok(RepeatTimer { fd })
+        Ok(Self { fd })
     }
 
     /// Arm the timer: first expiry after `delay_ms`, then once every
@@ -584,6 +606,7 @@ impl RepeatTimer {
     }
 
     /// Borrow the underlying fd for the reader thread to poll.
+    #[must_use]
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
     }
@@ -605,10 +628,12 @@ impl RepeatTimer {
         // valid fd. A timerfd read yields exactly a u64 count or EAGAIN; we
         // ignore both.
         unsafe {
-            read(fd, buf.as_mut_ptr() as *mut c_void, buf.len());
+            read(fd, buf.as_mut_ptr().cast::<c_void>(), buf.len());
         }
     }
 }
+
+use std::os::fd::AsFd;
 
 #[cfg(test)]
 mod tests {
@@ -672,7 +697,7 @@ mod tests {
         // Reconstruct the control region as a byte slice the way a received
         // cmsg buffer would look.
         let control =
-            unsafe { std::slice::from_raw_parts(hdr.msg_control as *const u8, hdr.msg_controllen) };
+            unsafe { std::slice::from_raw_parts(hdr.msg_control.cast_const(), hdr.msg_controllen) };
         let fds = IncomingControl::fds(control);
         assert_eq!(fds.len(), 1);
     }
@@ -696,10 +721,15 @@ mod tests {
         // must be treated as absent, not read out of bounds.
         let mut buf = vec![0u8; CMSG_HDR_LEN];
         unsafe {
-            let cmsg = buf.as_mut_ptr() as *mut CmsgHdr;
-            (*cmsg).cmsg_len = 9999; // way past buf.len()
-            (*cmsg).cmsg_level = SOL_SOCKET;
-            (*cmsg).cmsg_type = SCM_RIGHTS;
+            // Never dereferenced typed, only fed to `write_unaligned` --
+            // same rationale as the non-test call site above.
+            #[allow(clippy::cast_ptr_alignment)]
+            let cmsg = buf.as_mut_ptr().cast::<CmsgHdr>();
+            cmsg.write_unaligned(CmsgHdr {
+                len: 9999, // way past buf.len()
+                level: SOL_SOCKET,
+                kind: SCM_RIGHTS,
+            });
         }
         assert!(IncomingControl::fds(&buf).is_empty());
     }
@@ -708,10 +738,13 @@ mod tests {
     fn incoming_control_fds_ignores_non_scm_rights_cmsg() {
         let mut buf = vec![0u8; CMSG_HDR_LEN + 8];
         unsafe {
-            let cmsg = buf.as_mut_ptr() as *mut CmsgHdr;
-            (*cmsg).cmsg_len = CMSG_HDR_LEN + 8;
-            (*cmsg).cmsg_level = SOL_SOCKET;
-            (*cmsg).cmsg_type = 99; // not SCM_RIGHTS
+            #[allow(clippy::cast_ptr_alignment)]
+            let cmsg = buf.as_mut_ptr().cast::<CmsgHdr>();
+            cmsg.write_unaligned(CmsgHdr {
+                len: CMSG_HDR_LEN + 8,
+                level: SOL_SOCKET,
+                kind: 99, // not SCM_RIGHTS
+            });
         }
         assert!(IncomingControl::fds(&buf).is_empty());
     }
@@ -756,5 +789,3 @@ mod tests {
         assert_eq!((word + 1).cmsg_aligned(), word * 2);
     }
 }
-
-use std::os::fd::AsFd;

@@ -26,7 +26,7 @@ impl Canvas<'_> {
     /// `origin_x`/`origin_y` are the glyph's pen origin *before* bearing --
     /// the cell's top-left for the terminal, the current pen position for
     /// the bar -- and [`GlyphEntry::bearing_x`]/`bearing_y` are added here
-    /// (bearing_y is the already-resolved cell-top-to-glyph-top offset from
+    /// (`bearing_y` is the already-resolved cell-top-to-glyph-top offset from
     /// `font::FontFace::cell_bearing_y`, *not* a baseline-relative value, so
     /// it is used directly and never recombined with a separately-rounded
     /// ascender).
@@ -59,38 +59,45 @@ impl Canvas<'_> {
             return; // blank glyph (space etc.) — the caller's bg fill suffices.
         }
 
-        let buf_width = self.width() as u32;
+        let buf_width = self.width().cast_unsigned();
         let fg_px = if bg_alpha == 255 {
             fg.to_xrgb8888()
         } else {
             fg.premultiplied_argb8888(255)
         };
 
-        let glyph_x0 = i64::from(origin_x) + i64::from(entry.bearing_x);
-        let glyph_y0 = i64::from(origin_y) + i64::from(entry.bearing_y);
+        let pen_x0 = i64::from(origin_x) + i64::from(entry.bearing_x);
+        let top_y = i64::from(origin_y) + i64::from(entry.bearing_y);
 
         let pixels = self.pixels_mut();
         let atlas_w = atlas.width;
-        let buf_h = (pixels.len() / buf_width.max(1) as usize) as i64;
+        let buf_h = i64::try_from(pixels.len() / usize::try_from(buf_width.max(1)).unwrap_or(1))
+            .unwrap_or(0);
 
         // Clip the glyph's column/row span to the buffer ONCE, not per
-        // pixel: `glyph_x0`/`glyph_y0` are row/column-independent, so
+        // pixel: `pen_x0`/`pen_y0` are row/column-independent, so
         // `[col_lo, col_hi)` and `[row_lo, row_hi)` are per-glyph constants
-        // and the inner loop needs no bounds check.
-        let col_lo = (-glyph_x0).max(0) as u32;
-        let col_hi = (i64::from(buf_width) - glyph_x0).clamp(0, i64::from(entry.width)) as u32;
-        let row_lo = (-glyph_y0).max(0) as u32;
-        let row_hi = (buf_h - glyph_y0).clamp(0, i64::from(entry.height)) as u32;
+        // and the inner loop needs no bounds check. Each is a `.clamp(0, N)`
+        // result, always `>= 0` and `<= N`, so the `u32` conversions below
+        // are infallible.
+        let col_lo = u32::try_from((-pen_x0).max(0)).unwrap_or(0);
+        let col_hi =
+            u32::try_from((i64::from(buf_width) - pen_x0).clamp(0, i64::from(entry.width)))
+                .unwrap_or(0);
+        let row_lo = u32::try_from((-top_y).max(0)).unwrap_or(0);
+        let row_hi = u32::try_from((buf_h - top_y).clamp(0, i64::from(entry.height))).unwrap_or(0);
         if col_lo >= col_hi || row_lo >= row_hi {
             return;
         }
 
         for row in row_lo..row_hi {
-            let py = (glyph_y0 + i64::from(row)) as usize;
+            // Always `>= 0`: `row_lo..row_hi` is bounded by the clamp above.
+            let py = usize::try_from(top_y + i64::from(row)).unwrap_or(0);
             // Hoist the per-row bases out of the column loop: both the
             // destination row base (`py * buf_width`) and the atlas source
             // row base (`(entry.y + row) * atlas_w`) are per-row constants.
-            let dst_base = py * buf_width as usize + (glyph_x0 + i64::from(col_lo)) as usize;
+            let dst_base =
+                py * buf_width as usize + usize::try_from(pen_x0 + i64::from(col_lo)).unwrap_or(0);
             let atlas_base = ((entry.y + row) * atlas_w) as usize + (entry.x + col_lo) as usize;
             for i in 0..(col_hi - col_lo) as usize {
                 let a = atlas.data[atlas_base + i];

@@ -657,10 +657,8 @@ impl Parser {
 
         // Find the ';' separator between Ps and Pt.
         let sep = data.iter().position(|&b| b == b';');
-        let (numeric_field, text_field) = sep.map_or_else(
-            || (data, &b""[..]),
-            |pos| (&data[..pos], &data[pos + 1..]),
-        );
+        let (numeric_field, text_field) =
+            sep.map_or_else(|| (data, &b""[..]), |pos| (&data[..pos], &data[pos + 1..]));
 
         let ps: u8 = numeric_field.iter().fold(0u8, |acc, &b| {
             if b.is_ascii_digit() {
@@ -678,9 +676,8 @@ impl Parser {
         // landed mid-codepoint (buffer cut a multi-byte UTF-8 sequence), so
         // fall back to the longest valid-UTF-8 prefix rather than losing
         // the whole string.
-        let pt = core::str::from_utf8(text_field).unwrap_or_else(|e| {
-            core::str::from_utf8(&text_field[..e.valid_up_to()]).unwrap_or("")
-        });
+        let pt = core::str::from_utf8(text_field)
+            .unwrap_or_else(|e| core::str::from_utf8(&text_field[..e.valid_up_to()]).unwrap_or(""));
 
         let cmd = match ps {
             0 | 2 => OscCmd::SetTitle(pt),

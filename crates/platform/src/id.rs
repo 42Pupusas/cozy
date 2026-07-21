@@ -102,7 +102,8 @@ pub struct Serial(pub u32);
 
 impl Serial {
     #[inline]
-    pub fn raw(self) -> u32 {
+    #[must_use]
+    pub const fn raw(self) -> u32 {
         self.0
     }
 }

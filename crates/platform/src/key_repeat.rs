@@ -33,7 +33,7 @@ pub struct KeyRepeatState {
 impl KeyRepeatState {
     /// Wrap an already-created timerfd (owned by the connection setup, same
     /// as before this type existed) with fresh rate/delay/held-key state.
-    pub fn new(timer: RepeatTimer) -> Self {
+    pub const fn new(timer: RepeatTimer) -> Self {
         Self {
             timer,
             rate: DEFAULT_REPEAT_RATE,
@@ -45,7 +45,7 @@ impl KeyRepeatState {
     /// The key that should repeat right now, if the timer just fired
     /// (`RawEvent::Repeat`). `None` means nothing is held (a stray/late
     /// expiry racing a release -- safe to ignore).
-    pub fn held_key(&self) -> Option<Key> {
+    pub const fn held_key(&self) -> Option<Key> {
         self.held_key
     }
 
@@ -96,7 +96,7 @@ impl KeyRepeatState {
     /// in-flight repeat keeps its already-armed schedule, matching the
     /// original behavior (the timer was never re-armed mid-hold on this
     /// event).
-    pub fn set_repeat_info(&mut self, rate: u32, delay: u32) {
+    pub const fn set_repeat_info(&mut self, rate: u32, delay: u32) {
         self.rate = rate;
         self.delay = delay;
     }

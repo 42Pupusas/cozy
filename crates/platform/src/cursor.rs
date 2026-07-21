@@ -1,10 +1,12 @@
-//! Hardware cursor support: the system's real pointer image (loaded from the
-//! user's Xcursor theme, matching every other app on their desktop) rendered
-//! into a shared-memory buffer, attached to a dedicated `wl_surface`, and
-//! activated via `wl_pointer.set_cursor`.
+//! Hardware cursor support.
+//!
+//! The system's real pointer image (loaded from the user's Xcursor theme,
+//! matching every other app on their desktop) rendered into a shared-memory
+//! buffer, attached to a dedicated `wl_surface`, and activated via
+//! `wl_pointer.set_cursor`.
 //!
 //! If no system theme can be found or decoded (headless test box, unusual
-//! setup, etc.) we fall back to a small hand-drawn "left_ptr" bitmap so the
+//! setup, etc.) we fall back to a small hand-drawn "`left_ptr`" bitmap so the
 //! cursor is never simply invisible.
 
 use crate::conn::{ConnError, Sender};
@@ -25,7 +27,7 @@ const T: u8 = 0;
 const B: u8 = 1;
 const W: u8 = 2;
 
-/// The X "left_ptr" cursor at 16×16, as a flat row-major array of pixel tags.
+/// The X "`left_ptr`" cursor at 16×16, as a flat row-major array of pixel tags.
 /// Used only when no real system cursor theme could be loaded.
 const LEFT_PTR_BITMAP: &[u8] = &[
     T, T, T, T, B, B, B, B, T, T, T, T, T, T, T, T, //  0
@@ -79,18 +81,20 @@ impl PointerCursor {
         scale: i32,
     ) -> Result<Self> {
         let image = CursorImage::load_system_pointer(scale);
-        let (width, height, hotspot_x, hotspot_y) = match &image {
-            Some(img) => (
-                img.width as i32,
-                img.height as i32,
-                img.hotspot_x as i32,
-                img.hotspot_y as i32,
-            ),
-            None => (FALLBACK_SIZE, FALLBACK_SIZE, 2, 2),
-        };
+        let (width, height, hotspot_x, hotspot_y) =
+            image
+                .as_ref()
+                .map_or((FALLBACK_SIZE, FALLBACK_SIZE, 2, 2), |img| {
+                    (
+                        img.width.cast_signed(),
+                        img.height.cast_signed(),
+                        img.hotspot_x.cast_signed(),
+                        img.hotspot_y.cast_signed(),
+                    )
+                });
 
-        let w = width.max(1) as usize;
-        let h = height.max(1) as usize;
+        let w = usize::try_from(width.max(1)).unwrap_or(1);
+        let h = usize::try_from(height.max(1)).unwrap_or(1);
         let mut cshm = ShmBuffer::new(w, h, 1).map_err(|e| Error::Conn(ConnError::Sys(e)))?;
         match &image {
             Some(img) => Self::write_image(cshm.pixels(0), img),
@@ -100,9 +104,9 @@ impl PointerCursor {
         let cursor_pool: crate::id::PoolId = sender.alloc_id();
         let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
             .new_id(cursor_pool)
-            .i32(cshm.size_bytes() as i32)
+            .i32(i32::try_from(cshm.size_bytes()).unwrap_or(i32::MAX))
             .finish();
-        sender.send_with_fds(msg, &[cshm.fd()])?;
+        sender.send_with_fds(&msg, &[cshm.fd()])?;
         let cursor_surface: SurfaceId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(compositor, CompositorRequest::CreateSurface)

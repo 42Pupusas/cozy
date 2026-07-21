@@ -5,9 +5,9 @@
 )]
 //! The Wayland connection, split across two threads by direction.
 //!
-//! All I/O to the compositor goes through io_uring (via `ququmatz`), over a
+//! All I/O to the compositor goes through `io_uring` (via `ququmatz`), over a
 //! single `AF_UNIX` socket. To overlap input handling with rendering we use
-//! **two independent io_uring rings on the same socket fd**:
+//! **two independent `io_uring` rings on the same socket fd**:
 //!
 //! * [`Reader`] owns the receive ring and the provided-buffer pool. It runs on
 //!   its own thread: arm a multishot `recvmsg`, block, reap completions, split
@@ -15,7 +15,7 @@
 //!   lock-free SPSC ring. Arm / reap / re-arm are all local to this ring, so the
 //!   re-arm never crosses a thread boundary — no shared state.
 //! * [`Sender`] owns the send ring and stays on the main thread. It allocates
-//!   object ids and submits requests (`sendmsg`, optionally with SCM_RIGHTS
+//!   object ids and submits requests (`sendmsg`, optionally with `SCM_RIGHTS`
 //!   fds). Sends and receives are independent directions on the stream socket,
 //!   so the two rings never contend.
 //!
@@ -41,7 +41,7 @@ use crate::wire::{MessageBuilder, WireEvent};
 pub enum ConnError {
     /// A required environment variable was missing.
     Env(&'static str),
-    /// io_uring ring setup (`io_uring_setup` + mmaps) failed.
+    /// `io_uring` ring setup (`io_uring_setup` + mmaps) failed.
     Setup(ququmatz::Error),
     /// Registering the provided-buffer pool failed.
     Register(ququmatz::Error),
@@ -63,15 +63,15 @@ pub enum ConnError {
 impl fmt::Display for ConnError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConnError::Env(var) => write!(f, "environment variable {var} is not set"),
-            ConnError::Setup(e) => write!(f, "io_uring setup failed: {e}"),
-            ConnError::Register(e) => write!(f, "provided-buffer registration failed: {e}"),
-            ConnError::Submit(e) => write!(f, "io_uring submit/wait failed: {e}"),
-            ConnError::Connect(e) => write!(f, "connect to compositor failed: {e}"),
-            ConnError::NoCompletion => write!(f, "io_uring returned no completion after wait"),
-            ConnError::Io(e) => write!(f, "socket I/O failed: {e}"),
-            ConnError::Closed => write!(f, "the compositor closed the connection"),
-            ConnError::Sys(e) => write!(f, "{e}"),
+            Self::Env(var) => write!(f, "environment variable {var} is not set"),
+            Self::Setup(e) => write!(f, "io_uring setup failed: {e}"),
+            Self::Register(e) => write!(f, "provided-buffer registration failed: {e}"),
+            Self::Submit(e) => write!(f, "io_uring submit/wait failed: {e}"),
+            Self::Connect(e) => write!(f, "connect to compositor failed: {e}"),
+            Self::NoCompletion => write!(f, "io_uring returned no completion after wait"),
+            Self::Io(e) => write!(f, "socket I/O failed: {e}"),
+            Self::Closed => write!(f, "the compositor closed the connection"),
+            Self::Sys(e) => write!(f, "{e}"),
         }
     }
 }
@@ -79,17 +79,17 @@ impl fmt::Display for ConnError {
 impl std::error::Error for ConnError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            ConnError::Setup(e) | ConnError::Register(e) | ConnError::Submit(e) => Some(e),
-            ConnError::Connect(e) | ConnError::Io(e) => Some(e),
-            ConnError::Sys(e) => Some(e),
-            ConnError::Env(_) | ConnError::NoCompletion | ConnError::Closed => None,
+            Self::Setup(e) | Self::Register(e) | Self::Submit(e) => Some(e),
+            Self::Connect(e) | Self::Io(e) => Some(e),
+            Self::Sys(e) => Some(e),
+            Self::Env(_) | Self::NoCompletion | Self::Closed => None,
         }
     }
 }
 
 impl From<SysError> for ConnError {
     fn from(e: SysError) -> Self {
-        ConnError::Sys(e)
+        Self::Sys(e)
     }
 }
 
@@ -219,7 +219,7 @@ mod error_tests {
     }
 }
 
-/// io_uring submission-queue depth (per ring).
+/// `io_uring` submission-queue depth (per ring).
 const RING_ENTRIES: u32 = 16;
 
 /// Completion-queue depth — larger than the SQ. A multishot `recvmsg` burst
@@ -257,10 +257,11 @@ pub(crate) const REGISTRY_ID: u32 = 2;
 const UD_RECV: u64 = 0;
 const UD_TIMER: u64 = 1;
 
-/// Marker type whose sole job is to host [`WaylandConn::connect`] -- the
-/// operation isn't a method on any value that exists yet (it *builds* the
-/// values), so it lives as an associated fn on a zero-sized namespace type
-/// rather than a bare top-level `connect()`.
+/// Marker type whose sole job is to host [`WaylandConn::connect`].
+///
+/// The operation isn't a method on any value that exists yet (it *builds*
+/// the values), so it lives as an associated fn on a zero-sized namespace
+/// type rather than a bare top-level `connect()`.
 ///
 /// Named `WaylandConn` (not the shorter `Conn`) to stay unambiguous next to
 /// `dbus::conn::DbusConn`, the unrelated D-Bus connection type -- the two used
@@ -269,7 +270,7 @@ const UD_TIMER: u64 = 1;
 pub struct WaylandConn;
 
 impl WaylandConn {
-    /// Build the AF_UNIX socket, the two rings, connect, register the recv
+    /// Build the `AF_UNIX` socket, the two rings, connect, register the recv
     /// pool, arm the first multishot recv, and create the (disarmed)
     /// key-repeat timer. Returns the [`Sender`] and [`RepeatTimer`] (main
     /// thread) and the [`Reader`] (its own thread). The reader polls the
@@ -338,7 +339,7 @@ impl WaylandConn {
 
         let sender = Sender {
             sock,
-            _sock_owned: sock_owned,
+            sock_owned,
             ring: ring_tx,
             next_id: 2,
         };
@@ -356,32 +357,37 @@ impl WaylandConn {
 ///
 /// # Safety
 ///
-/// While the underlying io_uring ring is `!Send`, the `Sender` is always used
+/// While the underlying `io_uring` ring is `!Send`, the `Sender` is always used
 /// from the main/event-loop thread. The `Send` impl is needed so `Arc<Mutex<Sender>>`
 /// can satisfy `Sync` bounds in winit's `Window` type.
 pub struct Sender {
     sock: RawFd,
     /// Keeps the socket open for both rings; closed when the Sender drops.
-    _sock_owned: OwnedFd,
+    sock_owned: OwnedFd,
     ring: IoUring,
-    /// Next client object id. Id 1 is wl_display, so we start at 2.
+    /// Next client object id. Id 1 is `wl_display`, so we start at 2.
     next_id: u32,
 }
 
 // SAFETY: The Sender is always used from the thread that created it
 // (the main/event-loop thread). It's wrapped in `Arc<Mutex<>>` only for
 // structural reasons — io_uring ops are never submitted from other threads.
+// `ring: IoUring` is the only non-Send field and is exactly the field this
+// impl exists to paper over (clippy's non_send_fields_in_send_ty lint has
+// no other way to express "deliberately unsafe-impl-Send, see the comment
+// above" than to allow it at the impl site).
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Sender {}
 
 impl std::os::fd::AsRawFd for Sender {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self._sock_owned.as_raw_fd()
+        self.sock_owned.as_raw_fd()
     }
 }
 
 impl std::os::fd::AsFd for Sender {
     fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
-        self._sock_owned.as_fd()
+        self.sock_owned.as_fd()
     }
 }
 
@@ -448,28 +454,30 @@ impl Sender {
     /// Reserve a block of `count` consecutive object ids for a window's
     /// exclusive use. Returns `(start, end_exclusive)`. The window hands these
     /// out via [`WindowSender::alloc_id`] without touching the connection.
-    pub fn alloc_id_block(&mut self, count: u32) -> (u32, u32) {
+    pub const fn alloc_id_block(&mut self, count: u32) -> (u32, u32) {
         let start = self.next_id;
         self.next_id += count;
         (start, start + count)
     }
 
     /// Send a finished request with no fds.
-    pub fn send(&mut self, msg: Vec<u8>) -> Result<(), ConnError> {
+    pub fn send(&mut self, msg: &[u8]) -> Result<(), ConnError> {
         self.send_with_fds(msg, &[])
     }
 
-    /// Send a finished request, attaching `fds` as SCM_RIGHTS ancillary data.
-    pub fn send_with_fds(&mut self, msg: Vec<u8>, fds: &[BorrowedFd<'_>]) -> Result<(), ConnError> {
-        let mut out = OutgoingMessage::new(&msg, fds);
+    /// Send a finished request, attaching `fds` as `SCM_RIGHTS` ancillary data.
+    pub fn send_with_fds(&mut self, msg: &[u8], fds: &[BorrowedFd<'_>]) -> Result<(), ConnError> {
+        let mut out = OutgoingMessage::new(msg, fds);
         let hdr = out.header();
         // SAFETY: `hdr` points into `out`/`msg`; the SENDMSG SQE holds a raw
-        // pointer to `hdr`. We block until completion below, so all stay alive.
-        let sqe = unsafe { Sqe::sendmsg_ptr(self.sock, &hdr, MsgFlags::NOSIGNAL) };
+        // pointer to `hdr`. We block until completion below, so all stay alive
+        // -- `out`/`msg` are kept alive by simply staying in scope past the
+        // blocking wait, so there's no separate keep-alive binding needed.
+        let sqe = unsafe { Sqe::sendmsg_ptr(self.sock, &raw const hdr, MsgFlags::NOSIGNAL) };
         self.ring.push(sqe).map_err(ConnError::Submit)?;
         self.ring.submit_and_wait_retry(1)?;
         let cqe = self.ring.complete().ok_or(ConnError::NoCompletion)?;
-        let _keep_alive = (&hdr, &out, &msg);
+        drop(out);
         if cqe.result < 0 {
             return Err(ConnError::Io(io::Error::from_raw_os_error(-cqe.result)));
         }
@@ -478,26 +486,27 @@ impl Sender {
 
     /// Convenience: build → finish → send.
     pub fn request(&mut self, b: MessageBuilder) -> Result<(), ConnError> {
-        self.send(b.finish())
+        self.send(&b.finish())
     }
 
     /// Duplicate the underlying socket fd. The caller owns the returned fd —
-    /// the original stays open (it's the `_sock_owned` field and the io_uring
+    /// the original stays open (it's the `sock_owned` field and the `io_uring`
     /// rings still reference it).
     pub fn socket_fd(&self) -> io::Result<OwnedFd> {
-        self._sock_owned.try_clone()
+        self.sock_owned.try_clone()
     }
 
     /// Create a stub `Sender` that panics on any I/O attempt.
     /// Used by the winit-paint backend before the real connection is wired up.
     #[doc(hidden)]
+    #[must_use]
     pub fn stub() -> Self {
         fn dummy_socket() -> OwnedFd {
             std::fs::File::open("/dev/null").unwrap().into()
         }
         Self {
             sock: RawFd::from_raw(dummy_socket().as_raw_fd() as usize),
-            _sock_owned: dummy_socket(),
+            sock_owned: dummy_socket(),
             ring: IoUring::builder(2).clamp().cq_entries(4).build().unwrap(),
             next_id: 2,
         }
@@ -531,6 +540,13 @@ pub struct Reader {
 // operate on, recv (this thread) and send (the main thread) are separate socket
 // directions, and the timerfd is only ever armed (main) vs. polled/drained (this
 // thread), never raced.
+//
+// clippy's `non_send_fields_in_send_ty` flags `ring: IoUring` and
+// `recv_hdr: Box<MsgHdr>` as not independently provably `Send` -- true, but
+// irrelevant here: this whole struct (not just individual fields) moves to
+// the reader thread once at spawn and is never touched from any other
+// thread again, exactly the invariant this manual impl asserts.
+#[allow(clippy::non_send_fields_in_send_ty)]
 unsafe impl Send for Reader {}
 
 impl Reader {
@@ -559,8 +575,8 @@ impl Reader {
     /// (required by `single_issuer`/`defer_taskrun`).
     pub fn run(
         mut self,
-        producer: Producer<RawEvent>,
-        waker: Option<waker::Waker>,
+        producer: &Producer<RawEvent>,
+        waker: Option<&waker::Waker>,
     ) -> Result<(), ConnError> {
         // Arm the first multishot recv and the key-repeat timer poll, both from
         // *this* thread so it's the rx ring's sole issuer.
@@ -587,7 +603,7 @@ impl Reader {
                 // poll vs. the socket recv. The timer poll has no buffer/MORE
                 // flags, so we must split on user_data, not on the flags.
                 if cqe.user_data == UD_TIMER {
-                    self.absorb_timer_cqe(cqe.result, &producer)?;
+                    self.absorb_timer_cqe(cqe.result, producer)?;
                     pushed = true;
                 } else if self.absorb_recv_cqe(cqe.result, cqe.flags)? {
                     closed = true;
@@ -622,14 +638,12 @@ impl Reader {
 
             // Wake the UI thread, which polls a shared eventfd rather than
             // blocking on this ring (it also waits on the dirty-snapshot ring).
-            if pushed {
-                if let Some(w) = &waker {
-                    w.signal();
-                }
+            if pushed && let Some(w) = waker {
+                w.signal();
             }
 
             if closed {
-                if let Some(w) = &waker {
+                if let Some(w) = waker {
                     w.signal();
                 }
                 return Ok(());
@@ -726,7 +740,7 @@ trait CqeFlagsExt {
 
 impl CqeFlagsExt for CqeFlags {
     fn buffer_id(self) -> Option<u16> {
-        if self.contains(CqeFlags::BUFFER) {
+        if self.contains(Self::BUFFER) {
             Some((self.bits() >> 16) as u16)
         } else {
             None
@@ -875,10 +889,10 @@ impl Sender {
     ) -> Result<(), ConnError> {
         while let Some(req) = rx.pop() {
             match req {
-                WindowRequest::Send(msg) => self.send(msg)?,
+                WindowRequest::Send(msg) => self.send(&msg)?,
                 WindowRequest::SendWithFds { msg, fds } => {
                     let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(|fd| fd.as_fd()).collect();
-                    self.send_with_fds(msg, &borrowed)?;
+                    self.send_with_fds(&msg, &borrowed)?;
                 }
             }
         }

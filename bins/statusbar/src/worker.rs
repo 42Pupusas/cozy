@@ -5,7 +5,7 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use statusbar::{ModuleKind, ScrollAccumulator, Volume, steps_to_delta_pct};
+use statusbar::{ModuleKind, ScrollAccumulator, TrayItem, Volume, steps_to_delta_pct};
 
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
@@ -65,22 +65,40 @@ pub struct Snapshot {
     /// parallel to `State::notification_rules`, empty strings for
     /// not-currently-running apps skipped in `left_segments`.
     notifications: Vec<String>,
+    /// Native StatusNotifier/AppIndicator items are supplied asynchronously
+    /// by the dedicated D-Bus watcher, not recomputed by this polling worker.
+    tray: Vec<TrayItem>,
 }
 
 impl Snapshot {
     /// Left section, left-to-right draw order: the always-visible
     /// connectivity cluster (clock/date live in `right_segments`).
     pub fn left_segments(&self) -> Vec<(ModuleKind, &str)> {
-        let mut segs: Vec<(ModuleKind, &str)> = vec![
+        vec![
             (ModuleKind::Wifi, self.wifi.as_str()),
             (ModuleKind::Bluetooth, self.bluetooth.as_str()),
-        ];
-        segs.extend(
-            self.notifications
-                .iter()
-                .map(|s| (ModuleKind::Notification, s.as_str())),
-        );
-        segs
+        ]
+    }
+
+    /// Text-only app-urgency indicators retained for configurations that
+    /// explicitly use them. Native system-tray items are painted between this
+    /// connectivity cluster and these optional segments in `Painter`.
+    pub fn notification_segments(&self) -> impl Iterator<Item = (ModuleKind, &str)> {
+        self.notifications
+            .iter()
+            .map(|s| (ModuleKind::Notification, s.as_str()))
+    }
+
+    /// Native `StatusNotifier` items in registration order.
+    pub fn tray_items(&self) -> &[TrayItem] {
+        &self.tray
+    }
+
+    /// Replace the watcher-owned tray snapshot without involving the polling
+    /// worker: this preserves prompt notification updates even if a sensor
+    /// subprocess happens to be slow.
+    pub fn replace_tray(&mut self, tray: Vec<TrayItem>) {
+        self.tray = tray;
     }
 
     /// Center section -- unused for now (kept as an empty group so the
@@ -126,7 +144,9 @@ impl KnownPct {
     /// information -- `cast_signed`/`cast_unsigned` say that plainly
     /// instead of leaving it to an `as` cast clippy has to warn about.
     fn nudge_pct(pct: u32, delta_pct: i32) -> u32 {
-        (pct.cast_signed() + delta_pct).clamp(0, 100).cast_unsigned()
+        (pct.cast_signed() + delta_pct)
+            .clamp(0, 100)
+            .cast_unsigned()
     }
 }
 

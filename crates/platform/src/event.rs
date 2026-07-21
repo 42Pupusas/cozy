@@ -56,7 +56,7 @@ pub enum RawEvent {
     /// thread — which owns the held-key state — can re-apply the held key's
     /// motion. Carries no payload; the main thread already knows what's held.
     Repeat,
-    /// File descriptors received as ancillary (SCM_RIGHTS) data alongside a
+    /// File descriptors received as ancillary (`SCM_RIGHTS`) data alongside a
     /// message. Wayland attaches fds *out of band* to a specific message
     /// (`wl_data_source.send`, `wl_data_offer.receive`, `wl_keyboard.keymap`),
     /// not as a standalone message — so the reader forwards the message itself
@@ -113,25 +113,28 @@ impl RawEvent {
             object_id,
             opcode,
             args,
-            nargs: n as u8,
+            // `n <= 4` from the `.min(4)` above, always fits a `u8`.
+            nargs: u8::try_from(n).unwrap_or(4),
         }
     }
 
     /// The object id this event is about (raw wire value), or 0 for the
     /// non-`Wire` variants (`Bytes`, `Repeat`), which aren't about an object.
-    pub fn object_id(&self) -> u32 {
+    #[must_use]
+    pub const fn object_id(&self) -> u32 {
         match self {
-            RawEvent::Wire { object_id, .. } => *object_id,
-            RawEvent::Bytes(_) | RawEvent::Repeat | RawEvent::Fd(_) => 0,
+            Self::Wire { object_id, .. } => *object_id,
+            Self::Bytes(_) | Self::Repeat | Self::Fd(_) => 0,
         }
     }
 
     /// The opcode of this event (raw wire value), or 0 for the non-`Wire`
     /// variants (`Bytes`, `Repeat`).
-    pub fn opcode(&self) -> u16 {
+    #[must_use]
+    pub const fn opcode(&self) -> u16 {
         match self {
-            RawEvent::Wire { opcode, .. } => *opcode,
-            RawEvent::Bytes(_) | RawEvent::Repeat | RawEvent::Fd(_) => 0,
+            Self::Wire { opcode, .. } => *opcode,
+            Self::Bytes(_) | Self::Repeat | Self::Fd(_) => 0,
         }
     }
 
@@ -143,35 +146,41 @@ impl RawEvent {
 
     /// Decode this event's opcode into the event enum `E`, or `None` if it isn't
     /// one `E` models: `ev.event::<PointerEvent>()`.
+    #[must_use]
     pub fn event<E: FromOpcode>(&self) -> Option<E> {
         E::from_opcode(self.opcode())
     }
 
     /// Read fixed arg `i` as a `u32` (0 if out of range).
-    pub fn arg(&self, i: usize) -> u32 {
+    #[must_use]
+    pub const fn arg(&self, i: usize) -> u32 {
         match self {
-            RawEvent::Wire { args, nargs, .. } if i < *nargs as usize => args[i],
+            Self::Wire { args, nargs, .. } if i < *nargs as usize => args[i],
             _ => 0,
         }
     }
 
     /// Read fixed arg `i` reinterpreted as `i32` (for `wl_fixed`/signed args).
-    pub fn arg_i32(&self, i: usize) -> i32 {
-        self.arg(i) as i32
+    #[must_use]
+    pub const fn arg_i32(&self, i: usize) -> i32 {
+        self.arg(i).cast_signed()
     }
 
     /// Read arg `i` as an event [`Serial`].
-    pub fn serial(&self, i: usize) -> Serial {
+    #[must_use]
+    pub const fn serial(&self, i: usize) -> Serial {
         Serial(self.arg(i))
     }
 
     /// Read arg `i` as a [`Fixed`] (24.8 fixed-point) coordinate.
-    pub fn fixed(&self, i: usize) -> Fixed {
+    #[must_use]
+    pub const fn fixed(&self, i: usize) -> Fixed {
         Fixed(self.arg_i32(i))
     }
 
     /// Read args `ix` and `iy` as a [`Point`], converting from `wl_fixed`.
-    pub fn point(&self, ix: usize, iy: usize) -> Point {
+    #[must_use]
+    pub const fn point(&self, ix: usize, iy: usize) -> Point {
         Point::new(self.fixed(ix).to_pixels(), self.fixed(iy).to_pixels())
     }
 }

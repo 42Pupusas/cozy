@@ -55,6 +55,7 @@ mod field_code {
     pub const ERROR_NAME: u8 = 4;
     pub const REPLY_SERIAL: u8 = 5;
     pub const DESTINATION: u8 = 6;
+    pub const SENDER: u8 = 7;
     pub const SIGNATURE: u8 = 8;
 }
 
@@ -109,6 +110,38 @@ impl MessageBuilder {
                 buf.extend_from_slice(&n.to_le_bytes());
             }
         }
+    }
+
+    /// Build an empty `METHOD_RETURN` frame answering `call_serial` from
+    /// `destination`. `StatusNotifier` registration methods return no values,
+    /// so this deliberately covers the only server reply the bar needs
+    /// before adding a broad outbound-value encoder.
+    #[must_use]
+    pub fn build_empty_method_return(serial: u32, destination: &str, call_serial: u32) -> Vec<u8> {
+        let mut header_fields = Vec::new();
+        Self::write_string_field(
+            &mut header_fields,
+            field_code::DESTINATION,
+            b's',
+            destination,
+        );
+        Self::pad_to(&mut header_fields, 8);
+        header_fields.push(field_code::REPLY_SERIAL);
+        header_fields.extend_from_slice(&[1, b'u', 0]);
+        Self::pad_to(&mut header_fields, 4);
+        header_fields.extend_from_slice(&call_serial.to_le_bytes());
+
+        let mut out = vec![b'l', MessageType::MethodReturn.as_byte(), 0, 1];
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(header_fields.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&header_fields);
+        Self::pad_to(&mut out, 8);
+        out
     }
 
     /// Build a `METHOD_CALL` message frame: header + body, ready to write
@@ -198,6 +231,18 @@ impl BodyArg {
 #[derive(Debug)]
 pub struct Reply {
     pub kind: MessageType,
+    /// The sender unique name on incoming method calls/signals. This is the
+    /// destination required for a protocol-correct method return.
+    pub sender: Option<String>,
+    /// The object path advertised by an incoming method call.
+    pub path: Option<String>,
+    /// The interface advertised by an incoming method call.
+    pub interface: Option<String>,
+    /// The member advertised by an incoming method call.
+    pub member: Option<String>,
+    /// Serial assigned by the sender to this message. An incoming method call
+    /// must be answered with it as `REPLY_SERIAL`.
+    pub serial: u32,
     /// Present when `kind == Error`, e.g.
     /// `"org.freedesktop.DBus.Error.ServiceUnknown"`.
     pub error_name: Option<String>,
@@ -230,6 +275,7 @@ impl Reply {
 #[derive(Debug, Clone, Copy)]
 pub struct Prelude {
     pub message_type: MessageType,
+    pub serial: u32,
     pub body_len: u32,
     pub header_fields_len: u32,
 }
@@ -248,9 +294,11 @@ impl Prelude {
         }
         let message_type = MessageType::from_byte(buf[1])?;
         let body_len = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        let serial = u32::from_le_bytes(buf[8..12].try_into().ok()?);
         let header_fields_len = u32::from_le_bytes(buf[12..16].try_into().ok()?);
         Some(Self {
             message_type,
+            serial,
             body_len,
             header_fields_len,
         })
@@ -285,6 +333,10 @@ impl Reply {
         let mut signature = String::new();
         let mut error_name = None;
         let mut reply_serial = None;
+        let mut sender = None;
+        let mut path = None;
+        let mut interface = None;
+        let mut member = None;
 
         // Header fields are an ARRAY of STRUCT(BYTE, VARIANT), each struct
         // 8-aligned within the fields array's own start (which is itself
@@ -307,6 +359,10 @@ impl Reply {
             let val_start = sig_end + 1;
             let (val, next) = Unmarshaller::unmarshal(buf, val_start, inner_sig)?;
             match code {
+                field_code::PATH => path = val.as_display_string(),
+                field_code::INTERFACE => interface = val.as_display_string(),
+                field_code::MEMBER => member = val.as_display_string(),
+                field_code::SENDER => sender = val.as_display_string(),
                 field_code::SIGNATURE => {
                     if let Value::Signature(s) = val {
                         signature = s;
@@ -338,6 +394,11 @@ impl Reply {
 
         Some(Self {
             kind: prelude.message_type,
+            sender,
+            path,
+            interface,
+            member,
+            serial: prelude.serial,
             error_name,
             reply_serial,
             signature,

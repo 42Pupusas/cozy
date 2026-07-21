@@ -109,7 +109,7 @@ impl PointerState {
     /// followed by a release with nothing else of interest in between -- a
     /// bar has no drag/selection to distinguish, so press just arms it and
     /// release (while armed) reports it.
-    fn on_button(&mut self, ev: &RawEvent) {
+    const fn on_button(&mut self, ev: &RawEvent) {
         let button = PointerButton::from_code(ev.arg(2));
         let state = ButtonState::from_raw(ev.arg(3));
         self.apply_button(button, state);

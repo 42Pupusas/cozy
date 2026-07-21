@@ -6,7 +6,7 @@
 //!    compositor's `wl_keyboard.keymap` blob): resolves `(evdev keycode,
 //!    live modifier/layout state)` → the actual keysym the compositor's
 //!    keymap says that key produces right now — remaps included (e.g.
-//!    niri's `input.keyboard.xkb` swapping Esc and CapsLock). This is the
+//!    niri's `input.keyboard.xkb` swapping Esc and `CapsLock`). This is the
 //!    path used whenever `libxkbcommon` loaded and the keymap compiled.
 //!    [`XkbKeysym::from_raw`] + [`XkbKeysym::to_key`] turn the resulting
 //!    keysym into our [`Key`] enum.
@@ -28,6 +28,7 @@ use crate::protocol::Key;
 pub trait PhysicalKey {
     /// Map this physical evdev keycode to its logical keysym via the
     /// no-XKB fallback path (see module docs).
+    #[must_use]
     fn to_logical(self) -> Self;
 }
 
@@ -94,7 +95,7 @@ pub(crate) enum XkbKeysym {
 }
 
 impl XkbKeysym {
-    pub(crate) fn from_raw(raw: u32) -> Option<Self> {
+    pub(crate) const fn from_raw(raw: u32) -> Option<Self> {
         Some(match raw {
             0xff08 => Self::BackSpace,
             0xff09 => Self::Tab,
@@ -145,7 +146,7 @@ impl XkbKeysym {
 /// is purely a fold over its own variants.
 impl XkbKeysym {
     /// Translate this XKB keysym into our `Key` enum.
-    pub(crate) fn to_key(self) -> Key {
+    pub(crate) const fn to_key(self) -> Key {
         match self {
             Self::BackSpace => Key::Backspace,
             Self::Tab => Key::Tab,
@@ -175,7 +176,6 @@ impl XkbKeysym {
             Self::F12 => Key::F12,
             Self::ShiftL | Self::ShiftR => Key::LShift,
             Self::ControlL | Self::ControlR => Key::LCtrl,
-            Self::CapsLock => Key::CapsLock,
             // No dedicated NumLock/ScrollLock/Menu/Super variants in
             // `protocol::Key` today (only `input::Key` has them) -- these
             // never reach the encoder as anything but modifier-only no-ops
@@ -183,10 +183,9 @@ impl XkbKeysym {
             // variant (rather than dropping the event) keeps
             // repeat-suppression / is_modifier() correct without inventing
             // wire-protocol variants nothing else in `platform` uses.
-            Self::NumLock | Self::ScrollLock => Key::CapsLock,
+            Self::CapsLock | Self::NumLock | Self::ScrollLock => Key::CapsLock,
             Self::AltL | Self::AltR => Key::LAlt,
-            Self::SuperL | Self::SuperR => Key::LMeta,
-            Self::Menu => Key::LMeta,
+            Self::SuperL | Self::SuperR | Self::Menu => Key::LMeta,
         }
     }
 }

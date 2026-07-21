@@ -29,6 +29,8 @@ pub mod scroll;
 mod sys_file;
 pub mod temperature;
 pub mod text;
+pub mod tray;
+pub mod tray_icon;
 pub mod volume;
 pub mod wifi;
 
@@ -44,5 +46,7 @@ pub use notifications::{NotificationSegment, Notifications};
 pub use scroll::{ScrollAccumulator, steps_to_delta_pct};
 pub use temperature::Temperature;
 pub use text::TextRenderer;
+pub use tray::{TrayItem, TraySnapshot, TrayWatcher};
+pub use tray_icon::{TrayIcon, TrayPixmap};
 pub use volume::Volume;
 pub use wifi::Wifi;

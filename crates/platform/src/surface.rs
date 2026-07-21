@@ -56,15 +56,22 @@ impl Frame {
         height: i32,
         format: Format,
     ) -> Result<([Self; 2], ShmBuffer, PoolId)> {
-        let shm_mem = ShmBuffer::new(width as usize, height as usize, 2)
-            .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
+        // Window dimensions are always non-negative in practice (validated
+        // config / compositor-reported sizes); clamp defensively rather
+        // than panic on a pathological value.
+        let shm_mem = ShmBuffer::new(
+            usize::try_from(width).unwrap_or(0),
+            usize::try_from(height).unwrap_or(0),
+            2,
+        )
+        .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
         let stride = width * 4;
         let pool: PoolId = sender.alloc_id();
         let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
             .new_id(pool)
-            .i32(shm_mem.size_bytes() as i32)
+            .i32(i32::try_from(shm_mem.size_bytes()).unwrap_or(i32::MAX))
             .finish();
-        sender.send_with_fds(msg, &[shm_mem.fd()])?;
+        sender.send_with_fds(&msg, &[shm_mem.fd()])?;
         let mut frames = [Self {
             buffer: BufferId(0),
             free: true,
@@ -74,7 +81,7 @@ impl Frame {
             sender.request(
                 MessageBuilder::new(pool, ShmPoolRequest::CreateBuffer)
                     .new_id(buffer)
-                    .i32(shm_mem.frame_offset(i) as i32)
+                    .i32(i32::try_from(shm_mem.frame_offset(i)).unwrap_or(i32::MAX))
                     .i32(width)
                     .i32(height)
                     .i32(stride)
@@ -96,8 +103,9 @@ type Bootstrap = (
     std::thread::JoinHandle<Result<()>>,
 );
 
-/// Role-agnostic Wayland surface bootstrap steps shared by every window --
-/// see the module doc for why these live here once instead of being
+/// Role-agnostic Wayland surface bootstrap steps shared by every window.
+///
+/// See the module doc for why these live here once instead of being
 /// copy-pasted per window. A marker type (like [`crate::volume::Volume`] in
 /// the `statusbar` crate): every method is a one-off protocol exchange or a
 /// pure computation, there's no state to hold between calls.
@@ -156,9 +164,8 @@ impl SurfaceBootstrap {
                         return scale;
                     }
                 }
-                RawEvent::Repeat => {}
-                // Fd-carrying events never occur during output-scale probing.
-                RawEvent::Fd(_) => {}
+                // Neither occurs during output-scale probing.
+                RawEvent::Repeat | RawEvent::Fd(_) => {}
             }
         }
     }
@@ -224,7 +231,9 @@ impl SurfaceBootstrap {
         let reader_handle = std::thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
-                let r = reader.run(producer, Some(reader_wake)).map_err(Error::Conn);
+                let r = reader
+                    .run(&producer, Some(&reader_wake))
+                    .map_err(Error::Conn);
                 if let Err(e) = &r {
                     eprintln!("{thread_name}: reader error: {e}");
                 }
@@ -309,12 +318,13 @@ impl SurfaceBootstrap {
 
         // wl_callback.done: the frame we asked to be notified about was
         // shown.
-        if let Some(cb) = *frame_cb {
-            if ev.is(cb) && ev.event::<CallbackEvent>() == Some(CallbackEvent::Done) {
-                *frame_ready = true;
-                *frame_cb = None;
-                return Routed::Handled;
-            }
+        if let Some(cb) = *frame_cb
+            && ev.is(cb)
+            && ev.event::<CallbackEvent>() == Some(CallbackEvent::Done)
+        {
+            *frame_ready = true;
+            *frame_cb = None;
+            return Routed::Handled;
         }
 
         Routed::Passthrough

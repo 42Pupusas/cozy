@@ -92,7 +92,7 @@ impl ClipboardState {
 
     /// Record the latest `wl_keyboard.enter` serial. Must be called before
     /// [`Self::copy`] can publish anything (see `focus_serial`'s docs).
-    pub(crate) fn set_focus_serial(&mut self, serial: u32) {
+    pub(crate) const fn set_focus_serial(&mut self, serial: u32) {
         self.focus_serial = serial;
     }
 
@@ -139,7 +139,7 @@ impl ClipboardState {
     /// closes. A helper thread blocks reading our end and pushes the bytes
     /// back through the paste channel, then signals `wake` so the UI loop
     /// notices without polling. No-op if nothing is currently offered.
-    pub(crate) fn request_paste(&mut self, window_tx: &mut WindowSender, wake: &waker::Waker) {
+    pub(crate) fn request_paste(&self, window_tx: &WindowSender, wake: &waker::Waker) {
         let Some(offer) = self.offer else {
             return;
         };
@@ -176,7 +176,7 @@ impl ClipboardState {
 
     /// Whether a `data_source.send` is in flight, i.e. the next
     /// `RawEvent::Fd` is the pipe we should write our clipboard text into.
-    pub(crate) fn is_awaiting_send_fd(&self) -> bool {
+    pub(crate) const fn is_awaiting_send_fd(&self) -> bool {
         self.awaiting_send_fd
     }
 
@@ -206,13 +206,13 @@ impl ClipboardState {
 
     /// The current offer id, if any — for the window's event dispatch to
     /// route `wl_data_offer.*` events here.
-    pub(crate) fn offer_id(&self) -> Option<DataOfferId> {
+    pub(crate) const fn offer_id(&self) -> Option<DataOfferId> {
         self.offer
     }
 
     /// The current outgoing source id, if any — for the window's event
     /// dispatch to route `wl_data_source.*` events here.
-    pub(crate) fn source_id(&self) -> Option<DataSourceId> {
+    pub(crate) const fn source_id(&self) -> Option<DataSourceId> {
         self.source
     }
 
@@ -220,7 +220,7 @@ impl ClipboardState {
     /// the awaiting-fd flag (the fd itself arrives as the next
     /// `RawEvent::Fd`); `Cancelled` drops the source (a peer replaced our
     /// selection). Other events are ignored.
-    pub(crate) fn on_source_event(&mut self, event: DataSourceEvent) {
+    pub(crate) const fn on_source_event(&mut self, event: DataSourceEvent) {
         match event {
             DataSourceEvent::Send => self.awaiting_send_fd = true,
             DataSourceEvent::Cancelled => self.source = None,
@@ -232,8 +232,9 @@ impl ClipboardState {
     /// type). We only ever request `text/plain` on paste, so there's
     /// nothing to track here beyond acknowledging the offer exists —
     /// exposed so the window's dispatch has an explicit hook to call instead
-    /// of silently swallowing the event.
-    pub(crate) fn on_offer_event(&self, _event: DataOfferEvent) {}
+    /// of silently swallowing the event. Takes no `&self`: it's a
+    /// documented no-op stub, not a real query against clipboard state.
+    pub(crate) const fn on_offer_event(_event: DataOfferEvent) {}
 }
 
 #[cfg(test)]

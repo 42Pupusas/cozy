@@ -45,27 +45,32 @@ impl MessageBuilder {
         Self { buf }
     }
 
+    #[must_use]
     pub fn u32(mut self, v: u32) -> Self {
         self.buf.extend_from_slice(&v.to_ne_bytes());
         self
     }
 
+    #[must_use]
     pub fn i32(mut self, v: i32) -> Self {
         self.buf.extend_from_slice(&v.to_ne_bytes());
         self
     }
 
     /// An object id argument (a reference to an existing object).
+    #[must_use]
     pub fn object(self, id: impl ObjectId) -> Self {
         self.u32(id.raw())
     }
 
     /// A `new_id` argument: the id we're assigning to an object we're creating.
+    #[must_use]
     pub fn new_id(self, id: impl ObjectId) -> Self {
         self.u32(id.raw())
     }
 
     /// A string: length-prefixed, NUL-terminated, padded to 4 bytes.
+    #[must_use]
     pub fn string(mut self, s: &str) -> Self {
         let bytes = s.as_bytes();
         let len_with_nul = bytes.len() + 1;

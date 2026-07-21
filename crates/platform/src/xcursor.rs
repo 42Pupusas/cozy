@@ -1,5 +1,7 @@
-//! Loading real system cursor themes (Xcursor format) so our hardware cursor
-//! matches the user's actual desktop pointer instead of a hand-drawn bitmap.
+//! Loading real system cursor themes (Xcursor format).
+//!
+//! So our hardware cursor matches the user's actual desktop pointer instead
+//! of a hand-drawn bitmap.
 //!
 //! This implements just enough of the on-disk Xcursor format (see
 //! `Xcursor(3)`) to find a theme's `left_ptr` image and decode it: no
@@ -21,10 +23,11 @@
 use std::fs;
 use std::path::PathBuf;
 
-/// A single decoded cursor image: dimensions, hotspot, and premultiplied
-/// ARGB8888 pixels (native-endian `u32`s) — exactly the pixel format
-/// `wl_shm`'s `Argb8888` format expects, so callers can copy this straight
-/// into a shm buffer with no conversion.
+/// A single decoded cursor image: dimensions, hotspot, and premultiplied ARGB8888 pixels.
+///
+/// Native-endian `u32`s, exactly the pixel format `wl_shm`'s `Argb8888`
+/// format expects, so callers can copy this straight into a shm buffer with
+/// no conversion.
 #[derive(Debug, Clone)]
 pub struct CursorImage {
     pub width: u32,
@@ -63,7 +66,7 @@ impl CursorImage {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(24);
-        let want_size = base_size.saturating_mul(scale.max(1) as u32);
+        let want_size = base_size.saturating_mul(scale.max(1).cast_unsigned());
         Self::load(&theme, want_size)
     }
 
@@ -80,10 +83,10 @@ impl CursorImage {
             for dir in &dirs {
                 for name in POINTER_NAMES {
                     let path = dir.join(theme_name).join("cursors").join(name);
-                    if let Ok(bytes) = fs::read(&path) {
-                        if let Some(img) = Self::parse_best(&bytes, want_size) {
-                            return Some(img);
-                        }
+                    if let Ok(bytes) = fs::read(&path)
+                        && let Some(img) = Self::parse_best(&bytes, want_size)
+                    {
+                        return Some(img);
                     }
                 }
             }
@@ -114,9 +117,7 @@ impl CursorImage {
     /// Was a free `parse_all_images(bytes)` function.
     fn parse_all(bytes: &[u8]) -> Vec<Self> {
         let mut out = Vec::new();
-        let Some(mut r) = ByteCursor::new(bytes) else {
-            return out;
-        };
+        let mut r = ByteCursor::new(bytes);
         let Some(magic) = r.u32() else { return out };
         let Some(header) = r.u32() else { return out };
         let Some(_version) = r.u32() else { return out };
@@ -146,7 +147,7 @@ impl CursorImage {
 
     /// Was a free `parse_image_chunk(bytes, pos)` function.
     fn parse_chunk(bytes: &[u8], pos: usize) -> Option<Self> {
-        let mut r = ByteCursor::new(bytes.get(pos..)?)?;
+        let mut r = ByteCursor::new(bytes.get(pos..)?);
         let img_header = r.u32()?;
         let _img_type = r.u32()?;
         let _img_subtype = r.u32()?;
@@ -258,8 +259,8 @@ struct ByteCursor<'a> {
 }
 
 impl<'a> ByteCursor<'a> {
-    fn new(bytes: &'a [u8]) -> Option<Self> {
-        Some(Self { bytes, pos: 0 })
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, pos: 0 }
     }
 
     fn u32(&mut self) -> Option<u32> {
@@ -285,7 +286,7 @@ mod tests {
         buf.extend_from_slice(&XCUR_MAGIC.to_le_bytes());
         buf.extend_from_slice(&16u32.to_le_bytes());
         buf.extend_from_slice(&1u32.to_le_bytes());
-        buf.extend_from_slice(&(images.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&u32::try_from(images.len()).unwrap_or(0).to_le_bytes());
 
         let toc_end = 16 + images.len() * 12;
         let mut chunk_data = Vec::new();
@@ -298,7 +299,7 @@ mod tests {
         for (i, &(w, _h, _, _, _)) in images.iter().enumerate() {
             buf.extend_from_slice(&CHUNK_IMAGE.to_le_bytes());
             buf.extend_from_slice(&w.to_le_bytes()); // subtype == nominal size
-            buf.extend_from_slice(&(positions[i] as u32).to_le_bytes());
+            buf.extend_from_slice(&u32::try_from(positions[i]).unwrap_or(0).to_le_bytes());
         }
 
         // Now actually fill each chunk's header + pixels at its position.

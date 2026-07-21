@@ -292,7 +292,7 @@ impl BarWindow {
     }
 
     /// Mark the bar dirty so the next `tick` repaints and presents.
-    pub fn request_redraw(&mut self) {
+    pub const fn request_redraw(&mut self) {
         self.present.mark_dirty();
     }
 
@@ -320,7 +320,7 @@ impl BarWindow {
     /// Set the color the canvas is cleared to before each frame's `paint`
     /// closure runs, and request a redraw so the change is visible
     /// immediately.
-    pub fn set_background(&mut self, color: Color) {
+    pub const fn set_background(&mut self, color: Color) {
         self.background = color;
         self.present.mark_dirty();
     }
@@ -357,9 +357,10 @@ impl BarWindow {
         }
 
         if self.configured
-            && let PresentAttempt::Ready(slot) = self.present.begin_present() {
-                self.do_present(slot, &mut paint);
-            }
+            && let PresentAttempt::Ready(slot) = self.present.begin_present()
+        {
+            self.do_present(slot, &mut paint);
+        }
         Ok(true)
     }
 
@@ -391,10 +392,11 @@ impl BarWindow {
         // detection) and Axis (queue a scroll delta) matter for a bar with
         // no selection/drag of its own; see `PointerState` for all of it.
         if let Some(pointer) = self.pointer.id()
-            && ev.is(pointer) {
-                self.pointer.on_event(ev);
-                return Ok(());
-            }
+            && ev.is(pointer)
+        {
+            self.pointer.on_event(ev);
+            return Ok(());
+        }
 
         if ev.is(self.layer_surface) {
             match ev.event::<LayerSurfaceEvent>() {
@@ -618,4 +620,3 @@ impl BarWindow {
         surface::SurfaceBootstrap::bind(sender, registry, name, interface, version)
     }
 }
-

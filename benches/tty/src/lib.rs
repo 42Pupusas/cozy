@@ -147,8 +147,7 @@ impl Corpora {
     /// double-width characters exercising the `Cell::wide`/spacer path.
     #[must_use]
     pub fn wide_unicode(_cols: u16, _rows: u16, n: usize) -> Vec<u8> {
-        const LINE: &str =
-            "国际化测试字符宽度渲染国际化测试字符宽度渲染国际化测试字符宽度渲染国际化测试字符宽度渲染";
+        const LINE: &str = "国际化测试字符宽度渲染国际化测试字符宽度渲染国际化测试字符宽度渲染国际化测试字符宽度渲染";
         let mut out = String::with_capacity(LINE.len() * n + n);
         for _ in 0..n {
             out.push_str(LINE);
@@ -184,7 +183,8 @@ impl Corpora {
             // `i % rows`/`(i * 7) % cols` are bounded by `rows`/`cols: u16`, so
             // these always succeed.
             let row = u16::try_from(i % rows as usize).expect("i % rows fits in u16") + 1;
-            let col = u16::try_from((i * 7) % cols as usize).expect("(i * 7) % cols fits in u16") + 1;
+            let col =
+                u16::try_from((i * 7) % cols as usize).expect("(i * 7) % cols fits in u16") + 1;
             out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
             out.extend_from_slice(b"\x1b[K");
             out.extend_from_slice(format!("x{i}").as_bytes());

@@ -25,8 +25,8 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Conn(e) => write!(f, "{e}"),
-            Error::Protocol {
+            Self::Conn(e) => write!(f, "{e}"),
+            Self::Protocol {
                 object,
                 code,
                 message,
@@ -36,9 +36,9 @@ impl fmt::Display for Error {
                     "wayland protocol error on object {object} (code {code}): {message}"
                 )
             }
-            Error::ReaderStopped => write!(f, "reader thread stopped unexpectedly"),
-            Error::ReaderPanicked => write!(f, "reader thread panicked"),
-            Error::ReaderSpawn(e) => write!(f, "failed to spawn reader thread: {e}"),
+            Self::ReaderStopped => write!(f, "reader thread stopped unexpectedly"),
+            Self::ReaderPanicked => write!(f, "reader thread panicked"),
+            Self::ReaderSpawn(e) => write!(f, "failed to spawn reader thread: {e}"),
         }
     }
 }
@@ -46,8 +46,8 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Conn(e) => Some(e),
-            Error::ReaderSpawn(e) => Some(e),
+            Self::Conn(e) => Some(e),
+            Self::ReaderSpawn(e) => Some(e),
             _ => None,
         }
     }
@@ -55,13 +55,13 @@ impl std::error::Error for Error {
 
 impl From<ConnError> for Error {
     fn from(e: ConnError) -> Self {
-        Error::Conn(e)
+        Self::Conn(e)
     }
 }
 
 impl From<SysError> for Error {
     fn from(e: SysError) -> Self {
-        Error::Conn(ConnError::Sys(e))
+        Self::Conn(ConnError::Sys(e))
     }
 }
 

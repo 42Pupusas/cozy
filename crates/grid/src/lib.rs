@@ -1677,7 +1677,9 @@ impl Grid {
                 && idx <= 255
             {
                 // Checked `<= 255` above, so this always fits in u8.
-                self.reset_palette_override(u8::try_from(idx).expect("checked idx <= 255 fits in u8"));
+                self.reset_palette_override(
+                    u8::try_from(idx).expect("checked idx <= 255 fits in u8"),
+                );
             }
         }
     }
@@ -2583,5 +2585,3 @@ mod tests {
         }
     }
 }
-
-

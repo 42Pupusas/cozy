@@ -52,6 +52,9 @@ pub enum ModuleKind {
     /// shared by every configured rule since the color only depends on
     /// unread state, not which app; see `notifications::UnreadMarker`.
     Notification,
+    /// One native StatusNotifier/AppIndicator item. Its pixels arrive from
+    /// the application, so unlike text modules it has no foreground color.
+    SystemTray,
 }
 
 /// Extends `str` with the "trailing percent field" parse, as a method
@@ -131,7 +134,11 @@ impl ModuleKind {
             }
             Self::Temp => ORANGE,
             Self::Cpu => GREEN,
-            Self::Mem => BLUE,
+            // The tray renderer paints application-supplied ARGB pixels;
+            // this fallback only exists because `Painter` shares segment
+            // geometry with all module kinds -- same reasoning as `Mem`'s
+            // arbitrary-but-consistent blue.
+            Self::Mem | Self::SystemTray => BLUE,
             Self::VolOut => {
                 if text.ends_with('\u{f075f}') {
                     FG_DARK // waybar's #pulseaudio.muted
@@ -282,13 +289,7 @@ mod tests {
     fn temp_cpu_mem_brightness_are_fixed_colors() {
         assert_eq!(ModuleKind::Temp.color_for(" 50\u{b0}C"), palette::ORANGE);
         assert_eq!(ModuleKind::Cpu.color_for(" 50%"), palette::GREEN);
-        assert_eq!(
-            ModuleKind::Mem.color_for("1.0/2.0GiB"),
-            palette::BLUE
-        );
-        assert_eq!(
-            ModuleKind::Brightness.color_for(" 50%"),
-            palette::YELLOW
-        );
+        assert_eq!(ModuleKind::Mem.color_for("1.0/2.0GiB"), palette::BLUE);
+        assert_eq!(ModuleKind::Brightness.color_for(" 50%"), palette::YELLOW);
     }
 }

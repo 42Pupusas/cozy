@@ -66,7 +66,7 @@ macro_rules! events {
         }
         impl $name {
             /// Decode a wire opcode, or `None` if it isn't one we recognise.
-            pub fn from_opcode(op: u16) -> Option<Self> {
+            pub const fn from_opcode(op: u16) -> Option<Self> {
                 match op {
                     $($op => Some(Self::$variant),)+
                     _ => None,
@@ -133,7 +133,7 @@ requests! {
         /// Request a one-shot frame-throttling callback (a `wl_callback` whose
         /// `done` event fires when the compositor is ready for the next frame).
         Frame = 3,
-        /// Set the buffer scale (integer, ≥1). 1 = 1:1, 2 = HiDPI @ 2x.
+        /// Set the buffer scale (integer, ≥1). 1 = 1:1, 2 = `HiDPI` @ 2x.
         SetBufferScale = 8,
         Commit = 6,
     }
@@ -226,7 +226,7 @@ requests! {
     ToplevelRequest {
         Destroy = 0,
         SetTitle = 2,
-        /// Stable, machine-facing identifier (app_id) the compositor uses for
+        /// Stable, machine-facing identifier (`app_id`) the compositor uses for
         /// window rules / matching — distinct from the human-facing title,
         /// which apps overwrite at runtime via OSC.
         SetAppId = 3,
@@ -281,7 +281,7 @@ events! {
         /// atomically (so a reader can wait for `done` before acting).
         Done = 2,
         /// Integer buffer scale factor this output expects (1 = normal,
-        /// 2 = HiDPI @ 2x, ...). This is the one we actually read.
+        /// 2 = `HiDPI` @ 2x, ...). This is the one we actually read.
         Scale = 3,
     }
 }
@@ -343,11 +343,12 @@ pub enum PointerButton {
 
 impl PointerButton {
     /// Identify a button from its raw evdev code, or `None` if we don't model it.
-    pub fn from_code(code: u32) -> Option<Self> {
+    #[must_use]
+    pub const fn from_code(code: u32) -> Option<Self> {
         match code {
-            0x110 => Some(PointerButton::Left),
-            0x111 => Some(PointerButton::Right),
-            0x112 => Some(PointerButton::Middle),
+            0x110 => Some(Self::Left),
+            0x111 => Some(Self::Right),
+            0x112 => Some(Self::Middle),
             _ => None,
         }
     }
@@ -362,10 +363,11 @@ pub enum ButtonState {
 }
 
 impl ButtonState {
-    pub fn from_raw(state: u32) -> Option<Self> {
+    #[must_use]
+    pub const fn from_raw(state: u32) -> Option<Self> {
         match state {
-            0 => Some(ButtonState::Released),
-            1 => Some(ButtonState::Pressed),
+            0 => Some(Self::Released),
+            1 => Some(Self::Pressed),
             _ => None,
         }
     }
@@ -404,13 +406,13 @@ events! {
     DataDeviceEvent {
         /// A new drag offer appeared (unused here).
         DataOffer = 0,
-        /// Keyboard focus entered during DnD (unused here).
+        /// Keyboard focus entered during `DnD` (unused here).
         Enter = 1,
-        /// DnD focus left (unused here).
+        /// `DnD` focus left (unused here).
         Leave = 2,
-        /// DnD motion (unused here).
+        /// `DnD` motion (unused here).
         Motion = 3,
-        /// DnD drop (unused here).
+        /// `DnD` drop (unused here).
         Drop = 4,
         /// The clipboard selection changed: `id` (a `wl_data_offer`, or 0).
         Selection = 5,
@@ -423,7 +425,7 @@ requests! {
         Offer = 0,
         /// Destroy the source.
         Destroy = 1,
-        /// Set the allowed DnD actions (v3+; unused for plain clipboard).
+        /// Set the allowed `DnD` actions (v3+; unused for plain clipboard).
         SetActions = 2,
     }
 }
@@ -437,9 +439,9 @@ events! {
         Send = 1,
         /// The selection was replaced by another client; destroy our source.
         Cancelled = 2,
-        /// DnD drop performed (unused here).
+        /// `DnD` drop performed (unused here).
         DndDropPerformed = 3,
-        /// DnD finished (unused here).
+        /// `DnD` finished (unused here).
         DndFinished = 4,
         /// Action offered (unused here).
         Action = 5,
@@ -455,7 +457,7 @@ requests! {
         Receive = 1,
         /// Destroy the offer.
         Destroy = 2,
-        /// Finish a DnD offer (unused here).
+        /// Finish a `DnD` offer (unused here).
         Finish = 3,
         /// Set actions (unused here).
         SetActions = 4,
@@ -503,6 +505,7 @@ events! {
 }
 
 /// Whether a `wl_keyboard.key` event is a press or a release (its `state` arg).
+///
 /// Same wire values as [`ButtonState`], but a distinct type so a key state can't
 /// be passed where a pointer-button state is expected.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -513,18 +516,21 @@ pub enum KeyState {
 }
 
 impl KeyState {
-    pub fn from_raw(state: u32) -> Option<Self> {
+    #[must_use]
+    pub const fn from_raw(state: u32) -> Option<Self> {
         match state {
-            0 => Some(KeyState::Released),
-            1 => Some(KeyState::Pressed),
+            0 => Some(Self::Released),
+            1 => Some(Self::Pressed),
             _ => None,
         }
     }
 }
 
-/// The keys we act on, by their Linux evdev codes — exactly what a
-/// `wl_keyboard.key` event reports in its `key` argument (the raw kernel
-/// keycode; the +8 XKB offset applies only to the keymap, not the wire field).
+/// The keys we act on, by their Linux evdev codes.
+///
+/// Exactly what a `wl_keyboard.key` event reports in its `key` argument (the
+/// raw kernel keycode; the +8 XKB offset applies only to the keymap, not the
+/// wire field).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Key {
@@ -622,108 +628,110 @@ pub enum Key {
 impl Key {
     /// Identify a key from its raw evdev code, or `None` if we don't recognise it.
     #[allow(clippy::too_many_lines)]
-    pub fn from_code(code: u32) -> Option<Self> {
+    #[must_use]
+    pub const fn from_code(code: u32) -> Option<Self> {
         match code {
-            1 => Some(Key::Esc),
-            2 => Some(Key::N1),
-            3 => Some(Key::N2),
-            4 => Some(Key::N3),
-            5 => Some(Key::N4),
-            6 => Some(Key::N5),
-            7 => Some(Key::N6),
-            8 => Some(Key::N7),
-            9 => Some(Key::N8),
-            10 => Some(Key::N9),
-            11 => Some(Key::N0),
-            12 => Some(Key::Minus),
-            13 => Some(Key::Equal),
-            14 => Some(Key::Backspace),
-            15 => Some(Key::Tab),
-            16 => Some(Key::Q),
-            17 => Some(Key::W),
-            18 => Some(Key::E),
-            19 => Some(Key::R),
-            20 => Some(Key::T),
-            21 => Some(Key::Y),
-            22 => Some(Key::U),
-            23 => Some(Key::I),
-            24 => Some(Key::O),
-            25 => Some(Key::P),
-            26 => Some(Key::LBracket),
-            27 => Some(Key::RBracket),
-            28 => Some(Key::Enter),
-            29 => Some(Key::LCtrl),
-            30 => Some(Key::A),
-            31 => Some(Key::S),
-            32 => Some(Key::D),
-            33 => Some(Key::F),
-            34 => Some(Key::G),
-            35 => Some(Key::H),
-            36 => Some(Key::J),
-            37 => Some(Key::K),
-            38 => Some(Key::L),
-            39 => Some(Key::Semicolon),
-            40 => Some(Key::Apostrophe),
-            41 => Some(Key::Backtick),
-            42 => Some(Key::LShift),
-            43 => Some(Key::Backslash),
-            44 => Some(Key::Z),
-            45 => Some(Key::X),
-            46 => Some(Key::C),
-            47 => Some(Key::V),
-            48 => Some(Key::B),
-            49 => Some(Key::N),
-            50 => Some(Key::M),
-            51 => Some(Key::Comma),
-            52 => Some(Key::Dot),
-            53 => Some(Key::Slash),
-            54 => Some(Key::RShift),
-            56 => Some(Key::LAlt),
-            57 => Some(Key::Space),
-            58 => Some(Key::CapsLock),
-            59 => Some(Key::F1),
-            60 => Some(Key::F2),
-            61 => Some(Key::F3),
-            62 => Some(Key::F4),
-            63 => Some(Key::F5),
-            64 => Some(Key::F6),
-            65 => Some(Key::F7),
-            66 => Some(Key::F8),
-            67 => Some(Key::F9),
-            68 => Some(Key::F10),
-            87 => Some(Key::F11),
-            88 => Some(Key::F12),
-            97 => Some(Key::RCtrl),
-            100 => Some(Key::RAlt),
-            102 => Some(Key::Home),
-            103 => Some(Key::Up),
-            104 => Some(Key::PageUp),
-            105 => Some(Key::Left),
-            106 => Some(Key::Right),
-            107 => Some(Key::End),
-            108 => Some(Key::Down),
-            109 => Some(Key::PageDown),
-            110 => Some(Key::Insert),
-            111 => Some(Key::Delete),
-            125 => Some(Key::LMeta),
-            126 => Some(Key::RMeta),
+            1 => Some(Self::Esc),
+            2 => Some(Self::N1),
+            3 => Some(Self::N2),
+            4 => Some(Self::N3),
+            5 => Some(Self::N4),
+            6 => Some(Self::N5),
+            7 => Some(Self::N6),
+            8 => Some(Self::N7),
+            9 => Some(Self::N8),
+            10 => Some(Self::N9),
+            11 => Some(Self::N0),
+            12 => Some(Self::Minus),
+            13 => Some(Self::Equal),
+            14 => Some(Self::Backspace),
+            15 => Some(Self::Tab),
+            16 => Some(Self::Q),
+            17 => Some(Self::W),
+            18 => Some(Self::E),
+            19 => Some(Self::R),
+            20 => Some(Self::T),
+            21 => Some(Self::Y),
+            22 => Some(Self::U),
+            23 => Some(Self::I),
+            24 => Some(Self::O),
+            25 => Some(Self::P),
+            26 => Some(Self::LBracket),
+            27 => Some(Self::RBracket),
+            28 => Some(Self::Enter),
+            29 => Some(Self::LCtrl),
+            30 => Some(Self::A),
+            31 => Some(Self::S),
+            32 => Some(Self::D),
+            33 => Some(Self::F),
+            34 => Some(Self::G),
+            35 => Some(Self::H),
+            36 => Some(Self::J),
+            37 => Some(Self::K),
+            38 => Some(Self::L),
+            39 => Some(Self::Semicolon),
+            40 => Some(Self::Apostrophe),
+            41 => Some(Self::Backtick),
+            42 => Some(Self::LShift),
+            43 => Some(Self::Backslash),
+            44 => Some(Self::Z),
+            45 => Some(Self::X),
+            46 => Some(Self::C),
+            47 => Some(Self::V),
+            48 => Some(Self::B),
+            49 => Some(Self::N),
+            50 => Some(Self::M),
+            51 => Some(Self::Comma),
+            52 => Some(Self::Dot),
+            53 => Some(Self::Slash),
+            54 => Some(Self::RShift),
+            56 => Some(Self::LAlt),
+            57 => Some(Self::Space),
+            58 => Some(Self::CapsLock),
+            59 => Some(Self::F1),
+            60 => Some(Self::F2),
+            61 => Some(Self::F3),
+            62 => Some(Self::F4),
+            63 => Some(Self::F5),
+            64 => Some(Self::F6),
+            65 => Some(Self::F7),
+            66 => Some(Self::F8),
+            67 => Some(Self::F9),
+            68 => Some(Self::F10),
+            87 => Some(Self::F11),
+            88 => Some(Self::F12),
+            97 => Some(Self::RCtrl),
+            100 => Some(Self::RAlt),
+            102 => Some(Self::Home),
+            103 => Some(Self::Up),
+            104 => Some(Self::PageUp),
+            105 => Some(Self::Left),
+            106 => Some(Self::Right),
+            107 => Some(Self::End),
+            108 => Some(Self::Down),
+            109 => Some(Self::PageDown),
+            110 => Some(Self::Insert),
+            111 => Some(Self::Delete),
+            125 => Some(Self::LMeta),
+            126 => Some(Self::RMeta),
             _ => None,
         }
     }
 
     /// Modifier keys (Ctrl/Alt/Shift/Meta) never auto-repeat — holding them
     /// must not synthesize a stream of key events.
-    pub fn is_modifier(self) -> bool {
+    #[must_use]
+    pub const fn is_modifier(self) -> bool {
         matches!(
             self,
-            Key::LCtrl
-                | Key::RCtrl
-                | Key::LAlt
-                | Key::RAlt
-                | Key::LShift
-                | Key::RShift
-                | Key::LMeta
-                | Key::RMeta
+            Self::LCtrl
+                | Self::RCtrl
+                | Self::LAlt
+                | Self::RAlt
+                | Self::LShift
+                | Self::RShift
+                | Self::LMeta
+                | Self::RMeta
         )
     }
 }
@@ -739,7 +747,8 @@ pub enum SeatCapability {
 
 impl SeatCapability {
     /// Whether `bitmask` (from the capabilities event) includes this capability.
-    pub fn in_mask(self, bitmask: u32) -> bool {
+    #[must_use]
+    pub const fn in_mask(self, bitmask: u32) -> bool {
         bitmask & (self as u32) != 0
     }
 }
@@ -761,15 +770,18 @@ pub struct Modifiers {
     pub group: u32,
 }
 
-/// A `wl_fixed` value: signed 24.8 fixed-point. Pointer coordinates arrive in
-/// this format; the newtype keeps them from being read as plain pixels by
-/// accident — you must go through [`to_pixels`](Fixed::to_pixels).
+/// A `wl_fixed` value: signed 24.8 fixed-point.
+///
+/// Pointer coordinates arrive in this format; the newtype keeps them from
+/// being read as plain pixels by accident — you must go through
+/// [`to_pixels`](Fixed::to_pixels).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Fixed(pub i32);
 
 impl Fixed {
     /// Whole pixels, truncating the 8-bit fraction.
-    pub fn to_pixels(self) -> i32 {
+    #[must_use]
+    pub const fn to_pixels(self) -> i32 {
         self.0 / 256
     }
 }
@@ -785,7 +797,8 @@ pub enum Format {
 }
 
 impl Format {
-    pub fn code(self) -> u32 {
+    #[must_use]
+    pub const fn code(self) -> u32 {
         self as u32
     }
 }
@@ -851,7 +864,7 @@ pub const WL_DATA_DEVICE_MANAGER: Interface = Interface {
 requests! {
     /// `zwlr_layer_shell_v1` requests — the factory for layer surfaces.
     LayerShellRequest {
-        /// Turn a plain `wl_surface` into a layer surface: `id` (new_id),
+        /// Turn a plain `wl_surface` into a layer surface: `id` (`new_id`),
         /// `surface`, `output` (nullable -- 0 lets the compositor pick),
         /// `layer` (see [`Layer`]), `namespace` (a string identifying this
         /// shell client, e.g. "statusbar").
@@ -862,6 +875,7 @@ requests! {
 }
 
 /// `zwlr_layer_shell_v1` stacking layer (argument to `get_layer_surface`).
+///
 /// Bottom-to-top: `Background` sits behind normal windows, `Overlay` sits
 /// above everything including lock screens on some compositors.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -919,9 +933,10 @@ events! {
     }
 }
 
-/// `zwlr_layer_surface_v1` anchor bits (argument to `set_anchor`), ORed
-/// together. Two opposite edges anchored on an axis stretches that axis to
-/// fill the output -- a full-width top bar anchors `Top | Left | Right`.
+/// `zwlr_layer_surface_v1` anchor bits (argument to `set_anchor`), `ORed` together.
+///
+/// Two opposite edges anchored on an axis stretches that axis to fill the
+/// output -- a full-width top bar anchors `Top | Left | Right`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Anchor {
@@ -936,7 +951,7 @@ impl Anchor {
     /// `Anchor::bits(&[Anchor::Top, Anchor::Left, Anchor::Right])` for a
     /// full-width top bar.
     #[must_use]
-    pub fn bits(edges: &[Anchor]) -> u32 {
+    pub fn bits(edges: &[Self]) -> u32 {
         edges.iter().fold(0u32, |acc, e| acc | (*e as u32))
     }
 }
@@ -995,7 +1010,7 @@ requests! {
 // ── zwp_linux_dmabuf_v1 ──────────────────────────────────────────────────
 
 requests! {
-    /// `zwp_linux_dmabuf_v1` requests — factory for dmabuf-based wl_buffers.
+    /// `zwp_linux_dmabuf_v1` requests — factory for dmabuf-based `wl_buffers`.
     DmabufRequest {
         /// Unbind the factory (created objects remain valid).
         Destroy = 0,
@@ -1006,7 +1021,7 @@ requests! {
 events! {
     /// `zwp_linux_dmabuf_v1` events.
     DmabufEvent {
-        /// Advertised DRM_FORMAT code (deprecated in v4).
+        /// Advertised `DRM_FORMAT` code (deprecated in v4).
         Format = 0,
         /// Advertised modifier for a format (since v3, deprecated in v4).
         Modifier = 3,
@@ -1015,16 +1030,16 @@ events! {
 
 requests! {
     /// `zwp_linux_buffer_params_v1` requests — parameters for creating a
-    /// dmabuf-based wl_buffer.
+    /// dmabuf-based `wl_buffer`.
     DmabufParamsRequest {
         /// Delete this object, used or not.
         Destroy = 0,
-        /// Add one dmabuf fd to the set. `fd` travels out-of-band via SCM_RIGHTS.
+        /// Add one dmabuf fd to the set. `fd` travels out-of-band via `SCM_RIGHTS`.
         Add = 1,
-        /// Request asynchronous wl_buffer creation. New buffer id delivered via
+        /// Request asynchronous `wl_buffer` creation. New buffer id delivered via
         /// the `created` event.
         Create = 2,
-        /// Request immediate wl_buffer creation. Pre-allocated `new_id`; no
+        /// Request immediate `wl_buffer` creation. Pre-allocated `new_id`; no
         /// `created` event on success, `failed` on failure.
         CreateImmed = 3,
     }
@@ -1032,7 +1047,7 @@ requests! {
 events! {
     /// `zwp_linux_buffer_params_v1` events.
     DmabufParamsEvent {
-        /// `Create` succeeded — carries the new wl_buffer id.
+        /// `Create` succeeded — carries the new `wl_buffer` id.
         Created = 0,
         /// Buffer creation failed (compositor can't import dmabuf).
         Failed = 1,
@@ -1042,9 +1057,9 @@ events! {
 /// DRM fourcc codes for dmabuf buffer creation.
 pub mod drm_format {
     /// `DRM_FORMAT_XRGB8888` — 32-bit RGB, top byte unused.
-    pub const XRGB8888: u32 = 0x34325258;
+    pub const XRGB8888: u32 = 0x3432_5258;
     /// `DRM_FORMAT_ARGB8888` — 32-bit ARGB, alpha in top byte.
-    pub const ARGB8888: u32 = 0x34325241;
+    pub const ARGB8888: u32 = 0x3432_5241;
 }
 
 /// `DRM_FORMAT_MOD_LINEAR` — no tiling/compression.

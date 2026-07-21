@@ -24,22 +24,26 @@ pub struct Color {
 
 impl Color {
     /// Opaque color from 8-bit channels.
+    #[must_use]
     pub const fn rgb(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b, a: 0xff }
     }
 
     /// Color with an explicit alpha channel.
+    #[must_use]
     pub const fn rgba(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r, g, b, a }
     }
 
     /// Pack into the `0x00RRGGBB` word the XRGB8888 buffer expects.
+    #[must_use]
     pub const fn to_xrgb8888(self) -> u32 {
         ((self.r as u32) << 16) | ((self.g as u32) << 8) | (self.b as u32)
     }
 
     /// Pack into the `0xAARRGGBB` word the ARGB8888 format expects (cursors,
     /// subsurfaces with per-pixel alpha).
+    #[must_use]
     pub const fn to_argb8888(self) -> u32 {
         ((self.a as u32) << 24) | ((self.r as u32) << 16) | ((self.g as u32) << 8) | (self.b as u32)
     }
@@ -71,7 +75,7 @@ impl Color {
     /// `render.rs` -- moved onto `Color` (the foreground ink) since it's
     /// fundamentally a color-compositing operation, not a renderer concern.
     #[must_use]
-    pub fn blend_glyph(self, bg: Color, glyph_a: u8, bg_alpha: u8) -> u32 {
+    pub fn blend_glyph(self, bg: Self, glyph_a: u8, bg_alpha: u8) -> u32 {
         let fg = self;
         if bg_alpha == 255 {
             return bg.blend_opaque_to(fg, glyph_a);
@@ -85,10 +89,16 @@ impl Color {
         let pr = f64::from(fg.r).mul_add(ink_a, f64::from(bg.r) * uncovered);
         let pg = f64::from(fg.g).mul_add(ink_a, f64::from(bg.g) * uncovered);
         let pb = f64::from(fg.b).mul_add(ink_a, f64::from(bg.b) * uncovered);
-        let a8 = (out_a * 255.0).round() as u32;
-        let r8 = pr.round() as u32;
-        let g8 = pg.round() as u32;
-        let b8 = pb.round() as u32;
+        // Float source, no lossless-widening path available (see the font
+        // crate's raster.rs doc for the full float<->int cast rationale) --
+        // these are packed 8-bit color channels, always in 0.0..=255.0.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (a8, r8, g8, b8) = (
+            (out_a * 255.0).round() as u32,
+            pr.round() as u32,
+            pg.round() as u32,
+            pb.round() as u32,
+        );
         (a8 << 24) | (r8 << 16) | (g8 << 8) | b8
     }
 
@@ -99,7 +109,7 @@ impl Color {
     ///
     /// Was a free `blend_opaque(from, to, alpha)` function in `render.rs`.
     #[must_use]
-    pub fn blend_opaque_to(self, to: Color, alpha: u8) -> u32 {
+    pub fn blend_opaque_to(self, to: Self, alpha: u8) -> u32 {
         let from = self;
         let a = u32::from(alpha);
         // `div255(x)` == `x / 255` exactly for any u32 in `[0, 255*255]` (the
@@ -117,13 +127,13 @@ impl Color {
 
 /// A handful of named colors so call sites read in words, not hex.
 impl Color {
-    pub const BLACK: Color = Color::rgb(0x00, 0x00, 0x00);
-    pub const WHITE: Color = Color::rgb(0xff, 0xff, 0xff);
-    pub const SLATE: Color = Color::rgb(0x1e, 0x1e, 0x28); // the window background
-    pub const CORAL: Color = Color::rgb(0xff, 0x5c, 0x57); // the box
-    pub const TEAL: Color = Color::rgb(0x57, 0xc7, 0xff);
+    pub const BLACK: Self = Self::rgb(0x00, 0x00, 0x00);
+    pub const WHITE: Self = Self::rgb(0xff, 0xff, 0xff);
+    pub const SLATE: Self = Self::rgb(0x1e, 0x1e, 0x28); // the window background
+    pub const CORAL: Self = Self::rgb(0xff, 0x5c, 0x57); // the box
+    pub const TEAL: Self = Self::rgb(0x57, 0xc7, 0xff);
     /// Fully transparent black — the zero value in ARGB8888.
-    pub const TRANSPARENT: Color = Color::rgba(0x00, 0x00, 0x00, 0x00);
+    pub const TRANSPARENT: Self = Self::rgba(0x00, 0x00, 0x00, 0x00);
 }
 
 /// A point in pixel space. Signed so it can sit off any edge.
@@ -134,6 +144,7 @@ pub struct Point {
 }
 
 impl Point {
+    #[must_use]
     pub const fn new(x: i32, y: i32) -> Self {
         Self { x, y }
     }
@@ -150,25 +161,30 @@ pub struct Rect {
 }
 
 impl Rect {
+    #[must_use]
     pub const fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         Self { x, y, w, h }
     }
 
     /// Exclusive right/bottom edges.
+    #[must_use]
     pub const fn right(&self) -> i32 {
         self.x + self.w
     }
+    #[must_use]
     pub const fn bottom(&self) -> i32 {
         self.y + self.h
     }
 
     /// Shrink the rect inward by `n` on every side (negative `n` grows it).
-    pub const fn inset(&self, n: i32) -> Rect {
-        Rect::new(self.x + n, self.y + n, self.w - 2 * n, self.h - 2 * n)
+    #[must_use]
+    pub const fn inset(&self, n: i32) -> Self {
+        Self::new(self.x + n, self.y + n, self.w - 2 * n, self.h - 2 * n)
     }
 
     /// Whether `p` lies inside the rect (left/top inclusive, right/bottom
     /// exclusive — matching how `fill_rect` paints).
+    #[must_use]
     pub const fn contains(&self, p: Point) -> bool {
         p.x >= self.x && p.x < self.right() && p.y >= self.y && p.y < self.bottom()
     }
@@ -188,7 +204,10 @@ impl<'a> Canvas<'a> {
     /// Wrap a buffer. `pixels.len()` must be at least `width * height`.
     pub fn new(pixels: &'a mut [u32], width: i32, height: i32) -> Self {
         debug_assert!(width >= 0 && height >= 0);
-        debug_assert!(pixels.len() >= (width as usize) * (height as usize));
+        // Checked non-negative above, so these sign-preserving casts are exact.
+        debug_assert!(
+            pixels.len() >= (width.cast_unsigned() as usize) * (height.cast_unsigned() as usize)
+        );
         Self {
             pixels,
             width,
@@ -196,22 +215,25 @@ impl<'a> Canvas<'a> {
         }
     }
 
-    pub fn width(&self) -> i32 {
+    #[must_use]
+    pub const fn width(&self) -> i32 {
         self.width
     }
-    pub fn height(&self) -> i32 {
+    #[must_use]
+    pub const fn height(&self) -> i32 {
         self.height
     }
 
     /// The raw pixel buffer, mutable. Escape hatch for other modules (e.g.
     /// `render`'s grid-cell blitting) that need direct flat-index access
     /// rather than one of `Canvas`'s coordinate-based drawing primitives.
-    pub fn pixels_mut(&mut self) -> &mut [u32] {
+    pub const fn pixels_mut(&mut self) -> &mut [u32] {
         self.pixels
     }
 
     /// The whole canvas as a rect — handy for full-surface ops.
-    pub fn bounds(&self) -> Rect {
+    #[must_use]
+    pub const fn bounds(&self) -> Rect {
         Rect::new(0, 0, self.width, self.height)
     }
 
@@ -228,7 +250,10 @@ impl<'a> Canvas<'a> {
         if x < 0 || y < 0 || x >= self.width || y >= self.height {
             return;
         }
-        let idx = (y as usize) * (self.width as usize) + (x as usize);
+        // Checked non-negative (and in-bounds) above, so these
+        // sign-preserving casts are exact.
+        let idx = (y.cast_unsigned() as usize) * (self.width.cast_unsigned() as usize)
+            + (x.cast_unsigned() as usize);
         self.pixels[idx] = color.to_xrgb8888();
     }
 
@@ -238,10 +263,15 @@ impl<'a> Canvas<'a> {
             return;
         };
         let v = color.to_xrgb8888();
-        let w = self.width as usize;
+        // `self.width` is always non-negative (checked in Canvas::new), and
+        // `clip` guarantees `y0/y1/x0/x1` are all non-negative in-bounds
+        // coordinates, so these sign-preserving casts are exact.
+        let w = self.width.cast_unsigned() as usize;
         for y in y0..y1 {
-            let row = (y as usize) * w;
-            for px in &mut self.pixels[row + x0 as usize..row + x1 as usize] {
+            let row = (y.cast_unsigned() as usize) * w;
+            let start = row + x0.cast_unsigned() as usize;
+            let end = row + x1.cast_unsigned() as usize;
+            for px in &mut self.pixels[start..end] {
                 *px = v;
             }
         }
@@ -271,13 +301,18 @@ impl<'a> Canvas<'a> {
         // Only the printable-ASCII range is in the table; everything else (incl.
         // non-ASCII) draws blank but advances one cell.
         let code = c as u32;
-        if (font::FIRST as u32..=font::LAST as u32).contains(&code) {
-            let glyph = &font::FONT[(code as u8 - font::FIRST) as usize];
+        if (u32::from(font::FIRST)..=u32::from(font::LAST)).contains(&code) {
+            // Checked within FIRST..=LAST above (both u8-range), so this
+            // always fits in u8.
+            let code_u8 = u8::try_from(code).expect("checked code fits in u8");
+            let glyph = &font::FONT[(code_u8 - font::FIRST) as usize];
             for (row, bits) in glyph.iter().enumerate() {
                 // MSB is the leftmost pixel.
                 for col in 0..font::GLYPH_W {
                     if bits & (0x80 >> col) != 0 {
-                        self.set_pixel(x + col, y + row as i32, color);
+                        // A glyph is always a handful of rows, well under i32::MAX.
+                        let row_i32 = i32::try_from(row).unwrap_or(i32::MAX);
+                        self.set_pixel(x + col, y + row_i32, color);
                     }
                 }
             }
@@ -306,34 +341,43 @@ impl<'a> Canvas<'a> {
         if y < 0 || y >= self.height {
             return;
         }
-        let (mut a, mut b) = (x0.min(x1), x0.max(x1));
-        a = a.max(0);
-        b = b.min(self.width - 1);
-        if a > b {
+        let (mut left, mut right) = (x0.min(x1), x0.max(x1));
+        left = left.max(0);
+        right = right.min(self.width - 1);
+        if left > right {
             return;
         }
-        let v = color.to_xrgb8888();
-        let row = (y as usize) * (self.width as usize);
-        for px in &mut self.pixels[row + a as usize..=row + b as usize] {
-            *px = v;
+        let packed = color.to_xrgb8888();
+        // `y` is checked in-bounds (so non-negative) above, and
+        // `self.width` is always non-negative (checked in Canvas::new), so
+        // these sign-preserving casts are exact.
+        let row = (y.cast_unsigned() as usize) * (self.width.cast_unsigned() as usize);
+        let start = row + left.cast_unsigned() as usize;
+        let end = row + right.cast_unsigned() as usize;
+        for px in &mut self.pixels[start..=end] {
+            *px = packed;
         }
     }
 
-    /// Vertical line from `y0` to `y1` (inclusive) at column `x`, clipped.
-    pub fn vline(&mut self, y0: i32, y1: i32, x: i32, color: Color) {
-        if x < 0 || x >= self.width {
+    /// Vertical line from `y0` to `y1` (inclusive) at column `col`, clipped.
+    pub fn vline(&mut self, y0: i32, y1: i32, col: i32, color: Color) {
+        if col < 0 || col >= self.width {
             return;
         }
-        let (mut a, mut b) = (y0.min(y1), y0.max(y1));
-        a = a.max(0);
-        b = b.min(self.height - 1);
-        if a > b {
+        let (mut top, mut bottom) = (y0.min(y1), y0.max(y1));
+        top = top.max(0);
+        bottom = bottom.min(self.height - 1);
+        if top > bottom {
             return;
         }
-        let v = color.to_xrgb8888();
-        let w = self.width as usize;
-        for y in a..=b {
-            self.pixels[(y as usize) * w + x as usize] = v;
+        let packed = color.to_xrgb8888();
+        // `top`/`bottom` are clamped non-negative above, `self.width` is
+        // always non-negative (checked in Canvas::new), and `col` is
+        // checked in-bounds above, so these sign-preserving casts are exact.
+        let stride = self.width.cast_unsigned() as usize;
+        for y in top..=bottom {
+            self.pixels[(y.cast_unsigned() as usize) * stride + col.cast_unsigned() as usize] =
+                packed;
         }
     }
 
@@ -357,7 +401,7 @@ mod tests {
     use super::*;
 
     fn canvas_buf(w: i32, h: i32) -> Vec<u32> {
-        vec![0u32; (w * h) as usize]
+        vec![0u32; usize::try_from(w * h).unwrap_or(0)]
     }
 
     #[test]
@@ -456,7 +500,7 @@ mod tests {
                 for a in 0u32..=255 {
                     let num = u32::from(from) * (255 - a) + u32::from(to) * a;
                     let packed = Color::rgb(from, from, from)
-                        .blend_opaque_to(Color::rgb(to, to, to), a as u8);
+                        .blend_opaque_to(Color::rgb(to, to, to), u8::try_from(a).unwrap_or(255));
                     let ch = packed & 0xff;
                     assert_eq!(ch, num / 255, "from={from} to={to} a={a}");
                 }
@@ -478,7 +522,8 @@ mod tests {
         for (row, bits) in glyph.iter().enumerate() {
             for col in 0..font::GLYPH_W {
                 let set = bits & (0x80 >> col) != 0;
-                let px = buf[row * font::GLYPH_W as usize + col as usize];
+                let px = buf[row * usize::try_from(font::GLYPH_W).unwrap_or(0)
+                    + usize::try_from(col).unwrap_or(0)];
                 assert_eq!(px == ink, set, "row {row} col {col}");
             }
         }

@@ -116,11 +116,12 @@ pub enum InputEvent {
     Focus(bool),
 }
 
-/// Mouse button identity, mirroring [`crate::protocol::PointerButton`] plus
-/// the wheel/no-button cases `wl_pointer.axis`/motion-with-no-press need.
-/// Kept distinct from `protocol::PointerButton` (which only models the wire
-/// button codes) so `InputEvent::Mouse` can also carry wheel-scroll and
-/// bare-hover reports.
+/// Mouse button identity.
+///
+/// Mirrors [`crate::protocol::PointerButton`] plus the wheel/no-button cases
+/// `wl_pointer.axis`/motion-with-no-press need. Kept distinct from
+/// `protocol::PointerButton` (which only models the wire button codes) so
+/// `InputEvent::Mouse` can also carry wheel-scroll and bare-hover reports.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MouseButton {
     Left,
@@ -225,7 +226,7 @@ pub struct TermWindow {
     width: i32,
     height: i32,
     /// The `wl_output`-advertised buffer scale this window opened at (1 =
-    /// normal DPI, 2 = HiDPI @2x, ...). Fixed for the window's lifetime
+    /// normal DPI, 2 = `HiDPI` @2x, ...). Fixed for the window's lifetime
     /// (Wayland has no live output-scale-change event we handle -- a
     /// runtime DPI change would need a fresh `wl_surface.enter`/output
     /// lookup we don't do). Used to convert `xdg_toplevel.configure`'s
@@ -614,9 +615,8 @@ impl TermWindow {
     /// current offer's source to transfer `text/plain` over a pipe. See
     /// [`crate::clipboard::ClipboardState::request_paste`] for the fd/thread
     /// mechanics.
-    pub fn request_paste(&mut self) {
-        self.clipboard
-            .request_paste(&mut self.window_tx, &self.wake);
+    pub fn request_paste(&self) {
+        self.clipboard.request_paste(&self.window_tx, &self.wake);
     }
 
     /// A clone of the UI wakeup channel. Hand this to any thread (e.g. the
@@ -716,7 +716,7 @@ impl TermWindow {
     /// against a margin band (not the literal edge) since Wayland never
     /// reports pointer coordinates outside our surface -- see
     /// [`AUTOSCROLL_MARGIN_PX`].
-    fn autoscroll_active(&self) -> bool {
+    const fn autoscroll_active(&self) -> bool {
         self.selection.is_dragging()
             && (self.pointer_pos.y < AUTOSCROLL_MARGIN_PX
                 || self.pointer_pos.y >= self.height - AUTOSCROLL_MARGIN_PX)
@@ -770,7 +770,7 @@ impl TermWindow {
     /// parser thread's `TermModes` snapshot. While set, the app owns bare
     /// left-clicks (no terminal selection; Shift+click bypasses). On the
     /// falling edge any in-progress bypass drag ends naturally via release.
-    pub fn set_app_mouse(&mut self, on: bool) {
+    pub const fn set_app_mouse(&mut self, on: bool) {
         self.app_mouse = on;
         if !on {
             self.selection_bypass = false;
@@ -781,7 +781,7 @@ impl TermWindow {
     /// blink phase to full opacity so the cursor is always solid the instant
     /// you type, never mid-fade. Call this whenever the caller sends bytes to
     /// the PTY in response to a key press.
-    pub fn notify_activity(&mut self) {
+    pub const fn notify_activity(&mut self) {
         self.cursor_anim.on_activity();
         self.present.mark_dirty();
     }
@@ -799,7 +799,7 @@ impl TermWindow {
     /// this, only the next content change would repaint, leaving already-
     /// drawn rows showing colors from the *old* theme until they happen to
     /// scroll or get overwritten. Used by config live-reload; the caller
-    /// builds the new `Renderer` (needs `output_scale()` for HiDPI, and may
+    /// builds the new `Renderer` (needs `output_scale()` for `HiDPI`, and may
     /// need to reopen a Wayland buffer if opacity's opaque/translucent split
     /// changed -- see [`Self::needs_alpha_changed`]) and hands it over here.
     pub fn set_renderer(&mut self, renderer: render::Renderer) {
@@ -842,7 +842,7 @@ impl TermWindow {
     /// Update the cursor animation config (shape/blink/period) in place --
     /// used by config live-reload, which can change `[cursor]` without
     /// needing a full renderer rebuild.
-    pub fn set_cursor_config(&mut self, cfg: crate::cursor_anim::CursorAnimConfig) {
+    pub const fn set_cursor_config(&mut self, cfg: crate::cursor_anim::CursorAnimConfig) {
         self.cursor_anim.set_config(cfg);
         self.present.mark_dirty();
     }
@@ -917,7 +917,7 @@ impl TermWindow {
     /// representable here without a wider plumbing change. What XKB *does*
     /// let us fix at this layer: the navigation/editing/modifier/functional
     /// cluster, which is exactly what a compositor keymap remap like niri's
-    /// `input.keyboard.xkb` (swapping Esc and CapsLock) touches, and exactly
+    /// `input.keyboard.xkb` (swapping Esc and `CapsLock`) touches, and exactly
     /// the class of bug reported (Esc/CapsLock producing the wrong effect,
     /// or leaking a raw escape into a TUI that never asked for it). For
     /// everything else -- letters, digits, punctuation -- we keep the
@@ -1323,7 +1323,7 @@ impl TermWindow {
         if let Some(offer) = self.clipboard.offer_id() {
             if ev.is(offer) {
                 if let Some(offer_ev) = ev.event::<DataOfferEvent>() {
-                    self.clipboard.on_offer_event(offer_ev);
+                    crate::clipboard::ClipboardState::on_offer_event(offer_ev);
                 }
                 return Ok(());
             }
@@ -1454,6 +1454,13 @@ impl TermWindow {
     /// disturbing glyph pixels' relative contrast. Assumes the affected rows
     /// were just repainted clean (see [`Self::repaint_rows`]).
     fn apply_selection_highlight(&mut self) {
+        // Highlight tint + strength (0..255). ~35% steel-blue.
+        const HR: u32 = 0x40;
+        const HG: u32 = 0x60;
+        const HB: u32 = 0xa0;
+        const ALPHA: u32 = 90;
+        const INV: u32 = 255 - ALPHA;
+
         let Some(((ac, ar), (bc, br))) = self.selection.range() else {
             return;
         };
@@ -1465,12 +1472,6 @@ impl TermWindow {
         } else {
             ((bc, br), (ac, ar))
         };
-        // Highlight tint + strength (0..255). ~35% steel-blue.
-        const HR: u32 = 0x40;
-        const HG: u32 = 0x60;
-        const HB: u32 = 0xa0;
-        const ALPHA: u32 = 90;
-        const INV: u32 = 255 - ALPHA;
 
         let cols = (self.width / self.cell_w).max(1) as u16;
         let rows = (self.height / self.cell_h).max(1);
@@ -1519,6 +1520,11 @@ impl TermWindow {
     /// hovered -- the caller is responsible for repainting `prev_hover_row`
     /// clean first (same pattern as the selection highlight).
     fn apply_link_hover_underline(&mut self) {
+        // Light blue underline, preserving whatever alpha byte the pixel
+        // already carried (top byte, only meaningful on a translucent
+        // window -- see `Renderer::pack_bg`).
+        const UNDERLINE_RGB: u32 = 0x00A0_C0FF;
+
         if self.hover_link_id == 0 {
             return;
         }
@@ -1547,10 +1553,6 @@ impl TermWindow {
         }
         let x0 = lo * self.cell_w as usize;
         let x1 = ((hi + 1) * self.cell_w as usize).min(buf_w);
-        // Light blue underline, preserving whatever alpha byte the pixel
-        // already carried (top byte, only meaningful on a translucent
-        // window -- see `Renderer::pack_bg`).
-        const UNDERLINE_RGB: u32 = 0x00A0_C0FF;
         let base = y * buf_w;
         for x in x0..x1 {
             let idx = base + x;
@@ -1603,6 +1605,14 @@ impl TermWindow {
     /// Debug-instrumentation hook: note the current `pending_dirty` backlog
     /// depth and emit the once-a-second frame-pacing log line. No-op without
     /// `trace` (see [`crate::debug_overlay`]).
+    ///
+    /// Every `debug_*` no-op twin below deliberately keeps `&self` (unused
+    /// in the non-`trace` build) rather than becoming an associated fn:
+    /// call sites (`self.debug_pre_present()` etc.) must compile unchanged
+    /// under either `cfg`, so both twins need the same method signature --
+    /// the resulting `clippy::unused_self` is structural to the pattern,
+    /// not fixable per-twin without forcing every call site to branch on
+    /// the feature itself.
     #[cfg(feature = "trace")]
     fn debug_pre_present(&mut self) {
         self.debug.note_backlog(self.pending_dirty.len());
@@ -1610,28 +1620,31 @@ impl TermWindow {
     }
 
     #[cfg(not(feature = "trace"))]
-    fn debug_pre_present(&mut self) {}
+    #[allow(clippy::unused_self)]
+    const fn debug_pre_present(&self) {}
 
     /// Debug-instrumentation hook: record that a present was skipped because
     /// the frame callback hadn't arrived yet (vsync pacing). No-op without
     /// `trace`.
     #[cfg(feature = "trace")]
-    fn debug_note_skipped_not_ready(&mut self) {
+    const fn debug_note_skipped_not_ready(&mut self) {
         self.debug.note_skipped_not_ready();
     }
 
     #[cfg(not(feature = "trace"))]
-    fn debug_note_skipped_not_ready(&mut self) {}
+    #[allow(clippy::unused_self)]
+    const fn debug_note_skipped_not_ready(&self) {}
 
     /// Debug-instrumentation hook: record that a present was skipped because
     /// no shm buffer slot was free (buffer starvation). No-op without `trace`.
     #[cfg(feature = "trace")]
-    fn debug_note_skipped_no_slot(&mut self) {
+    const fn debug_note_skipped_no_slot(&mut self) {
         self.debug.note_skipped_no_slot();
     }
 
     #[cfg(not(feature = "trace"))]
-    fn debug_note_skipped_no_slot(&mut self) {}
+    #[allow(clippy::unused_self)]
+    const fn debug_note_skipped_no_slot(&self) {}
 
     /// Debug-instrumentation hook: remap the fps overlay's dirty-row tracker
     /// by a signed whole-screen shift (a viewport pixel-scroll). No-op
@@ -1642,7 +1655,8 @@ impl TermWindow {
     }
 
     #[cfg(not(feature = "trace"))]
-    fn debug_shift_prev_rows_signed(&mut self, _shifts: &[i32], _row_count: u16) {}
+    #[allow(clippy::unused_self)]
+    const fn debug_shift_prev_rows_signed(&self, _shifts: &[i32], _row_count: u16) {}
 
     /// Debug-instrumentation hook: remap the fps overlay's dirty-row tracker
     /// by an upward scroll band. No-op without `trace`.
@@ -1652,7 +1666,8 @@ impl TermWindow {
     }
 
     #[cfg(not(feature = "trace"))]
-    fn debug_shift_prev_rows(&mut self, _scrolls: &[grid::ScrollBand]) {}
+    #[allow(clippy::unused_self)]
+    const fn debug_shift_prev_rows(&self, _scrolls: &[grid::ScrollBand]) {}
 
     /// Debug-instrumentation hook: take the fps overlay's previously-touched
     /// rows for this frame's repaint-clean pass. Empty without `trace`.
@@ -1662,7 +1677,8 @@ impl TermWindow {
     }
 
     #[cfg(not(feature = "trace"))]
-    fn debug_take_prev_rows(&mut self) -> Vec<u16> {
+    #[allow(clippy::unused_self)]
+    const fn debug_take_prev_rows(&self) -> Vec<u16> {
         Vec::new()
     }
 
@@ -1684,7 +1700,8 @@ impl TermWindow {
     }
 
     #[cfg(not(feature = "trace"))]
-    fn debug_draw_overlay(&mut self) -> Vec<u16> {
+    #[allow(clippy::unused_self)]
+    const fn debug_draw_overlay(&self) -> Vec<u16> {
         Vec::new()
     }
 
@@ -1712,8 +1729,9 @@ impl TermWindow {
     }
 
     #[cfg(not(feature = "trace"))]
-    fn debug_record_busy_and_log(
-        &mut self,
+    #[allow(clippy::unused_self)]
+    const fn debug_record_busy_and_log(
+        &self,
         _total: std::time::Duration,
         _t_blit: std::time::Duration,
         _t_overlay: std::time::Duration,

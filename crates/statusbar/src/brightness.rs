@@ -108,7 +108,9 @@ impl Brightness {
                 // this is always non-negative.
                 let new_val_u32 = u32::try_from(new_val).unwrap_or(0);
                 let _ = dbus::logind::LogindSession::set_backlight_brightness(
-                    &mut conn, name, new_val_u32,
+                    &mut conn,
+                    name,
+                    new_val_u32,
                 );
             }
             return;

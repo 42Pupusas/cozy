@@ -1,8 +1,9 @@
-//! Frame-presentation state for the terminal window: the double-buffered
-//! `wl_shm` swap chain (two [`Frame`]s + the pool + pixel format backing
-//! them), the per-slot "needs re-copy from the backbuffer" bitmap, and the
-//! dirty/frame-ready/frame-callback bookkeeping that decides *when* a
-//! present may happen.
+//! Frame-presentation state for the terminal window.
+//!
+//! The double-buffered `wl_shm` swap chain (two [`Frame`]s + the pool + pixel
+//! format backing them), the per-slot "needs re-copy from the backbuffer"
+//! bitmap, and the dirty/frame-ready/frame-callback bookkeeping that decides
+//! *when* a present may happen.
 //!
 //! Extracted from `TermWindow` because this is a genuinely self-contained
 //! subsystem — the shm pool lifecycle (create once, grow/shrink in place
@@ -20,10 +21,12 @@ use crate::surface::{Frame, Routed};
 use crate::sys::{ShmBuffer, SysError};
 use crate::wire::MessageBuilder;
 
-/// Outcome of [`PresentState::begin_present`]: either a free slot is ready to
-/// present into, or one of the two reasons a present must be skipped this
-/// tick (kept distinct so callers can log/count them separately, matching
-/// the two skip counters `DebugOverlay` already tracks).
+/// Outcome of [`PresentState::begin_present`].
+///
+/// Either a free slot is ready to present into, or one of the two reasons a
+/// present must be skipped this tick (kept distinct so callers can
+/// log/count them separately, matching the two skip counters `DebugOverlay`
+/// already tracks).
 pub enum PresentAttempt {
     /// Nothing has changed since the last present; no work to do.
     NotDirty,
@@ -68,6 +71,7 @@ impl PresentState {
     /// stale bitmap fully true: both shm buffers start as blank/freshly
     /// mmap'd memory, so every row needs a first copy from the backbuffer
     /// before either slot shows the real image.
+    #[must_use]
     pub fn new(
         frames: [Frame; 2],
         shm_mem: ShmBuffer,
@@ -88,12 +92,13 @@ impl PresentState {
     }
 
     /// `wl_shm` pixel format this window's buffers use.
+    #[must_use]
     pub const fn buf_format(&self) -> Format {
         self.buf_format
     }
 
     /// Flag that the backbuffer has changed and a present is owed.
-    pub fn mark_dirty(&mut self) {
+    pub const fn mark_dirty(&mut self) {
         self.dirty = true;
     }
 
@@ -176,13 +181,14 @@ impl PresentState {
     }
 
     /// The `wl_buffer` object backing slot `slot`, for `Attach`.
-    pub fn frame_buffer(&self, slot: usize) -> BufferId {
+    #[must_use]
+    pub const fn frame_buffer(&self, slot: usize) -> BufferId {
         self.frames[slot].buffer
     }
 
     /// Record that a present just went out: arm the frame-callback wait and
     /// clear dirty/ready until the compositor answers.
-    pub fn finish_present(&mut self, cb: CallbackId) {
+    pub const fn finish_present(&mut self, cb: CallbackId) {
         self.frame_cb = Some(cb);
         self.frame_ready = false;
         self.dirty = false;
@@ -201,14 +207,21 @@ impl PresentState {
     /// [`Self::grow_pool`] before recreating buffers), or `None` on a lazy
     /// shrink (no server round-trip needed).
     pub fn resize_shm(&mut self, w: i32, h: i32) -> Result<Option<usize>, SysError> {
-        self.shm_mem.resize(w as usize, h as usize)
+        // Window dimensions are always non-negative in practice (validated
+        // config / compositor-reported sizes); clamp defensively rather
+        // than panic on a pathological value.
+        self.shm_mem.resize(
+            usize::try_from(w).unwrap_or(0),
+            usize::try_from(h).unwrap_or(0),
+        )
     }
 
     /// Tell the compositor the pool grew, ahead of carving new buffers out
     /// of the extra space.
     pub fn grow_pool(&self, window_tx: &mut WindowSender, new_capacity: usize) {
         window_tx.request(
-            MessageBuilder::new(self.pool, ShmPoolRequest::Resize).i32(new_capacity as i32),
+            MessageBuilder::new(self.pool, ShmPoolRequest::Resize)
+                .i32(i32::try_from(new_capacity).unwrap_or(i32::MAX)),
         );
     }
 
@@ -221,7 +234,7 @@ impl PresentState {
             window_tx.request(
                 MessageBuilder::new(self.pool, ShmPoolRequest::CreateBuffer)
                     .new_id(buffer)
-                    .i32(self.shm_mem.frame_offset(i) as i32)
+                    .i32(i32::try_from(self.shm_mem.frame_offset(i)).unwrap_or(i32::MAX))
                     .i32(w)
                     .i32(h)
                     .i32(stride)

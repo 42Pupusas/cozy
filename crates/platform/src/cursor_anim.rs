@@ -32,11 +32,11 @@ const SLIDE_MS: f32 = 90.0;
 const SLIDE_MS_MAX: f32 = 260.0;
 
 /// Cell-distance beyond which a jump is considered "long": below it, the
-/// slide always takes the base SLIDE_MS; above it, duration scales up
-/// toward SLIDE_MS_MAX and a landing pulse is armed.
+/// slide always takes the base `SLIDE_MS`; above it, duration scales up
+/// toward `SLIDE_MS_MAX` and a landing pulse is armed.
 const LONG_JUMP_CELLS: f32 = 8.0;
 
-/// Cell-distance at which slide duration reaches SLIDE_MS_MAX.
+/// Cell-distance at which slide duration reaches `SLIDE_MS_MAX`.
 const MAX_JUMP_CELLS: f32 = 40.0;
 
 /// How long the landing-pulse ring takes to expand and fade out, in ms.
@@ -116,7 +116,7 @@ impl CursorAnimator {
     }
 
     #[must_use]
-    pub fn new(cfg: CursorAnimConfig) -> Self {
+    pub const fn new(cfg: CursorAnimConfig) -> Self {
         Self {
             cfg,
             start_col: 0.0,
@@ -135,7 +135,7 @@ impl CursorAnimator {
 
     /// Replace the live config (e.g. on a config reload). Preserves in-flight
     /// animation state; only future ticks use the new period/shape/blink.
-    pub fn set_config(&mut self, cfg: CursorAnimConfig) {
+    pub const fn set_config(&mut self, cfg: CursorAnimConfig) {
         self.cfg = cfg;
     }
 
@@ -177,7 +177,7 @@ impl CursorAnimator {
     /// Reset the blink phase to full opacity. Call on any user activity
     /// (keystroke) so the cursor is always solid the instant you type,
     /// never mid-fade.
-    pub fn on_activity(&mut self) {
+    pub const fn on_activity(&mut self) {
         self.blink_phase_ms = 0.0;
     }
 
@@ -186,7 +186,7 @@ impl CursorAnimator {
     /// from animating; regaining it snaps the blink phase back to full
     /// opacity (via [`Self::on_activity`]) so the cursor reappears solid
     /// instead of wherever the sine wave happened to leave off.
-    pub fn set_focused(&mut self, focused: bool) {
+    pub const fn set_focused(&mut self, focused: bool) {
         if focused && !self.focused {
             self.on_activity();
         }

@@ -178,6 +178,24 @@ impl DbusConn {
         }
     }
 
+    /// Send an already-framed server reply. Kept narrow instead of exposing
+    /// raw socket access: callers can answer an incoming D-Bus method call
+    /// without being able to violate this connection's serial bookkeeping.
+    pub fn send_method_return(
+        &mut self,
+        destination: &str,
+        call_serial: u32,
+    ) -> Result<(), DbusError> {
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1).max(1);
+        let frame = crate::message::MessageBuilder::build_empty_method_return(
+            serial,
+            destination,
+            call_serial,
+        );
+        self.send_raw(&frame)
+    }
+
     fn send_raw(&mut self, bytes: &[u8]) -> Result<(), DbusError> {
         let mut sent = 0;
         while sent < bytes.len() {
@@ -359,6 +377,54 @@ impl DbusConn {
         let mut full = prelude_bytes;
         full.extend_from_slice(&rest);
         Reply::parse_message(&full).ok_or(DbusError::Malformed)
+    }
+
+    /// Claim a well-known session-bus name.
+    ///
+    /// A `StatusNotifier` watcher must own
+    /// `org.kde.StatusNotifierWatcher` before tray clients will register
+    /// their items with it. `PrimaryOwner` is deliberately requested instead
+    /// of queueing: a second bar must fail visibly rather than becoming a
+    /// silent standby watcher that never receives registrations.
+    pub fn request_name(&mut self, name: &str) -> Result<bool, DbusError> {
+        const DBUS: &str = "org.freedesktop.DBus";
+        const PATH: &str = "/org/freedesktop/DBus";
+        const PRIMARY_OWNER: u32 = 0x1;
+        const PRIMARY_OWNER_REPLY: u64 = 1;
+        let reply = self.call(
+            DBUS,
+            PATH,
+            DBUS,
+            "RequestName",
+            &[BodyArg::Str(name.to_owned()), BodyArg::U32(PRIMARY_OWNER)],
+        )?;
+        Ok(reply.values().first().and_then(crate::value::Value::as_u64)
+            == Some(PRIMARY_OWNER_REPLY))
+    }
+
+    /// Wait for the next complete incoming message. A `StatusNotifier` watcher
+    /// uses this server-side half of the connection to receive item
+    /// registrations and property-change signals between normal polling
+    /// calls. Unlike [`Self::call`], it intentionally does not discard
+    /// messages based on reply serial.
+    pub fn recv_message(&mut self) -> Result<Reply, DbusError> {
+        self.recv_one_message()
+    }
+
+    /// Subscribe this connection to messages matching a D-Bus match rule.
+    ///
+    /// The bus does not forward broadcast signals merely because a client can
+    /// parse them; a `StatusNotifier` watcher must explicitly subscribe before
+    /// `NewIcon` and `NewStatus` can reach its receive loop.
+    pub fn add_match(&mut self, rule: &str) -> Result<(), DbusError> {
+        self.call(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "AddMatch",
+            &[BodyArg::Str(rule.to_owned())],
+        )?;
+        Ok(())
     }
 
     /// Convenience: `org.freedesktop.DBus.Properties.Get`, unwrapping the

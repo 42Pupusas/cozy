@@ -25,9 +25,13 @@ impl ModuleKind {
             Self::Battery => Some("power"),
             Self::Brightness => Some("displays"),
             Self::VolOut | Self::VolIn => Some("sound"),
-            Self::Clock | Self::Date | Self::Temp | Self::Cpu | Self::Mem | Self::Notification => {
-                None
-            }
+            Self::Clock
+            | Self::Date
+            | Self::Temp
+            | Self::Cpu
+            | Self::Mem
+            | Self::Notification
+            | Self::SystemTray => None,
         }
     }
 }

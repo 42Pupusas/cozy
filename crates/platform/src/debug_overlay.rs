@@ -70,13 +70,13 @@ impl DebugOverlay {
 
     /// Record that `maybe_present` bailed because the compositor hadn't yet
     /// sent the frame callback (vsync pacing, not buffer starvation).
-    pub(crate) fn note_skipped_not_ready(&mut self) {
+    pub(crate) const fn note_skipped_not_ready(&mut self) {
         self.stats.skipped_not_ready += 1;
     }
 
     /// Record that `maybe_present` bailed because both shm buffers were still
     /// held by the compositor (buffer starvation, not vsync pacing).
-    pub(crate) fn note_skipped_no_slot(&mut self) {
+    pub(crate) const fn note_skipped_no_slot(&mut self) {
         self.stats.skipped_no_slot += 1;
     }
 
@@ -110,8 +110,10 @@ impl DebugOverlay {
         }
         self.stats.prune(std::time::Instant::now());
         let text = format!("{:.1} fps", self.stats.fps());
-        let cols = (width / cell_w).max(1) as u16;
-        let text_cols = text.chars().count() as u16;
+        // `width`/`cell_w` are pixel dimensions, and the readout text is a
+        // handful of ASCII chars -- both always far under `u16::MAX`.
+        let cols = u16::try_from((width / cell_w).max(1)).unwrap_or(u16::MAX);
+        let text_cols = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
         if text_cols == 0 || text_cols > cols {
             return Vec::new();
         }
@@ -131,7 +133,12 @@ impl DebugOverlay {
                 spacer: false,
                 link_id: 0,
             };
-            renderer.blit_cell(&mut canvas, start_col + i as u16, 0, &cell);
+            renderer.blit_cell(
+                &mut canvas,
+                start_col + u16::try_from(i).unwrap_or(u16::MAX),
+                0,
+                &cell,
+            );
         }
         vec![0u16]
     }
@@ -257,7 +264,7 @@ const FRAME_STATS_CAP: usize = 120;
 /// stops presenting, and every pause between wheel detents stays inside the
 /// 120-present window — the readout sagged to ~40 and then froze there while
 /// idling in scrollback, even though each presented frame was full-rate. An
-/// age bound makes fps() mean "presents per second over the last second of
+/// age bound makes `fps()` mean "presents per second over the last second of
 /// activity", which is what the overlay claims to show.
 const FRAME_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
 

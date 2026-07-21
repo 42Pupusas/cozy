@@ -432,8 +432,9 @@ impl Pty {
         // `len` is bounded by `WRITE_BUF_SIZE`, a small compile-time buffer
         // size, so this always fits in u32.
         let len_u32 = u32::try_from(len).unwrap_or(u32::MAX);
-        let sqe = unsafe { Sqe::write_ptr(self.master_fd, self.write_buf.as_ptr(), len_u32, u64::MAX) }
-            .user_data(tag::WRITE);
+        let sqe =
+            unsafe { Sqe::write_ptr(self.master_fd, self.write_buf.as_ptr(), len_u32, u64::MAX) }
+                .user_data(tag::WRITE);
         self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
         self.queue.submit().map_err(PtyError::UringEnter)
     }

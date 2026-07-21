@@ -83,13 +83,13 @@ impl SelectionTracker {
 
     /// The current `(anchor, head)` endpoints, if any.
     #[must_use]
-    pub fn range(&self) -> Option<(Endpoint, Endpoint)> {
+    pub const fn range(&self) -> Option<(Endpoint, Endpoint)> {
         self.range
     }
 
     /// Whether a selection is currently active.
     #[must_use]
-    pub fn is_active(&self) -> bool {
+    pub const fn is_active(&self) -> bool {
         self.range.is_some()
     }
 
@@ -98,7 +98,7 @@ impl SelectionTracker {
     /// while an actual drag is live (not e.g. after release, or before any
     /// press).
     #[must_use]
-    pub fn is_dragging(&self) -> bool {
+    pub const fn is_dragging(&self) -> bool {
         self.left_held
     }
 
@@ -123,7 +123,7 @@ impl SelectionTracker {
     /// Shift+click range extension: keep the anchor fixed and move the head to
     /// `cell`, so repeated shift+clicks (or a shift+click then a drag) keep
     /// growing/shrinking the same range.
-    fn extend(&mut self, cell: Endpoint) {
+    const fn extend(&mut self, cell: Endpoint) {
         if let Some((anchor, _head)) = self.range {
             self.range = Some((anchor, cell));
         } else {
@@ -193,12 +193,12 @@ impl SelectionTracker {
         if !self.left_held {
             return false;
         }
-        if let Some((anchor, _)) = self.range {
-            if cell != anchor {
-                self.range = Some((anchor, cell));
-                self.drag_moved = true;
-                return true;
-            }
+        if let Some((anchor, _)) = self.range
+            && cell != anchor
+        {
+            self.range = Some((anchor, cell));
+            self.drag_moved = true;
+            return true;
         }
         false
     }
@@ -243,8 +243,10 @@ impl SelectionTracker {
             // in the same coordinate space the freshly-scrolled-off rows
             // below get stamped with.
             self.shift(-delta);
+            // `delta > 0` per the outer guard, so this is infallible.
+            let delta_usize = usize::try_from(delta).unwrap_or(0);
             if !self.mirror.is_empty() && self.range.is_some() {
-                let d = (delta as usize).min(self.mirror.len());
+                let d = delta_usize.min(self.mirror.len());
                 // Stash the rows scrolling off the top into `history`,
                 // keyed by the signed viewport row they now occupy, instead
                 // of dropping them -- so a selection anchored to text that
@@ -261,11 +263,13 @@ impl SelectionTracker {
                 // rows too high, so `selected_text`'s `history.get(&row)`
                 // (row from the shifted endpoint) would miss it entirely.
                 for (i, cells) in self.mirror.drain(..d).enumerate() {
-                    let row = i as i32 - delta;
+                    // `i < d <= mirror.len()`, a viewport row count, always
+                    // far under `i32::MAX`.
+                    let row = i32::try_from(i).unwrap_or(i32::MAX) - delta;
                     self.history.insert(row, cells);
                 }
             } else if !self.mirror.is_empty() {
-                let d = (delta as usize).min(self.mirror.len());
+                let d = delta_usize.min(self.mirror.len());
                 self.mirror.drain(..d);
             }
         }
@@ -301,7 +305,9 @@ impl SelectionTracker {
         if lo > hi {
             return Vec::new();
         }
-        (lo..=hi).map(|r| r as u16).collect()
+        // Always `>= 0` and `< rows_visible` (an on-screen row count, well
+        // under `u16::MAX`) per the clamps above.
+        (lo..=hi).map(|r| u16::try_from(r).unwrap_or(0)).collect()
     }
 
     /// Extract the currently selected text from the cell mirror (viewport
@@ -334,7 +340,8 @@ impl SelectionTracker {
                     None => continue,
                 }
             } else {
-                match self.mirror.get(row as usize) {
+                // `row >= 0` per the `if row < 0` branch above.
+                match self.mirror.get(usize::try_from(row).unwrap_or(0)) {
                     Some(line) => line,
                     None => continue,
                 }

@@ -354,6 +354,13 @@ pub struct TermWindow {
     repeat_delay: u32,
     held_key: Option<Key>,
     modifiers: Modifiers,
+    /// Real XKB keymap translation, built from the compositor's
+    /// `wl_keyboard.keymap` blob (see `crates/xkb`). `None` until the first
+    /// `Keymap` event arrives, or permanently if `libxkbcommon` couldn't be
+    /// loaded / the keymap failed to compile -- callers fall back to the
+    /// physical-keycode path (`keymap::PhysicalKey::to_logical`) in either
+    /// case, so a missing library never blocks the terminal from starting.
+    xkb: Option<xkb::Translator>,
 
     cursor: Option<cursor::Cursor>,
 
@@ -458,6 +465,11 @@ pub struct TermWindow {
     /// Set when a `data_source.send` just arrived; the next `RawEvent::Fd` is the
     /// pipe to write our clipboard text into.
     awaiting_send_fd: bool,
+    /// Set when a `wl_keyboard.keymap` event just arrived; the next
+    /// `RawEvent::Fd` is the keymap blob to `mmap` + compile via
+    /// `crate::xkb`. Carries the event's `size` argument (the fd itself has
+    /// no length of its own -- the wire event tells us how much to map).
+    awaiting_keymap_fd: Option<usize>,
     /// Paste channel: helper threads that read a paste pipe send the bytes
     /// here; the UI loop drains it in `tick`. (std mpsc — multiple paste
     /// helper threads may be in flight, so a multi-producer channel.)
@@ -688,6 +700,7 @@ impl TermWindow {
             repeat_delay: DEFAULT_REPEAT_DELAY,
             held_key: None,
             modifiers: Modifiers::default(),
+            xkb: None,
             cursor,
             frames,
             shm_mem,
@@ -718,6 +731,7 @@ impl TermWindow {
             clipboard_offer: None,
             selection: crate::selection::SelectionTracker::new(),
             awaiting_send_fd: false,
+            awaiting_keymap_fd: None,
             paste_tx,
             paste_rx,
             focus_serial: 0,
@@ -1178,15 +1192,62 @@ impl TermWindow {
 
     // ── private ───────────────────────────────────────────────────────────
 
-    /// Consume the fd batch that followed a clipboard `send`/`receive`.
-    /// `send` → we write our `clipboard_text` to the peer's pipe; `receive`
-    /// (our paste request) → we read the peer's clipboard from the pipe.
+    /// Consume the fd batch that followed a clipboard `send`/`receive`, or a
+    /// `wl_keyboard.keymap` event. `send` → we write our `clipboard_text` to
+    /// the peer's pipe; `receive` (our paste request) → we read the peer's
+    /// clipboard from the pipe; `keymap` → we `mmap` + compile it via
+    /// `crate::xkb` so subsequent `Key` events resolve through the real XKB
+    /// state instead of the physical-keycode fallback.
+    /// Resolve one `wl_keyboard.key` press to our logical [`Key`] enum.
+    ///
+    /// `protocol::Key` is a fixed per-physical-key enum (letters carry their
+    /// QWERTY identity, not an arbitrary Unicode codepoint -- that
+    /// translation happens one layer up, in `bins/terminal`'s
+    /// `ToInputKey`), so full non-Latin/remapped-letter layout support isn't
+    /// representable here without a wider plumbing change. What XKB *does*
+    /// let us fix at this layer: the navigation/editing/modifier/functional
+    /// cluster, which is exactly what a compositor keymap remap like niri's
+    /// `input.keyboard.xkb` (swapping Esc and CapsLock) touches, and exactly
+    /// the class of bug reported (Esc/CapsLock producing the wrong effect,
+    /// or leaking a raw escape into a TUI that never asked for it). For
+    /// everything else -- letters, digits, punctuation -- we keep the
+    /// physical (US-QWERTY) mapping: correct for the common case, and no
+    /// worse than before XKB was wired in.
+    fn resolve_logical_key(&self, physical: Option<Key>, evdev_code: u32) -> Option<Key> {
+        if let Some(xkb) = &self.xkb {
+            let sym = xkb.keysym(evdev_code);
+            if sym != 0 {
+                if let Some(k) = keymap::keysym_to_key(sym) {
+                    return Some(k);
+                }
+                // A real (non-NoSymbol) keysym came back but it's outside
+                // our navigation/modifier/functional table -- almost
+                // certainly a printable character. Fall through to the
+                // physical mapping rather than dropping the press.
+            }
+        }
+        physical.map(keymap::PhysicalKey::to_logical)
+    }
+
     fn handle_clipboard_fds(&mut self, fds: Vec<std::os::fd::OwnedFd>) {
         use std::io::Write as _;
-        use std::os::fd::FromRawFd as _;
+        use std::os::fd::{AsFd as _, FromRawFd as _};
         let Some(fd) = fds.into_iter().next() else {
             return;
         };
+        if let Some(size) = self.awaiting_keymap_fd.take() {
+            match xkb::Translator::from_keymap_fd(fd.as_fd(), size) {
+                Ok(t) => self.xkb = Some(t),
+                Err(e) => {
+                    // Not fatal: `keymap::PhysicalKey::to_logical` (the
+                    // physical-keycode fallback) still works, just without
+                    // honoring the compositor's remap.
+                    eprintln!("platform: XKB keymap translation unavailable: {e}");
+                }
+            }
+            // `fd` (an mmap'd, now-unneeded fd) closes on scope exit.
+            return;
+        }
         let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
         if self.awaiting_send_fd {
             self.awaiting_send_fd = false;
@@ -1195,8 +1256,7 @@ impl TermWindow {
             let mut f = unsafe { std::fs::File::from_raw_fd(raw) };
             let _ = f.write_all(self.clipboard_text.as_bytes());
         } else {
-            // Unsolicited fd (e.g. the XKB keymap fd, which we don't parse).
-            // Re-wrap so it closes on drop instead of leaking.
+            // Unsolicited fd. Re-wrap so it closes on drop instead of leaking.
             let _f = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
         }
     }
@@ -1462,6 +1522,13 @@ impl TermWindow {
         if let Some(keyboard) = self.keyboard {
             if ev.is(keyboard) {
                 match ev.event::<KeyboardEvent>() {
+                    Some(KeyboardEvent::Keymap) => {
+                        // arg(0) = format (always XKB_V1 in practice), the
+                        // fd rides out-of-band as the very next `Fd` event,
+                        // arg(1) = size (the mapping's byte length -- the
+                        // fd carries no length of its own).
+                        self.awaiting_keymap_fd = Some(ev.arg(1) as usize);
+                    }
                     Some(KeyboardEvent::Enter) => {
                         // Keyboard focus gained: arg(0) is the serial we must
                         // present to `set_selection` to prove we own focus.
@@ -1475,7 +1542,7 @@ impl TermWindow {
                     }
                     Some(KeyboardEvent::Key) => {
                         let physical = Key::from_code(ev.arg(2));
-                        let logical = physical.map(keymap::PhysicalKey::to_logical);
+                        let logical = self.resolve_logical_key(physical, ev.arg(2));
                         let state = KeyState::from_raw(ev.arg(3));
                         // Start/stop repeat timer. Modifier keys never repeat.
                         match (logical, state) {
@@ -1541,6 +1608,18 @@ impl TermWindow {
                             locked: ev.arg(3),
                             group: ev.arg(4),
                         };
+                        if let Some(xkb) = &mut self.xkb {
+                            // Feed the raw masks straight through -- XKB
+                            // owns what depressed/latched/locked mean for
+                            // whatever keymap is loaded, we don't decode
+                            // them ourselves.
+                            let _ = xkb.update_mask(
+                                self.modifiers.depressed,
+                                self.modifiers.latched,
+                                self.modifiers.locked,
+                                self.modifiers.group,
+                            );
+                        }
                         // Ctrl toggling while the pointer sits over a link
                         // must start/stop the hover-underline immediately,
                         // not wait for the next pointer motion.

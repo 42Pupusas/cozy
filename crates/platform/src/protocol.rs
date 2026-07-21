@@ -476,9 +476,12 @@ events! {
     /// `wl_keyboard` events.
     KeyboardEvent {
         /// The XKB keymap, as `format`, an `fd`, and a `size`. The fd rides in
-        /// ancillary data — the one keyboard event that carries one. We don't
-        /// parse it (we map raw evdev codes directly), so we close the fd and
-        /// move on.
+        /// ancillary data — the one keyboard event that carries one. Parsed
+        /// via `crate::xkb::Translator` (see `window.rs`'s
+        /// `handle_clipboard_fds`, which despite the name also correlates
+        /// this fd by arrival order) so `Key` events honor the compositor's
+        /// actual keymap — remaps included — instead of only the raw
+        /// physical evdev code.
         Keymap = 0,
         /// Keyboard focus entered a surface: `serial`, `surface`, `keys` (an
         /// array of the evdev codes already held down).
@@ -488,7 +491,10 @@ events! {
         /// A key changed: `serial`, `time`, `key` (evdev code), `state`.
         Key = 3,
         /// Modifier/group state changed: `serial`, `depressed`, `latched`,
-        /// `locked`, `group`. We don't track modifiers yet.
+        /// `locked`, `group`. Tracked in `TermWindow::modifiers`, and (when
+        /// an XKB translator is loaded) fed straight through to
+        /// `xkb_state_update_mask` so keysym resolution reflects the live
+        /// modifier/layout state.
         Modifiers = 4,
         /// The compositor's key-repeat parameters: `rate` (keys/sec, 0 disables
         /// repeat) and `delay` (ms before the first repeat). `wl_keyboard` v4+.

@@ -142,6 +142,7 @@ dependencies = [
  "ququmatz",
  "vt_parser",
  "waker",
+ "xkb",
 ]
 
 [[package]]

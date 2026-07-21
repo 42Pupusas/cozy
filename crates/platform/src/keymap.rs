@@ -1,50 +1,214 @@
 //! Keymap translation: evdev scancodes → logical key symbols.
 //!
-//! ## Current state (first-iteration stub)
+//! ## Two paths
 //!
-//! We operate on raw Linux evdev keycodes — exactly what `wl_keyboard.key`
-//! reports on the wire. This is sufficient for:
+//! 1. **Real XKB** (`crate::xkb::Translator`, built once per window from the
+//!    compositor's `wl_keyboard.keymap` blob): resolves `(evdev keycode,
+//!    live modifier/layout state)` → the actual keysym the compositor's
+//!    keymap says that key produces right now — remaps included (e.g.
+//!    niri's `input.keyboard.xkb` swapping Esc and CapsLock). This is the
+//!    path used whenever `libxkbcommon` loaded and the keymap compiled.
+//!    [`keysym_to_key`] turns the resulting keysym into our [`Key`] enum.
 //!
-//! * Movement keys (WASD, arrows)
-//! * Modifier-aware action keys (Space, Tab, Esc, Enter)
-//! * Simple text entry (US-QWERTY only, no layout awareness)
+//! 2. **Physical-only fallback** ([`PhysicalKey::to_logical`]): used only
+//!    when XKB is unavailable (library missing, keymap fd never arrived
+//!    yet, compile failure). Sufficient for US-QWERTY, movement keys, and
+//!    modifier-aware action keys, but blind to layout remaps, non-US
+//!    layouts, dead keys, and IME composition.
 //!
-//! What does **not** work with physical-only keys:
-//!
-//! * Non-US layouts (AZERTY, QWERTZ, Dvorak, …)
-//! * Keys that differ by layout (e.g. `KEY_Z` is 'Y' on QWERTZ)
-//! * Dead keys / compose sequences
-//! * IME / CJK input
-//!
-//! ## Future: XKB integration
-//!
-//! When we need full keyboard support, the path is:
-//!
-//! 1. Parse the `wl_keyboard.keymap` fd (XKB keymap, v1 format) — the fd is
-//!    sent as ancillary data in the `keymap` event.
-//! 2. Feed it to `xkbcommon` (via `xkbcommon-dl`, already in winit's dep tree
-//!    for the X11 backend).
-//! 3. `xkb_state_key_get_one_sym()` maps each `key+modifiers` to a keysym.
-//! 4. Keysyms can then be classified: is this a letter? A dead key? Does it
-//!    produce text? This enables `ReceivedCharacter` events for text input.
-//!
-//! The stub below keeps the API stable so callers don't change when we swap in
-//! the real implementation.
+//! Both paths ultimately produce the same [`Key`] enum, so callers
+//! (`crate::window::TermWindow::resolve_logical_key`) don't need to care
+//! which one resolved a given press.
 
 use crate::protocol::Key;
 
 /// Extends [`Key`] with physical→logical keymap resolution, as a method
 /// instead of a free `physical_to_logical(key)` function.
 pub trait PhysicalKey {
-    /// Map this physical evdev keycode to its logical keysym. When XKB is
-    /// integrated, this will look up the keycode in the compiled keymap and
-    /// return a logical keysym.
+    /// Map this physical evdev keycode to its logical keysym via the
+    /// no-XKB fallback path (see module docs).
     fn to_logical(self) -> Self;
 }
 
 impl PhysicalKey for Key {
     fn to_logical(self) -> Self {
-        // Stub: physical-only. Replace with xkb_state_key_get_one_sym().
+        // Physical-only fallback: no layout remap applied. See module docs.
         self
+    }
+}
+
+/// The XKB keysyms (`xkbcommon/xkbcommon-keysyms.h`) we translate into a
+/// [`Key`] variant that has no direct Latin-1/Unicode mapping — navigation,
+/// editing, function keys, and the modifier/lock cluster. Printable
+/// characters don't need a table: XKB keysyms for ASCII and Latin-1 equal
+/// their Unicode codepoint directly (`xkb_keysym_to_utf32` handles the rest
+/// of Unicode, including non-Latin1 keysyms, without needing named
+/// constants here).
+///
+/// Real, closed C-enum set — kept as a `#[repr(u32)] enum` rather than a
+/// loose `const` group, matching the rest of this workspace's FFI-adjacent
+/// code (e.g. `Key`/`SeatCapability` just above/below in `protocol.rs`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+enum XkbKeysym {
+    BackSpace = 0xff08,
+    Tab = 0xff09,
+    Return = 0xff0d,
+    Escape = 0xff1b,
+    Delete = 0xffff,
+    Insert = 0xff63,
+    Home = 0xff50,
+    End = 0xff57,
+    PageUp = 0xff55,
+    PageDown = 0xff56,
+    Left = 0xff51,
+    Up = 0xff52,
+    Right = 0xff53,
+    Down = 0xff54,
+    F1 = 0xffbe,
+    F2 = 0xffbf,
+    F3 = 0xffc0,
+    F4 = 0xffc1,
+    F5 = 0xffc2,
+    F6 = 0xffc3,
+    F7 = 0xffc4,
+    F8 = 0xffc5,
+    F9 = 0xffc6,
+    F10 = 0xffc7,
+    F11 = 0xffc8,
+    F12 = 0xffc9,
+    ShiftL = 0xffe1,
+    ShiftR = 0xffe2,
+    ControlL = 0xffe3,
+    ControlR = 0xffe4,
+    CapsLock = 0xffe5,
+    NumLock = 0xff7f,
+    ScrollLock = 0xff14,
+    AltL = 0xffe9,
+    AltR = 0xffea,
+    SuperL = 0xffeb,
+    SuperR = 0xffec,
+    Menu = 0xff67,
+    KpEnter = 0xff8d,
+}
+
+impl XkbKeysym {
+    fn from_raw(raw: u32) -> Option<Self> {
+        Some(match raw {
+            0xff08 => Self::BackSpace,
+            0xff09 => Self::Tab,
+            0xff0d => Self::Return,
+            0xff1b => Self::Escape,
+            0xffff => Self::Delete,
+            0xff63 => Self::Insert,
+            0xff50 => Self::Home,
+            0xff57 => Self::End,
+            0xff55 => Self::PageUp,
+            0xff56 => Self::PageDown,
+            0xff51 => Self::Left,
+            0xff52 => Self::Up,
+            0xff53 => Self::Right,
+            0xff54 => Self::Down,
+            0xffbe => Self::F1,
+            0xffbf => Self::F2,
+            0xffc0 => Self::F3,
+            0xffc1 => Self::F4,
+            0xffc2 => Self::F5,
+            0xffc3 => Self::F6,
+            0xffc4 => Self::F7,
+            0xffc5 => Self::F8,
+            0xffc6 => Self::F9,
+            0xffc7 => Self::F10,
+            0xffc8 => Self::F11,
+            0xffc9 => Self::F12,
+            0xffe1 => Self::ShiftL,
+            0xffe2 => Self::ShiftR,
+            0xffe3 => Self::ControlL,
+            0xffe4 => Self::ControlR,
+            0xffe5 => Self::CapsLock,
+            0xff7f => Self::NumLock,
+            0xff14 => Self::ScrollLock,
+            0xffe9 => Self::AltL,
+            0xffea => Self::AltR,
+            0xffeb => Self::SuperL,
+            0xffec => Self::SuperR,
+            0xff67 => Self::Menu,
+            0xff8d => Self::KpEnter,
+            _ => return None,
+        })
+    }
+}
+
+/// Translate one XKB keysym into our [`Key`] enum. Returns `None` for a
+/// keysym we don't act on (dead keys, media keys, …) — callers should then
+/// try [`char_key`] for anything with a direct Unicode mapping, and finally
+/// fall back to the physical-keycode path if both come back empty.
+#[must_use]
+pub fn keysym_to_key(raw: u32) -> Option<Key> {
+    XkbKeysym::from_raw(raw).map(|k| match k {
+        XkbKeysym::BackSpace => Key::Backspace,
+        XkbKeysym::Tab => Key::Tab,
+        XkbKeysym::Return | XkbKeysym::KpEnter => Key::Enter,
+        XkbKeysym::Escape => Key::Esc,
+        XkbKeysym::Delete => Key::Delete,
+        XkbKeysym::Insert => Key::Insert,
+        XkbKeysym::Home => Key::Home,
+        XkbKeysym::End => Key::End,
+        XkbKeysym::PageUp => Key::PageUp,
+        XkbKeysym::PageDown => Key::PageDown,
+        XkbKeysym::Left => Key::Left,
+        XkbKeysym::Up => Key::Up,
+        XkbKeysym::Right => Key::Right,
+        XkbKeysym::Down => Key::Down,
+        XkbKeysym::F1 => Key::F1,
+        XkbKeysym::F2 => Key::F2,
+        XkbKeysym::F3 => Key::F3,
+        XkbKeysym::F4 => Key::F4,
+        XkbKeysym::F5 => Key::F5,
+        XkbKeysym::F6 => Key::F6,
+        XkbKeysym::F7 => Key::F7,
+        XkbKeysym::F8 => Key::F8,
+        XkbKeysym::F9 => Key::F9,
+        XkbKeysym::F10 => Key::F10,
+        XkbKeysym::F11 => Key::F11,
+        XkbKeysym::F12 => Key::F12,
+        XkbKeysym::ShiftL | XkbKeysym::ShiftR => Key::LShift,
+        XkbKeysym::ControlL | XkbKeysym::ControlR => Key::LCtrl,
+        XkbKeysym::CapsLock => Key::CapsLock,
+        // No dedicated NumLock/ScrollLock/Menu/Super variants in
+        // `protocol::Key` today (only `input::Key` has them) -- these never
+        // reach the encoder as anything but modifier-only no-ops either
+        // way, so mapping them to the nearest existing modifier variant
+        // (rather than dropping the event) keeps repeat-suppression /
+        // is_modifier() correct without inventing wire-protocol variants
+        // nothing else in `platform` uses.
+        XkbKeysym::NumLock | XkbKeysym::ScrollLock => Key::CapsLock,
+        XkbKeysym::AltL | XkbKeysym::AltR => Key::LAlt,
+        XkbKeysym::SuperL | XkbKeysym::SuperR => Key::LMeta,
+        XkbKeysym::Menu => Key::LMeta,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn niri_swapped_esc_capslock_keysyms_translate_correctly() {
+        // The exact keysyms `xkb::Translator::keysym` would hand back for
+        // the swapped keymap in `crates/xkb`'s own regression test.
+        assert_eq!(keysym_to_key(0xffe5), Some(Key::CapsLock)); // Caps_Lock
+        assert_eq!(keysym_to_key(0xff1b), Some(Key::Esc)); // Escape
+    }
+
+    #[test]
+    fn unmapped_keysym_returns_none() {
+        assert_eq!(keysym_to_key(0x1234_5678), None);
+    }
+
+    #[test]
+    fn kp_enter_and_return_both_map_to_enter() {
+        assert_eq!(keysym_to_key(0xff0d), Some(Key::Enter));
+        assert_eq!(keysym_to_key(0xff8d), Some(Key::Enter));
     }
 }

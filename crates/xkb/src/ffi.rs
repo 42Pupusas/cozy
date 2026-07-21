@@ -14,6 +14,7 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
+use std::sync::OnceLock;
 
 pub type xkb_context = c_void;
 pub type xkb_keymap = c_void;
@@ -151,6 +152,15 @@ unsafe fn sym<T: Copy>(handle: *mut c_void, name: &CStr) -> Option<T> {
 }
 
 impl Lib {
+    /// The process-wide `Lib` singleton, resolved once on first use and
+    /// cached for every subsequent call. An associated fn rather than a
+    /// bare free `lib()` function elsewhere in this crate -- `Lib` is what's
+    /// being fetched, so it's the natural namespace for fetching it.
+    pub fn global() -> Result<&'static Self, String> {
+        static LIB: OnceLock<Result<Lib, String>> = OnceLock::new();
+        LIB.get_or_init(Self::open).as_ref().map_err(Clone::clone)
+    }
+
     /// `dlopen("libxkbcommon.so.0")` and resolve every symbol we need.
     ///
     /// Tries the versioned soname first (what every distro package installs,

@@ -36,14 +36,6 @@ mod ffi;
 use std::ffi::c_char;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr::NonNull;
-use std::sync::OnceLock;
-
-fn lib() -> Result<&'static ffi::Lib, String> {
-    static LIB: OnceLock<Result<ffi::Lib, String>> = OnceLock::new();
-    LIB.get_or_init(ffi::Lib::open)
-        .as_ref()
-        .map_err(Clone::clone)
-}
 
 /// Any failure standing up the XKB translation path.
 #[derive(Debug)]
@@ -79,7 +71,7 @@ struct Context(NonNull<ffi::xkb_context>);
 
 impl Context {
     fn new() -> Result<Self, XkbError> {
-        let lib = lib().map_err(XkbError::LibraryUnavailable)?;
+        let lib = ffi::Lib::global().map_err(XkbError::LibraryUnavailable)?;
         // SAFETY: `context_new` is a plain constructor; `NoFlags` is the
         // only value the header defines for a fresh context.
         let raw = unsafe { (lib.context_new)(ffi::ContextFlags::NoFlags) };
@@ -91,7 +83,7 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        if let Ok(lib) = lib() {
+        if let Ok(lib) = ffi::Lib::global() {
             // SAFETY: `self.0` was returned by `xkb_context_new` and is
             // dropped exactly once (no other owner holds this pointer).
             unsafe { (lib.context_unref)(self.0.as_ptr()) };
@@ -110,7 +102,7 @@ struct Keymap {
 
 impl Keymap {
     fn compile(ctx: Context, text: &str) -> Result<Self, XkbError> {
-        let lib = lib().map_err(XkbError::LibraryUnavailable)?;
+        let lib = ffi::Lib::global().map_err(XkbError::LibraryUnavailable)?;
         // xkb_keymap_new_from_string wants a NUL-terminated C string.
         let mut owned = String::with_capacity(text.len() + 1);
         owned.push_str(text);
@@ -134,7 +126,7 @@ impl Keymap {
 
 impl Drop for Keymap {
     fn drop(&mut self) {
-        if let Ok(lib) = lib() {
+        if let Ok(lib) = ffi::Lib::global() {
             // SAFETY: `self.ptr` came from `xkb_keymap_new_from_string` and
             // is dropped exactly once.
             unsafe { (lib.keymap_unref)(self.ptr.as_ptr()) };
@@ -158,7 +150,7 @@ const XKB_MOD_NAME_CAPS: &str = "Lock\0";
 
 impl State {
     fn new(keymap: Keymap) -> Result<Self, XkbError> {
-        let lib = lib().map_err(XkbError::LibraryUnavailable)?;
+        let lib = ffi::Lib::global().map_err(XkbError::LibraryUnavailable)?;
         // SAFETY: `keymap.ptr` is a live, successfully-compiled keymap.
         let raw = unsafe { (lib.state_new)(keymap.ptr.as_ptr()) };
         let ptr = NonNull::new(raw).ok_or(XkbError::CompileFailed("xkb_state_new"))?;
@@ -179,7 +171,7 @@ impl State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        if let Ok(lib) = lib() {
+        if let Ok(lib) = ffi::Lib::global() {
             // SAFETY: `self.ptr` came from `xkb_state_new` and is dropped
             // exactly once.
             unsafe { (lib.state_unref)(self.ptr.as_ptr()) };
@@ -212,7 +204,7 @@ impl Translator {
     /// See [`XkbError`] — library missing, mmap failure, invalid UTF-8, or
     /// the keymap text failing to compile.
     pub fn from_keymap_fd(fd: BorrowedFd<'_>, size: usize) -> Result<Self, XkbError> {
-        let text = mmap_keymap(fd, size)?;
+        let text = Self::mmap_keymap(fd, size)?;
         let ctx = Context::new()?;
         let keymap = Keymap::compile(ctx, &text)?;
         let state = State::new(keymap)?;
@@ -229,7 +221,7 @@ impl Translator {
         locked: u32,
         group: u32,
     ) -> Result<(), XkbError> {
-        let lib = lib().map_err(XkbError::LibraryUnavailable)?;
+        let lib = ffi::Lib::global().map_err(XkbError::LibraryUnavailable)?;
         // SAFETY: `self.state.ptr` is a live state; the mask/group args are
         // passed through verbatim from the compositor, exactly the shape
         // `xkb_state_update_mask` expects (depressed/latched/locked mods,
@@ -256,7 +248,9 @@ impl Translator {
     /// state (e.g. an unassigned physical key).
     #[must_use]
     pub fn keysym(&self, evdev_code: u32) -> u32 {
-        let Ok(lib) = lib() else { return 0 };
+        let Ok(lib) = ffi::Lib::global() else {
+            return 0;
+        };
         let keycode = evdev_code + EVDEV_XKB_OFFSET;
         // SAFETY: `self.state.ptr` is a live state; any `xkb_keycode_t` is a
         // valid argument (out-of-range codes just yield NoSymbol, per spec).
@@ -268,7 +262,9 @@ impl Translator {
     /// modifier, a dead key mid-compose, a functional key, …).
     #[must_use]
     pub fn utf32(&self, evdev_code: u32) -> u32 {
-        let Ok(lib) = lib() else { return 0 };
+        let Ok(lib) = ffi::Lib::global() else {
+            return 0;
+        };
         let keycode = evdev_code + EVDEV_XKB_OFFSET;
         // SAFETY: same as `keysym` above.
         unsafe { (lib.state_key_get_utf32)(self.state.ptr.as_ptr(), keycode) }
@@ -279,7 +275,9 @@ impl Translator {
     /// drives `CapsLock` is still reported correctly).
     #[must_use]
     pub fn caps_lock_active(&self) -> bool {
-        let Ok(lib) = lib() else { return false };
+        let Ok(lib) = ffi::Lib::global() else {
+            return false;
+        };
         if self.state.caps_mod_index == u32::MAX {
             return false; // XKB_MOD_INVALID: this keymap has no "Lock" mod.
         }
@@ -296,44 +294,49 @@ impl Translator {
     }
 }
 
-/// `mmap` the compositor's keymap fd read-only and decode it as UTF-8.
-/// Kept as a free function (rather than a `Translator` method) since it's
-/// pure fd-in, string-out — easy to unit test without a real XKB context.
-fn mmap_keymap(fd: BorrowedFd<'_>, size: usize) -> Result<String, XkbError> {
-    if size == 0 {
-        return Err(XkbError::Mmap(std::io::Error::other("zero-size keymap")));
+impl Translator {
+    /// `mmap` the compositor's keymap fd read-only and decode it as UTF-8.
+    /// A private associated fn on `Translator` (rather than a free
+    /// function) since it's the first step of `Translator::from_keymap_fd`
+    /// and has no other caller -- pure fd-in, string-out, so it's still
+    /// easy to unit test without a real XKB context.
+    fn mmap_keymap(fd: BorrowedFd<'_>, size: usize) -> Result<String, XkbError> {
+        if size == 0 {
+            return Err(XkbError::Mmap(std::io::Error::other("zero-size keymap")));
+        }
+        // SAFETY: standard read-only, private, fixed-size mapping of a fd
+        // the caller owns for at least this call's duration (`BorrowedFd`).
+        let ptr = unsafe {
+            libc_mmap(
+                std::ptr::null_mut(),
+                size,
+                PROT_READ,
+                MAP_PRIVATE,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == MAP_FAILED {
+            return Err(XkbError::Mmap(std::io::Error::last_os_error()));
+        }
+        // SAFETY: `ptr` is a valid mapping of `size` bytes just established
+        // above; the compositor guarantees a NUL-terminated string within
+        // it, so we search for that terminator rather than trust the raw
+        // slice end (matches the protocol's documented "keymap.size
+        // includes the NUL").
+        let text = unsafe {
+            let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), size);
+            let nul_at = slice.iter().position(|&b| b == 0).unwrap_or(size);
+            std::str::from_utf8(&slice[..nul_at])
+                .map(str::to_owned)
+                .map_err(|_| XkbError::InvalidUtf8)
+        };
+        // SAFETY: unmapping the same ptr/size pair mmap returned.
+        unsafe {
+            libc_munmap(ptr, size);
+        }
+        text
     }
-    // SAFETY: standard read-only, private, fixed-size mapping of a fd the
-    // caller owns for at least this call's duration (`BorrowedFd`).
-    let ptr = unsafe {
-        libc_mmap(
-            std::ptr::null_mut(),
-            size,
-            PROT_READ,
-            MAP_PRIVATE,
-            fd.as_raw_fd(),
-            0,
-        )
-    };
-    if ptr == MAP_FAILED {
-        return Err(XkbError::Mmap(std::io::Error::last_os_error()));
-    }
-    // SAFETY: `ptr` is a valid mapping of `size` bytes just established
-    // above; the compositor guarantees a NUL-terminated string within it,
-    // so we search for that terminator rather than trust the raw slice end
-    // (matches the protocol's documented "keymap.size includes the NUL").
-    let text = unsafe {
-        let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), size);
-        let nul_at = slice.iter().position(|&b| b == 0).unwrap_or(size);
-        std::str::from_utf8(&slice[..nul_at])
-            .map(str::to_owned)
-            .map_err(|_| XkbError::InvalidUtf8)
-    };
-    // SAFETY: unmapping the same ptr/size pair mmap returned.
-    unsafe {
-        libc_munmap(ptr, size);
-    }
-    text
 }
 
 const PROT_READ: i32 = 0x1;
@@ -401,15 +404,19 @@ mod tests {
     #[test]
     fn mmap_keymap_round_trips_text() {
         let fd = write_keymap_fd("hello xkb\0padding-after-nul-ignored");
-        let text = mmap_keymap(fd.as_fd(), "hello xkb\0padding-after-nul-ignored".len() + 1)
-            .expect("mmap_keymap should succeed");
+        let text =
+            Translator::mmap_keymap(fd.as_fd(), "hello xkb\0padding-after-nul-ignored".len() + 1)
+                .expect("mmap_keymap should succeed");
         assert_eq!(text, "hello xkb");
     }
 
     #[test]
     fn mmap_keymap_rejects_zero_size() {
         let fd = write_keymap_fd("x");
-        assert!(matches!(mmap_keymap(fd.as_fd(), 0), Err(XkbError::Mmap(_))));
+        assert!(matches!(
+            Translator::mmap_keymap(fd.as_fd(), 0),
+            Err(XkbError::Mmap(_))
+        ));
     }
 
     #[test]

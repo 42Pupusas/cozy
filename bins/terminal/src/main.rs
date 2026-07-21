@@ -958,30 +958,9 @@ impl UiWorker<'_> {
         // pointer's `link_id` without reaching across to the parser thread.
         let mut links: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
 
-        // Config live-reload: watch the config file for writes (most editors
-        // save via rename-into-place, which is `IN_MOVE_SELF`/`IN_ATTRIB` on
-        // the old inode or `IN_CREATE` in the directory depending on the
-        // editor -- watching the *directory* for `CLOSE_WRITE|MOVED_TO` on
-        // any entry and filtering by filename catches every common save
-        // strategy, where watching the file itself would miss an atomic
-        // rename replacing the inode out from under the watch). Best-effort:
-        // if the config dir doesn't exist yet (nothing has ever been saved
-        // there) or inotify setup fails, live-reload is simply unavailable
-        // and the rest of the terminal works exactly as before.
-        let config_path = config::Config::xdg_config_path();
-        let config_watch = config_path.parent().and_then(|dir| {
-            let ino = ququmatz::Inotify::new().ok()?;
-            let dir_c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
-            ino.add_watch(
-                &dir_c,
-                ququmatz::WatchMask::CLOSE_WRITE | ququmatz::WatchMask::MOVED_TO,
-            )
-            .ok()?;
-            Some(ino)
-        });
-        let config_file_name = config_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned());
+        // Config live-reload -- see `ConfigWatcher`'s doc for the save-
+        // detection strategy and why it's best-effort.
+        let config_watcher = ConfigWatcher::new();
 
         loop {
             if quit.load(Ordering::Relaxed) {
@@ -1168,7 +1147,7 @@ impl UiWorker<'_> {
                                     continue;
                                 }
                                 Key::Enter => {
-                                    open_terminal_here(shell_pid.load(Ordering::Relaxed));
+                                    SiblingSpawner::open_here(shell_pid.load(Ordering::Relaxed));
                                     continue;
                                 }
                                 _ => {}
@@ -1269,25 +1248,9 @@ impl UiWorker<'_> {
                 pty_wake.signal();
             }
 
-            // Config live-reload: drain any pending inotify events on the
-            // config directory and, if our file was among the touched
-            // names, re-parse and hot-apply what's safe to change without a
-            // restart (theme/palette, font, opacity, cursor style/blink).
-            // `[general]` (shell, scrollback size, ...) and `[keybinds]`
-            // still need a restart -- they're consumed once at process
-            // startup on other threads this loop has no channel to.
-            if let (Some(ino), Some(fname)) = (&config_watch, &config_file_name)
-                && inotify_touched(ino, fname)
-            {
-                match config::Config::load_from(&config_path) {
-                    Ok(new_cfg) => {
-                        apply_live_config(&new_cfg, &mut win);
-                        did_work = true;
-                    }
-                    Err(e) => {
-                        eprintln!("terminal: config reload failed, keeping old config: {e}");
-                    }
-                }
+            // Config live-reload: see `ConfigWatcher::poll_reload`.
+            if config_watcher.poll_reload(&mut win) {
+                did_work = true;
             }
 
             if !win.tick()? {
@@ -1323,139 +1286,241 @@ impl UiWorker<'_> {
 
 // ── Config live-reload ────────────────────────────────────────────────────────────────────
 
-/// Drain every pending inotify event on the config directory's watch and
-/// report whether any of them named `fname` (our config file specifically,
-/// not some unrelated file saved alongside it in the same directory).
-/// Non-blocking -- the fd was opened with `IN_NONBLOCK`, so an empty read
-/// just means "nothing changed", not a stall.
-fn inotify_touched(ino: &ququmatz::Inotify, fname: &str) -> bool {
-    // Sized for a handful of coalesced events; `inotify_event` is 16 bytes
-    // plus each event's (padded) trailing filename, so this comfortably
-    // covers a burst of saves without needing to loop reads.
-    let mut buf = [0u8; 4096];
-    // EAGAIN (nothing pending) or a transient error either way.
-    let Ok(n) = ququmatz::syscall::read(ino.fd(), buf.as_mut_ptr(), buf.len()) else {
-        return false;
-    };
-    let header_size = std::mem::size_of::<ququmatz::InotifyEvent>();
-    let mut touched = false;
-    let mut off = 0usize;
-    while off + header_size <= n {
-        // SAFETY: `buf[off..]` holds at least `header_size` bytes of a kernel-
-        // written `inotify_event`, which is a plain-old-data repr(C) struct
-        // with no padding-sensitive invariants -- an unaligned read is exactly
-        // what the kernel's own byte-packed event stream requires.
-        let ev: ququmatz::InotifyEvent =
-            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) };
-        let name_len = ev.len as usize;
-        let name_start = off + header_size;
-        let name_end = name_start + name_len;
-        if name_end > n {
-            break; // Truncated trailing event -- stop rather than read garbage.
-        }
-        if name_len > 0 {
-            // The kernel pads the name with trailing NULs to the next 4-byte
-            // boundary; trim them before comparing.
-            let raw = &buf[name_start..name_end];
-            let trimmed = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
-            if trimmed == fname.as_bytes() {
-                touched = true;
-            }
-        }
-        off = name_end;
-    }
-    touched
+/// Watches the config file for saves and hot-applies whatever's safe to
+/// change without a restart. Was two free functions (`inotify_touched`,
+/// `apply_live_config`) plus three loose locals (`config_path`,
+/// `config_watch`, `config_file_name`) threaded through `UiWorker::run`'s
+/// loop body -- bundled here since they're one cohesive unit: the watch
+/// handle, the filename it's filtering for, and the reload/apply logic
+/// that consumes them are never meaningful apart from each other.
+struct ConfigWatcher {
+    /// `None` if the config directory doesn't exist yet or inotify setup
+    /// failed -- live-reload is then simply unavailable, not an error (see
+    /// `Self::new`).
+    inotify: Option<ququmatz::Inotify>,
+    /// The config file's bare name (no directory), to filter the
+    /// directory-wide watch down to saves of *this* file specifically.
+    file_name: Option<String>,
+    path: std::path::PathBuf,
 }
 
-/// Hot-apply the subset of a freshly-reloaded config that's safe to change
-/// without restarting the process: theme/palette, font, window opacity, and
-/// cursor style/blink. Everything else (`[general]`'s shell/scrollback,
-/// `[keybinds]`) is read once at startup on threads this function has no
-/// channel to reach, so it's simply left as-is until the next restart --
-/// consistent with how most terminals scope live-reload to appearance, not
-/// process-lifetime settings.
-fn apply_live_config(cfg: &Config, win: &mut TermWindow) {
-    let theme = platform::Theme::from_palette(&cfg.palette);
-    let renderer = platform::Renderer::with_scale(theme, &cfg.font, win.output_scale())
-        .with_opacity(cfg.window.opacity);
-    if win.needs_alpha_changed(&renderer) {
-        eprintln!(
-            "terminal: config reload: [window] opacity crossed the opaque/translucent boundary -- restart to apply (buffer format is fixed at startup)"
-        );
-        return;
+impl ConfigWatcher {
+    /// Set up the watch, best-effort: if the config dir doesn't exist yet
+    /// (nothing has ever been saved there) or inotify setup fails,
+    /// live-reload is simply unavailable and the rest of the terminal works
+    /// exactly as before.
+    ///
+    /// Watches the config file for writes (most editors save via
+    /// rename-into-place, which is `IN_MOVE_SELF`/`IN_ATTRIB` on the old
+    /// inode or `IN_CREATE` in the directory depending on the editor --
+    /// watching the *directory* for `CLOSE_WRITE|MOVED_TO` on any entry and
+    /// filtering by filename catches every common save strategy, where
+    /// watching the file itself would miss an atomic rename replacing the
+    /// inode out from under the watch).
+    fn new() -> Self {
+        let path = config::Config::xdg_config_path();
+        let inotify = path.parent().and_then(|dir| {
+            let ino = ququmatz::Inotify::new().ok()?;
+            let dir_c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+            ino.add_watch(
+                &dir_c,
+                ququmatz::WatchMask::CLOSE_WRITE | ququmatz::WatchMask::MOVED_TO,
+            )
+            .ok()?;
+            Some(ino)
+        });
+        let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        Self {
+            inotify,
+            file_name,
+            path,
+        }
     }
-    win.set_renderer(renderer);
-    win.set_cursor_config(platform::CursorAnimConfig {
-        shape: match cfg.cursor.style {
-            config::CursorStyle::Block => grid::CursorShape::Block,
-            config::CursorStyle::Beam => grid::CursorShape::Bar,
-            config::CursorStyle::Underline => grid::CursorShape::Underline,
-        },
-        blink: cfg.cursor.blink,
-        #[allow(clippy::cast_precision_loss)]
-        period_ms: (cfg.cursor.blink_rate * 2) as f32,
-    });
+
+    /// If our config file was touched since the last call, re-parse and
+    /// hot-apply it to `win`. Returns whether anything happened (so the
+    /// caller can fold it into its own `did_work` bookkeeping). `[general]`
+    /// (shell, scrollback size, ...) and `[keybinds]` still need a restart
+    /// -- they're consumed once at process startup on other threads this
+    /// has no channel to.
+    fn poll_reload(&self, win: &mut TermWindow) -> bool {
+        let (Some(ino), Some(fname)) = (&self.inotify, &self.file_name) else {
+            return false;
+        };
+        if !Self::touched(ino, fname) {
+            return false;
+        }
+        match config::Config::load_from(&self.path) {
+            Ok(new_cfg) => {
+                Self::apply(&new_cfg, win);
+                true
+            }
+            Err(e) => {
+                eprintln!("terminal: config reload failed, keeping old config: {e}");
+                false
+            }
+        }
+    }
+
+    /// Drain every pending inotify event on the config directory's watch and
+    /// report whether any of them named `fname` (our config file
+    /// specifically, not some unrelated file saved alongside it in the same
+    /// directory). Non-blocking -- the fd was opened with `IN_NONBLOCK`, so
+    /// an empty read just means "nothing changed", not a stall.
+    fn touched(ino: &ququmatz::Inotify, fname: &str) -> bool {
+        // Sized for a handful of coalesced events; `inotify_event` is 16
+        // bytes plus each event's (padded) trailing filename, so this
+        // comfortably covers a burst of saves without needing to loop reads.
+        let mut buf = [0u8; 4096];
+        // EAGAIN (nothing pending) or a transient error either way.
+        let Ok(n) = ququmatz::syscall::read(ino.fd(), buf.as_mut_ptr(), buf.len()) else {
+            return false;
+        };
+        let header_size = std::mem::size_of::<ququmatz::InotifyEvent>();
+        let mut touched = false;
+        let mut off = 0usize;
+        while off + header_size <= n {
+            // SAFETY: `buf[off..]` holds at least `header_size` bytes of a
+            // kernel-written `inotify_event`, which is a plain-old-data
+            // repr(C) struct with no padding-sensitive invariants -- an
+            // unaligned read is exactly what the kernel's own byte-packed
+            // event stream requires.
+            let ev: ququmatz::InotifyEvent =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) };
+            let name_len = ev.len as usize;
+            let name_start = off + header_size;
+            let name_end = name_start + name_len;
+            if name_end > n {
+                break; // Truncated trailing event -- stop rather than read garbage.
+            }
+            if name_len > 0 {
+                // The kernel pads the name with trailing NULs to the next
+                // 4-byte boundary; trim them before comparing.
+                let raw = &buf[name_start..name_end];
+                let trimmed = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
+                if trimmed == fname.as_bytes() {
+                    touched = true;
+                }
+            }
+            off = name_end;
+        }
+        touched
+    }
+
+    /// Hot-apply the subset of a freshly-reloaded config that's safe to
+    /// change without restarting the process: theme/palette, font, window
+    /// opacity, and cursor style/blink. Everything else (`[general]`'s
+    /// shell/scrollback, `[keybinds]`) is read once at startup on threads
+    /// this has no channel to reach, so it's simply left as-is until the
+    /// next restart -- consistent with how most terminals scope
+    /// live-reload to appearance, not process-lifetime settings.
+    fn apply(cfg: &Config, win: &mut TermWindow) {
+        let theme = platform::Theme::from_palette(&cfg.palette);
+        let renderer = platform::Renderer::with_scale(theme, &cfg.font, win.output_scale())
+            .with_opacity(cfg.window.opacity);
+        if win.needs_alpha_changed(&renderer) {
+            eprintln!(
+                "terminal: config reload: [window] opacity crossed the opaque/translucent boundary -- restart to apply (buffer format is fixed at startup)"
+            );
+            return;
+        }
+        win.set_renderer(renderer);
+        win.set_cursor_config(platform::CursorAnimConfig {
+            shape: match cfg.cursor.style {
+                config::CursorStyle::Block => grid::CursorShape::Block,
+                config::CursorStyle::Beam => grid::CursorShape::Bar,
+                config::CursorStyle::Underline => grid::CursorShape::Underline,
+            },
+            blink: cfg.cursor.blink,
+            #[allow(clippy::cast_precision_loss)]
+            period_ms: (cfg.cursor.blink_rate * 2) as f32,
+        });
+    }
 }
 
 // ── Ctrl+Shift+Enter: open a new terminal in the same CWD ─────────────────────
 
-/// Walk down from `pid` to its deepest living child (the PTY's foreground
-/// job -- usually the shell itself, or whatever command is currently
-/// running in it), following `/proc/<pid>/task/<pid>/children`.
-fn deepest_child(pid: i32) -> i32 {
-    let mut cur = pid;
-    while let Ok(raw) = std::fs::read_to_string(format!("/proc/{cur}/task/{cur}/children")) {
-        let Some(last) = raw.split_ascii_whitespace().next_back() else {
-            break;
-        };
-        let Ok(next) = last.parse::<i32>() else {
-            break;
-        };
-        cur = next;
-    }
-    cur
+/// Extends `i32` (a process id) with "walk to the deepest living child" as
+/// a method, instead of a free `deepest_child(pid)` function -- per the
+/// crate-wide rule, logic with no natural struct owner belongs on a trait
+/// over the primitive it operates on.
+trait ChildTree {
+    /// Walk down from this pid to its deepest living child (the PTY's
+    /// foreground job -- usually the shell itself, or whatever command is
+    /// currently running in it), following
+    /// `/proc/<pid>/task/<pid>/children`.
+    fn deepest_child(self) -> i32;
 }
 
-/// Ctrl+Shift+Enter: spawn a new instance of this terminal, `cd`'d into
-/// wherever the current one's shell (or its foreground job) is sitting --
-/// matching the "open a new window in the same directory" convention most
-/// terminals bind to this chord. `shell_pid` is `0` if the PTY thread
-/// hasn't finished forking yet (a vanishingly small startup window); in
-/// that case this is a harmless no-op.
-///
-/// Implemented terminal-side rather than by a window-manager keybind
-/// because we already own the one piece of state this needs -- the PTY's
-/// child PID -- with no IPC or `/proc`-scraping-some-other-window's-app-id
-/// required.
-fn open_terminal_here(shell_pid: i32) {
-    if shell_pid <= 0 {
-        return;
+impl ChildTree for i32 {
+    fn deepest_child(self) -> Self {
+        let mut cur = self;
+        while let Ok(raw) = std::fs::read_to_string(format!("/proc/{cur}/task/{cur}/children")) {
+            let Some(last) = raw.split_ascii_whitespace().next_back() else {
+                break;
+            };
+            let Ok(next) = last.parse::<Self>() else {
+                break;
+            };
+            cur = next;
+        }
+        cur
     }
-    let target_pid = deepest_child(shell_pid);
-    let cwd = std::fs::read_link(format!("/proc/{target_pid}/cwd")).ok();
-    let exe = std::env::current_exe().unwrap_or_else(|_| "mera-terminal".into());
-    let mut cmd = std::process::Command::new(exe);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    // Same zombie-avoidance as the OSC 8 Ctrl+click spawn: reap on a
-    // throwaway thread instead of leaking a `Child` or blocking the UI loop.
-    if let Ok(mut child) = cmd.spawn() {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+}
+
+/// Marker struct owning the Ctrl+Shift+Enter "open a new terminal here"
+/// action, instead of a free `open_terminal_here(shell_pid)` function --
+/// there's no natural instance data (it's a one-shot side effect keyed off
+/// an argument, not a stateful owner), but it's not shared/reusable logic
+/// belonging on some primitive's trait either, so a named marker type is
+/// the better fit than a loose free fn, matching `SurfaceBootstrap`/
+/// `Base64` elsewhere in this workspace.
+struct SiblingSpawner;
+
+impl SiblingSpawner {
+    /// Spawn a new instance of this terminal, `cd`'d into wherever the
+    /// current one's shell (or its foreground job) is sitting -- matching
+    /// the "open a new window in the same directory" convention most
+    /// terminals bind to this chord. `shell_pid` is `0` if the PTY thread
+    /// hasn't finished forking yet (a vanishingly small startup window); in
+    /// that case this is a harmless no-op.
+    ///
+    /// Implemented terminal-side rather than by a window-manager keybind
+    /// because we already own the one piece of state this needs -- the
+    /// PTY's child PID -- with no IPC or
+    /// `/proc`-scraping-some-other-window's-app-id required.
+    fn open_here(shell_pid: i32) {
+        if shell_pid <= 0 {
+            return;
+        }
+        let target_pid = shell_pid.deepest_child();
+        let cwd = std::fs::read_link(format!("/proc/{target_pid}/cwd")).ok();
+        let exe = std::env::current_exe().unwrap_or_else(|_| "mera-terminal".into());
+        let mut cmd = std::process::Command::new(exe);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        // Same zombie-avoidance as the OSC 8 Ctrl+click spawn: reap on a
+        // throwaway thread instead of leaking a `Child` or blocking the UI
+        // loop.
+        if let Ok(mut child) = cmd.spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 }
 
 #[cfg(test)]
 mod live_reload_tests {
-    use super::inotify_touched;
+    use super::ConfigWatcher;
 
     /// Write to a file inside a fresh temp dir, watched the same way
     /// `UiWorker::run` watches the real config directory (`CLOSE_WRITE |
     /// MOVED_TO` on the directory, filtered by filename), and confirm
-    /// `inotify_touched` reports the save. Exercises the real kernel ABI --
-    /// event header size/layout, name padding/NUL-trimming -- not a mock.
+    /// `ConfigWatcher::touched` reports the save. Exercises the real kernel
+    /// ABI -- event header size/layout, name padding/NUL-trimming -- not a
+    /// mock.
     #[test]
     fn detects_a_save_to_the_watched_file() {
         let dir =
@@ -1473,23 +1538,23 @@ mod live_reload_tests {
         .expect("add_watch");
 
         // No event yet -- a fresh watch with nothing written since must report false.
-        assert!(!inotify_touched(&ino, "config.toml"));
+        assert!(!ConfigWatcher::touched(&ino, "config.toml"));
 
         // A write + close (what every editor's "save" does, atomic-rename
         // editors aside) fires CLOSE_WRITE.
         std::fs::write(&file, "updated").unwrap();
         // inotify delivery is asynchronous; give the kernel a moment.
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(inotify_touched(&ino, "config.toml"));
+        assert!(ConfigWatcher::touched(&ino, "config.toml"));
 
         // Already drained -- a second immediate check sees nothing new.
-        assert!(!inotify_touched(&ino, "config.toml"));
+        assert!(!ConfigWatcher::touched(&ino, "config.toml"));
 
         // A save to some other file in the same directory must not be
         // reported as touching our config file.
         std::fs::write(dir.join("unrelated.txt"), "noise").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(!inotify_touched(&ino, "config.toml"));
+        assert!(!ConfigWatcher::touched(&ino, "config.toml"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -14,6 +14,7 @@ ququmatz      = { path = "/home/cuarentaydos/Code/tooling/ququmatz" }
 quetzal-uring = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl-uring" }
 quetzalcoatl  = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl" }
 shelby        = { path = "/home/cuarentaydos/Code/tooling/shelby/crates/shelby", features = ["std"] }
+json-bourne   = { path = "/home/cuarentaydos/Code/tooling/bourne/crates/bourne", features = ["derive"] }
 
 [workspace.lints.clippy]
 # groups

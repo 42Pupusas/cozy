@@ -157,9 +157,18 @@ fn main() {
     let (snapshot_tx, snapshot_rx) = mpsc::channel::<Snapshot>();
     let (scroll_tx, scroll_rx) = mpsc::channel::<(ModuleKind, i32)>();
     let (click_tx, click_rx) = mpsc::channel::<ModuleKind>();
+    let notification_rules = cfg.bar_notifications().to_vec();
     std::thread::Builder::new()
         .name("statusbar-worker".into())
-        .spawn(move || worker::run(&snapshot_tx, &scroll_rx, &click_rx, &wake))
+        .spawn(move || {
+            worker::run(
+                &snapshot_tx,
+                &scroll_rx,
+                &click_rx,
+                &wake,
+                notification_rules,
+            );
+        })
         .expect("spawn statusbar worker thread");
 
     let bar_height = window.height();

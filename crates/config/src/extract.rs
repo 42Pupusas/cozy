@@ -16,6 +16,15 @@ pub trait TableExt<'t> {
     /// Get a sub-table by key, or `None` if missing / not a table.
     fn get_table(&'t self, key: &str) -> Option<&'t Table<'t>>;
 
+    /// Get an array-of-tables by key (TOML `[[key]]` entries), or `None` if
+    /// missing / not an array / not every element a table. Used for
+    /// repeatable `[bar]` sub-sections like `[[bar.notifications]]`, where
+    /// `shelby` already folds each `[[...]]` header into a `Value::Array`
+    /// of `Value::Table` under the array's key -- this just narrows that
+    /// down to `&[Table]` for callers that don't want to match on `Value`
+    /// themselves.
+    fn get_array_of_tables(&'t self, key: &str) -> Option<Vec<&'t Table<'t>>>;
+
     /// Get a string value by key, or `None` if missing / not a string.
     fn get_str(&'t self, key: &str) -> Option<&'t str>;
 
@@ -54,6 +63,19 @@ impl<'t> TableExt<'t> for Table<'t> {
     fn get_table(&'t self, key: &str) -> Option<&'t Self> {
         match self.get(key)? {
             Value::Table(t) => Some(t),
+            _ => None,
+        }
+    }
+
+    fn get_array_of_tables(&'t self, key: &str) -> Option<Vec<&'t Self>> {
+        match self.get(key)? {
+            Value::Array(items) => items
+                .iter()
+                .map(|v| match v {
+                    Value::Table(t) => Some(t),
+                    _ => None,
+                })
+                .collect(),
             _ => None,
         }
     }

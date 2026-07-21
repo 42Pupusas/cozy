@@ -12,7 +12,6 @@
 //! renders that slot as an em-dash instead of erroring the whole process.
 
 use std::fs;
-use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Wall-clock `HH:MM:SS`, local time — via `crate::localtime` (raw
@@ -178,173 +177,6 @@ pub fn bluetooth() -> Option<String> {
     }
 }
 
-/// Default sink (output) volume percentage + mute state, via `pactl` (falls
-/// back to `amixer` if `pactl` isn't found).
-#[must_use]
-pub fn volume_out() -> Option<String> {
-    volume_out_raw().map(|(s, ..)| s)
-}
-
-/// Same as [`volume_out`] but also hands back the bare `(pct, muted)` pair --
-/// so a caller applying an optimistic scroll-delta (see the statusbar
-/// worker) can compute the next percentage without re-parsing the rendered
-/// string.
-#[must_use]
-pub fn volume_out_raw() -> Option<(String, u32, bool)> {
-    if let Some(v) = pactl_volume_raw("@DEFAULT_SINK@") {
-        return Some(v);
-    }
-    amixer_volume_raw("Master")
-}
-
-/// Default source (input/mic) volume percentage + mute state, via `pactl`.
-#[must_use]
-pub fn volume_in() -> Option<String> {
-    volume_in_raw().map(|(s, ..)| s)
-}
-
-/// See [`volume_out_raw`].
-#[must_use]
-pub fn volume_in_raw() -> Option<(String, u32, bool)> {
-    if let Some(v) = pactl_volume_raw("@DEFAULT_SOURCE@") {
-        return Some(v);
-    }
-    amixer_volume_raw("Capture")
-}
-
-/// Nudge the default sink (output) volume by `delta_pct` percentage points
-/// (negative to lower), via `pactl` (falls back to `amixer`). Clamped to
-/// `0..=100` by the underlying tool, not here. Fire-and-forget: errors are
-/// swallowed since the next module poll will just show whatever the mixer
-/// actually landed on.
-pub fn adjust_volume_out(delta_pct: i32) {
-    adjust_volume("@DEFAULT_SINK@", "Master", delta_pct);
-}
-
-/// Nudge the default source (input/mic) volume -- see [`adjust_volume_out`].
-pub fn adjust_volume_in(delta_pct: i32) {
-    adjust_volume("@DEFAULT_SOURCE@", "Capture", delta_pct);
-}
-
-fn adjust_volume(pactl_target: &str, amixer_control: &str, delta_pct: i32) {
-    let kind = if pactl_target.contains("SOURCE") {
-        "set-source-volume"
-    } else {
-        "set-sink-volume"
-    };
-    let sign = if delta_pct >= 0 { "+" } else { "-" };
-    let arg = format!("{sign}{}%", delta_pct.abs());
-    // `spawn` + drop the child, not `status`/`output`: this runs on the bar's
-    // single render thread, and a rapid wheel scroll fires this once per
-    // detent -- blocking on a `pactl`/`amixer` round-trip (process spawn +
-    // exec + a D-Bus/PulseAudio IPC hop, easily tens of ms) each time is
-    // exactly what made scrolling feel janky: the whole paint loop stalled
-    // on process I/O every tick instead of just kicking it off.  We don't
-    // need the exit status here -- the very next module poll re-reads
-    // whatever the mixer actually landed on regardless of whether this
-    // particular command succeeded.
-    let spawned = Command::new("pactl")
-        .args([kind, pactl_target, &arg])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    if spawned.is_err() {
-        let _ = Command::new("amixer")
-            .args([
-                "set",
-                amixer_control,
-                &format!("{}%{sign}", delta_pct.abs()),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
-}
-
-fn pactl_volume_raw(target: &str) -> Option<(String, u32, bool)> {
-    let kind = if target.contains("SOURCE") {
-        "get-source-volume"
-    } else {
-        "get-sink-volume"
-    };
-    let vol_out = Command::new("pactl").args([kind, target]).output().ok()?;
-    let vol_text = String::from_utf8(vol_out.stdout).ok()?;
-    let pct = vol_text
-        .split('/')
-        .find_map(|part| part.trim().strip_suffix('%'))
-        .and_then(|n| n.trim().parse::<u32>().ok())?;
-
-    let mute_kind = if target.contains("SOURCE") {
-        "get-source-mute"
-    } else {
-        "get-sink-mute"
-    };
-    let mute_out = Command::new("pactl")
-        .args([mute_kind, target])
-        .output()
-        .ok()?;
-    let muted = String::from_utf8(mute_out.stdout)
-        .unwrap_or_default()
-        .contains("yes");
-    let is_source = target.contains("SOURCE");
-    Some((format_volume(is_source, pct, muted), pct, muted))
-}
-
-fn amixer_volume_raw(control: &str) -> Option<(String, u32, bool)> {
-    let out = Command::new("amixer")
-        .args(["get", control])
-        .output()
-        .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    let line = text.lines().rfind(|l| l.contains('%'))?;
-    let pct = line
-        .split('[')
-        .nth(1)?
-        .split('%')
-        .next()?
-        .parse::<u32>()
-        .ok()?;
-    let muted = line.contains("[off]");
-    let is_source = control == "Capture";
-    Some((format_volume(is_source, pct, muted), pct, muted))
-}
-
-/// Render a volume/mic percentage + mute state the same way
-/// [`volume_out`]/[`volume_in`] do -- exposed `pub` (not just for this
-/// module's own callers) so a caller that already knows the percentage
-/// in hand (e.g. an optimistic UI update applied before the real `pactl`
-/// mutation has even been spawned, let alone read back) can format it
-/// identically without shelling out.
-#[must_use]
-pub fn format_volume(is_source: bool, pct: u32, muted: bool) -> String {
-    let icon = pick_volume_icon(is_source, pct, muted);
-    format!("{pct:>3}% {icon}")
-}
-
-fn pick_volume_icon(is_source: bool, pct: u32, muted: bool) -> &'static str {
-    if is_source {
-        return if muted { MIC_MUTED } else { MIC_ON };
-    }
-    if muted {
-        return VOL_MUTED;
-    }
-    if pct < 33 {
-        VOL_LOW
-    } else if pct < 66 {
-        VOL_MED
-    } else {
-        VOL_HIGH
-    }
-}
-
-const MIC_ON: &str = "󰍬";
-const MIC_MUTED: &str = "󰍭";
-const VOL_LOW: &str = "󰕿";
-const VOL_MED: &str = "󰖀";
-const VOL_HIGH: &str = "󰕾";
-const VOL_MUTED: &str = "󰝟";
 const BRIGHTNESS_ICON: &str = "󰃠";
 
 /// Screen backlight brightness percentage, from the first
@@ -355,7 +187,7 @@ pub fn brightness() -> Option<String> {
 }
 
 /// Same as [`brightness`] but also hands back the bare percentage -- see
-/// [`volume_out_raw`] for why.
+/// [`crate::volume::Volume::sink_raw`] for why.
 #[must_use]
 pub fn brightness_raw() -> Option<(String, u32)> {
     let dir = fs::read_dir("/sys/class/backlight").ok()?;
@@ -373,7 +205,7 @@ pub fn brightness_raw() -> Option<(String, u32)> {
 }
 
 /// Render a brightness percentage the same way `brightness()` does -- see
-/// `format_volume` for why this is `pub`.
+/// `crate::volume::Volume::format` for why this is `pub`.
 #[must_use]
 pub fn format_brightness(pct: u32) -> String {
     format!("{pct:>3}% {BRIGHTNESS_ICON}")
@@ -512,33 +344,4 @@ mod tests {
         assert_eq!(parse_kb(""), None);
     }
 
-    // pick_volume_icon / format_volume
-
-    #[test]
-    fn pick_volume_icon_sink_thresholds() {
-        assert_eq!(pick_volume_icon(false, 0, false), "\u{f057f}");
-        assert_eq!(pick_volume_icon(false, 32, false), "\u{f057f}");
-        assert_eq!(pick_volume_icon(false, 33, false), "\u{f0580}");
-        assert_eq!(pick_volume_icon(false, 65, false), "\u{f0580}");
-        assert_eq!(pick_volume_icon(false, 66, false), "\u{f057e}");
-        assert_eq!(pick_volume_icon(false, 100, false), "\u{f057e}");
-    }
-
-    #[test]
-    fn pick_volume_icon_muted_overrides_level() {
-        assert_eq!(pick_volume_icon(false, 100, true), "\u{f075f}");
-    }
-
-    #[test]
-    fn pick_volume_icon_source_ignores_level_thresholds() {
-        assert_eq!(pick_volume_icon(true, 5, false), "\u{f036c}");
-        assert_eq!(pick_volume_icon(true, 100, false), "\u{f036c}");
-        assert_eq!(pick_volume_icon(true, 50, true), "\u{f036d}");
-    }
-
-    #[test]
-    fn format_volume_pads_to_three_digits() {
-        assert_eq!(format_volume(false, 7, false), "  7% \u{f057f}");
-        assert_eq!(format_volume(false, 100, false), "100% \u{f057e}");
-    }
 }

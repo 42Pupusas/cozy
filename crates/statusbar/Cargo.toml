@@ -13,3 +13,4 @@ config       = { path = "../config" }
 waker        = { path = "../waker" }
 dbus         = { path = "../dbus" }
 quetzalcoatl = { workspace = true }
+json-bourne  = { workspace = true }

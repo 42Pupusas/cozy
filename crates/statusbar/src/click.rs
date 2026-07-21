@@ -28,7 +28,7 @@ pub fn settings_page(kind: ModuleKind) -> Option<&'static str> {
         | ModuleKind::Temp
         | ModuleKind::Cpu
         | ModuleKind::Mem
-        | ModuleKind::Mattermost => None,
+        | ModuleKind::Notification => None,
     }
 }
 

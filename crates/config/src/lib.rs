@@ -71,6 +71,23 @@
 //!                                           # waybar's icon set). unset = no
 //!                                           # icon fallback, no icons drawn.
 //! opacity     = 1.0                # defaults to [window].opacity
+//!
+//! # Zero or more app windows to watch for niri's "urgent" (attention-
+//! # demanding) state -- e.g. an Electron chat app flashing its taskbar
+//! # icon on an unread mention. Each entry becomes its own bar segment:
+//! # `icon` alone when that app has a window open with nothing new,
+//! # `icon` plus a red dot when niri reports one of its windows urgent.
+//! # An app with no window open at all renders nothing (segment hidden).
+//! [[bar.notifications]]
+//! app_id = "Mattermost"            # matched case-insensitively as a substring
+//!                                   # of niri's window app_id (so "mattermost"
+//!                                   # matches both "Mattermost" and the
+//!                                   # Flatpak's "mattermost-desktop")
+//! icon   = "nf-md-message-text"    # any single glyph, e.g. from a Nerd Font
+//!
+//! [[bar.notifications]]
+//! app_id = "Slack"
+//! icon   = "nf-md-slack"
 //! ```
 
 mod color;
@@ -334,6 +351,23 @@ pub struct Keybind {
     pub action: Action,
 }
 
+/// One `[[bar.notifications]]` entry: an app to watch for niri's
+/// window-urgency signal, and the glyph its bar segment should render.
+///
+/// This is deliberately compositor-agnostic in shape (just "an `app_id`
+/// and an icon") even though today's only consumer
+/// (`statusbar::notifications`) happens to source urgency from niri
+/// specifically -- the config format itself doesn't need to know that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationRule {
+    /// Matched case-insensitively as a substring of the window's `app_id`
+    /// (not an exact match -- Flatpak/native builds of the same app often
+    /// differ in casing/suffix, e.g. "Mattermost" vs "mattermost-desktop").
+    pub app_id: String,
+    /// The glyph to render for this app's segment.
+    pub icon: String,
+}
+
 /// Status-bar configuration.
 ///
 /// Every field is optional in the TOML `[bar]` table and, when unset,
@@ -368,6 +402,11 @@ pub struct BarConfig {
     /// Background opacity override, `0.0`-`1.0`. `None` mirrors
     /// `[window].opacity`.
     pub opacity: Option<f64>,
+    /// `[[bar.notifications]]` entries -- apps to watch for a
+    /// compositor-reported urgent/attention-demanding window. Empty by
+    /// default: no notification segments render unless the user opts an
+    /// app in. See [`NotificationRule`].
+    pub notifications: Vec<NotificationRule>,
 }
 
 // ── Root config ───────────────────────────────────────────────────────────────
@@ -689,6 +728,34 @@ impl Config {
         )? {
             self.bar.opacity = Some(n);
         }
+        self.apply_bar_notifications(bar)?;
+        Ok(())
+    }
+
+    /// Apply `[[bar.notifications]]`, if present. Split out of
+    /// [`Self::apply_bar`] for the same line-count reason every other
+    /// `apply_*` helper is split out.
+    fn apply_bar_notifications(&mut self, bar: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(entries) = bar.get_array_of_tables("notifications") else {
+            return Ok(());
+        };
+        for entry in entries {
+            let app_id = entry
+                .get_str("app_id")
+                .ok_or(ConfigError::InvalidValue {
+                    field: "bar.notifications.app_id",
+                    reason: "required, must be a string",
+                })?
+                .to_owned();
+            let icon = entry
+                .get_str("icon")
+                .ok_or(ConfigError::InvalidValue {
+                    field: "bar.notifications.icon",
+                    reason: "required, must be a string",
+                })?
+                .to_owned();
+            self.bar.notifications.push(NotificationRule { app_id, icon });
+        }
         Ok(())
     }
 
@@ -764,5 +831,13 @@ impl Config {
     #[must_use]
     pub fn bar_opacity(&self) -> f64 {
         self.bar.opacity.unwrap_or(self.window.opacity)
+    }
+
+    /// The apps to watch for a compositor-reported urgent window -- see
+    /// [`NotificationRule`]. Empty (no notification segments) unless the
+    /// user configured `[[bar.notifications]]` entries.
+    #[must_use]
+    pub fn bar_notifications(&self) -> &[NotificationRule] {
+        &self.bar.notifications
     }
 }

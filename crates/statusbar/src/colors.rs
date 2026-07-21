@@ -47,7 +47,10 @@ pub enum ModuleKind {
     VolOut,
     VolIn,
     Brightness,
-    Mattermost,
+    /// Any `[[bar.notifications]]` segment (Mattermost, Slack, ...) --
+    /// shared by every configured rule since the color only depends on
+    /// unread state, not which app; see `notifications::is_unread_text`.
+    Notification,
 }
 
 /// Per-module foreground color -- state is read straight off the icon glyph
@@ -109,9 +112,9 @@ pub fn module_color(kind: ModuleKind, text: &str) -> Color {
             }
         }
         ModuleKind::Brightness => YELLOW,
-        ModuleKind::Mattermost => {
-            if crate::mattermost::MattermostStatus::is_unread_text(text) {
-                RED // unread mention/DM -- matches the old waybar red dot
+        ModuleKind::Notification => {
+            if crate::notifications::is_unread_text(text) {
+                RED // unread mention/notification -- matches the old waybar red dot
             } else {
                 BLUE
             }

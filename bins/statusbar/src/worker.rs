@@ -5,7 +5,7 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use statusbar::{ModuleKind, ScrollAccumulator, settings_page, steps_to_delta_pct};
+use statusbar::{ModuleKind, ScrollAccumulator, Volume, settings_page, steps_to_delta_pct};
 
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
@@ -13,12 +13,12 @@ use statusbar::{ModuleKind, ScrollAccumulator, settings_page, steps_to_delta_pct
 const CLOCK_PERIOD: Duration = Duration::from_millis(1000);
 const FAST_PERIOD: Duration = Duration::from_secs(2); // battery, temp, mem
 const SLOW_PERIOD: Duration = Duration::from_secs(5); // wifi, bluetooth, volume, brightness
-/// How often the Mattermost module re-runs `niri msg --json windows`.
+/// How often `[[bar.notifications]]` re-runs `niri msg --json windows`.
 /// Deliberately its own (short) period rather than piggybacking on
 /// `SLOW_PERIOD`: an unread mention is exactly the kind of thing a user
 /// wants to notice promptly, and a `niri msg` round trip is cheap (a local
 /// IPC socket call, not a network request or a `pactl`-style mixer probe).
-const MATTERMOST_PERIOD: Duration = Duration::from_secs(2);
+const NOTIFICATIONS_PERIOD: Duration = Duration::from_secs(2);
 /// `cpu_usage` samples twice ~120ms apart, so give it its own slightly
 /// longer period rather than sharing `FAST_PERIOD`. Currently unused --
 /// see the comment where it would be called in `State::refresh`.
@@ -61,18 +61,24 @@ pub struct Snapshot {
     vol_out: String,
     vol_in: String,
     brightness: String,
-    mattermost: String,
+    /// Rendered `[[bar.notifications]]` segments, in config order --
+    /// parallel to `State::notification_rules`, empty strings for
+    /// not-currently-running apps skipped in `left_segments`.
+    notifications: Vec<String>,
 }
 
 impl Snapshot {
     /// Left section, left-to-right draw order: the always-visible
     /// connectivity cluster (clock/date live in `right_segments`).
     pub fn left_segments(&self) -> Vec<(ModuleKind, &str)> {
-        vec![
-            (ModuleKind::Mattermost, self.mattermost.as_str()),
-            (ModuleKind::Wifi, self.wifi.as_str()),
-            (ModuleKind::Bluetooth, self.bluetooth.as_str()),
-        ]
+        let mut segs: Vec<(ModuleKind, &str)> = self
+            .notifications
+            .iter()
+            .map(|s| (ModuleKind::Notification, s.as_str()))
+            .collect();
+        segs.push((ModuleKind::Wifi, self.wifi.as_str()));
+        segs.push((ModuleKind::Bluetooth, self.bluetooth.as_str()));
+        segs
     }
 
     /// Center section -- unused for now (kept as an empty group so the
@@ -115,9 +121,13 @@ struct State {
     last_clock: Instant,
     last_fast: Instant,
     last_slow: Instant,
-    last_mattermost: Instant,
+    last_notifications: Instant,
     #[allow(dead_code)]
     last_cpu: Instant,
+    /// `[[bar.notifications]]` rules read from config at startup -- static
+    /// for the process lifetime (same posture as every other config-driven
+    /// bar setting; no live config-reload support anywhere in this bar).
+    notification_rules: Vec<config::NotificationRule>,
     last_control_refresh: Instant,
     pending_scroll: Option<(ModuleKind, ScrollAccumulator)>,
     last_scroll_apply: Instant,
@@ -128,7 +138,7 @@ struct State {
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(notification_rules: Vec<config::NotificationRule>) -> Self {
         let now = Instant::now();
         // Back-date every timer so the very first `refresh` call (right
         // after the bar maps) populates every module immediately instead of
@@ -139,8 +149,9 @@ impl State {
             last_clock: stale,
             last_fast: stale,
             last_slow: stale,
-            last_mattermost: stale,
+            last_notifications: stale,
             last_cpu: stale,
+            notification_rules,
             last_control_refresh: stale,
             pending_scroll: None,
             last_scroll_apply: stale,
@@ -196,7 +207,7 @@ impl State {
             let bt = statusbar::modules::bluetooth().unwrap_or_else(|| DASH.into());
             changed |= self.snap.bluetooth != bt;
             self.snap.bluetooth = bt;
-            if let Some((s, pct, muted)) = statusbar::modules::volume_out_raw() {
+            if let Some((s, pct, muted)) = Volume::sink_raw() {
                 changed |= self.snap.vol_out != s;
                 self.snap.vol_out = s;
                 self.vol_out_known = Some(KnownPct { pct, muted });
@@ -205,7 +216,7 @@ impl State {
                 self.snap.vol_out = DASH.into();
                 self.vol_out_known = None;
             }
-            if let Some((s, pct, muted)) = statusbar::modules::volume_in_raw() {
+            if let Some((s, pct, muted)) = Volume::source_raw() {
                 changed |= self.snap.vol_in != s;
                 self.snap.vol_in = s;
                 self.vol_in_known = Some(KnownPct { pct, muted });
@@ -225,13 +236,15 @@ impl State {
             }
         }
 
-        if now.duration_since(self.last_mattermost) >= MATTERMOST_PERIOD {
-            self.last_mattermost = now;
-            let mm = statusbar::MattermostStatus::query()
-                .map(|s| s.render())
-                .unwrap_or_default();
-            changed |= self.snap.mattermost != mm;
-            self.snap.mattermost = mm;
+        if now.duration_since(self.last_notifications) >= NOTIFICATIONS_PERIOD {
+            self.last_notifications = now;
+            let rendered: Vec<String> = statusbar::notifications::query(&self.notification_rules)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|seg| seg.rendered)
+                .collect();
+            changed |= self.snap.notifications != rendered;
+            self.snap.notifications = rendered;
         }
 
         changed
@@ -240,10 +253,10 @@ impl State {
     /// Immediately re-read just the one control `kind` was scrolled on
     /// (skipping `SLOW_PERIOD`'s cooldown), debounced to at most once per
     /// `CONTROL_REFRESH_DEBOUNCE_MS`. NOT called right after firing a
-    /// scroll-triggered mutation any more -- `adjust_volume_out`/etc. spawn
+    /// scroll-triggered mutation any more -- `Volume::adjust_sink`/etc. spawn
     /// `pactl`/write sysfs and return immediately without waiting for the
     /// change to land (deliberately, to keep the worker non-blocking; see
-    /// `modules::adjust_volume`'s doc), so a readback moments later would
+    /// `Volume::adjust`'s doc), so a readback moments later would
     /// race it and often observe the *pre*-mutation value. `apply_optimistic`
     /// then keeps compounding its next delta on top of that stale reading,
     /// which is exactly the drift bug this once caused -- see
@@ -263,7 +276,7 @@ impl State {
         self.last_control_refresh = now;
         match kind {
             ModuleKind::VolOut => {
-                if let Some((s, pct, muted)) = statusbar::modules::volume_out_raw() {
+                if let Some((s, pct, muted)) = Volume::sink_raw() {
                     let changed = self.snap.vol_out != s;
                     self.snap.vol_out = s;
                     self.vol_out_known = Some(KnownPct { pct, muted });
@@ -273,7 +286,7 @@ impl State {
                 }
             }
             ModuleKind::VolIn => {
-                if let Some((s, pct, muted)) = statusbar::modules::volume_in_raw() {
+                if let Some((s, pct, muted)) = Volume::source_raw() {
                     let changed = self.snap.vol_in != s;
                     self.snap.vol_in = s;
                     self.vol_in_known = Some(KnownPct { pct, muted });
@@ -311,7 +324,7 @@ impl State {
             ModuleKind::VolOut => {
                 let known = self.vol_out_known.get_or_insert_with(KnownPct::default);
                 known.pct = (known.pct as i32 + delta_pct).clamp(0, 100) as u32;
-                let s = statusbar::modules::format_volume(false, known.pct, known.muted);
+                let s = Volume::format(false, known.pct, known.muted);
                 let changed = self.snap.vol_out != s;
                 self.snap.vol_out = s;
                 changed
@@ -319,7 +332,7 @@ impl State {
             ModuleKind::VolIn => {
                 let known = self.vol_in_known.get_or_insert_with(KnownPct::default);
                 known.pct = (known.pct as i32 + delta_pct).clamp(0, 100) as u32;
-                let s = statusbar::modules::format_volume(true, known.pct, known.muted);
+                let s = Volume::format(true, known.pct, known.muted);
                 let changed = self.snap.vol_in != s;
                 self.snap.vol_in = s;
                 changed
@@ -392,7 +405,7 @@ impl State {
                     return false;
                 };
                 let pct = (known.pct as i32 + delta).clamp(0, 100) as u32;
-                let s = statusbar::modules::format_volume(false, pct, known.muted);
+                let s = Volume::format(false, pct, known.muted);
                 let changed = self.snap.vol_out != s;
                 self.snap.vol_out = s;
                 changed
@@ -402,7 +415,7 @@ impl State {
                     return false;
                 };
                 let pct = (known.pct as i32 + delta).clamp(0, 100) as u32;
-                let s = statusbar::modules::format_volume(true, pct, known.muted);
+                let s = Volume::format(true, pct, known.muted);
                 let changed = self.snap.vol_in != s;
                 self.snap.vol_in = s;
                 changed
@@ -443,8 +456,8 @@ impl State {
         }
         let delta = steps_to_delta_pct(steps, SCROLL_STEP_PCT);
         match kind {
-            ModuleKind::VolOut => statusbar::modules::adjust_volume_out(delta),
-            ModuleKind::VolIn => statusbar::modules::adjust_volume_in(delta),
+            ModuleKind::VolOut => Volume::adjust_sink(delta),
+            ModuleKind::VolIn => Volume::adjust_source(delta),
             ModuleKind::Brightness => statusbar::modules::adjust_brightness(delta),
             _ => {}
         }
@@ -502,8 +515,9 @@ pub fn run(
     scroll_rx: &Receiver<(ModuleKind, i32)>,
     click_rx: &Receiver<ModuleKind>,
     wake: &waker::Waker,
+    notification_rules: Vec<config::NotificationRule>,
 ) {
-    let mut state = State::new();
+    let mut state = State::new(notification_rules);
     loop {
         let mut changed = state.refresh();
 

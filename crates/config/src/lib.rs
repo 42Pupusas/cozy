@@ -263,12 +263,14 @@ impl FontConfig {
 
     /// This config's font size in pixels, as consumed by [`FontFace::load`](../font/struct.FontFace.html#method.load).
     ///
-    /// `size` is validated to `1..=256` points; the result comfortably fits
-    /// `f32` with no precision loss.
+    /// `size` is validated to `1..=256` points, which fits in `u16`; going
+    /// through `f32::from(u16)` (a lossless widening conversion, unlike a
+    /// bare `as f32`) lets clippy prove there's no precision loss instead of
+    /// needing an allow.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn px_size(&self) -> f32 {
-        self.size as f32 * Self::DPI / 72.0
+        let size = u16::try_from(self.size).unwrap_or(u16::MAX);
+        f32::from(size) * Self::DPI / 72.0
     }
 }
 
@@ -803,9 +805,12 @@ impl Config {
     /// [`Config::bar_font_size`] converted to a pixel size the same way
     /// [`FontConfig::px_size`] does (96 DPI), for the bar's own font loader.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
     pub fn bar_font_px_size(&self) -> f32 {
-        self.bar_font_size() as f32 * FontConfig::DPI / 72.0
+        // Same validated-range argument as FontConfig::px_size: this value
+        // is always a validated font size (1..=256), which fits in u16, so
+        // f32::from(u16) proves losslessness instead of needing an allow.
+        let size = u16::try_from(self.bar_font_size()).unwrap_or(u16::MAX);
+        f32::from(size) * FontConfig::DPI / 72.0
     }
 
     /// The status bar's emoji fallback face: `[bar].emoji_path` if set,

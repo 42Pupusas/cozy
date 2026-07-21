@@ -87,9 +87,18 @@ pub enum InputEvent {
         rows: u16,
     },
     /// Mouse-wheel scroll, in lines (positive = scroll up/away, into history;
-    /// negative = scroll down/toward, toward the prompt).
+    /// negative = scroll down/toward, toward the prompt). Carries the cell
+    /// under the pointer and the live modifiers so the consumer can route it:
+    /// viewport scrollback scroll, wheel-button mouse report (when the app
+    /// negotiated tracking — vim's `mouse=a`), or alternate-scroll arrow keys
+    /// (alt screen, no tracking — `less`), which all need different bytes.
     Scroll {
         lines: i32,
+        /// 0-indexed column of the cell under the pointer.
+        col: u16,
+        /// 0-indexed row of the cell under the pointer.
+        row: u16,
+        modifiers: Modifiers,
     },
     /// Clipboard text read from another client, to be written to the PTY
     /// (a paste). Carries the raw clipboard bytes.
@@ -407,6 +416,18 @@ pub struct TermWindow {
     /// any) is down during a drag. `wl_pointer.motion` itself carries no
     /// button info, so this is the only way to know.
     mouse_pressed: Option<MouseButton>,
+    /// Whether the running application has negotiated mouse tracking
+    /// (`mouse_mode != Off`), mirrored in by the UI loop each iteration.
+    /// While true the app owns the pointer: bare clicks/drags are reported to
+    /// it and must NOT also drive the terminal's own selection highlight
+    /// (clicking in vim used to paint a stray selection over vim's UI).
+    app_mouse: bool,
+    /// True while a Shift+left drag is running a terminal-side selection
+    /// *despite* `app_mouse` (the universal "bypass the app" convention —
+    /// kitty/foot/xterm). While set, the left button's press/motion/release
+    /// reports are suppressed so the app never sees the orphan half of a
+    /// drag it didn't start.
+    selection_bypass: bool,
     dirty: bool,
     frame_ready: bool,
     frame_cb: Option<CallbackId>,
@@ -682,6 +703,8 @@ impl TermWindow {
             cell_h,
             pointer_pos: Point::new(0, 0),
             mouse_pressed: None,
+            app_mouse: false,
+            selection_bypass: false,
             dirty: true,
             frame_ready: true,
             frame_cb: None,
@@ -1004,11 +1027,27 @@ impl TermWindow {
             return;
         }
         self.autoscroll_last = Some(now);
-        self.input_queue
-            .push_back(InputEvent::Scroll { lines: dir });
+        self.input_queue.push_back(InputEvent::Scroll {
+            lines: dir,
+            col: 0,
+            row: 0,
+            modifiers: self.modifiers,
+        });
         let (cc, cr) = self.pointer_cell();
         if self.selection.drag_to((cc, i32::from(cr))) {
             self.dirty = true;
+        }
+    }
+
+    /// Mirror in whether the running app has negotiated mouse tracking
+    /// (`mouse_mode != Off`). Called by the UI loop each iteration from the
+    /// parser thread's `TermModes` snapshot. While set, the app owns bare
+    /// left-clicks (no terminal selection; Shift+click bypasses). On the
+    /// falling edge any in-progress bypass drag ends naturally via release.
+    pub fn set_app_mouse(&mut self, on: bool) {
+        self.app_mouse = on;
+        if !on {
+            self.selection_bypass = false;
         }
     }
 
@@ -1297,17 +1336,48 @@ impl TermWindow {
                         // granularity) decides whether a bare hover
                         // (`mouse_pressed == None`) or only a drag gets
                         // encoded -- same division of labor as `Key`.
-                        self.input_queue.push_back(InputEvent::Mouse {
-                            button: self.mouse_pressed.unwrap_or(MouseButton::None),
-                            kind: MouseEventKind::Motion,
-                            col: cc,
-                            row: cr,
-                            modifiers: self.modifiers,
-                        });
+                        // Except during a Shift+drag selection bypass: the
+                        // app never saw that press, so it must not see the
+                        // drag's motion either (orphan drag reports confuse
+                        // vim et al).
+                        if !(self.selection_bypass
+                            && self.mouse_pressed == Some(MouseButton::Left))
+                        {
+                            self.input_queue.push_back(InputEvent::Mouse {
+                                button: self.mouse_pressed.unwrap_or(MouseButton::None),
+                                kind: MouseEventKind::Motion,
+                                col: cc,
+                                row: cr,
+                                modifiers: self.modifiers,
+                            });
+                        }
                     }
                     Some(PointerEvent::Button) => {
                         let button = PointerButton::from_code(ev.arg(2));
                         let state = ButtonState::from_raw(ev.arg(3));
+                        let shift = (self.modifiers.depressed
+                            | self.modifiers.latched
+                            | self.modifiers.locked)
+                            & 0x01
+                            != 0;
+                        // Ownership of the left button (kitty/foot/xterm
+                        // convention): while an app has negotiated mouse
+                        // tracking it owns bare clicks (reported, no terminal
+                        // selection); Shift+click bypasses the app and drives
+                        // the terminal's own selection instead (selection
+                        // runs, report suppressed for the whole drag). With
+                        // no tracking the terminal owns the mouse outright.
+                        let is_left = matches!(button, Some(PointerButton::Left));
+                        let bypass_starts = is_left
+                            && matches!(state, Some(ButtonState::Pressed))
+                            && (!self.app_mouse || shift);
+                        let bypass_ends = is_left
+                            && matches!(state, Some(ButtonState::Released))
+                            && self.selection_bypass;
+                        // Suppress the app report for both halves of a bypassed
+                        // drag — an orphan press or release confuses the app.
+                        let suppress_report =
+                            self.app_mouse && (bypass_starts && shift || bypass_ends);
                         if let (Some(button), Some(state)) = (button, state) {
                             let (cc, cr) = self.pointer_cell();
                             let mb = match button {
@@ -1317,35 +1387,40 @@ impl TermWindow {
                             };
                             self.mouse_pressed =
                                 matches!(state, ButtonState::Pressed).then_some(mb);
-                            self.input_queue.push_back(InputEvent::Mouse {
-                                button: mb,
-                                kind: if matches!(state, ButtonState::Pressed) {
-                                    MouseEventKind::Press
-                                } else {
-                                    MouseEventKind::Release
-                                },
-                                col: cc,
-                                row: cr,
-                                modifiers: self.modifiers,
-                            });
+                            if !suppress_report {
+                                self.input_queue.push_back(InputEvent::Mouse {
+                                    button: mb,
+                                    kind: if matches!(state, ButtonState::Pressed) {
+                                        MouseEventKind::Press
+                                    } else {
+                                        MouseEventKind::Release
+                                    },
+                                    col: cc,
+                                    row: cr,
+                                    modifiers: self.modifiers,
+                                });
+                            }
                         }
                         match (button, state) {
                             (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
-                                let shift = (self.modifiers.depressed
-                                    | self.modifiers.latched
-                                    | self.modifiers.locked)
-                                    & 0x01
-                                    != 0;
-                                let (cc, cr) = self.pointer_cell();
-                                // Press semantics (shift-extend / dismiss-click /
-                                // begin-potential-selection) live in the model.
-                                self.selection.press_left((cc, i32::from(cr)), shift);
-                                self.dirty = true;
+                                if bypass_starts {
+                                    self.selection_bypass = self.app_mouse;
+                                    let (cc, cr) = self.pointer_cell();
+                                    // Press semantics (shift-extend / dismiss-click /
+                                    // begin-potential-selection) live in the model.
+                                    // Under app-mouse bypass shift is the *trigger*,
+                                    // not an extend request, so only pass it through
+                                    // when the terminal owns the mouse anyway.
+                                    self.selection
+                                        .press_left((cc, i32::from(cr)), shift && !self.app_mouse);
+                                    self.dirty = true;
+                                }
                             }
                             (Some(PointerButton::Left), Some(ButtonState::Released)) => {
                                 // Release ends the drag. If the pointer never
                                 // moved since press, this was a bare click on
                                 // empty space — nothing to keep.
+                                self.selection_bypass = false;
                                 self.selection.release_left();
                                 self.dirty = true;
                             }
@@ -1368,8 +1443,13 @@ impl TermWindow {
                             let steps = ((px + 7) / 15).max(1);
                             let lines = steps;
                             let signed = if value.0 < 0 { lines } else { -lines };
-                            self.input_queue
-                                .push_back(InputEvent::Scroll { lines: signed });
+                            let (cc, cr) = self.pointer_cell();
+                            self.input_queue.push_back(InputEvent::Scroll {
+                                lines: signed,
+                                col: cc,
+                                row: cr,
+                                modifiers: self.modifiers,
+                            });
                         }
                     }
                     _ => {}

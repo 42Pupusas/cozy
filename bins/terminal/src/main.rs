@@ -56,7 +56,7 @@ use vt_parser::Parser;
 /// Bit layout (low to high): `mouse_mode` (3 bits, [`MouseMode::to_u8`]),
 /// `sgr_mouse` (1 bit), `keyboard_mode` (2 bits, [`KeyboardMode::to_u8`]),
 /// `kitty_flags` (8 bits), `app_cursor` (1 bit), `app_keypad` (1 bit),
-/// `focus_events` (1 bit).
+/// `focus_events` (1 bit), `alt_screen` (1 bit).
 #[allow(clippy::struct_excessive_bools)] // each bool is an independent negotiated flag, not a state machine
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct TermModes {
@@ -67,6 +67,11 @@ struct TermModes {
     app_cursor: bool,
     app_keypad: bool,
     focus_events: bool,
+    /// Whether the alternate screen is active. Routes the mouse wheel: no
+    /// scrollback exists there, so with no app mouse tracking the wheel is
+    /// translated to arrow keys ("alternate scroll", what foot/kitty do) so
+    /// full-screen apps like `less` still scroll.
+    alt_screen: bool,
 }
 
 impl TermModes {
@@ -78,6 +83,7 @@ impl TermModes {
         v |= u32::from(self.app_cursor) << 14;
         v |= u32::from(self.app_keypad) << 15;
         v |= u32::from(self.focus_events) << 16;
+        v |= u32::from(self.alt_screen) << 17;
         v
     }
 
@@ -90,6 +96,7 @@ impl TermModes {
             app_cursor: (v >> 14) & 1 != 0,
             app_keypad: (v >> 15) & 1 != 0,
             focus_events: (v >> 16) & 1 != 0,
+            alt_screen: (v >> 17) & 1 != 0,
         }
     }
 
@@ -104,6 +111,7 @@ impl TermModes {
             app_cursor: grid.app_cursor(),
             app_keypad: grid.app_keypad(),
             focus_events: grid.focus_events(),
+            alt_screen: grid.alt_screen_active(),
         }
     }
 
@@ -988,7 +996,12 @@ impl UiWorker<'_> {
             // since the last iteration (mouse tracking/SGR, keyboard
             // protocol, app-cursor/keypad, focus events) before encoding any
             // input this iteration produces.
-            TermModes::unpack(term_modes.load(Ordering::Relaxed)).apply_to(&mut encoder);
+            let negotiated = TermModes::unpack(term_modes.load(Ordering::Relaxed));
+            negotiated.apply_to(&mut encoder);
+            // Let the window know whether the app owns the pointer (mouse
+            // tracking negotiated): gates the terminal-side selection so
+            // clicking in vim doesn't paint a stray highlight over its UI.
+            win.set_app_mouse(negotiated.mouse_mode != MouseMode::Off);
 
             // Drain one-shot bell/title events the parser thread queued
             // over the SPSC ui_events_rx ring.
@@ -1030,11 +1043,62 @@ impl UiWorker<'_> {
                         let _ = resize_tx.push(ParserMsg::Resize { cols, rows });
                         sent_input = true;
                     }
-                    InputEvent::Scroll { lines } => {
-                        // Mouse wheel scrolls the grid viewport (into scrollback),
-                        // not the shell. Route to the parser thread, which owns the
-                        // grid and re-renders the moved viewport.
-                        let _ = scroll_tx.push(ParserMsg::Scroll { delta: lines });
+                    InputEvent::Scroll {
+                        lines,
+                        col,
+                        row,
+                        modifiers,
+                    } => {
+                        // Route the wheel by what the app negotiated
+                        // (kitty/foot semantics; Shift bypasses to the
+                        // terminal's own scrollback in every case):
+                        //  1. app mouse tracking → encode wheel-button press
+                        //     reports (vim's `mouse=a` scrolls its buffer);
+                        //  2. alt screen, no tracking → "alternate scroll":
+                        //     arrow keys per line (`less`, pagers);
+                        //  3. otherwise → scroll the grid viewport into
+                        //     scrollback (the shell prompt case).
+                        let mods = modifiers.to_input();
+                        let negotiated = TermModes::unpack(term_modes.load(Ordering::Relaxed));
+                        if negotiated.mouse_mode != MouseMode::Off && !mods.shift() {
+                            let button = if lines > 0 {
+                                MouseButton::WheelUp
+                            } else {
+                                MouseButton::WheelDown
+                            };
+                            let mev = MouseEvent {
+                                button,
+                                state: input::mouse::ButtonState::Pressed,
+                                col,
+                                row,
+                                mods,
+                            };
+                            let mut mbuf = [0u8; 32];
+                            for _ in 0..lines.unsigned_abs() {
+                                if let Some(n) = encoder.encode_mouse(mev, &mut mbuf) {
+                                    let _ = input_tx.push(InputMsg::Bytes(mbuf[..n].into()));
+                                    sent_input = true;
+                                }
+                            }
+                        } else if negotiated.alt_screen && !mods.shift() {
+                            // Alternate scroll: Up/Down arrows, one per line,
+                            // honoring DECCKM (SS3 vs CSI) via the encoder.
+                            let key = if lines > 0 { Key::Up } else { Key::Down };
+                            let mut kbuf = [0u8; 16];
+                            for _ in 0..lines.unsigned_abs() {
+                                if let Some(n) = encoder.encode_key(
+                                    key,
+                                    KeyState::Pressed,
+                                    input::Modifiers::default(),
+                                    &mut kbuf,
+                                ) {
+                                    let _ = input_tx.push(InputMsg::Bytes(kbuf[..n].into()));
+                                    sent_input = true;
+                                }
+                            }
+                        } else {
+                            let _ = scroll_tx.push(ParserMsg::Scroll { delta: lines });
+                        }
                     }
                     InputEvent::Paste(bytes) => {
                         // Clipboard contents from another client: write to the PTY

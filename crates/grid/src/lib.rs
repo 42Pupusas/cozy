@@ -1487,6 +1487,16 @@ impl Grid {
         self.bracketed_paste
     }
 
+    /// Whether the alternate screen (DECSET 1049/47/1047) is active. Read by
+    /// the UI thread to route the mouse wheel: on the alt screen (no
+    /// scrollback) a wheel event with no app-negotiated mouse tracking is
+    /// translated to arrow keys ("alternate scroll"), so full-screen apps
+    /// like `less` or a pager inside nvim still scroll.
+    #[must_use]
+    pub fn alt_screen_active(&self) -> bool {
+        self.alt_active
+    }
+
     /// The negotiated mouse tracking granularity (`Off`/`X10`/`Normal`/
     /// `ButtonMotion`/`AnyEvent`), independent of SGR encoding (see
     /// [`Grid::sgr_mouse`]). Read by the UI thread's `Encoder` to decide

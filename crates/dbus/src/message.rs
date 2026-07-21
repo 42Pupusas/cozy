@@ -138,7 +138,7 @@ pub struct Reply {
     /// this is how the connection tells an unsolicited signal (e.g.
     /// `NameAcquired`, sent right after `Hello`, or a `PropertiesChanged`
     /// broadcast) apart from the reply it's actually waiting for. See
-    /// `Conn::call_raw`, which now loops discarding non-matching messages
+    /// `DbusConn::call_raw`, which now loops discarding non-matching messages
     /// instead of assuming the very next thing off the wire is always the
     /// reply -- an earlier version didn't do this and got its replies
     /// permanently off-by-one the moment any signal arrived.
@@ -161,7 +161,7 @@ impl Reply {
 ///
 /// `serial` must be nonzero and unique per in-flight call on this
 /// connection -- the reply carries it back as `REPLY_SERIAL`, which
-/// `Conn::call_raw` matches on to find its reply among interleaved signals.
+/// `DbusConn::call_raw` matches on to find its reply among interleaved signals.
 #[must_use]
 pub fn build_method_call(
     serial: u32,

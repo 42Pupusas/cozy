@@ -36,7 +36,7 @@ const RING_CQ_ENTRIES: u32 = 16;
 #[derive(Debug)]
 pub enum DbusError {
     /// Neither `DBUS_SESSION_BUS_ADDRESS` nor the well-known system bus
-    /// socket was usable (only relevant to [`Conn::session`]; `Conn::system`
+    /// socket was usable (only relevant to [`DbusConn::session`]; `DbusConn::system`
     /// has one fixed path and reports [`DbusError::Connect`] instead).
     NoAddress,
     Setup(ququmatz::Error),
@@ -73,14 +73,19 @@ impl std::error::Error for DbusError {}
 
 /// A blocking connection to one bus (system or session), good for a series
 /// of synchronous method calls from a single thread.
-pub struct Conn {
+///
+/// Named `DbusConn` (not the shorter `Conn`) to stay unambiguous next to
+/// `platform::conn::WaylandConn`, the unrelated Wayland connection type --
+/// the two used to share a bare name, which made grep/doc navigation and
+/// dependency tooling (`cargo graph`) misattribute edges between them.
+pub struct DbusConn {
     _sock: OwnedFd,
     sock_fd: ququmatz::types::RawFd,
     ring: IoUring,
     next_serial: u32,
 }
 
-impl Conn {
+impl DbusConn {
     /// Connect to the well-known system bus socket
     /// (`/var/run/dbus/system_bus_socket` — the standard path on every
     /// mainstream distro; there's no environment variable for it, unlike the

@@ -47,7 +47,11 @@ const LEFT_PTR_BITMAP: &[u8] = &[
 ];
 
 /// Everything the `Window` needs to keep alive for the cursor to work.
-pub struct Cursor {
+///
+/// Named `PointerCursor` (not the shorter `Cursor`) to stay unambiguous next
+/// to `grid::Cursor`, the unrelated terminal-cell cursor-position type --
+/// the two used to share a bare name.
+pub struct PointerCursor {
     /// The cursor's dedicated `wl_surface`.
     pub surface: SurfaceId,
     /// The buffer currently attached to the cursor surface.
@@ -63,7 +67,7 @@ pub struct Cursor {
     pub hotspot_y: i32,
 }
 
-impl Cursor {
+impl PointerCursor {
     /// Set up the cursor surface: try to load the user's real system cursor
     /// theme at `scale`x density, falling back to the built-in bitmap if
     /// none is found; paint it into an shm buffer; attach + commit the

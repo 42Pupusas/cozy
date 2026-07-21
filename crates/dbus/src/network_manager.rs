@@ -5,7 +5,7 @@
 //! information (connected SSID + a signal percentage), read as typed D-Bus
 //! properties instead of parsed CLI text.
 
-use crate::conn::{Conn, DbusError};
+use crate::conn::{DbusConn, DbusError};
 
 const DEST: &str = "org.freedesktop.NetworkManager";
 const ROOT_PATH: &str = "/org/freedesktop/NetworkManager";
@@ -36,7 +36,7 @@ pub struct WifiStatus {
 /// Returns `Ok(None)` when there's a Wi-Fi device but it's not associated
 /// (equivalent to `iw`'s "Not connected"), and `Err` only for real
 /// transport/bus failures.
-pub fn wifi_status(conn: &mut Conn) -> Result<Option<WifiStatus>, DbusError> {
+pub fn wifi_status(conn: &mut DbusConn) -> Result<Option<WifiStatus>, DbusError> {
     let reply = conn.call(DEST, ROOT_PATH, IFACE, "GetDevices", &[])?;
     let devices = reply.values();
     let Some(paths) = devices.first().and_then(crate::value::Value::as_items) else {

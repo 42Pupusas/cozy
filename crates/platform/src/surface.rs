@@ -16,7 +16,7 @@
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::spsc::{Consumer, RingBuffer};
 
-use crate::conn::{Conn, ConnError, Sender, WindowSender};
+use crate::conn::{ConnError, Sender, WaylandConn, WindowSender};
 use crate::draw::Color as DrawColor;
 use crate::error::{Error, Result};
 use crate::event::RawEvent;
@@ -173,7 +173,7 @@ pub fn pack_bg(bg: DrawColor, bg_alpha: u8) -> u32 {
 }
 
 /// The connection scaffolding every window stands up identically: an open
-/// [`Conn`], the reader half running on its own named thread pushing
+/// [`WaylandConn`], the reader half running on its own named thread pushing
 /// [`RawEvent`]s into an SPSC ring, and the (disarmed) key-repeat timer.
 ///
 /// Returns the main-thread [`Sender`], the [`RepeatTimer`], the event
@@ -182,7 +182,7 @@ pub fn pack_bg(bg: DrawColor, bg_alpha: u8) -> u32 {
 /// `thread_name` labels the reader thread and prefixes its error log so a
 /// crash is attributable to the right window. This is the byte-for-byte
 /// common prologue of `TermWindow::new`/`BarWindow::new` -- everything from
-/// `Conn::connect` through spawning the reader -- lifted out so neither
+/// `WaylandConn::connect` through spawning the reader -- lifted out so neither
 /// hand-rolls the thread + ring wiring.
 type Bootstrap = (
     Sender,
@@ -196,7 +196,7 @@ pub fn connect(
     thread_name: &'static str,
     wake: &waker::Waker,
 ) -> Result<Bootstrap> {
-    let (sender, reader, repeat_timer) = Conn::connect()?;
+    let (sender, reader, repeat_timer) = WaylandConn::connect()?;
     let (producer, events) = RingBuffer::<RawEvent>::new(Capacity::exact(ring_cap)).split();
     // The reader signals `wake` after pushing events so the UI thread -- which
     // polls its rings rather than blocking on this one -- unblocks from `wait`.

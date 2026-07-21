@@ -49,15 +49,19 @@
 //!     framebuffer using the embedded 8×16 bitmap font from `paint`.
 //!   * Key events produce `InputEvent`s destined for `crates/input` (M5).
 
+mod clipboard;
 pub mod conn;
 pub mod cursor;
 pub mod cursor_anim;
+mod debug_overlay;
 pub mod draw;
 pub mod error;
 pub mod event;
 pub mod font;
 pub mod id;
+mod key_repeat;
 pub mod keymap;
+pub mod present;
 pub mod protocol;
 pub mod sys;
 pub mod wire;

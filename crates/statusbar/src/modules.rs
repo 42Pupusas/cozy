@@ -153,7 +153,7 @@ fn parse_kb(s: &str) -> Option<u64> {
 /// (matches the old `iw`-based "Not connected" case, not a `None`).
 #[must_use]
 pub fn wifi() -> Option<String> {
-    let mut conn = dbus::Conn::system().ok()?;
+    let mut conn = dbus::DbusConn::system().ok()?;
     match dbus::network_manager::wifi_status(&mut conn).ok()? {
         Some(status) => Some(format!("{} 󰤨", status.ssid)),
         None => Some("󰤭".into()),
@@ -166,7 +166,7 @@ pub fn wifi() -> Option<String> {
 /// `None` if the system bus / bluez aren't reachable, or no adapter exists.
 #[must_use]
 pub fn bluetooth() -> Option<String> {
-    let mut conn = dbus::Conn::system().ok()?;
+    let mut conn = dbus::DbusConn::system().ok()?;
     let status = dbus::bluez::status(&mut conn).ok()??;
     if !status.powered {
         return Some("󰂲".into());
@@ -421,7 +421,7 @@ pub fn adjust_brightness(delta_pct: i32) {
             -magnitude
         };
         let new_val = (cur + step).clamp(0, max);
-        if let Ok(mut conn) = dbus::Conn::system() {
+        if let Ok(mut conn) = dbus::DbusConn::system() {
             #[allow(clippy::cast_sign_loss)]
             let _ = dbus::logind::set_backlight_brightness(&mut conn, name, new_val as u32);
         }

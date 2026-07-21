@@ -9,7 +9,7 @@
 //! back everything in one round trip: `a{oa{sa{sv}}}` — object path ->
 //! interface name -> property map.
 
-use crate::conn::{Conn, DbusError};
+use crate::conn::{DbusConn, DbusError};
 use crate::value::Value;
 
 const DEST: &str = "org.bluez";
@@ -35,7 +35,7 @@ pub struct BluetoothStatus {
 ///
 /// `Ok(None)` when no adapter object exists at all (distinct from "adapter
 /// present but off", which is `Ok(Some(status))` with `powered: false`).
-pub fn status(conn: &mut Conn) -> Result<Option<BluetoothStatus>, DbusError> {
+pub fn status(conn: &mut DbusConn) -> Result<Option<BluetoothStatus>, DbusError> {
     let reply = conn.call(DEST, ROOT_PATH, OBJECT_MANAGER_IFACE, "GetManagedObjects", &[])?;
     let values = reply.values();
     let Some(objects) = values.first().and_then(Value::as_items) else {

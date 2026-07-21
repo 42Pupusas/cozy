@@ -12,7 +12,7 @@
 //! and (for an active, local session) the default polkit policy allows it
 //! without a password prompt.
 
-use crate::conn::{Conn, DbusError};
+use crate::conn::{DbusConn, DbusError};
 use crate::message::BodyArg;
 use crate::value::Value;
 
@@ -31,7 +31,7 @@ const SESSION_IFACE: &str = "org.freedesktop.login1.Session";
 /// its pid's cgroup somehow -- `systemd-run`, certain sandboxing, etc.) --
 /// there's normally exactly one graphical session on a single-seat desktop,
 /// so "the session on seat0" is a reasonable, unambiguous fallback target.
-fn own_session_path(conn: &mut Conn) -> Result<String, DbusError> {
+fn own_session_path(conn: &mut DbusConn) -> Result<String, DbusError> {
     let by_pid = conn.call(
         DEST,
         MANAGER_PATH,
@@ -71,7 +71,7 @@ fn own_session_path(conn: &mut Conn) -> Result<String, DbusError> {
 /// session object -- `subsystem` is always `"backlight"` (the other
 /// logind-known subsystem, `"leds"`, is for keyboard backlights, not
 /// display ones).
-pub fn set_backlight_brightness(conn: &mut Conn, name: &str, value: u32) -> Result<(), DbusError> {
+pub fn set_backlight_brightness(conn: &mut DbusConn, name: &str, value: u32) -> Result<(), DbusError> {
     let session_path = own_session_path(conn)?;
     conn.call(
         DEST,

@@ -47,6 +47,7 @@ pub enum ModuleKind {
     VolOut,
     VolIn,
     Brightness,
+    Mattermost,
 }
 
 /// Per-module foreground color -- state is read straight off the icon glyph
@@ -108,6 +109,13 @@ pub fn module_color(kind: ModuleKind, text: &str) -> Color {
             }
         }
         ModuleKind::Brightness => YELLOW,
+        ModuleKind::Mattermost => {
+            if crate::mattermost::MattermostStatus::is_unread_text(text) {
+                RED // unread mention/DM -- matches the old waybar red dot
+            } else {
+                BLUE
+            }
+        }
     }
 }
 

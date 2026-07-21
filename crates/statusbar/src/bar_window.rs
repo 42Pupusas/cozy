@@ -2,7 +2,7 @@
 //! exclusive-zone strip drawn with a software framebuffer.
 //!
 //! This is the layer-shell sibling of `platform::TermWindow` — same
-//! connection plumbing (`platform::conn::Conn`, the wire encoder, the raw
+//! connection plumbing (`platform::conn::WaylandConn`, the wire encoder, the raw
 //! pixel `Canvas`), but anchored via `zwlr_layer_shell_v1` instead of
 //! `xdg_wm_base`, with no PTY/grid/selection/clipboard machinery: a bar just
 //! redraws a row of text modules on a timer or content change.
@@ -16,21 +16,21 @@
 //! existing pool via `wl_shm_pool.resize` (grow-only, lazy-shrink) and only
 //! recreate the two `wl_buffer`s carved out of it.
 
-use platform::conn::{ConnError, Sender, WindowSender};
+use platform::conn::{Sender, WindowSender};
 use platform::draw::{Canvas, Color, Point};
 use platform::event::RawEvent;
 use platform::font;
+use crate::pointer_state::PointerState;
 use platform::id::{
-    BufferId, CompositorId, LayerShellId, LayerSurfaceId, ObjectId, OutputId, PointerId, PoolId,
-    RegistryId, SeatId, ShmId, SurfaceId,
+    CompositorId, LayerShellId, LayerSurfaceId, ObjectId, OutputId, RegistryId, SeatId, ShmId,
+    SurfaceId,
 };
+use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
-    self as proto, Anchor, BufferRequest, ButtonState, CompositorRequest, DisplayEvent,
-    DisplayRequest, Format, KeyboardInteractivity, Layer, LayerShellRequest, LayerSurfaceEvent,
-    LayerSurfaceRequest, PointerButton, PointerEvent, RegistryEvent, SeatCapability, SeatEvent,
-    SeatRequest, ShmPoolRequest, SurfaceRequest,
+    self as proto, Anchor, CompositorRequest, DisplayEvent, DisplayRequest, Format,
+    KeyboardInteractivity, Layer, LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest,
+    RegistryEvent, SeatCapability, SeatEvent, SeatRequest, SurfaceRequest,
 };
-use platform::sys::ShmBuffer;
 use platform::wire::{MessageBuilder, WireEvent};
 use platform::{Error, Result};
 use quetzalcoatl::capacity::Capacity;
@@ -90,44 +90,18 @@ pub struct BarWindow {
     scale: i32,
 
     seat: SeatId,
-    pointer: Option<PointerId>,
-    /// Latest known pointer position, physical pixels, surface-local
-    /// (`(0,0)` at the bar's top-left) -- updated on Enter/Motion, read by
-    /// [`BarWindow::pointer_pos`] so the caller can hit-test which module
-    /// segment a scroll landed on.
-    pointer_pos: Point,
-    /// Pending scroll deltas from `wl_pointer.axis` (vertical only), drained
-    /// by [`BarWindow::take_scroll`] once per `tick`. One entry per axis
-    /// event; positive = wheel down, negative = wheel up (same sign
-    /// convention as `platform::TermWindow`'s scroll handling).
-    pending_scroll: Vec<i32>,
-    /// Sub-pixel remainder accumulator, in raw wl_fixed 24.8 units: a
-    /// touchpad or hi-res mouse wheel routinely sends many axis events
-    /// whose magnitude is under one whole pixel, and `Fixed::to_pixels`
-    /// truncates -- converting per-event before accumulating silently
-    /// discarded those (a slow/gentle scroll could produce nothing but
-    /// zeros, forever). This carries the truncated fraction forward so it
-    /// isn't lost, added back in before the next event's own truncation.
-    scroll_fixed_remainder: i32,
-    /// Set on a left-button *press*, cleared and reported on the matching
-    /// *release* -- only a clean press-then-release at (roughly) the same
-    /// spot counts as a click, same convention as everything else that
-    /// distinguishes a click from the start of a drag. A bar has nothing to
-    /// drag, so this never needs to track motion, just press/release
-    /// pairing.
-    left_pressed: bool,
-    /// Set true on a qualifying left-click release, drained by
-    /// [`BarWindow::take_click`] once per `tick`.
-    pending_click: bool,
+    /// `wl_pointer` position/click/scroll tracking -- see
+    /// [`PointerState`]'s module doc for why this is its own type rather
+    /// than six loose fields.
+    pointer: PointerState,
 
     width: i32,
-    frames: [Frame; 2],
-    shm_mem: ShmBuffer,
-    /// The `wl_shm_pool` backing `frames`, created once in [`BarWindow::new`]
-    /// and reused for the window's whole lifetime — see the module doc for
-    /// why a second `create_pool` gets rejected.
-    pool: PoolId,
-    buf_format: Format,
+    /// The `wl_shm` double-buffered swap chain plus the dirty/ready/callback
+    /// handshake -- reuses `platform::present::PresentState` verbatim rather
+    /// than reimplementing it, since the bar's swap chain is structurally
+    /// identical to `platform::TermWindow`'s (see the module doc): a pool
+    /// created once, grown/shrunk in place across resizes, two frame slots.
+    present: PresentState,
 
     backbuffer: Vec<u32>,
     /// Background the canvas is cleared to before each frame's `paint`
@@ -144,9 +118,6 @@ pub struct BarWindow {
     /// [`BarWindow::new`]) since it determines which `wl_shm` format we
     /// negotiate and that can't change after the pool/buffers exist.
     bg_alpha: u8,
-    dirty: bool,
-    frame_ready: bool,
-    frame_cb: Option<platform::id::CallbackId>,
     configured: bool,
     closing: bool,
 }
@@ -287,23 +258,17 @@ impl BarWindow {
             height: px_height,
             scale,
             seat,
-            pointer: None,
-            pointer_pos: Point::new(0, 0),
-            pending_scroll: Vec::new(),
-            scroll_fixed_remainder: 0,
-            left_pressed: false,
-            pending_click: false,
+            pointer: PointerState::new(),
             width: INITIAL_WIDTH,
-            frames,
-            shm_mem,
-            pool,
-            buf_format,
+            // A bar always re-copies its whole backbuffer into whichever
+            // slot presents next (see `present`) rather than diffing rows --
+            // there's no scrollback/selection-style partial repaint here --
+            // so the per-row stale bitmap `PresentState` carries is unused;
+            // `row_count: 1` just keeps that unused allocation tiny.
+            present: PresentState::new(frames, shm_mem, pool, buf_format, 1),
             backbuffer: vec![Color::BLACK.to_xrgb8888(); (INITIAL_WIDTH * px_height) as usize],
             background: Color::rgb(0x1e, 0x1e, 0x2e),
             bg_alpha,
-            dirty: false,
-            frame_ready: true,
-            frame_cb: None,
             configured: false,
             closing: false,
         })
@@ -322,14 +287,14 @@ impl BarWindow {
 
     /// Mark the bar dirty so the next `tick` repaints and presents.
     pub fn request_redraw(&mut self) {
-        self.dirty = true;
+        self.present.mark_dirty();
     }
 
     /// Latest known pointer position, physical pixels, surface-local
     /// (`(0,0)` at the bar's top-left).
     #[must_use]
     pub fn pointer_pos(&self) -> Point {
-        self.pointer_pos
+        self.pointer.pos()
     }
 
     /// Drain and return every scroll delta queued since the last call.
@@ -337,13 +302,13 @@ impl BarWindow {
     /// per `wl_pointer.axis` event, already converted from `wl_fixed` to
     /// pixels (a typical detent is ~15).
     pub fn take_scroll(&mut self) -> Vec<i32> {
-        std::mem::take(&mut self.pending_scroll)
+        self.pointer.take_scroll()
     }
 
     /// Consume a pending left-click (press + matching release since the
     /// last call), if any -- `true` at most once per genuine click.
     pub fn take_click(&mut self) -> bool {
-        std::mem::take(&mut self.pending_click)
+        self.pointer.take_click()
     }
 
     /// Set the color the canvas is cleared to before each frame's `paint`
@@ -351,7 +316,7 @@ impl BarWindow {
     /// immediately.
     pub fn set_background(&mut self, color: Color) {
         self.background = color;
-        self.dirty = true;
+        self.present.mark_dirty();
     }
 
     /// A clone of the shared wakeup channel — hand it to any producer (e.g.
@@ -385,8 +350,10 @@ impl BarWindow {
             }
         }
 
-        if self.configured && self.dirty && self.frame_ready {
-            self.present(&mut paint)?;
+        if self.configured {
+            if let PresentAttempt::Ready(slot) = self.present.begin_present() {
+                self.do_present(slot, &mut paint)?;
+            }
         }
         Ok(true)
     }
@@ -396,13 +363,7 @@ impl BarWindow {
         // frame callback are handled identically to `platform::TermWindow` via
         // the shared `surface::route_common`; only the bar-specific seat /
         // pointer / layer-surface events below differ.
-        match surface::route_common(
-            &ev,
-            &mut self.window_tx,
-            &mut self.frames,
-            &mut self.frame_ready,
-            &mut self.frame_cb,
-        ) {
+        match self.present.route_common(&ev, &mut self.window_tx) {
             surface::Routed::Fatal(e) => return Err(e),
             surface::Routed::Handled => return Ok(()),
             surface::Routed::Passthrough => {}
@@ -411,81 +372,22 @@ impl BarWindow {
         // wl_seat.capabilities
         if ev.is(self.seat) && ev.event::<SeatEvent>() == Some(SeatEvent::Capabilities) {
             let caps = ev.arg(0);
-            if self.pointer.is_none() && SeatCapability::Pointer.in_mask(caps) {
-                let pointer: PointerId = self.window_tx.alloc_id();
+            if self.pointer.id().is_none() && SeatCapability::Pointer.in_mask(caps) {
+                let pointer: platform::id::PointerId = self.window_tx.alloc_id();
                 self.window_tx.request(
                     MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer),
                 );
-                self.pointer = Some(pointer);
+                self.pointer.set_id(pointer);
             }
             return Ok(());
         }
 
-        // wl_pointer.* -- only Enter/Motion (track position) and Axis
-        // (queue a scroll delta) matter for a bar with no
-        // buttons/selection/drag of its own.
-        if let Some(pointer) = self.pointer {
+        // wl_pointer.* -- only Enter/Motion (track position), Button (click
+        // detection) and Axis (queue a scroll delta) matter for a bar with
+        // no selection/drag of its own; see `PointerState` for all of it.
+        if let Some(pointer) = self.pointer.id() {
             if ev.is(pointer) {
-                match ev.event::<PointerEvent>() {
-                    Some(PointerEvent::Enter) => {
-                        self.pointer_pos = ev.point(2, 3);
-                    }
-                    Some(PointerEvent::Motion) => {
-                        self.pointer_pos = ev.point(1, 2);
-                    }
-                    Some(PointerEvent::Button) => {
-                        // Args: (serial, time, button, state). A click is a
-                        // press immediately followed by a release with
-                        // nothing else of interest in between -- a bar has
-                        // no drag/selection to distinguish, so press just
-                        // arms it and release (while armed) reports it.
-                        let button = PointerButton::from_code(ev.arg(2));
-                        let state = ButtonState::from_raw(ev.arg(3));
-                        match (button, state) {
-                            (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
-                                self.left_pressed = true;
-                            }
-                            (Some(PointerButton::Left), Some(ButtonState::Released)) => {
-                                if self.left_pressed {
-                                    self.pending_click = true;
-                                }
-                                self.left_pressed = false;
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(PointerEvent::Axis) => {
-                        // Axis args: (time, axis, value). axis 0 = vertical;
-                        // value is wl_fixed (24.8) -- positive = wheel down,
-                        // negative = wheel up, same convention as
-                        // `platform::TermWindow`'s scroll handling.
-                        //
-                        // Touchpad/hi-res-wheel scrolling sends many small
-                        // axis events, routinely under one whole pixel each
-                        // (wl_fixed's 8 fractional bits mean e.g. 0.3px is a
-                        // real, distinct value on the wire). Converting each
-                        // event to pixels independently via `to_pixels()`
-                        // (plain truncating integer division) rounded every
-                        // such sub-pixel event down to exactly 0 and threw
-                        // it away -- a slow, gentle scroll gesture could
-                        // legitimately produce nothing but zeros forever,
-                        // which is why brightness/volume scrolling felt
-                        // broken or wildly inconsistent depending on scroll
-                        // speed. Instead accumulate in raw fixed-point units
-                        // and only truncate to pixels once enough has built
-                        // up, carrying the leftover fraction forward.
-                        let axis = ev.arg(1);
-                        if axis == 0 {
-                            let raw = self.scroll_fixed_remainder + ev.fixed(2).0;
-                            let px = raw / 256;
-                            self.scroll_fixed_remainder = raw - px * 256;
-                            if px != 0 {
-                                self.pending_scroll.push(px);
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                self.pointer.on_event(&ev);
                 return Ok(());
             }
         }
@@ -503,7 +405,7 @@ impl BarWindow {
                         self.resize(w)?;
                     }
                     self.configured = true;
-                    self.dirty = true;
+                    self.present.mark_dirty();
                     return Ok(());
                 }
                 Some(LayerSurfaceEvent::Closed) => {
@@ -528,37 +430,22 @@ impl BarWindow {
         }
         self.width = width;
 
-        for frame in &self.frames {
-            self.window_tx
-                .request(MessageBuilder::new(frame.buffer, BufferRequest::Destroy));
-        }
+        self.present.destroy_old_buffers(&mut self.window_tx);
 
         let grew = self
-            .shm_mem
-            .resize(width as usize, self.height as usize)
-            .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
-        let stride = width * 4;
-
-        if let Some(new_cap) = grew {
-            self.window_tx.request(
-                MessageBuilder::new(self.pool, ShmPoolRequest::Resize).i32(new_cap as i32),
-            );
+            .present
+            .resize_shm(width, self.height)
+            .map_err(|e| Error::Conn(platform::conn::ConnError::Sys(e)))?;
+        if let Some(new_capacity) = grew {
+            self.present.grow_pool(&mut self.window_tx, new_capacity);
         }
-
-        for (i, frame) in self.frames.iter_mut().enumerate() {
-            let buffer: BufferId = self.window_tx.alloc_id();
-            self.window_tx.request(
-                MessageBuilder::new(self.pool, ShmPoolRequest::CreateBuffer)
-                    .new_id(buffer)
-                    .i32(self.shm_mem.frame_offset(i) as i32)
-                    .i32(width)
-                    .i32(self.height)
-                    .i32(stride)
-                    .u32(self.buf_format.code()),
-            );
-            frame.buffer = buffer;
-            frame.free = true;
-        }
+        self.present
+            .recreate_buffers(&mut self.window_tx, width, self.height);
+        // A bar repaints its whole backbuffer every present (see
+        // `do_present`), so it has no rows to mark stale -- `row_count: 1`
+        // just matches the placeholder size `PresentState::new` was built
+        // with; only `dirty`/`frame_ready` actually matter here.
+        self.present.reset_after_resize(1);
 
         self.backbuffer = vec![Color::BLACK.to_xrgb8888(); (width * self.height) as usize];
         Ok(())
@@ -576,7 +463,7 @@ impl BarWindow {
         width: i32,
         height: i32,
         format: Format,
-    ) -> Result<([Frame; 2], ShmBuffer, PoolId)> {
+    ) -> Result<([Frame; 2], platform::sys::ShmBuffer, platform::id::PoolId)> {
         Frame::create_pair(sender, shm, width, height, format)
     }
 
@@ -587,12 +474,11 @@ impl BarWindow {
         surface::pack_bg(self.background, self.bg_alpha)
     }
 
-    fn present(&mut self, paint: &mut impl FnMut(&mut Canvas)) -> Result<()> {
-        let Some(slot) = self.frames.iter().position(|f| f.free) else {
-            return Ok(());
-        };
-        self.frames[slot].free = false;
-
+    /// Paint into the claimed free slot `slot` (from
+    /// `self.present.begin_present()`) and commit it. Named `do_present`
+    /// rather than `present` now that the swap-chain state itself lives in
+    /// the `present: PresentState` field of the same name.
+    fn do_present(&mut self, slot: usize, paint: &mut impl FnMut(&mut Canvas)) -> Result<()> {
         {
             let bg_packed = self.pack_bg();
             for p in &mut self.backbuffer {
@@ -602,10 +488,13 @@ impl BarWindow {
             paint(&mut canvas);
         }
 
-        let dst = self.shm_mem.pixels(slot);
+        // A bar has no scrollback/selection-style partial repaint, so unlike
+        // `platform::TermWindow` it always re-copies the whole backbuffer
+        // rather than consulting `PresentState`'s per-row stale bitmap.
+        let (dst, _stale) = self.present.slot_pixels_and_stale(slot);
         dst.copy_from_slice(&self.backbuffer);
 
-        let buffer = self.frames[slot].buffer;
+        let buffer = self.present.frame_buffer(slot);
         self.window_tx.request(
             MessageBuilder::new(self.surface, SurfaceRequest::Attach)
                 .object(buffer)
@@ -622,11 +511,9 @@ impl BarWindow {
         let cb: platform::id::CallbackId = self.window_tx.alloc_id();
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Frame).new_id(cb));
-        self.frame_cb = Some(cb);
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
-        self.frame_ready = false;
-        self.dirty = false;
+        self.present.finish_present(cb);
         Ok(())
     }
 

@@ -13,6 +13,12 @@ use statusbar::{ModuleKind, ScrollAccumulator, settings_page, steps_to_delta_pct
 const CLOCK_PERIOD: Duration = Duration::from_millis(1000);
 const FAST_PERIOD: Duration = Duration::from_secs(2); // battery, temp, mem
 const SLOW_PERIOD: Duration = Duration::from_secs(5); // wifi, bluetooth, volume, brightness
+/// How often the Mattermost module re-runs `niri msg --json windows`.
+/// Deliberately its own (short) period rather than piggybacking on
+/// `SLOW_PERIOD`: an unread mention is exactly the kind of thing a user
+/// wants to notice promptly, and a `niri msg` round trip is cheap (a local
+/// IPC socket call, not a network request or a `pactl`-style mixer probe).
+const MATTERMOST_PERIOD: Duration = Duration::from_secs(2);
 /// `cpu_usage` samples twice ~120ms apart, so give it its own slightly
 /// longer period rather than sharing `FAST_PERIOD`. Currently unused --
 /// see the comment where it would be called in `State::refresh`.
@@ -55,6 +61,7 @@ pub struct Snapshot {
     vol_out: String,
     vol_in: String,
     brightness: String,
+    mattermost: String,
 }
 
 impl Snapshot {
@@ -62,6 +69,7 @@ impl Snapshot {
     /// connectivity cluster (clock/date live in `right_segments`).
     pub fn left_segments(&self) -> Vec<(ModuleKind, &str)> {
         vec![
+            (ModuleKind::Mattermost, self.mattermost.as_str()),
             (ModuleKind::Wifi, self.wifi.as_str()),
             (ModuleKind::Bluetooth, self.bluetooth.as_str()),
         ]
@@ -107,6 +115,7 @@ struct State {
     last_clock: Instant,
     last_fast: Instant,
     last_slow: Instant,
+    last_mattermost: Instant,
     #[allow(dead_code)]
     last_cpu: Instant,
     last_control_refresh: Instant,
@@ -130,6 +139,7 @@ impl State {
             last_clock: stale,
             last_fast: stale,
             last_slow: stale,
+            last_mattermost: stale,
             last_cpu: stale,
             last_control_refresh: stale,
             pending_scroll: None,
@@ -213,6 +223,15 @@ impl State {
                 self.snap.brightness = DASH.into();
                 self.brightness_known = None;
             }
+        }
+
+        if now.duration_since(self.last_mattermost) >= MATTERMOST_PERIOD {
+            self.last_mattermost = now;
+            let mm = statusbar::MattermostStatus::query()
+                .map(|s| s.render())
+                .unwrap_or_default();
+            changed |= self.snap.mattermost != mm;
+            self.snap.mattermost = mm;
         }
 
         changed

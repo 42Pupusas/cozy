@@ -16,7 +16,7 @@
 //! * [`message`] — wire-frame (header + body) building and parsing.
 //! * [`sys`] — the unavoidable libc sliver (socket creation, `sockaddr_un`,
 //!   `geteuid`).
-//! * [`conn`] — [`conn::Conn`], the actual connection: connect, auth, call.
+//! * [`conn`] — [`conn::DbusConn`], the actual connection: connect, auth, call.
 //! * [`network_manager`] / [`bluez`] / [`logind`] — thin, service-specific
 //!   convenience wrappers the statusbar calls directly.
 
@@ -28,5 +28,5 @@ pub mod network_manager;
 pub mod sys;
 pub mod value;
 
-pub use conn::{Conn, DbusError};
+pub use conn::{DbusConn, DbusError};
 pub use value::Value;

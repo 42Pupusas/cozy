@@ -244,13 +244,18 @@ pub(crate) const REGISTRY_ID: u32 = 2;
 const UD_RECV: u64 = 0;
 const UD_TIMER: u64 = 1;
 
-/// Marker type whose sole job is to host [`Conn::connect`] -- the operation
-/// isn't a method on any value that exists yet (it *builds* the values), so
-/// it lives as an associated fn on a zero-sized namespace type rather than a
-/// bare top-level `connect()`.
-pub struct Conn;
+/// Marker type whose sole job is to host [`WaylandConn::connect`] -- the
+/// operation isn't a method on any value that exists yet (it *builds* the
+/// values), so it lives as an associated fn on a zero-sized namespace type
+/// rather than a bare top-level `connect()`.
+///
+/// Named `WaylandConn` (not the shorter `Conn`) to stay unambiguous next to
+/// `dbus::conn::DbusConn`, the unrelated D-Bus connection type -- the two used
+/// to share a bare name, which made grep/doc navigation and dependency
+/// tooling (`cargo graph`) misattribute edges between them.
+pub struct WaylandConn;
 
-impl Conn {
+impl WaylandConn {
     /// Build the AF_UNIX socket, the two rings, connect, register the recv
     /// pool, arm the first multishot recv, and create the (disarmed)
     /// key-repeat timer. Returns the [`Sender`] and [`RepeatTimer`] (main

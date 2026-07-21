@@ -32,12 +32,15 @@ pub mod bar_window;
 pub mod click;
 pub mod colors;
 pub mod localtime;
+pub mod mattermost;
 pub mod modules;
+mod pointer_state;
 pub mod scroll;
 pub mod text;
 
 pub use bar_window::{BarWindow, Edge};
 pub use click::settings_page;
 pub use colors::{ModuleKind, module_color};
+pub use mattermost::MattermostStatus;
 pub use scroll::{ScrollAccumulator, steps_to_delta_pct};
 pub use text::TextRenderer;

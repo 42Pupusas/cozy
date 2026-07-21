@@ -114,7 +114,7 @@ impl CursorImage {
     /// Was a free `parse_all_images(bytes)` function.
     fn parse_all(bytes: &[u8]) -> Vec<Self> {
         let mut out = Vec::new();
-        let Some(mut r) = Reader::new(bytes) else {
+        let Some(mut r) = ByteCursor::new(bytes) else {
             return out;
         };
         let Some(magic) = r.u32() else { return out };
@@ -146,7 +146,7 @@ impl CursorImage {
 
     /// Was a free `parse_image_chunk(bytes, pos)` function.
     fn parse_chunk(bytes: &[u8], pos: usize) -> Option<Self> {
-        let mut r = Reader::new(bytes.get(pos..)?)?;
+        let mut r = ByteCursor::new(bytes.get(pos..)?)?;
         let img_header = r.u32()?;
         let _img_type = r.u32()?;
         let _img_subtype = r.u32()?;
@@ -248,12 +248,16 @@ impl CursorImage {
 }
 
 /// Minimal little-endian cursor over a byte slice.
-struct Reader<'a> {
+///
+/// Named `ByteCursor` (not the shorter `Reader`) to stay unambiguous next to
+/// `conn::Reader`, the unrelated Wayland-socket receive-ring type -- the two
+/// used to share a bare name.
+struct ByteCursor<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
 
-impl<'a> Reader<'a> {
+impl<'a> ByteCursor<'a> {
     fn new(bytes: &'a [u8]) -> Option<Self> {
         Some(Self { bytes, pos: 0 })
     }

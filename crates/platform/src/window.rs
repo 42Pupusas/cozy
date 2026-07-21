@@ -23,22 +23,20 @@ use crate::draw::Point;
 use crate::error::{Error, Result};
 use crate::event::RawEvent;
 use crate::id::{
-    BufferId, CallbackId, CompositorId, DataDeviceId, DataDeviceManagerId, DataOfferId,
-    DataSourceId, DisplayId, KeyboardId, ObjectId, OutputId, PointerId, PoolId, RegistryId, SeatId,
+    CallbackId, CompositorId, DataDeviceManagerId, DisplayId, KeyboardId, ObjectId,
+    OutputId, PointerId, RegistryId, SeatId,
     ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
 };
 use crate::keymap;
 use crate::protocol::Modifiers;
 use crate::protocol::{
-    self as proto, BufferRequest, ButtonState, CompositorRequest, DataDeviceEvent,
-    DataDeviceManagerRequest, DataDeviceRequest, DataOfferEvent, DataOfferRequest, DataSourceEvent,
-    DataSourceRequest, DisplayEvent, DisplayRequest, Format, Key, KeyState, KeyboardEvent,
+    self as proto, ButtonState, CompositorRequest, DataDeviceEvent, DataOfferEvent,
+    DataSourceEvent, DisplayEvent, DisplayRequest, Format, Key, KeyState, KeyboardEvent,
     PointerButton, PointerEvent, PointerRequest, RegistryEvent, SeatCapability, SeatEvent,
-    SeatRequest, ShmPoolRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent,
+    SeatRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent,
     WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
 };
 use crate::render;
-use crate::sys::{RepeatTimer, ShmBuffer};
 use crate::wire::{MessageBuilder, WireEvent};
 
 const EVENT_RING_CAP: usize = 1024;
@@ -47,9 +45,6 @@ const EVENT_RING_CAP: usize = 1024;
 /// compositor window rules and tooling can match this window reliably even
 /// after the shell rewrites the title at runtime.
 const APP_ID: &str = "forfun.terminal";
-
-const DEFAULT_REPEAT_RATE: u32 = 25;
-const DEFAULT_REPEAT_DELAY: u32 = 600;
 
 /// Minimum interval between edge-of-window autoscroll steps while a
 /// selection drag sits pinned to the top/bottom edge of the content area.
@@ -155,166 +150,9 @@ enum Lifecycle {
     Closing,
 }
 
-/// Debug FPS instrumentation mode -- see the `debug_fps` field on
-/// [`TermWindow`]. Set once at startup from the `TERMINAL_DEBUG_FPS`
-/// environment variable and fixed for the window's lifetime.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum DebugFps {
-    /// No instrumentation -- zero cost (one enum compare per frame).
-    Off,
-    /// Draw a live "NN.N fps" readout in the top-right corner every frame.
-    Overlay,
-    /// Print "terminal: NN.N fps" to stderr about once a second.
-    Log,
-}
-
-impl DebugFps {
-    /// `TERMINAL_DEBUG_FPS=1` / `=true` → [`Self::Overlay`];
-    /// `TERMINAL_DEBUG_FPS=log` → [`Self::Log`]; unset or anything else →
-    /// [`Self::Off`].
-    fn from_env() -> Self {
-        match std::env::var("TERMINAL_DEBUG_FPS") {
-            Ok(v) if v == "log" => Self::Log,
-            Ok(v) if v == "1" || v.eq_ignore_ascii_case("true") => Self::Overlay,
-            _ => Self::Off,
-        }
-    }
-}
-
 use crate::surface::Frame;
-
-/// Rolling window of present timestamps, used to compute a live "presented
-/// FPS" figure -- how often [`TermWindow::maybe_present`] actually flips a
-/// frame, which (since presents are gated on the compositor's
-/// `wl_callback.done`) is the true on-screen refresh rate, not just how busy
-/// the render loop is.
-struct FrameStats {
-    /// Timestamps of the last up-to-`CAP` presents, oldest first.
-    times: std::collections::VecDeque<std::time::Instant>,
-    /// Wall-clock instant `times` was last logged to stderr (only used by
-    /// [`DebugFps::Log`]).
-    last_log: std::time::Instant,
-    /// Accumulated CPU time spent doing the actual work inside
-    /// `maybe_present` (blit + shm copy + damage bookkeeping) since the last
-    /// log, and how many presents that covers. Divided out at log time to
-    /// answer the only question that matters under a flood: is a low fps
-    /// CPU-bound (busy ~ frame interval) or compositor-bound (busy <<
-    /// interval, i.e. we're blocked waiting on `wl_callback.done`)?
-    busy_since_log: std::time::Duration,
-    presents_since_log: u32,
-    /// Largest `pending_dirty` backlog (snapshots awaiting one present) seen
-    /// since the last log. A monotonic ramp here is the signature of the
-    /// present being gated while the parser keeps queueing frames.
-    max_backlog_since_log: usize,
-    /// Times `maybe_present` bailed because the compositor still held both shm
-    /// buffers (`wl_buffer.release` lagging), vs. because we hadn't yet gotten
-    /// the frame callback. Distinguishes buffer-starvation from vsync pacing.
-    skipped_no_slot: u32,
-    skipped_not_ready: u32,
-}
-
-/// How many recent presents [`FrameStats`] keeps around to average over.
-const FRAME_STATS_CAP: usize = 120;
-
-/// Presents older than this (relative to the newest present) are dropped
-/// from the stats window. Without an age bound the average spans idle gaps:
-/// while scrolled into history the cursor is hidden, so the blink heartbeat
-/// stops presenting, and every pause between wheel detents stays inside the
-/// 120-present window — the readout sagged to ~40 and then froze there while
-/// idling in scrollback, even though each presented frame was full-rate. An
-/// age bound makes fps() mean "presents per second over the last second of
-/// activity", which is what the overlay claims to show.
-const FRAME_STATS_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(1);
-
-impl FrameStats {
-    fn new() -> Self {
-        Self {
-            times: std::collections::VecDeque::with_capacity(FRAME_STATS_CAP),
-            last_log: std::time::Instant::now(),
-            busy_since_log: std::time::Duration::ZERO,
-            presents_since_log: 0,
-            max_backlog_since_log: 0,
-            skipped_no_slot: 0,
-            skipped_not_ready: 0,
-        }
-    }
-
-    /// Drop presents older than [`FRAME_STATS_MAX_AGE`] relative to `now`.
-    /// Called both when a present is recorded AND before every read of
-    /// [`Self::fps`] (overlay/log), so an idle stretch (no presents while
-    /// parked in scrollback) decays the reading to 0 instead of freezing the
-    /// last sagged average on screen forever.
-    fn prune(&mut self, now: std::time::Instant) {
-        while self
-            .times
-            .front()
-            .is_some_and(|&t| now.duration_since(t) > FRAME_STATS_MAX_AGE)
-        {
-            self.times.pop_front();
-        }
-    }
-
-    fn note_backlog(&mut self, depth: usize) {
-        self.max_backlog_since_log = self.max_backlog_since_log.max(depth);
-    }
-
-    /// Add the CPU time one `maybe_present` spent on real work (not blocked on
-    /// the compositor).
-    fn record_busy(&mut self, dur: std::time::Duration) {
-        self.busy_since_log += dur;
-        self.presents_since_log += 1;
-    }
-
-    /// Mean busy microseconds per present since the last log, then reset the
-    /// accumulator. `0.0` if no presents happened.
-    ///
-    /// This is a diagnostics-only average (logged frame-pacing stats); a
-    /// `u128` microsecond count losing precision in the f64 conversion at
-    /// any value this process could plausibly accumulate is not observable
-    /// in the logged output.
-    #[allow(clippy::cast_precision_loss)]
-    fn drain_busy_us(&mut self) -> f64 {
-        let n = self.presents_since_log;
-        let total = std::mem::take(&mut self.busy_since_log);
-        self.presents_since_log = 0;
-        if n == 0 {
-            0.0
-        } else {
-            total.as_micros() as f64 / f64::from(n)
-        }
-    }
-
-    /// Record a present that just happened.
-    fn record(&mut self) {
-        let now = std::time::Instant::now();
-        self.times.push_back(now);
-        while self.times.len() > FRAME_STATS_CAP {
-            self.times.pop_front();
-        }
-        // Age-bound the window so idle gaps (no presents while parked in
-        // scrollback — the hidden cursor stops the blink heartbeat) don't
-        // get averaged into the next reading as phantom slowness.
-        self.prune(now);
-    }
-
-    /// Presented frames per second, averaged over the retained window.
-    /// `0.0` until at least two presents have been recorded.
-    fn fps(&self) -> f32 {
-        let Some(&first) = self.times.front() else {
-            return 0.0;
-        };
-        let Some(&last) = self.times.back() else {
-            return 0.0;
-        };
-        let span = last.duration_since(first).as_secs_f32();
-        if span <= 0.0 || self.times.len() < 2 {
-            return 0.0;
-        }
-        #[allow(clippy::cast_precision_loss)] // FRAME_STATS_CAP is tiny (120)
-        let intervals = (self.times.len() - 1) as f32;
-        intervals / span
-    }
-}
+#[cfg(feature = "trace")]
+use crate::debug_overlay::DebugOverlay;
 
 /// A Wayland window that renders a terminal grid using a software framebuffer.
 ///
@@ -349,10 +187,11 @@ pub struct TermWindow {
     pointer: Option<PointerId>,
     keyboard: Option<KeyboardId>,
 
-    repeat_timer: RepeatTimer,
-    repeat_rate: u32,
-    repeat_delay: u32,
-    held_key: Option<Key>,
+    /// Keyboard auto-repeat: the held key, negotiated rate/delay, and the
+    /// `timerfd` that paces synthesized repeats. Extracted from this struct
+    /// so the three fields' lockstep invariants live (and are tested) in
+    /// one place; see [`crate::key_repeat::KeyRepeatState`].
+    key_repeat: crate::key_repeat::KeyRepeatState,
     modifiers: Modifiers,
     /// Real XKB keymap translation, built from the compositor's
     /// `wl_keyboard.keymap` blob (see `crates/xkb`). `None` until the first
@@ -362,7 +201,7 @@ pub struct TermWindow {
     /// case, so a missing library never blocks the terminal from starting.
     xkb: Option<xkb::Translator>,
 
-    cursor: Option<cursor::Cursor>,
+    cursor: Option<cursor::PointerCursor>,
 
     /// Smooth cursor-slide + blink animation state. Advanced by wall-clock
     /// time in [`Self::tick`]; see [`crate::cursor_anim`].
@@ -371,34 +210,17 @@ pub struct TermWindow {
     /// animator's `dt_ms`.
     last_tick: std::time::Instant,
 
-    frames: [Frame; 2],
-    shm_mem: ShmBuffer,
-    /// The shm pool currently backing `frames`. Created once and reused across
-    /// resizes: it grows in place (`ftruncate` + `mremap` + `wl_shm_pool.resize`)
-    /// and shrinks lazily (the pool stays oversized). Only the per-resize
-    /// buffers are torn down and recreated; the pool id itself lives for the
-    /// window's lifetime.
-    pool: PoolId,
-    /// `wl_shm` pixel format backing `frames` -- `Argb8888` when the
-    /// renderer has a window opacity < 1.0 configured, else the cheaper
-    /// `Xrgb8888`. Fixed for the window's lifetime (set once from
-    /// `renderer.needs_alpha()` in [`Self::new`]); `resize` reuses it so a
-    /// live-resized translucent window doesn't silently go opaque.
-    buf_format: Format,
+    /// Frame-presentation state: the double-buffered shm swap chain, the
+    /// per-slot stale-row bitmap, and the dirty/frame-ready/frame-callback
+    /// handshake that gates when a present may fire. Extracted from this
+    /// struct so the swap-chain lifecycle lives (and is tested) in one
+    /// place; see [`crate::present::PresentState`].
+    present: crate::present::PresentState,
     /// Persistent full-window backbuffer. Dirty rows are blitted here (it keeps
     /// the complete last-known image), then copied into whichever shm frame is
     /// free on present. Without this, incremental dirty-row blits would only
     /// ever touch one of the two shm frames, leaving the rest black.
     backbuffer: Vec<u32>,
-    /// Per-frame-slot "needs re-copying from the backbuffer" bitmap, indexed
-    /// by cell row, index-parallel with `frames`. A row is set whenever the
-    /// backbuffer changes there; presenting into a slot copies + damages only
-    /// that slot's set rows (which may be a superset of this frame's changes,
-    /// if the slot sat out a present or two) then clears them. Without this,
-    /// every present -- even a single keystroke moving the cursor one row --
-    /// would memcpy the whole backbuffer and damage the entire surface,
-    /// forcing the compositor to recomposite the full window every frame.
-    stale_rows: [Vec<bool>; 2],
     /// Glyph source (bitmap or loaded TTF/OTF face) + resolved color theme.
     renderer: render::Renderer,
     width: i32,
@@ -435,9 +257,6 @@ pub struct TermWindow {
     /// reports are suppressed so the app never sees the orphan half of a
     /// drag it didn't start.
     selection_bypass: bool,
-    dirty: bool,
-    frame_ready: bool,
-    frame_cb: Option<CallbackId>,
     lifecycle: Lifecycle,
 
     /// Latest window size proposed by `xdg_toplevel.configure`, applied once per
@@ -449,40 +268,21 @@ pub struct TermWindow {
     input_queue: std::collections::VecDeque<InputEvent>,
 
     // ── Clipboard & selection ────────────────────────────────────────────
-    /// `(manager, per-seat device)` if the compositor supports `wl_data_device`.
-    data_device: Option<(DataDeviceManagerId, DataDeviceId)>,
-    /// The live data source we publish while our selection is on the clipboard.
-    clipboard_source: Option<DataSourceId>,
-    /// Text we last copied (served to other clients on `data_source.send`).
-    clipboard_text: String,
-    /// The clipboard offer from another client (for paste), with its MIME types.
-    clipboard_offer: Option<DataOfferId>,
+    /// Copy/paste over `wl_data_device`: the device, our outgoing source,
+    /// the peer's offer, and the paste helper-thread channel. Extracted from
+    /// this struct so the fiddly wire-protocol bookkeeping lives (and is
+    /// tested) in one place; see [`crate::clipboard::ClipboardState`].
+    clipboard: crate::clipboard::ClipboardState,
     /// The text-selection model: what's selected, the on-screen cell mirror it
     /// selects from, and the drag/scroll-follow state. Extracted from this
     /// struct so the selection logic lives (and is tested) in one place; see
     /// [`crate::selection::SelectionTracker`].
     selection: crate::selection::SelectionTracker,
-    /// Set when a `data_source.send` just arrived; the next `RawEvent::Fd` is the
-    /// pipe to write our clipboard text into.
-    awaiting_send_fd: bool,
     /// Set when a `wl_keyboard.keymap` event just arrived; the next
     /// `RawEvent::Fd` is the keymap blob to `mmap` + compile via
     /// `crate::xkb`. Carries the event's `size` argument (the fd itself has
     /// no length of its own -- the wire event tells us how much to map).
     awaiting_keymap_fd: Option<usize>,
-    /// Paste channel: helper threads that read a paste pipe send the bytes
-    /// here; the UI loop drains it in `tick`. (std mpsc — multiple paste
-    /// helper threads may be in flight, so a multi-producer channel.)
-    paste_tx: std::sync::mpsc::Sender<Vec<u8>>,
-    paste_rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    /// The serial from the most recent `wl_keyboard.enter` (keyboard-focus)
-    /// event. This is the serial the compositor expects in
-    /// `wl_data_device.set_selection`: it proves we hold keyboard focus at the
-    /// moment of the copy, and — unlike a stale `wl_pointer.button` /
-    /// `wl_keyboard.key` serial from an arbitrary earlier press — it stays
-    /// valid for the whole focused period. Using a stale serial is exactly
-    /// what triggers the compositor's "invalid arguments" protocol error.
-    focus_serial: u32,
     /// Viewport rows that carried a highlight on the previous frame. Repainted
     /// clean on the next frame before the (possibly moved/cleared) selection
     /// is re-tinted, so highlight never lingers after deselect or drag.
@@ -501,16 +301,13 @@ pub struct TermWindow {
     /// trail of tinted cells behind it.
     prev_cursor_rows: Vec<u16>,
 
-    /// Debug FPS instrumentation mode, fixed at startup from
-    /// `TERMINAL_DEBUG_FPS`. `Off` costs one enum compare per frame.
-    debug_fps: DebugFps,
-    /// Rolling present-time window backing the FPS readout/log; only
-    /// populated when `debug_fps != DebugFps::Off`.
-    frame_stats: FrameStats,
-    /// Viewport rows the FPS overlay text touched last frame -- repainted
-    /// clean before redrawing it, the same idempotent scheme as
-    /// `prev_cursor_rows`/`prev_selection_rows`.
-    prev_fps_rows: Vec<u16>,
+    /// FPS/frame-pacing debug instrumentation -- mode, rolling stats, and
+    /// the overlay text's own dirty-row bookkeeping, fixed at startup from
+    /// `TERMINAL_DEBUG_FPS`. Compiled out entirely without `trace` (see
+    /// [`DebugOverlay`]), so a release build carries zero extra state or
+    /// per-frame branches for it.
+    #[cfg(feature = "trace")]
+    debug: DebugOverlay,
 
     /// Wall-clock instant of the last edge-of-window autoscroll step taken
     /// while a selection drag's pointer sits pinned to the top/bottom edge
@@ -640,7 +437,7 @@ impl TermWindow {
         sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetAppId).string(APP_ID))?;
         sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
 
-        let cursor = cursor::Cursor::create(&mut sender, shm, compositor, scale).ok();
+        let cursor = cursor::PointerCursor::create(&mut sender, shm, compositor, scale).ok();
 
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<crate::conn::WindowRequest>::new(Capacity::exact(64)).split();
@@ -652,22 +449,8 @@ impl TermWindow {
             free_ids: Vec::new(),
         };
 
-        // Clipboard: create the per-seat data device, if the compositor
-        // advertised a `wl_data_device_manager`. Without one (rare), copy/paste
-        // is simply unavailable and the fields stay `None`.
-        let data_device = data_device_manager.map(|mgr| {
-            let dev: DataDeviceId = window_tx.alloc_id();
-            window_tx.request(
-                MessageBuilder::new(mgr, DataDeviceManagerRequest::GetDataDevice)
-                    .new_id(dev)
-                    .object(seat),
-            );
-            (mgr, dev)
-        });
-
-        // Paste channel: helper threads that read a paste pipe send the bytes
-        // here; the UI loop drains it each `tick`.
-        let (paste_tx, paste_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let clipboard =
+            crate::clipboard::ClipboardState::new(data_device_manager, seat, &mut window_tx);
 
         // Use `bg_packed()`, not `bg_xrgb()`: a translucent window's initial
         // backbuffer must carry the configured alpha from frame one, not
@@ -675,9 +458,10 @@ impl TermWindow {
         let backbuffer = vec![renderer.bg_packed(); (width * height) as usize];
         // Both shm frames start as blank memory (freshly mmap'd), so every
         // row is "stale" relative to the backbuffer until the first present
-        // copies it in.
+        // copies it in -- `PresentState::new` seeds that.
         let row_count = (rows as usize).max(1);
-        let stale_rows = [vec![true; row_count], vec![true; row_count]];
+        let present =
+            crate::present::PresentState::new(frames, shm_mem, pool, buf_format, row_count);
 
         Ok(Self {
             sender,
@@ -695,19 +479,12 @@ impl TermWindow {
             seat,
             pointer: None,
             keyboard: None,
-            repeat_timer,
-            repeat_rate: DEFAULT_REPEAT_RATE,
-            repeat_delay: DEFAULT_REPEAT_DELAY,
-            held_key: None,
+            key_repeat: crate::key_repeat::KeyRepeatState::new(repeat_timer),
             modifiers: Modifiers::default(),
             xkb: None,
             cursor,
-            frames,
-            shm_mem,
-            pool,
-            buf_format,
+            present,
             backbuffer,
-            stale_rows,
             renderer,
             width,
             height,
@@ -718,32 +495,21 @@ impl TermWindow {
             mouse_pressed: None,
             app_mouse: false,
             selection_bypass: false,
-            dirty: true,
-            frame_ready: true,
-            frame_cb: None,
             lifecycle: Lifecycle::Unconfigured,
             pending_resize: None,
             pending_dirty: Vec::new(),
             input_queue: std::collections::VecDeque::new(),
-            data_device,
-            clipboard_source: None,
-            clipboard_text: String::new(),
-            clipboard_offer: None,
+            clipboard,
             selection: crate::selection::SelectionTracker::new(),
-            awaiting_send_fd: false,
             awaiting_keymap_fd: None,
-            paste_tx,
-            paste_rx,
-            focus_serial: 0,
             prev_selection_rows: Vec::new(),
             hover_link_id: 0,
             prev_hover_row: None,
             prev_cursor_rows: Vec::new(),
             cursor_anim: crate::cursor_anim::CursorAnimator::new(cursor_cfg),
             last_tick: std::time::Instant::now(),
-            debug_fps: DebugFps::from_env(),
-            frame_stats: FrameStats::new(),
-            prev_fps_rows: Vec::new(),
+            #[cfg(feature = "trace")]
+            debug: DebugOverlay::new(),
             autoscroll_last: None,
             base_title: title.to_string(),
             bell_until: None,
@@ -763,7 +529,7 @@ impl TermWindow {
             self.cursor_anim
                 .set_target(snap.cursor.col, snap.cursor.row, snap.cursor.visible);
             self.pending_dirty.push(snap);
-            self.dirty = true;
+            self.present.mark_dirty();
         }
     }
 
@@ -814,7 +580,7 @@ impl TermWindow {
         let new = if ctrl { self.link_id_at(col, row) } else { 0 };
         if new != self.hover_link_id {
             self.hover_link_id = new;
-            self.dirty = true;
+            self.present.mark_dirty();
         }
     }
 
@@ -838,73 +604,15 @@ impl TermWindow {
     /// a program-requested clipboard write through the identical
     /// `wl_data_source` plumbing instead of duplicating it.
     pub fn write_clipboard(&mut self, text: String) {
-        if text.is_empty() {
-            return;
-        }
-        self.clipboard_text = text;
-        let Some((mgr, dev)) = self.data_device else {
-            return;
-        };
-        // `set_selection` requires the serial proving we hold keyboard focus
-        // (the `wl_keyboard.enter` serial). Without focus (shouldn't happen —
-        // copy only makes sense on a focused window) we keep the text locally
-        // but skip the Wayland publish rather than risk an invalid serial.
-        let serial = self.focus_serial;
-        if serial == 0 {
-            eprintln!("platform: copy skipped — no keyboard focus serial yet");
-            return;
-        }
-        let src: DataSourceId = self.window_tx.alloc_id();
-        self.window_tx.request(
-            MessageBuilder::new(mgr, DataDeviceManagerRequest::CreateDataSource).new_id(src),
-        );
-        self.window_tx
-            .request(MessageBuilder::new(src, DataSourceRequest::Offer).string("text/plain"));
-        // Wire arg order is (source, serial): libwayland marshals args in XML
-        // declaration order, and wl_data_device.set_selection declares
-        // `source` before `serial`. Sending (serial, source) makes the
-        // compositor read the source id as the serial and vice versa ->
-        // "invalid arguments" protocol error.
-        self.window_tx.request(
-            MessageBuilder::new(dev, DataDeviceRequest::SetSelection)
-                .object(src)
-                .u32(serial),
-        );
-        self.clipboard_source = Some(src);
+        self.clipboard.copy(&mut self.window_tx, text);
     }
 
     /// Request a paste from the system clipboard (Ctrl+Shift+V): ask the
-    /// current offer's source to transfer `text/plain` over a pipe. We hand
-    /// the pipe's write end to the peer (out-of-band fd); it writes the
-    /// clipboard contents and closes. A helper thread blocks reading our end
-    /// and pushes the bytes back as an [`InputEvent::Paste`].
+    /// current offer's source to transfer `text/plain` over a pipe. See
+    /// [`crate::clipboard::ClipboardState::request_paste`] for the fd/thread
+    /// mechanics.
     pub fn request_paste(&mut self) {
-        let Some(offer) = self.clipboard_offer else {
-            return;
-        };
-        let Ok((mut reader, writer)) = std::os::unix::net::UnixStream::pair() else {
-            return;
-        };
-        // `receive(mime_type, fd)`: the fd travels as ancillary data, not a
-        // wire word, so the message body is just the mime string.
-        self.window_tx.send_with_fds(
-            MessageBuilder::new(offer, DataOfferRequest::Receive)
-                .string("text/plain")
-                .finish(),
-            vec![writer.into()],
-        );
-        // Read on a helper thread (blocks until the peer writes + closes),
-        // then hand the bytes to the UI loop via the paste channel.
-        let tx = self.paste_tx.clone();
-        let wake = self.wake.clone();
-        std::thread::spawn(move || {
-            use std::io::Read as _;
-            let mut buf = Vec::new();
-            if reader.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                let _ = tx.send(buf);
-                wake.signal();
-            }
-        });
+        self.clipboard.request_paste(&mut self.window_tx, &self.wake);
     }
 
     /// A clone of the UI wakeup channel. Hand this to any thread (e.g. the
@@ -945,9 +653,9 @@ impl TermWindow {
         }
 
         // Drain any paste bytes a helper thread finished reading.
-        while let Ok(bytes) = self.paste_rx.try_recv() {
-            self.input_queue.push_back(InputEvent::Paste(bytes));
-        }
+        let input_queue = &mut self.input_queue;
+        self.clipboard
+            .drain_pastes(|bytes| input_queue.push_back(InputEvent::Paste(bytes)));
 
         // Revert a bell's title-bar flash once it's had its moment.
         if self
@@ -982,7 +690,7 @@ impl TermWindow {
         // doesn't make the cursor jump-slide in one giant step on resume.
         let dt_ms = dt_ms.min(100.0);
         if self.cursor_anim.advance(dt_ms) {
-            self.dirty = true;
+            self.present.mark_dirty();
         }
     }
 
@@ -1049,7 +757,7 @@ impl TermWindow {
         });
         let (cc, cr) = self.pointer_cell();
         if self.selection.drag_to((cc, i32::from(cr))) {
-            self.dirty = true;
+            self.present.mark_dirty();
         }
     }
 
@@ -1071,7 +779,7 @@ impl TermWindow {
     /// the PTY in response to a key press.
     pub fn notify_activity(&mut self) {
         self.cursor_anim.on_activity();
-        self.dirty = true;
+        self.present.mark_dirty();
     }
 
     /// The `wl_output`-advertised buffer scale this window opened at, for
@@ -1092,14 +800,13 @@ impl TermWindow {
     /// changed -- see [`Self::needs_alpha_changed`]) and hands it over here.
     pub fn set_renderer(&mut self, renderer: render::Renderer) {
         self.renderer = renderer;
-        self.dirty = true;
+        self.present.mark_dirty();
         // A full repaint needs every visible row queued as if freshly dirtied,
         // not just whatever changed since the last frame -- otherwise rows
         // that haven't changed content-wise (but need their pixels redrawn in
         // the new theme) are silently skipped by `repaint_rows`.
         self.pending_dirty.clear();
-        self.stale_rows[0].iter_mut().for_each(|s| *s = true);
-        self.stale_rows[1].iter_mut().for_each(|s| *s = true);
+        self.present.mark_all_stale();
     }
 
     /// Live-patch one palette index (an OSC 4 write) and force a full
@@ -1110,10 +817,9 @@ impl TermWindow {
     /// the same "mark every row stale" dance `set_renderer` does.
     pub fn apply_palette_change(&mut self, n: u8, rgb: (u8, u8, u8)) {
         self.renderer.set_palette_color(n, rgb);
-        self.dirty = true;
+        self.present.mark_dirty();
         self.pending_dirty.clear();
-        self.stale_rows[0].iter_mut().for_each(|s| *s = true);
-        self.stale_rows[1].iter_mut().for_each(|s| *s = true);
+        self.present.mark_all_stale();
     }
 
     /// Whether swapping to `renderer` would change the opaque/translucent
@@ -1126,7 +832,7 @@ impl TermWindow {
     /// needs a restart.
     #[must_use]
     pub fn needs_alpha_changed(&self, renderer: &render::Renderer) -> bool {
-        renderer.needs_alpha() != (self.buf_format == Format::Argb8888)
+        renderer.needs_alpha() != (self.present.buf_format() == Format::Argb8888)
     }
 
     /// Update the cursor animation config (shape/blink/period) in place --
@@ -1134,7 +840,7 @@ impl TermWindow {
     /// needing a full renderer rebuild.
     pub fn set_cursor_config(&mut self, cfg: crate::cursor_anim::CursorAnimConfig) {
         self.cursor_anim.set_config(cfg);
-        self.dirty = true;
+        self.present.mark_dirty();
     }
 
     /// Set the window title (OSC 0/2: `ESC ] 0 ; text BEL` /
@@ -1230,8 +936,7 @@ impl TermWindow {
     }
 
     fn handle_clipboard_fds(&mut self, fds: Vec<std::os::fd::OwnedFd>) {
-        use std::io::Write as _;
-        use std::os::fd::{AsFd as _, FromRawFd as _};
+        use std::os::fd::AsFd as _;
         let Some(fd) = fds.into_iter().next() else {
             return;
         };
@@ -1248,17 +953,11 @@ impl TermWindow {
             // `fd` (an mmap'd, now-unneeded fd) closes on scope exit.
             return;
         }
-        let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
-        if self.awaiting_send_fd {
-            self.awaiting_send_fd = false;
-            // Write our selection, then close (dropping the File on scope
-            // exit signals EOF to the pasting client). Best-effort.
-            let mut f = unsafe { std::fs::File::from_raw_fd(raw) };
-            let _ = f.write_all(self.clipboard_text.as_bytes());
-        } else {
-            // Unsolicited fd. Re-wrap so it closes on drop instead of leaking.
-            let _f = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        if self.clipboard.is_awaiting_send_fd() {
+            self.clipboard.write_send_fd(fd);
         }
+        // Else: unsolicited fd. Dropping `fd` here closes it instead of
+        // leaking (it's an OwnedFd, so this is automatic).
     }
 
     fn handle_event(&mut self, ev: RawEvent) -> Result<()> {
@@ -1274,13 +973,7 @@ impl TermWindow {
         // frame callback -- live in `surface::route_common`. `Fatal` is our
         // protocol error; `Handled` means it's fully dealt with; `Passthrough`
         // falls through to the terminal-specific dispatch below.
-        match crate::surface::route_common(
-            &ev,
-            &mut self.window_tx,
-            &mut self.frames,
-            &mut self.frame_ready,
-            &mut self.frame_cb,
-        ) {
+        match self.present.route_common(&ev, &mut self.window_tx) {
             crate::surface::Routed::Fatal(e) => return Err(e),
             crate::surface::Routed::Handled => return Ok(()),
             crate::surface::Routed::Passthrough => {}
@@ -1288,7 +981,7 @@ impl TermWindow {
 
         // Key repeat timer.
         if matches!(ev, RawEvent::Repeat) {
-            if let Some(key) = self.held_key {
+            if let Some(key) = self.key_repeat.held_key() {
                 self.input_queue.push_back(InputEvent::Key {
                     key: Some(key),
                     state: Some(KeyState::Pressed),
@@ -1388,7 +1081,7 @@ impl TermWindow {
                         // held — releasing ends the drag.
                         let (cc, cr) = self.pointer_cell();
                         if self.selection.drag_to((cc, i32::from(cr))) {
-                            self.dirty = true;
+                            self.present.mark_dirty();
                         }
                         self.update_hover_link(cc, cr);
                         // VT mouse reporting: forward every motion report:
@@ -1473,7 +1166,7 @@ impl TermWindow {
                                     // when the terminal owns the mouse anyway.
                                     self.selection
                                         .press_left((cc, i32::from(cr)), shift && !self.app_mouse);
-                                    self.dirty = true;
+                                    self.present.mark_dirty();
                                 }
                             }
                             (Some(PointerButton::Left), Some(ButtonState::Released)) => {
@@ -1482,7 +1175,7 @@ impl TermWindow {
                                 // empty space — nothing to keep.
                                 self.selection_bypass = false;
                                 self.selection.release_left();
-                                self.dirty = true;
+                                self.present.mark_dirty();
                             }
                             _ => {}
                         }
@@ -1532,12 +1225,12 @@ impl TermWindow {
                     Some(KeyboardEvent::Enter) => {
                         // Keyboard focus gained: arg(0) is the serial we must
                         // present to `set_selection` to prove we own focus.
-                        self.focus_serial = ev.arg(0);
+                        self.clipboard.set_focus_serial(ev.arg(0));
                         // Gaining focus makes the cursor solid (not
                         // mid-fade) immediately, then lets it resume
                         // blinking -- see `set_focused`.
                         self.cursor_anim.set_focused(true);
-                        self.dirty = true;
+                        self.present.mark_dirty();
                         self.input_queue.push_back(InputEvent::Focus(true));
                     }
                     Some(KeyboardEvent::Key) => {
@@ -1549,25 +1242,10 @@ impl TermWindow {
                             (Some(k), Some(KeyState::Pressed))
                                 if !physical.is_some_and(Key::is_modifier) =>
                             {
-                                self.held_key = Some(k);
-                                // A failed arm means this key just won't
-                                // auto-repeat -- annoying but not fatal, so
-                                // we don't abort the event loop over it. But
-                                // silence here previously meant "held_key is
-                                // set but the timer never fires", which is a
-                                // real (if rare) bug worth seeing in logs.
-                                if let Err(e) = self.repeat_timer.arm(
-                                    u64::from(self.repeat_delay),
-                                    u64::from(1000 / self.repeat_rate.max(1)),
-                                ) {
-                                    eprintln!("platform: failed to arm key-repeat timer: {e}");
-                                }
+                                self.key_repeat.on_key_press(k);
                             }
-                            (Some(k), Some(KeyState::Released)) if self.held_key == Some(k) => {
-                                self.held_key = None;
-                                if let Err(e) = self.repeat_timer.disarm() {
-                                    eprintln!("platform: failed to disarm key-repeat timer: {e}");
-                                }
+                            (Some(k), Some(KeyState::Released)) => {
+                                self.key_repeat.on_key_release(k);
                             }
                             _ => {}
                         }
@@ -1575,7 +1253,7 @@ impl TermWindow {
                         // through to the application as a normal Esc).
                         if logical == Some(Key::Esc) && state == Some(KeyState::Pressed) {
                             if self.selection.clear() {
-                                self.dirty = true;
+                                self.present.mark_dirty();
                             }
                         }
                         self.input_queue.push_back(InputEvent::Key {
@@ -1585,20 +1263,16 @@ impl TermWindow {
                         });
                     }
                     Some(KeyboardEvent::RepeatInfo) => {
-                        self.repeat_rate = ev.arg(0);
-                        self.repeat_delay = ev.arg(1);
+                        self.key_repeat.set_repeat_info(ev.arg(0), ev.arg(1));
                     }
                     Some(KeyboardEvent::Leave) => {
-                        self.held_key = None;
-                        if let Err(e) = self.repeat_timer.disarm() {
-                            eprintln!("platform: failed to disarm key-repeat timer: {e}");
-                        }
+                        self.key_repeat.on_leave();
                         // Losing focus freezes the cursor fully hidden so it
                         // stops blinking -- the classic "which window is
                         // focused" cue: only the focused window's cursor is
                         // ever visible.
                         self.cursor_anim.set_focused(false);
-                        self.dirty = true;
+                        self.present.mark_dirty();
                         self.input_queue.push_back(InputEvent::Focus(false));
                     }
                     Some(KeyboardEvent::Modifiers) => {
@@ -1633,25 +1307,20 @@ impl TermWindow {
         }
 
         // wl_data_device.* — clipboard selection offers from other clients.
-        if let Some((_, dev)) = self.data_device {
+        if let Some(dev) = self.clipboard.device_id() {
             if ev.is(dev) && ev.event::<DataDeviceEvent>() == Some(DataDeviceEvent::Selection) {
                 // arg(0) = new wl_data_offer id (0 = selection cleared).
-                let raw = ev.arg(0);
-                self.clipboard_offer = if raw == 0 {
-                    None
-                } else {
-                    Some(DataOfferId::from_raw(raw))
-                };
+                self.clipboard.on_selection_event(ev.arg(0));
                 return Ok(());
             }
         }
 
         // wl_data_offer.* — MIME types a peer advertises (we only need to know
         // the offer exists; we always request text/plain on paste).
-        if let Some(offer) = self.clipboard_offer {
+        if let Some(offer) = self.clipboard.offer_id() {
             if ev.is(offer) {
-                if ev.event::<DataOfferEvent>() == Some(DataOfferEvent::Offer) {
-                    // Could track the mime list; we just accept text/plain.
+                if let Some(offer_ev) = ev.event::<DataOfferEvent>() {
+                    self.clipboard.on_offer_event(offer_ev);
                 }
                 return Ok(());
             }
@@ -1661,17 +1330,10 @@ impl TermWindow {
         // (cancelled). Both arrive as Wire events (the reader only routes
         // display/registry to Bytes); send's string arg is misparsed into the
         // inline u32 slots, but we don't need it — we always serve text/plain.
-        if let Some(src) = self.clipboard_source {
+        if let Some(src) = self.clipboard.source_id() {
             if ev.is(src) {
-                match ev.event::<DataSourceEvent>() {
-                    Some(DataSourceEvent::Send) => {
-                        // The fd to write into arrives as the next RawEvent::Fd.
-                        self.awaiting_send_fd = true;
-                    }
-                    Some(DataSourceEvent::Cancelled) => {
-                        self.clipboard_source = None;
-                    }
-                    _ => {}
+                if let Some(src_ev) = ev.event::<DataSourceEvent>() {
+                    self.clipboard.on_source_event(src_ev);
                 }
                 return Ok(());
             }
@@ -1694,25 +1356,8 @@ impl TermWindow {
         let rows = (h / self.cell_h) as u16;
         self.input_queue
             .push_back(InputEvent::Resize { cols, rows });
-        self.dirty = true;
+        self.present.mark_dirty();
         Ok(())
-    }
-
-    /// Mark viewport rows as needing to be re-copied from the backbuffer into
-    /// *both* shm frame slots next time each is presented into. Called
-    /// whenever the backbuffer actually changes at those rows (content blit,
-    /// selection tint, cursor overlay, FPS overlay), so [`Self::maybe_present`]
-    /// only ever copies/damages what's actually different, instead of the
-    /// whole window on every frame.
-    fn mark_rows_stale(&mut self, rows: impl IntoIterator<Item = u16>) {
-        for row in rows {
-            let r = usize::from(row);
-            for slot in &mut self.stale_rows {
-                if let Some(flag) = slot.get_mut(r) {
-                    *flag = true;
-                }
-            }
-        }
     }
 
     /// Repaint the given viewport rows from the cell mirror into the
@@ -1952,107 +1597,121 @@ impl TermWindow {
         (lo..=hi).collect()
     }
 
-    /// Debug FPS instrumentation: draw a "NN.N fps" readout into the top-right
-    /// corner of the backbuffer (`DebugFps::Overlay`), or print the same
-    /// figure to stderr about once a second (`DebugFps::Log`). No-op (and
-    /// essentially free -- one enum compare) when `debug_fps` is `Off`.
-    /// Returns the viewport rows the overlay text touched, for
-    /// `prev_fps_rows` bookkeeping (same idempotent repaint scheme as the
-    /// cursor/selection overlays).
-    fn draw_fps_overlay(&mut self) -> Vec<u16> {
-        match self.debug_fps {
-            DebugFps::Off => Vec::new(),
-            // The stderr readout is emitted from `log_frame_pacing`, called at
-            // the top of every `maybe_present` (including its skip paths) so
-            // the counter split keeps reporting even while presents are being
-            // starved -- the exact regime we want to diagnose. Nothing to draw
-            // into the backbuffer here.
-            DebugFps::Log => Vec::new(),
-            DebugFps::Overlay => {
-                self.frame_stats.prune(std::time::Instant::now());
-                let text = format!("{:.1} fps", self.frame_stats.fps());
-                let cols = (self.width / self.cell_w).max(1) as u16;
-                let text_cols = text.chars().count() as u16;
-                if text_cols == 0 || text_cols > cols {
-                    return Vec::new();
-                }
-                let start_col = cols - text_cols;
-                // High-contrast fixed readout: white on black, independent of
-                // the active theme, so it's always legible regardless of
-                // what's underneath.
-                let attrs = grid::Attrs::with_colors(
-                    grid::Color::Rgb(0xff, 0xff, 0xff),
-                    grid::Color::Rgb(0x00, 0x00, 0x00),
-                );
-                let mut canvas =
-                    crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
-                for (i, ch) in text.chars().enumerate() {
-                    let cell = grid::Cell {
-                        ch,
-                        attrs,
-                        wide: false,
-                        spacer: false,
-                        link_id: 0,
-                    };
-                    self.renderer
-                        .blit_cell(&mut canvas, start_col + i as u16, 0, &cell);
-                }
-                vec![0u16]
-            }
-        }
+    /// Debug-instrumentation hook: note the current `pending_dirty` backlog
+    /// depth and emit the once-a-second frame-pacing log line. No-op without
+    /// `trace` (see [`crate::debug_overlay`]).
+    #[cfg(feature = "trace")]
+    fn debug_pre_present(&mut self) {
+        self.debug.note_backlog(self.pending_dirty.len());
+        self.debug.log_frame_pacing();
     }
 
-    /// Emit the frame-pacing diagnostic to stderr ~once a second when
-    /// `TERMINAL_DEBUG_FPS=log`. Called at the *top* of every `maybe_present`
-    /// -- crucially including the calls that early-return without presenting
-    /// (`skipped_not_ready` / `skipped_no_slot`) -- so the counter split stays
-    /// live even under a hard stall, when successful presents (and thus the
-    /// old log site in `draw_fps_overlay`) go quiet exactly when the numbers
-    /// matter most.
-    ///
-    /// The line answers the scroll-flood question directly:
-    /// - `skipped no-slot`  ≫ `not-ready`  → buffer starvation (both shm
-    ///   frames held by the compositor) → more frames would help (triple
-    ///   buffering).
-    /// - `skipped not-ready` ≫ `no-slot`   → pure vsync pacing (waiting on
-    ///   `wl_callback.done`); more buffers won't help.
-    /// - `-> CPU-bound`                     → render work itself is the wall.
-    fn log_frame_pacing(&mut self) {
-        if self.debug_fps != DebugFps::Log {
-            return;
-        }
-        let now = std::time::Instant::now();
-        if now.duration_since(self.frame_stats.last_log).as_secs_f32() < 1.0 {
-            return;
-        }
-        self.frame_stats.last_log = now;
-        self.frame_stats.prune(now);
-        let fps = self.frame_stats.fps();
-        let busy_us = self.frame_stats.drain_busy_us();
-        // Frame interval at this fps, in microseconds. `busy_us` is CPU time
-        // actually spent in maybe_present; the rest of the interval was spent
-        // blocked on `wl_callback.done`.
-        let interval_us = if fps > 0.0 {
-            1_000_000.0 / f64::from(fps)
-        } else {
-            0.0
-        };
-        let bound = if interval_us > 0.0 && busy_us / interval_us > 0.6 {
-            "CPU-bound"
-        } else {
-            "compositor-bound"
-        };
-        let backlog = self.frame_stats.max_backlog_since_log;
-        let no_slot = self.frame_stats.skipped_no_slot;
-        let not_ready = self.frame_stats.skipped_not_ready;
-        self.frame_stats.max_backlog_since_log = 0;
-        self.frame_stats.skipped_no_slot = 0;
-        self.frame_stats.skipped_not_ready = 0;
-        eprintln!(
-            "terminal: {fps:.1} fps | present-busy {busy_us:.0} us/frame \
-             (interval {interval_us:.0} us) -> {bound} | backlog max {backlog} | \
-             skipped no-slot {no_slot} not-ready {not_ready}"
+    #[cfg(not(feature = "trace"))]
+    fn debug_pre_present(&mut self) {}
+
+    /// Debug-instrumentation hook: record that a present was skipped because
+    /// the frame callback hadn't arrived yet (vsync pacing). No-op without
+    /// `trace`.
+    #[cfg(feature = "trace")]
+    fn debug_note_skipped_not_ready(&mut self) {
+        self.debug.note_skipped_not_ready();
+    }
+
+    #[cfg(not(feature = "trace"))]
+    fn debug_note_skipped_not_ready(&mut self) {}
+
+    /// Debug-instrumentation hook: record that a present was skipped because
+    /// no shm buffer slot was free (buffer starvation). No-op without `trace`.
+    #[cfg(feature = "trace")]
+    fn debug_note_skipped_no_slot(&mut self) {
+        self.debug.note_skipped_no_slot();
+    }
+
+    #[cfg(not(feature = "trace"))]
+    fn debug_note_skipped_no_slot(&mut self) {}
+
+    /// Debug-instrumentation hook: remap the fps overlay's dirty-row tracker
+    /// by a signed whole-screen shift (a viewport pixel-scroll). No-op
+    /// without `trace`.
+    #[cfg(feature = "trace")]
+    fn debug_shift_prev_rows_signed(&mut self, shifts: &[i32], row_count: u16) {
+        Self::shift_overlay_rows_signed(&mut self.debug.prev_rows, shifts, row_count);
+    }
+
+    #[cfg(not(feature = "trace"))]
+    fn debug_shift_prev_rows_signed(&mut self, _shifts: &[i32], _row_count: u16) {}
+
+    /// Debug-instrumentation hook: remap the fps overlay's dirty-row tracker
+    /// by an upward scroll band. No-op without `trace`.
+    #[cfg(feature = "trace")]
+    fn debug_shift_prev_rows(&mut self, scrolls: &[grid::ScrollBand]) {
+        Self::shift_overlay_rows(&mut self.debug.prev_rows, scrolls);
+    }
+
+    #[cfg(not(feature = "trace"))]
+    fn debug_shift_prev_rows(&mut self, _scrolls: &[grid::ScrollBand]) {}
+
+    /// Debug-instrumentation hook: take the fps overlay's previously-touched
+    /// rows for this frame's repaint-clean pass. Empty without `trace`.
+    #[cfg(feature = "trace")]
+    fn debug_take_prev_rows(&mut self) -> Vec<u16> {
+        std::mem::take(&mut self.debug.prev_rows)
+    }
+
+    #[cfg(not(feature = "trace"))]
+    fn debug_take_prev_rows(&mut self) -> Vec<u16> {
+        Vec::new()
+    }
+
+    /// Debug-instrumentation hook: record this present in the rolling fps
+    /// average and draw the "NN.N fps" overlay text, returning the rows it
+    /// touched. Always empty (and free) without `trace`.
+    #[cfg(feature = "trace")]
+    fn debug_draw_overlay(&mut self) -> Vec<u16> {
+        self.debug.record_present();
+        let rows = self.debug.draw(
+            &mut self.backbuffer,
+            self.width,
+            self.height,
+            self.cell_w,
+            &mut self.renderer,
         );
+        self.debug.prev_rows.clone_from(&rows);
+        rows
+    }
+
+    #[cfg(not(feature = "trace"))]
+    fn debug_draw_overlay(&mut self) -> Vec<u16> {
+        Vec::new()
+    }
+
+    /// Debug-instrumentation hook: record this present's busy time and, on a
+    /// slow present, log the phase breakdown. No-op without `trace`.
+    #[cfg(feature = "trace")]
+    fn debug_record_busy_and_log(
+        &mut self,
+        total: std::time::Duration,
+        t_blit: std::time::Duration,
+        t_overlay: std::time::Duration,
+        folded_len: usize,
+        painted_rows: usize,
+        painted_cells: usize,
+    ) {
+        self.debug.record_busy(total);
+        self.debug
+            .log_slow_present(total, t_blit, t_overlay, folded_len, painted_rows, painted_cells);
+    }
+
+    #[cfg(not(feature = "trace"))]
+    fn debug_record_busy_and_log(
+        &mut self,
+        _total: std::time::Duration,
+        _t_blit: std::time::Duration,
+        _t_overlay: std::time::Duration,
+        _folded_len: usize,
+        _painted_rows: usize,
+        _painted_cells: usize,
+    ) {
     }
 
     fn maybe_present(&mut self) -> Result<()> {
@@ -2060,19 +1719,19 @@ impl TermWindow {
             return Ok(());
         }
         self.apply_pending_resize()?;
-        self.frame_stats.note_backlog(self.pending_dirty.len());
-        self.log_frame_pacing();
-        if !self.dirty || !self.frame_ready {
-            if self.dirty && !self.frame_ready {
-                self.frame_stats.skipped_not_ready += 1;
+        self.debug_pre_present();
+        let slot = match self.present.begin_present() {
+            crate::present::PresentAttempt::NotDirty => return Ok(()),
+            crate::present::PresentAttempt::NotReady => {
+                self.debug_note_skipped_not_ready();
+                return Ok(());
             }
-            return Ok(());
-        }
-        let Some(slot) = self.frames.iter().position(|f| f.free) else {
-            self.frame_stats.skipped_no_slot += 1;
-            return Ok(());
+            crate::present::PresentAttempt::NoFreeSlot => {
+                self.debug_note_skipped_no_slot();
+                return Ok(());
+            }
+            crate::present::PresentAttempt::Ready(slot) => slot,
         };
-        self.frames[slot].free = false;
         // Time the real work below (blit + shm copy + damage), excluding the
         // early-return checks and the compositor wait that gated us getting
         // here. See `FrameStats::record_busy`.
@@ -2161,12 +1820,12 @@ impl TermWindow {
             let rows = (self.height / self.cell_h).max(1) as u16;
             Self::shift_overlay_rows_signed(&mut self.prev_cursor_rows, &viewport_shifts, rows);
             Self::shift_overlay_rows_signed(&mut self.prev_selection_rows, &viewport_shifts, rows);
-            Self::shift_overlay_rows_signed(&mut self.prev_fps_rows, &viewport_shifts, rows);
+            self.debug_shift_prev_rows_signed(&viewport_shifts, rows);
         }
         if !scrolls.is_empty() {
             Self::shift_overlay_rows(&mut self.prev_cursor_rows, &scrolls);
             Self::shift_overlay_rows(&mut self.prev_selection_rows, &scrolls);
-            Self::shift_overlay_rows(&mut self.prev_fps_rows, &scrolls);
+            self.debug_shift_prev_rows(&scrolls);
             // The pixel-scroll `copy_within` rewrote EVERY backbuffer row in
             // the band `[top, bot]` (their content shifted up), but the
             // snapshot's dirty rows -- what feeds `touched_rows` -- only cover
@@ -2209,7 +1868,7 @@ impl TermWindow {
                 rows_to_repaint.push(r);
             }
         }
-        for r in std::mem::take(&mut self.prev_fps_rows) {
+        for r in self.debug_take_prev_rows() {
             if !rows_to_repaint.contains(&r) {
                 rows_to_repaint.push(r);
             }
@@ -2226,16 +1885,14 @@ impl TermWindow {
         let new_cursor_rows = self.draw_cursor_overlay();
         touched_rows.extend_from_slice(&new_cursor_rows);
         self.prev_cursor_rows = new_cursor_rows;
-        self.frame_stats.record();
-        let new_fps_rows = self.draw_fps_overlay();
+        let new_fps_rows = self.debug_draw_overlay();
         touched_rows.extend_from_slice(&new_fps_rows);
-        self.prev_fps_rows = new_fps_rows;
         let t_overlay = present_start.elapsed();
 
         // Every row touched this frame is now stale relative to *both* shm
         // slots (whichever one isn't presented into this time still needs
         // catching up next time it's used).
-        self.mark_rows_stale(touched_rows);
+        self.present.mark_rows_stale(touched_rows);
 
         // Copy + damage only the rows this slot is actually stale for --
         // typically just the handful that changed (e.g. one line of typing),
@@ -2254,8 +1911,7 @@ impl TermWindow {
         // partial strip is filled too -- otherwise the freshly-mmap'd (zeroed)
         // shm bottom shows through as a blank line.
         let buf_h = self.height as usize;
-        let dst = self.shm_mem.pixels(slot);
-        let stale = &mut self.stale_rows[slot];
+        let (dst, stale) = self.present.slot_pixels_and_stale(slot);
         let last_row = stale.len().saturating_sub(1);
         let mut damage_rects: Vec<(i32, i32)> = Vec::new(); // (y_px, height_px)
         let mut row = 0usize;
@@ -2288,7 +1944,7 @@ impl TermWindow {
             damage_rects.push((y0 as i32, (y1 - y0) as i32));
         }
 
-        let buf = self.frames[slot].buffer;
+        let buf = self.present.frame_buffer(slot);
         self.window_tx.request(
             MessageBuilder::new(self.surface, SurfaceRequest::Attach)
                 .object(buf)
@@ -2307,32 +1963,15 @@ impl TermWindow {
         let cb: CallbackId = self.window_tx.alloc_id();
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Frame).new_id(cb));
-        self.frame_cb = Some(cb);
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
 
-        self.frame_ready = false;
-        self.dirty = false;
+        self.present.finish_present(cb);
         let total = present_start.elapsed();
-        self.frame_stats.record_busy(total);
         // On a slow present (>5ms -- never the 60fps steady state, always the
         // spikes we're chasing), break the timed region into its three phases
-        // so we can see WHICH one owns the ~16ms. Gated behind DebugFps::Log so
-        // it's free otherwise. `submit` includes the stale-row shm memcpy plus
-        // the Attach/Damage/Commit ring writes -- if the socket is applying
-        // backpressure (compositor can't drain), the write blocks here and this
-        // phase, not blit, will own the time.
-        if self.debug_fps == DebugFps::Log && total.as_micros() > 5_000 {
-            let blit_us = t_blit.as_micros();
-            let overlay_us = t_overlay.saturating_sub(t_blit).as_micros();
-            let submit_us = total.saturating_sub(t_overlay).as_micros();
-            eprintln!(
-                "terminal:   slow present {}us = blit {blit_us}us ({folded_len} folded, \
-                 {painted_rows} rows / {painted_cells} cells) \
-                 + overlay {overlay_us}us + shm-copy/submit {submit_us}us",
-                total.as_micros()
-            );
-        }
+        // so we can see WHICH one owns the ~16ms.
+        self.debug_record_busy_and_log(total, t_blit, t_overlay, folded_len, painted_rows, painted_cells);
         Ok(())
     }
 
@@ -2342,10 +1981,7 @@ impl TermWindow {
         // ids; without it every resize step would leak 2 buffer ids. (Before,
         // the pool was destroyed and rebuilt too, which also re-`mmap`ped and
         // re-sent the shm fd on every drag frame — now avoided.)
-        for frame in &self.frames {
-            self.window_tx
-                .request(MessageBuilder::new(frame.buffer, BufferRequest::Destroy));
-        }
+        self.present.destroy_old_buffers(&mut self.window_tx);
 
         // Grow the existing pool in place instead of tearing it down: `ftruncate`
         // the memfd + `mremap` our mapping, and only when it actually grew tell
@@ -2353,34 +1989,18 @@ impl TermWindow {
         // pool and skips the round-trip entirely (lazy shrink). Either way the
         // shm fd is never re-sent, so a resize storm stops thrashing the pool.
         let grew = self
-            .shm_mem
-            .resize(w as usize, h as usize)
+            .present
+            .resize_shm(w, h)
             .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
-        let stride = w * 4;
 
         if let Some(new_cap) = grew {
             // Route the resize through the same `window_tx` MPSC ring as the
             // buffer creates below so it stays ordered ahead of them (the pool
             // must be big enough before the new buffers are carved out of it).
-            self.window_tx.request(
-                MessageBuilder::new(self.pool, ShmPoolRequest::Resize).i32(new_cap as i32),
-            );
+            self.present.grow_pool(&mut self.window_tx, new_cap);
         }
 
-        for (i, frame) in self.frames.iter_mut().enumerate() {
-            let buffer: BufferId = self.window_tx.alloc_id();
-            self.window_tx.request(
-                MessageBuilder::new(self.pool, ShmPoolRequest::CreateBuffer)
-                    .new_id(buffer)
-                    .i32(self.shm_mem.frame_offset(i) as i32)
-                    .i32(w)
-                    .i32(h)
-                    .i32(stride)
-                    .u32(self.buf_format.code()),
-            );
-            frame.buffer = buffer;
-            frame.free = true;
-        }
+        self.present.recreate_buffers(&mut self.window_tx, w, h);
         // Carry the old image into the new backbuffer (top-left aligned) instead
         // of clearing to background. The grid reflow + full snapshot arrives a
         // round-trip later via the parser thread; until then we keep showing the
@@ -2400,23 +2020,20 @@ impl TermWindow {
         }
         self.backbuffer = new_back;
 
-        // `self.pool` is unchanged — we reuse it across resizes now.
+        // `self.present`'s pool is unchanged — we reuse it across resizes now.
         self.width = w;
         self.height = h;
-        self.dirty = true;
         // Both shm buffers are brand-new (freshly created, uninitialized)
         // memory, so every row is stale relative to the backbuffer in both
         // slots -- the next two presents each need a full copy to actually
         // fill their buffer, not just the rows that changed since the old
-        // size.
+        // size. Both buffers are also brand-new and free, and any in-flight
+        // frame callback referred to the now-destroyed surface contents, so
+        // force the next present to fire immediately (never leave the
+        // surface showing a detached/blank buffer -- the cause of resize
+        // flashing).
         let row_count = ((h / self.cell_h).max(1)) as usize;
-        self.stale_rows = [vec![true; row_count], vec![true; row_count]];
-        // Both buffers are brand-new and free, and any in-flight frame callback
-        // referred to the now-destroyed surface contents. Force the next
-        // present to fire immediately so we never leave the surface showing a
-        // detached/blank buffer (the cause of resize flashing).
-        self.frame_ready = true;
-        self.frame_cb = None;
+        self.present.reset_after_resize(row_count);
         Ok(())
     }
 

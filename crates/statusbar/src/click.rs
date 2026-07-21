@@ -27,7 +27,8 @@ pub fn settings_page(kind: ModuleKind) -> Option<&'static str> {
         | ModuleKind::Date
         | ModuleKind::Temp
         | ModuleKind::Cpu
-        | ModuleKind::Mem => None,
+        | ModuleKind::Mem
+        | ModuleKind::Mattermost => None,
     }
 }
 

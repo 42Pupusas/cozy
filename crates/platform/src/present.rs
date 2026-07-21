@@ -125,11 +125,17 @@ impl PresentState {
 
     /// Route the connection-level events every window handles identically
     /// (`wl_buffer.release`, the frame callback) through
-    /// [`crate::surface::route_common`], borrowing exactly the fields it
-    /// needs. Callers still handle `wl_display` events and role-specific
-    /// dispatch themselves via the returned [`Routed`].
+    /// [`crate::surface::SurfaceBootstrap::route_common`], borrowing exactly
+    /// the fields it needs. Callers still handle `wl_display` events and
+    /// role-specific dispatch themselves via the returned [`Routed`].
     pub fn route_common(&mut self, ev: &crate::event::RawEvent, window_tx: &mut WindowSender) -> Routed {
-        crate::surface::route_common(ev, window_tx, &mut self.frames, &mut self.frame_ready, &mut self.frame_cb)
+        crate::surface::SurfaceBootstrap::route_common(
+            ev,
+            window_tx,
+            &mut self.frames,
+            &mut self.frame_ready,
+            &mut self.frame_cb,
+        )
     }
 
     /// Decide whether a present may happen this tick, and if so claim a free

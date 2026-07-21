@@ -155,7 +155,7 @@ impl BarWindow {
         // uses; the `_repeat_timer` is unused here (a bar has no keyboard) but
         // kept alive so its fd stays valid for the reader's poll.
         let (mut sender, _repeat_timer, mut events, reader_handle) =
-            surface::connect(EVENT_RING_CAP, "statusbar-wayland-reader", &wake)?;
+            surface::SurfaceBootstrap::connect(EVENT_RING_CAP, "statusbar-wayland-reader", &wake)?;
 
         let Globals {
             compositor,
@@ -468,10 +468,10 @@ impl BarWindow {
     }
 
     /// Pack `self.background` for this window's fixed buffer format via the
-    /// role-agnostic [`platform::surface::pack_bg`] -- the single source of
-    /// truth shared with `platform::Renderer`.
+    /// role-agnostic [`platform::surface::SurfaceBootstrap::pack_bg`] -- the
+    /// single source of truth shared with `platform::Renderer`.
     fn pack_bg(&self) -> u32 {
-        surface::pack_bg(self.background, self.bg_alpha)
+        surface::SurfaceBootstrap::pack_bg(self.background, self.bg_alpha)
     }
 
     /// Paint into the claimed free slot `slot` (from
@@ -589,14 +589,16 @@ impl BarWindow {
         })
     }
 
-    /// Delegates to the role-agnostic [`platform::surface::output_scale`],
-    /// shared with `platform::TermWindow`.
+    /// Delegates to the role-agnostic
+    /// [`platform::surface::SurfaceBootstrap::output_scale`], shared with
+    /// `platform::TermWindow`.
     fn output_scale(sender: &mut Sender, events: &mut Consumer<RawEvent>, output: OutputId) -> i32 {
-        surface::output_scale(sender, events, output)
+        surface::SurfaceBootstrap::output_scale(sender, events, output)
     }
 
-    /// Delegates to the role-agnostic [`platform::surface::bind`], shared
-    /// with `platform::TermWindow`.
+    /// Delegates to the role-agnostic
+    /// [`platform::surface::SurfaceBootstrap::bind`], shared with
+    /// `platform::TermWindow`.
     fn bind<T: ObjectId>(
         sender: &mut Sender,
         registry: RegistryId,
@@ -604,7 +606,7 @@ impl BarWindow {
         interface: &str,
         version: u32,
     ) -> Result<T> {
-        surface::bind(sender, registry, name, interface, version)
+        surface::SurfaceBootstrap::bind(sender, registry, name, interface, version)
     }
 }
 

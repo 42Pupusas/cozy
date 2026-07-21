@@ -369,7 +369,7 @@ impl TermWindow {
         build_renderer: impl FnOnce(i32) -> render::Renderer,
     ) -> Result<Self> {
         let (mut sender, repeat_timer, mut events, reader_handle) =
-            crate::surface::connect(EVENT_RING_CAP, "terminal-wayland-reader", &wake)?;
+            crate::surface::SurfaceBootstrap::connect(EVENT_RING_CAP, "terminal-wayland-reader", &wake)?;
 
         let Globals {
             compositor,
@@ -2177,13 +2177,15 @@ impl Registry {
     /// scaling) if the output never reports a scale (some compositors only
     /// send it when it's non-default) or times out.
     ///
-    /// Delegates to the role-agnostic [`crate::surface::output_scale`].
+    /// Delegates to the role-agnostic
+    /// [`crate::surface::SurfaceBootstrap::output_scale`].
     fn output_scale(sender: &mut Sender, events: &mut Consumer<RawEvent>, output: OutputId) -> i32 {
-        crate::surface::output_scale(sender, events, output)
+        crate::surface::SurfaceBootstrap::output_scale(sender, events, output)
     }
 
     /// Bind one global by name/interface/version off the registry.
-    /// Delegates to the role-agnostic [`crate::surface::bind`].
+    /// Delegates to the role-agnostic
+    /// [`crate::surface::SurfaceBootstrap::bind`].
     fn bind<T: ObjectId>(
         sender: &mut Sender,
         registry: RegistryId,
@@ -2191,7 +2193,7 @@ impl Registry {
         interface: &str,
         version: u32,
     ) -> Result<T> {
-        crate::surface::bind(sender, registry, name, interface, version)
+        crate::surface::SurfaceBootstrap::bind(sender, registry, name, interface, version)
     }
 }
 

@@ -507,10 +507,10 @@ impl Renderer {
     /// Pack a background color at `bg_alpha`: plain XRGB8888 when fully
     /// opaque (byte-identical to the pre-transparency renderer), or
     /// premultiplied ARGB8888 otherwise. Delegates to the role-agnostic
-    /// [`crate::surface::pack_bg`], the single source of truth both this
-    /// renderer and `statusbar::BarWindow` share.
+    /// [`crate::surface::SurfaceBootstrap::pack_bg`], the single source of
+    /// truth both this renderer and `statusbar::BarWindow` share.
     fn pack_bg(bg: DrawColor, bg_alpha: u8) -> u32 {
-        crate::surface::pack_bg(bg, bg_alpha)
+        crate::surface::SurfaceBootstrap::pack_bg(bg, bg_alpha)
     }
 
     /// Blit a single cell into the canvas at cell column/row `cx`/`cy`.

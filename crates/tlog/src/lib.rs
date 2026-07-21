@@ -95,74 +95,89 @@ impl Channel {
     }
 }
 
-static MASK: AtomicU32 = AtomicU32::new(0);
-static MASK_INIT: OnceLock<()> = OnceLock::new();
-
-/// Parse a `TERMINAL_LOG` value (`"pty,render"`, `"all"`, `""`) into a bitmask.
-/// Unknown tokens are silently ignored -- a typo'd channel name should not
-/// crash the terminal it's meant to be debugging.
-fn parse_mask(spec: &str) -> u32 {
-    let mut mask = 0u32;
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if part.eq_ignore_ascii_case("all") {
-            return Channel::ALL.iter().fold(0, |m, c| m | c.bit());
-        }
-        if let Some(ch) = Channel::from_name(part) {
-            mask |= ch.bit();
-        }
-    }
-    mask
-}
-
-fn mask() -> u32 {
-    MASK_INIT.get_or_init(|| {
-        let spec = std::env::var("TERMINAL_LOG").unwrap_or_default();
-        MASK.store(parse_mask(&spec), Ordering::Relaxed);
-    });
-    MASK.load(Ordering::Relaxed)
-}
-
-/// Whether `channel` is currently selected. Called by [`trace!`] before it
-/// formats anything; cheap enough to also call directly to guard a block of
-/// debug-only work larger than one line.
-#[doc(hidden)]
-#[must_use]
-pub fn is_on(channel: Channel) -> bool {
-    mask() & channel.bit() != 0
-}
-
 enum Sink {
     Stderr,
     File(Mutex<std::fs::File>),
 }
 
-static SINK: OnceLock<Sink> = OnceLock::new();
+/// Owns the process-global tracing state.
+///
+/// Groups the selected-channel bitmask and the output sink, plus the
+/// operations on them, as associated functions instead of a loose cluster of
+/// free functions (`parse_mask`/`mask`/`sink`/`is_on`/`emit`) each
+/// independently reaching into its own `static`. There's no instance -- the
+/// state genuinely is process-global -- but grouping the logic under one
+/// named type keeps the relationship between the statics and the functions
+/// that touch them explicit rather than implicit module scoping.
+pub struct Logger;
 
-fn sink() -> &'static Sink {
-    SINK.get_or_init(|| {
-        std::env::var("TERMINAL_LOG_FILE").map_or(Sink::Stderr, |path| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_or(Sink::Stderr, |f| Sink::File(Mutex::new(f)))
+impl Logger {
+    fn mask_cell() -> &'static AtomicU32 {
+        static MASK: AtomicU32 = AtomicU32::new(0);
+        &MASK
+    }
+
+    /// Parse a `TERMINAL_LOG` value (`"pty,render"`, `"all"`, `""`) into a
+    /// bitmask. Unknown tokens are silently ignored -- a typo'd channel name
+    /// should not crash the terminal it's meant to be debugging.
+    fn parse_mask(spec: &str) -> u32 {
+        let mut mask = 0u32;
+        for part in spec.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if part.eq_ignore_ascii_case("all") {
+                return Channel::ALL.iter().fold(0, |m, c| m | c.bit());
+            }
+            if let Some(ch) = Channel::from_name(part) {
+                mask |= ch.bit();
+            }
+        }
+        mask
+    }
+
+    fn mask() -> u32 {
+        static MASK_INIT: OnceLock<()> = OnceLock::new();
+        MASK_INIT.get_or_init(|| {
+            let spec = std::env::var("TERMINAL_LOG").unwrap_or_default();
+            Self::mask_cell().store(Self::parse_mask(&spec), Ordering::Relaxed);
+        });
+        Self::mask_cell().load(Ordering::Relaxed)
+    }
+
+    /// Whether `channel` is currently selected. Called by [`trace!`] before
+    /// it formats anything; cheap enough to also call directly to guard a
+    /// block of debug-only work larger than one line.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_on(channel: Channel) -> bool {
+        Self::mask() & channel.bit() != 0
+    }
+
+    fn sink() -> &'static Sink {
+        static SINK: OnceLock<Sink> = OnceLock::new();
+        SINK.get_or_init(|| {
+            std::env::var("TERMINAL_LOG_FILE").map_or(Sink::Stderr, |path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_or(Sink::Stderr, |f| Sink::File(Mutex::new(f)))
+            })
         })
-    })
-}
+    }
 
-/// Write one already-gated, already-formatted line. Not meant to be called
-/// directly -- use [`trace!`].
-#[doc(hidden)]
-pub fn emit(channel: Channel, args: std::fmt::Arguments) {
-    match sink() {
-        Sink::Stderr => eprintln!("[{:>8}] {args}", channel.name()),
-        Sink::File(f) => {
-            if let Ok(mut f) = f.lock() {
-                let _ = writeln!(f, "[{:>8}] {args}", channel.name());
+    /// Write one already-gated, already-formatted line. Not meant to be
+    /// called directly -- use [`trace!`].
+    #[doc(hidden)]
+    pub fn emit(channel: Channel, args: std::fmt::Arguments) {
+        match Self::sink() {
+            Sink::Stderr => eprintln!("[{:>8}] {args}", channel.name()),
+            Sink::File(f) => {
+                if let Ok(mut f) = f.lock() {
+                    let _ = writeln!(f, "[{:>8}] {args}", channel.name());
+                }
             }
         }
     }
@@ -184,8 +199,8 @@ macro_rules! trace {
     ($channel:ident, $($arg:tt)*) => {{
         #[cfg(feature = "trace")]
         {
-            if $crate::is_on($crate::Channel::$channel) {
-                $crate::emit($crate::Channel::$channel, format_args!($($arg)*));
+            if $crate::Logger::is_on($crate::Channel::$channel) {
+                $crate::Logger::emit($crate::Channel::$channel, format_args!($($arg)*));
             }
         }
         #[cfg(not(feature = "trace"))]
@@ -225,23 +240,27 @@ impl std::fmt::Display for Escaped<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Channel, Escaped, parse_mask};
+    use super::{Channel, Escaped, Logger};
 
     #[test]
     fn parse_mask_empty_is_zero() {
-        assert_eq!(parse_mask(""), 0);
+        assert_eq!(Logger::parse_mask(""), 0);
     }
 
     #[test]
     fn parse_mask_all_sets_every_bit() {
         let all = Channel::ALL.iter().fold(0, |m, c| m | c.bit());
-        assert_eq!(parse_mask("all"), all);
-        assert_eq!(parse_mask("ALL"), all, "channel names are case-insensitive");
+        assert_eq!(Logger::parse_mask("all"), all);
+        assert_eq!(
+            Logger::parse_mask("ALL"),
+            all,
+            "channel names are case-insensitive"
+        );
     }
 
     #[test]
     fn parse_mask_selects_named_channels_only() {
-        let mask = parse_mask("pty,render");
+        let mask = Logger::parse_mask("pty,render");
         assert_eq!(mask, Channel::Pty.bit() | Channel::Render.bit());
         assert_eq!(mask & Channel::Grid.bit(), 0, "grid was not requested");
     }
@@ -250,7 +269,7 @@ mod tests {
     fn parse_mask_tolerates_whitespace_and_unknown_tokens() {
         // A typo'd channel name must not panic -- it's silently dropped so a
         // debug session doesn't crash the very thing it's meant to observe.
-        let mask = parse_mask(" pty , bogus, render ");
+        let mask = Logger::parse_mask(" pty , bogus, render ");
         assert_eq!(mask, Channel::Pty.bit() | Channel::Render.bit());
     }
 

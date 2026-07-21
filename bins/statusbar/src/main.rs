@@ -41,7 +41,7 @@ mod worker;
 use std::sync::mpsc;
 
 use platform::draw::{Canvas, Color};
-use statusbar::{BarWindow, Edge, ModuleKind, TextRenderer, module_color};
+use statusbar::{BarWindow, Edge, ModuleKind, TextRenderer};
 pub(crate) use worker::Snapshot;
 
 #[allow(clippy::too_many_arguments)]
@@ -74,7 +74,7 @@ fn paint(
         if seg.is_empty() {
             continue;
         }
-        let color = module_color(kind, seg);
+        let color = kind.color_for(seg);
         let pen_x = text.draw_text_alpha(canvas, seg, left_edge, y, color, bg, bg_alpha);
         let w = pen_x - left_edge;
         segment_rects.push((kind, left_edge - hit_pad, left_edge + w + hit_pad));
@@ -92,7 +92,7 @@ fn paint(
             if seg.is_empty() {
                 continue;
             }
-            let color = module_color(*kind, seg);
+            let color = kind.color_for(seg);
             let pen_x = text.draw_text_alpha(canvas, seg, x, y, color, bg, bg_alpha);
             let w = pen_x - x;
             segment_rects.push((*kind, x - hit_pad, x + w + hit_pad));
@@ -107,7 +107,7 @@ fn paint(
         if seg.is_empty() {
             continue;
         }
-        let color = module_color(kind, seg);
+        let color = kind.color_for(seg);
         let w = text.draw_text_right_alpha(canvas, seg, right_edge, y, color, bg, bg_alpha);
         segment_rects.push((kind, right_edge - w - hit_pad, right_edge + hit_pad));
         right_edge -= w + gap;
@@ -246,7 +246,7 @@ fn main() {
 
         // Left-click: open the module's COSMIC settings page (mirrors
         // waybar's own "on-click": "cosmic-popup <page>" bindings -- see
-        // `statusbar::click::settings_page`). Same hit-test as scroll;
+        // `statusbar::ModuleKind::settings_page`). Same hit-test as scroll;
         // the actual `cosmic-settings`/`cosmic-popup` spawn happens on the
         // worker thread so a slow launch never stalls the Wayland pump.
         if window.take_click() {

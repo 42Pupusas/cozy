@@ -5,7 +5,7 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use statusbar::{ModuleKind, ScrollAccumulator, Volume, settings_page, steps_to_delta_pct};
+use statusbar::{ModuleKind, ScrollAccumulator, Volume, steps_to_delta_pct};
 
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
@@ -468,14 +468,14 @@ impl State {
     }
 
     /// Open the COSMIC settings page for `kind`, if it has one (see
-    /// `statusbar::click::settings_page` -- mirrors the user's own
+    /// `ModuleKind::settings_page` -- mirrors the user's own
     /// `~/.config/waybar/config` `on-click` bindings), debounced so a
     /// double-click doesn't race two `cosmic-settings` instances for
     /// focus. Fire-and-forget, same posture as the volume/brightness
     /// mutations: spawn and immediately let go, never block the worker
     /// loop on it.
     fn handle_click(&mut self, kind: ModuleKind) {
-        let Some(page) = settings_page(kind) else {
+        let Some(page) = kind.settings_page() else {
             return;
         };
         let now = Instant::now();

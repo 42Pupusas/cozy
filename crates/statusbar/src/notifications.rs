@@ -76,7 +76,7 @@ fn niri_windows() -> Option<Vec<NiriWindow>> {
 }
 
 /// One rendered notification segment, paired with whether it should be
-/// painted in the "unread" color -- see `colors::module_color`.
+/// painted in the "unread" color -- see `ModuleKind::color_for`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotificationSegment {
     pub rendered: String,
@@ -131,7 +131,7 @@ pub const UNREAD_DOT: char = '\u{f0765}';
 
 /// Whether a rendered segment string should be painted in the "unread"
 /// color -- re-derived from the string itself (not carried alongside it,
-/// since `colors::module_color` only ever sees the rendered string) by
+/// since `ModuleKind::color_for` only ever sees the rendered string) by
 /// checking for the trailing dot [`AppStatus::render`] appends. Works
 /// regardless of which app's (variable-length) icon precedes it, unlike a
 /// length comparison against one fixed icon.

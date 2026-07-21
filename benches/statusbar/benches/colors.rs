@@ -1,15 +1,15 @@
-//! `statusbar::module_color`: per-module color lookup, called once per
-//! segment on every repaint (so up to ~11 times per frame in `paint`).
+//! `statusbar::ModuleKind::color_for`: per-module color lookup, called once
+//! per segment on every repaint (so up to ~11 times per frame in `paint`).
 //!
-//! Dominated by `trailing_percent`'s string split/parse for the `Battery`
-//! variant -- the other variants are O(1) glyph-prefix/suffix checks or a
-//! flat match. Benchmarked separately so a future change to the string
-//! parsing doesn't silently regress the whole paint loop unnoticed.
+//! Dominated by the `Battery` variant's trailing-percent string split/parse
+//! -- the other variants are O(1) glyph-prefix/suffix checks or a flat
+//! match. Benchmarked separately so a future change to the string parsing
+//! doesn't silently regress the whole paint loop unnoticed.
 //!
 //! Run:
 //!   cargo bench -p statusbar-benches --bench colors
 
-use statusbar::{ModuleKind, module_color};
+use statusbar::ModuleKind;
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
@@ -24,17 +24,17 @@ const CLOCK_SAMPLE: &str = "12:34:56";
 
 #[divan::bench]
 fn battery_color(bencher: divan::Bencher) {
-    bencher.bench(|| module_color(ModuleKind::Battery, divan::black_box(BATTERY_SAMPLE)));
+    bencher.bench(|| ModuleKind::Battery.color_for(divan::black_box(BATTERY_SAMPLE)));
 }
 
 #[divan::bench]
 fn wifi_color(bencher: divan::Bencher) {
-    bencher.bench(|| module_color(ModuleKind::Wifi, divan::black_box(WIFI_SAMPLE)));
+    bencher.bench(|| ModuleKind::Wifi.color_for(divan::black_box(WIFI_SAMPLE)));
 }
 
 #[divan::bench]
 fn clock_color(bencher: divan::Bencher) {
-    bencher.bench(|| module_color(ModuleKind::Clock, divan::black_box(CLOCK_SAMPLE)));
+    bencher.bench(|| ModuleKind::Clock.color_for(divan::black_box(CLOCK_SAMPLE)));
 }
 
 /// One full `paint()`-equivalent pass: every module's color resolved once,
@@ -55,7 +55,7 @@ fn full_segment_set(bencher: divan::Bencher) {
     ];
     bencher.bench(|| {
         for (kind, text) in divan::black_box(segments) {
-            let _ = module_color(kind, text);
+            let _ = kind.color_for(text);
         }
     });
 }

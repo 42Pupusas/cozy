@@ -18,8 +18,9 @@ invocation).
   segment. Cheap by construction; the interesting signal is the alloc
   tripwire (must be zero, like `vt_parser`/`grid`'s hot paths in
   `benches/tty`), not the wall-time.
-- `benches/colors.rs` — `module_color`: per-module color lookup, called
-  once per segment on every repaint (up to ~11 times/frame in `paint`).
+- `benches/colors.rs` — `ModuleKind::color_for`: per-module color lookup,
+  called once per segment on every repaint (up to ~11 times/frame in
+  `paint`).
 
 ## Why these three
 
@@ -50,7 +51,7 @@ correctness test (`crates/statusbar/src/{colors,scroll,modules}.rs`'s own
 Every bench file sets `divan::AllocProfiler` as `#[global_allocator]`.
 `scroll.rs` and the warm-path benches in `text.rs`/`colors.rs` are
 expected to print **no alloc block at all** — a regression there (e.g. a
-future change that makes `module_color` build a `String`, or
+future change that makes `ModuleKind::color_for` build a `String`, or
 `ScrollAccumulator` grow a `Vec`) is worth chasing down. `draw_text_cold`
 in `text.rs` is expected to allocate (fresh atlas insertions grow
 backing storage) — its alloc count is a magnitude signal, not a

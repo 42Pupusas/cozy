@@ -20,7 +20,6 @@ use crate::pointer_state::PointerState;
 use platform::conn::{Sender, WindowSender};
 use platform::draw::{Canvas, Color, Point};
 use platform::event::RawEvent;
-use platform::font;
 use platform::id::{
     CompositorId, LayerShellId, LayerSurfaceId, ObjectId, OutputId, RegistryId, SeatId, ShmId,
     SurfaceId,
@@ -610,23 +609,3 @@ impl BarWindow {
     }
 }
 
-/// Draw left-aligned text at `(x, y)` using the embedded bitmap font,
-/// returning the x just past the last glyph. Thin re-export wrapper so
-/// module code doesn't need to reach into `platform::draw` directly.
-pub fn draw_text(canvas: &mut Canvas, text: &str, x: i32, y: i32, color: Color) -> i32 {
-    canvas.draw_text(text, x, y, color);
-    x + text.chars().count() as i32 * font::GLYPH_W
-}
-
-/// Right-align `text` so its last glyph ends at `right_x`.
-pub fn draw_text_right(canvas: &mut Canvas, text: &str, right_x: i32, y: i32, color: Color) {
-    let w = text.chars().count() as i32 * font::GLYPH_W;
-    canvas.draw_text(text, right_x - w, y, color);
-}
-
-/// Vertical center for one line of the embedded bitmap font within a bar of
-/// `bar_height` pixels.
-#[must_use]
-pub fn text_baseline_y(bar_height: i32) -> i32 {
-    ((bar_height - font::GLYPH_H) / 2).max(0)
-}

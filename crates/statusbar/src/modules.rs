@@ -1,10 +1,11 @@
 //! Status-bar modules.
 //!
 //! Each module is a stateless-ish `fn() -> Option<String>` reading straight
-//! from `/proc`/`/sys` (or shelling a system tool where the kernel doesn't
-//! expose the number directly, e.g. mixer volume). None of these need root or
-//! any new crate dependency — everything here is either a `/proc`/`/sys`
-//! text file or a well-known CLI already on a desktop Linux box.
+//! from `/proc`/`/sys`/libc (or shelling a system tool where neither exposes
+//! the number directly, e.g. mixer volume). None of these need root or any
+//! new crate dependency — everything here is a `/proc`/`/sys` text file, a
+//! raw libc call (see `crate::localtime`), or a well-known CLI already on a
+//! desktop Linux box.
 //!
 //! Fallible by design: a laptop-only module (battery) on a desktop, or a
 //! missing CLI (bluetoothctl not installed), just returns `None` and the bar
@@ -14,21 +15,17 @@ use std::fs;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Wall-clock `HH:MM:SS`, local time — via `date`, not a chrono dependency
-/// (the whole point of reusing this crate's zero-extra-deps posture).
+/// Wall-clock `HH:MM:SS`, local time — via `crate::localtime` (raw
+/// `time(2)`/`localtime_r(3)`), not a `date` shell-out.
 #[must_use]
 pub fn clock() -> Option<String> {
-    let out = Command::new("date").arg("+%H:%M:%S").output().ok()?;
-    let s = String::from_utf8(out.stdout).ok()?;
-    Some(s.trim().to_string())
+    crate::localtime::clock()
 }
 
 /// Date, `YYYY-MM-DD`.
 #[must_use]
 pub fn date() -> Option<String> {
-    let out = Command::new("date").arg("+%Y-%m-%d").output().ok()?;
-    let s = String::from_utf8(out.stdout).ok()?;
-    Some(s.trim().to_string())
+    crate::localtime::date()
 }
 
 /// First battery under `/sys/class/power_supply/BAT*`: percentage + charge

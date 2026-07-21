@@ -31,6 +31,7 @@
 pub mod bar_window;
 pub mod click;
 pub mod colors;
+pub mod localtime;
 pub mod modules;
 pub mod scroll;
 pub mod text;

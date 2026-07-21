@@ -188,14 +188,18 @@ pub enum CsiAction {
     DeviceStatusReport(u8),
     /// DECSTBM — set top and bottom margins (r).
     SetScrollRegion { top: u16, bottom: u16 },
-    /// SM — set mode (h).
-    SetMode(u16),
-    /// RM — reset mode (l).
-    ResetMode(u16),
-    /// DECSET — DEC private mode set (?h).
-    DecSet(u16),
-    /// DECRST — DEC private mode reset (?l).
-    DecRst(u16),
+    /// SM — set mode (h). Multi-parameter: `CSI 4;20 h` sets several modes
+    /// in one sequence, so the whole param list is carried.
+    SetMode(Params),
+    /// RM — reset mode (l). Multi-parameter, like [`CsiAction::SetMode`].
+    ResetMode(Params),
+    /// DECSET — DEC private mode set (?h). Multi-parameter: apps batch modes
+    /// (`CSI ?1002;1006 h` — mouse drag tracking + SGR encoding together),
+    /// and dropping all but the first silently loses negotiations.
+    DecSet(Params),
+    /// DECRST — DEC private mode reset (?l). Multi-parameter, like
+    /// [`CsiAction::DecSet`].
+    DecRst(Params),
     /// DA — device attributes (c).
     DeviceAttributes(u8),
     /// ICH — insert characters (@).

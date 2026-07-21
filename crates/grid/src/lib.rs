@@ -1221,10 +1221,28 @@ impl Grid {
                 // that probe capabilities before drawing get an answer.
                 self.replies.extend_from_slice(b"\x1b[?6c");
             }
-            CsiAction::DecSet(mode) => self.set_dec_mode(*mode, true),
-            CsiAction::DecRst(mode) => self.set_dec_mode(*mode, false),
-            CsiAction::SetMode(mode) => self.set_ansi_mode(*mode, true),
-            CsiAction::ResetMode(mode) => self.set_ansi_mode(*mode, false),
+            // Multi-parameter: `CSI ?1002;1006 h` batches several mode
+            // negotiations in one sequence — apply every one.
+            CsiAction::DecSet(params) => {
+                for mode in params.iter() {
+                    self.set_dec_mode(mode, true);
+                }
+            }
+            CsiAction::DecRst(params) => {
+                for mode in params.iter() {
+                    self.set_dec_mode(mode, false);
+                }
+            }
+            CsiAction::SetMode(params) => {
+                for mode in params.iter() {
+                    self.set_ansi_mode(mode, true);
+                }
+            }
+            CsiAction::ResetMode(params) => {
+                for mode in params.iter() {
+                    self.set_ansi_mode(mode, false);
+                }
+            }
             CsiAction::CursorStyle(style) => self.set_cursor_style(*style),
             CsiAction::TabClear(mode) => self.tab_clear(*mode),
             CsiAction::CursorForwardTab(n) => self.cursor_forward_tab(*n),

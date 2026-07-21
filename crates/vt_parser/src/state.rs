@@ -487,14 +487,16 @@ impl Parser {
                 top: p.get_or(0, 1),
                 bottom: p.get_or(1, u16::MAX),
             },
-            // SM
-            (None, b'h') => CsiAction::SetMode(p.get_raw(0)),
+            // SM — multi-parameter (`CSI 4;20 h`), carry the whole list.
+            (None, b'h') => CsiAction::SetMode(*p),
             // RM
-            (None, b'l') => CsiAction::ResetMode(p.get_raw(0)),
-            // DECSET
-            (Some(b'?'), b'h') => CsiAction::DecSet(p.get_raw(0)),
+            (None, b'l') => CsiAction::ResetMode(*p),
+            // DECSET — multi-parameter: apps batch modes
+            // (`CSI ?1002;1006 h`); taking only the first silently dropped
+            // every other negotiation in the sequence.
+            (Some(b'?'), b'h') => CsiAction::DecSet(*p),
             // DECRST
-            (Some(b'?'), b'l') => CsiAction::DecRst(p.get_raw(0)),
+            (Some(b'?'), b'l') => CsiAction::DecRst(*p),
             // DECSCUSR — set cursor style (`CSI Ps SP q`).
             (Some(b' '), b'q') => CsiAction::CursorStyle(p.get_or(0, 1)),
             // TBC — tab clear (`CSI Ps g`).
@@ -1004,7 +1006,32 @@ mod tests {
         let mut p = Parser::new();
         let mut count = 0;
         p.feed(b"\x1b[?25h", |ev| {
-            assert_eq!(ev, TermEvent::Csi(CsiAction::DecSet(25)));
+            match ev {
+                TermEvent::Csi(CsiAction::DecSet(params)) => {
+                    assert_eq!(params.iter().collect::<Vec<_>>(), vec![25]);
+                }
+                other => panic!("expected DecSet, got {other:?}"),
+            }
+            count += 1;
+        });
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn dec_set_multiple_params_carries_all_modes() {
+        // Apps batch mode negotiations: `CSI ?1002;1006 h` (mouse drag
+        // tracking + SGR encoding). All params must survive parsing — the
+        // old single-param DecSet silently dropped everything after the
+        // first, which broke vim's mouse under any batching client.
+        let mut p = Parser::new();
+        let mut count = 0;
+        p.feed(b"\x1b[?1002;1006h", |ev| {
+            match ev {
+                TermEvent::Csi(CsiAction::DecSet(params)) => {
+                    assert_eq!(params.iter().collect::<Vec<_>>(), vec![1002, 1006]);
+                }
+                other => panic!("expected DecSet, got {other:?}"),
+            }
             count += 1;
         });
         assert_eq!(count, 1);

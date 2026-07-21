@@ -58,6 +58,34 @@ fn disabling_a_non_active_tracking_mode_does_not_clobber_the_active_one() {
 }
 
 #[test]
+fn decset_batched_params_apply_every_mode() {
+    // Apps commonly batch mode negotiations in ONE sequence:
+    // `CSI ?1002;1006 h`. The parser used to keep only the first param, so
+    // SGR encoding (and anything else batched after slot 0) was silently
+    // dropped — vim's mouse half-worked with garbled coordinates.
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[?1002;1006h");
+    assert_eq!(g.mouse_mode(), MouseMode::ButtonMotion);
+    assert!(g.sgr_mouse(), "the second batched param (1006) must apply");
+    // Batched reset must also apply both.
+    feed(&mut g, b"\x1b[?1002;1006l");
+    assert_eq!(g.mouse_mode(), MouseMode::Off);
+    assert!(!g.sgr_mouse());
+}
+
+#[test]
+fn decset_batched_alt_screen_and_paste_apply_together() {
+    // The smcup-style batch nvim/tmux configs produce: `CSI ?1049;2004 h`.
+    let mut g = Grid::new(80, 24);
+    feed(&mut g, b"\x1b[?1049;2004h");
+    assert!(g.alt_screen_active());
+    assert!(g.bracketed_paste());
+    feed(&mut g, b"\x1b[?1049;2004l");
+    assert!(!g.alt_screen_active());
+    assert!(!g.bracketed_paste());
+}
+
+#[test]
 fn decckm_toggles_app_cursor() {
     let mut g = Grid::new(80, 24);
     assert!(!g.app_cursor());

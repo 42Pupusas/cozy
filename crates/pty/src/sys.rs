@@ -529,9 +529,12 @@ impl WaitStatus {
     /// its only caller).
     const fn from_raw(status: i32) -> Self {
         // WIFEXITED(status): low 7 bits of status are 0 for a normal exit.
-        #[allow(clippy::verbose_bit_mask)]
-        // & 0x7f reads as WIFEXITED's mask, not a power-of-two check
-        if status & 0x7f == 0 {
+        // Named as a mask constant (rather than the bare literal `0x7f`)
+        // so it reads unambiguously as WIFEXITED's bitmask, not a
+        // power-of-two check -- clippy's verbose_bit_mask lint is tuned to
+        // flag exactly that ambiguity in an inline `& 0x7f`.
+        const WIFEXITED_MASK: i32 = 0x7f;
+        if status & WIFEXITED_MASK == 0 {
             // WEXITSTATUS(status)
             Self::Exited((status >> 8) & 0xff)
         } else {
@@ -658,17 +661,18 @@ impl RawPty {
                 let slave_fd_ret = unsafe {
                     Syscall::Open.invoke3(slave_path.as_ptr() as usize, OpenFlags::RDWR.bits(), 0)
                 };
-                // Post-fork child: an `if let` with a diverging else is
-                // clearer than `map_or_else` with side-effecting closures.
-                #[allow(clippy::option_if_let_else)]
-                let slave_fd = if let Ok(fd) = slave_fd_ret.into_errno_result() {
-                    RawFd::from_raw(fd)
-                } else {
+                // A `let-else` (rather than an `if let`/`else` clippy would
+                // want collapsed into `map_or_else`) reads clearly for a
+                // diverging post-fork-child error path: side-effecting
+                // syscalls, then `unreachable!()`, not a value-producing
+                // closure.
+                let Ok(fd) = slave_fd_ret.into_errno_result() else {
                     // Can't report -- just exit.
                     unsafe { Syscall::Close.invoke1(master_fd.as_usize()) };
                     unsafe { Syscall::ExitGroup.invoke1(1) };
                     unreachable!()
                 };
+                let slave_fd = RawFd::from_raw(fd);
 
                 // Set the slave as the controlling terminal. If this fails
                 // the shell starts with no controlling tty -- no job

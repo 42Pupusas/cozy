@@ -1,8 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::missing_const_for_fn,
-    clippy::manual_div_ceil
-)]
 //! Dirty-region tracker for incremental rendering.
 //!
 //! Tracks which rows have changed since the last [`DirtyRegion::take_snapshot`]
@@ -24,7 +19,7 @@ pub struct DirtyRegion {
 
 impl DirtyRegion {
     pub(crate) fn new(cols: u16, rows: u16) -> Self {
-        let words = (usize::from(rows) + 63) / 64;
+        let words = usize::from(rows).div_ceil(64);
         Self {
             words: vec![0u64; words],
             cols,
@@ -121,7 +116,11 @@ impl DirtyRegion {
             let mut bits = word;
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
-                let row = (word_idx * 64 + bit) as u16;
+                // A row index that doesn't fit in u16 can't be `< self.rows`
+                // (itself a u16) anyway, so map an overflow to a sentinel
+                // that's guaranteed to fail the bounds check below rather
+                // than wrapping into some other in-range row.
+                let row = u16::try_from(word_idx * 64 + bit).unwrap_or(u16::MAX);
                 if row < self.rows {
                     let cells: Vec<Cell> = (0..self.cols)
                         .map(|col| screen.get_cell(col, row))
@@ -204,7 +203,7 @@ impl ScrollBand {
     /// The `(0, 0, 0)` "mixed regions" sentinel and any zero-delta collapse
     /// to inactive — no pixel-shift, just repaint the dirty rows directly.
     #[must_use]
-    pub fn is_active(self) -> bool {
+    pub const fn is_active(self) -> bool {
         self.delta > 0 && self.bot >= self.top
     }
 }
@@ -281,7 +280,7 @@ impl DirtySnapshot {
     /// scroll. (Compose relies on this being incremental-only; a viewport
     /// shift is exposed separately via [`Self::pixel_shift`].)
     #[must_use]
-    pub fn scroll_span(&self) -> Option<ScrollBand> {
+    pub const fn scroll_span(&self) -> Option<ScrollBand> {
         match self.kind {
             SnapshotKind::Incremental { scroll_span } => scroll_span,
             SnapshotKind::Viewport { .. } => None,
@@ -294,7 +293,7 @@ impl DirtySnapshot {
     /// at bottom). `None` for full-frame viewport repaints and for every
     /// incremental snapshot (which use [`Self::scroll_span`] instead).
     #[must_use]
-    pub fn viewport_shift(&self) -> Option<i32> {
+    pub const fn viewport_shift(&self) -> Option<i32> {
         match self.kind {
             SnapshotKind::Viewport { shift, .. } => shift,
             SnapshotKind::Incremental { .. } => None,
@@ -304,7 +303,7 @@ impl DirtySnapshot {
     /// The scrollback offset when this is a viewport snapshot; `None` for
     /// incremental (live-bottom) snapshots.
     #[must_use]
-    pub fn viewport_offset(&self) -> Option<u16> {
+    pub const fn viewport_offset(&self) -> Option<u16> {
         match self.kind {
             SnapshotKind::Viewport { offset, .. } => Some(offset),
             SnapshotKind::Incremental { .. } => None,
@@ -314,7 +313,7 @@ impl DirtySnapshot {
     /// True if no rows changed AND the cursor didn't move/toggle visibility
     /// either -- i.e. there is genuinely nothing new for the renderer to do.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.rows.is_empty() && !self.cursor_changed && self.content_delta == 0
     }
 

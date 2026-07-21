@@ -19,6 +19,7 @@ type RawFdInt = i32;
 unsafe extern "C" {
     fn socket(domain: i32, ty: i32, protocol: i32) -> RawFdInt;
     fn geteuid() -> u32;
+    fn getpid() -> i32;
 }
 
 pub const AF_UNIX: i32 = 1;
@@ -46,6 +47,14 @@ pub fn make_unix_socket() -> io::Result<OwnedFd> {
 pub fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no arguments and cannot fail.
     unsafe { geteuid() }
+}
+
+/// This process's own pid, used to ask logind (`GetSessionByPID`) which
+/// session we belong to without needing `XDG_SESSION_ID` to be set.
+#[must_use]
+pub fn own_pid() -> u32 {
+    // SAFETY: getpid takes no arguments and cannot fail.
+    unsafe { getpid() as u32 }
 }
 
 /// A `struct sockaddr_un` built for `connect(2)`. Same layout/contract as

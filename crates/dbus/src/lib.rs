@@ -17,11 +17,12 @@
 //! * [`sys`] — the unavoidable libc sliver (socket creation, `sockaddr_un`,
 //!   `geteuid`).
 //! * [`conn`] — [`conn::Conn`], the actual connection: connect, auth, call.
-//! * [`network_manager`] / [`bluez`] — thin, service-specific convenience
-//!   wrappers the statusbar calls directly.
+//! * [`network_manager`] / [`bluez`] / [`logind`] — thin, service-specific
+//!   convenience wrappers the statusbar calls directly.
 
 pub mod bluez;
 pub mod conn;
+pub mod logind;
 pub mod message;
 pub mod network_manager;
 pub mod sys;

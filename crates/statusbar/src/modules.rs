@@ -383,30 +383,29 @@ pub fn format_brightness(pct: u32) -> String {
 }
 
 /// Nudge screen backlight brightness by `delta_pct` percentage points
-/// (negative to dim) via a direct `/sys/class/backlight/*/brightness`
-/// read-modify-write (works without root when a udev rule grants the
-/// `video` group write access, which is the common desktop default -- e.g.
-/// `73-seat-backlight.rules` upstream udev/systemd). Not `brightnessctl`:
-/// its relative-delta syntax is asymmetric (`+N%` to raise but `N%-`, not
-/// `-N%`, to lower) and got this wrong in an earlier version, silently
-/// no-opping every dim adjustment.
+/// (negative to dim), via `logind`'s `Session.SetBrightness` D-Bus call
+/// (`dbus::logind::set_backlight_brightness`) rather than a direct
+/// `/sys/class/backlight/*/brightness` write.
+///
+/// A direct sysfs write only works unprivileged when a udev rule has
+/// granted the `video` group (or an ACL/uaccess tag) write access to that
+/// file -- on a stock install without that rule (as on this machine: the
+/// `video` group has no regular users in it, only `greeter`), the write
+/// silently fails with a permission error that a bare `fs::write` swallows
+/// via `let _ =`. `logind` is the actual sanctioned unprivileged path: it's
+/// polkit-gated instead of file-permission-gated, and the default polkit
+/// policy allows an active local session to call it without a password
+/// prompt. Not `brightnessctl` either: its relative-delta syntax is
+/// asymmetric (`+N%` to raise but `N%-`, not `-N%`, to lower) and got this
+/// wrong in an earlier version, silently no-opping every dim adjustment.
 pub fn adjust_brightness(delta_pct: i32) {
-    // `brightnessctl`'s relative-delta syntax puts the sign in different
-    // places depending on direction: `+10%` to raise, but `10%-` (sign
-    // *trailing*, magnitude first) to lower -- `-10%` is not valid and
-    // brightnessctl rejects it as a bad argument, which combined with
-    // stderr being nulled made every dim-scroll a silent no-op. Rather than
-    // rely on getting that asymmetric syntax right (and on brightnessctl
-    // being installed at all), just do the sysfs read-modify-write
-    // directly -- it's a couple of small file reads/writes, cheap enough
-    // to not need `spawn`'s fire-and-forget treatment, and it's already
-    // `brightness()`'s own read path so behavior stays consistent between
-    // the two.
     let Ok(dir) = fs::read_dir("/sys/class/backlight") else {
         return;
     };
     for entry in dir.flatten() {
         let path = entry.path();
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
         let Some(cur) = read_trim(path.join("brightness")).and_then(|s| s.parse::<i64>().ok())
         else {
             continue;
@@ -425,7 +424,10 @@ pub fn adjust_brightness(delta_pct: i32) {
             -magnitude
         };
         let new_val = (cur + step).clamp(0, max);
-        let _ = fs::write(path.join("brightness"), new_val.to_string());
+        if let Ok(mut conn) = dbus::Conn::system() {
+            #[allow(clippy::cast_sign_loss)]
+            let _ = dbus::logind::set_backlight_brightness(&mut conn, name, new_val as u32);
+        }
         return;
     }
 }

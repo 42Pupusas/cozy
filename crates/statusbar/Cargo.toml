@@ -11,4 +11,5 @@ platform     = { path = "../platform" }
 font         = { path = "../font" }
 config       = { path = "../config" }
 waker        = { path = "../waker" }
+dbus         = { path = "../dbus" }
 quetzalcoatl = { workspace = true }

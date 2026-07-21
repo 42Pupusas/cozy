@@ -1,0 +1,404 @@
+#![allow(
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::too_long_first_doc_paragraph,
+    clippy::too_many_lines,
+    clippy::match_same_arms
+)]
+//! D-Bus type system: signatures, marshalled values, and the (un)marshaller.
+//!
+//! We only ever *encode* a handful of simple signatures ourselves (`""`,
+//! `"s"`, `"ss"` for method-call bodies) — those are built by hand in
+//! [`crate::message`]. What genuinely needs to be generic is *decoding*:
+//! `NetworkManager` and bluez replies are arbitrarily nested (`a{sv}`,
+//! `a{oa{sa{sv}}}`, arrays of struct, …), so [`unmarshal`] recurses on the
+//! signature grammar rather than hard-coding each shape we care about.
+
+/// One marshalled D-Bus value, tagged by its own type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    Byte(u8),
+    Bool(bool),
+    I16(i16),
+    U16(u16),
+    I32(i32),
+    U32(u32),
+    I64(i64),
+    U64(u64),
+    Double(f64),
+    Str(String),
+    ObjectPath(String),
+    Signature(String),
+    Array(Vec<Self>),
+    Struct(Vec<Self>),
+    Variant(Box<Self>),
+    DictEntry(Box<Self>, Box<Self>),
+}
+
+impl Value {
+    /// Unwrap a `Variant`, following through to its inner value. Returns
+    /// `self` unchanged if it isn't a variant — callers that already know
+    /// what they got (e.g. straight off an array element) can call this
+    /// unconditionally.
+    #[must_use]
+    pub fn into_inner(self) -> Self {
+        match self {
+            Self::Variant(inner) => inner.into_inner(),
+            other => other,
+        }
+    }
+
+    /// Best-effort string view: `Str`/`ObjectPath` directly, or an
+    /// array-of-byte SSID (`NetworkManager` hands SSIDs back as `ay`, not
+    /// `s` — they're arbitrary bytes, not guaranteed UTF-8) decoded lossily.
+    #[must_use]
+    pub fn as_display_string(&self) -> Option<String> {
+        match self {
+            Self::Str(s) | Self::ObjectPath(s) => Some(s.clone()),
+            Self::Array(items) => {
+                let bytes: Option<Vec<u8>> = items
+                    .iter()
+                    .map(|v| match v {
+                        Self::Byte(b) => Some(*b),
+                        _ => None,
+                    })
+                    .collect();
+                bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
+            }
+            _ => None,
+        }
+    }
+
+    /// Best-effort integer view, widening any of the fixed-width int types.
+    #[must_use]
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Byte(v) => Some(u64::from(*v)),
+            Self::U16(v) => Some(u64::from(*v)),
+            Self::U32(v) => Some(u64::from(*v)),
+            Self::U64(v) => Some(*v),
+            Self::I16(v) if *v >= 0 => Some(*v as u64),
+            Self::I32(v) if *v >= 0 => Some(*v as u64),
+            Self::I64(v) if *v >= 0 => Some(*v as u64),
+            _ => None,
+        }
+    }
+
+    /// Best-effort bool view.
+    #[must_use]
+    pub const fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    /// Best-effort array view (also treats a `Struct` as a slice of its
+    /// fields, since some callers don't care which of the two produced the
+    /// list -- e.g. walking `ManagedObjects` where dict values are arrays
+    /// but we only ever want to iterate).
+    #[must_use]
+    pub fn as_items(&self) -> Option<&[Self]> {
+        match self {
+            Self::Array(items) | Self::Struct(items) => Some(items),
+            _ => None,
+        }
+    }
+
+    /// Look up a value by string key in an array of `DictEntry` — the shape
+    /// every `a{s?}` (property maps, interface maps) unmarshals to. Skips
+    /// entries whose key isn't a `Str`/`ObjectPath` (never happens for a
+    /// well-formed `a{s?}`, but keeps this total instead of panicking).
+    #[must_use]
+    pub fn dict_get(&self, key: &str) -> Option<&Self> {
+        let items = self.as_items()?;
+        items.iter().find_map(|entry| {
+            let Self::DictEntry(k, v) = entry else {
+                return None;
+            };
+            (k.as_display_string().as_deref() == Some(key)).then_some(v.as_ref())
+        })
+    }
+}
+
+/// Split a signature into its first complete type and the remainder — e.g.
+/// `"sa{sv}u"` -> `("s", "a{sv}u")`, or `"a{sv}"` -> `("a{sv}", "")`.
+///
+/// Recurses through `a` (array of the next complete type) and matches
+/// balanced `(...)`/`{...}` so struct/dict-entry bodies come back whole.
+#[must_use]
+pub fn split_first_type(sig: &str) -> (&str, &str) {
+    let bytes = sig.as_bytes();
+    if bytes.is_empty() {
+        return ("", "");
+    }
+    match bytes[0] {
+        b'a' => {
+            let (inner, _) = split_first_type(&sig[1..]);
+            let len = 1 + inner.len();
+            (&sig[..len], &sig[len..])
+        }
+        b'(' | b'{' => {
+            let open = bytes[0];
+            let close = if open == b'(' { b')' } else { b'}' };
+            let mut depth = 1i32;
+            let mut i = 1;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == open {
+                    depth += 1;
+                } else if bytes[i] == close {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            (&sig[..i], &sig[i..])
+        }
+        _ => (&sig[..1], &sig[1..]),
+    }
+}
+
+/// The alignment (in bytes) a value of this signature's first type is padded
+/// to before it's written/read.
+#[must_use]
+pub const fn alignment_of(sig: &str) -> usize {
+    match sig.as_bytes().first() {
+        Some(b'y') => 1,
+        Some(b'b' | b'i' | b'u') => 4,
+        Some(b'n' | b'q') => 2,
+        Some(b'x' | b't' | b'd') => 8,
+        Some(b's' | b'o') => 4,
+        Some(b'g' | b'v') => 1,
+        Some(b'a') => 4,
+        Some(b'(' | b'{') => 8,
+        _ => 1,
+    }
+}
+
+const fn align_up(offset: usize, n: usize) -> usize {
+    if n <= 1 {
+        offset
+    } else {
+        offset.div_ceil(n) * n
+    }
+}
+
+macro_rules! read_le {
+    ($buf:expr, $off:expr, $ty:ty) => {{
+        let size = std::mem::size_of::<$ty>();
+        let bytes = $buf.get($off..$off + size)?;
+        Some(<$ty>::from_le_bytes(bytes.try_into().ok()?))
+    }};
+}
+
+/// Decode one complete value of `sig` (its *first* type — trailing bytes in
+/// `sig` are ignored, matching [`split_first_type`]'s contract) starting at
+/// `offset` in `buf`. Returns the value and the offset just past it.
+#[must_use]
+pub fn unmarshal(buf: &[u8], offset: usize, sig: &str) -> Option<(Value, usize)> {
+    let c = *sig.as_bytes().first()?;
+    match c {
+        b'y' => Some((Value::Byte(*buf.get(offset)?), offset + 1)),
+        b'b' => {
+            let o = align_up(offset, 4);
+            let v: u32 = read_le!(buf, o, u32)?;
+            Some((Value::Bool(v != 0), o + 4))
+        }
+        b'n' => {
+            let o = align_up(offset, 2);
+            Some((Value::I16(read_le!(buf, o, i16)?), o + 2))
+        }
+        b'q' => {
+            let o = align_up(offset, 2);
+            Some((Value::U16(read_le!(buf, o, u16)?), o + 2))
+        }
+        b'i' => {
+            let o = align_up(offset, 4);
+            Some((Value::I32(read_le!(buf, o, i32)?), o + 4))
+        }
+        b'u' => {
+            let o = align_up(offset, 4);
+            Some((Value::U32(read_le!(buf, o, u32)?), o + 4))
+        }
+        b'x' => {
+            let o = align_up(offset, 8);
+            Some((Value::I64(read_le!(buf, o, i64)?), o + 8))
+        }
+        b't' => {
+            let o = align_up(offset, 8);
+            Some((Value::U64(read_le!(buf, o, u64)?), o + 8))
+        }
+        b'd' => {
+            let o = align_up(offset, 8);
+            Some((Value::Double(read_le!(buf, o, f64)?), o + 8))
+        }
+        b's' | b'o' => {
+            let o = align_up(offset, 4);
+            let len: u32 = read_le!(buf, o, u32)?;
+            let start = o + 4;
+            let end = start + len as usize;
+            let s = std::str::from_utf8(buf.get(start..end)?).ok()?.to_string();
+            let val = if c == b's' {
+                Value::Str(s)
+            } else {
+                Value::ObjectPath(s)
+            };
+            Some((val, end + 1)) // +1 for the NUL terminator
+        }
+        b'g' => {
+            let len = *buf.get(offset)? as usize;
+            let start = offset + 1;
+            let end = start + len;
+            let s = std::str::from_utf8(buf.get(start..end)?).ok()?.to_string();
+            Some((Value::Signature(s), end + 1))
+        }
+        b'v' => {
+            let len = *buf.get(offset)? as usize;
+            let start = offset + 1;
+            let sig_end = start + len;
+            let inner_sig = std::str::from_utf8(buf.get(start..sig_end)?)
+                .ok()?
+                .to_string();
+            let val_start = sig_end + 1; // skip signature's NUL
+            let (inner, end) = unmarshal(buf, val_start, &inner_sig)?;
+            Some((Value::Variant(Box::new(inner)), end))
+        }
+        b'a' => {
+            let elem_sig = &sig[1..];
+            let o = align_up(offset, 4);
+            let len: u32 = read_le!(buf, o, u32)?;
+            let elem_align = alignment_of(elem_sig);
+            let start = align_up(o + 4, elem_align);
+            let end = start + len as usize;
+            let mut items = Vec::new();
+            let mut p = start;
+            while p < end {
+                let (v, np) = unmarshal(buf, p, elem_sig)?;
+                items.push(v);
+                p = np;
+            }
+            Some((Value::Array(items), end.max(start)))
+        }
+        b'(' => {
+            let o = align_up(offset, 8);
+            let inner = &sig[1..sig.len().saturating_sub(1)];
+            let mut items = Vec::new();
+            let mut p = o;
+            let mut rest = inner;
+            while !rest.is_empty() {
+                let (t, r) = split_first_type(rest);
+                let (v, np) = unmarshal(buf, p, t)?;
+                items.push(v);
+                p = np;
+                rest = r;
+            }
+            Some((Value::Struct(items), p))
+        }
+        b'{' => {
+            let o = align_up(offset, 8);
+            let inner = &sig[1..sig.len().saturating_sub(1)];
+            let (kt, rest) = split_first_type(inner);
+            let (kv, p1) = unmarshal(buf, o, kt)?;
+            let (vt, _) = split_first_type(rest);
+            let (vv, p2) = unmarshal(buf, p1, vt)?;
+            Some((Value::DictEntry(Box::new(kv), Box::new(vv)), p2))
+        }
+        _ => None,
+    }
+}
+
+/// Decode every complete value in `body` per the (possibly multi-type) top-
+/// level signature `sig`, e.g. a method-return body of signature `"sa{sv}"`.
+#[must_use]
+pub fn unmarshal_body(buf: &[u8], sig: &str) -> Option<Vec<Value>> {
+    let mut out = Vec::new();
+    let mut offset = 0;
+    let mut rest = sig;
+    while !rest.is_empty() {
+        let (t, r) = split_first_type(rest);
+        let (v, next) = unmarshal(buf, offset, t)?;
+        out.push(v);
+        offset = next;
+        rest = r;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_first_type_basic() {
+        assert_eq!(split_first_type("s"), ("s", ""));
+        assert_eq!(split_first_type("su"), ("s", "u"));
+        assert_eq!(split_first_type("a{sv}"), ("a{sv}", ""));
+        assert_eq!(split_first_type("a{sv}u"), ("a{sv}", "u"));
+        assert_eq!(split_first_type("(sy)u"), ("(sy)", "u"));
+        assert_eq!(split_first_type("aau"), ("aau", ""));
+        assert_eq!(split_first_type("aa{sv}s"), ("aa{sv}", "s"));
+        assert_eq!(split_first_type(""), ("", ""));
+    }
+
+    fn pad_to(buf: &mut Vec<u8>, n: usize) {
+        while buf.len() % n != 0 {
+            buf.push(0);
+        }
+    }
+
+    fn push_string(buf: &mut Vec<u8>, s: &str) {
+        pad_to(buf, 4);
+        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+        buf.push(0);
+    }
+
+    #[test]
+    fn unmarshal_string_roundtrip() {
+        let mut buf = Vec::new();
+        push_string(&mut buf, "hello");
+        let (v, end) = unmarshal(&buf, 0, "s").unwrap();
+        assert_eq!(v, Value::Str("hello".into()));
+        assert_eq!(end, buf.len());
+    }
+
+    #[test]
+    fn unmarshal_array_of_string() {
+        let mut buf = Vec::new();
+        // array length placeholder, then elements aligned to 4 (string align).
+        pad_to(&mut buf, 4);
+        let len_pos = buf.len();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        let start = buf.len();
+        push_string(&mut buf, "a");
+        push_string(&mut buf, "bb");
+        let elems_len = (buf.len() - start) as u32;
+        buf[len_pos..len_pos + 4].copy_from_slice(&elems_len.to_le_bytes());
+
+        let (v, end) = unmarshal(&buf, 0, "as").unwrap();
+        assert_eq!(
+            v,
+            Value::Array(vec![Value::Str("a".into()), Value::Str("bb".into())])
+        );
+        assert_eq!(end, buf.len());
+    }
+
+    #[test]
+    fn unmarshal_variant_wrapping_u32() {
+        let mut buf = Vec::new();
+        buf.push(1u8); // signature length
+        buf.push(b'u');
+        buf.push(0); // signature NUL
+        pad_to(&mut buf, 4);
+        buf.extend_from_slice(&42u32.to_le_bytes());
+        let (v, end) = unmarshal(&buf, 0, "v").unwrap();
+        assert_eq!(v, Value::Variant(Box::new(Value::U32(42))));
+        assert_eq!(end, buf.len());
+        assert_eq!(v.into_inner(), Value::U32(42));
+    }
+
+    #[test]
+    fn as_display_string_decodes_byte_array_ssid() {
+        let v = Value::Array(vec![Value::Byte(b'h'), Value::Byte(b'i')]);
+        assert_eq!(v.as_display_string().as_deref(), Some("hi"));
+    }
+}

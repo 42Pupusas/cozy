@@ -148,58 +148,36 @@ fn parse_kb(s: &str) -> Option<u64> {
         .ok()
 }
 
-/// Connected Wi-Fi SSID + a signal-strength percentage, via `iw`. `None` when
-/// no wireless interface is connected or `iw` isn't installed.
+/// Connected Wi-Fi SSID + a signal-strength percentage, via NetworkManager
+/// over D-Bus (`dbus::network_manager::wifi_status`) instead of shelling out
+/// to `iw` and scraping its text output. `None` only when the system bus /
+/// NetworkManager aren't reachable at all; a Wi-Fi device present but not
+/// associated to an access point still renders the disconnected icon
+/// (matches the old `iw`-based "Not connected" case, not a `None`).
 #[must_use]
 pub fn wifi() -> Option<String> {
-    // Find the first wireless interface.
-    let dev_out = Command::new("iw").arg("dev").output().ok()?;
-    let dev_text = String::from_utf8(dev_out.stdout).ok()?;
-    let iface = dev_text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("Interface "))?
-        .trim()
-        .to_string();
-
-    let link_out = Command::new("iw")
-        .args(["dev", &iface, "link"])
-        .output()
-        .ok()?;
-    let link_text = String::from_utf8(link_out.stdout).ok()?;
-    if link_text.contains("Not connected") {
-        return Some("󰤭".into());
+    let mut conn = dbus::Conn::system().ok()?;
+    match dbus::network_manager::wifi_status(&mut conn).ok()? {
+        Some(status) => Some(format!("{} 󰤨", status.ssid)),
+        None => Some("󰤭".into()),
     }
-    let ssid = link_text
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("SSID: "))
-        .unwrap_or("?")
-        .to_string();
-    Some(format!("{ssid} 󰤨"))
 }
 
 /// Whether Bluetooth is powered and how many devices are connected, via
-/// `bluetoothctl`. `None` if the daemon/CLI isn't available.
+/// bluez's `ObjectManager.GetManagedObjects` over D-Bus (`dbus::bluez::status`)
+/// instead of shelling out to `bluetoothctl` and scraping its text output.
+/// `None` if the system bus / bluez aren't reachable, or no adapter exists.
 #[must_use]
 pub fn bluetooth() -> Option<String> {
-    let out = Command::new("bluetoothctl").arg("show").output().ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    let powered = text.lines().any(|l| l.trim() == "Powered: yes");
-    if !powered {
+    let mut conn = dbus::Conn::system().ok()?;
+    let status = dbus::bluez::status(&mut conn).ok()??;
+    if !status.powered {
         return Some("󰂲".into());
     }
-    let devices_out = Command::new("bluetoothctl")
-        .args(["devices", "Connected"])
-        .output()
-        .ok()?;
-    let n = String::from_utf8(devices_out.stdout)
-        .ok()?
-        .lines()
-        .filter(|l| l.starts_with("Device"))
-        .count();
-    if n == 0 {
+    if status.connected_count == 0 {
         Some("󰂯".into())
     } else {
-        Some(format!("{n} 󰂱"))
+        Some(format!("{} 󰂱", status.connected_count))
     }
 }
 

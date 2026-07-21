@@ -85,9 +85,9 @@ impl Snapshot {
             (ModuleKind::Temp, self.temp.as_str()),
             // (ModuleKind::Cpu, self.cpu.as_str()), // disabled per user request
             // (ModuleKind::Mem, self.mem.as_str()), // disabled per user request
-            (ModuleKind::VolOut, self.vol_out.as_str()),
-            (ModuleKind::VolIn, self.vol_in.as_str()),
             (ModuleKind::Brightness, self.brightness.as_str()),
+            (ModuleKind::VolIn, self.vol_in.as_str()),
+            (ModuleKind::VolOut, self.vol_out.as_str()),
         ]
     }
 }

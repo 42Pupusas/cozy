@@ -45,7 +45,7 @@ mod selection;
 pub use cell::{Attrs, Cell, Color, UnderlineStyle};
 pub use cursor::{Cursor, CursorShape};
 pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand, SnapshotKind};
-pub use palette::{XTERM_256, parse_color_spec};
+pub use palette::XTERM_256;
 pub use screen::Screen;
 pub use selection::{Point as SelPoint, Selection};
 
@@ -363,77 +363,88 @@ impl Charset {
     }
 }
 
-/// Compose a base character with a following zero-width combining mark into
-/// its precomposed (NFC) form, covering the combining marks a real keyboard
-/// or IME actually produces over a Latin base letter (acute, grave,
-/// circumflex, tilde, diaeresis, ring above, cedilla). Returns `None` for
-/// any pair not in the table -- most emoji ZWJ sequences, combining marks
-/// over non-Latin letters, or marks stacked more than once (this only
-/// handles a single mark following a plain base, matching what `Cell`, with
-/// no cluster storage, can represent at all).
-///
-/// Deliberately a lookup table, not a call into a Unicode normalization
-/// crate: this crate has zero external dependencies beyond its sibling
-/// crates, and the realistic terminal input (typed accents, not arbitrary
-/// decomposed text) only ever exercises this small, fixed set.
-fn compose_precomposed(base: char, mark: char) -> Option<char> {
-    Some(match (base, mark) {
-        ('a', '\u{301}') => '\u{e1}',
-        ('a', '\u{300}') => '\u{e0}',
-        ('a', '\u{302}') => '\u{e2}',
-        ('a', '\u{303}') => '\u{e3}',
-        ('a', '\u{308}') => '\u{e4}',
-        ('a', '\u{30a}') => '\u{e5}',
-        ('A', '\u{301}') => '\u{c1}',
-        ('A', '\u{300}') => '\u{c0}',
-        ('A', '\u{302}') => '\u{c2}',
-        ('A', '\u{303}') => '\u{c3}',
-        ('A', '\u{308}') => '\u{c4}',
-        ('A', '\u{30a}') => '\u{c5}',
-        ('e', '\u{301}') => '\u{e9}',
-        ('e', '\u{300}') => '\u{e8}',
-        ('e', '\u{302}') => '\u{ea}',
-        ('e', '\u{308}') => '\u{eb}',
-        ('E', '\u{301}') => '\u{c9}',
-        ('E', '\u{300}') => '\u{c8}',
-        ('E', '\u{302}') => '\u{ca}',
-        ('E', '\u{308}') => '\u{cb}',
-        ('i', '\u{301}') => '\u{ed}',
-        ('i', '\u{300}') => '\u{ec}',
-        ('i', '\u{302}') => '\u{ee}',
-        ('i', '\u{308}') => '\u{ef}',
-        ('I', '\u{301}') => '\u{cd}',
-        ('I', '\u{300}') => '\u{cc}',
-        ('I', '\u{302}') => '\u{ce}',
-        ('I', '\u{308}') => '\u{cf}',
-        ('o', '\u{301}') => '\u{f3}',
-        ('o', '\u{300}') => '\u{f2}',
-        ('o', '\u{302}') => '\u{f4}',
-        ('o', '\u{303}') => '\u{f5}',
-        ('o', '\u{308}') => '\u{f6}',
-        ('O', '\u{301}') => '\u{d3}',
-        ('O', '\u{300}') => '\u{d2}',
-        ('O', '\u{302}') => '\u{d4}',
-        ('O', '\u{303}') => '\u{d5}',
-        ('O', '\u{308}') => '\u{d6}',
-        ('u', '\u{301}') => '\u{fa}',
-        ('u', '\u{300}') => '\u{f9}',
-        ('u', '\u{302}') => '\u{fb}',
-        ('u', '\u{308}') => '\u{fc}',
-        ('U', '\u{301}') => '\u{da}',
-        ('U', '\u{300}') => '\u{d9}',
-        ('U', '\u{302}') => '\u{db}',
-        ('U', '\u{308}') => '\u{dc}',
-        ('n', '\u{303}') => '\u{f1}',
-        ('N', '\u{303}') => '\u{d1}',
-        ('c', '\u{327}') => '\u{e7}',
-        ('C', '\u{327}') => '\u{c7}',
-        ('y', '\u{301}') => '\u{fd}',
-        ('y', '\u{308}') => '\u{ff}',
-        ('Y', '\u{301}') => '\u{dd}',
-        ('Y', '\u{308}') => '\u{178}',
-        _ => return None,
-    })
+/// Extends `char` with precomposed-accent composition, as a method instead
+/// of a free `compose_precomposed(base, mark)` function -- `base` (the
+/// receiver) is the natural owner since this is fundamentally "what does
+/// this char become when a mark lands on it".
+trait ComposeWithMark {
+    /// Compose this base character with a following zero-width combining
+    /// mark into its precomposed (NFC) form, covering the combining marks a
+    /// real keyboard or IME actually produces over a Latin base letter
+    /// (acute, grave, circumflex, tilde, diaeresis, ring above, cedilla).
+    /// Returns `None` for any pair not in the table -- most emoji ZWJ
+    /// sequences, combining marks over non-Latin letters, or marks stacked
+    /// more than once (this only handles a single mark following a plain
+    /// base, matching what `Cell`, with no cluster storage, can represent at
+    /// all).
+    ///
+    /// Deliberately a lookup table, not a call into a Unicode normalization
+    /// crate: this crate has zero external dependencies beyond its sibling
+    /// crates, and the realistic terminal input (typed accents, not
+    /// arbitrary decomposed text) only ever exercises this small, fixed set.
+    fn compose_with(self, mark: char) -> Option<char>;
+}
+
+impl ComposeWithMark for char {
+    fn compose_with(self, mark: char) -> Option<char> {
+        Some(match (self, mark) {
+            ('a', '\u{301}') => '\u{e1}',
+            ('a', '\u{300}') => '\u{e0}',
+            ('a', '\u{302}') => '\u{e2}',
+            ('a', '\u{303}') => '\u{e3}',
+            ('a', '\u{308}') => '\u{e4}',
+            ('a', '\u{30a}') => '\u{e5}',
+            ('A', '\u{301}') => '\u{c1}',
+            ('A', '\u{300}') => '\u{c0}',
+            ('A', '\u{302}') => '\u{c2}',
+            ('A', '\u{303}') => '\u{c3}',
+            ('A', '\u{308}') => '\u{c4}',
+            ('A', '\u{30a}') => '\u{c5}',
+            ('e', '\u{301}') => '\u{e9}',
+            ('e', '\u{300}') => '\u{e8}',
+            ('e', '\u{302}') => '\u{ea}',
+            ('e', '\u{308}') => '\u{eb}',
+            ('E', '\u{301}') => '\u{c9}',
+            ('E', '\u{300}') => '\u{c8}',
+            ('E', '\u{302}') => '\u{ca}',
+            ('E', '\u{308}') => '\u{cb}',
+            ('i', '\u{301}') => '\u{ed}',
+            ('i', '\u{300}') => '\u{ec}',
+            ('i', '\u{302}') => '\u{ee}',
+            ('i', '\u{308}') => '\u{ef}',
+            ('I', '\u{301}') => '\u{cd}',
+            ('I', '\u{300}') => '\u{cc}',
+            ('I', '\u{302}') => '\u{ce}',
+            ('I', '\u{308}') => '\u{cf}',
+            ('o', '\u{301}') => '\u{f3}',
+            ('o', '\u{300}') => '\u{f2}',
+            ('o', '\u{302}') => '\u{f4}',
+            ('o', '\u{303}') => '\u{f5}',
+            ('o', '\u{308}') => '\u{f6}',
+            ('O', '\u{301}') => '\u{d3}',
+            ('O', '\u{300}') => '\u{d2}',
+            ('O', '\u{302}') => '\u{d4}',
+            ('O', '\u{303}') => '\u{d5}',
+            ('O', '\u{308}') => '\u{d6}',
+            ('u', '\u{301}') => '\u{fa}',
+            ('u', '\u{300}') => '\u{f9}',
+            ('u', '\u{302}') => '\u{fb}',
+            ('u', '\u{308}') => '\u{fc}',
+            ('U', '\u{301}') => '\u{da}',
+            ('U', '\u{300}') => '\u{d9}',
+            ('U', '\u{302}') => '\u{db}',
+            ('U', '\u{308}') => '\u{dc}',
+            ('n', '\u{303}') => '\u{f1}',
+            ('N', '\u{303}') => '\u{d1}',
+            ('c', '\u{327}') => '\u{e7}',
+            ('C', '\u{327}') => '\u{c7}',
+            ('y', '\u{301}') => '\u{fd}',
+            ('y', '\u{308}') => '\u{ff}',
+            ('Y', '\u{301}') => '\u{dd}',
+            ('Y', '\u{308}') => '\u{178}',
+            _ => return None,
+        })
+    }
 }
 
 impl Grid {
@@ -916,7 +927,7 @@ impl Grid {
     /// isn't possible -- but the common case (a Latin base letter plus one
     /// of the handful of combining diacritics real keyboards/IMEs actually
     /// produce) is handled by rewriting the previous cell's glyph to its
-    /// precomposed NFC form via [`compose_precomposed`]. Anything outside
+    /// precomposed NFC form via [`ComposeWithMark::compose_with`]. Anything outside
     /// that table (emoji ZWJ sequences, combining marks over non-Latin base
     /// characters, ...) is dropped as before -- silently ignored rather than
     /// corrupting an unrelated cell, since we can't store the cluster.
@@ -936,7 +947,7 @@ impl Grid {
             c
         };
         let base = self.active_screen().get_cell(base_col, row);
-        let Some(composed) = compose_precomposed(base.ch, mark) else {
+        let Some(composed) = base.ch.compose_with(mark) else {
             return;
         };
         let mut cell = base;
@@ -1651,7 +1662,7 @@ impl Grid {
                     u16::from(g) * 0x101,
                     u16::from(b) * 0x101,
                 );
-            } else if let Some(rgb) = parse_color_spec(spec) {
+            } else if let Some(rgb) = Color::parse_spec(spec) {
                 self.set_palette_override(idx, rgb);
             }
         }
@@ -1735,7 +1746,7 @@ impl Grid {
         if data == "?" || !(selection.is_empty() || selection == "c" || selection == "s") {
             return;
         }
-        if let Some(text) = base64::decode_to_string(data) {
+        if let Some(text) = base64::Base64::decode_to_string(data) {
             self.pending_clipboard = Some(text);
         }
     }

@@ -116,8 +116,9 @@ impl ClipboardState {
             return;
         }
         let src: DataSourceId = window_tx.alloc_id();
-        window_tx
-            .request(MessageBuilder::new(mgr, DataDeviceManagerRequest::CreateDataSource).new_id(src));
+        window_tx.request(
+            MessageBuilder::new(mgr, DataDeviceManagerRequest::CreateDataSource).new_id(src),
+        );
         window_tx.request(MessageBuilder::new(src, DataSourceRequest::Offer).string("text/plain"));
         // Wire arg order is (source, serial): libwayland marshals args in XML
         // declaration order, and wl_data_device.set_selection declares

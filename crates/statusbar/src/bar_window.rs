@@ -16,11 +16,11 @@
 //! existing pool via `wl_shm_pool.resize` (grow-only, lazy-shrink) and only
 //! recreate the two `wl_buffer`s carved out of it.
 
+use crate::pointer_state::PointerState;
 use platform::conn::{Sender, WindowSender};
 use platform::draw::{Canvas, Color, Point};
 use platform::event::RawEvent;
 use platform::font;
-use crate::pointer_state::PointerState;
 use platform::id::{
     CompositorId, LayerShellId, LayerSurfaceId, ObjectId, OutputId, RegistryId, SeatId, ShmId,
     SurfaceId,

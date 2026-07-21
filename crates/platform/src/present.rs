@@ -128,7 +128,11 @@ impl PresentState {
     /// [`crate::surface::SurfaceBootstrap::route_common`], borrowing exactly
     /// the fields it needs. Callers still handle `wl_display` events and
     /// role-specific dispatch themselves via the returned [`Routed`].
-    pub fn route_common(&mut self, ev: &crate::event::RawEvent, window_tx: &mut WindowSender) -> Routed {
+    pub fn route_common(
+        &mut self,
+        ev: &crate::event::RawEvent,
+        window_tx: &mut WindowSender,
+    ) -> Routed {
         crate::surface::SurfaceBootstrap::route_common(
             ev,
             window_tx,
@@ -203,8 +207,9 @@ impl PresentState {
     /// Tell the compositor the pool grew, ahead of carving new buffers out
     /// of the extra space.
     pub fn grow_pool(&self, window_tx: &mut WindowSender, new_capacity: usize) {
-        window_tx
-            .request(MessageBuilder::new(self.pool, ShmPoolRequest::Resize).i32(new_capacity as i32));
+        window_tx.request(
+            MessageBuilder::new(self.pool, ShmPoolRequest::Resize).i32(new_capacity as i32),
+        );
     }
 
     /// Carve fresh `w x h` buffers for both slots out of the (possibly just

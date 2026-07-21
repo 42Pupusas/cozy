@@ -23,9 +23,8 @@ use crate::draw::Point;
 use crate::error::{Error, Result};
 use crate::event::RawEvent;
 use crate::id::{
-    CallbackId, CompositorId, DataDeviceManagerId, DisplayId, KeyboardId, ObjectId,
-    OutputId, PointerId, RegistryId, SeatId,
-    ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
+    CallbackId, CompositorId, DataDeviceManagerId, DisplayId, KeyboardId, ObjectId, OutputId,
+    PointerId, RegistryId, SeatId, ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
 };
 use crate::keymap;
 use crate::protocol::Modifiers;
@@ -33,8 +32,8 @@ use crate::protocol::{
     self as proto, ButtonState, CompositorRequest, DataDeviceEvent, DataOfferEvent,
     DataSourceEvent, DisplayEvent, DisplayRequest, Format, Key, KeyState, KeyboardEvent,
     PointerButton, PointerEvent, PointerRequest, RegistryEvent, SeatCapability, SeatEvent,
-    SeatRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent,
-    WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
+    SeatRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent, WmBaseRequest,
+    XdgSurfaceEvent, XdgSurfaceRequest,
 };
 use crate::render;
 use crate::wire::{MessageBuilder, WireEvent};
@@ -150,9 +149,9 @@ enum Lifecycle {
     Closing,
 }
 
-use crate::surface::Frame;
 #[cfg(feature = "trace")]
 use crate::debug_overlay::DebugOverlay;
+use crate::surface::Frame;
 
 /// A Wayland window that renders a terminal grid using a software framebuffer.
 ///
@@ -369,7 +368,11 @@ impl TermWindow {
         build_renderer: impl FnOnce(i32) -> render::Renderer,
     ) -> Result<Self> {
         let (mut sender, repeat_timer, mut events, reader_handle) =
-            crate::surface::SurfaceBootstrap::connect(EVENT_RING_CAP, "terminal-wayland-reader", &wake)?;
+            crate::surface::SurfaceBootstrap::connect(
+                EVENT_RING_CAP,
+                "terminal-wayland-reader",
+                &wake,
+            )?;
 
         let Globals {
             compositor,
@@ -612,7 +615,8 @@ impl TermWindow {
     /// [`crate::clipboard::ClipboardState::request_paste`] for the fd/thread
     /// mechanics.
     pub fn request_paste(&mut self) {
-        self.clipboard.request_paste(&mut self.window_tx, &self.wake);
+        self.clipboard
+            .request_paste(&mut self.window_tx, &self.wake);
     }
 
     /// A clone of the UI wakeup channel. Hand this to any thread (e.g. the
@@ -1093,8 +1097,7 @@ impl TermWindow {
                         // app never saw that press, so it must not see the
                         // drag's motion either (orphan drag reports confuse
                         // vim et al).
-                        if !(self.selection_bypass
-                            && self.mouse_pressed == Some(MouseButton::Left))
+                        if !(self.selection_bypass && self.mouse_pressed == Some(MouseButton::Left))
                         {
                             self.input_queue.push_back(InputEvent::Mouse {
                                 button: self.mouse_pressed.unwrap_or(MouseButton::None),
@@ -1698,8 +1701,14 @@ impl TermWindow {
         painted_cells: usize,
     ) {
         self.debug.record_busy(total);
-        self.debug
-            .log_slow_present(total, t_blit, t_overlay, folded_len, painted_rows, painted_cells);
+        self.debug.log_slow_present(
+            total,
+            t_blit,
+            t_overlay,
+            folded_len,
+            painted_rows,
+            painted_cells,
+        );
     }
 
     #[cfg(not(feature = "trace"))]
@@ -1971,7 +1980,14 @@ impl TermWindow {
         // On a slow present (>5ms -- never the 60fps steady state, always the
         // spikes we're chasing), break the timed region into its three phases
         // so we can see WHICH one owns the ~16ms.
-        self.debug_record_busy_and_log(total, t_blit, t_overlay, folded_len, painted_rows, painted_cells);
+        self.debug_record_busy_and_log(
+            total,
+            t_blit,
+            t_overlay,
+            folded_len,
+            painted_rows,
+            painted_cells,
+        );
         Ok(())
     }
 

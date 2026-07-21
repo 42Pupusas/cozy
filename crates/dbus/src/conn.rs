@@ -23,7 +23,7 @@ use std::os::fd::OwnedFd;
 use ququmatz::types::MsgFlags;
 use ququmatz::{IoUring, Sqe};
 
-use crate::message::{self, BodyArg, MessageType, Prelude, Reply, PRELUDE_LEN};
+use crate::message::{self, BodyArg, MessageType, PRELUDE_LEN, Prelude, Reply};
 use crate::sys;
 
 /// Ring depth — one call in flight at a time, so this only ever needs a

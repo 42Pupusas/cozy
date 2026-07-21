@@ -7,6 +7,9 @@
 //! in `platform::render` alone; OSC 4 support needs the grid thread to know
 //! it too; a single `const` table is one obviously-correct place instead of
 //! two copies that could silently drift apart.
+
+use crate::cell::Color;
+
 pub static XTERM_256: [(u8, u8, u8); 256] = {
     let mut t = [(0u8, 0u8, 0u8); 256];
     // 0-7: standard colors
@@ -56,54 +59,63 @@ pub static XTERM_256: [(u8, u8, u8); 256] = {
     t
 };
 
-/// Parse an X11/xterm color spec as used by OSC 4/10/11's *set* form.
-///
-/// Accepts `XParseColor`-style specs: `#RGB`, `#RRGGBB`, `#RRRGGGBBB`,
-/// `#RRRRGGGGBBBB`, or `rgb:R/G/B` with 1-4 hex digits per channel (short
-/// forms are the high bits, e.g. `rgb:f/0/0` == `rgb:ff/00/00` == pure red).
-/// Returns `None` for anything else (including `?`, which is a query, not a
-/// set, and is the caller's job to detect first).
-#[must_use]
-pub fn parse_color_spec(spec: &str) -> Option<(u8, u8, u8)> {
-    if let Some(hex) = spec.strip_prefix('#') {
-        // #RGB / #RRGGBB / #RRRGGGBBB / #RRRRGGGGBBBB -- N hex digits per
-        // channel, N in {1,2,3,4}; each channel's *most significant* byte is
-        // what we keep (X11 convention: values are the high bits of a wider
-        // fixed-point fraction).
-        let n = hex.len();
-        if n == 0 || n % 3 != 0 || n > 12 {
-            return None;
-        }
-        let per = n / 3;
-        let chan = |s: &str| -> Option<u8> {
-            let v = u32::from_str_radix(s, 16).ok()?;
-            let max = (1u32 << (per * 4)) - 1;
-            Some(((v * 255 + max / 2) / max) as u8)
-        };
-        let r = chan(&hex[0..per])?;
-        let g = chan(&hex[per..2 * per])?;
-        let b = chan(&hex[2 * per..3 * per])?;
-        return Some((r, g, b));
-    }
-    if let Some(rest) = spec.strip_prefix("rgb:") {
-        let mut parts = rest.split('/');
-        let chan = |s: &str| -> Option<u8> {
-            if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+/// Extends [`Color`] with X11/xterm color-spec parsing, as an associated
+/// function instead of a free `parse_color_spec(spec)` function -- `Color`
+/// is what the parsed result conceptually is, so it's the natural
+/// namespace even though the output here is the raw `(u8, u8, u8)` tuple
+/// callers actually need (both `Grid`'s palette-override table and
+/// `platform::render::Theme` want the tuple, not a `Color::Rgb` wrapper).
+impl Color {
+    /// Parse an X11/xterm color spec as used by OSC 4/10/11's *set* form.
+    ///
+    /// Accepts `XParseColor`-style specs: `#RGB`, `#RRGGBB`, `#RRRGGGBBB`,
+    /// `#RRRRGGGGBBBB`, or `rgb:R/G/B` with 1-4 hex digits per channel
+    /// (short forms are the high bits, e.g. `rgb:f/0/0` == `rgb:ff/00/00`
+    /// == pure red). Returns `None` for anything else (including `?`,
+    /// which is a query, not a set, and is the caller's job to detect
+    /// first).
+    #[must_use]
+    pub fn parse_spec(spec: &str) -> Option<(u8, u8, u8)> {
+        if let Some(hex) = spec.strip_prefix('#') {
+            // #RGB / #RRGGBB / #RRRGGGBBB / #RRRRGGGGBBBB -- N hex digits per
+            // channel, N in {1,2,3,4}; each channel's *most significant* byte is
+            // what we keep (X11 convention: values are the high bits of a wider
+            // fixed-point fraction).
+            let n = hex.len();
+            if n == 0 || n % 3 != 0 || n > 12 {
                 return None;
             }
-            let v = u32::from_str_radix(s, 16).ok()?;
-            let max = (1u32 << (s.len() * 4)) - 1;
-            Some(((v * 255 + max / 2) / max) as u8)
-        };
-        let r = chan(parts.next()?)?;
-        let g = chan(parts.next()?)?;
-        let b = chan(parts.next()?)?;
-        if parts.next().is_some() {
-            return None;
+            let per = n / 3;
+            let chan = |s: &str| -> Option<u8> {
+                let v = u32::from_str_radix(s, 16).ok()?;
+                let max = (1u32 << (per * 4)) - 1;
+                Some(((v * 255 + max / 2) / max) as u8)
+            };
+            let r = chan(&hex[0..per])?;
+            let g = chan(&hex[per..2 * per])?;
+            let b = chan(&hex[2 * per..3 * per])?;
+            return Some((r, g, b));
         }
-        return Some((r, g, b));
+        if let Some(rest) = spec.strip_prefix("rgb:") {
+            let mut parts = rest.split('/');
+            let chan = |s: &str| -> Option<u8> {
+                if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return None;
+                }
+                let v = u32::from_str_radix(s, 16).ok()?;
+                let max = (1u32 << (s.len() * 4)) - 1;
+                Some(((v * 255 + max / 2) / max) as u8)
+            };
+            let r = chan(parts.next()?)?;
+            let g = chan(parts.next()?)?;
+            let b = chan(parts.next()?)?;
+            if parts.next().is_some() {
+                return None;
+            }
+            return Some((r, g, b));
+        }
+        None
     }
-    None
 }
 
 #[cfg(test)]
@@ -124,36 +136,36 @@ mod tests {
 
     #[test]
     fn parse_hash_rgb_short_form() {
-        assert_eq!(parse_color_spec("#f00"), Some((255, 0, 0)));
-        assert_eq!(parse_color_spec("#0f0"), Some((0, 255, 0)));
+        assert_eq!(Color::parse_spec("#f00"), Some((255, 0, 0)));
+        assert_eq!(Color::parse_spec("#0f0"), Some((0, 255, 0)));
     }
 
     #[test]
     fn parse_hash_rrggbb() {
-        assert_eq!(parse_color_spec("#ff0000"), Some((255, 0, 0)));
-        assert_eq!(parse_color_spec("#1e1e2e"), Some((0x1e, 0x1e, 0x2e)));
+        assert_eq!(Color::parse_spec("#ff0000"), Some((255, 0, 0)));
+        assert_eq!(Color::parse_spec("#1e1e2e"), Some((0x1e, 0x1e, 0x2e)));
     }
 
     #[test]
     fn parse_hash_wide_forms_scale_down() {
-        assert_eq!(parse_color_spec("#ffff00000000"), Some((255, 0, 0)));
-        assert_eq!(parse_color_spec("#fff000000000"), Some((255, 0, 0)));
+        assert_eq!(Color::parse_spec("#ffff00000000"), Some((255, 0, 0)));
+        assert_eq!(Color::parse_spec("#fff000000000"), Some((255, 0, 0)));
     }
 
     #[test]
     fn parse_rgb_colon_form() {
-        assert_eq!(parse_color_spec("rgb:ff/00/00"), Some((255, 0, 0)));
-        assert_eq!(parse_color_spec("rgb:f/0/0"), Some((255, 0, 0)));
-        assert_eq!(parse_color_spec("rgb:ffff/0000/0000"), Some((255, 0, 0)));
+        assert_eq!(Color::parse_spec("rgb:ff/00/00"), Some((255, 0, 0)));
+        assert_eq!(Color::parse_spec("rgb:f/0/0"), Some((255, 0, 0)));
+        assert_eq!(Color::parse_spec("rgb:ffff/0000/0000"), Some((255, 0, 0)));
     }
 
     #[test]
     fn parse_rejects_malformed_specs() {
-        assert_eq!(parse_color_spec("?"), None);
-        assert_eq!(parse_color_spec(""), None);
-        assert_eq!(parse_color_spec("#12345"), None);
-        assert_eq!(parse_color_spec("rgb:zz/00/00"), None);
-        assert_eq!(parse_color_spec("rgb:ff/00"), None);
-        assert_eq!(parse_color_spec("notacolor"), None);
+        assert_eq!(Color::parse_spec("?"), None);
+        assert_eq!(Color::parse_spec(""), None);
+        assert_eq!(Color::parse_spec("#12345"), None);
+        assert_eq!(Color::parse_spec("rgb:zz/00/00"), None);
+        assert_eq!(Color::parse_spec("rgb:ff/00"), None);
+        assert_eq!(Color::parse_spec("notacolor"), None);
     }
 }

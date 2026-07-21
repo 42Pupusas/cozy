@@ -40,7 +40,9 @@ use std::sync::OnceLock;
 
 fn lib() -> Result<&'static ffi::Lib, String> {
     static LIB: OnceLock<Result<ffi::Lib, String>> = OnceLock::new();
-    LIB.get_or_init(ffi::Lib::open).as_ref().map_err(Clone::clone)
+    LIB.get_or_init(ffi::Lib::open)
+        .as_ref()
+        .map_err(Clone::clone)
 }
 
 /// Any failure standing up the XKB translation path.
@@ -390,11 +392,7 @@ mod tests {
         let raw = unsafe { memfd_create(c"xkb-test".as_ptr(), 0) };
         assert!(raw >= 0, "memfd_create failed");
         let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        let mut file = std::fs::File::from(
-            owned
-                .try_clone()
-                .expect("dup memfd"),
-        );
+        let mut file = std::fs::File::from(owned.try_clone().expect("dup memfd"));
         file.write_all(text.as_bytes()).unwrap();
         file.write_all(b"\0").unwrap();
         owned
@@ -411,10 +409,7 @@ mod tests {
     #[test]
     fn mmap_keymap_rejects_zero_size() {
         let fd = write_keymap_fd("x");
-        assert!(matches!(
-            mmap_keymap(fd.as_fd(), 0),
-            Err(XkbError::Mmap(_))
-        ));
+        assert!(matches!(mmap_keymap(fd.as_fd(), 0), Err(XkbError::Mmap(_))));
     }
 
     #[test]

@@ -60,14 +60,7 @@ fn now_local() -> Option<(i32, i32, i32, i32, i32, i32)> {
     if res.is_null() {
         return None;
     }
-    Some((
-        tm.hour,
-        tm.min,
-        tm.sec,
-        tm.year + 1900,
-        tm.mon + 1,
-        tm.mday,
-    ))
+    Some((tm.hour, tm.min, tm.sec, tm.year + 1900, tm.mon + 1, tm.mday))
 }
 
 /// Wall-clock `HH:MM:SS`, local time.

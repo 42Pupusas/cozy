@@ -941,7 +941,15 @@ impl Renderer {
         // already-resolved cell-top-to-glyph-top offset from
         // `FontFace::cell_bearing_y`, used directly (never recombined with a
         // separately-rounded ascender, which was the old baseline-jitter bug).
-        canvas.blit_glyph(&cache.atlas, &entry, px0 as i32, py0 as i32, fg, bg, bg_alpha);
+        canvas.blit_glyph(
+            &cache.atlas,
+            &entry,
+            px0 as i32,
+            py0 as i32,
+            fg,
+            bg,
+            bg_alpha,
+        );
     }
 
     /// Blit every dirty row in `snap` into the canvas.

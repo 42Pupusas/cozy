@@ -38,7 +38,13 @@ impl BluetoothStatus {
     /// "adapter present but off", which is `Ok(Some(status))` with
     /// `powered: false`).
     pub fn query(conn: &mut DbusConn) -> Result<Option<Self>, DbusError> {
-        let reply = conn.call(DEST, ROOT_PATH, OBJECT_MANAGER_IFACE, "GetManagedObjects", &[])?;
+        let reply = conn.call(
+            DEST,
+            ROOT_PATH,
+            OBJECT_MANAGER_IFACE,
+            "GetManagedObjects",
+            &[],
+        )?;
         let values = reply.values();
         let Some(objects) = values.first().and_then(Value::as_items) else {
             return Ok(None);
@@ -77,10 +83,10 @@ impl BluetoothStatus {
                         && props
                             .dict_get("Connected")
                             .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                        => {
-                            connected_count += 1;
-                        }
+                            .unwrap_or(false) =>
+                    {
+                        connected_count += 1;
+                    }
                     _ => {}
                 }
             }

@@ -13,7 +13,7 @@
 
 #![allow(non_camel_case_types)]
 
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{CStr, c_char, c_int, c_void};
 
 pub type xkb_context = c_void;
 pub type xkb_keymap = c_void;
@@ -87,8 +87,7 @@ type FnStateKeyGetOneSym = unsafe extern "C" fn(*mut xkb_state, xkb_keycode_t) -
 type FnStateKeyGetUtf32 = unsafe extern "C" fn(*mut xkb_state, xkb_keycode_t) -> u32;
 type FnStateModIndexIsActive =
     unsafe extern "C" fn(*mut xkb_state, xkb_mod_index_t, StateComponent) -> c_int;
-type FnKeymapModGetIndex =
-    unsafe extern "C" fn(*mut xkb_keymap, *const c_char) -> xkb_mod_index_t;
+type FnKeymapModGetIndex = unsafe extern "C" fn(*mut xkb_keymap, *const c_char) -> xkb_mod_index_t;
 
 /// The subset of `libxkbcommon`'s C ABI we call, resolved once via `dlopen`
 /// + `dlsym` and cached for the process lifetime.
@@ -172,8 +171,13 @@ impl Lib {
                 let cname = concat!($name, "\0");
                 // SAFETY: `handle` is the live handle just opened above;
                 // `cname` is NUL-terminated by construction.
-                unsafe { sym(handle, CStr::from_bytes_with_nul_unchecked(cname.as_bytes())) }
-                    .ok_or_else(|| format!("libxkbcommon: missing symbol `{}`", $name))?
+                unsafe {
+                    sym(
+                        handle,
+                        CStr::from_bytes_with_nul_unchecked(cname.as_bytes()),
+                    )
+                }
+                .ok_or_else(|| format!("libxkbcommon: missing symbol `{}`", $name))?
             }};
         }
 

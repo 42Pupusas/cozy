@@ -100,7 +100,9 @@ impl Brightness {
             if let Ok(mut conn) = dbus::DbusConn::system() {
                 #[allow(clippy::cast_sign_loss)]
                 let _ = dbus::logind::LogindSession::set_backlight_brightness(
-                    &mut conn, name, new_val as u32,
+                    &mut conn,
+                    name,
+                    new_val as u32,
                 );
             }
             return;

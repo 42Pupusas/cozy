@@ -579,7 +579,8 @@ impl Encoder {
             // still works after a crashed program leaves Kitty mode enabled
             // -- and every other key falls back to legacy too unless the
             // app asked to disambiguate escape codes.
-            let always_legacy = matches!(key, Key::Enter | Key::Backspace | Key::Tab) || is_bare_text;
+            let always_legacy =
+                matches!(key, Key::Enter | Key::Backspace | Key::Tab) || is_bare_text;
             if (always_legacy || !disambiguate)
                 && let Some(n) = self.encode_legacy(key, mods, buf)
             {
@@ -1588,12 +1589,18 @@ mod tests {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
         e.kitty_flags = 0b1;
-        assert_eq!(kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE), b"\r");
+        assert_eq!(
+            kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE),
+            b"\r"
+        );
         assert_eq!(
             kitty(&e, Key::Backspace, KeyState::Pressed, Modifiers::NONE),
             b"\x7f"
         );
-        assert_eq!(kitty(&e, Key::Tab, KeyState::Pressed, Modifiers::NONE), b"\t");
+        assert_eq!(
+            kitty(&e, Key::Tab, KeyState::Pressed, Modifiers::NONE),
+            b"\t"
+        );
     }
 
     #[test]
@@ -1620,12 +1627,18 @@ mod tests {
             );
         }
         // Press still produces the legacy byte, unaffected.
-        assert_eq!(kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE), b"\r");
+        assert_eq!(
+            kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE),
+            b"\r"
+        );
         assert_eq!(
             kitty(&e, Key::Backspace, KeyState::Pressed, Modifiers::NONE),
             b"\x7f"
         );
-        assert_eq!(kitty(&e, Key::Tab, KeyState::Pressed, Modifiers::NONE), b"\t");
+        assert_eq!(
+            kitty(&e, Key::Tab, KeyState::Pressed, Modifiers::NONE),
+            b"\t"
+        );
     }
 
     #[test]
@@ -1642,9 +1655,18 @@ mod tests {
             e.keyboard_mode = KeyboardMode::Kitty;
             e
         };
-        assert_eq!(kitty(&e, Key::Char('a'), KeyState::Pressed, Modifiers::NONE), b"a");
-        assert_eq!(kitty(&e, Key::Char('Z'), KeyState::Pressed, Modifiers::SHIFT), b"Z");
-        assert_eq!(kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE), b"\r");
+        assert_eq!(
+            kitty(&e, Key::Char('a'), KeyState::Pressed, Modifiers::NONE),
+            b"a"
+        );
+        assert_eq!(
+            kitty(&e, Key::Char('Z'), KeyState::Pressed, Modifiers::SHIFT),
+            b"Z"
+        );
+        assert_eq!(
+            kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE),
+            b"\r"
+        );
     }
 
     #[test]

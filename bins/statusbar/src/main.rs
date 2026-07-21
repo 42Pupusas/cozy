@@ -148,11 +148,17 @@ fn main() {
         let c = cfg.bar_background();
         Color::rgb(c.r, c.g, c.b)
     };
-    // `.clamp(0.0, 255.0)` right before the cast lets clippy prove the
-    // truncation/sign-loss can't happen (rather than needing an allow).
-    let bg_alpha = (cfg.bar_opacity().clamp(0.0, 1.0) * 255.0)
-        .round()
-        .clamp(0.0, 255.0) as u8;
+    // Pixel-alpha float->int conversion: `.clamp(0.0, 1.0)` before
+    // multiplying guarantees the result is in `0.0..=255.0`, so the
+    // truncation/sign-loss this cast could otherwise cause can't actually
+    // happen -- but clippy's cast_possible_truncation/cast_sign_loss fire
+    // on float->int cast syntax unconditionally regardless of provable
+    // range (stable Rust has no checked/saturating float->int conversion
+    // API), so this is a deliberate, reviewed allow rather than a
+    // hand-rolled slower conversion with no behavior change -- matches
+    // `platform::Renderer::set_opacity`'s identical cast.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let bg_alpha = (cfg.bar_opacity().clamp(0.0, 1.0) * 255.0).round() as u8;
     window.set_background(bg);
 
     // Font size is a point size (like the terminal's own `[font] size`);

@@ -94,7 +94,15 @@ impl Outline {
         let y_max = d.i16_at(8).ok_or(ParseError::TooShort)?;
 
         if num_contours >= 0 {
-            Self::decode_simple(d, num_contours as usize, x_min, y_min, x_max, y_max)
+            // Checked non-negative above, so the sign-preserving cast is exact.
+            Self::decode_simple(
+                d,
+                num_contours.cast_unsigned() as usize,
+                x_min,
+                y_min,
+                x_max,
+                y_max,
+            )
         } else {
             Self::decode_composite(glyf_data, d, loca, depth, x_min, y_min, x_max, y_max)
         }
@@ -162,7 +170,10 @@ impl Outline {
                 v
             };
             x_acc += dx;
-            xs.push(x_acc as i16);
+            // A well-formed glyf table's accumulated coordinates never leave
+            // FUnits range (i16); a malformed font could overflow that, so
+            // clamp defensively rather than wrapping into a bogus point.
+            xs.push(i16::try_from(x_acc).unwrap_or(if x_acc > 0 { i16::MAX } else { i16::MIN }));
         }
 
         // ── Y coordinates ─────────────────────────────────────────────────
@@ -181,7 +192,8 @@ impl Outline {
                 v
             };
             y_acc += dy;
-            ys.push(y_acc as i16);
+            // Same defensive clamp as the x-coordinate accumulator above.
+            ys.push(i16::try_from(y_acc).unwrap_or(if y_acc > 0 { i16::MAX } else { i16::MIN }));
         }
 
         // ── Build verbs ───────────────────────────────────────────────────

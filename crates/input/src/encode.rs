@@ -731,7 +731,7 @@ impl SeqWriter<'_> {
 /// ASCII letters and the standard US-QWERTY punctuation row have an
 /// explicit shifted form (1 -> !, a -> A, ...). Anything else -- accented
 /// letters, CJK, emoji, or any other Unicode scalar the platform layer
-/// hands us via Key::Char -- is passed through as its own UTF-8 encoding
+/// hands us via `Key::Char` -- is passed through as its own UTF-8 encoding
 /// rather than collapsed to a placeholder space, so IME/compose input and
 /// clipboard paste-as-keys round-trip correctly.
 trait EncodeTerminalChar {
@@ -823,7 +823,7 @@ impl EncodeTerminalChar for char {
 enum KittyKey {
     /// `CSI <num> ; <mod> : <evt> u` — codepoint keys (text + PUA functionals).
     Unicode(u32),
-    /// `CSI <num> ; <mod> : <evt> ~` — tilde-form functionals (Insert, PgUp…).
+    /// `CSI <num> ; <mod> : <evt> ~` — tilde-form functionals (Insert, `PgUp`…).
     Tilde(u32),
     /// `CSI 1 ; <mod> : <evt> <letter>` — letter-form functionals (arrows…).
     Letter(u8),

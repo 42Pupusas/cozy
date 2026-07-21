@@ -25,16 +25,6 @@
 //! | `Normal`   | `CSI ? 1000 h`| Press+release, 3 bytes   |
 //! | `Sgr`      | `CSI ? 1006 h`| Press+release, variable  |
 
-#![warn(clippy::pedantic)]
-#![warn(clippy::nursery)]
-#![warn(clippy::perf)]
-#![warn(clippy::style)]
-#![allow(
-    clippy::missing_docs_in_private_items,
-    clippy::doc_markdown,
-    clippy::module_name_repetitions
-)]
-
 pub mod encode;
 pub mod key;
 pub mod mouse;

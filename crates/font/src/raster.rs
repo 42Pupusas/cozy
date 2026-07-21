@@ -8,6 +8,22 @@
 //!
 //! Pure Rust, zero allocations beyond the output bitmap and temporary edge list.
 
+// Glyph rasterization is inherently float<->int pixel math (subpixel
+// coverage accumulation, scanline/column indices <-> f32 coordinates).
+// Every such cast here is bounded by the glyph's own bitmap dimensions and
+// correct by construction, but clippy's cast_possible_truncation/
+// cast_sign_loss/cast_precision_loss lints fire on float<->int cast syntax
+// unconditionally -- there is no clamp/try_from that satisfies them for a
+// float source (stable Rust has no checked/saturating float->int
+// conversion API), so this is the one deliberate, reviewed allow in this
+// module rather than scattering per-site allows or hand-rolling slower
+// manual conversions with no behavior change.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+
 use crate::outline::{Outline, Point, Verb};
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -100,43 +116,26 @@ impl Edge {
             edges.extend(Self::new(p0, p1));
             return;
         }
-        // De Casteljau midpoint split.
-        let m0 = p0.lerp2(ctrl, 0.5);
-        let m1 = ctrl.lerp2(p1, 0.5);
-        let mid = m0.lerp2(m1, 0.5);
-        Self::subdivide_quad(edges, p0, m0, mid, depth - 1);
-        Self::subdivide_quad(edges, mid, m1, p1, depth - 1);
+        // Split the quadratic Bézier at t=0.5 (de Casteljau).
+        let mid = |a: (f32, f32), b: (f32, f32)| ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+        let p01 = mid(p0, ctrl);
+        let p12 = mid(ctrl, p1);
+        let split = mid(p01, p12);
+        Self::subdivide_quad(edges, p0, p01, split, depth - 1);
+        Self::subdivide_quad(edges, split, p12, p1, depth - 1);
     }
 }
 
-/// Extends the `(f32, f32)` pixel-coordinate pair with linear interpolation,
-/// as a method instead of a free `lerp2(a, b, t)` function -- mirrors
-/// [`crate::outline::Point::lerp`] for the raw-tuple form used during
-/// rasterization.
-trait Lerp2 {
-    fn lerp2(self, other: Self, t: f32) -> Self;
-}
-
-impl Lerp2 for (f32, f32) {
-    fn lerp2(self, other: Self, t: f32) -> Self {
-        (
-            (other.0 - self.0).mul_add(t, self.0),
-            (other.1 - self.1).mul_add(t, self.1),
-        )
-    }
-}
-
-// ── Public entry ──────────────────────────────────────────────────────────────
+// ── Rasterizer ──────────────────────────────────────────────────────────────
 
 impl Outline {
-    /// Rasterize this outline into a bitmap of size `w × h`.
+    /// Rasterize this outline into an 8-bit alpha [`Bitmap`] of size `w × h`,
+    /// scaling font units by `scale` and placing the glyph so its baseline
+    /// sits at pixel row `baseline` (with `x_offset` shifting horizontally).
     ///
-    /// `scale`     — font-units → pixels (typically `px_size / units_per_em`)
-    /// `baseline`  — Y pixel at which the font baseline sits (usually close to `h`)
-    /// `x_offset`  — horizontal shift in pixels (left side bearing applied by caller)
-    ///
-    /// Was a free `rasterize(outline: &Outline, ..)` function — moved onto
-    /// `Outline` itself since it's the only thing being consumed here; this
+    /// Was a free `rasterize(outline: &Outline, ..)` function -- moved onto
+    /// `Outline` as the type being consumed, matching the `T::method(&self)`
+    /// convention used throughout this crate. The `Self::rasterize` name
     /// also disambiguates by name from `FontFace::rasterize` (`outline.rasterize(..)`
     /// vs `face.rasterize(codepoint)`) instead of both being called `rasterize`
     /// at different scopes.

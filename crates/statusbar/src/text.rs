@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use font::{Atlas, FontFace, GlyphEntry};
 use platform::draw::{Canvas, Color};
 use platform::font as bitmap_font;
-use platform::text::blit_glyph;
 
 /// Chosen once at bar startup from `[bar] font_path`/`font_size` (mirroring
 /// `[font]` when unset) -- see `config::Config::bar_font_path`.
@@ -195,10 +194,10 @@ impl TextRenderer {
                     let Some(entry) = f.entry(ch as u32) else {
                         continue;
                     };
-                    // `blit_glyph` (shared with `platform::Renderer`) adds the
+                    // `Canvas::blit_glyph` (shared with `platform::Renderer`) adds the
                     // glyph's bearing to this pen origin and no-ops on a blank
                     // glyph, so no width/height guard is needed here.
-                    blit_glyph(canvas, &f.atlas, &entry, pen_x, y, fg, bg, bg_alpha);
+                    canvas.blit_glyph(&f.atlas, &entry, pen_x, y, fg, bg, bg_alpha);
                     pen_x += entry.advance;
                 }
                 pen_x

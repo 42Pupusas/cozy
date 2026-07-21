@@ -8,7 +8,8 @@
 //!    keymap says that key produces right now — remaps included (e.g.
 //!    niri's `input.keyboard.xkb` swapping Esc and CapsLock). This is the
 //!    path used whenever `libxkbcommon` loaded and the keymap compiled.
-//!    [`keysym_to_key`] turns the resulting keysym into our [`Key`] enum.
+//!    [`XkbKeysym::from_raw`] + [`XkbKeysym::to_key`] turn the resulting
+//!    keysym into our [`Key`] enum.
 //!
 //! 2. **Physical-only fallback** ([`PhysicalKey::to_logical`]): used only
 //!    when XKB is unavailable (library missing, keymap fd never arrived
@@ -50,7 +51,7 @@ impl PhysicalKey for Key {
 /// code (e.g. `Key`/`SeatCapability` just above/below in `protocol.rs`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
-enum XkbKeysym {
+pub(crate) enum XkbKeysym {
     BackSpace = 0xff08,
     Tab = 0xff09,
     Return = 0xff0d,
@@ -93,7 +94,7 @@ enum XkbKeysym {
 }
 
 impl XkbKeysym {
-    fn from_raw(raw: u32) -> Option<Self> {
+    pub(crate) fn from_raw(raw: u32) -> Option<Self> {
         Some(match raw {
             0xff08 => Self::BackSpace,
             0xff09 => Self::Tab,
@@ -139,59 +140,67 @@ impl XkbKeysym {
     }
 }
 
-/// Translate one XKB keysym into our [`Key`] enum. Returns `None` for a
-/// keysym we don't act on (dead keys, media keys, …) — callers should then
-/// try [`char_key`] for anything with a direct Unicode mapping, and finally
-/// fall back to the physical-keycode path if both come back empty.
-#[must_use]
-pub fn keysym_to_key(raw: u32) -> Option<Key> {
-    XkbKeysym::from_raw(raw).map(|k| match k {
-        XkbKeysym::BackSpace => Key::Backspace,
-        XkbKeysym::Tab => Key::Tab,
-        XkbKeysym::Return | XkbKeysym::KpEnter => Key::Enter,
-        XkbKeysym::Escape => Key::Esc,
-        XkbKeysym::Delete => Key::Delete,
-        XkbKeysym::Insert => Key::Insert,
-        XkbKeysym::Home => Key::Home,
-        XkbKeysym::End => Key::End,
-        XkbKeysym::PageUp => Key::PageUp,
-        XkbKeysym::PageDown => Key::PageDown,
-        XkbKeysym::Left => Key::Left,
-        XkbKeysym::Up => Key::Up,
-        XkbKeysym::Right => Key::Right,
-        XkbKeysym::Down => Key::Down,
-        XkbKeysym::F1 => Key::F1,
-        XkbKeysym::F2 => Key::F2,
-        XkbKeysym::F3 => Key::F3,
-        XkbKeysym::F4 => Key::F4,
-        XkbKeysym::F5 => Key::F5,
-        XkbKeysym::F6 => Key::F6,
-        XkbKeysym::F7 => Key::F7,
-        XkbKeysym::F8 => Key::F8,
-        XkbKeysym::F9 => Key::F9,
-        XkbKeysym::F10 => Key::F10,
-        XkbKeysym::F11 => Key::F11,
-        XkbKeysym::F12 => Key::F12,
-        XkbKeysym::ShiftL | XkbKeysym::ShiftR => Key::LShift,
-        XkbKeysym::ControlL | XkbKeysym::ControlR => Key::LCtrl,
-        XkbKeysym::CapsLock => Key::CapsLock,
-        // No dedicated NumLock/ScrollLock/Menu/Super variants in
-        // `protocol::Key` today (only `input::Key` has them) -- these never
-        // reach the encoder as anything but modifier-only no-ops either
-        // way, so mapping them to the nearest existing modifier variant
-        // (rather than dropping the event) keeps repeat-suppression /
-        // is_modifier() correct without inventing wire-protocol variants
-        // nothing else in `platform` uses.
-        XkbKeysym::NumLock | XkbKeysym::ScrollLock => Key::CapsLock,
-        XkbKeysym::AltL | XkbKeysym::AltR => Key::LAlt,
-        XkbKeysym::SuperL | XkbKeysym::SuperR => Key::LMeta,
-        XkbKeysym::Menu => Key::LMeta,
-    })
+/// Extends `XkbKeysym` with its translation to our `Key` enum, as a method
+/// instead of a free function -- `XkbKeysym` is the natural owner since this
+/// is purely a fold over its own variants.
+impl XkbKeysym {
+    /// Translate this XKB keysym into our `Key` enum.
+    pub(crate) fn to_key(self) -> Key {
+        match self {
+            Self::BackSpace => Key::Backspace,
+            Self::Tab => Key::Tab,
+            Self::Return | Self::KpEnter => Key::Enter,
+            Self::Escape => Key::Esc,
+            Self::Delete => Key::Delete,
+            Self::Insert => Key::Insert,
+            Self::Home => Key::Home,
+            Self::End => Key::End,
+            Self::PageUp => Key::PageUp,
+            Self::PageDown => Key::PageDown,
+            Self::Left => Key::Left,
+            Self::Up => Key::Up,
+            Self::Right => Key::Right,
+            Self::Down => Key::Down,
+            Self::F1 => Key::F1,
+            Self::F2 => Key::F2,
+            Self::F3 => Key::F3,
+            Self::F4 => Key::F4,
+            Self::F5 => Key::F5,
+            Self::F6 => Key::F6,
+            Self::F7 => Key::F7,
+            Self::F8 => Key::F8,
+            Self::F9 => Key::F9,
+            Self::F10 => Key::F10,
+            Self::F11 => Key::F11,
+            Self::F12 => Key::F12,
+            Self::ShiftL | Self::ShiftR => Key::LShift,
+            Self::ControlL | Self::ControlR => Key::LCtrl,
+            Self::CapsLock => Key::CapsLock,
+            // No dedicated NumLock/ScrollLock/Menu/Super variants in
+            // `protocol::Key` today (only `input::Key` has them) -- these
+            // never reach the encoder as anything but modifier-only no-ops
+            // either way, so mapping them to the nearest existing modifier
+            // variant (rather than dropping the event) keeps
+            // repeat-suppression / is_modifier() correct without inventing
+            // wire-protocol variants nothing else in `platform` uses.
+            Self::NumLock | Self::ScrollLock => Key::CapsLock,
+            Self::AltL | Self::AltR => Key::LAlt,
+            Self::SuperL | Self::SuperR => Key::LMeta,
+            Self::Menu => Key::LMeta,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Mirrors the call-site pattern in `window.rs`'s
+    /// `resolve_logical_key`: `XkbKeysym::from_raw` then `to_key`, with no
+    /// intermediate free-fn wrapper -- see module docs.
+    fn keysym_to_key(raw: u32) -> Option<Key> {
+        XkbKeysym::from_raw(raw).map(XkbKeysym::to_key)
+    }
 
     #[test]
     fn niri_swapped_esc_capslock_keysyms_translate_correctly() {

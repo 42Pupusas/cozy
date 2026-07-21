@@ -923,7 +923,7 @@ impl TermWindow {
         if let Some(xkb) = &self.xkb {
             let sym = xkb.keysym(evdev_code);
             if sym != 0 {
-                if let Some(k) = keymap::keysym_to_key(sym) {
+                if let Some(k) = keymap::XkbKeysym::from_raw(sym).map(keymap::XkbKeysym::to_key) {
                     return Some(k);
                 }
                 // A real (non-NoSymbol) keysym came back but it's outside

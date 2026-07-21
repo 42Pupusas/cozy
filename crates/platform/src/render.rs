@@ -935,22 +935,13 @@ impl Renderer {
         let Some(entry) = cache.entry(ch as u32) else {
             return;
         };
-        // The atlas blend is the shared kernel (see `crate::text::blit_glyph`).
+        // The atlas blend is the shared kernel (see `Canvas::blit_glyph`).
         // The glyph's pen origin is the cell's top-left (`px0`, `py0`); the
         // kernel adds `entry.bearing_x`/`bearing_y` -- `bearing_y` is the
         // already-resolved cell-top-to-glyph-top offset from
         // `FontFace::cell_bearing_y`, used directly (never recombined with a
         // separately-rounded ascender, which was the old baseline-jitter bug).
-        crate::text::blit_glyph(
-            canvas,
-            &cache.atlas,
-            &entry,
-            px0 as i32,
-            py0 as i32,
-            fg,
-            bg,
-            bg_alpha,
-        );
+        canvas.blit_glyph(&cache.atlas, &entry, px0 as i32, py0 as i32, fg, bg, bg_alpha);
     }
 
     /// Blit every dirty row in `snap` into the canvas.

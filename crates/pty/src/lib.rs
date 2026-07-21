@@ -307,6 +307,13 @@ impl Pty {
                             self.read_pending = Some(len);
                         }
                     }
+                    CqeAction::ReadRetry => {
+                        // Transient errno (EINTR/EAGAIN) — nothing was read;
+                        // re-arm and keep going. Treating this as EOF (the
+                        // old behaviour) tore the whole session down on a
+                        // stray signal.
+                        self.arm_read()?;
+                    }
                     CqeAction::ReadEof => {
                         // EOF or EIO on the master fd: the child closed the
                         // slave side (it exited or is exiting). The SIGCHLD
@@ -396,7 +403,7 @@ impl Pty {
         let mut quit = false;
         while let Some(msg) = next_input() {
             match msg {
-                PtyInput::Bytes(b) => self.pending_write.extend(b.iter().copied()),
+                PtyInput::Bytes(b) => self.pending_write.extend(b),
                 PtyInput::Resize(ws) => pending_resize = Some(ws),
                 PtyInput::Quit => quit = true,
             }
@@ -412,16 +419,15 @@ impl Pty {
         if self.write_in_flight || self.pending_write.is_empty() {
             return Ok(());
         }
-        let mut len = 0usize;
-        while len < WRITE_BUF_SIZE {
-            match self.pending_write.pop_front() {
-                Some(b) => {
-                    self.write_buf[len] = b;
-                    len += 1;
-                }
-                None => break,
-            }
-        }
+        // Batch-copy from the deque's two contiguous halves instead of a
+        // per-byte pop_front (which pays a wraparound branch every byte —
+        // noticeable when a large paste floods pending_write).
+        let len = WRITE_BUF_SIZE.min(self.pending_write.len());
+        let (head, tail) = self.pending_write.as_slices();
+        let from_head = len.min(head.len());
+        self.write_buf[..from_head].copy_from_slice(&head[..from_head]);
+        self.write_buf[from_head..len].copy_from_slice(&tail[..len - from_head]);
+        self.pending_write.drain(..len);
         self.write_len = len;
         self.write_in_flight = true;
         // SAFETY: write_buf is a stable heap allocation owned by self; it is
@@ -538,6 +544,9 @@ impl Pty {
 enum CqeAction {
     None,
     ReadOk(usize),
+    /// Master-fd read completed with a transient errno (`EINTR`/`EAGAIN`) —
+    /// no data, no EOF; just re-arm the read.
+    ReadRetry,
     /// Master-fd read returned 0 (EOF) or an error (typically EIO once the
     /// child exits and the slave side closes) — both mean "child gone".
     ReadEof,
@@ -551,9 +560,15 @@ impl CqeAction {
     const fn from_cqe(user_data: u64, result: i32) -> Self {
         match user_data {
             tag::READ => {
+                const EAGAIN: i32 = 11;
+                const EINTR: i32 = 4;
                 if result > 0 {
                     Self::ReadOk(result as usize)
+                } else if result == -EAGAIN || result == -EINTR {
+                    Self::ReadRetry
                 } else {
+                    // 0 (EOF) or a fatal errno (typically -EIO once the
+                    // child exits and the slave side closes) — child gone.
                     Self::ReadEof
                 }
             }

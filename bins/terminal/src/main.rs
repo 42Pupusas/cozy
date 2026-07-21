@@ -125,6 +125,15 @@ const ROWS: u16 = 24;
 /// PTY read buffer size.
 const PTY_BUF: usize = 4096;
 
+// A PTY read chunk must fit in one `ParserMsg::Data` slot: `Pty::run`
+// retries the *whole* rejected buffer when `on_output` returns false, so
+// the push must be all-or-nothing — splitting one read across several ring
+// slots would deliver the already-pushed parts twice on retry.
+const _: () = assert!(
+    pty::READ_BUF_SIZE <= PTY_BUF,
+    "a PTY read chunk must fit in one ParserMsg::Data slot"
+);
+
 // Ring topology (3 rings, one per directed edge of the pty→parser→ui→pty
 // cycle -- the data ring carries its read buffer inline, so no separate
 // free-list ring is needed to recycle buffers parser→pty):
@@ -561,9 +570,12 @@ impl PtyWorker {
         };
 
         // Adapter: PTY output chunks → parser ring. `bytes` never exceeds
-        // `pty::READ_BUF_SIZE`, which equals `PTY_BUF`, so this is always a
-        // single chunk in practice; the loop stays defensive against either
-        // constant changing independently in the future.
+        // `pty::READ_BUF_SIZE`, which equals `PTY_BUF` (compile-time
+        // asserted below), so a chunk always fits in exactly one ring slot.
+        // This must NOT be a push-per-part loop: `Pty::run` retries the
+        // *whole* rejected buffer on `false`, so partially pushing several
+        // parts and then failing would deliver the pushed parts twice on
+        // retry. All-or-nothing is the only retry-safe shape.
         //
         // The read bytes are copied *inline* into the `ParserMsg::Data` slot
         // (the ring slot is the buffer -- no `Box`, no free-list recycle
@@ -575,20 +587,14 @@ impl PtyWorker {
         // of silently dropping the chunk. The kernel's own pty output buffer
         // then fills up and throttles the child's `write(2)` calls for us.
         let on_output = move |bytes: &[u8]| -> bool {
-            for part in bytes.chunks(PTY_BUF) {
-                let mut buf = [0u8; PTY_BUF];
-                buf[..part.len()].copy_from_slice(part);
-                if parser_tx
-                    .push(ParserMsg::Data(PtyChunk {
-                        buf,
-                        len: part.len(),
-                    }))
-                    .is_err()
-                {
-                    return false;
-                }
-            }
-            true
+            let mut buf = [0u8; PTY_BUF];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            parser_tx
+                .push(ParserMsg::Data(PtyChunk {
+                    buf,
+                    len: bytes.len(),
+                }))
+                .is_ok()
         };
 
         match pty.run(next_input, on_output) {

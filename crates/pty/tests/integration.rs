@@ -6,6 +6,11 @@ use std::time::{Duration, Instant};
 
 /// Poll `try_read` until it yields data, EOF, or the deadline passes.
 /// Returns accumulated bytes.
+// EOF and a read error both break the loop the same way, but they're kept as
+// separate match arms (rather than merged with `|`) because they're
+// semantically distinct outcomes -- a future change handling one differently
+// (e.g. asserting on the error) shouldn't have to first split them back apart.
+#[allow(clippy::match_same_arms)]
 fn read_until(pty: &mut PtySimple, deadline: Duration) -> Vec<u8> {
     let start = Instant::now();
     let mut out = Vec::new();
@@ -58,11 +63,8 @@ fn nonexistent_shell_returns_err_not_panic() {
     let result = PtySimple::spawn("/definitely/not/a/real/shell", &[], 80, 24);
     // Either an error surfaces, or spawn succeeds and the child just exits
     // 127 immediately -- both are acceptable, but neither may panic.
-    match result {
-        Ok(mut pty) => {
-            let _ = read_until(&mut pty, Duration::from_secs(1));
-        }
-        Err(_) => {}
+    if let Ok(mut pty) = result {
+        let _ = read_until(&mut pty, Duration::from_secs(1));
     }
 }
 

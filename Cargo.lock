@@ -60,6 +60,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dbus"
+version = "0.1.0"
+dependencies = [
+ "ququmatz",
+]
+
+[[package]]
 name = "divan"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -209,6 +216,7 @@ name = "statusbar"
 version = "0.1.0"
 dependencies = [
  "config",
+ "dbus",
  "font",
  "platform",
  "quetzalcoatl",

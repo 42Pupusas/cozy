@@ -59,22 +59,6 @@ impl AppStatus {
     }
 }
 
-/// Run `niri msg --json windows` and parse it into typed windows. `None` if
-/// the command couldn't be run/parsed (not running under niri, `niri`
-/// missing from `PATH`, socket unreachable, ...) -- callers treat that the
-/// same as any other unreachable module.
-fn niri_windows() -> Option<Vec<NiriWindow>> {
-    let out = Command::new("niri")
-        .args(["msg", "--json", "windows"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(out.stdout).ok()?;
-    parse_str(&text).ok()
-}
-
 /// One rendered notification segment, paired with whether it should be
 /// painted in the "unread" color -- see `ModuleKind::color_for`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,61 +67,99 @@ pub struct NotificationSegment {
     pub unread: bool,
 }
 
-/// Resolve every configured `[[bar.notifications]]` rule against an
-/// already-fetched window list, in the same order as `rules`. Pure (no
-/// process I/O) so it's directly unit-testable against fixture windows --
-/// [`query`] is just this plus the `niri msg` fetch.
-fn resolve(rules: &[config::NotificationRule], windows: &[NiriWindow]) -> Vec<NotificationSegment> {
-    rules
-        .iter()
-        .map(|rule| {
-            let needle = rule.app_id.to_ascii_lowercase();
-            let matched = windows.iter().filter(|w| {
-                w.app_id
-                    .as_deref()
-                    .is_some_and(|id| id.to_ascii_lowercase().contains(&needle))
-            });
-            let mut status = AppStatus::default();
-            for w in matched {
-                status.running = true;
-                status.unread |= w.is_urgent;
-            }
-            NotificationSegment {
-                rendered: status.render(&rule.icon),
-                unread: status.unread,
-            }
-        })
-        .collect()
-}
-
-/// Query niri once and resolve every configured `[[bar.notifications]]`
-/// rule against it, in the same order as `rules`. `None` if the niri query
-/// itself failed; `Some(vec![])` if `rules` is empty (no notifications
-/// configured -- the common case until the user opts an app in, and this
-/// short-circuits before ever touching niri, so a compositor without niri
-/// IPC doesn't matter until the user actually configures a rule).
-#[must_use]
-pub fn query(rules: &[config::NotificationRule]) -> Option<Vec<NotificationSegment>> {
-    if rules.is_empty() {
-        return Some(Vec::new());
-    }
-    let windows = niri_windows()?;
-    Some(resolve(rules, &windows))
-}
-
 /// The dot glyph [`AppStatus::render`] appends after an app's icon when
 /// it's unread (nf-md `circle`, U+F0765).
 pub const UNREAD_DOT: char = '\u{f0765}';
 
-/// Whether a rendered segment string should be painted in the "unread"
-/// color -- re-derived from the string itself (not carried alongside it,
-/// since `ModuleKind::color_for` only ever sees the rendered string) by
-/// checking for the trailing dot [`AppStatus::render`] appends. Works
-/// regardless of which app's (variable-length) icon precedes it, unlike a
-/// length comparison against one fixed icon.
-#[must_use]
-pub fn is_unread_text(text: &str) -> bool {
-    text.ends_with(UNREAD_DOT)
+/// `[[bar.notifications]]` resolution -- a marker type (like
+/// [`crate::volume::Volume`]) rather than a value: fetching/resolving is
+/// always against the caller's current `rules` slice, there's nothing to
+/// cache here.
+pub struct Notifications;
+
+impl Notifications {
+    /// Run `niri msg --json windows` and parse it into typed windows. `None`
+    /// if the command couldn't be run/parsed (not running under niri, `niri`
+    /// missing from `PATH`, socket unreachable, ...) -- callers treat that
+    /// the same as any other unreachable module.
+    fn niri_windows() -> Option<Vec<NiriWindow>> {
+        let out = Command::new("niri")
+            .args(["msg", "--json", "windows"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8(out.stdout).ok()?;
+        parse_str(&text).ok()
+    }
+
+    /// Resolve every configured `[[bar.notifications]]` rule against an
+    /// already-fetched window list, in the same order as `rules`. Pure (no
+    /// process I/O) so it's directly unit-testable against fixture windows
+    /// -- [`Self::query`] is just this plus the `niri msg` fetch.
+    fn resolve(
+        rules: &[config::NotificationRule],
+        windows: &[NiriWindow],
+    ) -> Vec<NotificationSegment> {
+        rules
+            .iter()
+            .map(|rule| {
+                let needle = rule.app_id.to_ascii_lowercase();
+                let matched = windows.iter().filter(|w| {
+                    w.app_id
+                        .as_deref()
+                        .is_some_and(|id| id.to_ascii_lowercase().contains(&needle))
+                });
+                let mut status = AppStatus::default();
+                for w in matched {
+                    status.running = true;
+                    status.unread |= w.is_urgent;
+                }
+                NotificationSegment {
+                    rendered: status.render(&rule.icon),
+                    unread: status.unread,
+                }
+            })
+            .collect()
+    }
+
+    /// Query niri once and resolve every configured `[[bar.notifications]]`
+    /// rule against it, in the same order as `rules`. `None` if the niri
+    /// query itself failed; `Some(vec![])` if `rules` is empty (no
+    /// notifications configured -- the common case until the user opts an
+    /// app in, and this short-circuits before ever touching niri, so a
+    /// compositor without niri IPC doesn't matter until the user actually
+    /// configures a rule).
+    #[must_use]
+    pub fn query(rules: &[config::NotificationRule]) -> Option<Vec<NotificationSegment>> {
+        if rules.is_empty() {
+            return Some(Vec::new());
+        }
+        let windows = Self::niri_windows()?;
+        Some(Self::resolve(rules, &windows))
+    }
+}
+
+/// Extends `str` with the "is this a rendered unread-notification segment"
+/// check, as a method instead of a free `is_unread_text(text)` function --
+/// per the crate-wide rule, reusable logic with no obvious struct owner
+/// belongs on a trait over the primitive it operates on (matches
+/// `colors::TrailingPercent` on `str`).
+pub trait UnreadMarker {
+    /// Whether a rendered segment string should be painted in the "unread"
+    /// color -- re-derived from the string itself (not carried alongside
+    /// it, since `ModuleKind::color_for` only ever sees the rendered
+    /// string) by checking for the trailing dot [`AppStatus::render`]
+    /// appends. Works regardless of which app's (variable-length) icon
+    /// precedes it, unlike a length comparison against one fixed icon.
+    fn is_unread_text(&self) -> bool;
+}
+
+impl UnreadMarker for str {
+    fn is_unread_text(&self) -> bool {
+        self.ends_with(UNREAD_DOT)
+    }
 }
 
 #[cfg(test)]
@@ -172,7 +194,7 @@ mod tests {
         // `rules` empty short-circuits before ever touching niri -- can't
         // observe that directly in a unit test, but it must not panic/error
         // even when `niri` isn't on PATH (as in CI).
-        assert_eq!(query(&[]), Some(Vec::new()));
+        assert_eq!(Notifications::query(&[]), Some(Vec::new()));
     }
 
     #[test]
@@ -200,9 +222,9 @@ mod tests {
 
     #[test]
     fn is_unread_text_distinguishes_plain_icon_from_icon_plus_dot() {
-        assert!(!is_unread_text("X"));
-        assert!(is_unread_text("X \u{f0765}"));
-        assert!(!is_unread_text(""));
+        assert!(!"X".is_unread_text());
+        assert!("X \u{f0765}".is_unread_text());
+        assert!(!"".is_unread_text());
     }
 
     #[test]
@@ -222,7 +244,7 @@ mod tests {
             },
         ];
         let rules = [rule("mattermost", "M"), rule("Slack", "S")];
-        let results = resolve(&rules, &windows);
+        let results = Notifications::resolve(&rules, &windows);
         assert_eq!(results[0].rendered, "M \u{f0765}");
         assert!(results[0].unread);
         assert_eq!(results[1].rendered, ""); // no Slack window open
@@ -236,7 +258,7 @@ mod tests {
             is_urgent: false,
         }];
         let rules = [rule("mattermost", "M")];
-        let results = resolve(&rules, &windows);
+        let results = Notifications::resolve(&rules, &windows);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].rendered, "");
         assert!(!results[0].unread);

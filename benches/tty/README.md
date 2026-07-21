@@ -74,6 +74,6 @@ benches that want to catch effects that only show up at larger geometry.
 
 ## Adding a corpus
 
-Add a `fn(cols: u16, rows: u16, n: usize) -> Vec<u8>` to `src/lib.rs` and
-list it in `CORPORA`; every `#[divan::bench(args = CORPORA)]` benchmark
-picks it up automatically.
+Add a `fn(cols: u16, rows: u16, n: usize) -> Vec<u8>` associated function on
+`Corpora` in `src/lib.rs` and list it in `CORPORA`; every
+`#[divan::bench(args = CORPORA)]` benchmark picks it up automatically.

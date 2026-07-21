@@ -49,7 +49,7 @@ pub enum ModuleKind {
     Brightness,
     /// Any `[[bar.notifications]]` segment (Mattermost, Slack, ...) --
     /// shared by every configured rule since the color only depends on
-    /// unread state, not which app; see `notifications::is_unread_text`.
+    /// unread state, not which app; see `notifications::UnreadMarker`.
     Notification,
 }
 
@@ -147,7 +147,8 @@ impl ModuleKind {
             }
             Self::Brightness => YELLOW,
             Self::Notification => {
-                if crate::notifications::is_unread_text(text) {
+                use crate::notifications::UnreadMarker;
+                if text.is_unread_text() {
                     RED // unread mention/notification -- matches the old waybar red dot
                 } else {
                     BLUE

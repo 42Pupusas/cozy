@@ -44,37 +44,46 @@ unsafe extern "C" {
     fn localtime_r(t: *const i64, result: *mut Tm) -> *mut Tm;
 }
 
-/// Read the current local time as `(hour, min, sec, year, month, day)` --
-/// `year` is the full calendar year (already `+1900`-adjusted from libc's
-/// `tm_year`), `month` is 1-12 (already `+1`-adjusted from libc's 0-11).
-fn now_local() -> Option<(i32, i32, i32, i32, i32, i32)> {
-    let mut t: i64 = 0;
-    // SAFETY: `&raw mut t` is a valid, aligned `*mut i64` for the duration
-    // of this call.
-    unsafe { time(&raw mut t) };
-    let mut tm = Tm::default();
-    // SAFETY: `&raw const t` and `&raw mut tm` are both valid for the
-    // duration of this call; `localtime_r` writes into `tm` and returns a
-    // pointer aliasing it (or null on failure) rather than allocating.
-    let res = unsafe { localtime_r(&raw const t, &raw mut tm) };
-    if res.is_null() {
-        return None;
+/// Raw libc local-time reads -- a marker type (like [`crate::clock::Clock`],
+/// which builds on top of this) rather than a value: every call re-reads
+/// the current time, there's nothing to cache.
+pub struct LocalTime;
+
+impl LocalTime {
+    /// Read the current local time as `(hour, min, sec, year, month, day)`
+    /// -- `year` is the full calendar year (already `+1900`-adjusted from
+    /// libc's `tm_year`), `month` is 1-12 (already `+1`-adjusted from
+    /// libc's 0-11).
+    fn now() -> Option<(i32, i32, i32, i32, i32, i32)> {
+        let mut t: i64 = 0;
+        // SAFETY: `&raw mut t` is a valid, aligned `*mut i64` for the
+        // duration of this call.
+        unsafe { time(&raw mut t) };
+        let mut tm = Tm::default();
+        // SAFETY: `&raw const t` and `&raw mut tm` are both valid for the
+        // duration of this call; `localtime_r` writes into `tm` and returns
+        // a pointer aliasing it (or null on failure) rather than
+        // allocating.
+        let res = unsafe { localtime_r(&raw const t, &raw mut tm) };
+        if res.is_null() {
+            return None;
+        }
+        Some((tm.hour, tm.min, tm.sec, tm.year + 1900, tm.mon + 1, tm.mday))
     }
-    Some((tm.hour, tm.min, tm.sec, tm.year + 1900, tm.mon + 1, tm.mday))
-}
 
-/// Wall-clock `HH:MM:SS`, local time.
-#[must_use]
-pub fn clock() -> Option<String> {
-    let (h, m, s, ..) = now_local()?;
-    Some(format!("{h:02}:{m:02}:{s:02}"))
-}
+    /// Wall-clock `HH:MM:SS`, local time.
+    #[must_use]
+    pub fn clock() -> Option<String> {
+        let (h, m, s, ..) = Self::now()?;
+        Some(format!("{h:02}:{m:02}:{s:02}"))
+    }
 
-/// Date, `YYYY-MM-DD`.
-#[must_use]
-pub fn date() -> Option<String> {
-    let (_, _, _, y, mo, d) = now_local()?;
-    Some(format!("{y:04}-{mo:02}-{d:02}"))
+    /// Date, `YYYY-MM-DD`.
+    #[must_use]
+    pub fn date() -> Option<String> {
+        let (_, _, _, y, mo, d) = Self::now()?;
+        Some(format!("{y:04}-{mo:02}-{d:02}"))
+    }
 }
 
 #[cfg(test)]
@@ -83,7 +92,7 @@ mod tests {
 
     #[test]
     fn clock_matches_expected_shape() {
-        let s = clock().expect("clock() should succeed on any normal box");
+        let s = LocalTime::clock().expect("clock() should succeed on any normal box");
         assert_eq!(s.len(), 8);
         assert_eq!(s.as_bytes()[2], b':');
         assert_eq!(s.as_bytes()[5], b':');
@@ -91,7 +100,7 @@ mod tests {
 
     #[test]
     fn date_matches_expected_shape() {
-        let s = date().expect("date() should succeed on any normal box");
+        let s = LocalTime::date().expect("date() should succeed on any normal box");
         assert_eq!(s.len(), 10);
         assert_eq!(s.as_bytes()[4], b'-');
         assert_eq!(s.as_bytes()[7], b'-');
@@ -110,7 +119,7 @@ mod tests {
             return; // no `date` on PATH in this environment -- skip
         };
         let expected = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let ours = date().unwrap();
+        let ours = LocalTime::date().unwrap();
         assert_eq!(ours, expected, "libc localtime disagrees with `date`");
     }
 }

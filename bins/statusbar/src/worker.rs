@@ -238,7 +238,7 @@ impl State {
 
         if now.duration_since(self.last_notifications) >= NOTIFICATIONS_PERIOD {
             self.last_notifications = now;
-            let rendered: Vec<String> = statusbar::notifications::query(&self.notification_rules)
+            let rendered: Vec<String> = statusbar::Notifications::query(&self.notification_rules)
                 .unwrap_or_default()
                 .into_iter()
                 .map(|seg| seg.rendered)
@@ -504,59 +504,92 @@ impl State {
     }
 }
 
-/// Run forever: refresh modules on their timers, drain queued scroll deltas
-/// and apply/read-back volume-brightness adjustments, sending a fresh
-/// [`Snapshot`] to `snapshot_tx` (and signalling `wake`) whenever anything
-/// changes. All the blocking work (process spawns, `/proc` reads, the
-/// deliberate ~120ms `cpu_usage` sample window) lives entirely on this
-/// thread -- see `main.rs`'s module doc.
-pub fn run(
-    snapshot_tx: &Sender<Snapshot>,
-    scroll_rx: &Receiver<(ModuleKind, i32)>,
-    click_rx: &Receiver<ModuleKind>,
-    wake: &waker::Waker,
-    notification_rules: Vec<config::NotificationRule>,
-) {
-    let mut state = State::new(notification_rules);
-    loop {
-        let mut changed = state.refresh();
+/// The background worker thread itself -- a marker type grouping
+/// [`Self::spawn_thread`] (called from `main`) with [`Self::run`] (the
+/// thread body), instead of leaving them as two free functions with no
+/// shared owner.
+pub struct Worker;
 
-        while let Ok(kind) = click_rx.try_recv() {
-            state.handle_click(kind);
-        }
+impl Worker {
+    /// Spawn the worker thread (see the module doc for why module
+    /// computation lives on its own thread) -- split out of `main` purely
+    /// to keep that function under clippy's line-count lint; no behavior
+    /// of its own beyond the `Builder::spawn` call itself.
+    pub fn spawn_thread(
+        snapshot_tx: mpsc::Sender<Snapshot>,
+        scroll_rx: mpsc::Receiver<(ModuleKind, i32)>,
+        click_rx: mpsc::Receiver<ModuleKind>,
+        wake: waker::Waker,
+        notification_rules: Vec<config::NotificationRule>,
+    ) {
+        std::thread::Builder::new()
+            .name("statusbar-worker".into())
+            .spawn(move || {
+                Self::run(
+                    &snapshot_tx,
+                    &scroll_rx,
+                    &click_rx,
+                    &wake,
+                    notification_rules,
+                );
+            })
+            .expect("spawn statusbar worker thread");
+    }
 
-        // Block on the scroll channel itself (not a plain sleep) so a
-        // wheel event is picked up the instant it arrives instead of
-        // waiting out an idle poll interval -- `recv_timeout` still
-        // returns on its own after `wait_ms` so module timers keep firing
-        // when nothing's scrolling. Drain every already-queued delta once
-        // one arrives (each one repaints the optimistic percentage as it
-        // goes -- see `queue_scroll`), same coalescing behavior as before
-        // for the real mutation.
-        let wait_ms = if state.pending_scroll.is_some() {
-            SCROLL_APPLY_DEBOUNCE_MS
-        } else {
-            IDLE_POLL_MS
-        };
-        match scroll_rx.recv_timeout(Duration::from_millis(wait_ms)) {
-            Ok((kind, raw_px)) => {
-                changed |= state.queue_scroll(kind, raw_px);
-                loop {
-                    match scroll_rx.try_recv() {
-                        Ok((kind, raw_px)) => changed |= state.queue_scroll(kind, raw_px),
-                        Err(TryRecvError::Empty) => break,
-                        Err(TryRecvError::Disconnected) => return,
+    /// Run forever: refresh modules on their timers, drain queued scroll
+    /// deltas and apply/read-back volume-brightness adjustments, sending a
+    /// fresh [`Snapshot`] to `snapshot_tx` (and signalling `wake`) whenever
+    /// anything changes. All the blocking work (process spawns, `/proc`
+    /// reads, the deliberate ~120ms `cpu_usage` sample window) lives
+    /// entirely on this thread -- see `main.rs`'s module doc.
+    fn run(
+        snapshot_tx: &Sender<Snapshot>,
+        scroll_rx: &Receiver<(ModuleKind, i32)>,
+        click_rx: &Receiver<ModuleKind>,
+        wake: &waker::Waker,
+        notification_rules: Vec<config::NotificationRule>,
+    ) {
+        let mut state = State::new(notification_rules);
+        loop {
+            let mut changed = state.refresh();
+
+            while let Ok(kind) = click_rx.try_recv() {
+                state.handle_click(kind);
+            }
+
+            // Block on the scroll channel itself (not a plain sleep) so a
+            // wheel event is picked up the instant it arrives instead of
+            // waiting out an idle poll interval -- `recv_timeout` still
+            // returns on its own after `wait_ms` so module timers keep firing
+            // when nothing's scrolling. Drain every already-queued delta once
+            // one arrives (each one repaints the optimistic percentage as it
+            // goes -- see `queue_scroll`), same coalescing behavior as before
+            // for the real mutation.
+            let wait_ms = if state.pending_scroll.is_some() {
+                SCROLL_APPLY_DEBOUNCE_MS
+            } else {
+                IDLE_POLL_MS
+            };
+            match scroll_rx.recv_timeout(Duration::from_millis(wait_ms)) {
+                Ok((kind, raw_px)) => {
+                    changed |= state.queue_scroll(kind, raw_px);
+                    loop {
+                        match scroll_rx.try_recv() {
+                            Ok((kind, raw_px)) => changed |= state.queue_scroll(kind, raw_px),
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => return,
+                        }
                     }
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-        changed |= state.apply_pending_scroll();
+            changed |= state.apply_pending_scroll();
 
-        if changed {
-            let _ = snapshot_tx.send(state.snap.clone());
-            wake.signal();
+            if changed {
+                let _ = snapshot_tx.send(state.snap.clone());
+                wake.signal();
+            }
         }
     }
 }

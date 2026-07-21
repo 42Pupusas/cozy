@@ -64,7 +64,7 @@ mod field_code {
 /// handful of encode-side helpers instead of leaving them as free
 /// functions -- see [`crate::value::Unmarshaller`] for the decode-side
 /// sibling.
-struct MessageBuilder;
+pub(crate) struct MessageBuilder;
 
 impl MessageBuilder {
     const fn align_up(n: usize, to: usize) -> usize {
@@ -111,15 +111,15 @@ impl MessageBuilder {
         }
     }
 
-    /// Build a `METHOD_CALL` message frame: header + body, ready to write to
-    /// the socket.
+    /// Build a `METHOD_CALL` message frame: header + body, ready to write
+    /// to the socket.
     ///
     /// `serial` must be nonzero and unique per in-flight call on this
     /// connection -- the reply carries it back as `REPLY_SERIAL`, which
     /// `DbusConn::call_raw` matches on to find its reply among interleaved
     /// signals.
     #[must_use]
-    fn build_method_call(
+    pub fn build_method_call(
         serial: u32,
         destination: &str,
         path: &str,
@@ -224,19 +224,6 @@ impl Reply {
     }
 }
 
-/// Build a `METHOD_CALL` message frame -- see [`MessageBuilder`].
-#[must_use]
-pub fn build_method_call(
-    serial: u32,
-    destination: &str,
-    path: &str,
-    interface: &str,
-    member: &str,
-    args: &[BodyArg],
-) -> Vec<u8> {
-    MessageBuilder::build_method_call(serial, destination, path, interface, member, args)
-}
-
 /// The fixed 16-byte prelude every D-Bus message starts with, decoded enough
 /// to know how many more bytes to read off the wire before the message is
 /// complete.
@@ -271,7 +258,7 @@ impl Prelude {
 
     /// Total byte length of the whole message (prelude + header fields,
     /// padded to 8, + body), i.e. how many bytes the caller must have
-    /// buffered before calling [`parse_message`].
+    /// buffered before calling [`Reply::parse_message`].
     #[must_use]
     pub const fn total_len(&self) -> usize {
         let after_fields = PRELUDE_LEN + self.header_fields_len as usize;
@@ -279,80 +266,84 @@ impl Prelude {
     }
 }
 
-/// Parse one complete message (prelude + header fields + body) out of `buf`.
-///
-/// `buf` must be at least `Prelude::parse(buf).total_len()` bytes (checked
-/// by the caller via [`Prelude`] first, same two-phase read `platform::conn`
-/// does for Wayland frames — read a fixed prelude, then read exactly as many
-/// more bytes as it says).
-#[must_use]
-pub fn parse_message(buf: &[u8]) -> Option<Reply> {
-    let prelude = Prelude::parse(buf)?;
-    let fields_start = PRELUDE_LEN;
-    let fields_end = fields_start + prelude.header_fields_len as usize;
-    let _fields_bounds_check = buf.get(fields_start..fields_end)?;
+impl Reply {
+    /// Parse one complete message (prelude + header fields + body) out of
+    /// `buf` into a [`Reply`] -- the natural owner of this parse, since
+    /// that's exactly what it constructs.
+    ///
+    /// `buf` must be at least `Prelude::parse(buf).total_len()` bytes
+    /// (checked by the caller via [`Prelude`] first, same two-phase read
+    /// `platform::conn` does for Wayland frames — read a fixed prelude,
+    /// then read exactly as many more bytes as it says).
+    #[must_use]
+    pub fn parse_message(buf: &[u8]) -> Option<Self> {
+        let prelude = Prelude::parse(buf)?;
+        let fields_start = PRELUDE_LEN;
+        let fields_end = fields_start + prelude.header_fields_len as usize;
+        let _fields_bounds_check = buf.get(fields_start..fields_end)?;
 
-    let mut signature = String::new();
-    let mut error_name = None;
-    let mut reply_serial = None;
+        let mut signature = String::new();
+        let mut error_name = None;
+        let mut reply_serial = None;
 
-    // Header fields are an ARRAY of STRUCT(BYTE, VARIANT), each struct
-    // 8-aligned within the fields array's own start (which is itself
-    // 8-aligned relative to the message start, since it directly follows a
-    // u32 length at offset 12 -- wait, actually the array *contents* start
-    // right after the u32 length with no extra padding beyond the struct's
-    // own 8-byte alignment requirement, applied relative to buf[0]).
-    let mut offset = fields_start;
-    while offset < fields_end {
-        offset = MessageBuilder::align_up(offset, 8);
-        if offset >= fields_end {
-            break;
-        }
-        let code = *buf.get(offset)?;
-        // VARIANT: 1-byte sig len, sig bytes, NUL, then value.
-        let sig_len = *buf.get(offset + 1)? as usize;
-        let sig_start = offset + 2;
-        let sig_end = sig_start + sig_len;
-        let inner_sig = std::str::from_utf8(buf.get(sig_start..sig_end)?).ok()?;
-        let val_start = sig_end + 1;
-        let (val, next) = Unmarshaller::unmarshal(buf, val_start, inner_sig)?;
-        match code {
-            field_code::SIGNATURE => {
-                if let Value::Signature(s) = val {
-                    signature = s;
+        // Header fields are an ARRAY of STRUCT(BYTE, VARIANT), each struct
+        // 8-aligned within the fields array's own start (which is itself
+        // 8-aligned relative to the message start, since it directly follows a
+        // u32 length at offset 12 -- wait, actually the array *contents* start
+        // right after the u32 length with no extra padding beyond the struct's
+        // own 8-byte alignment requirement, applied relative to buf[0]).
+        let mut offset = fields_start;
+        while offset < fields_end {
+            offset = MessageBuilder::align_up(offset, 8);
+            if offset >= fields_end {
+                break;
+            }
+            let code = *buf.get(offset)?;
+            // VARIANT: 1-byte sig len, sig bytes, NUL, then value.
+            let sig_len = *buf.get(offset + 1)? as usize;
+            let sig_start = offset + 2;
+            let sig_end = sig_start + sig_len;
+            let inner_sig = std::str::from_utf8(buf.get(sig_start..sig_end)?).ok()?;
+            let val_start = sig_end + 1;
+            let (val, next) = Unmarshaller::unmarshal(buf, val_start, inner_sig)?;
+            match code {
+                field_code::SIGNATURE => {
+                    if let Value::Signature(s) = val {
+                        signature = s;
+                    }
                 }
-            }
-            field_code::ERROR_NAME => {
-                if let Some(s) = val.as_display_string() {
-                    error_name = Some(s);
+                field_code::ERROR_NAME => {
+                    if let Some(s) = val.as_display_string() {
+                        error_name = Some(s);
+                    }
                 }
+                field_code::REPLY_SERIAL => {
+                    reply_serial = val.as_u64().map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+                }
+                _ => {}
             }
-            field_code::REPLY_SERIAL => {
-                reply_serial = val.as_u64().map(|n| u32::try_from(n).unwrap_or(u32::MAX));
-            }
-            _ => {}
+            offset = next;
         }
-        offset = next;
+
+        let body_start = MessageBuilder::align_up(fields_end, 8);
+        let body_end = body_start + prelude.body_len as usize;
+        let body = buf.get(body_start..body_end)?.to_vec();
+
+        // Validate the signature actually parses to the declared body length by
+        // touching split_first_type at least once so it's exercised even on
+        // signature-less (empty-body) replies -- keeps the import used and
+        // documents that an empty signature is valid (zero-arg replies).
+        let _ = Unmarshaller::split_first_type(&signature);
+        let _ = Unmarshaller::alignment_of(&signature);
+
+        Some(Self {
+            kind: prelude.message_type,
+            error_name,
+            reply_serial,
+            signature,
+            body,
+        })
     }
-
-    let body_start = MessageBuilder::align_up(fields_end, 8);
-    let body_end = body_start + prelude.body_len as usize;
-    let body = buf.get(body_start..body_end)?.to_vec();
-
-    // Validate the signature actually parses to the declared body length by
-    // touching split_first_type at least once so it's exercised even on
-    // signature-less (empty-body) replies -- keeps the import used and
-    // documents that an empty signature is valid (zero-arg replies).
-    let _ = Unmarshaller::split_first_type(&signature);
-    let _ = Unmarshaller::alignment_of(&signature);
-
-    Some(Reply {
-        kind: prelude.message_type,
-        error_name,
-        reply_serial,
-        signature,
-        body,
-    })
 }
 
 #[cfg(test)]
@@ -361,7 +352,7 @@ mod tests {
 
     #[test]
     fn roundtrip_method_call_no_args() {
-        let msg = build_method_call(
+        let msg = MessageBuilder::build_method_call(
             1,
             "org.freedesktop.NetworkManager",
             "/org/freedesktop/NetworkManager",
@@ -376,7 +367,7 @@ mod tests {
 
     #[test]
     fn roundtrip_method_call_with_string_arg() {
-        let msg = build_method_call(
+        let msg = MessageBuilder::build_method_call(
             7,
             "org.bluez",
             "/org/bluez/hci0",
@@ -418,7 +409,7 @@ mod tests {
         let prelude = Prelude::parse(&out).unwrap();
         assert_eq!(prelude.total_len(), out.len());
 
-        let reply = parse_message(&out).unwrap();
+        let reply = Reply::parse_message(&out).unwrap();
         assert_eq!(reply.kind, MessageType::MethodReturn);
         assert_eq!(reply.signature, "s");
         assert_eq!(reply.values(), vec![Value::Str("hello".into())]);

@@ -15,13 +15,13 @@ impl Clock {
     /// `time(2)`/`localtime_r(3)`), not a `date` shell-out.
     #[must_use]
     pub fn time() -> Option<String> {
-        crate::localtime::clock()
+        crate::localtime::LocalTime::clock()
     }
 
     /// Date, `YYYY-MM-DD`.
     #[must_use]
     pub fn date() -> Option<String> {
-        crate::localtime::date()
+        crate::localtime::LocalTime::date()
     }
 
     /// Unix timestamp in whole seconds — a cheap monotonic-ish tick used by

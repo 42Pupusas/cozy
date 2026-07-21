@@ -44,99 +44,81 @@ use platform::draw::{Canvas, Color};
 use statusbar::{BarWindow, Edge, ModuleKind, TextRenderer};
 pub(crate) use worker::Snapshot;
 
-#[allow(clippy::too_many_arguments)]
-fn paint(
-    canvas: &mut Canvas,
-    snapshot: &Snapshot,
-    text: &mut TextRenderer,
-    bg: Color,
-    bg_alpha: u8,
-    bar_height: i32,
-    scale: i32,
-    segment_rects: &mut Vec<(ModuleKind, i32, i32)>,
-) {
-    segment_rects.clear();
-    let y = text.baseline_y(bar_height);
-    let pad = 20 * scale;
-    let gap = 18 * scale;
-    // Scroll/click hit-testing only cares about x-ranges, not glyph pixels,
-    // so pad each segment's interactive rect out by half the inter-segment
-    // gap on each side -- glyph-tight hit boxes made it fiddly to land the
-    // pointer precisely on vol-out/vol-in/brightness to scroll them. Half
-    // the gap on each side means neighboring segments' padded rects meet
-    // exactly at the gap's midpoint without overlapping.
-    let hit_pad = gap / 2;
+/// The bar's per-frame paint pass -- a marker type (no state of its own;
+/// every input is a parameter) grouping [`Self::paint`] instead of leaving
+/// it as a free function with no owning type.
+struct Painter;
 
-    // Left: left-to-right layout, each segment starting `gap` past the
-    // previous one's end.
-    let mut left_edge = pad;
-    for (kind, seg) in snapshot.left_segments() {
-        if seg.is_empty() {
-            continue;
-        }
-        let color = kind.color_for(seg);
-        let pen_x = text.draw_text_alpha(canvas, seg, left_edge, y, color, bg, bg_alpha);
-        let w = pen_x - left_edge;
-        segment_rects.push((kind, left_edge - hit_pad, left_edge + w + hit_pad));
-        left_edge += w + gap;
-    }
+impl Painter {
+    #[allow(clippy::too_many_arguments)]
+    fn paint(
+        canvas: &mut Canvas,
+        snapshot: &Snapshot,
+        text: &mut TextRenderer,
+        bg: Color,
+        bg_alpha: u8,
+        bar_height: i32,
+        scale: i32,
+        segment_rects: &mut Vec<(ModuleKind, i32, i32)>,
+    ) {
+        segment_rects.clear();
+        let y = text.baseline_y(bar_height);
+        let pad = 20 * scale;
+        let gap = 18 * scale;
+        // Scroll/click hit-testing only cares about x-ranges, not glyph pixels,
+        // so pad each segment's interactive rect out by half the inter-segment
+        // gap on each side -- glyph-tight hit boxes made it fiddly to land the
+        // pointer precisely on vol-out/vol-in/brightness to scroll them. Half
+        // the gap on each side means neighboring segments' padded rects meet
+        // exactly at the gap's midpoint without overlapping.
+        let hit_pad = gap / 2;
 
-    // Center: horizontally centered as one contiguous cluster (joined by
-    // `gap`), regardless of what the left/right sections are doing.
-    let center = snapshot.center_segments();
-    if !center.is_empty() {
-        let joined_w: i32 = center.iter().map(|(_, s)| text.measure(s)).sum::<i32>()
-            + gap * (center.len() as i32 - 1).max(0);
-        let mut x = (canvas.width() - joined_w) / 2;
-        for (kind, seg) in &center {
+        // Left: left-to-right layout, each segment starting `gap` past the
+        // previous one's end.
+        let mut left_edge = pad;
+        for (kind, seg) in snapshot.left_segments() {
             if seg.is_empty() {
                 continue;
             }
             let color = kind.color_for(seg);
-            let pen_x = text.draw_text_alpha(canvas, seg, x, y, color, bg, bg_alpha);
-            let w = pen_x - x;
-            segment_rects.push((*kind, x - hit_pad, x + w + hit_pad));
-            x += w + gap;
+            let pen_x = text.draw_text_alpha(canvas, seg, left_edge, y, color, bg, bg_alpha);
+            let w = pen_x - left_edge;
+            segment_rects.push((kind, left_edge - hit_pad, left_edge + w + hit_pad));
+            left_edge += w + gap;
+        }
+
+        // Center: horizontally centered as one contiguous cluster (joined by
+        // `gap`), regardless of what the left/right sections are doing.
+        let center = snapshot.center_segments();
+        if !center.is_empty() {
+            let joined_w: i32 = center.iter().map(|(_, s)| text.measure(s)).sum::<i32>()
+                + gap * (center.len() as i32 - 1).max(0);
+            let mut x = (canvas.width() - joined_w) / 2;
+            for (kind, seg) in &center {
+                if seg.is_empty() {
+                    continue;
+                }
+                let color = kind.color_for(seg);
+                let pen_x = text.draw_text_alpha(canvas, seg, x, y, color, bg, bg_alpha);
+                let w = pen_x - x;
+                segment_rects.push((*kind, x - hit_pad, x + w + hit_pad));
+                x += w + gap;
+            }
+        }
+
+        // Right-to-left layout: draw each segment ending `gap` to the left of
+        // the previous one's start.
+        let mut right_edge = canvas.width() - pad;
+        for (kind, seg) in snapshot.right_segments() {
+            if seg.is_empty() {
+                continue;
+            }
+            let color = kind.color_for(seg);
+            let w = text.draw_text_right_alpha(canvas, seg, right_edge, y, color, bg, bg_alpha);
+            segment_rects.push((kind, right_edge - w - hit_pad, right_edge + hit_pad));
+            right_edge -= w + gap;
         }
     }
-
-    // Right-to-left layout: draw each segment ending `gap` to the left of
-    // the previous one's start.
-    let mut right_edge = canvas.width() - pad;
-    for (kind, seg) in snapshot.right_segments() {
-        if seg.is_empty() {
-            continue;
-        }
-        let color = kind.color_for(seg);
-        let w = text.draw_text_right_alpha(canvas, seg, right_edge, y, color, bg, bg_alpha);
-        segment_rects.push((kind, right_edge - w - hit_pad, right_edge + hit_pad));
-        right_edge -= w + gap;
-    }
-}
-
-/// Spawn the worker thread (see the module doc for why module computation
-/// lives on its own thread) -- split out of `main` purely to keep that
-/// function under clippy's line-count lint; no behavior of its own beyond
-/// the `Builder::spawn` call itself.
-fn spawn_worker_thread(
-    snapshot_tx: mpsc::Sender<Snapshot>,
-    scroll_rx: mpsc::Receiver<(ModuleKind, i32)>,
-    click_rx: mpsc::Receiver<ModuleKind>,
-    wake: waker::Waker,
-    notification_rules: Vec<config::NotificationRule>,
-) {
-    std::thread::Builder::new()
-        .name("statusbar-worker".into())
-        .spawn(move || {
-            worker::run(
-                &snapshot_tx,
-                &scroll_rx,
-                &click_rx,
-                &wake,
-                notification_rules,
-            );
-        })
-        .expect("spawn statusbar worker thread");
 }
 
 fn main() {
@@ -183,7 +165,7 @@ fn main() {
     let (scroll_tx, scroll_rx) = mpsc::channel::<(ModuleKind, i32)>();
     let (click_tx, click_rx) = mpsc::channel::<ModuleKind>();
     let notification_rules = cfg.bar_notifications().to_vec();
-    spawn_worker_thread(snapshot_tx, scroll_rx, click_rx, wake, notification_rules);
+    worker::Worker::spawn_thread(snapshot_tx, scroll_rx, click_rx, wake, notification_rules);
 
     let bar_height = window.height();
     let mut segment_rects: Vec<(ModuleKind, i32, i32)> = Vec::new();
@@ -203,7 +185,7 @@ fn main() {
         }
 
         match window.tick(|canvas| {
-            paint(
+            Painter::paint(
                 canvas,
                 &snapshot,
                 &mut text,

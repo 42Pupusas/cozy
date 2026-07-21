@@ -23,7 +23,7 @@ use std::os::fd::OwnedFd;
 use ququmatz::types::MsgFlags;
 use ququmatz::{IoUring, Sqe};
 
-use crate::message::{self, BodyArg, MessageType, PRELUDE_LEN, Prelude, Reply};
+use crate::message::{BodyArg, MessageType, PRELUDE_LEN, Prelude, Reply};
 use crate::sys;
 
 /// Ring depth — one call in flight at a time, so this only ever needs a
@@ -319,7 +319,14 @@ impl DbusConn {
     ) -> Result<Reply, DbusError> {
         let serial = self.next_serial;
         self.next_serial = self.next_serial.wrapping_add(1).max(1);
-        let msg = message::build_method_call(serial, destination, path, interface, member, args);
+        let msg = crate::message::MessageBuilder::build_method_call(
+            serial,
+            destination,
+            path,
+            interface,
+            member,
+            args,
+        );
         self.send_raw(&msg)?;
 
         // The bus can (and does) interleave unsolicited signals with the
@@ -351,7 +358,7 @@ impl DbusConn {
 
         let mut full = prelude_bytes;
         full.extend_from_slice(&rest);
-        message::parse_message(&full).ok_or(DbusError::Malformed)
+        Reply::parse_message(&full).ok_or(DbusError::Malformed)
     }
 
     /// Convenience: `org.freedesktop.DBus.Properties.Get`, unwrapping the

@@ -510,27 +510,36 @@ impl Encoder {
         // several bogus keystrokes instead of the one letter that was typed.
         let report_all_keys = self.kitty_flags & KITTY_REPORT_ALL_KEYS != 0;
         let disambiguate = self.kitty_flags & KITTY_DISAMBIGUATE != 0;
-        // Bare modifier-key events are reported ONLY when the app asked for
-        // "report all keys as escape codes" (spec: only that mode reports
-        // "events for pressing modifier keys"). Without this gate a bare
-        // Shift/Ctrl press fell through encode_legacy (which has no
-        // representation for a modifier, returning None) into the CSI-u
-        // catch-all below -- so a shell that leaves kitty mode latched while
-        // a child runs (fish keeps its negotiated mode active across
-        // sudo/pacman prompts) had every modifier press mid-prompt spray
-        // `CSI 57441;1:1u` at a legacy byte-reader like pacman's [Y/n].
-        if !report_all_keys && matches!(key, Key::Shift | Key::Ctrl | Key::Alt | Key::Super) {
-            return None;
-        }
-        // Lock keys are ordinary functional keys (PUA codepoints), reported
-        // under disambiguate -- but with NO enhancement flags at all the
-        // terminal is in legacy-compatible kitty mode, and the spec allows
-        // (and legacy readers require) ignoring keys that have no legacy
-        // encoding rather than volunteering CSI-u at programs that never
-        // negotiated anything.
+        // Bare modifier-key events -- including the lock keys -- are
+        // reported ONLY when the app asked for "report all keys as escape
+        // codes" (kitty's actual C source, kitty/keys.c `is_modifier_key`,
+        // treats CapsLock/NumLock/ScrollLock exactly the same as
+        // Shift/Ctrl/Alt/Super: all of them gated solely by report_all_keys,
+        // with *no* exception for `disambiguate`). Getting this wrong for
+        // the lock keys specifically meant: neovim negotiates disambiguate +
+        // report-event-types (`CSI >3u`, flags 0b011) but never report-all-
+        // keys, so a CapsLock press/release leaked `CSI 57358;1u` into
+        // nvim -- which doesn't know what to do with an unrequested
+        // CSI-u escape for a key it never asked to have reported, and
+        // rendered it as a stray tofu glyph instead of silently ignoring
+        // it. Without this gate a bare Shift/Ctrl press similarly fell
+        // through encode_legacy (which has no representation for a
+        // modifier, returning None) into the CSI-u catch-all below -- so a
+        // shell that leaves kitty mode latched while a child runs (fish
+        // keeps its negotiated mode active across sudo/pacman prompts) had
+        // every modifier press mid-prompt spray `CSI 57441;1:1u` at a
+        // legacy byte-reader like pacman's [Y/n].
         if !report_all_keys
-            && !disambiguate
-            && matches!(key, Key::CapsLock | Key::NumLock | Key::ScrollLock)
+            && matches!(
+                key,
+                Key::Shift
+                    | Key::Ctrl
+                    | Key::Alt
+                    | Key::Super
+                    | Key::CapsLock
+                    | Key::NumLock
+                    | Key::ScrollLock
+            )
         {
             return None;
         }
@@ -1080,19 +1089,17 @@ mod tests {
         assert_eq!(encode(&e, Key::Delete, Modifiers::NONE), b"\x1b[3;1:1~");
         assert_eq!(encode(&e, Key::PageUp, Modifiers::NONE), b"\x1b[5;1:1~");
         assert_eq!(encode(&e, Key::PageDown, Modifiers::NONE), b"\x1b[6;1:1~");
-        // PUA-only keys keep the `u` terminator with their canonical codepoints.
-        assert_eq!(
-            encode(&e, Key::CapsLock, Modifiers::NONE),
-            b"\x1b[57358;1:1u"
-        );
-        assert_eq!(
-            encode(&e, Key::ScrollLock, Modifiers::NONE),
-            b"\x1b[57359;1:1u"
-        );
-        assert_eq!(
-            encode(&e, Key::NumLock, Modifiers::NONE),
-            b"\x1b[57360;1:1u"
-        );
+        // Lock keys (CapsLock/NumLock/ScrollLock) are NOT covered by
+        // disambiguate alone -- kitty's own C source (kitty/keys.c
+        // `is_modifier_key`) gates them exactly like Shift/Ctrl/Alt/Super,
+        // silent unless report-all-keys (0b1000) is set. See
+        // kitty_special_pua_only_keys for their PUA form under that flag,
+        // and kitty_bare_modifiers_are_silent_without_report_all_keys for
+        // the silence regression this protects (a stray CapsLock leaking
+        // `CSI 57358;1u` into neovim's disambiguate+report-events default).
+        assert_eq!(encode(&e, Key::CapsLock, Modifiers::NONE), b"");
+        assert_eq!(encode(&e, Key::ScrollLock, Modifiers::NONE), b"");
+        assert_eq!(encode(&e, Key::NumLock, Modifiers::NONE), b"");
     }
 
     #[test]
@@ -1520,11 +1527,16 @@ mod tests {
                 );
             }
         }
-        // Lock keys stay silent too while NO enhancement is active (pure
-        // legacy-compatible kitty mode) -- they surface only under
-        // disambiguate (kitty_functional_keys_use_correct_terminators) or
-        // report-all-keys.
-        for flags in [0u8, 0b10] {
+        // Regression: lock keys (CapsLock/NumLock/ScrollLock) are gated
+        // identically to the other modifier keys in real kitty (kitty/keys.c
+        // `is_modifier_key` treats them the same as Shift/Ctrl/Alt/Super,
+        // with NO exception carved out for `disambiguate`) -- so they must
+        // stay silent for *any* flag combo that lacks report-all-keys,
+        // including disambiguate + report-event-types (0b011), which is
+        // exactly what neovim negotiates by default (`CSI >3u`). Getting
+        // this wrong let a bare CapsLock press leak `CSI 57358;1u` into
+        // nvim, which rendered it as a stray tofu glyph.
+        for flags in [0u8, 0b1, 0b10, 0b11, 0b111] {
             e.kitty_flags = flags;
             for key in [Key::CapsLock, Key::NumLock, Key::ScrollLock] {
                 let mut buf = [0u8; 16];

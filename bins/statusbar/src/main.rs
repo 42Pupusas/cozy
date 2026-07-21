@@ -114,6 +114,31 @@ fn paint(
     }
 }
 
+/// Spawn the worker thread (see the module doc for why module computation
+/// lives on its own thread) -- split out of `main` purely to keep that
+/// function under clippy's line-count lint; no behavior of its own beyond
+/// the `Builder::spawn` call itself.
+fn spawn_worker_thread(
+    snapshot_tx: mpsc::Sender<Snapshot>,
+    scroll_rx: mpsc::Receiver<(ModuleKind, i32)>,
+    click_rx: mpsc::Receiver<ModuleKind>,
+    wake: waker::Waker,
+    notification_rules: Vec<config::NotificationRule>,
+) {
+    std::thread::Builder::new()
+        .name("statusbar-worker".into())
+        .spawn(move || {
+            worker::run(
+                &snapshot_tx,
+                &scroll_rx,
+                &click_rx,
+                &wake,
+                notification_rules,
+            );
+        })
+        .expect("spawn statusbar worker thread");
+}
+
 fn main() {
     let cfg = config::Config::load().unwrap_or_else(|e| {
         eprintln!("statusbar: config error: {e} — using defaults");
@@ -158,18 +183,7 @@ fn main() {
     let (scroll_tx, scroll_rx) = mpsc::channel::<(ModuleKind, i32)>();
     let (click_tx, click_rx) = mpsc::channel::<ModuleKind>();
     let notification_rules = cfg.bar_notifications().to_vec();
-    std::thread::Builder::new()
-        .name("statusbar-worker".into())
-        .spawn(move || {
-            worker::run(
-                &snapshot_tx,
-                &scroll_rx,
-                &click_rx,
-                &wake,
-                notification_rules,
-            );
-        })
-        .expect("spawn statusbar worker thread");
+    spawn_worker_thread(snapshot_tx, scroll_rx, click_rx, wake, notification_rules);
 
     let bar_height = window.height();
     let mut segment_rects: Vec<(ModuleKind, i32, i32)> = Vec::new();

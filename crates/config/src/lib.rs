@@ -754,7 +754,9 @@ impl Config {
                     reason: "required, must be a string",
                 })?
                 .to_owned();
-            self.bar.notifications.push(NotificationRule { app_id, icon });
+            self.bar
+                .notifications
+                .push(NotificationRule { app_id, icon });
         }
         Ok(())
     }

@@ -383,6 +383,38 @@ fn bar_icon_path_set_from_bar_table() {
     assert_eq!(cfg.bar_icon_path(), Some("/nerd.ttf"));
 }
 
+#[test]
+fn bar_notifications_empty_by_default() {
+    let cfg = Config::parse("");
+    assert!(cfg.bar_notifications().is_empty());
+}
+
+#[test]
+fn bar_notifications_parses_array_of_tables_in_order() {
+    let cfg = Config::parse(
+        "[[bar.notifications]]\napp_id = \"mattermost\"\nicon = \"M\"\n\n\
+         [[bar.notifications]]\napp_id = \"Slack\"\nicon = \"S\"\n",
+    );
+    let rules = cfg.bar_notifications();
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0].app_id, "mattermost");
+    assert_eq!(rules[0].icon, "M");
+    assert_eq!(rules[1].app_id, "Slack");
+    assert_eq!(rules[1].icon, "S");
+}
+
+#[test]
+fn bar_notifications_missing_app_id_is_a_validation_error() {
+    let err = Config::fail("[[bar.notifications]]\nicon = \"M\"\n");
+    assert!(err.contains("bar.notifications.app_id"));
+}
+
+#[test]
+fn bar_notifications_missing_icon_is_a_validation_error() {
+    let err = Config::fail("[[bar.notifications]]\napp_id = \"mattermost\"\n");
+    assert!(err.contains("bar.notifications.icon"));
+}
+
 // ── ConfigError ───────────────────────────────────────────────────────────
 
 #[test]

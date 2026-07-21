@@ -125,8 +125,8 @@ impl DbusConn {
     }
 
     fn connect_addr(addr: &sys::SockAddrUn) -> Result<Self, DbusError> {
-        let sock = sys::make_unix_socket().map_err(DbusError::Connect)?;
-        let sock_fd = sys::as_uring_fd(&sock);
+        let sock = sys::DbusSys::make_unix_socket().map_err(DbusError::Connect)?;
+        let sock_fd = sys::DbusSys::as_uring_fd(&sock);
 
         let mut ring = IoUring::builder(RING_ENTRIES)
             .clamp()
@@ -257,7 +257,7 @@ impl DbusConn {
     /// the credential the kernel attached to the socket).
     fn authenticate(&mut self) -> Result<(), DbusError> {
         self.send_raw(&[0])?; // initial NUL byte, required before AUTH
-        let uid = sys::effective_uid();
+        let uid = sys::DbusSys::effective_uid();
         let hex_uid = uid.to_string().bytes().fold(String::new(), |mut acc, b| {
             use std::fmt::Write as _;
             let _ = write!(acc, "{b:02x}");

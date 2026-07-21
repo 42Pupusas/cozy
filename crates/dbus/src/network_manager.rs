@@ -30,52 +30,54 @@ pub struct WifiStatus {
     pub strength: u8,
 }
 
-/// Query every device `NetworkManager` knows about, find the first Wi-Fi
-/// device, and report its active access point (if any).
-///
-/// Returns `Ok(None)` when there's a Wi-Fi device but it's not associated
-/// (equivalent to `iw`'s "Not connected"), and `Err` only for real
-/// transport/bus failures.
-pub fn wifi_status(conn: &mut DbusConn) -> Result<Option<WifiStatus>, DbusError> {
-    let reply = conn.call(DEST, ROOT_PATH, IFACE, "GetDevices", &[])?;
-    let devices = reply.values();
-    let Some(paths) = devices.first().and_then(crate::value::Value::as_items) else {
-        return Ok(None);
-    };
-
-    for path_val in paths {
-        let Some(path) = path_val.as_display_string() else {
-            continue;
-        };
-        let device_type = conn
-            .get_property(DEST, &path, DEVICE_IFACE, "DeviceType")?
-            .as_u64()
-            .unwrap_or(0);
-        if device_type != DEVICE_TYPE_WIFI {
-            continue;
-        }
-
-        let ap_path = conn
-            .get_property(DEST, &path, WIRELESS_IFACE, "ActiveAccessPoint")?
-            .as_display_string()
-            .unwrap_or_default();
-        // NM represents "no AP" as the root object path "/".
-        if ap_path.is_empty() || ap_path == "/" {
+impl WifiStatus {
+    /// Query every device `NetworkManager` knows about, find the first
+    /// Wi-Fi device, and report its active access point (if any).
+    ///
+    /// Returns `Ok(None)` when there's a Wi-Fi device but it's not
+    /// associated (equivalent to `iw`'s "Not connected"), and `Err` only
+    /// for real transport/bus failures.
+    pub fn query(conn: &mut DbusConn) -> Result<Option<Self>, DbusError> {
+        let reply = conn.call(DEST, ROOT_PATH, IFACE, "GetDevices", &[])?;
+        let devices = reply.values();
+        let Some(paths) = devices.first().and_then(crate::value::Value::as_items) else {
             return Ok(None);
+        };
+
+        for path_val in paths {
+            let Some(path) = path_val.as_display_string() else {
+                continue;
+            };
+            let device_type = conn
+                .get_property(DEST, &path, DEVICE_IFACE, "DeviceType")?
+                .as_u64()
+                .unwrap_or(0);
+            if device_type != DEVICE_TYPE_WIFI {
+                continue;
+            }
+
+            let ap_path = conn
+                .get_property(DEST, &path, WIRELESS_IFACE, "ActiveAccessPoint")?
+                .as_display_string()
+                .unwrap_or_default();
+            // NM represents "no AP" as the root object path "/".
+            if ap_path.is_empty() || ap_path == "/" {
+                return Ok(None);
+            }
+
+            let ssid = conn
+                .get_property(DEST, &ap_path, AP_IFACE, "Ssid")?
+                .as_display_string()
+                .unwrap_or_default();
+            let strength = conn
+                .get_property(DEST, &ap_path, AP_IFACE, "Strength")?
+                .as_u64()
+                .unwrap_or(0)
+                .min(100) as u8;
+
+            return Ok(Some(Self { ssid, strength }));
         }
 
-        let ssid = conn
-            .get_property(DEST, &ap_path, AP_IFACE, "Ssid")?
-            .as_display_string()
-            .unwrap_or_default();
-        let strength = conn
-            .get_property(DEST, &ap_path, AP_IFACE, "Strength")?
-            .as_u64()
-            .unwrap_or(0)
-            .min(100) as u8;
-
-        return Ok(Some(WifiStatus { ssid, strength }));
+        Ok(None)
     }
-
-    Ok(None)
 }

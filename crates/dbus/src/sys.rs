@@ -25,38 +25,57 @@ const SOCK_STREAM: i32 = 1;
 /// `platform::sys` applies to the Wayland socket.
 const SOCK_CLOEXEC: i32 = 0o2_000_000;
 
-/// Create an `AF_UNIX`, `SOCK_STREAM`, close-on-exec socket.
-pub fn make_unix_socket() -> io::Result<OwnedFd> {
-    // SAFETY: standard socket(2) call with fixed, valid arguments.
-    let fd = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: socket() returned a fresh owned fd.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// The effective uid of this process, as used by SASL `EXTERNAL` auth.
+/// The sliver of raw libc syscalls this crate can't avoid.
 ///
-/// The mechanism proves identity via `SO_PEERCRED`, but still sends the
-/// uid as an ASCII-decimal, hex-encoded string in the `AUTH` line.
-#[must_use]
-pub fn effective_uid() -> u32 {
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    unsafe { geteuid() }
-}
+/// A zero-sized marker type (not a value with fields) grouping
+/// `socket(2)`/`geteuid(2)`/`getpid(2)` wrappers under one owner instead of
+/// leaving them as free functions, the same `RawPty`-style pattern
+/// `crate::pty` uses for its own unavoidable libc sliver.
+pub struct DbusSys;
 
-/// This process's own pid, used to ask logind (`GetSessionByPID`) which
-/// session we belong to without needing `XDG_SESSION_ID` to be set.
-#[must_use]
-pub fn own_pid() -> u32 {
-    // SAFETY: getpid takes no arguments and cannot fail.
-    let pid = unsafe { getpid() };
-    // A pid is always non-negative in practice (getpid(2) never returns a
-    // negative value); fall back to 0 -- a pid `logind` will never
-    // recognize as any real session -- rather than panic if that were ever
-    // somehow violated.
-    u32::try_from(pid).unwrap_or(0)
+impl DbusSys {
+    /// Create an `AF_UNIX`, `SOCK_STREAM`, close-on-exec socket.
+    pub fn make_unix_socket() -> io::Result<OwnedFd> {
+        // SAFETY: standard socket(2) call with fixed, valid arguments.
+        let fd = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: socket() returned a fresh owned fd.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    /// The effective uid of this process, as used by SASL `EXTERNAL` auth.
+    ///
+    /// The mechanism proves identity via `SO_PEERCRED`, but still sends the
+    /// uid as an ASCII-decimal, hex-encoded string in the `AUTH` line.
+    #[must_use]
+    pub fn effective_uid() -> u32 {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { geteuid() }
+    }
+
+    /// This process's own pid, used to ask logind (`GetSessionByPID`) which
+    /// session we belong to without needing `XDG_SESSION_ID` to be set.
+    #[must_use]
+    pub fn own_pid() -> u32 {
+        // SAFETY: getpid takes no arguments and cannot fail.
+        let pid = unsafe { getpid() };
+        // A pid is always non-negative in practice (getpid(2) never returns
+        // a negative value); fall back to 0 -- a pid `logind` will never
+        // recognize as any real session -- rather than panic if that were
+        // ever somehow violated.
+        u32::try_from(pid).unwrap_or(0)
+    }
+
+    /// Borrow a socket's raw fd as `ququmatz`'s
+    /// [`RawFd`](ququmatz::types::RawFd).
+    #[must_use]
+    pub fn as_uring_fd(fd: &OwnedFd) -> ququmatz::types::RawFd {
+        // A raw fd is always non-negative; usize::try_from only fails on a
+        // negative fd, which as_raw_fd() never returns for an OwnedFd.
+        ququmatz::types::RawFd::from_raw(usize::try_from(fd.as_raw_fd()).unwrap_or(0))
+    }
 }
 
 /// A `struct sockaddr_un` built for `connect(2)`. Same layout/contract as
@@ -103,14 +122,6 @@ impl SockAddrUn {
     }
 }
 
-/// Borrow a socket's raw fd as `ququmatz`'s [`RawFd`](ququmatz::types::RawFd).
-#[must_use]
-pub fn as_uring_fd(fd: &OwnedFd) -> ququmatz::types::RawFd {
-    // A raw fd is always non-negative; usize::try_from only fails on a
-    // negative fd, which as_raw_fd() never returns for an OwnedFd.
-    ququmatz::types::RawFd::from_raw(usize::try_from(fd.as_raw_fd()).unwrap_or(0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +149,6 @@ mod tests {
     fn effective_uid_is_plausible() {
         // Just confirm it doesn't panic and returns something -- can't assert
         // a specific value in a sandboxed test runner.
-        let _ = effective_uid();
+        let _ = DbusSys::effective_uid();
     }
 }

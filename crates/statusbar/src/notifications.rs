@@ -87,10 +87,7 @@ pub struct NotificationSegment {
 /// already-fetched window list, in the same order as `rules`. Pure (no
 /// process I/O) so it's directly unit-testable against fixture windows --
 /// [`query`] is just this plus the `niri msg` fetch.
-fn resolve(
-    rules: &[config::NotificationRule],
-    windows: &[NiriWindow],
-) -> Vec<NotificationSegment> {
+fn resolve(rules: &[config::NotificationRule], windows: &[NiriWindow]) -> Vec<NotificationSegment> {
     rules
         .iter()
         .map(|rule| {

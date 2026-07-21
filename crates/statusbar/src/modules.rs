@@ -145,7 +145,7 @@ fn parse_kb(s: &str) -> Option<u64> {
 }
 
 /// Connected Wi-Fi SSID + a signal-strength percentage, via NetworkManager
-/// over D-Bus (`dbus::network_manager::wifi_status`) instead of shelling out
+/// over D-Bus (`dbus::network_manager::WifiStatus::query`) instead of shelling out
 /// to `iw` and scraping its text output. `None` only when the system bus /
 /// NetworkManager aren't reachable at all; a Wi-Fi device present but not
 /// associated to an access point still renders the disconnected icon
@@ -153,20 +153,20 @@ fn parse_kb(s: &str) -> Option<u64> {
 #[must_use]
 pub fn wifi() -> Option<String> {
     let mut conn = dbus::DbusConn::system().ok()?;
-    match dbus::network_manager::wifi_status(&mut conn).ok()? {
+    match dbus::network_manager::WifiStatus::query(&mut conn).ok()? {
         Some(status) => Some(format!("{} 󰤨", status.ssid)),
         None => Some("󰤭".into()),
     }
 }
 
 /// Whether Bluetooth is powered and how many devices are connected, via
-/// bluez's `ObjectManager.GetManagedObjects` over D-Bus (`dbus::bluez::status`)
+/// bluez's `ObjectManager.GetManagedObjects` over D-Bus (`dbus::bluez::BluetoothStatus::query`)
 /// instead of shelling out to `bluetoothctl` and scraping its text output.
 /// `None` if the system bus / bluez aren't reachable, or no adapter exists.
 #[must_use]
 pub fn bluetooth() -> Option<String> {
     let mut conn = dbus::DbusConn::system().ok()?;
-    let status = dbus::bluez::status(&mut conn).ok()??;
+    let status = dbus::bluez::BluetoothStatus::query(&mut conn).ok()??;
     if !status.powered {
         return Some("󰂲".into());
     }
@@ -213,7 +213,7 @@ pub fn format_brightness(pct: u32) -> String {
 
 /// Nudge screen backlight brightness by `delta_pct` percentage points
 /// (negative to dim), via `logind`'s `Session.SetBrightness` D-Bus call
-/// (`dbus::logind::set_backlight_brightness`) rather than a direct
+/// (`dbus::logind::LogindSession::set_backlight_brightness`) rather than a direct
 /// `/sys/class/backlight/*/brightness` write.
 ///
 /// A direct sysfs write only works unprivileged when a udev rule has
@@ -255,7 +255,7 @@ pub fn adjust_brightness(delta_pct: i32) {
         let new_val = (cur + step).clamp(0, max);
         if let Ok(mut conn) = dbus::DbusConn::system() {
             #[allow(clippy::cast_sign_loss)]
-            let _ = dbus::logind::set_backlight_brightness(&mut conn, name, new_val as u32);
+            let _ = dbus::logind::LogindSession::set_backlight_brightness(&mut conn, name, new_val as u32);
         }
         return;
     }
@@ -343,5 +343,4 @@ mod tests {
         assert_eq!(parse_kb("not a number"), None);
         assert_eq!(parse_kb(""), None);
     }
-
 }

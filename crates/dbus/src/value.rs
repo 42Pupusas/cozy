@@ -4,8 +4,9 @@
 //! `"s"`, `"ss"` for method-call bodies) — those are built by hand in
 //! [`crate::message`]. What genuinely needs to be generic is *decoding*:
 //! `NetworkManager` and bluez replies are arbitrarily nested (`a{sv}`,
-//! `a{oa{sa{sv}}}`, arrays of struct, …), so [`unmarshal`] recurses on the
-//! signature grammar rather than hard-coding each shape we care about.
+//! `a{oa{sa{sv}}}`, arrays of struct, …), so [`Unmarshaller::unmarshal`]
+//! recurses on the signature grammar rather than hard-coding each shape we
+//! care about.
 
 /// One marshalled D-Bus value, tagged by its own type.
 #[derive(Debug, Clone, PartialEq)]
@@ -114,63 +115,16 @@ impl Value {
     }
 }
 
-/// Split a signature into its first complete type and the remainder — e.g.
-/// `"sa{sv}u"` -> `("s", "a{sv}u")`, or `"a{sv}"` -> `("a{sv}", "")`.
+/// The D-Bus signature grammar and wire (un)marshaller.
 ///
-/// Recurses through `a` (array of the next complete type) and matches
-/// balanced `(...)`/`{...}` so struct/dict-entry bodies come back whole.
-#[must_use]
-pub fn split_first_type(sig: &str) -> (&str, &str) {
-    let bytes = sig.as_bytes();
-    if bytes.is_empty() {
-        return ("", "");
-    }
-    match bytes[0] {
-        b'a' => {
-            let (inner, _) = split_first_type(&sig[1..]);
-            let len = 1 + inner.len();
-            (&sig[..len], &sig[len..])
-        }
-        b'(' | b'{' => {
-            let open = bytes[0];
-            let close = if open == b'(' { b')' } else { b'}' };
-            let mut depth = 1i32;
-            let mut i = 1;
-            while i < bytes.len() && depth > 0 {
-                if bytes[i] == open {
-                    depth += 1;
-                } else if bytes[i] == close {
-                    depth -= 1;
-                }
-                i += 1;
-            }
-            (&sig[..i], &sig[i..])
-        }
-        _ => (&sig[..1], &sig[1..]),
-    }
-}
-
-/// The alignment (in bytes) a value of this signature's first type is padded
-/// to before it's written/read.
-#[must_use]
-pub const fn alignment_of(sig: &str) -> usize {
-    match sig.as_bytes().first() {
-        Some(b'b' | b'i' | b'u' | b's' | b'o' | b'a') => 4,
-        Some(b'n' | b'q') => 2,
-        Some(b'x' | b't' | b'd' | b'(' | b'{') => 8,
-        // b'y' (byte), b'g'/b'v' (signature/variant), and everything
-        // unrecognized are all 1-byte aligned.
-        _ => 1,
-    }
-}
-
-const fn align_up(offset: usize, n: usize) -> usize {
-    if n <= 1 {
-        offset
-    } else {
-        offset.div_ceil(n) * n
-    }
-}
+/// A zero-sized marker type, not a value with fields, since decoding is
+/// purely a function of `(buf, offset, sig)` with no state carried between
+/// calls (unlike [`crate::conn::DbusConn`], which does own a live
+/// connection). Grouping the whole recursive-descent decoder under one
+/// type gives it one obvious home instead of a dozen same-purpose
+/// functions floating at module scope -- see [`crate::message`] for the
+/// sibling encode-side type.
+pub struct Unmarshaller;
 
 macro_rules! read_le {
     ($buf:expr, $off:expr, $ty:ty) => {{
@@ -180,146 +134,210 @@ macro_rules! read_le {
     }};
 }
 
-/// Decode a UTF-8 string body (`s`/`o`: 4-byte length prefix, `g`:
-/// 1-byte) plus its NUL terminator, returning the string and the offset
-/// just past the terminator.
-fn unmarshal_str_body(buf: &[u8], start: usize, len: usize) -> Option<(String, usize)> {
-    let end = start + len;
-    let text = std::str::from_utf8(buf.get(start..end)?).ok()?.to_string();
-    Some((text, end + 1))
-}
-
-/// Decode an array (`a<elem_sig>`) starting at `offset`.
-fn unmarshal_array(buf: &[u8], offset: usize, elem_sig: &str) -> Option<(Value, usize)> {
-    let aligned = align_up(offset, 4);
-    let len: u32 = read_le!(buf, aligned, u32)?;
-    let elem_align = alignment_of(elem_sig);
-    let start = align_up(aligned + 4, elem_align);
-    let end = start + len as usize;
-    let mut items = Vec::new();
-    let mut pos = start;
-    while pos < end {
-        let (item, next) = unmarshal(buf, pos, elem_sig)?;
-        items.push(item);
-        pos = next;
+impl Unmarshaller {
+    /// Split a signature into its first complete type and the remainder —
+    /// e.g. `"sa{sv}u"` -> `("s", "a{sv}u")`, or `"a{sv}"` -> `("a{sv}",
+    /// "")`.
+    ///
+    /// Recurses through `a` (array of the next complete type) and matches
+    /// balanced `(...)`/`{...}` so struct/dict-entry bodies come back
+    /// whole.
+    #[must_use]
+    pub fn split_first_type(sig: &str) -> (&str, &str) {
+        let bytes = sig.as_bytes();
+        if bytes.is_empty() {
+            return ("", "");
+        }
+        match bytes[0] {
+            b'a' => {
+                let (inner, _) = Self::split_first_type(&sig[1..]);
+                let len = 1 + inner.len();
+                (&sig[..len], &sig[len..])
+            }
+            b'(' | b'{' => {
+                let open = bytes[0];
+                let close = if open == b'(' { b')' } else { b'}' };
+                let mut depth = 1i32;
+                let mut i = 1;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == open {
+                        depth += 1;
+                    } else if bytes[i] == close {
+                        depth -= 1;
+                    }
+                    i += 1;
+                }
+                (&sig[..i], &sig[i..])
+            }
+            _ => (&sig[..1], &sig[1..]),
+        }
     }
-    Some((Value::Array(items), end.max(start)))
-}
 
-/// Decode a struct body (the part of `sig` between `(` and `)`) starting at
-/// `offset`, which is 8-byte aligned per the D-Bus struct rule.
-fn unmarshal_struct(buf: &[u8], offset: usize, inner_sig: &str) -> Option<(Value, usize)> {
-    let mut items = Vec::new();
-    let mut pos = align_up(offset, 8);
-    let mut rest = inner_sig;
-    while !rest.is_empty() {
-        let (field_sig, remainder) = split_first_type(rest);
-        let (field, next) = unmarshal(buf, pos, field_sig)?;
-        items.push(field);
-        pos = next;
-        rest = remainder;
+    /// The alignment (in bytes) a value of this signature's first type is
+    /// padded to before it's written/read.
+    #[must_use]
+    pub const fn alignment_of(sig: &str) -> usize {
+        match sig.as_bytes().first() {
+            Some(b'b' | b'i' | b'u' | b's' | b'o' | b'a') => 4,
+            Some(b'n' | b'q') => 2,
+            Some(b'x' | b't' | b'd' | b'(' | b'{') => 8,
+            // b'y' (byte), b'g'/b'v' (signature/variant), and everything
+            // unrecognized are all 1-byte aligned.
+            _ => 1,
+        }
     }
-    Some((Value::Struct(items), pos))
-}
 
-/// Decode a dict-entry body (the part of `sig` between `{` and `}`) starting
-/// at `offset` -- always exactly one key then one value.
-fn unmarshal_dict_entry(buf: &[u8], offset: usize, inner_sig: &str) -> Option<(Value, usize)> {
-    let aligned = align_up(offset, 8);
-    let (key_sig, rest) = split_first_type(inner_sig);
-    let (key, after_key) = unmarshal(buf, aligned, key_sig)?;
-    let (val_sig, _) = split_first_type(rest);
-    let (val, after_val) = unmarshal(buf, after_key, val_sig)?;
-    Some((Value::DictEntry(Box::new(key), Box::new(val)), after_val))
-}
-
-/// Decode one complete value of `sig` (its *first* type — trailing bytes in
-/// `sig` are ignored, matching [`split_first_type`]'s contract).
-///
-/// Starts at `offset` in `buf`; returns the value and the offset just past
-/// it.
-#[must_use]
-pub fn unmarshal(buf: &[u8], offset: usize, sig: &str) -> Option<(Value, usize)> {
-    let type_byte = *sig.as_bytes().first()?;
-    match type_byte {
-        b'y' => Some((Value::Byte(*buf.get(offset)?), offset + 1)),
-        b'b' => {
-            let aligned = align_up(offset, 4);
-            let raw: u32 = read_le!(buf, aligned, u32)?;
-            Some((Value::Bool(raw != 0), aligned + 4))
+    const fn align_up(offset: usize, n: usize) -> usize {
+        if n <= 1 {
+            offset
+        } else {
+            offset.div_ceil(n) * n
         }
-        b'n' => {
-            let aligned = align_up(offset, 2);
-            Some((Value::I16(read_le!(buf, aligned, i16)?), aligned + 2))
-        }
-        b'q' => {
-            let aligned = align_up(offset, 2);
-            Some((Value::U16(read_le!(buf, aligned, u16)?), aligned + 2))
-        }
-        b'i' => {
-            let aligned = align_up(offset, 4);
-            Some((Value::I32(read_le!(buf, aligned, i32)?), aligned + 4))
-        }
-        b'u' => {
-            let aligned = align_up(offset, 4);
-            Some((Value::U32(read_le!(buf, aligned, u32)?), aligned + 4))
-        }
-        b'x' => {
-            let aligned = align_up(offset, 8);
-            Some((Value::I64(read_le!(buf, aligned, i64)?), aligned + 8))
-        }
-        b't' => {
-            let aligned = align_up(offset, 8);
-            Some((Value::U64(read_le!(buf, aligned, u64)?), aligned + 8))
-        }
-        b'd' => {
-            let aligned = align_up(offset, 8);
-            Some((Value::Double(read_le!(buf, aligned, f64)?), aligned + 8))
-        }
-        b's' | b'o' => {
-            let aligned = align_up(offset, 4);
-            let len: u32 = read_le!(buf, aligned, u32)?;
-            let (text, end) = unmarshal_str_body(buf, aligned + 4, len as usize)?;
-            let val = if type_byte == b's' {
-                Value::Str(text)
-            } else {
-                Value::ObjectPath(text)
-            };
-            Some((val, end))
-        }
-        b'g' => {
-            let len = *buf.get(offset)? as usize;
-            let (text, end) = unmarshal_str_body(buf, offset + 1, len)?;
-            Some((Value::Signature(text), end))
-        }
-        b'v' => {
-            let len = *buf.get(offset)? as usize;
-            let (inner_sig, val_start) = unmarshal_str_body(buf, offset + 1, len)?;
-            let (inner, end) = unmarshal(buf, val_start, &inner_sig)?;
-            Some((Value::Variant(Box::new(inner)), end))
-        }
-        b'a' => unmarshal_array(buf, offset, &sig[1..]),
-        b'(' => unmarshal_struct(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
-        b'{' => unmarshal_dict_entry(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
-        _ => None,
     }
-}
 
-/// Decode every complete value in `body` per the (possibly multi-type) top-
-/// level signature `sig`, e.g. a method-return body of signature `"sa{sv}"`.
-#[must_use]
-pub fn unmarshal_body(buf: &[u8], sig: &str) -> Option<Vec<Value>> {
-    let mut out = Vec::new();
-    let mut offset = 0;
-    let mut rest = sig;
-    while !rest.is_empty() {
-        let (t, r) = split_first_type(rest);
-        let (v, next) = unmarshal(buf, offset, t)?;
-        out.push(v);
-        offset = next;
-        rest = r;
+    /// Decode a UTF-8 string body (`s`/`o`: 4-byte length prefix, `g`:
+    /// 1-byte) plus its NUL terminator, returning the string and the offset
+    /// just past the terminator.
+    fn unmarshal_str_body(buf: &[u8], start: usize, len: usize) -> Option<(String, usize)> {
+        let end = start + len;
+        let text = std::str::from_utf8(buf.get(start..end)?).ok()?.to_string();
+        Some((text, end + 1))
     }
-    Some(out)
+
+    /// Decode an array (`a<elem_sig>`) starting at `offset`.
+    fn unmarshal_array(buf: &[u8], offset: usize, elem_sig: &str) -> Option<(Value, usize)> {
+        let aligned = Self::align_up(offset, 4);
+        let len: u32 = read_le!(buf, aligned, u32)?;
+        let elem_align = Self::alignment_of(elem_sig);
+        let start = Self::align_up(aligned + 4, elem_align);
+        let end = start + len as usize;
+        let mut items = Vec::new();
+        let mut pos = start;
+        while pos < end {
+            let (item, next) = Self::unmarshal(buf, pos, elem_sig)?;
+            items.push(item);
+            pos = next;
+        }
+        Some((Value::Array(items), end.max(start)))
+    }
+
+    /// Decode a struct body (the part of `sig` between `(` and `)`) starting
+    /// at `offset`, which is 8-byte aligned per the D-Bus struct rule.
+    fn unmarshal_struct(buf: &[u8], offset: usize, inner_sig: &str) -> Option<(Value, usize)> {
+        let mut items = Vec::new();
+        let mut pos = Self::align_up(offset, 8);
+        let mut rest = inner_sig;
+        while !rest.is_empty() {
+            let (field_sig, remainder) = Self::split_first_type(rest);
+            let (field, next) = Self::unmarshal(buf, pos, field_sig)?;
+            items.push(field);
+            pos = next;
+            rest = remainder;
+        }
+        Some((Value::Struct(items), pos))
+    }
+
+    /// Decode a dict-entry body (the part of `sig` between `{` and `}`)
+    /// starting at `offset` -- always exactly one key then one value.
+    fn unmarshal_dict_entry(buf: &[u8], offset: usize, inner_sig: &str) -> Option<(Value, usize)> {
+        let aligned = Self::align_up(offset, 8);
+        let (key_sig, rest) = Self::split_first_type(inner_sig);
+        let (key, after_key) = Self::unmarshal(buf, aligned, key_sig)?;
+        let (val_sig, _) = Self::split_first_type(rest);
+        let (val, after_val) = Self::unmarshal(buf, after_key, val_sig)?;
+        Some((Value::DictEntry(Box::new(key), Box::new(val)), after_val))
+    }
+
+    /// Decode one complete value of `sig` (its *first* type — trailing
+    /// bytes in `sig` are ignored, matching [`Self::split_first_type`]'s
+    /// contract).
+    ///
+    /// Starts at `offset` in `buf`; returns the value and the offset just
+    /// past it.
+    #[must_use]
+    pub fn unmarshal(buf: &[u8], offset: usize, sig: &str) -> Option<(Value, usize)> {
+        let type_byte = *sig.as_bytes().first()?;
+        match type_byte {
+            b'y' => Some((Value::Byte(*buf.get(offset)?), offset + 1)),
+            b'b' => {
+                let aligned = Self::align_up(offset, 4);
+                let raw: u32 = read_le!(buf, aligned, u32)?;
+                Some((Value::Bool(raw != 0), aligned + 4))
+            }
+            b'n' => {
+                let aligned = Self::align_up(offset, 2);
+                Some((Value::I16(read_le!(buf, aligned, i16)?), aligned + 2))
+            }
+            b'q' => {
+                let aligned = Self::align_up(offset, 2);
+                Some((Value::U16(read_le!(buf, aligned, u16)?), aligned + 2))
+            }
+            b'i' => {
+                let aligned = Self::align_up(offset, 4);
+                Some((Value::I32(read_le!(buf, aligned, i32)?), aligned + 4))
+            }
+            b'u' => {
+                let aligned = Self::align_up(offset, 4);
+                Some((Value::U32(read_le!(buf, aligned, u32)?), aligned + 4))
+            }
+            b'x' => {
+                let aligned = Self::align_up(offset, 8);
+                Some((Value::I64(read_le!(buf, aligned, i64)?), aligned + 8))
+            }
+            b't' => {
+                let aligned = Self::align_up(offset, 8);
+                Some((Value::U64(read_le!(buf, aligned, u64)?), aligned + 8))
+            }
+            b'd' => {
+                let aligned = Self::align_up(offset, 8);
+                Some((Value::Double(read_le!(buf, aligned, f64)?), aligned + 8))
+            }
+            b's' | b'o' => {
+                let aligned = Self::align_up(offset, 4);
+                let len: u32 = read_le!(buf, aligned, u32)?;
+                let (text, end) = Self::unmarshal_str_body(buf, aligned + 4, len as usize)?;
+                let val = if type_byte == b's' {
+                    Value::Str(text)
+                } else {
+                    Value::ObjectPath(text)
+                };
+                Some((val, end))
+            }
+            b'g' => {
+                let len = *buf.get(offset)? as usize;
+                let (text, end) = Self::unmarshal_str_body(buf, offset + 1, len)?;
+                Some((Value::Signature(text), end))
+            }
+            b'v' => {
+                let len = *buf.get(offset)? as usize;
+                let (inner_sig, val_start) = Self::unmarshal_str_body(buf, offset + 1, len)?;
+                let (inner, end) = Self::unmarshal(buf, val_start, &inner_sig)?;
+                Some((Value::Variant(Box::new(inner)), end))
+            }
+            b'a' => Self::unmarshal_array(buf, offset, &sig[1..]),
+            b'(' => Self::unmarshal_struct(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
+            b'{' => Self::unmarshal_dict_entry(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
+            _ => None,
+        }
+    }
+
+    /// Decode every complete value in `body` per the (possibly multi-type)
+    /// top-level signature `sig`, e.g. a method-return body of signature
+    /// `"sa{sv}"`.
+    #[must_use]
+    pub fn unmarshal_body(buf: &[u8], sig: &str) -> Option<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut offset = 0;
+        let mut rest = sig;
+        while !rest.is_empty() {
+            let (t, r) = Self::split_first_type(rest);
+            let (v, next) = Self::unmarshal(buf, offset, t)?;
+            out.push(v);
+            offset = next;
+            rest = r;
+        }
+        Some(out)
+    }
 }
 
 #[cfg(test)]
@@ -328,14 +346,14 @@ mod tests {
 
     #[test]
     fn split_first_type_basic() {
-        assert_eq!(split_first_type("s"), ("s", ""));
-        assert_eq!(split_first_type("su"), ("s", "u"));
-        assert_eq!(split_first_type("a{sv}"), ("a{sv}", ""));
-        assert_eq!(split_first_type("a{sv}u"), ("a{sv}", "u"));
-        assert_eq!(split_first_type("(sy)u"), ("(sy)", "u"));
-        assert_eq!(split_first_type("aau"), ("aau", ""));
-        assert_eq!(split_first_type("aa{sv}s"), ("aa{sv}", "s"));
-        assert_eq!(split_first_type(""), ("", ""));
+        assert_eq!(Unmarshaller::split_first_type("s"), ("s", ""));
+        assert_eq!(Unmarshaller::split_first_type("su"), ("s", "u"));
+        assert_eq!(Unmarshaller::split_first_type("a{sv}"), ("a{sv}", ""));
+        assert_eq!(Unmarshaller::split_first_type("a{sv}u"), ("a{sv}", "u"));
+        assert_eq!(Unmarshaller::split_first_type("(sy)u"), ("(sy)", "u"));
+        assert_eq!(Unmarshaller::split_first_type("aau"), ("aau", ""));
+        assert_eq!(Unmarshaller::split_first_type("aa{sv}s"), ("aa{sv}", "s"));
+        assert_eq!(Unmarshaller::split_first_type(""), ("", ""));
     }
 
     fn pad_to(buf: &mut Vec<u8>, n: usize) {
@@ -355,7 +373,7 @@ mod tests {
     fn unmarshal_string_roundtrip() {
         let mut buf = Vec::new();
         push_string(&mut buf, "hello");
-        let (v, end) = unmarshal(&buf, 0, "s").unwrap();
+        let (v, end) = Unmarshaller::unmarshal(&buf, 0, "s").unwrap();
         assert_eq!(v, Value::Str("hello".into()));
         assert_eq!(end, buf.len());
     }
@@ -373,7 +391,7 @@ mod tests {
         let elems_len = (buf.len() - start) as u32;
         buf[len_pos..len_pos + 4].copy_from_slice(&elems_len.to_le_bytes());
 
-        let (v, end) = unmarshal(&buf, 0, "as").unwrap();
+        let (v, end) = Unmarshaller::unmarshal(&buf, 0, "as").unwrap();
         assert_eq!(
             v,
             Value::Array(vec![Value::Str("a".into()), Value::Str("bb".into())])
@@ -389,7 +407,7 @@ mod tests {
         buf.push(0); // signature NUL
         pad_to(&mut buf, 4);
         buf.extend_from_slice(&42u32.to_le_bytes());
-        let (v, end) = unmarshal(&buf, 0, "v").unwrap();
+        let (v, end) = Unmarshaller::unmarshal(&buf, 0, "v").unwrap();
         assert_eq!(v, Value::Variant(Box::new(Value::U32(42))));
         assert_eq!(end, buf.len());
         assert_eq!(v.into_inner(), Value::U32(42));

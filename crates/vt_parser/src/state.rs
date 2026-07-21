@@ -1,13 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::match_same_arms,
-    clippy::many_single_char_names,
-    clippy::similar_names,
-    clippy::unreadable_literal,
-    clippy::missing_const_for_fn,
-    clippy::option_if_let_else,
-    clippy::manual_split_once
-)]
 //! VT/ANSI parser state machine.
 //!
 //! Implements the Paul Williams DEC ANSI parser model.
@@ -247,7 +237,7 @@ impl Parser {
             let ok = match total {
                 2 => acc >= 0x80,
                 3 => acc >= 0x800,
-                4 => (0x10000..=0x10FFFF).contains(&acc),
+                4 => (0x0001_0000..=0x0010_FFFF).contains(&acc),
                 _ => false,
             };
             Some(TermEvent::Print(if ok { ch } else { '\u{FFFD}' }))
@@ -259,7 +249,7 @@ impl Parser {
 
     // ── ESC ───────────────────────────────────────────────────────────────
 
-    fn escape(&mut self, byte: u8) -> Option<TermEvent<'static>> {
+    const fn escape(&mut self, byte: u8) -> Option<TermEvent<'static>> {
         match byte {
             // Intermediates (space through /)
             0x20..=0x2F => {
@@ -307,7 +297,7 @@ impl Parser {
         }
     }
 
-    fn escape_intermediate(&mut self, byte: u8) -> Option<TermEvent<'static>> {
+    const fn escape_intermediate(&mut self, byte: u8) -> Option<TermEvent<'static>> {
         match byte {
             0x30..=0x7E => {
                 self.state = State::Ground;
@@ -413,7 +403,7 @@ impl Parser {
         }
     }
 
-    fn csi_intermediate(&mut self, byte: u8) -> Option<TermEvent<'static>> {
+    const fn csi_intermediate(&mut self, byte: u8) -> Option<TermEvent<'static>> {
         match byte {
             0x40..=0x7E => {
                 self.state = State::Ground;
@@ -427,7 +417,18 @@ impl Parser {
         }
     }
 
-    fn dispatch_csi(&mut self, final_byte: u8) -> TermEvent<'static> {
+    /// Narrow a raw CSI/SGR parameter (`u16`, since CSI params can carry
+    /// values up to 65535 -- see `Params::get_raw`) to `u8` for the actions
+    /// that only ever mean something in `0..=255` (erase-mode selectors,
+    /// Kitty protocol flags, SGR color components). Out-of-range input is
+    /// user-supplied CSI text, not an internal invariant violation -- masking
+    /// to the low byte (matching plain `as u8`'s historical behavior) is the
+    /// intentional, correct response, not an error to propagate.
+    const fn truncate_param(v: u16) -> u8 {
+        (v & 0xFF) as u8
+    }
+
+    const fn dispatch_csi(&mut self, final_byte: u8) -> TermEvent<'static> {
         let p = &self.params;
         let inter = self.intermediate;
 
@@ -452,9 +453,9 @@ impl Parser {
                 col: p.get_or(1, 1),
             },
             // ED
-            (None, b'J') => CsiAction::EraseDisplay(p.get_raw(0) as u8),
+            (None, b'J') => CsiAction::EraseDisplay(Self::truncate_param(p.get_raw(0))),
             // EL
-            (None, b'K') => CsiAction::EraseLine(p.get_raw(0) as u8),
+            (None, b'K') => CsiAction::EraseLine(Self::truncate_param(p.get_raw(0))),
             // IL
             (None, b'L') => CsiAction::InsertLines(p.get_or(0, 1)),
             // DL
@@ -479,9 +480,9 @@ impl Parser {
             // SGR
             (None, b'm') => CsiAction::Sgr(self.decode_sgr()),
             // DSR
-            (None, b'n') => CsiAction::DeviceStatusReport(p.get_raw(0) as u8),
+            (None, b'n') => CsiAction::DeviceStatusReport(Self::truncate_param(p.get_raw(0))),
             // DA
-            (None, b'c') => CsiAction::DeviceAttributes(p.get_raw(0) as u8),
+            (None, b'c') => CsiAction::DeviceAttributes(Self::truncate_param(p.get_raw(0))),
             // DECSTBM
             (None, b'r') => CsiAction::SetScrollRegion {
                 top: p.get_or(0, 1),
@@ -510,11 +511,11 @@ impl Parser {
                 CsiAction::XtermModifyOtherKeys(p.get_raw(1))
             }
             // Kitty keyboard protocol.
-            (Some(b'>'), b'u') => CsiAction::KittyKeyboardPush(p.get_raw(0) as u8),
+            (Some(b'>'), b'u') => CsiAction::KittyKeyboardPush(Self::truncate_param(p.get_raw(0))),
             (Some(b'<'), b'u') => CsiAction::KittyKeyboardPop(p.get_or(0, 1)),
             (Some(b'='), b'u') => CsiAction::KittyKeyboardSet {
-                flags: p.get_raw(0) as u8,
-                mode: p.get_or(1, 1) as u8,
+                flags: Self::truncate_param(p.get_raw(0)),
+                mode: Self::truncate_param(p.get_or(1, 1)),
             },
             (Some(b'?'), b'u') => CsiAction::KittyKeyboardQuery,
             // Unknown
@@ -528,30 +529,30 @@ impl Parser {
         TermEvent::Csi(action)
     }
 
-    fn decode_sgr(&self) -> SgrAttrs {
+    const fn decode_sgr(&self) -> SgrAttrs {
         let mut attrs = SgrAttrs::EMPTY;
-        let p = &self.params;
+        let params = &self.params;
 
-        if p.is_empty() {
+        if params.is_empty() {
             attrs.push(SgrAttr::Reset);
             return attrs;
         }
 
-        let mut i = 0usize;
-        while i < p.len() {
-            let val = p.get_raw(i);
+        let mut idx = 0usize;
+        while idx < params.len() {
+            let val = params.get_raw(idx);
             let attr = match val {
                 0 => SgrAttr::Reset,
                 1 => SgrAttr::Bold,
                 2 => SgrAttr::Dim,
                 3 => SgrAttr::Italic,
                 // `CSI 4 m` (bare) is always straight underline; `CSI 4:n m`
-                // (colon sub-parameter) selects a style -- `is_sub(i + 1)`
+                // (colon sub-parameter) selects a style -- `is_sub(idx + 1)`
                 // is what distinguishes it from `CSI 4;n m`, which is just
                 // "underline, then attribute n" (two independent SGRs).
-                4 if p.is_sub(i + 1) => {
-                    let style = p.get_raw(i + 1) as u8;
-                    i += 1;
+                4 if params.is_sub(idx + 1) => {
+                    let style = Self::truncate_param(params.get_raw(idx + 1));
+                    idx += 1;
                     SgrAttr::UnderlineStyle(style)
                 }
                 4 => SgrAttr::Underline,
@@ -567,65 +568,65 @@ impl Parser {
                 27 => SgrAttr::NoInverse,
                 28 => SgrAttr::NoInvisible,
                 29 => SgrAttr::NoStrikethrough,
-                30..=37 => SgrAttr::FgStandard((val - 30) as u8),
-                38 => match p.get_raw(i + 1) {
+                30..=37 => SgrAttr::FgStandard(Self::truncate_param(val - 30)),
+                38 => match params.get_raw(idx + 1) {
                     5 => {
-                        let idx = p.get_raw(i + 2) as u8;
-                        i += 2;
-                        SgrAttr::Fg256(idx)
+                        let color_idx = Self::truncate_param(params.get_raw(idx + 2));
+                        idx += 2;
+                        SgrAttr::Fg256(color_idx)
                     }
                     2 => {
-                        let r = p.get_raw(i + 2) as u8;
-                        let g = p.get_raw(i + 3) as u8;
-                        let b = p.get_raw(i + 4) as u8;
-                        i += 4;
-                        SgrAttr::FgRgb(r, g, b)
+                        let red = Self::truncate_param(params.get_raw(idx + 2));
+                        let green = Self::truncate_param(params.get_raw(idx + 3));
+                        let blue = Self::truncate_param(params.get_raw(idx + 4));
+                        idx += 4;
+                        SgrAttr::FgRgb(red, green, blue)
                     }
                     _ => SgrAttr::FgDefault,
                 },
                 39 => SgrAttr::FgDefault,
-                40..=47 => SgrAttr::BgStandard((val - 40) as u8),
-                48 => match p.get_raw(i + 1) {
+                40..=47 => SgrAttr::BgStandard(Self::truncate_param(val - 40)),
+                48 => match params.get_raw(idx + 1) {
                     5 => {
-                        let idx = p.get_raw(i + 2) as u8;
-                        i += 2;
-                        SgrAttr::Bg256(idx)
+                        let color_idx = Self::truncate_param(params.get_raw(idx + 2));
+                        idx += 2;
+                        SgrAttr::Bg256(color_idx)
                     }
                     2 => {
-                        let r = p.get_raw(i + 2) as u8;
-                        let g = p.get_raw(i + 3) as u8;
-                        let b = p.get_raw(i + 4) as u8;
-                        i += 4;
-                        SgrAttr::BgRgb(r, g, b)
+                        let red = Self::truncate_param(params.get_raw(idx + 2));
+                        let green = Self::truncate_param(params.get_raw(idx + 3));
+                        let blue = Self::truncate_param(params.get_raw(idx + 4));
+                        idx += 4;
+                        SgrAttr::BgRgb(red, green, blue)
                     }
                     _ => SgrAttr::BgDefault,
                 },
                 49 => SgrAttr::BgDefault,
-                58 => match p.get_raw(i + 1) {
+                58 => match params.get_raw(idx + 1) {
                     5 => {
-                        let idx = p.get_raw(i + 2) as u8;
-                        i += 2;
-                        SgrAttr::UnderlineColor256(idx)
+                        let color_idx = Self::truncate_param(params.get_raw(idx + 2));
+                        idx += 2;
+                        SgrAttr::UnderlineColor256(color_idx)
                     }
                     2 => {
-                        let r = p.get_raw(i + 2) as u8;
-                        let g = p.get_raw(i + 3) as u8;
-                        let b = p.get_raw(i + 4) as u8;
-                        i += 4;
-                        SgrAttr::UnderlineColorRgb(r, g, b)
+                        let red = Self::truncate_param(params.get_raw(idx + 2));
+                        let green = Self::truncate_param(params.get_raw(idx + 3));
+                        let blue = Self::truncate_param(params.get_raw(idx + 4));
+                        idx += 4;
+                        SgrAttr::UnderlineColorRgb(red, green, blue)
                     }
                     _ => SgrAttr::UnderlineColorDefault,
                 },
                 59 => SgrAttr::UnderlineColorDefault,
-                90..=97 => SgrAttr::FgStandard((val - 90 + 8) as u8),
-                100..=107 => SgrAttr::BgStandard((val - 100 + 8) as u8),
+                90..=97 => SgrAttr::FgStandard(Self::truncate_param(val - 90 + 8)),
+                100..=107 => SgrAttr::BgStandard(Self::truncate_param(val - 100 + 8)),
                 _ => {
-                    i += 1;
+                    idx += 1;
                     continue;
                 }
             };
             attrs.push(attr);
-            i += 1;
+            idx += 1;
         }
         attrs
     }
@@ -634,14 +635,9 @@ impl Parser {
 
     fn osc_string(&mut self, byte: u8) -> Option<TermEvent<'_>> {
         match byte {
-            // BEL terminates OSC (xterm extension).
-            0x07 => {
-                self.state = State::Ground;
-                Some(self.dispatch_osc())
-            }
-            // ST (ESC \) terminates OSC — ESC was already consumed by
-            // the anywhere rule; we see the `\` here.
-            0x9C | b'\\' => {
+            // BEL (xterm extension) or ST (ESC \, with ESC already consumed
+            // by the anywhere rule so we see just the `\` here) terminates OSC.
+            0x07 | 0x9C | b'\\' => {
                 self.state = State::Ground;
                 Some(self.dispatch_osc())
             }
@@ -661,13 +657,12 @@ impl Parser {
 
         // Find the ';' separator between Ps and Pt.
         let sep = data.iter().position(|&b| b == b';');
-        let (ps_bytes, pt_bytes) = if let Some(pos) = sep {
-            (&data[..pos], &data[pos + 1..])
-        } else {
-            (data, &b""[..])
-        };
+        let (numeric_field, text_field) = sep.map_or_else(
+            || (data, &b""[..]),
+            |pos| (&data[..pos], &data[pos + 1..]),
+        );
 
-        let ps: u8 = ps_bytes.iter().fold(0u8, |acc, &b| {
+        let ps: u8 = numeric_field.iter().fold(0u8, |acc, &b| {
             if b.is_ascii_digit() {
                 acc.saturating_mul(10).saturating_add(b - b'0')
             } else {
@@ -683,14 +678,15 @@ impl Parser {
         // landed mid-codepoint (buffer cut a multi-byte UTF-8 sequence), so
         // fall back to the longest valid-UTF-8 prefix rather than losing
         // the whole string.
-        let pt = core::str::from_utf8(pt_bytes)
-            .unwrap_or_else(|e| core::str::from_utf8(&pt_bytes[..e.valid_up_to()]).unwrap_or(""));
+        let pt = core::str::from_utf8(text_field).unwrap_or_else(|e| {
+            core::str::from_utf8(&text_field[..e.valid_up_to()]).unwrap_or("")
+        });
 
         let cmd = match ps {
             0 | 2 => OscCmd::SetTitle(pt),
             8 => {
                 // OSC 8 ; params ; uri BEL — hyperlink.
-                let uri = pt.splitn(2, ';').nth(1).unwrap_or(pt);
+                let uri = pt.split_once(';').map_or(pt, |x| x.1);
                 OscCmd::Hyperlink { uri }
             }
             4 => OscCmd::SetColor { pairs: pt },
@@ -748,7 +744,7 @@ impl Parser {
 
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    fn reset_seq(&mut self) {
+    const fn reset_seq(&mut self) {
         self.params.clear();
         self.intermediate = None;
         self.esc_intermediate = None;

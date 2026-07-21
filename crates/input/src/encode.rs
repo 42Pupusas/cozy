@@ -510,6 +510,30 @@ impl Encoder {
         // several bogus keystrokes instead of the one letter that was typed.
         let report_all_keys = self.kitty_flags & KITTY_REPORT_ALL_KEYS != 0;
         let disambiguate = self.kitty_flags & KITTY_DISAMBIGUATE != 0;
+        // Bare modifier-key events are reported ONLY when the app asked for
+        // "report all keys as escape codes" (spec: only that mode reports
+        // "events for pressing modifier keys"). Without this gate a bare
+        // Shift/Ctrl press fell through encode_legacy (which has no
+        // representation for a modifier, returning None) into the CSI-u
+        // catch-all below -- so a shell that leaves kitty mode latched while
+        // a child runs (fish keeps its negotiated mode active across
+        // sudo/pacman prompts) had every modifier press mid-prompt spray
+        // `CSI 57441;1:1u` at a legacy byte-reader like pacman's [Y/n].
+        if !report_all_keys && matches!(key, Key::Shift | Key::Ctrl | Key::Alt | Key::Super) {
+            return None;
+        }
+        // Lock keys are ordinary functional keys (PUA codepoints), reported
+        // under disambiguate -- but with NO enhancement flags at all the
+        // terminal is in legacy-compatible kitty mode, and the spec allows
+        // (and legacy readers require) ignoring keys that have no legacy
+        // encoding rather than volunteering CSI-u at programs that never
+        // negotiated anything.
+        if !report_all_keys
+            && !disambiguate
+            && matches!(key, Key::CapsLock | Key::NumLock | Key::ScrollLock)
+        {
+            return None;
+        }
         // Text keys only report *release* once "report all keys" is on (a
         // repeat still just resends the same text, exactly as legacy mode's
         // key-repeat already does -- only release has no representation of
@@ -1458,6 +1482,46 @@ mod tests {
             kitty(&e, Key::Super, KeyState::Pressed, Modifiers::NONE),
             b"\x1b[57444;1:1u"
         );
+    }
+
+    #[test]
+    fn kitty_bare_modifiers_are_silent_without_report_all_keys() {
+        // Regression: a shell (fish) leaves kitty mode latched while a child
+        // runs -- flags 0 (or just disambiguate, 0b1) but mode still Kitty.
+        // Bare modifier presses must produce NOTHING then; they used to fall
+        // through the legacy encoder (None for modifiers) into the CSI-u
+        // catch-all, spraying `CSI 57441;1:1u` into legacy readers like
+        // pacman's [Y/n] prompt whenever Shift was pressed.
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        for flags in [0u8, 0b1, 0b11, 0b111] {
+            e.kitty_flags = flags;
+            for key in [Key::Shift, Key::Ctrl, Key::Alt, Key::Super] {
+                let mut buf = [0u8; 16];
+                assert_eq!(
+                    e.encode_key(key, KeyState::Pressed, Modifiers::NONE, &mut buf),
+                    None,
+                    "bare {key:?} must be silent at kitty flags {flags:#b}"
+                );
+            }
+        }
+        // Lock keys stay silent too while NO enhancement is active (pure
+        // legacy-compatible kitty mode) -- they surface only under
+        // disambiguate (kitty_functional_keys_use_correct_terminators) or
+        // report-all-keys.
+        for flags in [0u8, 0b10] {
+            e.kitty_flags = flags;
+            for key in [Key::CapsLock, Key::NumLock, Key::ScrollLock] {
+                let mut buf = [0u8; 16];
+                assert_eq!(
+                    e.encode_key(key, KeyState::Pressed, Modifiers::NONE, &mut buf),
+                    None,
+                    "{key:?} must be silent at kitty flags {flags:#b}"
+                );
+            }
+        }
+        // With report-all-keys (0b1000) they ARE reported (covered in
+        // kitty_bare_modifier_keys_report_their_own_pua_codepoints).
     }
 
     #[test]

@@ -1,19 +1,4 @@
 #![allow(
-    clippy::missing_const_for_fn,
-    clippy::match_same_arms,
-    clippy::unused_self,
-    clippy::needless_pass_by_ref_mut,
-    clippy::trivially_copy_pass_by_ref,
-    clippy::items_after_test_module,
-    clippy::single_match,
-    // Terminal geometry (`cols`/`rows`/scroll offsets) is bounded well under
-    // i32/u16 range in practice (a `u16` cell coordinate, a scrollback capped
-    // at `SCROLLBACK_MAX = 10_000`), so the exhaustive `as` casts pedantic
-    // flags throughout this crate are false positives, not real overflow
-    // risk -- see e.g. `Screen::get_viewport_cell`'s `scrollback_len as i64`.
-    clippy::cast_possible_wrap,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
     // `Grid`/`TermWindow`-shaped state machines naturally accumulate a
     // handful of independent bool flags (blink on/off, focused, dirty,
     // bracketed-paste, ...); forcing them into an enum soup would obscure
@@ -92,7 +77,7 @@ impl PendingRepaint {
     /// fast path (`Some((0, 0, 0))`, the same sentinel `take_dirty` already
     /// collapses to `None`). A pending `Viewport` repaint is left untouched --
     /// it will discard any scroll band on the next `take_dirty` regardless.
-    fn accumulate_scroll(&mut self, top: u16, bot: u16, delta: u16) {
+    const fn accumulate_scroll(&mut self, top: u16, bot: u16, delta: u16) {
         if delta == 0 {
             return;
         }
@@ -498,7 +483,7 @@ impl Grid {
     /// Set the default fg/bg colors OSC 10/11 replies report, from the
     /// driver's resolved theme. Call once after construction (the theme is
     /// fixed for the terminal's lifetime; there's no live-reload path yet).
-    pub fn set_default_colors(&mut self, fg: Color, bg: Color) {
+    pub const fn set_default_colors(&mut self, fg: Color, bg: Color) {
         self.default_fg = fg;
         self.default_bg = bg;
     }
@@ -512,18 +497,21 @@ impl Grid {
         if self.alt_active {
             return;
         }
-        let max = self.primary.scrollback_len() as i32;
-        let cur = self.viewport_offset as i32;
+        // scrollback_len/viewport_offset are bounded by SCROLLBACK_MAX (a
+        // small constant, far under i32::MAX), so these always fit.
+        let max = i32::try_from(self.primary.scrollback_len()).unwrap_or(i32::MAX);
+        let cur = i32::try_from(self.viewport_offset).unwrap_or(i32::MAX);
         let new = (cur + delta).clamp(0, max);
         if new != cur {
-            self.viewport_offset = new as usize;
+            // `new` is clamped to `0..=max` above, so it's always non-negative.
+            self.viewport_offset = new.cast_unsigned() as usize;
             self.pending_repaint = PendingRepaint::Viewport;
         }
     }
 
     /// Current viewport offset (lines scrolled into scrollback; `0` = bottom).
     #[must_use]
-    pub fn viewport_offset(&self) -> usize {
+    pub const fn viewport_offset(&self) -> usize {
         self.viewport_offset
     }
 
@@ -637,8 +625,13 @@ impl Grid {
         // offset, so `shift = prev - cur`.
         let shift = match self.rendered_offset {
             Some(prev) if self.content_delta == 0 => {
-                let s = prev as i64 - cur as i64;
-                (s != 0 && s.unsigned_abs() < u64::from(rows)).then_some(s as i32)
+                // viewport_offset is bounded by SCROLLBACK_MAX (a small
+                // constant, far under i64::MAX), so these always fit.
+                let prev = i64::try_from(prev).unwrap_or(i64::MAX);
+                let cur_i64 = i64::try_from(cur).unwrap_or(i64::MAX);
+                let s = prev - cur_i64;
+                (s != 0 && s.unsigned_abs() < u64::from(rows))
+                    .then(|| i32::try_from(s).unwrap_or(if s > 0 { i32::MAX } else { i32::MIN }))
             }
             _ => None,
         };
@@ -649,7 +642,7 @@ impl Grid {
             cursor_changed: false,
             content_delta: 0,
             kind: SnapshotKind::Viewport {
-                offset: cur.min(u16::MAX as usize) as u16,
+                offset: u16::try_from(cur.min(usize::from(u16::MAX))).unwrap_or(u16::MAX),
                 shift,
             },
         }
@@ -784,7 +777,7 @@ impl Grid {
 
     /// Return the viewport to the live bottom if it was scrolled up. Called on
     /// every applied event so fresh output always reveals the prompt.
-    fn snap_viewport_to_bottom(&mut self) {
+    const fn snap_viewport_to_bottom(&mut self) {
         if self.viewport_offset != 0 {
             self.viewport_offset = 0;
             self.pending_repaint = PendingRepaint::Viewport;
@@ -800,25 +793,25 @@ impl Grid {
 
     /// Read-only view of the active screen (for testing / headless render).
     #[must_use]
-    pub fn screen(&self) -> &Screen {
+    pub const fn screen(&self) -> &Screen {
         self.active_screen()
     }
 
     /// Current cursor position.
     #[must_use]
-    pub fn cursor(&self) -> (u16, u16) {
+    pub const fn cursor(&self) -> (u16, u16) {
         (self.cursor.col, self.cursor.row)
     }
 
     /// Current cursor visual shape (DECSCUSR, `CSI Ps SP q`).
     #[must_use]
-    pub fn cursor_shape(&self) -> CursorShape {
+    pub const fn cursor_shape(&self) -> CursorShape {
         self.cursor.shape
     }
 
     // ── private ───────────────────────────────────────────────────────────
 
-    fn active_screen(&self) -> &Screen {
+    const fn active_screen(&self) -> &Screen {
         if self.alt_active {
             &self.alternate
         } else {
@@ -826,7 +819,7 @@ impl Grid {
         }
     }
 
-    fn active_screen_mut(&mut self) -> &mut Screen {
+    const fn active_screen_mut(&mut self) -> &mut Screen {
         if self.alt_active {
             &mut self.alternate
         } else {
@@ -1211,7 +1204,7 @@ impl Grid {
             }
             CsiAction::Sgr(attrs) => {
                 for attr in attrs {
-                    self.apply_sgr(attr);
+                    self.apply_sgr(*attr);
                 }
             }
             CsiAction::DeviceStatusReport(n) => match n {
@@ -1246,12 +1239,12 @@ impl Grid {
             }
             CsiAction::SetMode(params) => {
                 for mode in params.iter() {
-                    self.set_ansi_mode(mode, true);
+                    Self::set_ansi_mode(mode, true);
                 }
             }
             CsiAction::ResetMode(params) => {
                 for mode in params.iter() {
-                    self.set_ansi_mode(mode, false);
+                    Self::set_ansi_mode(mode, false);
                 }
             }
             CsiAction::CursorStyle(style) => self.set_cursor_style(*style),
@@ -1306,7 +1299,7 @@ impl Grid {
         }
     }
 
-    fn apply_sgr(&mut self, attr: &SgrAttr) {
+    fn apply_sgr(&mut self, attr: SgrAttr) {
         match attr {
             SgrAttr::Reset => self.attrs = Attrs::default(),
             SgrAttr::Bold => self.attrs.set_bold(true),
@@ -1327,24 +1320,22 @@ impl Grid {
             SgrAttr::NoInverse => self.attrs.set_inverse(false),
             SgrAttr::NoInvisible => self.attrs.set_invisible(false),
             SgrAttr::NoStrikethrough => self.attrs.set_strikethrough(false),
-            SgrAttr::FgStandard(n) => self.attrs.fg = Color::Indexed(*n),
-            SgrAttr::BgStandard(n) => self.attrs.bg = Color::Indexed(*n),
+            SgrAttr::FgStandard(n) | SgrAttr::Fg256(n) => self.attrs.fg = Color::Indexed(n),
+            SgrAttr::BgStandard(n) | SgrAttr::Bg256(n) => self.attrs.bg = Color::Indexed(n),
             SgrAttr::FgDefault => self.attrs.fg = Color::Default,
             SgrAttr::BgDefault => self.attrs.bg = Color::Default,
-            SgrAttr::Fg256(n) => self.attrs.fg = Color::Indexed(*n),
-            SgrAttr::Bg256(n) => self.attrs.bg = Color::Indexed(*n),
-            SgrAttr::FgRgb(r, g, b) => self.attrs.fg = Color::Rgb(*r, *g, *b),
-            SgrAttr::BgRgb(r, g, b) => self.attrs.bg = Color::Rgb(*r, *g, *b),
+            SgrAttr::FgRgb(r, g, b) => self.attrs.fg = Color::Rgb(r, g, b),
+            SgrAttr::BgRgb(r, g, b) => self.attrs.bg = Color::Rgb(r, g, b),
             SgrAttr::UnderlineStyle(n) => {
-                self.attrs.underline_style = crate::cell::UnderlineStyle::from_sgr(*n);
+                self.attrs.underline_style = crate::cell::UnderlineStyle::from_sgr(n);
                 // A style of 0 ("CSI 4:0 m") is the colon-form way to turn
                 // underline off entirely -- everything else implies it's on
                 // (mirrors how a bare `CSI 4 m` always turns it on).
-                self.attrs.set_underline(*n != 0);
+                self.attrs.set_underline(n != 0);
             }
-            SgrAttr::UnderlineColor256(n) => self.attrs.underline_color = Color::Indexed(*n),
+            SgrAttr::UnderlineColor256(n) => self.attrs.underline_color = Color::Indexed(n),
             SgrAttr::UnderlineColorRgb(r, g, b) => {
-                self.attrs.underline_color = Color::Rgb(*r, *g, *b);
+                self.attrs.underline_color = Color::Rgb(r, g, b);
             }
             SgrAttr::UnderlineColorDefault => self.attrs.underline_color = Color::Default,
         }
@@ -1432,15 +1423,17 @@ impl Grid {
     /// mode space from DEC private modes (e.g. ANSI `4` is IRM/insert mode,
     /// unrelated to DEC private `4`). Nothing in this space is implemented
     /// yet -- IRM (insert/replace) has no effect on `Grid::print` -- so this
-    /// is currently a documented no-op rather than a silent gap.
-    fn set_ansi_mode(&mut self, _mode: u16, _enable: bool) {}
+    /// is currently a documented no-op rather than a silent gap. Takes no
+    /// `&self`/`&mut self`: it doesn't touch `Grid` state (yet), so it's an
+    /// associated fn rather than a method that would trip `unused_self`.
+    const fn set_ansi_mode(_mode: u16, _enable: bool) {}
 
     /// DECSCUSR (`CSI Ps SP q`) — set cursor shape/blink. `Ps`: 0/1 = blinking
     /// block, 2 = steady block, 3 = blinking underline, 4 = steady underline,
     /// 5 = blinking bar, 6 = steady bar. The renderer's own blink animation
     /// is driven by config (not per-app blink requests), so the odd/even
     /// blink-vs-steady distinction collapses to shape only.
-    fn set_cursor_style(&mut self, style: u16) {
+    const fn set_cursor_style(&mut self, style: u16) {
         self.cursor.shape = match style {
             0..=2 => CursorShape::Block,
             3 | 4 => CursorShape::Underline,
@@ -1512,7 +1505,7 @@ impl Grid {
     /// Whether the application has enabled bracketed paste (DECSET 2004).
     /// Read by the driver when wrapping clipboard paste in ESC[200~ … ESC[201~.
     #[must_use]
-    pub fn bracketed_paste(&self) -> bool {
+    pub const fn bracketed_paste(&self) -> bool {
         self.bracketed_paste
     }
 
@@ -1522,7 +1515,7 @@ impl Grid {
     /// translated to arrow keys ("alternate scroll"), so full-screen apps
     /// like `less` or a pager inside nvim still scroll.
     #[must_use]
-    pub fn alt_screen_active(&self) -> bool {
+    pub const fn alt_screen_active(&self) -> bool {
         self.alt_active
     }
 
@@ -1531,7 +1524,7 @@ impl Grid {
     /// [`Grid::sgr_mouse`]). Read by the UI thread's `Encoder` to decide
     /// whether/which pointer events to forward to the PTY.
     #[must_use]
-    pub fn mouse_mode(&self) -> MouseMode {
+    pub const fn mouse_mode(&self) -> MouseMode {
         self.mouse_mode
     }
 
@@ -1539,7 +1532,7 @@ impl Grid {
     /// layered independently on top of [`Grid::mouse_mode`]'s tracking
     /// granularity.
     #[must_use]
-    pub fn sgr_mouse(&self) -> bool {
+    pub const fn sgr_mouse(&self) -> bool {
         self.sgr_mouse
     }
 
@@ -1547,7 +1540,7 @@ impl Grid {
     /// Kitty progressive enhancement / legacy). Read by the UI thread's
     /// `Encoder`.
     #[must_use]
-    pub fn keyboard_mode(&self) -> KeyboardMode {
+    pub const fn keyboard_mode(&self) -> KeyboardMode {
         self.keyboard_mode
     }
 
@@ -1560,13 +1553,13 @@ impl Grid {
 
     /// DECCKM — application-cursor mode (arrow keys send SS3 instead of CSI).
     #[must_use]
-    pub fn app_cursor(&self) -> bool {
+    pub const fn app_cursor(&self) -> bool {
         self.app_cursor
     }
 
     /// DECPAM/DECPNM — application-keypad mode.
     #[must_use]
-    pub fn app_keypad(&self) -> bool {
+    pub const fn app_keypad(&self) -> bool {
         self.app_keypad
     }
 
@@ -1574,7 +1567,7 @@ impl Grid {
     /// 1004, xterm). Read by the UI thread to decide whether to encode and
     /// forward `wl_keyboard` enter/leave as `CSI I` / `CSI O`.
     #[must_use]
-    pub fn focus_events(&self) -> bool {
+    pub const fn focus_events(&self) -> bool {
         self.focus_events
     }
 
@@ -1588,7 +1581,7 @@ impl Grid {
     /// The most recent OSC 0/2 window title the application set, if any
     /// since the last call, clearing it. `None` means no new title arrived
     /// (the UI thread's window keeps showing whatever it last applied).
-    pub fn take_title(&mut self) -> Option<String> {
+    pub const fn take_title(&mut self) -> Option<String> {
         self.pending_title.take()
     }
 
@@ -1596,7 +1589,7 @@ impl Grid {
     /// the last call, clearing it. Polled by the UI thread (same pattern as
     /// `take_title`) to publish the text via the platform's existing
     /// `wl_data_source` clipboard machinery.
-    pub fn take_clipboard(&mut self) -> Option<String> {
+    pub const fn take_clipboard(&mut self) -> Option<String> {
         self.pending_clipboard.take()
     }
 
@@ -1630,7 +1623,8 @@ impl Grid {
 
     fn reset_all_palette_overrides(&mut self) {
         for n in 0..256u16 {
-            self.reset_palette_override(n as u8);
+            // `0..256u16` is always `<= 255`, so this always fits in u8.
+            self.reset_palette_override(u8::try_from(n).expect("palette index fits in u8"));
         }
     }
 
@@ -1652,7 +1646,8 @@ impl Grid {
             if idx > 255 {
                 continue;
             }
-            let idx = idx as u8;
+            // Checked `<= 255` above, so this always fits in u8.
+            let idx = u8::try_from(idx).expect("checked idx <= 255 fits in u8");
             if spec == "?" {
                 let (r, g, b) = self.palette_color(idx);
                 let _ = write!(
@@ -1681,7 +1676,8 @@ impl Grid {
             if let Ok(idx) = idx_s.parse::<u16>()
                 && idx <= 255
             {
-                self.reset_palette_override(idx as u8);
+                // Checked `<= 255` above, so this always fits in u8.
+                self.reset_palette_override(u8::try_from(idx).expect("checked idx <= 255 fits in u8"));
             }
         }
     }
@@ -1764,11 +1760,11 @@ impl Grid {
             return;
         }
         if self.link_table.last().is_some_and(|last| last == uri) {
-            self.active_link_id = self.link_table.len() as u32;
+            self.active_link_id = u32::try_from(self.link_table.len()).unwrap_or(u32::MAX);
             return;
         }
         self.link_table.push(uri.to_string());
-        self.active_link_id = self.link_table.len() as u32;
+        self.active_link_id = u32::try_from(self.link_table.len()).unwrap_or(u32::MAX);
     }
 
     /// Resolve a [`Cell::link_id`] back to its URI, or `None` for `0`
@@ -1989,6 +1985,20 @@ impl Grid {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
+
+impl core::fmt::Display for Grid {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let screen = self.active_screen();
+        for row in 0..screen.rows() {
+            for col in 0..screen.cols() {
+                let cell = screen.get_cell(col, row);
+                write!(f, "{}", cell.ch)?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2256,7 +2266,8 @@ mod tests {
         apply_str(&mut g, b"abcdefghij"); // 2 rows of 5
         g.resize(10, 5);
         for (i, ch) in (b'a'..=b'j').enumerate() {
-            assert_eq!(g.screen().get_cell(i as u16, 0).ch, ch as char);
+            let col = u16::try_from(i).expect("test column fits in u16");
+            assert_eq!(g.screen().get_cell(col, 0).ch, ch as char);
         }
     }
 
@@ -2573,18 +2584,4 @@ mod tests {
     }
 }
 
-// ── Display (headless render for testing) ─────────────────────────────────
 
-impl core::fmt::Display for Grid {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let screen = self.active_screen();
-        for row in 0..screen.rows() {
-            for col in 0..screen.cols() {
-                let cell = screen.get_cell(col, row);
-                write!(f, "{}", cell.ch)?;
-            }
-            writeln!(f)?;
-        }
-        Ok(())
-    }
-}

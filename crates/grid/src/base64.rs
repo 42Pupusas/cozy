@@ -28,7 +28,12 @@ impl Base64 {
     /// Reverse lookup: byte -> 6-bit value, or `None` for "not a base64
     /// char".
     fn sextet(b: u8) -> Option<u8> {
-        ALPHABET.iter().position(|&c| c == b).map(|i| i as u8)
+        // ALPHABET has exactly 64 entries, so any position is < 64: always
+        // fits in u8.
+        ALPHABET
+            .iter()
+            .position(|&c| c == b)
+            .map(|i| u8::try_from(i).expect("ALPHABET index fits in u8"))
     }
 
     fn decode(input: &[u8]) -> Option<Vec<u8>> {
@@ -44,7 +49,13 @@ impl Base64 {
             bits += 6;
             if bits >= 8 {
                 bits -= 8;
-                out.push((acc >> bits) as u8);
+                // `acc` accumulates without ever being masked down, so
+                // `acc >> bits` can have more than 8 bits set -- the low
+                // byte is the actual decoded value, so mask to it explicitly
+                // (rather than relying on `as u8`'s implicit truncation)
+                // before the now-infallible try_from.
+                let byte = (acc >> bits) & 0xFF;
+                out.push(u8::try_from(byte).expect("masked byte fits in u8"));
             }
         }
         Some(out)

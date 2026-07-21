@@ -47,7 +47,7 @@ impl Selection {
     /// Begin a selection anchored at `point` (both ends equal until the drag
     /// extends one of them).
     #[must_use]
-    pub fn new(point: Point) -> Self {
+    pub const fn new(point: Point) -> Self {
         Self {
             start: point,
             end: point,
@@ -150,9 +150,12 @@ mod tests {
         let mut s = Screen::new(cols, rows, sb_max);
         for (r, text) in lines.iter().enumerate() {
             for (c, ch) in text.chars().enumerate() {
+                // Test fixture lines are always short, well under u16::MAX.
+                let col = u16::try_from(c).expect("test column fits in u16");
+                let row = u16::try_from(r).expect("test row fits in u16");
                 s.set_cell(
-                    c as u16,
-                    r as u16,
+                    col,
+                    row,
                     Cell {
                         ch,
                         ..Cell::default()

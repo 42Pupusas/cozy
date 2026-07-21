@@ -146,8 +146,11 @@ impl Screen {
         // Index into the linear [scrollback | visible] buffer by row.
         // `abs_row` is the absolute physical row: the view's row 0 sits at
         // absolute row `scrollback_len - viewport_offset`.
-        let sb = self.scrollback_len as i64;
-        let abs_row = sb - viewport_offset as i64 + i64::from(row);
+        // scrollback_len/viewport_offset are bounded by SCROLLBACK_MAX (a
+        // small constant, far under i64::MAX), so these always fit.
+        let sb = i64::try_from(self.scrollback_len).unwrap_or(i64::MAX);
+        let viewport_offset = i64::try_from(viewport_offset).unwrap_or(i64::MAX);
+        let abs_row = sb - viewport_offset + i64::from(row);
         if abs_row < 0 {
             return Cell::default();
         }

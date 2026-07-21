@@ -89,7 +89,10 @@ impl Color {
             let chan = |s: &str| -> Option<u8> {
                 let v = u32::from_str_radix(s, 16).ok()?;
                 let max = (1u32 << (per * 4)) - 1;
-                Some(((v * 255 + max / 2) / max) as u8)
+                // `v <= max` (it's `per` hex digits, same as `max`), so
+                // `(v * 255 + max/2) / max` is always `<= 255`: fits in u8.
+                let scaled = (v * 255 + max / 2) / max;
+                Some(u8::try_from(scaled).expect("scaled channel fits in u8"))
             };
             let r = chan(&hex[0..per])?;
             let g = chan(&hex[per..2 * per])?;
@@ -104,7 +107,10 @@ impl Color {
                 }
                 let v = u32::from_str_radix(s, 16).ok()?;
                 let max = (1u32 << (s.len() * 4)) - 1;
-                Some(((v * 255 + max / 2) / max) as u8)
+                // `v <= max` (it's `s.len()` hex digits, same as `max`), so
+                // `(v * 255 + max/2) / max` is always `<= 255`: fits in u8.
+                let scaled = (v * 255 + max / 2) / max;
+                Some(u8::try_from(scaled).expect("scaled channel fits in u8"))
             };
             let r = chan(parts.next()?)?;
             let g = chan(parts.next()?)?;

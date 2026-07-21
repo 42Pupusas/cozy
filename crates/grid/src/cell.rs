@@ -93,7 +93,7 @@ macro_rules! flag_accessors {
             }
             #[doc = concat!("Set or clear the ", stringify!($get), " SGR flag.")]
             #[inline]
-            pub fn $set(&mut self, on: bool) {
+            pub const fn $set(&mut self, on: bool) {
                 if on {
                     self.flags |= flag::$bit;
                 } else {
@@ -158,6 +158,18 @@ pub struct Cell {
     pub link_id: u32,
 }
 
+impl Default for Cell {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            attrs: Attrs::default(),
+            wide: false,
+            spacer: false,
+            link_id: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod size_tests {
     #[test]
@@ -172,17 +184,5 @@ mod size_tests {
         // one.
         assert_eq!(std::mem::size_of::<super::Cell>(), 24);
         assert_eq!(std::mem::size_of::<super::Attrs>(), 14);
-    }
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            ch: ' ',
-            attrs: Attrs::default(),
-            wide: false,
-            spacer: false,
-            link_id: 0,
-        }
     }
 }

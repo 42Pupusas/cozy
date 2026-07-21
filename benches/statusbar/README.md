@@ -23,8 +23,10 @@ invocation).
 
 ## Why these three
 
-Everything else in `statusbar` is either I/O-bound (the `modules::*`
-sensor readers all shell out to `/proc`, `/sys`, or a CLI — dominated by
+Everything else in `statusbar` is either I/O-bound (the sensor-reader
+modules -- `battery`, `cpu`, `memory`, `temperature`, `wifi`, `bluetooth`,
+`brightness`, `volume`, `clock` -- all shell out to `/proc`, `/sys`, or a
+CLI — dominated by
 syscall/process-spawn latency, not CPU, so a divan micro-bench would
 mostly measure noise) or a thin Wayland wire-protocol wrapper
 (`bar_window.rs` — already covered by `platform`'s own connection-level

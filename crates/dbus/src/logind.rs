@@ -5,7 +5,7 @@
 //! way an unprivileged desktop session gets write access is a udev rule
 //! granting the `video` group (or an `ACL`/`uaccess` tag) permission on it.
 //! This system has neither set up, which is exactly why a direct sysfs
-//! write silently failed here (see `modules::adjust_brightness`'s history).
+//! write silently failed here (see `statusbar::brightness::Brightness::adjust`'s history).
 //!
 //! `logind` exposes `SetBrightness` on the session object specifically so a
 //! desktop session doesn't need either of those: it's polkit-gated instead,

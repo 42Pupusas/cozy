@@ -20,7 +20,7 @@ const DEVICE_TYPE_WIFI: u64 = 2;
 /// The connected network's SSID and signal strength, or `None` if no Wi-Fi
 /// device is associated to an access point.
 ///
-/// Mirrors `modules::wifi`'s "Not connected" case returning the
+/// Mirrors `statusbar::wifi::Wifi::read`'s "Not connected" case returning the
 /// disconnected icon upstream — this function just reports the data, the
 /// statusbar module still decides how to render "no AP".
 #[derive(Debug, Clone)]

@@ -24,25 +24,44 @@
 //! Module layout:
 //!   * [`bar_window`] — the layer-shell window: connection setup, resize/
 //!     configure handling, double-buffered shm present loop.
-//!   * [`modules`] — the individual status widgets (clock, battery, cpu,
-//!     mem, network, ...), each producing a plain string (or a few) the bar
-//!     lays out left/center/right and draws with the embedded bitmap font.
+//!   * the individual status widgets (each a marker-type owner like
+//!     [`volume::Volume`], not a free function -- see each module's doc for
+//!     why): [`clock`], [`battery`], [`cpu`], [`memory`], [`temperature`],
+//!     [`wifi`], [`bluetooth`], [`brightness`], [`volume`]. Each produces a
+//!     plain string (or a few) the bar lays out left/center/right and draws
+//!     with the embedded bitmap font.
 
 pub mod bar_window;
+pub mod battery;
+pub mod bluetooth;
+pub mod brightness;
 pub mod click;
+pub mod clock;
 pub mod colors;
+pub mod cpu;
 pub mod localtime;
-pub mod modules;
+pub mod memory;
 pub mod notifications;
 mod pointer_state;
 pub mod scroll;
+mod sys_file;
+pub mod temperature;
 pub mod text;
 pub mod volume;
+pub mod wifi;
 
 pub use bar_window::{BarWindow, Edge};
+pub use battery::Battery;
+pub use bluetooth::Bluetooth;
+pub use brightness::Brightness;
 pub use click::settings_page;
+pub use clock::Clock;
 pub use colors::{ModuleKind, module_color};
+pub use cpu::Cpu;
+pub use memory::Memory;
 pub use notifications::NotificationSegment;
 pub use scroll::{ScrollAccumulator, steps_to_delta_pct};
+pub use temperature::Temperature;
 pub use text::TextRenderer;
 pub use volume::Volume;
+pub use wifi::Wifi;

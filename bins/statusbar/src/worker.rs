@@ -169,7 +169,7 @@ impl State {
 
         if now.duration_since(self.last_clock) >= CLOCK_PERIOD {
             self.last_clock = now;
-            if let Some(c) = statusbar::modules::clock() {
+            if let Some(c) = statusbar::Clock::time() {
                 changed |= self.snap.clock != c;
                 self.snap.clock = c;
             }
@@ -177,16 +177,16 @@ impl State {
 
         if now.duration_since(self.last_fast) >= FAST_PERIOD {
             self.last_fast = now;
-            let d = statusbar::modules::date().unwrap_or_else(|| DASH.into());
+            let d = statusbar::Clock::date().unwrap_or_else(|| DASH.into());
             changed |= self.snap.date != d;
             self.snap.date = d;
-            let b = statusbar::modules::battery().unwrap_or_else(|| DASH.into());
+            let b = statusbar::Battery::read().unwrap_or_else(|| DASH.into());
             changed |= self.snap.battery != b;
             self.snap.battery = b;
-            let t = statusbar::modules::temperature().unwrap_or_else(|| DASH.into());
+            let t = statusbar::Temperature::read().unwrap_or_else(|| DASH.into());
             changed |= self.snap.temp != t;
             self.snap.temp = t;
-            let m = statusbar::modules::memory().unwrap_or_else(|| DASH.into());
+            let m = statusbar::Memory::read().unwrap_or_else(|| DASH.into());
             changed |= self.snap.mem != m;
             self.snap.mem = m;
         }
@@ -201,10 +201,10 @@ impl State {
 
         if now.duration_since(self.last_slow) >= SLOW_PERIOD {
             self.last_slow = now;
-            let w = statusbar::modules::wifi().unwrap_or_else(|| DASH.into());
+            let w = statusbar::Wifi::read().unwrap_or_else(|| DASH.into());
             changed |= self.snap.wifi != w;
             self.snap.wifi = w;
-            let bt = statusbar::modules::bluetooth().unwrap_or_else(|| DASH.into());
+            let bt = statusbar::Bluetooth::read().unwrap_or_else(|| DASH.into());
             changed |= self.snap.bluetooth != bt;
             self.snap.bluetooth = bt;
             if let Some((s, pct, muted)) = Volume::sink_raw() {
@@ -225,7 +225,7 @@ impl State {
                 self.snap.vol_in = DASH.into();
                 self.vol_in_known = None;
             }
-            if let Some((s, pct)) = statusbar::modules::brightness_raw() {
+            if let Some((s, pct)) = statusbar::Brightness::read_raw() {
                 changed |= self.snap.brightness != s;
                 self.snap.brightness = s;
                 self.brightness_known = Some(KnownPct { pct, muted: false });
@@ -296,7 +296,7 @@ impl State {
                 }
             }
             ModuleKind::Brightness => {
-                if let Some((s, pct)) = statusbar::modules::brightness_raw() {
+                if let Some((s, pct)) = statusbar::Brightness::read_raw() {
                     let changed = self.snap.brightness != s;
                     self.snap.brightness = s;
                     self.brightness_known = Some(KnownPct { pct, muted: false });
@@ -340,7 +340,7 @@ impl State {
             ModuleKind::Brightness => {
                 let known = self.brightness_known.get_or_insert_with(KnownPct::default);
                 known.pct = (known.pct as i32 + delta_pct).clamp(0, 100) as u32;
-                let s = statusbar::modules::format_brightness(known.pct);
+                let s = statusbar::Brightness::format(known.pct);
                 let changed = self.snap.brightness != s;
                 self.snap.brightness = s;
                 changed
@@ -425,7 +425,7 @@ impl State {
                     return false;
                 };
                 let pct = (known.pct as i32 + delta).clamp(0, 100) as u32;
-                let s = statusbar::modules::format_brightness(pct);
+                let s = statusbar::Brightness::format(pct);
                 let changed = self.snap.brightness != s;
                 self.snap.brightness = s;
                 changed
@@ -458,7 +458,7 @@ impl State {
         match kind {
             ModuleKind::VolOut => Volume::adjust_sink(delta),
             ModuleKind::VolIn => Volume::adjust_source(delta),
-            ModuleKind::Brightness => statusbar::modules::adjust_brightness(delta),
+            ModuleKind::Brightness => statusbar::Brightness::adjust(delta),
             _ => {}
         }
         // Commit the delta straight into `*_known` instead of racing a

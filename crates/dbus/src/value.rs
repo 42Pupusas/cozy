@@ -1,10 +1,3 @@
-#![allow(
-    clippy::cast_sign_loss,
-    clippy::many_single_char_names,
-    clippy::too_long_first_doc_paragraph,
-    clippy::too_many_lines,
-    clippy::match_same_arms
-)]
 //! D-Bus type system: signatures, marshalled values, and the (un)marshaller.
 //!
 //! We only ever *encode* a handful of simple signatures ourselves (`""`,
@@ -77,9 +70,9 @@ impl Value {
             Self::U16(v) => Some(u64::from(*v)),
             Self::U32(v) => Some(u64::from(*v)),
             Self::U64(v) => Some(*v),
-            Self::I16(v) if *v >= 0 => Some(*v as u64),
-            Self::I32(v) if *v >= 0 => Some(*v as u64),
-            Self::I64(v) if *v >= 0 => Some(*v as u64),
+            Self::I16(v) if *v >= 0 => Some(v.cast_unsigned().into()),
+            Self::I32(v) if *v >= 0 => Some(v.cast_unsigned().into()),
+            Self::I64(v) if *v >= 0 => Some(v.cast_unsigned()),
             _ => None,
         }
     }
@@ -162,14 +155,11 @@ pub fn split_first_type(sig: &str) -> (&str, &str) {
 #[must_use]
 pub const fn alignment_of(sig: &str) -> usize {
     match sig.as_bytes().first() {
-        Some(b'y') => 1,
-        Some(b'b' | b'i' | b'u') => 4,
+        Some(b'b' | b'i' | b'u' | b's' | b'o' | b'a') => 4,
         Some(b'n' | b'q') => 2,
-        Some(b'x' | b't' | b'd') => 8,
-        Some(b's' | b'o') => 4,
-        Some(b'g' | b'v') => 1,
-        Some(b'a') => 4,
-        Some(b'(' | b'{') => 8,
+        Some(b'x' | b't' | b'd' | b'(' | b'{') => 8,
+        // b'y' (byte), b'g'/b'v' (signature/variant), and everything
+        // unrecognized are all 1-byte aligned.
         _ => 1,
     }
 }
@@ -190,118 +180,127 @@ macro_rules! read_le {
     }};
 }
 
+/// Decode a UTF-8 string body (`s`/`o`: 4-byte length prefix, `g`:
+/// 1-byte) plus its NUL terminator, returning the string and the offset
+/// just past the terminator.
+fn unmarshal_str_body(buf: &[u8], start: usize, len: usize) -> Option<(String, usize)> {
+    let end = start + len;
+    let text = std::str::from_utf8(buf.get(start..end)?).ok()?.to_string();
+    Some((text, end + 1))
+}
+
+/// Decode an array (`a<elem_sig>`) starting at `offset`.
+fn unmarshal_array(buf: &[u8], offset: usize, elem_sig: &str) -> Option<(Value, usize)> {
+    let aligned = align_up(offset, 4);
+    let len: u32 = read_le!(buf, aligned, u32)?;
+    let elem_align = alignment_of(elem_sig);
+    let start = align_up(aligned + 4, elem_align);
+    let end = start + len as usize;
+    let mut items = Vec::new();
+    let mut pos = start;
+    while pos < end {
+        let (item, next) = unmarshal(buf, pos, elem_sig)?;
+        items.push(item);
+        pos = next;
+    }
+    Some((Value::Array(items), end.max(start)))
+}
+
+/// Decode a struct body (the part of `sig` between `(` and `)`) starting at
+/// `offset`, which is 8-byte aligned per the D-Bus struct rule.
+fn unmarshal_struct(buf: &[u8], offset: usize, inner_sig: &str) -> Option<(Value, usize)> {
+    let mut items = Vec::new();
+    let mut pos = align_up(offset, 8);
+    let mut rest = inner_sig;
+    while !rest.is_empty() {
+        let (field_sig, remainder) = split_first_type(rest);
+        let (field, next) = unmarshal(buf, pos, field_sig)?;
+        items.push(field);
+        pos = next;
+        rest = remainder;
+    }
+    Some((Value::Struct(items), pos))
+}
+
+/// Decode a dict-entry body (the part of `sig` between `{` and `}`) starting
+/// at `offset` -- always exactly one key then one value.
+fn unmarshal_dict_entry(buf: &[u8], offset: usize, inner_sig: &str) -> Option<(Value, usize)> {
+    let aligned = align_up(offset, 8);
+    let (key_sig, rest) = split_first_type(inner_sig);
+    let (key, after_key) = unmarshal(buf, aligned, key_sig)?;
+    let (val_sig, _) = split_first_type(rest);
+    let (val, after_val) = unmarshal(buf, after_key, val_sig)?;
+    Some((Value::DictEntry(Box::new(key), Box::new(val)), after_val))
+}
+
 /// Decode one complete value of `sig` (its *first* type — trailing bytes in
-/// `sig` are ignored, matching [`split_first_type`]'s contract) starting at
-/// `offset` in `buf`. Returns the value and the offset just past it.
+/// `sig` are ignored, matching [`split_first_type`]'s contract).
+///
+/// Starts at `offset` in `buf`; returns the value and the offset just past
+/// it.
 #[must_use]
 pub fn unmarshal(buf: &[u8], offset: usize, sig: &str) -> Option<(Value, usize)> {
-    let c = *sig.as_bytes().first()?;
-    match c {
+    let type_byte = *sig.as_bytes().first()?;
+    match type_byte {
         b'y' => Some((Value::Byte(*buf.get(offset)?), offset + 1)),
         b'b' => {
-            let o = align_up(offset, 4);
-            let v: u32 = read_le!(buf, o, u32)?;
-            Some((Value::Bool(v != 0), o + 4))
+            let aligned = align_up(offset, 4);
+            let raw: u32 = read_le!(buf, aligned, u32)?;
+            Some((Value::Bool(raw != 0), aligned + 4))
         }
         b'n' => {
-            let o = align_up(offset, 2);
-            Some((Value::I16(read_le!(buf, o, i16)?), o + 2))
+            let aligned = align_up(offset, 2);
+            Some((Value::I16(read_le!(buf, aligned, i16)?), aligned + 2))
         }
         b'q' => {
-            let o = align_up(offset, 2);
-            Some((Value::U16(read_le!(buf, o, u16)?), o + 2))
+            let aligned = align_up(offset, 2);
+            Some((Value::U16(read_le!(buf, aligned, u16)?), aligned + 2))
         }
         b'i' => {
-            let o = align_up(offset, 4);
-            Some((Value::I32(read_le!(buf, o, i32)?), o + 4))
+            let aligned = align_up(offset, 4);
+            Some((Value::I32(read_le!(buf, aligned, i32)?), aligned + 4))
         }
         b'u' => {
-            let o = align_up(offset, 4);
-            Some((Value::U32(read_le!(buf, o, u32)?), o + 4))
+            let aligned = align_up(offset, 4);
+            Some((Value::U32(read_le!(buf, aligned, u32)?), aligned + 4))
         }
         b'x' => {
-            let o = align_up(offset, 8);
-            Some((Value::I64(read_le!(buf, o, i64)?), o + 8))
+            let aligned = align_up(offset, 8);
+            Some((Value::I64(read_le!(buf, aligned, i64)?), aligned + 8))
         }
         b't' => {
-            let o = align_up(offset, 8);
-            Some((Value::U64(read_le!(buf, o, u64)?), o + 8))
+            let aligned = align_up(offset, 8);
+            Some((Value::U64(read_le!(buf, aligned, u64)?), aligned + 8))
         }
         b'd' => {
-            let o = align_up(offset, 8);
-            Some((Value::Double(read_le!(buf, o, f64)?), o + 8))
+            let aligned = align_up(offset, 8);
+            Some((Value::Double(read_le!(buf, aligned, f64)?), aligned + 8))
         }
         b's' | b'o' => {
-            let o = align_up(offset, 4);
-            let len: u32 = read_le!(buf, o, u32)?;
-            let start = o + 4;
-            let end = start + len as usize;
-            let s = std::str::from_utf8(buf.get(start..end)?).ok()?.to_string();
-            let val = if c == b's' {
-                Value::Str(s)
+            let aligned = align_up(offset, 4);
+            let len: u32 = read_le!(buf, aligned, u32)?;
+            let (text, end) = unmarshal_str_body(buf, aligned + 4, len as usize)?;
+            let val = if type_byte == b's' {
+                Value::Str(text)
             } else {
-                Value::ObjectPath(s)
+                Value::ObjectPath(text)
             };
-            Some((val, end + 1)) // +1 for the NUL terminator
+            Some((val, end))
         }
         b'g' => {
             let len = *buf.get(offset)? as usize;
-            let start = offset + 1;
-            let end = start + len;
-            let s = std::str::from_utf8(buf.get(start..end)?).ok()?.to_string();
-            Some((Value::Signature(s), end + 1))
+            let (text, end) = unmarshal_str_body(buf, offset + 1, len)?;
+            Some((Value::Signature(text), end))
         }
         b'v' => {
             let len = *buf.get(offset)? as usize;
-            let start = offset + 1;
-            let sig_end = start + len;
-            let inner_sig = std::str::from_utf8(buf.get(start..sig_end)?)
-                .ok()?
-                .to_string();
-            let val_start = sig_end + 1; // skip signature's NUL
+            let (inner_sig, val_start) = unmarshal_str_body(buf, offset + 1, len)?;
             let (inner, end) = unmarshal(buf, val_start, &inner_sig)?;
             Some((Value::Variant(Box::new(inner)), end))
         }
-        b'a' => {
-            let elem_sig = &sig[1..];
-            let o = align_up(offset, 4);
-            let len: u32 = read_le!(buf, o, u32)?;
-            let elem_align = alignment_of(elem_sig);
-            let start = align_up(o + 4, elem_align);
-            let end = start + len as usize;
-            let mut items = Vec::new();
-            let mut p = start;
-            while p < end {
-                let (v, np) = unmarshal(buf, p, elem_sig)?;
-                items.push(v);
-                p = np;
-            }
-            Some((Value::Array(items), end.max(start)))
-        }
-        b'(' => {
-            let o = align_up(offset, 8);
-            let inner = &sig[1..sig.len().saturating_sub(1)];
-            let mut items = Vec::new();
-            let mut p = o;
-            let mut rest = inner;
-            while !rest.is_empty() {
-                let (t, r) = split_first_type(rest);
-                let (v, np) = unmarshal(buf, p, t)?;
-                items.push(v);
-                p = np;
-                rest = r;
-            }
-            Some((Value::Struct(items), p))
-        }
-        b'{' => {
-            let o = align_up(offset, 8);
-            let inner = &sig[1..sig.len().saturating_sub(1)];
-            let (kt, rest) = split_first_type(inner);
-            let (kv, p1) = unmarshal(buf, o, kt)?;
-            let (vt, _) = split_first_type(rest);
-            let (vv, p2) = unmarshal(buf, p1, vt)?;
-            Some((Value::DictEntry(Box::new(kv), Box::new(vv)), p2))
-        }
+        b'a' => unmarshal_array(buf, offset, &sig[1..]),
+        b'(' => unmarshal_struct(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
+        b'{' => unmarshal_dict_entry(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
         _ => None,
     }
 }

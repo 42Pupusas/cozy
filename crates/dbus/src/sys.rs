@@ -1,14 +1,10 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    clippy::too_long_first_doc_paragraph
-)]
 //! The sliver of raw libc this crate can't avoid: making the `AF_UNIX`
 //! socket and building its `sockaddr_un`, plus reading our own uid for SASL
-//! `EXTERNAL` auth. Mirrors `platform::sys`'s `SockAddrUn` (that crate isn't
-//! a dependency here, so this is a small, deliberate duplication rather than
-//! reaching across crates for a dozen lines).
+//! `EXTERNAL` auth.
+//!
+//! Mirrors `platform::sys`'s `SockAddrUn` (that crate isn't a dependency
+//! here, so this is a small, deliberate duplication rather than reaching
+//! across crates for a dozen lines).
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -40,9 +36,10 @@ pub fn make_unix_socket() -> io::Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-/// The effective uid of this process, as used by SASL `EXTERNAL` auth (the
-/// mechanism proves identity via `SO_PEERCRED`, but still sends the uid as
-/// an ASCII-decimal, hex-encoded string in the `AUTH` line).
+/// The effective uid of this process, as used by SASL `EXTERNAL` auth.
+///
+/// The mechanism proves identity via `SO_PEERCRED`, but still sends the
+/// uid as an ASCII-decimal, hex-encoded string in the `AUTH` line.
 #[must_use]
 pub fn effective_uid() -> u32 {
     // SAFETY: geteuid takes no arguments and cannot fail.
@@ -54,7 +51,12 @@ pub fn effective_uid() -> u32 {
 #[must_use]
 pub fn own_pid() -> u32 {
     // SAFETY: getpid takes no arguments and cannot fail.
-    unsafe { getpid() as u32 }
+    let pid = unsafe { getpid() };
+    // A pid is always non-negative in practice (getpid(2) never returns a
+    // negative value); fall back to 0 -- a pid `logind` will never
+    // recognize as any real session -- rather than panic if that were ever
+    // somehow violated.
+    u32::try_from(pid).unwrap_or(0)
 }
 
 /// A `struct sockaddr_un` built for `connect(2)`. Same layout/contract as
@@ -72,10 +74,10 @@ impl SockAddrUn {
     #[must_use]
     pub fn new(path: &[u8]) -> Self {
         let mut buf = vec![0u8; Self::FAMILY_LEN + Self::SUN_PATH_LEN];
-        buf[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+        buf[0..2].copy_from_slice(&u16::try_from(AF_UNIX).unwrap_or(0).to_ne_bytes());
         let n = path.len().min(Self::SUN_PATH_LEN - 1);
         buf[Self::FAMILY_LEN..Self::FAMILY_LEN + n].copy_from_slice(&path[..n]);
-        let len = (Self::FAMILY_LEN + n + 1) as u32;
+        let len = u32::try_from(Self::FAMILY_LEN + n + 1).unwrap_or(u32::MAX);
         Self { buf, len }
     }
 
@@ -87,11 +89,11 @@ impl SockAddrUn {
     #[must_use]
     pub fn new_abstract(name: &[u8]) -> Self {
         let mut buf = vec![0u8; Self::FAMILY_LEN + Self::SUN_PATH_LEN];
-        buf[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+        buf[0..2].copy_from_slice(&u16::try_from(AF_UNIX).unwrap_or(0).to_ne_bytes());
         // buf[FAMILY_LEN] is already 0 (the abstract marker byte).
         let n = name.len().min(Self::SUN_PATH_LEN - 1);
         buf[Self::FAMILY_LEN + 1..Self::FAMILY_LEN + 1 + n].copy_from_slice(&name[..n]);
-        let len = (Self::FAMILY_LEN + 1 + n) as u32;
+        let len = u32::try_from(Self::FAMILY_LEN + 1 + n).unwrap_or(u32::MAX);
         Self { buf, len }
     }
 
@@ -104,7 +106,9 @@ impl SockAddrUn {
 /// Borrow a socket's raw fd as `ququmatz`'s [`RawFd`](ququmatz::types::RawFd).
 #[must_use]
 pub fn as_uring_fd(fd: &OwnedFd) -> ququmatz::types::RawFd {
-    ququmatz::types::RawFd::from_raw(fd.as_raw_fd() as usize)
+    // A raw fd is always non-negative; usize::try_from only fails on a
+    // negative fd, which as_raw_fd() never returns for an OwnedFd.
+    ququmatz::types::RawFd::from_raw(usize::try_from(fd.as_raw_fd()).unwrap_or(0))
 }
 
 #[cfg(test)]

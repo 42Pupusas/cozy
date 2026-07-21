@@ -1,12 +1,12 @@
-#![allow(clippy::too_long_first_doc_paragraph)]
 //! `org.freedesktop.login1` convenience calls: setting backlight brightness
 //! through the session, not a direct sysfs write.
 //!
 //! `/sys/class/backlight/*/brightness` is root-owned by default; the usual
 //! way an unprivileged desktop session gets write access is a udev rule
-//! granting the `video` group (or an `ACL`/`uaccess` tag) permission on it --
-//! this system has neither set up, which is exactly why a direct sysfs
+//! granting the `video` group (or an `ACL`/`uaccess` tag) permission on it.
+//! This system has neither set up, which is exactly why a direct sysfs
 //! write silently failed here (see `modules::adjust_brightness`'s history).
+//!
 //! `logind` exposes `SetBrightness` on the session object specifically so a
 //! desktop session doesn't need either of those: it's polkit-gated instead,
 //! and (for an active, local session) the default polkit policy allows it
@@ -65,10 +65,12 @@ fn own_session_path(conn: &mut Conn) -> Result<String, DbusError> {
     Err(DbusError::Malformed)
 }
 
-/// Set `/sys/class/backlight/<name>/brightness` to `value` via
-/// `Session.SetBrightness("backlight", name, value)` on our own session
-/// object -- `subsystem` is always `"backlight"` (the other logind-known
-/// subsystem, `"leds"`, is for keyboard backlights, not display ones).
+/// Set `/sys/class/backlight/<name>/brightness` to `value`.
+///
+/// Calls `Session.SetBrightness("backlight", name, value)` on our own
+/// session object -- `subsystem` is always `"backlight"` (the other
+/// logind-known subsystem, `"leds"`, is for keyboard backlights, not
+/// display ones).
 pub fn set_backlight_brightness(conn: &mut Conn, name: &str, value: u32) -> Result<(), DbusError> {
     let session_path = own_session_path(conn)?;
     conn.call(

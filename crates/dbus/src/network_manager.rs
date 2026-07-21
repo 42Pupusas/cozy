@@ -1,4 +1,3 @@
-#![allow(clippy::too_long_first_doc_paragraph)]
 //! `org.freedesktop.NetworkManager` convenience calls: the active Wi-Fi
 //! connection's SSID and signal strength.
 //!
@@ -19,10 +18,11 @@ const AP_IFACE: &str = "org.freedesktop.NetworkManager.AccessPoint";
 const DEVICE_TYPE_WIFI: u64 = 2;
 
 /// The connected network's SSID and signal strength, or `None` if no Wi-Fi
-/// device is associated to an access point (mirrors `modules::wifi`'s
-/// "Not connected" case returning the disconnected icon upstream — this
-/// function just reports the data, the statusbar module still decides how
-/// to render "no AP").
+/// device is associated to an access point.
+///
+/// Mirrors `modules::wifi`'s "Not connected" case returning the
+/// disconnected icon upstream — this function just reports the data, the
+/// statusbar module still decides how to render "no AP".
 #[derive(Debug, Clone)]
 pub struct WifiStatus {
     pub ssid: String,
@@ -31,9 +31,11 @@ pub struct WifiStatus {
 }
 
 /// Query every device `NetworkManager` knows about, find the first Wi-Fi
-/// device, and report its active access point (if any). Returns `Ok(None)`
-/// when there's a Wi-Fi device but it's not associated (equivalent to `iw`'s
-/// "Not connected"), and `Err` only for real transport/bus failures.
+/// device, and report its active access point (if any).
+///
+/// Returns `Ok(None)` when there's a Wi-Fi device but it's not associated
+/// (equivalent to `iw`'s "Not connected"), and `Err` only for real
+/// transport/bus failures.
 pub fn wifi_status(conn: &mut Conn) -> Result<Option<WifiStatus>, DbusError> {
     let reply = conn.call(DEST, ROOT_PATH, IFACE, "GetDevices", &[])?;
     let devices = reply.values();

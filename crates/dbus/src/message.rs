@@ -1,11 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::too_long_first_doc_paragraph,
-    clippy::match_same_arms,
-    clippy::branches_sharing_code,
-    clippy::missing_const_for_fn,
-    clippy::vec_init_then_push
-)]
 //! D-Bus wire messages: building method-call frames and parsing whatever
 //! comes back (method returns, error replies, signals).
 //!
@@ -84,30 +76,22 @@ fn write_string_field(buf: &mut Vec<u8>, code: u8, sig_char: u8, s: &str) {
     buf.push(0); // signature NUL
     if sig_char == b'g' {
         // SIGNATURE type: length-prefixed by one byte, no 4-byte len/no pad.
-        buf.push(s.len() as u8);
-        buf.extend_from_slice(s.as_bytes());
-        buf.push(0);
+        buf.push(u8::try_from(s.len()).unwrap_or(u8::MAX));
     } else {
         pad_to(buf, 4);
-        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        buf.extend_from_slice(s.as_bytes());
-        buf.push(0);
+        buf.extend_from_slice(&u32::try_from(s.len()).unwrap_or(u32::MAX).to_le_bytes());
     }
+    buf.extend_from_slice(s.as_bytes());
+    buf.push(0);
 }
 
 /// Append one already-marshalled argument's bytes to a method-call body,
 /// handling the padding its type requires.
 fn write_value(buf: &mut Vec<u8>, v: &BodyArg) {
     match v {
-        BodyArg::Str(s) => {
+        BodyArg::Str(s) | BodyArg::ObjectPath(s) => {
             pad_to(buf, 4);
-            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            buf.extend_from_slice(s.as_bytes());
-            buf.push(0);
-        }
-        BodyArg::ObjectPath(s) => {
-            pad_to(buf, 4);
-            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&u32::try_from(s.len()).unwrap_or(u32::MAX).to_le_bytes());
             buf.extend_from_slice(s.as_bytes());
             buf.push(0);
         }
@@ -118,8 +102,9 @@ fn write_value(buf: &mut Vec<u8>, v: &BodyArg) {
     }
 }
 
-/// The handful of argument shapes our own outgoing method calls ever need
-/// (NetworkManager/bluez getters take zero args or a string/object-path/u32).
+/// The handful of argument shapes our own outgoing method calls ever need.
+///
+/// (NetworkManager/bluez getters take zero args or a string/object-path/u32.)
 /// Kept separate from [`Value`] (the *decode*-side type, which must model
 /// everything a reply could contain) since encode only needs to cover what
 /// we actually send.
@@ -171,11 +156,12 @@ impl Reply {
     }
 }
 
-/// Build a `METHOD_CALL` message frame: header + body, ready to write to the
-/// socket. `serial` must be nonzero and unique per in-flight call on this
-/// connection (the reply carries it back as `REPLY_SERIAL`, though we don't
-/// bother matching on that — see [`crate::conn`] doc comment for why a
-/// simple connection can get away with request/response-in-order).
+/// Build a `METHOD_CALL` message frame: header + body, ready to write to
+/// the socket.
+///
+/// `serial` must be nonzero and unique per in-flight call on this
+/// connection -- the reply carries it back as `REPLY_SERIAL`, which
+/// `Conn::call_raw` matches on to find its reply among interleaved signals.
 #[must_use]
 pub fn build_method_call(
     serial: u32,
@@ -202,15 +188,16 @@ pub fn build_method_call(
         write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', &sig);
     }
 
-    let mut out = Vec::new();
-    out.push(b'l'); // little-endian
-    out.push(MessageType::MethodCall.as_byte());
-    out.push(0); // flags: none (expect a reply)
-    out.push(1); // protocol version
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    let mut out = vec![
+        b'l', // little-endian
+        MessageType::MethodCall.as_byte(),
+        0, // flags: none (expect a reply)
+        1, // protocol version
+    ];
+    out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
     out.extend_from_slice(&serial.to_le_bytes());
     // header fields array: length-prefixed, elements 8-aligned (struct).
-    out.extend_from_slice(&(header_fields.len() as u32).to_le_bytes());
+    out.extend_from_slice(&u32::try_from(header_fields.len()).unwrap_or(u32::MAX).to_le_bytes());
     out.extend_from_slice(&header_fields);
     pad_to(&mut out, 8); // body starts 8-aligned from message start
     out.extend_from_slice(&body);
@@ -253,14 +240,15 @@ impl Prelude {
     /// padded to 8, + body), i.e. how many bytes the caller must have
     /// buffered before calling [`parse_message`].
     #[must_use]
-    pub fn total_len(&self) -> usize {
+    pub const fn total_len(&self) -> usize {
         let after_fields = PRELUDE_LEN + self.header_fields_len as usize;
         align_up(after_fields, 8) + self.body_len as usize
     }
 }
 
-/// Parse one complete message (prelude + header fields + body) out of `buf`,
-/// which must be at least `Prelude::parse(buf).total_len()` bytes (checked
+/// Parse one complete message (prelude + header fields + body) out of `buf`.
+///
+/// `buf` must be at least `Prelude::parse(buf).total_len()` bytes (checked
 /// by the caller via [`Prelude`] first, same two-phase read `platform::conn`
 /// does for Wayland frames — read a fixed prelude, then read exactly as many
 /// more bytes as it says).
@@ -307,7 +295,7 @@ pub fn parse_message(buf: &[u8]) -> Option<Reply> {
                 }
             }
             field_code::REPLY_SERIAL => {
-                reply_serial = val.as_u64().map(|n| n as u32);
+                reply_serial = val.as_u64().map(|n| u32::try_from(n).unwrap_or(u32::MAX));
             }
             _ => {}
         }

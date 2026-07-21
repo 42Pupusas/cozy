@@ -1,10 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::needless_pass_by_value,
-    clippy::format_collect,
-    clippy::redundant_clone
-)]
 //! A minimal, synchronous D-Bus connection over `io_uring`.
 //!
 //! This isn't a general-purpose D-Bus client — it's sized for what the
@@ -119,14 +112,14 @@ impl Conn {
     }
 
     fn connect_path(path: &[u8]) -> Result<Self, DbusError> {
-        Self::connect_addr(sys::SockAddrUn::new(path))
+        Self::connect_addr(&sys::SockAddrUn::new(path))
     }
 
     fn connect_abstract(name: &[u8]) -> Result<Self, DbusError> {
-        Self::connect_addr(sys::SockAddrUn::new_abstract(name))
+        Self::connect_addr(&sys::SockAddrUn::new_abstract(name))
     }
 
-    fn connect_addr(addr: sys::SockAddrUn) -> Result<Self, DbusError> {
+    fn connect_addr(addr: &sys::SockAddrUn) -> Result<Self, DbusError> {
         let sock = sys::make_unix_socket().map_err(DbusError::Connect)?;
         let sock_fd = sys::as_uring_fd(&sock);
 
@@ -185,11 +178,12 @@ impl Conn {
         while sent < bytes.len() {
             // SAFETY: `bytes[sent..]` is valid for the duration of this
             // blocking submit+wait+complete, all within this call.
+            let remaining = u32::try_from(bytes.len() - sent).unwrap_or(u32::MAX);
             let sqe = unsafe {
                 Sqe::send_ptr(
                     self.sock_fd,
                     bytes[sent..].as_ptr(),
-                    (bytes.len() - sent) as u32,
+                    remaining,
                     MsgFlags::NOSIGNAL,
                 )
             };
@@ -200,7 +194,8 @@ impl Conn {
             if n == 0 {
                 return Err(DbusError::Closed);
             }
-            sent += n as usize;
+            // `n` is a byte count `run_one` just confirmed is >= 0.
+            sent += usize::try_from(n).unwrap_or(0);
         }
         Ok(())
     }
@@ -213,11 +208,12 @@ impl Conn {
         while got < n {
             // SAFETY: `out[got..]` is valid for the duration of this blocking
             // submit+wait+complete.
+            let remaining = u32::try_from(n - got).unwrap_or(u32::MAX);
             let sqe = unsafe {
                 Sqe::recv_ptr(
                     self.sock_fd,
                     out[got..].as_mut_ptr(),
-                    (n - got) as u32,
+                    remaining,
                     MsgFlags::default(),
                 )
             };
@@ -228,7 +224,8 @@ impl Conn {
             if r == 0 {
                 return Err(DbusError::Closed);
             }
-            got += r as usize;
+            // `r` is a byte count `run_one` just confirmed is >= 0.
+            got += usize::try_from(r).unwrap_or(0);
         }
         Ok(out)
     }
@@ -256,11 +253,11 @@ impl Conn {
     fn authenticate(&mut self) -> Result<(), DbusError> {
         self.send_raw(&[0])?; // initial NUL byte, required before AUTH
         let uid = sys::effective_uid();
-        let hex_uid = uid
-            .to_string()
-            .bytes()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+        let hex_uid = uid.to_string().bytes().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
         self.send_raw(format!("AUTH EXTERNAL {hex_uid}\r\n").as_bytes())?;
         let line = self.recv_line()?;
         if !line.starts_with("OK ") {

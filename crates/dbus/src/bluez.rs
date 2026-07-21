@@ -1,4 +1,3 @@
-#![allow(clippy::too_long_first_doc_paragraph)]
 //! `org.bluez` convenience calls: adapter power state + connected device
 //! count.
 //!
@@ -20,9 +19,11 @@ const ADAPTER_IFACE: &str = "org.bluez.Adapter1";
 const DEVICE_IFACE: &str = "org.bluez.Device1";
 
 /// Bluetooth status: whether any adapter is powered, and how many devices
-/// are currently connected. `None` fields mean "no adapter found" (bluez not
-/// running, or genuinely no hardware) — the statusbar module already treats
-/// a `None` return the same as the old `bluetoothctl`-missing case.
+/// are currently connected.
+///
+/// `None` fields mean "no adapter found" (bluez not running, or genuinely no
+/// hardware) — the statusbar module already treats a `None` return the same
+/// as the old `bluetoothctl`-missing case.
 #[derive(Debug, Clone)]
 pub struct BluetoothStatus {
     pub powered: bool,
@@ -30,9 +31,10 @@ pub struct BluetoothStatus {
 }
 
 /// Walk bluez's managed-object tree once and summarize adapter power +
-/// connected-device count. `Ok(None)` when no adapter object exists at all
-/// (distinct from "adapter present but off", which is `Ok(Some(status))`
-/// with `powered: false`).
+/// connected-device count.
+///
+/// `Ok(None)` when no adapter object exists at all (distinct from "adapter
+/// present but off", which is `Ok(Some(status))` with `powered: false`).
 pub fn status(conn: &mut Conn) -> Result<Option<BluetoothStatus>, DbusError> {
     let reply = conn.call(DEST, ROOT_PATH, OBJECT_MANAGER_IFACE, "GetManagedObjects", &[])?;
     let values = reply.values();

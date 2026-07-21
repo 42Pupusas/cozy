@@ -29,7 +29,7 @@ pub struct PointerState {
     /// event; positive = wheel down, negative = wheel up (same sign
     /// convention as `platform::TermWindow`'s scroll handling).
     pending_scroll: Vec<i32>,
-    /// Sub-pixel remainder accumulator, in raw wl_fixed 24.8 units: a
+    /// Sub-pixel remainder accumulator, in raw `wl_fixed` 24.8 units: a
     /// touchpad or hi-res mouse wheel routinely sends many axis events
     /// whose magnitude is under one whole pixel, and `Fixed::to_pixels`
     /// truncates -- converting per-event before accumulating silently
@@ -57,19 +57,19 @@ impl PointerState {
 
     /// The `wl_pointer` object id, once the seat has advertised one.
     #[must_use]
-    pub fn id(&self) -> Option<PointerId> {
+    pub const fn id(&self) -> Option<PointerId> {
         self.pointer
     }
 
     /// Record the `wl_pointer` object obtained from `wl_seat.get_pointer`.
-    pub fn set_id(&mut self, pointer: PointerId) {
+    pub const fn set_id(&mut self, pointer: PointerId) {
         self.pointer = Some(pointer);
     }
 
     /// Latest known pointer position, physical pixels, surface-local
     /// (`(0,0)` at the bar's top-left).
     #[must_use]
-    pub fn pos(&self) -> Point {
+    pub const fn pos(&self) -> Point {
         self.pos
     }
 
@@ -90,7 +90,7 @@ impl PointerState {
     /// Handle one `wl_pointer` event (already confirmed to be
     /// `ev.is(self.id())` by the caller). Only Enter/Motion/Button/Axis
     /// carry anything a bar cares about; everything else (Frame,
-    /// AxisSource, ...) is ignored.
+    /// `AxisSource`, ...) is ignored.
     pub fn on_event(&mut self, ev: &RawEvent) {
         match ev.event::<PointerEvent>() {
             Some(PointerEvent::Enter) => {
@@ -118,7 +118,7 @@ impl PointerState {
     /// The actual press/release state machine, split out from
     /// [`Self::on_button`]'s wire-arg decoding so tests can drive it
     /// directly without constructing a real wire-encoded `RawEvent`.
-    fn apply_button(&mut self, button: Option<PointerButton>, state: Option<ButtonState>) {
+    const fn apply_button(&mut self, button: Option<PointerButton>, state: Option<ButtonState>) {
         match (button, state) {
             (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
                 self.left_pressed = true;
@@ -134,11 +134,11 @@ impl PointerState {
     }
 
     /// Axis args: (time, axis, value). axis 0 = vertical; value is
-    /// wl_fixed (24.8) -- positive = wheel down, negative = wheel up, same
+    /// `wl_fixed` (24.8) -- positive = wheel down, negative = wheel up, same
     /// convention as `platform::TermWindow`'s scroll handling.
     ///
     /// Touchpad/hi-res-wheel scrolling sends many small axis events,
-    /// routinely under one whole pixel each (wl_fixed's 8 fractional bits
+    /// routinely under one whole pixel each (`wl_fixed`'s 8 fractional bits
     /// mean e.g. 0.3px is a real, distinct value on the wire). Converting
     /// each event to pixels independently via `to_pixels()` (plain
     /// truncating integer division) rounded every such sub-pixel event down

@@ -10,15 +10,18 @@
 //! immediately and a screenshot doesn't.
 
 /// Raw wheel pixels (`wl_fixed`-derived) per one logical scroll "step" /
-/// detent. Matches a typical physical mouse wheel click; touchpad/hi-res-
-/// wheel micro-events accumulate fractionally toward this rather than each
+/// detent.
+///
+/// Matches a typical physical mouse wheel click; touchpad/hi-res-wheel
+/// micro-events accumulate fractionally toward this rather than each
 /// counting as a full step on their own.
 pub const PX_PER_STEP: i32 = 15;
 
 /// Accumulates raw scroll-wheel pixels for a single control until there's
-/// at least one whole detent's worth, then hands back the percentage-point
-/// delta to apply -- carrying any sub-detent remainder forward rather than
-/// dropping it.
+/// at least one whole detent's worth.
+///
+/// Then hands back the percentage-point delta to apply -- carrying any
+/// sub-detent remainder forward rather than dropping it.
 ///
 /// # History
 ///
@@ -56,7 +59,7 @@ impl ScrollAccumulator {
     }
 
     /// Add `raw_px` to the pending accumulation.
-    pub fn add(&mut self, raw_px: i32) {
+    pub const fn add(&mut self, raw_px: i32) {
         self.pending_px += raw_px;
     }
 
@@ -71,7 +74,7 @@ impl ScrollAccumulator {
     /// matching `wl_pointer.axis`'s own sign convention), leaving any
     /// sub-detent remainder queued. Returns `0` (and leaves the
     /// accumulator untouched) if less than one whole detent is pending.
-    pub fn take_steps(&mut self) -> i32 {
+    pub const fn take_steps(&mut self) -> i32 {
         let steps = self.pending_px / PX_PER_STEP;
         if steps == 0 {
             return 0;
@@ -83,16 +86,17 @@ impl ScrollAccumulator {
     /// Reset to empty, discarding any pending sub-detent remainder --
     /// e.g. when the pointer moves to a different segment, whose scroll
     /// history isn't relevant to this one.
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.pending_px = 0;
     }
 }
 
 /// Convert a wheel step count into a percentage-point delta to apply to a
-/// volume/brightness control. Wheel up (negative steps, matching
-/// `wl_pointer.axis`'s sign convention where negative = up/away) increases
-/// the value; wheel down decreases it -- the usual volume-knob feel (push
-/// up = louder).
+/// volume/brightness control.
+///
+/// Wheel up (negative steps, matching `wl_pointer.axis`'s sign convention
+/// where negative = up/away) increases the value; wheel down decreases it
+/// -- the usual volume-knob feel (push up = louder).
 #[must_use]
 pub const fn steps_to_delta_pct(steps: i32, step_pct: i32) -> i32 {
     -steps * step_pct

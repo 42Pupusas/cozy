@@ -28,7 +28,7 @@ use json_bourne::{FromJson, parse_str};
 #[derive(Debug, FromJson)]
 #[bourne(deny_unknown_fields = false)]
 struct NiriWindow {
-    /// `None` for windows with no app_id set at all (some Xwayland apps);
+    /// `None` for windows with no `app_id` set at all (some Xwayland apps);
     /// such a window can never match a `NotificationRule`.
     #[bourne(default)]
     app_id: Option<String>,
@@ -71,10 +71,11 @@ pub struct NotificationSegment {
 /// it's unread (nf-md `circle`, U+F0765).
 pub const UNREAD_DOT: char = '\u{f0765}';
 
-/// `[[bar.notifications]]` resolution -- a marker type (like
-/// [`crate::volume::Volume`]) rather than a value: fetching/resolving is
-/// always against the caller's current `rules` slice, there's nothing to
-/// cache here.
+/// `[[bar.notifications]]` resolution.
+///
+/// A marker type (like [`crate::volume::Volume`]) rather than a value:
+/// fetching/resolving is always against the caller's current `rules`
+/// slice, there's nothing to cache here.
 pub struct Notifications;
 
 impl Notifications {
@@ -142,10 +143,12 @@ impl Notifications {
 }
 
 /// Extends `str` with the "is this a rendered unread-notification segment"
-/// check, as a method instead of a free `is_unread_text(text)` function --
-/// per the crate-wide rule, reusable logic with no obvious struct owner
-/// belongs on a trait over the primitive it operates on (matches
-/// `colors::TrailingPercent` on `str`).
+/// check.
+///
+/// A method instead of a free `is_unread_text(text)` function -- per the
+/// crate-wide rule, reusable logic with no obvious struct owner belongs on
+/// a trait over the primitive it operates on (matches `colors::TrailingPercent`
+/// on `str`).
 pub trait UnreadMarker {
     /// Whether a rendered segment string should be painted in the "unread"
     /// color -- re-derived from the string itself (not carried alongside

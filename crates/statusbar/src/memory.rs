@@ -23,7 +23,13 @@ impl Memory {
             }
         }
         let (total, avail) = (total_kb?, avail_kb?);
+        // A real machine's RAM in kB is nowhere near f64's 52-bit mantissa
+        // limit (that's ~4.5 petabytes), but that bound isn't provable from
+        // the u64 type alone -- same situation as the font crate's
+        // documented float casts.
+        #[allow(clippy::cast_precision_loss)]
         let used_gib = (total - avail) as f64 / 1024.0 / 1024.0;
+        #[allow(clippy::cast_precision_loss)]
         let total_gib = total as f64 / 1024.0 / 1024.0;
         Some(format!("{used_gib:>4.1}/{total_gib:>4.1}GiB 󰅛"))
     }
@@ -33,7 +39,7 @@ impl Memory {
     fn parse_kb(s: &str) -> Option<u64> {
         s.trim()
             .strip_suffix(" kB")
-            .unwrap_or(s.trim())
+            .unwrap_or_else(|| s.trim())
             .trim()
             .parse()
             .ok()

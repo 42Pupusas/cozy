@@ -170,7 +170,7 @@ impl Volume {
         format!("{pct:>3}% {icon}")
     }
 
-    fn pick_icon(is_source: bool, pct: u32, muted: bool) -> &'static str {
+    const fn pick_icon(is_source: bool, pct: u32, muted: bool) -> &'static str {
         if is_source {
             return if muted { MIC_MUTED } else { MIC_ON };
         }

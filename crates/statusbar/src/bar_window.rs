@@ -42,7 +42,7 @@ const APP_ID: &str = "statusbar";
 /// Placeholder width the pool is first sized at, before the compositor's
 /// initial `configure` tells us the real (output-width) size. Matches
 /// `TermWindow`'s "size known before first commit" ordering closely enough
-/// that we never hit the "second create_pool" rejection — the *first* frame
+/// that we never hit the "second `create_pool`" rejection — the *first* frame
 /// pair (buffers + pool) is created up front, and every later size change
 /// reuses the same pool via `resize`.
 const INITIAL_WIDTH: i32 = 1;
@@ -57,8 +57,8 @@ pub enum Edge {
 impl Edge {
     fn anchor_bits(self) -> u32 {
         match self {
-            Edge::Top => Anchor::bits(&[Anchor::Top, Anchor::Left, Anchor::Right]),
-            Edge::Bottom => Anchor::bits(&[Anchor::Bottom, Anchor::Left, Anchor::Right]),
+            Self::Top => Anchor::bits(&[Anchor::Top, Anchor::Left, Anchor::Right]),
+            Self::Bottom => Anchor::bits(&[Anchor::Bottom, Anchor::Left, Anchor::Right]),
         }
     }
 }
@@ -164,12 +164,14 @@ impl BarWindow {
             output,
         } = Self::discover(&mut sender, &mut events)?;
 
-        let scale = match output {
-            Some(o) => Self::output_scale(&mut sender, &mut events, o),
-            None => 1,
-        };
+        let scale = output.map_or(1, |o| Self::output_scale(&mut sender, &mut events, o));
 
         let px_height = height * scale;
+        // Float source, no lossless-widening path available (see the font
+        // crate's raster.rs doc for the full float<->int cast rationale) --
+        // `.clamp(0.0, 1.0)` right before multiplying guarantees the result
+        // is in `0.0..=255.0`, so this is a deliberate, reviewed allow.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let bg_alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
         // A translucent bar (opacity < 1.0) needs per-pixel alpha (Argb8888);
         // an opaque one keeps the cheaper Xrgb8888 the compositor doesn't
@@ -265,7 +267,12 @@ impl BarWindow {
             // so the per-row stale bitmap `PresentState` carries is unused;
             // `row_count: 1` just keeps that unused allocation tiny.
             present: PresentState::new(frames, shm_mem, pool, buf_format, 1),
-            backbuffer: vec![Color::BLACK.to_xrgb8888(); (INITIAL_WIDTH * px_height) as usize],
+            // INITIAL_WIDTH and px_height (bar_height * output scale) are
+            // always positive by construction, so this cast can't lose sign.
+            backbuffer: vec![
+                Color::BLACK.to_xrgb8888();
+                usize::try_from(INITIAL_WIDTH * px_height).unwrap_or(0)
+            ],
             background: Color::rgb(0x1e, 0x1e, 0x2e),
             bg_alpha,
             configured: false,
@@ -275,12 +282,12 @@ impl BarWindow {
 
     /// Physical cell height in pixels the bar was opened at (already scaled).
     #[must_use]
-    pub fn height(&self) -> i32 {
+    pub const fn height(&self) -> i32 {
         self.height
     }
 
     #[must_use]
-    pub fn scale(&self) -> i32 {
+    pub const fn scale(&self) -> i32 {
         self.scale
     }
 
@@ -292,7 +299,7 @@ impl BarWindow {
     /// Latest known pointer position, physical pixels, surface-local
     /// (`(0,0)` at the bar's top-left).
     #[must_use]
-    pub fn pointer_pos(&self) -> Point {
+    pub const fn pointer_pos(&self) -> Point {
         self.pointer.pos()
     }
 
@@ -343,26 +350,25 @@ impl BarWindow {
             .map_err(Error::Conn)?;
 
         while let Some(ev) = self.events.pop() {
-            self.handle_event(ev)?;
+            self.handle_event(&ev)?;
             if self.closing {
                 return Ok(false);
             }
         }
 
-        if self.configured {
-            if let PresentAttempt::Ready(slot) = self.present.begin_present() {
-                self.do_present(slot, &mut paint)?;
+        if self.configured
+            && let PresentAttempt::Ready(slot) = self.present.begin_present() {
+                self.do_present(slot, &mut paint);
             }
-        }
         Ok(true)
     }
 
-    fn handle_event(&mut self, ev: RawEvent) -> Result<()> {
+    fn handle_event(&mut self, ev: &RawEvent) -> Result<()> {
         // The `wl_display` error/delete_id routing, `wl_buffer.release`, and
         // frame callback are handled identically to `platform::TermWindow` via
         // the shared `surface::route_common`; only the bar-specific seat /
         // pointer / layer-surface events below differ.
-        match self.present.route_common(&ev, &mut self.window_tx) {
+        match self.present.route_common(ev, &mut self.window_tx) {
             surface::Routed::Fatal(e) => return Err(e),
             surface::Routed::Handled => return Ok(()),
             surface::Routed::Passthrough => {}
@@ -384,18 +390,19 @@ impl BarWindow {
         // wl_pointer.* -- only Enter/Motion (track position), Button (click
         // detection) and Axis (queue a scroll delta) matter for a bar with
         // no selection/drag of its own; see `PointerState` for all of it.
-        if let Some(pointer) = self.pointer.id() {
-            if ev.is(pointer) {
-                self.pointer.on_event(&ev);
+        if let Some(pointer) = self.pointer.id()
+            && ev.is(pointer) {
+                self.pointer.on_event(ev);
                 return Ok(());
             }
-        }
 
         if ev.is(self.layer_surface) {
             match ev.event::<LayerSurfaceEvent>() {
                 Some(LayerSurfaceEvent::Configure) => {
                     let serial = ev.arg(0);
-                    let w = ev.arg(1) as i32 * self.scale;
+                    // Wayland surface dimensions never approach i32::MAX,
+                    // so this is never actually a sign-changing wrap.
+                    let w = ev.arg(1).cast_signed() * self.scale;
                     self.window_tx.request(
                         MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
                             .u32(serial),
@@ -446,7 +453,11 @@ impl BarWindow {
         // with; only `dirty`/`frame_ready` actually matter here.
         self.present.reset_after_resize(1);
 
-        self.backbuffer = vec![Color::BLACK.to_xrgb8888(); (width * self.height) as usize];
+        // `width`/`self.height` are always positive by construction (both
+        // come from validated Wayland configure events), so this can't
+        // lose sign.
+        self.backbuffer =
+            vec![Color::BLACK.to_xrgb8888(); usize::try_from(width * self.height).unwrap_or(0)];
         Ok(())
     }
 
@@ -477,7 +488,7 @@ impl BarWindow {
     /// `self.present.begin_present()`) and commit it. Named `do_present`
     /// rather than `present` now that the swap-chain state itself lives in
     /// the `present: PresentState` field of the same name.
-    fn do_present(&mut self, slot: usize, paint: &mut impl FnMut(&mut Canvas)) -> Result<()> {
+    fn do_present(&mut self, slot: usize, paint: &mut impl FnMut(&mut Canvas)) {
         {
             let bg_packed = self.pack_bg();
             for p in &mut self.backbuffer {
@@ -513,7 +524,6 @@ impl BarWindow {
         self.window_tx
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
         self.present.finish_present(cb);
-        Ok(())
     }
 
     fn discover(sender: &mut Sender, events: &mut Consumer<RawEvent>) -> Result<Globals> {

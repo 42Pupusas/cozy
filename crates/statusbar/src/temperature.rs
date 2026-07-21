@@ -17,11 +17,16 @@ impl Temperature {
         let dir = fs::read_dir("/sys/class/thermal").ok()?;
         for entry in dir.flatten() {
             let path = entry.path().join("temp");
-            if let Some(raw) = path.read_trim() {
-                if let Ok(milli) = raw.parse::<i64>() {
-                    return Some(format!("{:>3.0}°C", milli as f64 / 1000.0));
+            if let Some(raw) = path.read_trim()
+                && let Ok(milli) = raw.parse::<i64>() {
+                    // A real thermal-zone millidegree reading is nowhere
+                    // near f64's 52-bit mantissa limit, but that bound isn't
+                    // provable from the i64 type alone -- same situation as
+                    // the font crate's documented float casts.
+                    #[allow(clippy::cast_precision_loss)]
+                    let celsius = milli as f64 / 1000.0;
+                    return Some(format!("{celsius:>3.0}°C"));
                 }
-            }
         }
         None
     }

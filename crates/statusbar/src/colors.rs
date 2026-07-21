@@ -12,12 +12,13 @@
 use platform::draw::Color;
 
 /// Kanagawa Dragon accents, lifted verbatim from waybar's own
-/// `~/.config/waybar/style.css` `@define-color` block -- so our bar's
-/// per-module colors match waybar's exactly, not just the shape of the
-/// idea. `fg`/`bg` aren't here: those already come from `[bar]`/`[colors]`
-/// (see `cfg.bar_foreground`/`bar_background`), since unlike waybar's
-/// hardcoded stylesheet, ours mirrors the terminal's configured theme by
-/// default.
+/// `~/.config/waybar/style.css` `@define-color` block.
+///
+/// So our bar's per-module colors match waybar's exactly, not just the
+/// shape of the idea. `fg`/`bg` aren't here: those already come from
+/// `[bar]`/`[colors]` (see `cfg.bar_foreground`/`bar_background`), since
+/// unlike waybar's hardcoded stylesheet, ours mirrors the terminal's
+/// configured theme by default.
 pub mod palette {
     use platform::draw::Color;
 

@@ -33,6 +33,12 @@ impl Brightness {
             if max <= 0.0 {
                 continue;
             }
+            // Float source, no lossless-widening path available (see the
+            // font crate's raster.rs doc for the full float<->int cast
+            // rationale) -- `cur/max` is a fraction of a sysfs-reported
+            // brightness, always non-negative and comfortably under u32::MAX
+            // once scaled to a percentage.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let pct = (cur / max * 100.0).round() as u32;
             return Some((Self::format(pct), pct));
         }
@@ -98,11 +104,11 @@ impl Brightness {
             };
             let new_val = (cur + step).clamp(0, max);
             if let Ok(mut conn) = dbus::DbusConn::system() {
-                #[allow(clippy::cast_sign_loss)]
+                // Clamped to `0..=max` above (and `max > 0`, checked), so
+                // this is always non-negative.
+                let new_val_u32 = u32::try_from(new_val).unwrap_or(0);
                 let _ = dbus::logind::LogindSession::set_backlight_brightness(
-                    &mut conn,
-                    name,
-                    new_val as u32,
+                    &mut conn, name, new_val_u32,
                 );
             }
             return;

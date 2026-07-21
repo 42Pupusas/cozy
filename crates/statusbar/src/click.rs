@@ -1,9 +1,11 @@
-//! Left-click → COSMIC settings page dispatch, mirroring the user's own
-//! `~/.config/waybar/config` `"on-click": "cosmic-popup <page>"` bindings
-//! module-for-module (`cosmic-popup` is their own `~/.local/bin` wrapper
-//! around `cosmic-settings <page>` that auto-closes on focus loss — see
-//! `cosmic-settings help` for the page slug list). Clock/date/temp have no
-//! waybar `on-click` of their own, so they're left unmapped here too.
+//! Left-click → COSMIC settings page dispatch.
+//!
+//! Mirrors the user's own `~/.config/waybar/config` `"on-click":
+//! "cosmic-popup <page>"` bindings module-for-module (`cosmic-popup` is
+//! their own `~/.local/bin` wrapper around `cosmic-settings <page>` that
+//! auto-closes on focus loss — see `cosmic-settings help` for the page slug
+//! list). Clock/date/temp have no waybar `on-click` of their own, so
+//! they're left unmapped here too.
 //!
 //! `ModuleKind::settings_page` is a pure lookup (no process spawning here)
 //! so the mapping itself is unit-testable without a live desktop session;
@@ -16,7 +18,7 @@ impl ModuleKind {
     /// or `None` if this module has no click action (matches which waybar
     /// modules do/don't set `on-click` in the user's config).
     #[must_use]
-    pub fn settings_page(self) -> Option<&'static str> {
+    pub const fn settings_page(self) -> Option<&'static str> {
         match self {
             Self::Wifi => Some("network"),
             Self::Bluetooth => Some("bluetooth"),

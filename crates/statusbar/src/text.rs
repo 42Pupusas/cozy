@@ -1,10 +1,12 @@
-//! Text rendering for the bar: either the embedded 8×16 bitmap font (no
-//! config, always available) or a real TTF/OTF face loaded via `font`,
-//! rasterized into a growing glyph atlas exactly like
-//! `platform::render`'s `GlyphCache` -- just decoupled from the terminal's
-//! fixed-width cell grid, since bar text is proportional-ish (still
-//! monospace-metric in practice, but drawn glyph-by-glyph at each glyph's
-//! own advance rather than snapped to a `cell_w` grid column).
+//! Text rendering for the bar.
+//!
+//! Either the embedded 8×16 bitmap font (no config, always available) or a
+//! real TTF/OTF face loaded via `font`, rasterized into a growing glyph
+//! atlas exactly like `platform::render`'s `GlyphCache` -- just decoupled
+//! from the terminal's fixed-width cell grid, since bar text is
+//! proportional-ish (still monospace-metric in practice, but drawn
+//! glyph-by-glyph at each glyph's own advance rather than snapped to a
+//! `cell_w` grid column).
 
 use std::collections::HashMap;
 
@@ -125,6 +127,11 @@ impl TextRenderer {
     pub fn line_height(&self) -> i32 {
         match self {
             Self::Bitmap => bitmap_font::GLYPH_H,
+            // Float source, no lossless-widening path available (see the
+            // font crate's raster.rs doc for the full float<->int cast
+            // rationale) -- a glyph cell height is always tiny and
+            // positive.
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             Self::Face(f) => f.cell_height.round().max(1.0) as i32,
         }
     }
@@ -140,13 +147,27 @@ impl TextRenderer {
     /// not-yet-cached glyphs as a side effect, same as `draw_text`).
     pub fn measure(&mut self, text: &str) -> i32 {
         match self {
-            Self::Bitmap => text.chars().count() as i32 * bitmap_font::GLYPH_W,
+            // A bar segment's rendered text is always short, well under
+            // i32::MAX chars.
+            Self::Bitmap => {
+                i32::try_from(text.chars().count()).unwrap_or(i32::MAX) * bitmap_font::GLYPH_W
+            }
             Self::Face(f) => {
                 let mut w = 0.0f32;
                 for ch in text.chars() {
-                    w += f.entry(ch as u32).map_or(0.0, |e| e.advance as f32);
+                    // A glyph advance is always tiny (well under i16::MAX
+                    // pixels), so narrowing through i16 first makes this
+                    // widening to f32 provably lossless.
+                    w += f.entry(ch as u32).map_or(0.0, |e| {
+                        f32::from(i16::try_from(e.advance).unwrap_or(i16::MAX))
+                    });
                 }
-                w.round() as i32
+                // Float source, no lossless-widening path available (see
+                // the font crate's raster.rs doc) -- a measured text width
+                // is always tiny and positive.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let width = w.round() as i32;
+                width
             }
         }
     }
@@ -186,7 +207,9 @@ impl TextRenderer {
         match self {
             Self::Bitmap => {
                 canvas.draw_text(text, x, y, fg);
-                x + text.chars().count() as i32 * bitmap_font::GLYPH_W
+                // A bar segment's rendered text is always short, well
+                // under i32::MAX chars.
+                x + i32::try_from(text.chars().count()).unwrap_or(i32::MAX) * bitmap_font::GLYPH_W
             }
             Self::Face(f) => {
                 let mut pen_x = x;
@@ -257,6 +280,10 @@ impl FaceRenderer {
         } else {
             self.face.rasterize(codepoint)
         };
+        // Float source, no lossless-widening path available (see the font
+        // crate's raster.rs doc for the full float<->int cast rationale) --
+        // glyph bearing/advance are always tiny pixel offsets.
+        #[allow(clippy::cast_possible_truncation)]
         let entry = self.atlas.insert(
             &g.bitmap,
             g.metrics.bearing_x.round() as i32,

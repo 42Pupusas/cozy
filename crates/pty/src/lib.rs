@@ -1,9 +1,3 @@
-// Syscall FFI: `as` casts between C int widths are bounded and correct.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
 //! Pseudoterminal management.
 //!
 //! Spawns a child process under a POSIX pseudoterminal and drives all I/O
@@ -181,7 +175,9 @@ impl Pty {
             pending_write: VecDeque::new(),
             signal_fd,
             signal_buf: Box::new([0u8; 128]),
-            wake_fd: ququmatz::RawFd::from_raw(wake_fd as usize),
+            // A valid fd is always non-negative (checked by the OS at
+            // open/eventfd time), so this cast can't lose the sign.
+            wake_fd: ququmatz::RawFd::from_raw(wake_fd.cast_unsigned() as usize),
             wake_buf: Box::new([0u8; 8]),
             shutdown,
             read_pending: None,
@@ -433,15 +429,11 @@ impl Pty {
         // SAFETY: write_buf is a stable heap allocation owned by self; it is
         // only rewritten after the WriteDone CQE for this SQE is consumed
         // (single-write-in-flight invariant via write_in_flight).
-        let sqe = unsafe {
-            Sqe::write_ptr(
-                self.master_fd,
-                self.write_buf.as_ptr(),
-                len as u32,
-                u64::MAX,
-            )
-        }
-        .user_data(tag::WRITE);
+        // `len` is bounded by `WRITE_BUF_SIZE`, a small compile-time buffer
+        // size, so this always fits in u32.
+        let len_u32 = u32::try_from(len).unwrap_or(u32::MAX);
+        let sqe = unsafe { Sqe::write_ptr(self.master_fd, self.write_buf.as_ptr(), len_u32, u64::MAX) }
+            .user_data(tag::WRITE);
         self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
         self.queue.submit().map_err(PtyError::UringEnter)
     }
@@ -462,7 +454,8 @@ impl Pty {
         const EAGAIN: i32 = 11;
         const EINTR: i32 = 4;
         if result >= 0 {
-            let written = result as usize;
+            // Checked non-negative above, so the sign-preserving cast is exact.
+            let written = result.cast_unsigned() as usize;
             if written < self.write_len {
                 for i in (written..self.write_len).rev() {
                     self.pending_write.push_front(self.write_buf[i]);
@@ -481,11 +474,13 @@ impl Pty {
         // SAFETY: read_buf is a stable heap allocation owned by self, valid
         // until the next arm_read — which only happens after this SQE's CQE
         // is consumed (single-read-in-flight invariant).
+        // READ_BUF_SIZE is a small compile-time buffer size, always fits in u32.
+        let read_buf_size_u32 = u32::try_from(READ_BUF_SIZE).expect("READ_BUF_SIZE fits in u32");
         let sqe = unsafe {
             Sqe::read_ptr(
                 self.master_fd,
                 self.read_buf.as_ptr().cast_mut(),
-                READ_BUF_SIZE as u32,
+                read_buf_size_u32,
                 u64::MAX,
             )
         }
@@ -563,7 +558,8 @@ impl CqeAction {
                 const EAGAIN: i32 = 11;
                 const EINTR: i32 = 4;
                 if result > 0 {
-                    Self::ReadOk(result as usize)
+                    // Checked positive above, so the sign-preserving cast is exact.
+                    Self::ReadOk(result.cast_unsigned() as usize)
                 } else if result == -EAGAIN || result == -EINTR {
                     Self::ReadRetry
                 } else {

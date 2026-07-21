@@ -10,7 +10,7 @@ use statusbar::{ModuleKind, ScrollAccumulator, Volume, steps_to_delta_pct};
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
 /// often to keep from spawning processes constantly.
-const CLOCK_PERIOD: Duration = Duration::from_millis(1000);
+const CLOCK_PERIOD: Duration = Duration::from_secs(1);
 const FAST_PERIOD: Duration = Duration::from_secs(2); // battery, temp, mem
 const SLOW_PERIOD: Duration = Duration::from_secs(5); // wifi, bluetooth, volume, brightness
 /// How often `[[bar.notifications]]` re-runs `niri msg --json windows`.
@@ -23,7 +23,7 @@ const NOTIFICATIONS_PERIOD: Duration = Duration::from_secs(2);
 /// longer period rather than sharing `FAST_PERIOD`. Currently unused --
 /// see the comment where it would be called in `State::refresh`.
 #[allow(dead_code)]
-const CPU_PERIOD: Duration = Duration::from_millis(2000);
+const CPU_PERIOD: Duration = Duration::from_secs(2);
 
 /// Percentage points nudged per wheel detent when scroll-adjusting
 /// vol-out/vol-in/brightness.
@@ -71,21 +71,24 @@ impl Snapshot {
     /// Left section, left-to-right draw order: the always-visible
     /// connectivity cluster (clock/date live in `right_segments`).
     pub fn left_segments(&self) -> Vec<(ModuleKind, &str)> {
-        let mut segs: Vec<(ModuleKind, &str)> = self
-            .notifications
-            .iter()
-            .map(|s| (ModuleKind::Notification, s.as_str()))
-            .collect();
-        segs.push((ModuleKind::Wifi, self.wifi.as_str()));
-        segs.push((ModuleKind::Bluetooth, self.bluetooth.as_str()));
+        let mut segs: Vec<(ModuleKind, &str)> = vec![
+            (ModuleKind::Wifi, self.wifi.as_str()),
+            (ModuleKind::Bluetooth, self.bluetooth.as_str()),
+        ];
+        segs.extend(
+            self.notifications
+                .iter()
+                .map(|s| (ModuleKind::Notification, s.as_str())),
+        );
         segs
     }
 
     /// Center section -- unused for now (kept as an empty group so the
     /// three-section layout is exercised even with nothing docked there;
-    /// a sway-IPC workspace/window-title module would land here).
-    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
-    pub fn center_segments(&self) -> Vec<(ModuleKind, &str)> {
+    /// a sway-IPC workspace/window-title module would land here). Takes no
+    /// `&self`: it doesn't depend on any snapshot content yet, so it's an
+    /// associated fn rather than a method that would trip `unused_self`.
+    pub const fn center_segments() -> Vec<(ModuleKind, &'static str)> {
         Vec::new()
     }
 
@@ -116,6 +119,17 @@ struct KnownPct {
     muted: bool,
 }
 
+impl KnownPct {
+    /// Nudge a cached percentage by a signed delta, clamped to `0..=100`.
+    /// `pct` is always in `0..=100` (never near `i32`/`u32`'s extremes), so
+    /// the sign-changing casts here can't actually wrap or lose
+    /// information -- `cast_signed`/`cast_unsigned` say that plainly
+    /// instead of leaving it to an `as` cast clippy has to warn about.
+    fn nudge_pct(pct: u32, delta_pct: i32) -> u32 {
+        (pct.cast_signed() + delta_pct).clamp(0, 100).cast_unsigned()
+    }
+}
+
 struct State {
     snap: Snapshot,
     last_clock: Instant,
@@ -143,7 +157,7 @@ impl State {
         // Back-date every timer so the very first `refresh` call (right
         // after the bar maps) populates every module immediately instead of
         // waiting out a full period on a blank bar.
-        let stale = now - Duration::from_secs(3600);
+        let stale = now.checked_sub(Duration::from_hours(1)).unwrap_or(now);
         Self {
             snap: Snapshot::default(),
             last_clock: stale,
@@ -323,7 +337,7 @@ impl State {
         match kind {
             ModuleKind::VolOut => {
                 let known = self.vol_out_known.get_or_insert_with(KnownPct::default);
-                known.pct = (known.pct as i32 + delta_pct).clamp(0, 100) as u32;
+                known.pct = KnownPct::nudge_pct(known.pct, delta_pct);
                 let s = Volume::format(false, known.pct, known.muted);
                 let changed = self.snap.vol_out != s;
                 self.snap.vol_out = s;
@@ -331,7 +345,7 @@ impl State {
             }
             ModuleKind::VolIn => {
                 let known = self.vol_in_known.get_or_insert_with(KnownPct::default);
-                known.pct = (known.pct as i32 + delta_pct).clamp(0, 100) as u32;
+                known.pct = KnownPct::nudge_pct(known.pct, delta_pct);
                 let s = Volume::format(true, known.pct, known.muted);
                 let changed = self.snap.vol_in != s;
                 self.snap.vol_in = s;
@@ -339,7 +353,7 @@ impl State {
             }
             ModuleKind::Brightness => {
                 let known = self.brightness_known.get_or_insert_with(KnownPct::default);
-                known.pct = (known.pct as i32 + delta_pct).clamp(0, 100) as u32;
+                known.pct = KnownPct::nudge_pct(known.pct, delta_pct);
                 let s = statusbar::Brightness::format(known.pct);
                 let changed = self.snap.brightness != s;
                 self.snap.brightness = s;
@@ -404,7 +418,7 @@ impl State {
                 let Some(known) = self.vol_out_known else {
                     return false;
                 };
-                let pct = (known.pct as i32 + delta).clamp(0, 100) as u32;
+                let pct = KnownPct::nudge_pct(known.pct, delta);
                 let s = Volume::format(false, pct, known.muted);
                 let changed = self.snap.vol_out != s;
                 self.snap.vol_out = s;
@@ -414,7 +428,7 @@ impl State {
                 let Some(known) = self.vol_in_known else {
                     return false;
                 };
-                let pct = (known.pct as i32 + delta).clamp(0, 100) as u32;
+                let pct = KnownPct::nudge_pct(known.pct, delta);
                 let s = Volume::format(true, pct, known.muted);
                 let changed = self.snap.vol_in != s;
                 self.snap.vol_in = s;
@@ -424,7 +438,7 @@ impl State {
                 let Some(known) = self.brightness_known else {
                     return false;
                 };
-                let pct = (known.pct as i32 + delta).clamp(0, 100) as u32;
+                let pct = KnownPct::nudge_pct(known.pct, delta);
                 let s = statusbar::Brightness::format(pct);
                 let changed = self.snap.brightness != s;
                 self.snap.brightness = s;

@@ -357,14 +357,15 @@ mod tests {
     }
 
     fn pad_to(buf: &mut Vec<u8>, n: usize) {
-        while buf.len() % n != 0 {
+        while !buf.len().is_multiple_of(n) {
             buf.push(0);
         }
     }
 
     fn push_string(buf: &mut Vec<u8>, s: &str) {
         pad_to(buf, 4);
-        buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        let len = u32::try_from(s.len()).expect("test string fits in u32");
+        buf.extend_from_slice(&len.to_le_bytes());
         buf.extend_from_slice(s.as_bytes());
         buf.push(0);
     }
@@ -388,7 +389,7 @@ mod tests {
         let start = buf.len();
         push_string(&mut buf, "a");
         push_string(&mut buf, "bb");
-        let elems_len = (buf.len() - start) as u32;
+        let elems_len = u32::try_from(buf.len() - start).expect("test array fits in u32");
         buf[len_pos..len_pos + 4].copy_from_slice(&elems_len.to_le_bytes());
 
         let (v, end) = Unmarshaller::unmarshal(&buf, 0, "as").unwrap();

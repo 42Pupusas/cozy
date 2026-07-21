@@ -130,7 +130,10 @@ mod tests {
     fn sockaddr_pathname_layout() {
         let addr = SockAddrUn::new(b"/var/run/dbus/system_bus_socket");
         let bytes = addr.as_bytes();
-        assert_eq!(&bytes[0..2], &(AF_UNIX as u16).to_ne_bytes());
+        assert_eq!(
+            &bytes[0..2],
+            &u16::try_from(AF_UNIX).unwrap_or(0).to_ne_bytes()
+        );
         let path = b"/var/run/dbus/system_bus_socket";
         assert_eq!(&bytes[2..2 + path.len()], path);
         assert_eq!(bytes[2 + path.len()], 0); // NUL terminator present

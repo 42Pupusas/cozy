@@ -1,8 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
 //! A dead-simple synchronous PTY wrapper for the M4 integration prototype.
 //!
 //! Uses raw `read(2)` / `write(2)` syscalls (non-blocking) instead of
@@ -69,9 +64,10 @@ impl PtySimple {
             return Ok(None);
         }
         if n < 0 {
-            return Err(PtyError::Exec(-n as i32));
+            // Linux errno values are always small (< 4096), well inside i32.
+            return Err(PtyError::Exec(i32::try_from(-n).unwrap_or(i32::MAX)));
         }
-        Ok(Some(n as usize))
+        Ok(Some(n.cast_unsigned()))
     }
 
     /// Write all bytes to the PTY master fd.
@@ -84,13 +80,14 @@ impl PtySimple {
             let n = self.master_fd.raw_write(&data[offset..]);
             if n <= 0 {
                 let errno = if n < 0 {
-                    -n as i32
+                    // Linux errno values are always small (< 4096), well inside i32.
+                    i32::try_from(-n).unwrap_or(i32::MAX)
                 } else {
                     5 /* EIO */
                 };
                 return Err(PtyError::Exec(errno));
             }
-            offset += n as usize;
+            offset += n.cast_unsigned();
         }
         Ok(())
     }
@@ -135,17 +132,19 @@ impl PtyRawIo for RawFd {
 
         let flags = unsafe { Syscall::Fcntl.invoke2(self.as_usize(), FcntlCmd::GetFl as usize) };
         if flags < 0 {
-            return Err(PtyError::Exec(-flags as i32));
+            // Linux errno values are always small (< 4096), well inside i32.
+            return Err(PtyError::Exec(i32::try_from(-flags).unwrap_or(i32::MAX)));
         }
         let ret = unsafe {
             Syscall::Fcntl.invoke3(
                 self.as_usize(),
                 FcntlCmd::SetFl as usize,
-                flags as usize | OpenFlags::NONBLOCK.bits(),
+                flags.cast_unsigned() | OpenFlags::NONBLOCK.bits(),
             )
         };
         if ret < 0 {
-            return Err(PtyError::Exec(-ret as i32));
+            // Linux errno values are always small (< 4096), well inside i32.
+            return Err(PtyError::Exec(i32::try_from(-ret).unwrap_or(i32::MAX)));
         }
         Ok(())
     }

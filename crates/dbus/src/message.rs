@@ -394,14 +394,13 @@ mod tests {
         let mut body = Vec::new();
         MessageBuilder::write_value(&mut body, &BodyArg::Str("hello".into()));
 
-        let mut out = Vec::new();
-        out.push(b'l');
-        out.push(MessageType::MethodReturn.as_byte());
-        out.push(0);
-        out.push(1);
-        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        let mut out = vec![b'l', MessageType::MethodReturn.as_byte(), 0, 1];
+        let body_len = u32::try_from(body.len()).expect("test body fits in u32");
+        let header_fields_len =
+            u32::try_from(header_fields.len()).expect("test header fields fit in u32");
+        out.extend_from_slice(&body_len.to_le_bytes());
         out.extend_from_slice(&5u32.to_le_bytes());
-        out.extend_from_slice(&(header_fields.len() as u32).to_le_bytes());
+        out.extend_from_slice(&header_fields_len.to_le_bytes());
         out.extend_from_slice(&header_fields);
         MessageBuilder::pad_to(&mut out, 8);
         out.extend_from_slice(&body);

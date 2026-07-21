@@ -1,8 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
 //! A tiny cross-thread wakeup primitive built on `eventfd(2)` + `poll(2)`.
 //!
 //! The lock-free SPSC rings (`quetzalcoatl`) block via `std::thread::park`,

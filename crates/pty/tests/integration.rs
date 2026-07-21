@@ -6,18 +6,17 @@ use std::time::{Duration, Instant};
 
 /// Poll `try_read` until it yields data, EOF, or the deadline passes.
 /// Returns accumulated bytes.
-// EOF and a read error both break the loop the same way, but they're kept as
-// separate match arms (rather than merged with `|`) because they're
-// semantically distinct outcomes -- a future change handling one differently
-// (e.g. asserting on the error) shouldn't have to first split them back apart.
-#[allow(clippy::match_same_arms)]
+// EOF and a read error both break the loop the same way today -- merged into
+// one arm (rather than clippy::match_same_arms-triggering separate ones) --
+// but stay easy to re-split later since `try_read`'s `Ok(Some(0))`/`Err(_)`
+// are still distinct patterns right there in the `|`, not collapsed away.
 fn read_until(pty: &mut PtySimple, deadline: Duration) -> Vec<u8> {
     let start = Instant::now();
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     loop {
         match pty.try_read(&mut buf) {
-            Ok(Some(0)) => break, // EOF
+            Ok(Some(0)) | Err(_) => break, // EOF, or a real read error
             Ok(Some(n)) => out.extend_from_slice(&buf[..n]),
             Ok(None) => {
                 if start.elapsed() > deadline {
@@ -25,7 +24,6 @@ fn read_until(pty: &mut PtySimple, deadline: Duration) -> Vec<u8> {
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            Err(_) => break,
         }
         if start.elapsed() > deadline {
             break;

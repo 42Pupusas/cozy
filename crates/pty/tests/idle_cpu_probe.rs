@@ -90,9 +90,11 @@ fn idle_loop_burns_negligible_cpu() {
         .expect("Pty::run did not exit after shutdown flag was set + wake");
 
     // Tick counts here are small (a few hundred over a 5s probe window), so
-    // the f64 conversion is exact -- nowhere near the 2^52 precision cliff.
-    #[allow(clippy::cast_precision_loss)]
-    let cpu_secs = (ticks_after - ticks_before) as f64 / clock_ticks_per_sec() as f64;
+    // this narrowing to u32 (then losslessly to f64) is exact -- nowhere
+    // near either type's precision/range cliff.
+    let tick_delta = u32::try_from(ticks_after - ticks_before).expect("tick delta fits in u32");
+    let ticks_per_sec = u32::try_from(clock_ticks_per_sec()).expect("ticks/sec fits in u32");
+    let cpu_secs = f64::from(tick_delta) / f64::from(ticks_per_sec);
     let wall_secs = wall_elapsed.as_secs_f64();
 
     // A correctly parked loop burns a small fraction of the idle window.

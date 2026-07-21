@@ -1,9 +1,3 @@
-// Raw syscall FFI: `as` casts between C int widths are bounded and correct.
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap
-)]
 //! Raw POSIX syscall wrappers for PTY management.
 //!
 //! All unsafe is contained here. Every function documents the invariant
@@ -302,9 +296,10 @@ trait RawSyscallReturn {
 impl RawSyscallReturn for isize {
     fn into_errno_result(self) -> Result<usize, i32> {
         if self < 0 {
-            Err((-self) as i32)
+            // Linux errno values are always small (< 4096), well inside i32.
+            Err(i32::try_from(-self).unwrap_or(i32::MAX))
         } else {
-            Ok(self as usize)
+            Ok(self.cast_unsigned())
         }
     }
 }
@@ -446,7 +441,8 @@ impl ChildPid {
     /// outlive us as an orphan holding the PTY slave open).
     pub fn hangup(self) {
         if self.0 > 0 {
-            unsafe { Syscall::Kill.invoke2(self.0 as usize, Signal::Hup as usize) };
+            // Checked positive above, so the sign-preserving cast is exact.
+            unsafe { Syscall::Kill.invoke2(self.0.cast_unsigned() as usize, Signal::Hup as usize) };
         }
     }
 
@@ -470,7 +466,8 @@ impl ChildPid {
         let mut status: i32 = 0;
         let ret = unsafe {
             Syscall::Wait4.invoke4(
-                self.0 as usize,
+                // Checked positive above, so the sign-preserving cast is exact.
+                self.0.cast_unsigned() as usize,
                 core::ptr::addr_of_mut!(status) as usize,
                 Wait4Flags::Blocking as usize,
                 0,
@@ -495,7 +492,7 @@ impl ChildPid {
         let mut status: i32 = 0;
         let ret = unsafe {
             Syscall::Wait4.invoke4(
-                self.0 as usize,
+                self.0.cast_unsigned() as usize,
                 core::ptr::addr_of_mut!(status) as usize,
                 Wait4Flags::NoHang as usize,
                 0,
@@ -713,7 +710,12 @@ impl RawPty {
             }
             Ok(child_pid) => {
                 // ── parent ─────────────────────────────────────────────
-                Ok((master_fd, ChildPid(child_pid as i32)))
+                // fork()'s pid return is always small and positive on Linux
+                // (bounded by /proc/sys/kernel/pid_max, well under i32::MAX).
+                Ok((
+                    master_fd,
+                    ChildPid(i32::try_from(child_pid).unwrap_or(i32::MAX)),
+                ))
             }
         }
     }

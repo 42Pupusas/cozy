@@ -1,12 +1,3 @@
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_wrap,
-    clippy::cast_precision_loss,
-    clippy::doc_markdown,
-    clippy::duration_suboptimal_units,
-    clippy::unchecked_time_subtraction
-)]
 //! `statusbar` — a wlroots-layer-shell status bar, built on the same
 //! `io_uring` Wayland connection / software canvas as the `terminal` binary.
 //!
@@ -44,23 +35,37 @@ use platform::draw::{Canvas, Color};
 use statusbar::{BarWindow, Edge, ModuleKind, TextRenderer};
 pub(crate) use worker::Snapshot;
 
+/// Per-frame paint parameters that stay constant for the run's whole
+/// lifetime (background color/alpha) or only change on resize/rescale
+/// (bar height, output scale) -- grouped out of [`Painter::paint`]'s
+/// argument list since they travel together and aren't part of the
+/// per-frame `canvas`/`snapshot`/`text`/`segment_rects` identity.
+struct PaintStyle {
+    bg: Color,
+    bg_alpha: u8,
+    bar_height: i32,
+    scale: i32,
+}
+
 /// The bar's per-frame paint pass -- a marker type (no state of its own;
 /// every input is a parameter) grouping [`Self::paint`] instead of leaving
 /// it as a free function with no owning type.
 struct Painter;
 
 impl Painter {
-    #[allow(clippy::too_many_arguments)]
     fn paint(
         canvas: &mut Canvas,
         snapshot: &Snapshot,
         text: &mut TextRenderer,
-        bg: Color,
-        bg_alpha: u8,
-        bar_height: i32,
-        scale: i32,
+        style: &PaintStyle,
         segment_rects: &mut Vec<(ModuleKind, i32, i32)>,
     ) {
+        let PaintStyle {
+            bg,
+            bg_alpha,
+            bar_height,
+            scale,
+        } = *style;
         segment_rects.clear();
         let y = text.baseline_y(bar_height);
         let pad = 20 * scale;
@@ -89,10 +94,11 @@ impl Painter {
 
         // Center: horizontally centered as one contiguous cluster (joined by
         // `gap`), regardless of what the left/right sections are doing.
-        let center = snapshot.center_segments();
+        let center = Snapshot::center_segments();
         if !center.is_empty() {
+            let center_len = i32::try_from(center.len()).expect("center segment count fits in i32");
             let joined_w: i32 = center.iter().map(|(_, s)| text.measure(s)).sum::<i32>()
-                + gap * (center.len() as i32 - 1).max(0);
+                + gap * (center_len - 1).max(0);
             let mut x = (canvas.width() - joined_w) / 2;
             for (kind, seg) in &center {
                 if seg.is_empty() {
@@ -128,7 +134,7 @@ fn main() {
     });
 
     let wake = waker::Waker::new().expect("create waker");
-    let bar_height = cfg.bar_height() as i32;
+    let bar_height = i32::try_from(cfg.bar_height()).unwrap_or(i32::MAX);
     let mut window = match BarWindow::new(Edge::Top, bar_height, cfg.bar_opacity(), wake.clone()) {
         Ok(w) => w,
         Err(e) => {
@@ -142,14 +148,22 @@ fn main() {
         let c = cfg.bar_background();
         Color::rgb(c.r, c.g, c.b)
     };
-    let bg_alpha = (cfg.bar_opacity().clamp(0.0, 1.0) * 255.0).round() as u8;
+    // `.clamp(0.0, 255.0)` right before the cast lets clippy prove the
+    // truncation/sign-loss can't happen (rather than needing an allow).
+    let bg_alpha = (cfg.bar_opacity().clamp(0.0, 1.0) * 255.0)
+        .round()
+        .clamp(0.0, 255.0) as u8;
     window.set_background(bg);
 
     // Font size is a point size (like the terminal's own `[font] size`);
     // convert to pixels at 96 DPI, then scale by the output's physical
     // pixel density so it renders crisp on HiDPI, matching
     // `platform::Renderer::with_scale`'s convention.
-    let px_size = cfg.bar_font_px_size() * scale as f32;
+    // `From<i16> for f32` is lossless (i16 fits entirely inside f32's
+    // mantissa) -- narrow the always-small (1, 2, 3...) output scale to
+    // `i16` first so this multiply needs no lossy `as` cast at all.
+    let scale_f32 = f32::from(i16::try_from(scale).unwrap_or(i16::MAX));
+    let px_size = cfg.bar_font_px_size() * scale_f32;
     let mut text = TextRenderer::load_with_fallbacks(
         cfg.bar_font_path(),
         &[cfg.bar_emoji_path(), cfg.bar_icon_path()],
@@ -168,6 +182,12 @@ fn main() {
     worker::Worker::spawn_thread(snapshot_tx, scroll_rx, click_rx, wake, notification_rules);
 
     let bar_height = window.height();
+    let paint_style = PaintStyle {
+        bg,
+        bg_alpha,
+        bar_height,
+        scale,
+    };
     let mut segment_rects: Vec<(ModuleKind, i32, i32)> = Vec::new();
     let mut snapshot = Snapshot::default();
 
@@ -185,16 +205,7 @@ fn main() {
         }
 
         match window.tick(|canvas| {
-            Painter::paint(
-                canvas,
-                &snapshot,
-                &mut text,
-                bg,
-                bg_alpha,
-                bar_height,
-                scale,
-                &mut segment_rects,
-            );
+            Painter::paint(canvas, &snapshot, &mut text, &paint_style, &mut segment_rects);
         }) {
             Ok(true) => {}
             Ok(false) => break,

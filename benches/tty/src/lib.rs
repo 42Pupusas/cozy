@@ -133,9 +133,8 @@ impl Corpora {
             let c = (i % 6) + 41;
             out.extend_from_slice(format!("\x1b[{c}m").as_bytes());
             for col in 0..cols {
-                // `col % 10` is always in `0..10`, so the truncating cast is exact.
-                #[allow(clippy::cast_possible_truncation)]
-                let digit = (col % 10) as u8;
+                // `col % 10` is always in `0..10`, so this always succeeds.
+                let digit = u8::try_from(col % 10).expect("col % 10 fits in u8");
                 out.push(b'0' + digit);
             }
             out.extend_from_slice(b"\r\n");
@@ -183,11 +182,9 @@ impl Corpora {
         let cols = cols.max(1);
         for i in 0..n {
             // `i % rows`/`(i * 7) % cols` are bounded by `rows`/`cols: u16`, so
-            // the truncating casts back to u16 are exact.
-            #[allow(clippy::cast_possible_truncation)]
-            let row = (i % rows as usize) as u16 + 1;
-            #[allow(clippy::cast_possible_truncation)]
-            let col = ((i * 7) % cols as usize) as u16 + 1;
+            // these always succeed.
+            let row = u16::try_from(i % rows as usize).expect("i % rows fits in u16") + 1;
+            let col = u16::try_from((i * 7) % cols as usize).expect("(i * 7) % cols fits in u16") + 1;
             out.extend_from_slice(format!("\x1b[{row};{col}H").as_bytes());
             out.extend_from_slice(b"\x1b[K");
             out.extend_from_slice(format!("x{i}").as_bytes());

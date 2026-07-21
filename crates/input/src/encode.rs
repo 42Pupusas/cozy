@@ -542,6 +542,21 @@ impl Encoder {
         if is_bare_text && !report_all_keys && matches!(state, KeyState::Released) {
             return None;
         }
+        // Same exception applies to Enter/Backspace/Tab: the spec calls
+        // these out by name -- "will not have release events unless report
+        // all keys is also set" -- precisely so `reset` still works at a
+        // shell prompt. Without this check, `always_legacy` below fires
+        // unconditionally regardless of state for these three keys, so a
+        // release (which every app that asks for report-event-types, e.g.
+        // neovim's default `CSI >3u`, now receives) fell through to
+        // `encode_legacy` and resent the exact same byte the press already
+        // sent -- every Enter/Backspace in neovim registered twice.
+        if matches!(key, Key::Enter | Key::Backspace | Key::Tab)
+            && !report_all_keys
+            && matches!(state, KeyState::Released)
+        {
+            return None;
+        }
         // The legacy text-key algorithm (alt -> ESC prefix, else ctrl -> C0
         // table, else shift -> shifted glyph, else bare) only ever consults
         // alt/ctrl/shift. Any other modifier active (super/hyper/meta) has
@@ -1561,6 +1576,38 @@ mod tests {
         let mut e = enc();
         e.keyboard_mode = KeyboardMode::Kitty;
         e.kitty_flags = 0b1;
+        assert_eq!(kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE), b"\r");
+        assert_eq!(
+            kitty(&e, Key::Backspace, KeyState::Pressed, Modifiers::NONE),
+            b"\x7f"
+        );
+        assert_eq!(kitty(&e, Key::Tab, KeyState::Pressed, Modifiers::NONE), b"\t");
+    }
+
+    #[test]
+    fn enter_backspace_tab_release_is_silent_without_report_all_keys() {
+        // Regression: neovim negotiates flags 0b011 (disambiguate +
+        // report-event-types, its actual default -- `CSI >3u`), which makes
+        // the terminal start sending *release* events too. Enter/Backspace/
+        // Tab have no CSI-u release representation unless report-all-keys
+        // (0b1000) is also set (same "reset still works" exception that
+        // keeps their *press* on legacy bytes) -- so their release must be
+        // silently dropped, not re-encoded as a second legacy byte. Getting
+        // this wrong meant every Enter/Backspace typed in neovim fired
+        // twice: once on press (legacy byte) and once more on release
+        // (fell through to the same legacy encoding again).
+        let mut e = enc();
+        e.keyboard_mode = KeyboardMode::Kitty;
+        e.kitty_flags = 0b1 | 0b10; // disambiguate + report-event-types, no report-all-keys
+        for key in [Key::Enter, Key::Backspace, Key::Tab] {
+            let mut buf = [0u8; 16];
+            assert_eq!(
+                e.encode_key(key, KeyState::Released, Modifiers::NONE, &mut buf),
+                None,
+                "{key:?} release must be silent at flags 0b011"
+            );
+        }
+        // Press still produces the legacy byte, unaffected.
         assert_eq!(kitty(&e, Key::Enter, KeyState::Pressed, Modifiers::NONE), b"\r");
         assert_eq!(
             kitty(&e, Key::Backspace, KeyState::Pressed, Modifiers::NONE),

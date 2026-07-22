@@ -288,7 +288,9 @@ impl NetworkState {
                 return value;
             }
         }
-        let value = self.gateway().and_then(|gateway| {
+        let value = self
+            .gateway()
+            .and_then(|gateway| {
                 // `-n` is important: this is an ICMP probe to a numeric
                 // gateway address, never a hostname lookup or DNS request.
                 let output = Command::new("ping")
@@ -695,10 +697,10 @@ impl MemoryDevice {
                 }
                 let path = entry.path();
                 let part = Self::attribute(&path, "part_number");
-                let manufacturer = Self::attribute(&path, "dimm_label")
-                    .or_else(|| Self::attribute(&path, "mfg"));
-                let memory_type = Self::attribute(&path, "dimm_type")
-                    .or_else(|| Self::attribute(&path, "type"));
+                let manufacturer =
+                    Self::attribute(&path, "dimm_label").or_else(|| Self::attribute(&path, "mfg"));
+                let memory_type =
+                    Self::attribute(&path, "dimm_type").or_else(|| Self::attribute(&path, "type"));
                 let label = [manufacturer, part, memory_type]
                     .into_iter()
                     .flatten()

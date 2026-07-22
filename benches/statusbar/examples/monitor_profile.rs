@@ -1,8 +1,8 @@
 //! Long-running monitor workload for perf. Unlike the Divan benchmark, this
 //! keeps the sampler hot long enough for symbol-level profiles to stabilize.
 
-use std::hint::black_box;
 use statusbar::MonitorReader;
+use std::hint::black_box;
 
 struct MonitorProfile {
     reader: MonitorReader,
@@ -29,7 +29,9 @@ impl MonitorProfile {
 }
 
 fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "sample".to_owned());
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "sample".to_owned());
     let mut profile = MonitorProfile::new();
     match mode.as_str() {
         "process" => profile.process_scan(100),

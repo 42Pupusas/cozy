@@ -14,7 +14,7 @@
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
+    clippy::cast_sign_loss
 )]
 
 use std::time::{Duration, Instant};
@@ -38,12 +38,17 @@ struct AsciiFloodBenchmark {
 
 impl AsciiFloodBenchmark {
     fn from_args(args: &[String]) -> Self {
-        let target_bytes = args.iter()
+        let target_bytes = args
+            .iter()
             .find_map(|arg| arg.strip_prefix("bytes=")?.parse().ok())
             .unwrap_or(DEFAULT_BYTES);
-        let font_path = args.iter()
+        let font_path = args
+            .iter()
             .find_map(|arg| arg.strip_prefix("font=").map(String::from));
-        Self { target_bytes, font_path }
+        Self {
+            target_bytes,
+            font_path,
+        }
     }
 
     fn input_chunk() -> [u8; PTY_CHUNK] {
@@ -58,9 +63,16 @@ impl AsciiFloodBenchmark {
     fn renderer(&self) -> Renderer {
         self.font_path.as_ref().map_or_else(
             || Renderer::builtin(Theme::builtin()),
-            |path| Renderer::new(Theme::builtin(), &FontConfig {
-                path: Some(path.clone()), size: 14, emoji_path: None,
-            }),
+            |path| {
+                Renderer::new(
+                    Theme::builtin(),
+                    &FontConfig {
+                        path: Some(path.clone()),
+                        size: 14,
+                        emoji_path: None,
+                    },
+                )
+            },
         )
     }
 
@@ -78,8 +90,13 @@ impl AsciiFloodBenchmark {
         start.elapsed()
     }
 
-    fn present(renderer: &mut Renderer, backbuffer: &mut [u32], width: usize,
-        height: usize, snapshots: &[DirtySnapshot]) -> usize {
+    fn present(
+        renderer: &mut Renderer,
+        backbuffer: &mut [u32],
+        width: usize,
+        height: usize,
+        snapshots: &[DirtySnapshot],
+    ) -> usize {
         let mut canvas = Canvas::new(backbuffer, width as i32, height as i32);
         for snapshot in snapshots {
             renderer.blit_snapshot(&mut canvas, snapshot);
@@ -115,7 +132,9 @@ impl AsciiFloodBenchmark {
             chunks += 1;
             if chunks % BATCH_CHUNKS == 0 || bytes == self.target_bytes {
                 let snapshot = grid.take_dirty();
-                if !snapshot.is_empty() { pending.push(snapshot); }
+                if !snapshot.is_empty() {
+                    pending.push(snapshot);
+                }
             }
             parse_snapshot_time += phase_start.elapsed();
             if pending.len() >= SNAPSHOTS_PER_PRESENT || bytes == self.target_bytes {
@@ -127,8 +146,16 @@ impl AsciiFloodBenchmark {
             }
         }
         Measurement {
-            bytes, chunks, snapshots, presents, elapsed: start.elapsed(),
-            parser_only_time, parse_snapshot_time, render_time, cell_width, cell_height,
+            bytes,
+            chunks,
+            snapshots,
+            presents,
+            elapsed: start.elapsed(),
+            parser_only_time,
+            parse_snapshot_time,
+            render_time,
+            cell_width,
+            cell_height,
         }
     }
 
@@ -138,21 +165,34 @@ impl AsciiFloodBenchmark {
         let mib = measurement.bytes as f64 / (1024.0 * 1024.0);
         let throughput = mib / seconds;
         println!("ASCII flood: {mib:.1} MiB");
-        println!("renderer: {} ({}x{} cell, {}x{} pixels)",
+        println!(
+            "renderer: {} ({}x{} cell, {}x{} pixels)",
             self.font_path.as_deref().map_or("bitmap", |_| "ttf"),
-            measurement.cell_width, measurement.cell_height,
-            COLS as usize * measurement.cell_width, ROWS as usize * measurement.cell_height);
+            measurement.cell_width,
+            measurement.cell_height,
+            COLS as usize * measurement.cell_width,
+            ROWS as usize * measurement.cell_height
+        );
         let parser_seconds = measurement.parser_only_time.as_secs_f64();
         let pipeline_seconds = measurement.parse_snapshot_time.as_secs_f64();
         let grid_seconds = (pipeline_seconds - parser_seconds).max(0.0);
         let render_seconds = measurement.render_time.as_secs_f64();
-        println!("elapsed: {seconds:.3} s | throughput: {throughput:.1} MiB/s | {:.1} MB/s",
-            throughput * 1.048_576);
-        println!("phases: parser-only {parser_seconds:.3} s | grid+snapshot estimate {grid_seconds:.3} s | render/blit {render_seconds:.3} s");
-        println!("timed share: parse+grid+snapshot {:.1}% | render/blit {:.1}%",
-            100.0 * pipeline_seconds / seconds, 100.0 * render_seconds / seconds);
-        println!("work: {} PTY chunks | {} snapshots | {} presents",
-            measurement.chunks, measurement.snapshots, measurement.presents);
+        println!(
+            "elapsed: {seconds:.3} s | throughput: {throughput:.1} MiB/s | {:.1} MB/s",
+            throughput * 1.048_576
+        );
+        println!(
+            "phases: parser-only {parser_seconds:.3} s | grid+snapshot estimate {grid_seconds:.3} s | render/blit {render_seconds:.3} s"
+        );
+        println!(
+            "timed share: parse+grid+snapshot {:.1}% | render/blit {:.1}%",
+            100.0 * pipeline_seconds / seconds,
+            100.0 * render_seconds / seconds
+        );
+        println!(
+            "work: {} PTY chunks | {} snapshots | {} presents",
+            measurement.chunks, measurement.snapshots, measurement.presents
+        );
         println!("note: compositor, Wayland dispatch, and actual PTY scheduling are not timed");
     }
 }

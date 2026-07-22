@@ -329,7 +329,8 @@ impl<'a> Canvas<'a> {
             let source_x = (x0 - rect.x).cast_unsigned() as usize;
             let source_start = source_y * source_width + source_x;
             let copy_width = (x1 - x0).cast_unsigned() as usize;
-            let target_start = y.cast_unsigned() as usize * target_width + x0.cast_unsigned() as usize;
+            let target_start =
+                y.cast_unsigned() as usize * target_width + x0.cast_unsigned() as usize;
             self.pixels[target_start..target_start + copy_width]
                 .copy_from_slice(&source[source_start..source_start + copy_width]);
         }

@@ -75,8 +75,11 @@ impl WorkloadMode {
 
 impl GridHotspotWorkload {
     fn from_args(args: &[String]) -> Self {
-        let mode = args.get(1).map_or(WorkloadMode::Print, |arg| WorkloadMode::parse(arg));
-        let target_bytes = args.iter()
+        let mode = args
+            .get(1)
+            .map_or(WorkloadMode::Print, |arg| WorkloadMode::parse(arg));
+        let target_bytes = args
+            .iter()
             .find_map(|arg| arg.strip_prefix("bytes=")?.parse().ok())
             .unwrap_or(DEFAULT_BYTES);
         Self { mode, target_bytes }
@@ -99,9 +102,7 @@ impl GridHotspotWorkload {
             let length = (self.target_bytes - bytes).min(LINE.len());
             parser.feed(&LINE[..length], |event| grid.apply(&event));
             bytes += length;
-            if matches!(self.mode, WorkloadMode::Snapshot)
-                && bytes.is_multiple_of(64 * 4096)
-            {
+            if matches!(self.mode, WorkloadMode::Snapshot) && bytes.is_multiple_of(64 * 4096) {
                 let _ = grid.take_dirty();
                 snapshots += 1;
             }
@@ -143,16 +144,25 @@ impl GridHotspotWorkload {
     fn print(&self) {
         let measurement = self.run();
         let seconds = measurement.elapsed.as_secs_f64();
-        println!("mode: {}", match self.mode {
-            WorkloadMode::Print => "print",
-            WorkloadMode::Snapshot => "snapshot",
-            WorkloadMode::Scroll => "scroll",
-        });
+        println!(
+            "mode: {}",
+            match self.mode {
+                WorkloadMode::Print => "print",
+                WorkloadMode::Snapshot => "snapshot",
+                WorkloadMode::Scroll => "scroll",
+            }
+        );
         println!("elapsed: {seconds:.6} s");
         if measurement.bytes > 0 {
-            println!("throughput: {:.1} MiB/s", measurement.bytes as f64 / seconds / 1_048_576.0);
+            println!(
+                "throughput: {:.1} MiB/s",
+                measurement.bytes as f64 / seconds / 1_048_576.0
+            );
         }
-        println!("snapshots: {} | scrolls: {}", measurement.snapshots, measurement.scrolls);
+        println!(
+            "snapshots: {} | scrolls: {}",
+            measurement.snapshots, measurement.scrolls
+        );
         println!(
             "cell: {} bytes | visible row: {} bytes",
             size_of::<grid::Cell>(),

@@ -1866,9 +1866,7 @@ impl TermWindow {
             let first = (damage.y.max(0) / self.cell_h).max(0);
             let last_pixel = damage.bottom().min(self.height).saturating_sub(1);
             let last = (last_pixel / self.cell_h).max(first);
-            touched_rows.extend(
-                (first..=last).map(|row| u16::try_from(row).unwrap_or(u16::MAX)),
-            );
+            touched_rows.extend((first..=last).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
         }
         // Sub-phase timers (only read when DebugFps::Log fires below on a slow
         // present): `t_blit` = the coalesce+blit_snapshot loop, the only phase

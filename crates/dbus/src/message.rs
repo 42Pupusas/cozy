@@ -166,9 +166,7 @@ impl MessageBuilder {
         header_fields.extend_from_slice(&call_serial.to_le_bytes());
 
         let mut out = vec![b'l', MessageType::MethodReturn.as_byte(), 0, 1];
-        out.extend_from_slice(
-            &u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes(),
-        );
+        out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
         out.extend_from_slice(&serial.to_le_bytes());
         out.extend_from_slice(
             &u32::try_from(header_fields.len())

@@ -3,7 +3,6 @@
 //! sysfs policy are not duplicated by a second binary.
 
 use std::collections::{HashMap, VecDeque};
-use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::Read;
 use std::net::Ipv4Addr;
@@ -478,7 +477,7 @@ impl ProcessScanner {
         self.pending.clear();
         if let Ok(entries) = fs::read_dir("/proc") {
             for entry in entries.flatten() {
-                if let Ok(pid) = entry.file_name().to_string_lossy().parse() {
+                if let Some(pid) = Self::parse_pid_entry(entry.file_name().as_encoded_bytes()) {
                     self.pending.push(pid);
                 }
             }
@@ -527,8 +526,30 @@ impl ProcessScanner {
                 .total_cmp(&left.cpu)
                 .then_with(|| right.memory_kb.cmp(&left.memory_kb))
         });
-        self.collected.truncate(24);
+        // Publish the complete sorted sweep. The window decides how many rows
+        // fit visually; truncating here made processes disappear from the
+        // monitor and prevented future layout/scrolling improvements.
         Some(std::mem::take(&mut self.collected))
+    }
+
+    /// Parses a `/proc` directory-entry name as a PID directly from its raw
+    /// bytes, skipping the `OsStr -> String` UTF-8 validation and allocation
+    /// that `to_string_lossy().parse()` pays for every directory entry
+    /// (including the non-PID entries like `self`, `net`, `sys`). PIDs are
+    /// always plain ASCII digits, so a byte-level scan is both correct and
+    /// allocation-free.
+    fn parse_pid_entry(name: &[u8]) -> Option<u32> {
+        if name.is_empty() {
+            return None;
+        }
+        let mut value: u32 = 0;
+        for &byte in name {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+        }
+        Some(value)
     }
 }
 
@@ -538,11 +559,37 @@ struct ProcessStatPath {
 }
 
 impl ProcessStatPath {
+    /// Formats the PID digits directly into the shared buffer instead of
+    /// going through `core::fmt`'s `Display`/`Write` machinery (`write!`),
+    /// which profiling showed as measurable per-PID overhead in the process
+    /// scan's innermost loop: an `Arguments` value, a v-table dispatch
+    /// through `fmt::Write`, and per-digit `Formatter` bookkeeping, all to
+    /// print an integer that is always a handful of ASCII digits.
     fn set_pid(&mut self, pid: u32) {
         self.value.clear();
         self.value.push_str("/proc/");
-        let _ = write!(self.value, "{pid}");
+        Self::push_decimal(&mut self.value, pid);
         self.value.push_str("/stat");
+    }
+
+    /// Pushes `value`'s decimal digits onto `out` without an intermediate
+    /// allocation: digits land in a fixed stack buffer (`u32::MAX` is 10
+    /// digits) in reverse order, then get appended in the correct order.
+    fn push_decimal(out: &mut String, mut value: u32) {
+        if value == 0 {
+            out.push('0');
+            return;
+        }
+        let mut digits = [0u8; 10];
+        let mut len = 0;
+        while value > 0 {
+            digits[len] = b'0' + (value % 10) as u8;
+            value /= 10;
+            len += 1;
+        }
+        for &digit in digits[..len].iter().rev() {
+            out.push(digit as char);
+        }
     }
 
     fn as_str(&self) -> &str {
@@ -871,19 +918,27 @@ impl MonitorReader {
                 field += 1;
                 continue;
             }
-            let mut value = 0u64;
-            for &byte in &bytes[token_start..index] {
-                if !byte.is_ascii_digit() {
-                    return None;
-                }
-                value = value
-                    .saturating_mul(10)
-                    .saturating_add(u64::from(byte - b'0'));
-            }
+            // Only the three counters below are needed. Other stat fields
+            // include signed values (notably `nice`), so parsing every token
+            // as u64 silently discarded most otherwise valid processes.
             match field {
-                11 => user = Some(value),
-                12 => system = Some(value),
-                21 => resident_pages = Some(value),
+                11 | 12 | 21 => {
+                    let mut value = 0u64;
+                    for &byte in &bytes[token_start..index] {
+                        if !byte.is_ascii_digit() {
+                            return None;
+                        }
+                        value = value
+                            .saturating_mul(10)
+                            .saturating_add(u64::from(byte - b'0'));
+                    }
+                    match field {
+                        11 => user = Some(value),
+                        12 => system = Some(value),
+                        21 => resident_pages = Some(value),
+                        _ => unreachable!(),
+                    }
+                }
                 _ => {}
             }
             field += 1;
@@ -1052,6 +1107,31 @@ mod tests {
         let mut reader = MonitorReader::new();
         let sample = reader.sample();
         assert!(sample.cpu >= 0.0);
+    }
+
+    #[test]
+    fn parse_pid_entry_accepts_plain_digit_names() {
+        assert_eq!(ProcessScanner::parse_pid_entry(b"1"), Some(1));
+        assert_eq!(ProcessScanner::parse_pid_entry(b"42"), Some(42));
+        assert_eq!(ProcessScanner::parse_pid_entry(b"4194304"), Some(4_194_304));
+    }
+
+    #[test]
+    fn parse_pid_entry_rejects_non_pid_proc_entries() {
+        assert_eq!(ProcessScanner::parse_pid_entry(b"self"), None);
+        assert_eq!(ProcessScanner::parse_pid_entry(b"net"), None);
+        assert_eq!(ProcessScanner::parse_pid_entry(b""), None);
+        assert_eq!(ProcessScanner::parse_pid_entry(b"12a"), None);
+        assert_eq!(ProcessScanner::parse_pid_entry(b"-1"), None);
+    }
+
+    #[test]
+    fn stat_path_set_pid_matches_the_formatted_path_for_a_range_of_pids() {
+        let mut path = ProcessStatPath::default();
+        for pid in [0u32, 1, 9, 10, 42, 999, 65535, 4_194_304, u32::MAX] {
+            path.set_pid(pid);
+            assert_eq!(path.as_str(), format!("/proc/{pid}/stat"));
+        }
     }
 
     #[test]

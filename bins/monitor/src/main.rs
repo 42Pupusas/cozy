@@ -682,53 +682,94 @@ impl Painter {
         );
         Self::card(canvas, proc_rect, full_repaint);
         if full_repaint {
-            text.draw_text(
+            let inset = 14;
+            let left = proc_rect.x + inset;
+            let right = proc_rect.x + proc_rect.w - inset;
+            let pid_right = left + 48;
+            let name_left = pid_right + 12;
+            let cpu_right = right - 76;
+            let mem_right = right;
+            title_text.draw_text(
                 canvas,
-                "TOP PROCESSES",
-                proc_rect.x + 14,
+                "Processes",
+                left,
                 proc_rect.y + 14,
                 DIM,
                 CARD_SURFACE,
             );
-            text.draw_text(
+            subtitle_text.draw_text_right(
                 canvas,
                 &format!("{} tasks", snap.processes.len()),
-                proc_rect.x + 14,
-                proc_rect.y + 30,
+                right,
+                proc_rect.y + 15,
                 FAINT,
                 CARD_SURFACE,
             );
-            text.draw_text(
+            subtitle_text.draw_text(canvas, "PID", left, proc_rect.y + 40, FAINT, CARD_SURFACE);
+            subtitle_text.draw_text(
                 canvas,
-                "PROCESS                 CPU       MEM",
-                proc_rect.x + 14,
-                proc_rect.y + 52,
+                "Name",
+                name_left,
+                proc_rect.y + 40,
                 FAINT,
                 CARD_SURFACE,
             );
-            for (row, process) in snap.processes.iter().take(18).enumerate() {
-                let y = proc_rect.y + 70 + i32::try_from(row).unwrap_or(0) * 18;
-                let name: String = process.name.chars().take(18).collect();
+            subtitle_text.draw_text_right(
+                canvas,
+                "CPU",
+                cpu_right,
+                proc_rect.y + 40,
+                FAINT,
+                CARD_SURFACE,
+            );
+            subtitle_text.draw_text_right(
+                canvas,
+                "Memory",
+                mem_right,
+                proc_rect.y + 40,
+                FAINT,
+                CARD_SURFACE,
+            );
+            let row_height = 18;
+            let first_row = proc_rect.y + 59;
+            let available_height = (proc_rect.y + proc_rect.h - inset - first_row).max(0);
+            let row_count = (available_height / row_height) as usize;
+            for (row, process) in snap.processes.iter().take(row_count).enumerate() {
+                let y = first_row + i32::try_from(row).unwrap_or(0) * row_height;
+                let name_width = (cpu_right - name_left - 12).max(1);
+                let name = Self::truncate_prefix(&process.name, text, name_width);
+                text.draw_text(canvas, &process.pid.to_string(), left, y, DIM, CARD_SURFACE);
                 text.draw_text(
                     canvas,
-                    &format!("{name:<18}"),
-                    proc_rect.x + 14,
+                    &name,
+                    name_left,
                     y,
-                    FG,
+                    if row == 0 { ORANGE } else { FG },
                     CARD_SURFACE,
                 );
-                text.draw_text_right(
-                    canvas,
-                    &format!("{:>5.1}%", process.cpu),
-                    proc_rect.x + proc_rect.w - 60,
-                    y,
-                    if row == 0 { ORANGE } else { DIM },
-                    CARD_SURFACE,
+                // Process CPU remains measured in one-core percentage, but
+                // the table uses a visual bar instead of another numeric wall
+                // of percentages. The bar is bounded to its dedicated column
+                // and saturates at 100% for multi-threaded processes.
+                let bar_right = cpu_right;
+                let bar_left = bar_right - 58;
+                let bar_y = y + 5;
+                canvas.fill_rect(
+                    Rect::new(bar_left, bar_y, bar_right - bar_left, 6),
+                    CARD_BORDER,
                 );
+                let fill = (process.cpu.clamp(0.0, 100.0) / 100.0 * (bar_right - bar_left) as f32)
+                    .round() as i32;
+                if fill > 0 {
+                    canvas.fill_rect(
+                        Rect::new(bar_left, bar_y, fill, 6),
+                        if row == 0 { ORANGE } else { CYAN },
+                    );
+                }
                 text.draw_text_right(
                     canvas,
-                    &format!("{:>6}K", process.memory_kb),
-                    proc_rect.x + proc_rect.w - 14,
+                    &format!("{:.1} MB", process.memory_kb as f32 / 1024.0),
+                    mem_right,
                     y,
                     DIM,
                     CARD_SURFACE,

@@ -2,7 +2,8 @@
 //! The readers stay here beside the status-bar sensors so `/proc` parsing and
 //! sysfs policy are not duplicated by a second binary.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::time::Instant;
@@ -21,6 +22,9 @@ pub struct MonitorSample {
     pub cpu_cores: usize,
     pub cpu_frequency_ghz: f32,
     pub disk_io_mb_s: f32,
+    pub memory_available_mb: f32,
+    pub swap_used_mb: f32,
+    pub swap_total_mb: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -126,7 +130,7 @@ impl CpuState {
         &self.brand
     }
 
-    fn core_count(&self) -> usize {
+    const fn core_count(&self) -> usize {
         self.core_count
     }
 
@@ -270,32 +274,32 @@ struct ProcessScanner {
     pending: Vec<u32>,
     cursor: usize,
     collected: Vec<ProcessInfo>,
-    live: HashSet<u32>,
+    stat_path: ProcessStatPath,
 }
 
 impl ProcessScanner {
     const SLICES: usize = 10;
 
     fn begin(&mut self) {
-        self.pending = fs::read_dir("/proc").map_or_else(
-            |_| Vec::new(),
-            |entries| {
-                entries
-                    .flatten()
-                    .filter_map(|entry| entry.file_name().to_string_lossy().parse().ok())
-                    .collect()
-            },
-        );
+        self.pending.clear();
+        if let Ok(entries) = fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                if let Ok(pid) = entry.file_name().to_string_lossy().parse() {
+                    self.pending.push(pid);
+                }
+            }
+        }
         self.cursor = 0;
         self.collected.clear();
-        self.live.clear();
     }
+
 
     /// Parse one bounded batch. Returning `Some` marks the end of a complete
     /// sweep; callers retain their old published list between completions.
     fn advance(&mut self, cpu: &mut ProcessCpuState) -> Option<Vec<ProcessInfo>> {
         if self.cursor >= self.pending.len() {
             self.begin();
+            cpu.begin_scan();
         }
         if self.pending.is_empty() {
             return Some(Vec::new());
@@ -304,14 +308,13 @@ impl ProcessScanner {
         let end = (self.cursor + batch).min(self.pending.len());
         let now = Instant::now();
         for &pid in &self.pending[self.cursor..end] {
-            let path = format!("/proc/{pid}/stat");
-            let Some(stat) = fs::read_to_string(path).ok() else {
+            self.stat_path.set_pid(pid);
+            let Some(stat) = fs::read_to_string(self.stat_path.as_str()).ok() else {
                 continue;
             };
             let Some((name, ticks, resident_pages)) = MonitorReader::process_stat(&stat) else {
                 continue;
             };
-            self.live.insert(pid);
             self.collected.push(ProcessInfo {
                 pid,
                 name,
@@ -323,7 +326,7 @@ impl ProcessScanner {
         if self.cursor < self.pending.len() {
             return None;
         }
-        cpu.retain_live(&self.live);
+        cpu.retain_live();
         self.collected.sort_by(|left, right| {
             right
                 .cpu
@@ -335,8 +338,27 @@ impl ProcessScanner {
     }
 }
 
+#[derive(Default)]
+struct ProcessStatPath {
+    value: String,
+}
+
+impl ProcessStatPath {
+    fn set_pid(&mut self, pid: u32) {
+        self.value.clear();
+        self.value.push_str("/proc/");
+        let _ = write!(self.value, "{pid}");
+        self.value.push_str("/stat");
+    }
+
+    fn as_str(&self) -> &str {
+        &self.value
+    }
+}
+
 struct ProcessCpuState {
-    previous: HashMap<u32, (u64, Instant)>,
+    previous: HashMap<u32, (u64, Instant, u64)>,
+    generation: u64,
     ticks_per_second: f32,
     page_size_kb: u64,
 }
@@ -370,6 +392,7 @@ impl ProcessCpuState {
         };
         Self {
             previous: HashMap::new(),
+            generation: 0,
             ticks_per_second,
             page_size_kb,
         }
@@ -377,8 +400,12 @@ impl ProcessCpuState {
 
     /// Return utilization in units of one logical CPU: 100% means one core
     /// fully busy, while a multi-threaded process may legitimately exceed it.
+    fn begin_scan(&mut self) {
+        self.generation = self.generation.wrapping_add(1).max(1);
+    }
+
     fn percentage(&mut self, pid: u32, ticks: u64, now: Instant) -> f32 {
-        let result = self.previous.get(&pid).map_or(0.0, |&(old_ticks, then)| {
+        let result = self.previous.get(&pid).map_or(0.0, |&(old_ticks, then, _)| {
             let elapsed = now.duration_since(then).as_secs_f32();
             if elapsed <= 0.0 {
                 return 0.0;
@@ -387,14 +414,15 @@ impl ProcessCpuState {
             let consumed = ticks.saturating_sub(old_ticks) as f32 / self.ticks_per_second;
             (consumed / elapsed * 100.0).max(0.0)
         });
-        self.previous.insert(pid, (ticks, now));
+        self.previous.insert(pid, (ticks, now, self.generation));
         result
     }
 
     /// Forget exited processes so a long-running monitor never retains stale
     /// PID entries (and so reused PIDs always begin with a fresh baseline).
-    fn retain_live(&mut self, live: &HashSet<u32>) {
-        self.previous.retain(|pid, _| live.contains(pid));
+    fn retain_live(&mut self) {
+        let generation = self.generation;
+        self.previous.retain(|_, (_, _, seen)| *seen == generation);
     }
 }
 
@@ -488,7 +516,7 @@ impl MonitorReader {
                 v.next().unwrap_or(0.0),
             ]
         });
-        let (memory, _) = MemoryValues::read();
+        let (memory, memory_available_mb, swap_used_mb, swap_total_mb) = MemoryValues::read();
         let temperature = TemperatureValue::read();
         let disk = DiskValue::read();
         let disk_io_mb_s = self.disk_io.throughput_mb_s();
@@ -507,6 +535,9 @@ impl MonitorReader {
             cpu_cores: self.cpu.core_count(),
             cpu_frequency_ghz,
             disk_io_mb_s,
+            memory_available_mb,
+            swap_used_mb,
+            swap_total_mb,
         }
     }
 
@@ -538,20 +569,48 @@ impl MonitorReader {
     }
 
     fn process_stat(stat: &str) -> Option<(String, u64, u64)> {
-        let close = stat.rfind(')')?;
-        let name = stat.get(..close)?.split_once('(')?.1.to_owned();
-        let mut fields = stat.get(close + 1..)?.split_whitespace();
-        let mut user: Option<u64> = None;
-        let mut system: Option<u64> = None;
-        let mut resident_pages: Option<u64> = None;
-        for index in 0..=21 {
-            let field = fields.next()?;
-            match index {
-                11 => user = field.parse().ok(),
-                12 => system = field.parse().ok(),
-                21 => resident_pages = field.parse().ok(),
+        let bytes = stat.as_bytes();
+        let close = bytes.iter().rposition(|&byte| byte == b')')?;
+        let open = bytes[..close].iter().position(|&byte| byte == b'(')?;
+        let name = stat.get(open + 1..close)?.to_owned();
+        let mut index = close + 1;
+        let mut field = 0;
+        let mut user = None;
+        let mut system = None;
+        let mut resident_pages = None;
+        while field <= 21 {
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let token_start = index;
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if token_start == index {
+                return None;
+            }
+            if field == 0 {
+                // The state field is a single alphabetic byte; all later
+                // fields needed here are decimal counters.
+                field += 1;
+                continue;
+            }
+            let mut value = 0u64;
+            for &byte in &bytes[token_start..index] {
+                if !byte.is_ascii_digit() {
+                    return None;
+                }
+                value = value
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(byte - b'0'));
+            }
+            match field {
+                11 => user = Some(value),
+                12 => system = Some(value),
+                21 => resident_pages = Some(value),
                 _ => {}
             }
+            field += 1;
         }
         Some((name, user?.saturating_add(system?), resident_pages?))
     }
@@ -559,7 +618,7 @@ impl MonitorReader {
 
 struct MemoryValues;
 impl MemoryValues {
-    fn read() -> (f32, u64) {
+    fn read() -> (f32, f32, f32, f32) {
         let text = fs::read_to_string("/proc/meminfo").unwrap_or_default();
         let find = |key| {
             text.lines()
@@ -574,13 +633,21 @@ impl MemoryValues {
         };
         let total = find("MemTotal:");
         let available = find("MemAvailable:");
+        let swap_total = find("SwapTotal:");
+        let swap_free = find("SwapFree:");
         #[allow(clippy::cast_precision_loss)]
         let used = if total == 0 {
             0.0
         } else {
-            100.0 * (total - available) as f32 / total as f32
+            100.0 * (total.saturating_sub(available)) as f32 / total as f32
         };
-        (used, total)
+        #[allow(clippy::cast_precision_loss)]
+        (
+            used,
+            available as f32 / 1024.0,
+            swap_total.saturating_sub(swap_free) as f32 / 1024.0,
+            swap_total as f32 / 1024.0,
+        )
     }
 }
 struct TemperatureValue;

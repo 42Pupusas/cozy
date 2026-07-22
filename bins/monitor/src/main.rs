@@ -110,6 +110,9 @@ impl SampleInterpolator {
             cpu_cores: to.cpu_cores,
             cpu_frequency_ghz: blend(from.cpu_frequency_ghz, to.cpu_frequency_ghz),
             disk_io_mb_s: blend(from.disk_io_mb_s, to.disk_io_mb_s),
+            memory_available_mb: blend(from.memory_available_mb, to.memory_available_mb),
+            swap_used_mb: blend(from.swap_used_mb, to.swap_used_mb),
+            swap_total_mb: blend(from.swap_total_mb, to.swap_total_mb),
         }
     }
 }
@@ -303,13 +306,22 @@ impl Painter {
         let hero_end = Self::metric(hero_text, canvas, hero, rect.x + 14, hero_y);
         let unit_y = hero_y + hero_text.baseline_offset() - subtitle_text.baseline_offset();
         subtitle_text.draw_text(canvas, unit, hero_end + 6, unit_y, DIM, CARD_SURFACE);
-        let column_width = (rect.w - 28) / i32::try_from(details.len().max(1)).unwrap_or(1);
+        let row_width = rect.w - 28;
         let normal_y = details_y + subtitle_text.baseline_offset() - normal_text.baseline_offset();
-        for (index, (label, value)) in details.iter().enumerate() {
-            let x = rect.x + 14 + i32::try_from(index).unwrap_or(0) * column_width;
+        let pair_widths: Vec<i32> = details
+            .iter()
+            .map(|(label, value)| subtitle_text.measure(label) + 8 + normal_text.measure(value))
+            .collect();
+        let used_width: i32 = pair_widths.iter().sum();
+        let gap = ((row_width - used_width)
+            / i32::try_from(details.len().saturating_sub(1).max(1)).unwrap_or(1))
+        .max(8);
+        let mut x = rect.x + 14;
+        for ((label, value), pair_width) in details.iter().zip(pair_widths) {
             subtitle_text.draw_text(canvas, label, x, details_y, FAINT, CARD_SURFACE);
             let value_x = x + subtitle_text.measure(label) + 8;
             normal_text.draw_text(canvas, value, value_x, normal_y, DIM, CARD_SURFACE);
+            x += pair_width + gap;
         }
     }
 
@@ -491,6 +503,22 @@ impl Painter {
             }
         }
         if full_repaint {
+            let memory_used = format!("{:.0}%", snap.sample.memory);
+            let memory_available = format!("{:.1} GB", snap.sample.memory_available_mb / 1024.0);
+            let swap = if snap.sample.swap_total_mb <= 0.0 {
+                "ZRAM —".to_owned()
+            } else {
+                format!(
+                    "{:.1}/{:.1} GB",
+                    snap.sample.swap_used_mb / 1024.0,
+                    snap.sample.swap_total_mb / 1024.0
+                )
+            };
+            let memory_details = [
+                ("USED", memory_used.as_str()),
+                ("AVAIL", memory_available.as_str()),
+                ("SWAP", swap.as_str()),
+            ];
             Self::card_text(
                 canvas,
                 cards[1],
@@ -498,7 +526,7 @@ impl Painter {
                 "SYSTEM",
                 &format!("{:.0}", snap.sample.memory),
                 "%",
-                &[("USED", "—"), ("AVAIL", "—"), ("SWAP", "—")],
+                &memory_details,
                 hero_text,
                 title_text,
                 subtitle_text,

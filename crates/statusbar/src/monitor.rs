@@ -18,6 +18,10 @@ pub struct MonitorSample {
     pub load: [f32; 3],
     pub memory: f32,
     pub temperature: f32,
+    pub thermal_device: String,
+    pub thermal_max: f32,
+    pub thermal_avg: f32,
+    pub thermal_min: f32,
     pub disk: f32,
     pub network_rx: f32,
     pub network_tx: f32,
@@ -775,7 +779,7 @@ impl MonitorReader {
             ]
         });
         let (memory, memory_available_mb, swap_used_mb, swap_total_mb) = MemoryValues::read();
-        let temperature = TemperatureValue::read();
+        let thermal = TemperatureValue::read();
         let disk = DiskValue::read();
         let disk_io_mb_s = self.disk_io.throughput_mb_s();
         let cpu_frequency_ghz = CpuFrequency::read_ghz();
@@ -786,7 +790,11 @@ impl MonitorReader {
             cores,
             load,
             memory,
-            temperature,
+            temperature: thermal.current,
+            thermal_device: thermal.device,
+            thermal_max: thermal.maximum,
+            thermal_avg: thermal.average,
+            thermal_min: thermal.minimum,
             disk,
             network_rx,
             network_tx,
@@ -918,21 +926,69 @@ impl MemoryValues {
         )
     }
 }
+struct TemperatureReading {
+    current: f32,
+    maximum: f32,
+    average: f32,
+    minimum: f32,
+    device: String,
+}
+
 struct TemperatureValue;
 impl TemperatureValue {
-    fn read() -> f32 {
-        fs::read_dir("/sys/class/thermal").map_or(0.0, |entries| {
-            entries
-                .flatten()
-                .find_map(|e| {
-                    fs::read_to_string(e.path().join("temp"))
-                        .ok()?
-                        .trim()
-                        .parse::<f32>()
-                        .ok()
-                })
-                .map_or(0.0, |v| v / 1000.0)
-        })
+    fn read() -> TemperatureReading {
+        let mut readings = Vec::new();
+        let Ok(entries) = fs::read_dir("/sys/class/thermal") else {
+            return TemperatureReading {
+                current: 0.0,
+                maximum: 0.0,
+                average: 0.0,
+                minimum: 0.0,
+                device: "THERMAL".to_owned(),
+            };
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(value) = fs::read_to_string(path.join("temp"))
+                .ok()
+                .and_then(|text| text.trim().parse::<f32>().ok())
+            else {
+                continue;
+            };
+            let temperature = value / 1000.0;
+            let kind = fs::read_to_string(path.join("type"))
+                .ok()
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty())
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            readings.push((temperature, kind));
+        }
+        let Some((current, sensor)) = readings.first().cloned() else {
+            return TemperatureReading {
+                current: 0.0,
+                maximum: 0.0,
+                average: 0.0,
+                minimum: 0.0,
+                device: "THERMAL".to_owned(),
+            };
+        };
+        let maximum = readings.iter().map(|(value, _)| *value).fold(0.0, f32::max);
+        let average = readings.iter().map(|(value, _)| *value).sum::<f32>()
+            / readings.len() as f32;
+        let minimum = readings.iter().map(|(value, _)| *value).fold(f32::INFINITY, f32::min);
+        let device = readings
+            .iter()
+            .map(|(_, kind)| kind.as_str())
+            .find(|kind| !kind.eq_ignore_ascii_case("thermal"))
+            .unwrap_or(sensor.as_str())
+            .to_owned();
+        TemperatureReading {
+            current,
+            maximum,
+            average,
+            minimum,
+            device,
+        }
     }
 }
 /// Linux's `statvfs(2)` layout. The monitor targets Linux, and the fields we

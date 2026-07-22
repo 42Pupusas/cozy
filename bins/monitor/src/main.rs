@@ -103,6 +103,10 @@ impl SampleInterpolator {
             load: std::array::from_fn(|index| blend(from.load[index], to.load[index])),
             memory: blend(from.memory, to.memory),
             temperature: blend(from.temperature, to.temperature),
+            thermal_device: to.thermal_device.clone(),
+            thermal_max: blend(from.thermal_max, to.thermal_max),
+            thermal_avg: blend(from.thermal_avg, to.thermal_avg),
+            thermal_min: blend(from.thermal_min, to.thermal_min),
             disk: blend(from.disk, to.disk),
             network_rx: blend(from.network_rx, to.network_rx),
             network_tx: blend(from.network_tx, to.network_tx),
@@ -388,13 +392,14 @@ impl Painter {
         let height = canvas.height();
         let margin = 18;
         let gap = 12;
-        let header = 42;
+        // The dashboard has no separate top bar; cards begin at the outer
+        // margin so the telemetry and process list use the full window height.
         let process_w = (width / 3).max(220);
         let left_w = width - margin * 2 - process_w - gap;
         let col_w = (left_w - gap) / 2;
-        let row_h = ((height - header - margin - gap) / 2).max(90);
+        let row_h = ((height - margin * 2 - gap) / 2).max(90);
         let xs = [margin, margin + col_w + gap];
-        let ys = [header, header + row_h + gap];
+        let ys = [margin, margin + row_h + gap];
         // Reserve explicit, non-overlapping bands for the card header, hero
         // metric, and detail row. The chart starts only after those bands;
         // deriving its height from the remaining space prevents large Hero
@@ -412,28 +417,8 @@ impl Painter {
         let graph_h = (row_h - graph_top - CARD_INSET).max(1);
         let card = |x: i32, y: i32| Rect::new(x, y, col_w, row_h);
 
-        // The mockup's restrained shell is intentional: nearly black canvas,
-        // quiet borders, and small uppercase labels keep telemetry dominant.
-        if full_repaint {
-            title_text.draw_text(canvas, "pulse", margin, 14, FG, UI_BACKGROUND);
-            subtitle_text.draw_text(
-                canvas,
-                "SYSTEM MONITOR",
-                margin + 52,
-                15,
-                FAINT,
-                UI_BACKGROUND,
-            );
-            text.draw_text_right(
-                canvas,
-                "LIVE · 60 FPS",
-                width - margin,
-                15,
-                DIM,
-                UI_BACKGROUND,
-            );
-            canvas.hline(margin, width - margin, header - 1, CARD_BORDER);
-        }
+        // The dashboard intentionally has no separate top bar. The cards and
+        // process list provide all identity and status context themselves.
         let cards = [
             card(xs[0], ys[0]), // CPU
             card(xs[1], ys[0]), // Memory
@@ -532,7 +517,7 @@ impl Painter {
             // safely and keep every column readable.
             let row_x = cpu_card.x + 14;
             let row_width = cpu_card.w - 28;
-            let labels = ["LOAD", "DISK IO", "FREQ"];
+            let labels = ["Load", "Disk I/O", "Freq"];
             // Load is available directly from /proc/loadavg and complements
             // the instantaneous CPU percentage without requiring perf access.
             let load = format!("{:.2}", snap.sample.load[0]);
@@ -567,14 +552,14 @@ impl Painter {
                 )
             };
             let memory_details = [
-                ("USED", memory_used.as_str()),
-                ("AVAIL", memory_available.as_str()),
-                ("SWAP", swap.as_str()),
+                ("Used", memory_used.as_str()),
+                ("Available", memory_available.as_str()),
+                ("Swap", swap.as_str()),
             ];
             Self::card_text(
                 canvas,
                 cards[1],
-                "MEMORY",
+                "Memory",
                 &snap.sample.memory_device,
                 &format!("{:.0}", snap.sample.memory),
                 "%",
@@ -587,11 +572,15 @@ impl Painter {
             Self::card_text(
                 canvas,
                 cards[2],
-                "TEMPERATURE",
-                "THERMAL",
+                "Temperature",
+                &snap.sample.thermal_device,
                 &format!("{:.0}", snap.sample.temperature),
                 "°C",
-                &[("MAX", "—"), ("AVG", "—"), ("SENSOR", "—")],
+                &[
+                    ("Max", &format!("{:.1} °C", snap.sample.thermal_max)),
+                    ("Average", &format!("{:.1} °C", snap.sample.thermal_avg)),
+                    ("Min", &format!("{:.1} °C", snap.sample.thermal_min)),
+                ],
                 hero_text,
                 title_text,
                 subtitle_text,
@@ -603,12 +592,12 @@ impl Painter {
             let network_link = if snap.sample.network_link_mbps > 0.0 {
                 format!("{:.0} Mb/s", snap.sample.network_link_mbps)
             } else {
-                "UP".to_owned()
+                "Up".to_owned()
             };
             Self::card_text(
                 canvas,
                 cards[3],
-                "NETWORK",
+                "Network",
                 &snap.sample.network_device,
                 &network_ping,
                 "ms",
@@ -687,9 +676,9 @@ impl Painter {
 
         let proc_rect = Rect::new(
             margin + left_w + gap,
-            header,
+            margin,
             process_w,
-            height - header - margin,
+            height - margin * 2,
         );
         Self::card(canvas, proc_rect, full_repaint);
         if full_repaint {
@@ -748,7 +737,7 @@ impl Painter {
             phases.static_content += Instant::now().duration_since(started);
             canvas.bounds()
         } else {
-            Rect::new(0, header, width, height - header)
+            Rect::new(0, margin, width, height - margin * 2)
         }
     }
 }

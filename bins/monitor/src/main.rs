@@ -106,6 +106,8 @@ impl SampleInterpolator {
             disk: blend(from.disk, to.disk),
             network_rx: blend(from.network_rx, to.network_rx),
             network_tx: blend(from.network_tx, to.network_tx),
+            cpu_brand: to.cpu_brand.clone(),
+            cpu_cores: to.cpu_cores,
         }
     }
 }
@@ -180,8 +182,6 @@ impl Painter {
     fn graph(
         cache: &mut ChartCache,
         canvas: &mut Canvas,
-        text: &mut TextRenderer,
-        title: &str,
         values: &VecDeque<f32>,
         x: i32,
         y: i32,
@@ -203,7 +203,6 @@ impl Painter {
             &[],
             HISTORY,
         );
-        text.draw_text(canvas, title, x + 6, y + 6, FG, CHART_PANEL);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -243,6 +242,34 @@ impl Painter {
 
     fn metric(text: &mut TextRenderer, canvas: &mut Canvas, value: &str, x: i32, y: i32) -> i32 {
         text.draw_text(canvas, value, x, y, FG, CARD_SURFACE)
+    }
+
+    /// Retain the beginning of a string and replace its overflowing end with
+    /// an ellipsis. CPU metadata should read naturally from the start (for
+    /// example, `Intel(R) Core(TM) … · 16 cores`) rather than exposing an
+    /// arbitrary suffix of the brand.
+    fn truncate_prefix(text: &str, renderer: &mut TextRenderer, max_width: i32) -> String {
+        if max_width <= 0 {
+            return String::new();
+        }
+        if renderer.measure(text) <= max_width {
+            return text.to_owned();
+        }
+        let ellipsis_width = renderer.measure("…");
+        if ellipsis_width >= max_width {
+            return "…".to_owned();
+        }
+        let mut prefix = String::new();
+        for character in text.chars() {
+            let mut candidate = prefix.clone();
+            candidate.push(character);
+            candidate.push('…');
+            if renderer.measure(&candidate) > max_width {
+                break;
+            }
+            prefix.push(character);
+        }
+        format!("{prefix}…")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -381,9 +408,25 @@ impl Painter {
                 DIM,
                 CARD_SURFACE,
             );
+            // Keep the metadata in the right half of the title row.  A full
+            // CPU brand can be much wider than the card, so truncate the
+            // brand before adding the core count; truncating the combined
+            // string can preserve the suffix while still allowing the brand
+            // to consume nearly the whole row.
+            let core_suffix = format!(" · {} cores", snap.sample.cpu_cores);
+            // The title is short, so let the metadata use most of the card
+            // rather than truncating a perfectly readable brand too early.
+            // Keep a left-side safety gap so it can never collide with `CPU`.
+            let metadata_width = (cpu_card.w * 3 / 4 - 14).max(1);
+            let brand_width =
+                (metadata_width - subtitle_text.measure(&core_suffix) - subtitle_text.measure("…"))
+                    .max(1);
+            let brand = Self::truncate_prefix(&snap.sample.cpu_brand, subtitle_text, brand_width);
+            let cpu_meta = format!("{brand}{core_suffix}");
+            let cpu_meta = Self::truncate_prefix(&cpu_meta, subtitle_text, metadata_width);
             subtitle_text.draw_text_right(
                 canvas,
-                &format!("system cpu · {} cores", snap.sample.cores.len()),
+                &cpu_meta,
                 cpu_card.x + cpu_card.w - 14,
                 cpu_card.y + 13,
                 FAINT,
@@ -489,8 +532,6 @@ impl Painter {
         Self::graph(
             &mut self.memory,
             canvas,
-            text,
-            "MEMORY",
             &history.memory,
             graph_rect(cards[1]).x,
             graph_rect(cards[1]).y,
@@ -502,8 +543,6 @@ impl Painter {
         Self::graph(
             &mut self.temperature,
             canvas,
-            text,
-            "TEMPERATURE",
             &history.temp,
             graph_rect(cards[2]).x,
             graph_rect(cards[2]).y,
@@ -515,8 +554,6 @@ impl Painter {
         Self::graph(
             &mut self.network,
             canvas,
-            text,
-            "NETWORK",
             &history.rx,
             graph_rect(cards[3]).x,
             graph_rect(cards[3]).y,

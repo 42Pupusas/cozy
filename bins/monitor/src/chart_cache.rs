@@ -63,11 +63,21 @@ impl ChartCache {
         color: Color,
         overlays: &[Overlay<'_>],
         history_capacity: usize,
+        sequence: u64,
     ) {
         if self.needs_rebuild(bounds, primary.len()) {
-            self.rebuild(bounds.w, bounds.h, primary, maximum, color, overlays);
+            self.rebuild(
+                bounds.w, bounds.h, primary, maximum, color, overlays, sequence,
+            );
         } else {
-            self.advance(primary, maximum, color, overlays, history_capacity);
+            self.advance(
+                primary,
+                maximum,
+                color,
+                overlays,
+                history_capacity,
+                sequence,
+            );
         }
         target.copy_pixels(
             Rect::new(bounds.x, bounds.y, self.width, self.height),
@@ -93,13 +103,14 @@ impl ChartCache {
         maximum: f32,
         color: Color,
         overlays: &[Overlay<'_>],
+        sequence: u64,
     ) {
         self.width = width.max(0);
         self.height = height.max(0);
         let area = self.width.cast_unsigned() as usize * self.height.cast_unsigned() as usize;
         self.pixels.resize(area, self.panel.to_xrgb8888());
         self.scroll_remainder = 0.0;
-        self.seen_samples = primary.len();
+        self.seen_samples = sequence as usize;
         let mut canvas = Canvas::new(&mut self.pixels, self.width, self.height);
         let chart = Chart::new(Rect::new(0, 0, self.width, self.height), color, self.panel);
         chart.draw(&mut canvas, primary, maximum);
@@ -115,9 +126,11 @@ impl ChartCache {
         color: Color,
         overlays: &[Overlay<'_>],
         history_capacity: usize,
+        sequence: u64,
     ) {
-        let added = primary.len().saturating_sub(self.seen_samples);
-        self.seen_samples = primary.len();
+        let previous = self.seen_samples as u64;
+        let added = sequence.saturating_sub(previous) as usize;
+        self.seen_samples = sequence as usize;
         if added == 0 || self.width <= 0 || self.height <= 0 || history_capacity == 0 {
             return;
         }

@@ -5,7 +5,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
 use std::fs;
+use std::net::Ipv4Addr;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
+use std::process::Command;
 use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
@@ -18,6 +20,9 @@ pub struct MonitorSample {
     pub disk: f32,
     pub network_rx: f32,
     pub network_tx: f32,
+    pub network_device: String,
+    pub network_ping_ms: f32,
+    pub network_link_mbps: f32,
     pub cpu_brand: String,
     pub cpu_cores: usize,
     pub cpu_frequency_ghz: f32,
@@ -220,6 +225,165 @@ impl CpuState {
 #[derive(Default)]
 struct NetworkState {
     previous: Option<(u64, u64, std::time::Instant)>,
+    device: Option<String>,
+    last_ping: Option<(Instant, f32)>,
+}
+
+impl NetworkState {
+    fn device_label(&mut self) -> String {
+        if let Some(device) = &self.device {
+            return device.clone();
+        }
+        let interfaces = fs::read_dir("/sys/class/net")
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "lo")
+            .collect::<Vec<_>>();
+        // Prefer the interface carrying the default route. A directory-order
+        // choice can otherwise select docker0 or another virtual bridge even
+        // though it is not the adapter providing network connectivity.
+        let default_interface = Self::default_route_interface();
+        let selected = default_interface
+            .as_deref()
+            .and_then(|name| {
+                interfaces
+                    .iter()
+                    .find(|candidate| candidate.as_str() == name)
+                    .filter(|candidate| {
+                        Self::hardware_label(candidate).is_some()
+                            && Self::interface_is_up(candidate)
+                    })
+            })
+            .or_else(|| {
+                interfaces.iter().find(|name| {
+                    Self::hardware_label(name).is_some() && Self::interface_is_up(name)
+                })
+            })
+            .or_else(|| {
+                interfaces
+                    .iter()
+                    .find(|name| !Self::virtual_interface(name))
+            })
+            .or_else(|| interfaces.first());
+        let label = selected
+            .map(|name| Self::hardware_label(name).unwrap_or_else(|| name.clone()))
+            .unwrap_or_else(|| "NO NETWORK".to_owned());
+        self.device = Some(label.clone());
+        label
+    }
+
+    fn ping_ms(&mut self) -> f32 {
+        let now = Instant::now();
+        if let Some((at, value)) = self.last_ping {
+            if now.duration_since(at) < std::time::Duration::from_secs(1) {
+                return value;
+            }
+        }
+        let value = Self::default_gateway()
+            .and_then(|gateway| {
+                let output = Command::new("ping")
+                    .args(["-n", "-c", "1", "-W", "1", &gateway.to_string()])
+                    .output()
+                    .ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                let text = String::from_utf8_lossy(&output.stdout);
+                text.split_whitespace()
+                    .find_map(|field| field.strip_prefix("time="))
+                    .and_then(|value| value.parse::<f32>().ok())
+            })
+            .unwrap_or(0.0);
+        self.last_ping = Some((now, value));
+        value
+    }
+
+    fn link_mbps(&mut self) -> f32 {
+        let interface = Self::default_route_interface().or_else(|| {
+            self.device.as_ref().and_then(|label| {
+                fs::read_dir("/sys/class/net").ok()?.flatten().find_map(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    (Self::hardware_label(&name).as_deref() == Some(label.as_str())).then_some(name)
+                })
+            })
+        });
+        interface
+            .and_then(|name| fs::read_to_string(format!("/sys/class/net/{name}/speed")).ok())
+            .and_then(|speed| speed.trim().parse::<f32>().ok())
+            .filter(|speed| *speed > 0.0)
+            .unwrap_or(0.0)
+    }
+
+    fn default_gateway() -> Option<Ipv4Addr> {
+        let routes = fs::read_to_string("/proc/net/route").ok()?;
+        routes.lines().skip(1).find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _interface = fields.next()?;
+            let destination = fields.next()?;
+            let gateway = fields.next()?;
+            let flags = fields.next()?;
+            if destination != "00000000" || gateway == "00000000" || flags == "0000" {
+                return None;
+            }
+            let value = u32::from_str_radix(gateway, 16).ok()?;
+            Some(Ipv4Addr::from(value.to_le_bytes()))
+        })
+    }
+
+    fn default_route_interface() -> Option<String> {
+        let routes = fs::read_to_string("/proc/net/route").ok()?;
+        routes.lines().skip(1).find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let interface = fields.next()?;
+            let destination = fields.next()?;
+            let gateway = fields.next()?;
+            let flags = fields.next()?;
+            (destination == "00000000" && gateway != "00000000" && flags != "0000")
+                .then(|| interface.to_owned())
+        })
+    }
+
+    fn interface_is_up(interface: &str) -> bool {
+        fs::read_to_string(format!("/sys/class/net/{interface}/operstate"))
+            .map(|state| matches!(state.trim(), "up" | "unknown"))
+            .unwrap_or(false)
+    }
+
+    fn virtual_interface(interface: &str) -> bool {
+        interface.starts_with("docker")
+            || interface.starts_with("veth")
+            || interface.starts_with("br-")
+            || interface.starts_with("virbr")
+            || interface.starts_with("tun")
+            || interface.starts_with("tap")
+            || interface.starts_with("wg")
+    }
+
+    fn hardware_label(interface: &str) -> Option<String> {
+        let root = format!("/sys/class/net/{interface}/device");
+        if !std::path::Path::new(&root).exists() {
+            return None;
+        }
+        let uevent = fs::read_to_string(format!("{root}/uevent")).ok()?;
+        let mut driver = None;
+        let mut pci_id = None;
+        for line in uevent.lines() {
+            if let Some(value) = line.strip_prefix("DRIVER=") {
+                driver = Some(value.to_owned());
+            } else if let Some(value) = line.strip_prefix("PCI_ID=") {
+                pci_id = Some(value.to_owned());
+            }
+        }
+        match (driver, pci_id) {
+            (Some(driver), Some(pci_id)) => Some(format!("{driver} {pci_id}")),
+            (Some(driver), None) => Some(driver),
+            (None, Some(pci_id)) => Some(pci_id),
+            (None, None) => Some(interface.to_owned()),
+        }
+    }
 }
 
 impl NetworkState {
@@ -292,7 +456,6 @@ impl ProcessScanner {
         self.cursor = 0;
         self.collected.clear();
     }
-
 
     /// Parse one bounded batch. Returning `Some` marks the end of a complete
     /// sweep; callers retain their old published list between completions.
@@ -405,15 +568,18 @@ impl ProcessCpuState {
     }
 
     fn percentage(&mut self, pid: u32, ticks: u64, now: Instant) -> f32 {
-        let result = self.previous.get(&pid).map_or(0.0, |&(old_ticks, then, _)| {
-            let elapsed = now.duration_since(then).as_secs_f32();
-            if elapsed <= 0.0 {
-                return 0.0;
-            }
-            #[allow(clippy::cast_precision_loss)]
-            let consumed = ticks.saturating_sub(old_ticks) as f32 / self.ticks_per_second;
-            (consumed / elapsed * 100.0).max(0.0)
-        });
+        let result = self
+            .previous
+            .get(&pid)
+            .map_or(0.0, |&(old_ticks, then, _)| {
+                let elapsed = now.duration_since(then).as_secs_f32();
+                if elapsed <= 0.0 {
+                    return 0.0;
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let consumed = ticks.saturating_sub(old_ticks) as f32 / self.ticks_per_second;
+                (consumed / elapsed * 100.0).max(0.0)
+            });
         self.previous.insert(pid, (ticks, now, self.generation));
         result
     }
@@ -522,6 +688,7 @@ impl MonitorReader {
         let disk_io_mb_s = self.disk_io.throughput_mb_s();
         let cpu_frequency_ghz = CpuFrequency::read_ghz();
         let (network_rx, network_tx) = self.network.throughput();
+        let network_device = self.network.device_label();
         MonitorSample {
             cpu,
             cores,
@@ -531,6 +698,9 @@ impl MonitorReader {
             disk,
             network_rx,
             network_tx,
+            network_device,
+            network_ping_ms: self.network.ping_ms(),
+            network_link_mbps: self.network.link_mbps(),
             cpu_brand: self.cpu.brand().to_owned(),
             cpu_cores: self.cpu.core_count(),
             cpu_frequency_ghz,

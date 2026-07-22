@@ -106,6 +106,9 @@ impl SampleInterpolator {
             disk: blend(from.disk, to.disk),
             network_rx: blend(from.network_rx, to.network_rx),
             network_tx: blend(from.network_tx, to.network_tx),
+            network_device: to.network_device.clone(),
+            network_ping_ms: blend(from.network_ping_ms, to.network_ping_ms),
+            network_link_mbps: blend(from.network_link_mbps, to.network_link_mbps),
             cpu_brand: to.cpu_brand.clone(),
             cpu_cores: to.cpu_cores,
             cpu_frequency_ghz: blend(from.cpu_frequency_ghz, to.cpu_frequency_ghz),
@@ -123,6 +126,8 @@ struct History {
     memory: VecDeque<f32>,
     temp: VecDeque<f32>,
     rx: VecDeque<f32>,
+    tx: VecDeque<f32>,
+    sequence: u64,
 }
 
 impl History {
@@ -133,6 +138,8 @@ impl History {
             memory: VecDeque::new(),
             temp: VecDeque::new(),
             rx: VecDeque::new(),
+            tx: VecDeque::new(),
+            sequence: 0,
         }
     }
     fn push(queue: &mut VecDeque<f32>, value: f32) {
@@ -142,6 +149,7 @@ impl History {
         }
     }
     fn add(&mut self, s: &MonitorSample) {
+        self.sequence = self.sequence.saturating_add(1);
         Self::push(&mut self.cpu, s.cpu);
         // CPU topology may appear after startup (or change after hotplug). Keep
         // each core in its own series so all lines share a consistent timeline.
@@ -152,6 +160,7 @@ impl History {
         Self::push(&mut self.memory, s.memory);
         Self::push(&mut self.temp, s.temperature);
         Self::push(&mut self.rx, s.network_rx);
+        Self::push(&mut self.tx, s.network_tx);
     }
 }
 
@@ -194,6 +203,8 @@ impl Painter {
         color: Color,
         maximum: f32,
         height: i32,
+        sequence: u64,
+        overlays: &[Overlay<'_>],
     ) {
         // The chart deliberately has no grid or frame: at this small size they
         // compete with the data. Its private surface advances like the
@@ -205,8 +216,9 @@ impl Painter {
             values,
             maximum,
             color,
-            &[],
+            overlays,
             HISTORY,
+            sequence,
         );
     }
 
@@ -220,6 +232,7 @@ impl Painter {
         y: i32,
         w: i32,
         h: i32,
+        sequence: u64,
     ) {
         let overlays: Vec<_> = cores
             .iter()
@@ -234,6 +247,7 @@ impl Painter {
             GREEN,
             &overlays,
             HISTORY,
+            sequence,
         );
     }
 
@@ -545,14 +559,26 @@ impl Painter {
                 subtitle_text,
                 text,
             );
+            let network_ping = format!("{:.1}", snap.sample.network_ping_ms);
+            let network_rx = format!("{:.2} MB/s", snap.sample.network_rx);
+            let network_tx = format!("{:.2} MB/s", snap.sample.network_tx);
+            let network_link = if snap.sample.network_link_mbps > 0.0 {
+                format!("{:.0} Mb/s", snap.sample.network_link_mbps)
+            } else {
+                "UP".to_owned()
+            };
             Self::card_text(
                 canvas,
                 cards[3],
                 "NETWORK",
-                "THROUGHPUT",
-                &format!("{:.1}", snap.sample.network_rx),
-                "MB/s",
-                &[("RX", "—"), ("TX", "—"), ("LINK", "—")],
+                &snap.sample.network_device,
+                &network_ping,
+                "ms",
+                &[
+                    ("RX", &network_rx),
+                    ("TX", &network_tx),
+                    ("LINK", &network_link),
+                ],
                 hero_text,
                 title_text,
                 subtitle_text,
@@ -570,6 +596,7 @@ impl Painter {
             r.y,
             r.w,
             r.h,
+            history.sequence,
         );
         phases.cpu_chart += started.elapsed();
         let started = Instant::now();
@@ -583,6 +610,8 @@ impl Painter {
             CYAN,
             100.0,
             graph_h,
+            history.sequence,
+            &[],
         );
         Self::graph(
             &mut self.temperature,
@@ -594,6 +623,8 @@ impl Painter {
             ORANGE,
             100.0,
             graph_h,
+            history.sequence,
+            &[],
         );
         Self::graph(
             &mut self.network,
@@ -605,6 +636,8 @@ impl Painter {
             CYAN,
             10.0,
             graph_h,
+            history.sequence,
+            &[Overlay::new(&history.tx, ORANGE)],
         );
         phases.other_charts += started.elapsed();
 

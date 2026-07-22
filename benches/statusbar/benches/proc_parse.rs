@@ -26,6 +26,13 @@ fn process_stat_allocating(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
+fn cpu_times_byte_parser(bencher: divan::Bencher) {
+    bencher.bench(|| {
+        divan::black_box(MonitorReader::parse_cpu_times_for_bench(divan::black_box(PROC_CPU)))
+    });
+}
+
+#[divan::bench]
 fn cpu_line_streaming(bencher: divan::Bencher) {
     bencher.bench(|| {
         let mut total = 0u64;

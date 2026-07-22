@@ -245,6 +245,45 @@ impl Painter {
         text.draw_text(canvas, value, x, y, FG, CARD_SURFACE)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn card_text(
+        canvas: &mut Canvas,
+        rect: Rect,
+        title: &str,
+        meta: &str,
+        hero: &str,
+        unit: &str,
+        details: &[(&str, &str)],
+        hero_text: &mut TextRenderer,
+        title_text: &mut TextRenderer,
+        subtitle_text: &mut TextRenderer,
+        normal_text: &mut TextRenderer,
+    ) {
+        let title_y = rect.y + 12;
+        let hero_y = rect.y + 14 + 26;
+        let details_y = rect.y + 14 + 26 + 82 - 8;
+        title_text.draw_text(canvas, title, rect.x + 14, title_y, DIM, CARD_SURFACE);
+        subtitle_text.draw_text_right(
+            canvas,
+            meta,
+            rect.x + rect.w - 14,
+            title_y + 1,
+            FAINT,
+            CARD_SURFACE,
+        );
+        let hero_end = Self::metric(hero_text, canvas, hero, rect.x + 14, hero_y);
+        let unit_y = hero_y + hero_text.baseline_offset() - subtitle_text.baseline_offset();
+        subtitle_text.draw_text(canvas, unit, hero_end + 6, unit_y, DIM, CARD_SURFACE);
+        let column_width = (rect.w - 28) / i32::try_from(details.len().max(1)).unwrap_or(1);
+        let normal_y = details_y + subtitle_text.baseline_offset() - normal_text.baseline_offset();
+        for (index, (label, value)) in details.iter().enumerate() {
+            let x = rect.x + 14 + i32::try_from(index).unwrap_or(0) * column_width;
+            subtitle_text.draw_text(canvas, label, x, details_y, FAINT, CARD_SURFACE);
+            let value_x = x + subtitle_text.measure(label) + 8;
+            normal_text.draw_text(canvas, value, value_x, normal_y, DIM, CARD_SURFACE);
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::too_many_arguments)]
     fn paint(
@@ -393,33 +432,44 @@ impl Painter {
             }
         }
         if full_repaint {
-            Self::metric(
-                hero_text,
+            Self::card_text(
                 canvas,
-                &format!("{:3.0}%", snap.sample.memory),
-                xs[1] + 14,
-                ys[0] + 10,
+                cards[1],
+                "MEMORY",
+                "SYSTEM",
+                &format!("{:.0}", snap.sample.memory),
+                "%",
+                &[("USED", "—"), ("AVAIL", "—"), ("SWAP", "—")],
+                hero_text,
+                title_text,
+                subtitle_text,
+                text,
             );
-        }
-        if full_repaint {
-            Self::metric(
-                hero_text,
+            Self::card_text(
                 canvas,
-                &format!("{:3.0}°C", snap.sample.temperature),
-                xs[0] + 14,
-                ys[1] + 10,
+                cards[2],
+                "TEMPERATURE",
+                "THERMAL",
+                &format!("{:.0}", snap.sample.temperature),
+                "°C",
+                &[("MAX", "—"), ("AVG", "—"), ("SENSOR", "—")],
+                hero_text,
+                title_text,
+                subtitle_text,
+                text,
             );
-        }
-        if full_repaint {
-            Self::metric(
-                hero_text,
+            Self::card_text(
                 canvas,
-                &format!(
-                    "↓{:.1} ↑{:.1}",
-                    snap.sample.network_rx, snap.sample.network_tx
-                ),
-                xs[1] + 14,
-                ys[1] + 10,
+                cards[3],
+                "NETWORK",
+                "THROUGHPUT",
+                &format!("{:.1}", snap.sample.network_rx),
+                "MB/s",
+                &[("RX", "—"), ("TX", "—"), ("LINK", "—")],
+                hero_text,
+                title_text,
+                subtitle_text,
+                text,
             );
         }
         let started = Instant::now();

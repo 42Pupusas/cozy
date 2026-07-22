@@ -92,31 +92,77 @@ impl CpuState {
     }
 
     fn read_times() -> Vec<(u64, u64)> {
-        fs::read_to_string("/proc/stat").map_or_else(
-            |_| Vec::new(),
-            |text| {
-                text.lines()
-                    .filter(|line| line.starts_with("cpu"))
-                    .filter_map(|line| {
-                        let mut fields = line.split_whitespace();
-                        fields.next()?;
-                        let mut total = 0u64;
-                        let mut idle = None;
-                        let mut iowait = 0u64;
-                        for (count, field) in fields.enumerate() {
-                            let value = field.parse::<u64>().ok()?;
-                            total = total.saturating_add(value);
-                            match count {
-                                3 => idle = Some(value),
-                                4 => iowait = value,
-                                _ => {}
-                            }
-                        }
-                        Some((total, idle? + iowait))
-                    })
-                    .collect()
-            },
-        )
+        fs::read_to_string("/proc/stat")
+            .map_or_else(|_| Vec::new(), |text| Self::parse_times(&text))
+    }
+
+    /// Parse the CPU records in `/proc/stat` without creating line or field
+    /// iterators. `/proc` is an ASCII kernel interface, so a byte scanner is
+    /// both more precise and cheaper than Unicode whitespace parsing here.
+    fn parse_times(text: &str) -> Vec<(u64, u64)> {
+        let bytes = text.as_bytes();
+        let mut result = Vec::with_capacity(8);
+        let mut line_start = 0;
+        while line_start < bytes.len() {
+            let line_end = bytes[line_start..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(bytes.len(), |offset| line_start + offset);
+            let line = &bytes[line_start..line_end];
+            if line.starts_with(b"cpu")
+                && let Some(times) = Self::parse_cpu_line(line)
+            {
+                result.push(times);
+            }
+            line_start = line_end.saturating_add(1);
+        }
+        result
+    }
+
+    fn parse_cpu_line(line: &[u8]) -> Option<(u64, u64)> {
+        let mut index = 3;
+        while line
+            .get(index)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        {
+            index += 1;
+        }
+        while line.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        let mut field = 0;
+        let mut total = 0u64;
+        let mut idle = None;
+        let mut iowait = 0u64;
+        while index < line.len() {
+            let start = index;
+            while line.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            if start == index {
+                return None;
+            }
+            let mut value = 0u64;
+            for &byte in &line[start..index] {
+                value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+            }
+            total = total.saturating_add(value);
+            match field {
+                3 => idle = Some(value),
+                4 => iowait = value,
+                _ => {}
+            }
+            field += 1;
+            while line.get(index).is_some_and(u8::is_ascii_whitespace) {
+                index += 1;
+            }
+        }
+        Some((total, idle?.saturating_add(iowait)))
+    }
+
+    #[allow(dead_code)]
+    pub fn parse_cpu_times_for_bench(text: &str) -> Vec<(u64, u64)> {
+        Self::parse_times(text)
     }
 }
 
@@ -368,6 +414,12 @@ impl MonitorReader {
         Self::process_stat(stat)
     }
 
+    /// Parse procfs CPU counters without performing the filesystem read.
+    #[must_use]
+    pub fn parse_cpu_times_for_bench(text: &str) -> Vec<(u64, u64)> {
+        CpuState::parse_times(text)
+    }
+
     fn process_stat(stat: &str) -> Option<(String, u64, u64)> {
         let close = stat.rfind(')')?;
         let name = stat.get(..close)?.split_once('(')?.1.to_owned();
@@ -502,5 +554,16 @@ mod tests {
         assert_eq!(name, "worker");
         assert_eq!(ticks, 579);
         assert_eq!(resident_pages, 321);
+    }
+
+    #[test]
+    fn cpu_times_byte_parser_preserves_aggregate_and_core_records() {
+        let text = "cpu  123 45 67 890 12 3 4 5 6 7\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 99\n";
+        assert_eq!(CpuState::parse_times(text), vec![(1_162, 902), (55, 9)]);
+    }
+
+    #[test]
+    fn cpu_times_byte_parser_rejects_incomplete_records() {
+        assert!(CpuState::parse_times("cpu 1 2 3\ncpu0 x 2 3 4\n").is_empty());
     }
 }

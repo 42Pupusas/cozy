@@ -228,28 +228,44 @@ impl Painter {
         cache: &mut ChartCache,
         canvas: &mut Canvas,
         aggregate: &VecDeque<f32>,
-        cores: &[VecDeque<f32>],
         x: i32,
         y: i32,
         w: i32,
         h: i32,
         sequence: u64,
     ) {
-        let overlays: Vec<_> = cores
-            .iter()
-            .enumerate()
-            .map(|(index, values)| Overlay::new(values, CORE_COLORS[index % CORE_COLORS.len()]))
-            .collect();
+        // The line is intentionally aggregate-only. Per-core activity is a
+        // current-state comparison and is much easier to read as bars than as
+        // a stack of nearly indistinguishable historical overlays.
         cache.paint(
             canvas,
             Rect::new(x, y, w, h),
             aggregate,
             100.0,
             GREEN,
-            &overlays,
+            &[],
             HISTORY,
             sequence,
         );
+    }
+
+    fn cpu_bars(canvas: &mut Canvas, cores: &[f32], x: i32, y: i32, w: i32, h: i32) {
+        canvas.fill_rect(Rect::new(x, y, w, h), CARD_SURFACE);
+        if cores.is_empty() || w <= 0 || h <= 0 {
+            return;
+        }
+        let gap = 3;
+        let bar_width = ((w - gap * (cores.len() as i32 - 1)) / cores.len() as i32).max(1);
+        for (index, value) in cores.iter().enumerate() {
+            let bar_x = x + index as i32 * (bar_width + gap);
+            let amount = value.clamp(0.0, 100.0) / 100.0;
+            let bar_height = (amount * h as f32).round() as i32;
+            let bar_y = y + h - bar_height;
+            canvas.fill_rect(
+                Rect::new(bar_x, bar_y, bar_width, bar_height),
+                CORE_COLORS[index % CORE_COLORS.len()],
+            );
+        }
     }
 
     fn card(canvas: &mut Canvas, rect: Rect, full_repaint: bool) {
@@ -429,6 +445,22 @@ impl Painter {
         }
         let graph_rect =
             |rect: Rect| Rect::new(rect.x + 1, rect.y + graph_top, rect.w - 2, graph_h);
+        // Reserve the lower part of the CPU chart for one live bar per core.
+        // The aggregate line retains the larger upper viewport and its cached
+        // history; bars are cheap to redraw from the interpolated snapshot.
+        // Give the per-core bars enough vertical resolution to distinguish
+        // ordinary utilization changes without crowding the card details.
+        let cpu_bar_height = 96;
+        let cpu_bar_gap = 8;
+        let cpu_area = graph_rect(cards[0]);
+        let cpu_line_height = (cpu_area.h - cpu_bar_height - cpu_bar_gap).max(1);
+        let cpu_line = Rect::new(cpu_area.x, cpu_area.y, cpu_area.w, cpu_line_height);
+        let cpu_bars = Rect::new(
+            cpu_area.x,
+            cpu_area.y + cpu_line_height + cpu_bar_gap,
+            cpu_area.w,
+            cpu_bar_height,
+        );
         if full_repaint {
             // CPU card follows the mockup's four-row rhythm: a compact
             // identity row, a hero value row, a mixed-type detail row, and
@@ -592,17 +624,23 @@ impl Painter {
             );
         }
         let started = Instant::now();
-        let r = graph_rect(cards[0]);
         Self::cpu_graph(
             &mut self.cpu,
             canvas,
             &history.cpu,
-            &history.cores,
-            r.x,
-            r.y,
-            r.w,
-            r.h,
+            cpu_line.x,
+            cpu_line.y,
+            cpu_line.w,
+            cpu_line.h,
             history.sequence,
+        );
+        Self::cpu_bars(
+            canvas,
+            &snap.sample.cores,
+            cpu_bars.x,
+            cpu_bars.y,
+            cpu_bars.w,
+            cpu_bars.h,
         );
         phases.cpu_chart += started.elapsed();
         let started = Instant::now();

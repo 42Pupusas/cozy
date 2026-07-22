@@ -92,7 +92,11 @@ impl DirtyRegion {
             } else {
                 ((1u64 << width) - 1) << top
             };
-            let bottom_start = bot - n + 1;
+            // `n` may equal the full region height (including a region
+            // beginning at row 0), so compute as `bot + 1 - n`: the
+            // algebraically equivalent `bot - n + 1` underflows before the
+            // addition in debug builds when `n == bot + 1`.
+            let bottom_start = bot + 1 - n;
             let bottom_width = n;
             let bottom_mask = if bottom_width == 64 {
                 u64::MAX
@@ -119,7 +123,13 @@ impl DirtyRegion {
 
     /// Mark a range of rows dirty (inclusive).
     pub(crate) fn mark_rows(&mut self, top: u16, bot: u16) {
-        debug_assert!(top <= bot);
+        // Terminal commands can name an empty/clamped region (for example a
+        // line edit just outside the active scroll margin). It is a no-op,
+        // not a programmer error; keeping the guard here means callers never
+        // need to duplicate a raw range-order check.
+        if top > bot {
+            return;
+        }
         let top = usize::from(top);
         let bot = usize::from(bot);
         let first_word = top / 64;
@@ -157,7 +167,10 @@ impl DirtyRegion {
     /// is the only place that knows the previous cursor state to diff
     /// against.
     pub(crate) fn take_snapshot(&mut self, screen: &Screen) -> DirtySnapshot {
-        let mut rows = Vec::new();
+        // Pre-size to the exact dirty count -- a popcount per word is far
+        // cheaper than even one mid-push reallocation of a Vec of row Vecs.
+        let dirty: usize = self.words.iter().map(|w| w.count_ones() as usize).sum();
+        let mut rows = Vec::with_capacity(dirty);
         for (word_idx, &word) in self.words.iter().enumerate() {
             if word == 0 {
                 continue;
@@ -171,9 +184,17 @@ impl DirtyRegion {
                 // than wrapping into some other in-range row.
                 let row = u16::try_from(word_idx * 64 + bit).unwrap_or(u16::MAX);
                 if row < self.rows {
-                    let cells: Vec<Cell> = (0..self.cols)
-                        .map(|col| screen.get_cell(col, row))
-                        .collect();
+                    // Copy the row in one shot. `visible_row_cells` hands us
+                    // the whole row as a contiguous slice (one memcpy via
+                    // `to_vec`), or `None` for a lazily-blank row (stale
+                    // cells that must read as default). The old per-column
+                    // `get_cell` loop recomputed the physical row index and
+                    // re-checked the blank bit + bounds for every cell --
+                    // pure overhead on the hottest snapshot path.
+                    let cells: Vec<Cell> = match screen.visible_row_cells(row) {
+                        Some(cells) => cells,
+                        None => vec![Cell::default(); usize::from(self.cols)],
+                    };
                     rows.push(DirtyRow { row, cells });
                 }
                 bits &= bits - 1;

@@ -3,9 +3,10 @@
 //! Implements the Paul Williams DEC ANSI parser model.
 //! Reference: <https://vt100.net/emu/dec_ansi_parser>
 
-use crate::TermEvent;
 use crate::event::{C0, CsiAction, DcsCmd, OscCmd, SgrAttr, SgrAttrs};
 use crate::params::Params;
+use crate::scan::Scanner;
+use crate::{EventCallback, TermEvent, TerminalSink};
 
 /// DEC ANSI parser states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,9 +88,21 @@ impl Parser {
     /// at most one event. Events borrow from the parser's internal buffers
     /// (see [`TermEvent`]), so each must be fully handled inside `callback`
     /// before the next byte is processed.
-    pub fn feed(&mut self, bytes: &[u8], mut callback: impl FnMut(TermEvent)) {
+    pub fn feed(&mut self, bytes: &[u8], callback: impl for<'a> FnMut(TermEvent<'a>)) {
+        self.feed_to(bytes, &mut EventCallback::new(callback));
+    }
+
+    /// Feed bytes directly to a [`TerminalSink`].
+    ///
+    /// This is the production parser-to-grid path. It preserves exactly the
+    /// same event ordering as [`Self::feed`] without materialising a
+    /// [`TermEvent`] and matching it again for each recognised action.
+    pub fn feed_to(&mut self, bytes: &[u8], sink: &mut impl TerminalSink) {
         let mut i = 0;
         let n = bytes.len();
+        // One CPU-feature probe per chunk (cached atomic load), reused by
+        // every printable-run scan below.
+        let scanner = Scanner::new();
         while i < n {
             // ── Plain ASCII run fast path ────────────────────────────────
             // Floods spend most of their bytes in Ground as printable ASCII.
@@ -105,14 +118,14 @@ impl Parser {
             // (DEL 0x7F stays excluded -- it is a control byte).
             if self.state == State::Ground && matches!(bytes[i], 0x20..=0x7E) {
                 let start = i;
-                while i < n && matches!(bytes[i], 0x20..=0x7E) {
-                    i += 1;
-                }
+                // SIMD scan (SSE2/AVX2 on x86_64, scalar elsewhere): finds
+                // the run terminator 16/32 bytes at a time instead of one.
+                i += scanner.printable_run_len(&bytes[i..]);
                 if i - start >= 8 {
-                    callback(TermEvent::PrintRun(&bytes[start..i]));
+                    sink.print_run(&bytes[start..i]);
                 } else {
                     for &byte in &bytes[start..i] {
-                        callback(TermEvent::Print(char::from(byte)));
+                        sink.print(char::from(byte));
                     }
                 }
                 continue;
@@ -144,10 +157,27 @@ impl Parser {
                     continue;
                 }
             }
-            if let Some(ev) = self.advance(bytes[i]) {
-                callback(ev);
+            if let Some(event) = self.advance(bytes[i]) {
+                Self::dispatch(event, sink);
             }
             i += 1;
+        }
+    }
+
+    /// Deliver one general-path event to a direct sink.
+    fn dispatch(event: TermEvent<'_>, sink: &mut impl TerminalSink) {
+        match event {
+            TermEvent::Print(ch) => sink.print(ch),
+            TermEvent::PrintRun(bytes) => sink.print_run(bytes),
+            TermEvent::Control(control) => sink.control(control),
+            TermEvent::Esc {
+                intermediate,
+                final_byte,
+            } => sink.esc(intermediate, final_byte),
+            TermEvent::Csi(action) => sink.csi(action),
+            TermEvent::Osc(command) => sink.osc(command),
+            TermEvent::Dcs(command) => sink.dcs(command),
+            TermEvent::Ignored => sink.ignored(),
         }
     }
 

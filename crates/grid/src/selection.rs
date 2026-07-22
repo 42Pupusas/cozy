@@ -153,11 +153,7 @@ mod tests {
                 // Test fixture lines are always short, well under u16::MAX.
                 let col = u16::try_from(c).expect("test column fits in u16");
                 let row = u16::try_from(r).expect("test row fits in u16");
-                s.set_cell(
-                    col,
-                    row,
-                    Cell::new(ch, crate::Attrs::default(), 0),
-                );
+                s.set_cell(col, row, Cell::new(ch, crate::Attrs::default(), 0));
             }
         }
         s
@@ -231,21 +227,9 @@ mod tests {
     #[test]
     fn spacer_cells_are_not_double_counted() {
         let mut s = Screen::new(10, 3, 0);
-        s.set_cell(
-            0,
-            0,
-            Cell::wide_lead('中', crate::Attrs::default(), 0),
-        );
-        s.set_cell(
-            1,
-            0,
-            Cell::wide_spacer(crate::Attrs::default(), 0),
-        );
-        s.set_cell(
-            2,
-            0,
-            Cell::new('x', crate::Attrs::default(), 0),
-        );
+        s.set_cell(0, 0, Cell::wide_lead('中', crate::Attrs::default(), 0));
+        s.set_cell(1, 0, Cell::wide_spacer(crate::Attrs::default(), 0));
+        s.set_cell(2, 0, Cell::new('x', crate::Attrs::default(), 0));
         let sel = Selection {
             start: pt(0, 0),
             end: pt(2, 0),

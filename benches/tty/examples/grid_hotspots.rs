@@ -162,14 +162,14 @@ impl GridHotspotWorkload {
             // Convert row counts to bytes so the memmove/memset volume is
             // directly comparable with the input stream size.
             let row_bytes = size_of::<grid::Cell>() as u64 * u64::from(COLS);
+            // Compaction counters are gone: the ring buffer never compacts
+            // (eviction is a head bump, rows never move), so only the
+            // scroll/blank volume remains interesting.
             println!(
-                "scroll stats: {} scroll_up calls | {} rows blanked ({:.1} MiB) | {} compactions | {} rows moved ({:.1} MiB)",
+                "scroll stats: {} scroll_up calls | {} rows blanked ({:.1} MiB)",
                 stats.scroll_up_calls,
                 stats.rows_blanked,
                 stats.rows_blanked as f64 * row_bytes as f64 / 1_048_576.0,
-                stats.compactions,
-                stats.compaction_rows_moved,
-                stats.compaction_rows_moved as f64 * row_bytes as f64 / 1_048_576.0,
             );
         }
     }

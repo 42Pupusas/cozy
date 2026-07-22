@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>pulse — system monitor</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg: #0a0a0b;
+    --surface: #101012;
+    --border: #1e1e21;
+    --border-hi: #2e2e33;
+    --fg: #f2f2f3;
+    --dim: #8a8a90;
+    --faint: #55555a;
+    --grid: #161618;
+  }
+  html, body { height:100%; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 13px;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+
+  /* ---------- shell ---------- */
+  .app { display:flex; flex-direction:column; height:100vh; padding: 14px 18px 16px; gap: 14px; }
+
+  header {
+    display:flex; align-items:center; justify-content:space-between;
+    padding: 2px 4px 12px;
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+  }
+  .brand { display:flex; align-items:center; gap:10px; }
+  .dot {
+    width:7px; height:7px; border-radius:50%; background:var(--fg);
+    animation: breathe 2.4s ease-in-out infinite;
+  }
+  @keyframes breathe { 0%,100%{opacity:1} 50%{opacity:.25} }
+  .brand .name { font-weight:600; font-size:14px; letter-spacing:.02em; }
+  .brand .sub { color:var(--faint); font-size:11px; margin-left:2px; }
+  .hdr-right { color:var(--fg); font-size:12.5px; }
+  .hdr-right .up { color:var(--faint); margin-right:14px; }
+  .blink { animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity:.15; } }
+
+  /* ---------- grid ---------- */
+  .grid {
+    flex:1; min-height:0;
+    display:grid;
+    grid-template-columns: 1.15fr 1.15fr .9fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 12px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+    display:flex; flex-direction:column; min-height:0; min-width:0;
+  }
+  .card-head { display:flex; align-items:baseline; justify-content:space-between; margin-bottom: 8px; flex:0 0 auto; }
+  .card-title { font-size:10.5px; font-weight:600; letter-spacing:.14em; text-transform:uppercase; color:var(--dim); }
+  .card-meta { font-size:11px; color:var(--faint); }
+
+  .cpu-card { grid-column: 1 / 2; }
+  .mem-card { grid-column: 2 / 3; }
+  .proc-card { grid-column: 3 / 4; grid-row: 1 / 3; }
+  .gpu-card { grid-column: 1 / 2; grid-row: 2; }
+  .net-card { grid-column: 2 / 3; grid-row: 2; }
+
+  .big { font-size: 40px; font-weight:600; letter-spacing:-0.02em; line-height:1; }
+  .big small { font-size: 18px; color: var(--dim); font-weight:500; }
+  .chips { display:flex; gap:14px; margin-top:6px; flex:0 0 auto; }
+  .chip { font-size:11px; color:var(--faint); }
+  .chip b { color:var(--dim); font-weight:500; }
+
+  canvas.chart { flex:1; min-height:0; width:100%; display:block; }
+
+  .cores { display:grid; grid-template-columns:repeat(16, 1fr); gap:6px; margin-top:10px; flex:0 0 auto; }
+  .core { height:34px; background:var(--grid); border-radius:4px; position:relative; overflow:hidden; }
+  .core i { position:absolute; left:0; right:0; bottom:0; background:var(--fg); display:block; }
+
+  /* memory */
+  .mem-body { flex:1; display:flex; align-items:center; gap:22px; min-height:0; }
+  .donut-wrap { position:relative; width:132px; height:132px; flex:0 0 auto; }
+  .donut-center { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; }
+  .donut-center .pct { font-size:22px; font-weight:600; }
+  .donut-center .lbl { font-size:10px; color:var(--faint); letter-spacing:.1em; text-transform:uppercase; margin-top:2px; }
+  .legend { display:flex; flex-direction:column; gap:9px; font-size:12px; }
+  .legend .row { display:flex; align-items:center; gap:8px; }
+  .swatch { width:8px; height:8px; border-radius:2px; }
+  .legend .v { margin-left:auto; color:var(--dim); }
+  .legend .k { color:var(--faint); }
+
+  /* stat tiles */
+  .tiles { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:10px; flex:0 0 auto; }
+  .tile { border:1px solid var(--border); border-radius:7px; padding:8px 10px; }
+  .tile .k { font-size:10px; color:var(--faint); text-transform:uppercase; letter-spacing:.1em; }
+  .tile .v { font-size:14px; font-weight:500; margin-top:3px; }
+
+  /* processes */
+  .proc-card { padding: 14px 0 6px; }
+  .proc-card .card-head { padding: 0 16px; }
+  table { width:100%; border-collapse:collapse; }
+  thead th {
+    text-align:left; font-size:10px; font-weight:600; letter-spacing:.12em;
+    text-transform:uppercase; color:var(--faint);
+    padding: 6px 16px; border-bottom:1px solid var(--border);
+  }
+  thead th.num, td.num { text-align:right; }
+  tbody td { padding: 8px 16px; border-bottom:1px solid var(--grid); font-size:12px; }
+  tbody tr:last-child td { border-bottom:none; }
+  .pname { display:flex; align-items:center; gap:9px; font-weight:500; }
+  .pico { width:16px; height:16px; border-radius:4px; background:var(--border-hi); flex:0 0 auto; }
+  .cpu-cell { min-width:90px; }
+  .cpu-bar { height:3px; background:var(--grid); border-radius:2px; margin-top:4px; overflow:hidden; }
+  .cpu-bar i { display:block; height:100%; background:var(--fg); }
+  .proc-scroll { flex:1; min-height:0; overflow-y:auto; }
+  .proc-scroll::-webkit-scrollbar { width:8px; }
+  .proc-scroll::-webkit-scrollbar-thumb { background:var(--border-hi); border-radius:4px; }
+  .proc-scroll::-webkit-scrollbar-track { background:transparent; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <span class="dot"></span>
+      <span class="name">pulse</span>
+      <span class="sub mono">6.8.1-arch1 · x86_64</span>
+    </div>
+    <div class="hdr-right mono">
+      <span class="up" id="uptime">up 6d 04:12:33</span><span id="clock">00<span class="blink">:</span>00<span class="blink">:</span>00</span>
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- CPU -->
+    <section class="card cpu-card">
+      <div class="card-head">
+        <span class="card-title">CPU</span>
+        <span class="card-meta mono">ryzen 9 7950x · 16 cores</span>
+      </div>
+      <div class="big"><span id="cpuPct">42</span><small>%</small></div>
+      <div class="chips mono">
+        <span class="chip">freq <b id="cpuFreq">4.9 GHz</b></span>
+        <span class="chip">temp <b id="cpuTemp">61°C</b></span>
+        <span class="chip">load <b id="cpuLoad">3.84 2.91 2.20</b></span>
+      </div>
+      <canvas class="chart" id="cpuChart"></canvas>
+      <div class="cores" id="cores"></div>
+    </section>
+
+    <!-- MEMORY -->
+    <section class="card mem-card">
+      <div class="card-head">
+        <span class="card-title">Memory</span>
+        <span class="card-meta mono">64 GB DDR5</span>
+      </div>
+      <div class="mem-body">
+        <div class="donut-wrap">
+          <canvas id="memDonut" width="264" height="264" style="width:132px;height:132px"></canvas>
+          <div class="donut-center">
+            <div class="pct mono" id="memPct">58%</div>
+            <div class="lbl">ram</div>
+          </div>
+        </div>
+        <div class="legend mono">
+          <div class="row"><span class="swatch" style="background:#f2f2f3"></span><span class="k">used</span><span class="v" id="memUsed">37.1 GB</span></div>
+          <div class="row"><span class="swatch" style="background:#8a8a90"></span><span class="k">cached</span><span class="v" id="memCached">12.4 GB</span></div>
+          <div class="row"><span class="swatch" style="background:#2e2e33"></span><span class="k">free</span><span class="v" id="memFree">14.5 GB</span></div>
+          <div class="row"><span class="swatch" style="background:#55555a"></span><span class="k">swap</span><span class="v" id="memSwap">0.8 / 8 GB</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- GPU -->
+    <section class="card gpu-card">
+      <div class="card-head">
+        <span class="card-title">GPU</span>
+        <span class="card-meta mono">rx 7900 xtx</span>
+      </div>
+      <div class="big" style="font-size:30px"><span id="gpuPct">23</span><small>%</small></div>
+      <canvas class="chart" id="gpuChart"></canvas>
+      <div class="tiles mono">
+        <div class="tile"><div class="k">vram</div><div class="v" id="gpuVram">9.2 / 24 GB</div></div>
+        <div class="tile"><div class="k">power</div><div class="v" id="gpuPower">142 W</div></div>
+        <div class="tile"><div class="k">clock</div><div class="v" id="gpuClock">2.3 GHz</div></div>
+      </div>
+    </section>
+
+    <!-- NETWORK -->
+    <section class="card net-card">
+      <div class="card-head">
+        <span class="card-title">Network</span>
+        <span class="card-meta mono">enp5s0 · ping <span id="ping">12 ms</span></span>
+      </div>
+      <div class="chips mono" style="margin-top:0">
+        <span class="chip">▼ <b id="netDown">38.4 MB/s</b></span>
+        <span class="chip">▲ <b id="netUp">4.1 MB/s</b></span>
+      </div>
+      <canvas class="chart" id="netChart"></canvas>
+    </section>
+
+    <!-- PROCESSES -->
+    <section class="card proc-card">
+      <div class="card-head">
+        <span class="card-title">Top processes</span>
+        <span class="card-meta mono" id="procCount">128 tasks</span>
+      </div>
+      <div class="proc-scroll">
+        <table>
+          <thead><tr><th>Process</th><th class="num">CPU</th><th class="num">MEM</th></tr></thead>
+          <tbody id="procBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>
+
+<script>
+const lerp = (a,b,t)=>a+(b-a)*t;
+const rnd = (a,b)=>a+Math.random()*(b-a);
+
+/* ---------- data streams ---------- */
+class Stream {
+  constructor(n, base, vol, min, max){
+    this.data = Array.from({length:n}, ()=>base+rnd(-vol,vol));
+    this.base=base; this.vol=vol; this.min=min; this.max=max;
+  }
+  tick(){
+    const last = this.data[this.data.length-1];
+    let next = last + rnd(-this.vol, this.vol) + (this.base-last)*0.06;
+    next = Math.max(this.min, Math.min(this.max, next));
+    this.data.push(next); this.data.shift();
+    return next;
+  }
+}
+
+const N = 90;
+const cpu = new Stream(N, 42, 7, 3, 96);
+const gpu = new Stream(N, 23, 6, 1, 98);
+const netD = new Stream(N, 38, 9, 0.2, 120);
+const netU = new Stream(N, 4.1, 1.2, 0.05, 30);
+
+/* per-core */
+const coreVals = Array.from({length:16}, ()=>rnd(5,70));
+const coresEl = document.getElementById('cores');
+const coreBars = coreVals.map(v=>{
+  const d = document.createElement('div'); d.className='core';
+  const i = document.createElement('i'); d.appendChild(i); coresEl.appendChild(d);
+  return i;
+});
+
+/* ---------- charts ---------- */
+function setupCanvas(cv){
+  const dpr = window.devicePixelRatio||1;
+  const r = cv.getBoundingClientRect();
+  cv.width = r.width*dpr; cv.height = r.height*dpr;
+  const ctx = cv.getContext('2d'); ctx.setTransform(dpr,0,0,dpr,0,0);
+  return { ctx, w:r.width, h:r.height };
+}
+const chartState = new Map();
+function drawLineChart(cv, streams, opts={}){
+  let s = chartState.get(cv);
+  const rect = cv.getBoundingClientRect();
+  if(!s || Math.abs(s.w-rect.width)>1 || Math.abs(s.h-rect.height)>1){
+    s = setupCanvas(cv); chartState.set(cv,s);
+  }
+  const {ctx,w,h} = s;
+  ctx.clearRect(0,0,w,h);
+
+  // gridlines
+  ctx.strokeStyle = '#161618'; ctx.lineWidth = 1;
+  for(let i=1;i<4;i++){ const y=h*i/4; ctx.beginPath(); ctx.moveTo(0,y+.5); ctx.lineTo(w,y+.5); ctx.stroke(); }
+
+  let maxV = opts.max;
+  if(!maxV){ maxV = Math.max(...streams.flatMap(st=>st.data)) * 1.15; }
+  if(maxV<=0) maxV=1;
+
+  streams.forEach((st, idx)=>{
+    const n = st.data.length;
+    const px = i => w - (n-1-i)*(w/(n-1));
+    const py = v => h - (v/maxV)*(h-4) - 2;
+    ctx.beginPath();
+    st.data.forEach((v,i)=> i? ctx.lineTo(px(i),py(v)) : ctx.moveTo(px(0),py(v)));
+    ctx.strokeStyle = idx===0 ? '#f2f2f3' : '#55555a';
+    ctx.lineWidth = 1.6; ctx.lineJoin='round'; ctx.stroke();
+    if(idx===0 && opts.fill!==false){
+      ctx.lineTo(w,h); ctx.lineTo(0,h); ctx.closePath();
+      ctx.fillStyle='rgba(242,242,243,0.05)'; ctx.fill();
+    }
+    // leading dot
+    const lv = st.data[n-1];
+    ctx.beginPath(); ctx.arc(w, py(lv), 2.4, 0, Math.PI*2);
+    ctx.fillStyle = idx===0 ? '#f2f2f3' : '#55555a'; ctx.fill();
+  });
+}
+
+/* ---------- donut ---------- */
+function drawDonut(pct, swapPct){
+  const cv = document.getElementById('memDonut');
+  const ctx = cv.getContext('2d');
+  const W=cv.width, H=cv.height, cx=W/2, cy=H/2;
+  ctx.clearRect(0,0,W,H);
+  const ring=(p,color,r,lw)=>{
+    ctx.beginPath();
+    ctx.arc(cx,cy,r,-Math.PI/2,-Math.PI/2+Math.PI*2*p);
+    ctx.strokeStyle=color; ctx.lineWidth=lw; ctx.lineCap='round'; ctx.stroke();
+  };
+  // tracks
+  ctx.beginPath(); ctx.arc(cx,cy,104,0,Math.PI*2); ctx.strokeStyle='#1e1e21'; ctx.lineWidth=18; ctx.stroke();
+  ctx.beginPath(); ctx.arc(cx,cy,76,0,Math.PI*2); ctx.strokeStyle='#1e1e21'; ctx.lineWidth=10; ctx.stroke();
+  ring(pct,'#f2f2f3',104,18);
+  ring(swapPct,'#55555a',76,10);
+}
+
+/* ---------- processes ---------- */
+const procSeed = [
+  ['firefox', 14.2, 3.1],['code', 11.8, 2.4],['cargo', 9.4, 1.1],
+  ['Xorg', 6.7, 0.6],['pipewire', 3.2, 0.2],['telegram-desktop', 2.8, 0.9],
+  ['systemd', 0.4, 0.05],['kworker/u32:2', 5.1, 0.0],['alacritty', 1.2, 0.3],
+  ['slack', 4.6, 1.8],['spotify', 2.1, 0.7],['dockerd', 1.8, 0.5],
+  ['rustc', 8.9, 1.4],['nodejs', 3.7, 0.8],['bluetoothd', 0.1, 0.02],
+  ['NetworkManager', 0.3, 0.04],['gsd-power', 0.2, 0.03],['kwin_wayland', 5.9, 0.8],
+];
+const procs = procSeed.map(([name,cpu,mem])=>({name,cpu,mem}));
+const procBody = document.getElementById('procBody');
+function renderProcs(){
+  const sorted=[...procs].sort((a,b)=>b.cpu-a.cpu);
+  document.getElementById('procCount').textContent = (112+Math.floor(rnd(0,40)))+' tasks';
+  procBody.innerHTML = sorted.map(p=>`
+    <tr>
+      <td><div class="pname"><span class="pico"></span>${p.name}</div></td>
+      <td class="num cpu-cell mono">${p.cpu.toFixed(1)}%<div class="cpu-bar"><i style="width:${Math.min(100,p.cpu*4)}%;opacity:${0.25+Math.min(0.75,p.cpu/16)}"></i></div></td>
+      <td class="num mono" style="color:var(--dim)">${p.mem.toFixed(1)} GB</td>
+    </tr>`).join('');
+}
+
+/* ---------- live values ---------- */
+let t=0;
+function tick(){
+  t++;
+  const c = cpu.tick();
+  const g = gpu.tick();
+  netD.tick(); netU.tick();
+
+  document.getElementById('cpuPct').textContent = Math.round(c);
+  document.getElementById('gpuPct').textContent = Math.round(g);
+  document.getElementById('cpuFreq').textContent = (3.8+c/100*1.7).toFixed(1)+' GHz';
+  document.getElementById('cpuTemp').textContent = Math.round(38+c*0.32)+'°C';
+  document.getElementById('cpuLoad').textContent = `${(c/12).toFixed(2)} ${(c/15).toFixed(2)} ${(c/19).toFixed(2)}`;
+  document.getElementById('netDown').textContent = netD.data[N-1].toFixed(1)+' MB/s';
+  document.getElementById('netUp').textContent = netU.data[N-1].toFixed(1)+' MB/s';
+  document.getElementById('ping').textContent = Math.round(10+rnd(0,6))+' ms';
+  document.getElementById('gpuPower').textContent = Math.round(60+g*1.9)+' W';
+  document.getElementById('gpuClock').textContent = (1.2+g/100*1.4).toFixed(1)+' GHz';
+  document.getElementById('gpuVram').textContent = (6+g/100*6).toFixed(1)+' / 24 GB';
+
+  // memory drift
+  const mem = 0.58 + Math.sin(t/40)*0.03;
+  const swap = 0.10 + Math.sin(t/90)*0.02;
+  document.getElementById('memPct').textContent = Math.round(mem*100)+'%';
+  document.getElementById('memUsed').textContent = (mem*64).toFixed(1)+' GB';
+  document.getElementById('memCached').textContent = (64*0.19).toFixed(1)+' GB';
+  document.getElementById('memFree').textContent = (64*(1-mem-0.19)).toFixed(1)+' GB';
+  document.getElementById('memSwap').textContent = (swap*8).toFixed(1)+' / 8 GB';
+  drawDonut(mem, swap);
+
+  // cores
+  coreVals.forEach((v,i)=>{
+    coreVals[i] = Math.max(2, Math.min(98, v + rnd(-9,9) + (c-v)*0.05));
+    const b = coreBars[i];
+    b.style.height = coreVals[i]+'%';
+    b.style.opacity = 0.18 + coreVals[i]/100*0.82;
+  });
+
+  // procs drift
+  procs.forEach(p=>{ p.cpu=Math.max(0.1,p.cpu+rnd(-1.4,1.4)); p.mem=Math.max(0.02,p.mem+rnd(-0.05,0.05)); });
+  renderProcs();
+
+  drawLineChart(document.getElementById('cpuChart'), [cpu], {max:100});
+  drawLineChart(document.getElementById('gpuChart'), [gpu], {max:100});
+  drawLineChart(document.getElementById('netChart'), [netD, netU], {fill:true});
+}
+setInterval(tick, 1000);
+
+/* clock */
+function clock(){
+  const d=new Date();
+  const p=n=>String(n).padStart(2,'0');
+  document.getElementById('clock').innerHTML =
+    `${p(d.getHours())}<span class="blink">:</span>${p(d.getMinutes())}<span class="blink">:</span>${p(d.getSeconds())}`;
+}
+setInterval(clock,1000); clock();
+
+window.addEventListener('resize', ()=>chartState.clear());
+tick();
+</script>
+</body>
+</html>

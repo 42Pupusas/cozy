@@ -656,13 +656,21 @@ impl TermWindow {
         self.tick_inner(None)
     }
 
-    /// Process events and paint a client-owned full-window canvas while
-    /// retaining the normal xdg-shell lifecycle and resize handling.
-    pub fn tick_with_painter(&mut self, mut paint: impl FnMut(&mut crate::draw::Canvas<'_>)) -> Result<bool> {
+    /// Process events and paint a client-owned canvas while retaining the
+    /// normal xdg-shell lifecycle and resize handling. The painter reports the
+    /// changed pixel rectangle so software clients can animate a small region
+    /// without copying an otherwise-static full window every frame.
+    pub fn tick_with_painter(
+        &mut self,
+        mut paint: impl FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Rect,
+    ) -> Result<bool> {
         self.tick_inner(Some(&mut paint))
     }
 
-    fn tick_inner(&mut self, custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>)>) -> Result<bool> {
+    fn tick_inner(
+        &mut self,
+        custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Rect>,
+    ) -> Result<bool> {
         if self.lifecycle == Lifecycle::Closing {
             return Ok(false);
         }
@@ -1763,7 +1771,10 @@ impl TermWindow {
     ) {
     }
 
-    fn maybe_present(&mut self, custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>)>) -> Result<()> {
+    fn maybe_present(
+        &mut self,
+        custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Rect>,
+    ) -> Result<()> {
         if self.lifecycle != Lifecycle::Mapped {
             return Ok(());
         }
@@ -1846,17 +1857,18 @@ impl TermWindow {
         // below can use `self` again; `drop()` here is a borrow-checker nudge,
         // not resource cleanup.
         let custom_painted = custom_paint.is_some();
-        if let Some(paint) = custom_paint {
-            paint(&mut canvas);
-        }
+        let custom_damage = custom_paint.map(|paint| paint(&mut canvas));
         let _ = canvas;
-        // A custom painter owns pixels outside the terminal grid, so there are
-        // no DirtySnapshots to populate `touched_rows`. Mark every logical row
-        // stale; otherwise the custom pixels remain only in the persistent
-        // backbuffer and never get copied into the shm slot the compositor sees.
-        if custom_painted {
-            let row_count = (self.height / self.cell_h).max(1);
-            touched_rows.extend(0..u16::try_from(row_count).unwrap_or(u16::MAX));
+        // A custom painter owns pixels outside the terminal grid. Convert only
+        // its reported pixel band to stale logical rows; marking every row here
+        // used to make a 60 Hz graph animation memcpy the entire window.
+        if let Some(damage) = custom_damage {
+            let first = (damage.y.max(0) / self.cell_h).max(0);
+            let last_pixel = damage.bottom().min(self.height).saturating_sub(1);
+            let last = (last_pixel / self.cell_h).max(first);
+            touched_rows.extend(
+                (first..=last).map(|row| u16::try_from(row).unwrap_or(u16::MAX)),
+            );
         }
         // Sub-phase timers (only read when DebugFps::Log fires below on a slow
         // present): `t_blit` = the coalesce+blit_snapshot loop, the only phase

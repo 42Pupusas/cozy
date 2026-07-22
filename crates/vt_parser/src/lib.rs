@@ -1,7 +1,8 @@
 //! VT/ANSI escape sequence parser.
 //!
 //! A zero-allocation state machine that consumes raw bytes from the PTY
-//! master fd and emits typed [`TermEvent`]s via a callback (see [`Parser::feed`]).
+//! master fd through either typed [`TermEvent`] callbacks ([`Parser::feed`])
+//! or a direct [`TerminalSink`] ([`Parser::feed_to`]).
 //! Runs on its own thread, consuming raw [`ByteChunk`]s from `crates/pty`
 //! over an SPSC ring; each `TermEvent` is applied straight to `crates/grid`
 //! inside the callback rather than being queued, since it may borrow from
@@ -25,8 +26,12 @@
 
 mod event;
 mod params;
+mod scan;
+mod sink;
 mod state;
 
 pub use event::{C0, CsiAction, DcsCmd, OscCmd, SgrAttr, SgrAttrs, TermEvent};
 pub use params::Params;
+use sink::EventCallback;
+pub use sink::TerminalSink;
 pub use state::Parser;

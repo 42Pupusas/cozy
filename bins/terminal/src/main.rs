@@ -738,7 +738,7 @@ impl ParserSession {
                 // draws its dim autosuggestion and repositions the cursor.
                 tlog::trace!(Pty, "{}", tlog::Escaped(bytes));
                 let grid = &mut self.grid;
-                self.parser.feed(bytes, |ev| grid.apply(&ev));
+                self.parser.feed_to(bytes, grid);
             }
             ParserMsg::Resize { cols, rows } => self.grid.resize(cols, rows),
             ParserMsg::Scroll { delta } => self.grid.scroll_viewport(delta),

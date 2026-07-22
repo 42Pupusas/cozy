@@ -161,7 +161,10 @@ impl TrayWatcher {
         };
         // Registration has no return values. Reply before querying the item:
         // clients may not expose properties until their invocation completes.
-        if conn.send_method_return(sender, message.serial, &[]).is_err() {
+        if conn
+            .send_method_return(sender, message.serial, &[])
+            .is_err()
+        {
             return false;
         }
         let Some(item) = Self::read_item(conn, sender, &service, &path) else {

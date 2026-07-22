@@ -183,6 +183,19 @@ impl Attrs {
     pub const fn set_underline_style(&mut self, style: UnderlineStyle) {
         self.flags = (self.flags & !flag::STYLE_MASK) | (style.to_bits() << flag::STYLE_SHIFT);
     }
+
+    /// Return the renderable SGR state without cell-local placement bits.
+    ///
+    /// `wide` and `spacer` describe one *occurrence* of a style, not the
+    /// style itself. Screen storage interns this normalized value so every
+    /// ordinary, wide-lead, and spacer cell sharing SGR/link state can refer
+    /// to the same style-table entry while retaining their placement in a
+    /// separate byte plane.
+    #[inline]
+    pub(crate) const fn without_placement(mut self) -> Self {
+        self.flags &= !(flag::WIDE | flag::SPACER);
+        self
+    }
 }
 
 /// A single terminal cell.

@@ -25,3 +25,7 @@ harness = false
 [[bench]]
 name    = "colors"
 harness = false
+
+[[bench]]
+name    = "proc_parse"
+harness = false

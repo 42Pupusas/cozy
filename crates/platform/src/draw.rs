@@ -110,6 +110,14 @@ impl Color {
     /// Was a free `blend_opaque(from, to, alpha)` function in `render.rs`.
     #[must_use]
     pub fn blend_opaque_to(self, to: Self, alpha: u8) -> u32 {
+        self.blend_opaque_color(to, alpha).to_xrgb8888()
+    }
+
+    /// Return the opaque colour produced by compositing `to` over `self`.
+    /// This keeps the result reusable when an entire primitive has the same
+    /// known background, as with a monitor chart's freshly painted panel.
+    #[must_use]
+    pub fn blend_opaque_color(self, to: Self, alpha: u8) -> Self {
         let from = self;
         let a = u32::from(alpha);
         // `div255(x)` == `x / 255` exactly for any u32 in `[0, 255*255]` (the
@@ -118,10 +126,12 @@ impl Color {
         // blend, ~21% of the real Face-path flood (perf) -- three divides per
         // AA pixel were the single most expensive op in that frame.
         let div255 = |x: u32| (x + 1 + (x >> 8)) >> 8;
-        let r = div255(u32::from(from.r) * (255 - a) + u32::from(to.r) * a);
-        let g = div255(u32::from(from.g) * (255 - a) + u32::from(to.g) * a);
-        let b = div255(u32::from(from.b) * (255 - a) + u32::from(to.b) * a);
-        (r << 16) | (g << 8) | b
+        #[allow(clippy::cast_possible_truncation)]
+        Self::rgb(
+            div255(u32::from(from.r) * (255 - a) + u32::from(to.r) * a) as u8,
+            div255(u32::from(from.g) * (255 - a) + u32::from(to.g) * a) as u8,
+            div255(u32::from(from.b) * (255 - a) + u32::from(to.b) * a) as u8,
+        )
     }
 }
 
@@ -293,6 +303,35 @@ impl<'a> Canvas<'a> {
             for px in &mut self.pixels[start..end] {
                 *px = v;
             }
+        }
+    }
+
+    /// Copy tightly packed XRGB pixels into `rect`, clipping to the canvas.
+    ///
+    /// This is the software equivalent of the terminal renderer's persistent
+    /// backbuffer blit: a cached widget can update privately, then transfer its
+    /// finished rows without rerasterizing its contents in the parent canvas.
+    pub fn copy_pixels(&mut self, rect: Rect, source: &[u32]) {
+        if rect.w <= 0 || rect.h <= 0 {
+            return;
+        }
+        let required = rect.w.cast_unsigned() as usize * rect.h.cast_unsigned() as usize;
+        if source.len() < required {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clip(rect) else {
+            return;
+        };
+        let source_width = rect.w.cast_unsigned() as usize;
+        let target_width = self.width.cast_unsigned() as usize;
+        for y in y0..y1 {
+            let source_y = (y - rect.y).cast_unsigned() as usize;
+            let source_x = (x0 - rect.x).cast_unsigned() as usize;
+            let source_start = source_y * source_width + source_x;
+            let copy_width = (x1 - x0).cast_unsigned() as usize;
+            let target_start = y.cast_unsigned() as usize * target_width + x0.cast_unsigned() as usize;
+            self.pixels[target_start..target_start + copy_width]
+                .copy_from_slice(&source[source_start..source_start + copy_width]);
         }
     }
 

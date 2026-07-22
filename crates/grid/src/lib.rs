@@ -21,6 +21,7 @@
 
 mod base64;
 mod cell;
+pub mod cell_store;
 mod cursor;
 mod dirty;
 mod palette;
@@ -37,7 +38,7 @@ pub use selection::{Point as SelPoint, Selection};
 pub use stats::ScrollStats;
 
 use input::{KeyboardMode, MouseMode};
-use vt_parser::{C0, CsiAction, DcsCmd, OscCmd, SgrAttr, TermEvent};
+use vt_parser::{C0, CsiAction, DcsCmd, OscCmd, SgrAttr, TermEvent, TerminalSink};
 
 /// Scrollback limit (lines above the visible area).
 pub const SCROLLBACK_MAX: usize = 10_000;
@@ -887,9 +888,8 @@ impl Grid {
 
             let available = usize::from(cols - col);
             let count = (bytes.len() - offset).min(available);
-            let row_start = self.active_screen().visible_row_start_for(row);
             let written = self.active_screen_mut().write_ascii_cells(
-                row_start,
+                row,
                 col,
                 &bytes[offset..offset + count],
                 attrs,
@@ -966,17 +966,14 @@ impl Grid {
         let link_id = self.active_link_id;
         let is_wide = width == 2;
         {
-            let screen = self.active_screen_mut();
-            let row_start = screen.visible_row_start_for(row);
             let lead = if is_wide {
                 Cell::wide_lead(ch, attrs, link_id)
             } else {
                 Cell::new(ch, attrs, link_id)
             };
-            screen.set_cell_at(row_start, col, lead);
-            if is_wide && col + 1 < cols {
-                screen.set_cell_at(row_start, col + 1, Cell::wide_spacer(attrs, link_id));
-            }
+            let spacer = (is_wide && col + 1 < cols).then(|| Cell::wide_spacer(attrs, link_id));
+            self.active_screen_mut()
+                .set_cell_pair(row, col, lead, spacer);
         }
         self.dirty.mark(col, row);
         if is_wide && col + 1 < cols {
@@ -2077,6 +2074,52 @@ impl Grid {
     }
 }
 
+/// Direct parser sink for the production parser-to-grid pipeline.
+///
+/// Each method mirrors the corresponding [`Grid::apply`] branch. Keeping the
+/// state transition here avoids rebuilding and re-matching `TermEvent` for
+/// every parser action, especially the high-volume printable ASCII runs.
+impl TerminalSink for Grid {
+    fn print(&mut self, ch: char) {
+        self.snap_viewport_to_bottom();
+        self.print(ch);
+    }
+
+    fn print_run(&mut self, bytes: &[u8]) {
+        self.snap_viewport_to_bottom();
+        self.print_ascii_run(bytes);
+    }
+
+    fn control(&mut self, control: C0) {
+        self.snap_viewport_to_bottom();
+        self.control(control);
+    }
+
+    fn esc(&mut self, intermediate: Option<u8>, final_byte: u8) {
+        self.snap_viewport_to_bottom();
+        self.esc(intermediate, final_byte);
+    }
+
+    fn csi(&mut self, action: CsiAction) {
+        self.snap_viewport_to_bottom();
+        self.csi(&action);
+    }
+
+    fn osc(&mut self, command: OscCmd<'_>) {
+        self.snap_viewport_to_bottom();
+        self.osc(&command);
+    }
+
+    fn dcs(&mut self, command: DcsCmd<'_>) {
+        self.snap_viewport_to_bottom();
+        self.dcs(&command);
+    }
+
+    fn ignored(&mut self) {
+        self.snap_viewport_to_bottom();
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 impl core::fmt::Display for Grid {
@@ -2101,6 +2144,43 @@ mod tests {
     fn apply_str(grid: &mut Grid, s: &[u8]) {
         let mut p = Parser::new();
         p.feed(s, |ev| grid.apply(&ev));
+    }
+
+    fn apply_direct(grid: &mut Grid, s: &[u8]) {
+        let mut p = Parser::new();
+        p.feed_to(s, grid);
+    }
+
+    #[test]
+    fn direct_parser_sink_matches_event_pipeline() {
+        // Exercise all dispatch families together, including a long ASCII run
+        // and OSC/DCS payloads that borrow parser-owned buffers. The direct
+        // pipeline must be observably identical to the compatibility event
+        // pipeline, not merely faster on plain output.
+        let input = b"hello terminal output\x1b[31m red\x1b[0m\r\n\x1b]2;title\x07\x1bP$qm\x1b\\\x1b[2;4Hdone";
+        let mut events = Grid::new(20, 4);
+        let mut direct = Grid::new(20, 4);
+        apply_str(&mut events, input);
+        apply_direct(&mut direct, input);
+        assert_eq!(events.to_string(), direct.to_string());
+        assert_eq!(events.cursor(), direct.cursor());
+        let events_dirty = events.take_dirty();
+        let direct_dirty = direct.take_dirty();
+        assert_eq!(events_dirty.rows.len(), direct_dirty.rows.len());
+        assert_eq!(events_dirty.cols, direct_dirty.cols);
+        assert_eq!(events_dirty.cursor, direct_dirty.cursor);
+        assert_eq!(events_dirty.cursor_changed, direct_dirty.cursor_changed);
+        assert_eq!(events_dirty.content_delta, direct_dirty.content_delta);
+        assert_eq!(
+            format!("{:?}", events_dirty.kind),
+            format!("{:?}", direct_dirty.kind)
+        );
+        for (event_row, direct_row) in events_dirty.rows.iter().zip(&direct_dirty.rows) {
+            assert_eq!(event_row.row, direct_row.row);
+            assert_eq!(event_row.cells, direct_row.cells);
+        }
+        assert_eq!(events.take_title(), direct.take_title());
+        assert_eq!(events.take_replies(), direct.take_replies());
     }
 
     const CJK_ZHONG: &str = "\u{4e2d}"; // '中' (Chinese for "middle") — 2 cells wide

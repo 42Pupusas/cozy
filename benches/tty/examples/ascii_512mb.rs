@@ -110,7 +110,7 @@ impl AsciiFloodBenchmark {
         while bytes < self.target_bytes {
             let phase_start = Instant::now();
             let length = (self.target_bytes - bytes).min(chunk.len());
-            parser.feed(&chunk[..length], |event| grid.apply(&event));
+            parser.feed_to(&chunk[..length], &mut grid);
             bytes += length;
             chunks += 1;
             if chunks % BATCH_CHUNKS == 0 || bytes == self.target_bytes {

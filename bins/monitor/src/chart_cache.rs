@@ -65,7 +65,7 @@ impl ChartCache {
         history_capacity: usize,
         sequence: u64,
     ) {
-        if self.needs_rebuild(bounds, primary.len()) {
+        if self.needs_rebuild(bounds) {
             self.rebuild(
                 bounds.w, bounds.h, primary, maximum, color, overlays, sequence,
             );
@@ -85,14 +85,14 @@ impl ChartCache {
         );
     }
 
-    const fn needs_rebuild(&self, bounds: Rect, samples: usize) -> bool {
-        self.width != bounds.w
-            || self.height != bounds.h
-            || self.pixels.is_empty()
-            // Before the history viewport is full, samples occupy a changing
-            // scale. Rebuilding on each new 10 Hz observation keeps startup
-            // truthful; steady-state is the performance-critical case.
-            || samples < self.seen_samples
+    const fn needs_rebuild(&self, bounds: Rect) -> bool {
+        // `seen_samples` is a monotonic sequence number, not a history length.
+        // Comparing it with the capped VecDeque length would make every frame
+        // rebuild once the sequence exceeded the history capacity, causing a
+        // delayed long-session CPU regression. Sequence tracking belongs only
+        // to incremental advancement; geometry and allocation determine when
+        // a full rasterization is necessary.
+        self.width != bounds.w || self.height != bounds.h || self.pixels.is_empty()
     }
 
     fn rebuild(
@@ -260,6 +260,7 @@ mod tests {
             Color::WHITE,
             &[],
             2,
+            2,
         );
         values.push_back(0.5);
         cache.paint(
@@ -270,6 +271,7 @@ mod tests {
             Color::WHITE,
             &[],
             2,
+            3,
         );
         assert_eq!(cache.seen_samples, 3);
     }

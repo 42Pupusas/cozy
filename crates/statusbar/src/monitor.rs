@@ -4,7 +4,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as FmtWrite;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::net::Ipv4Addr;
 use std::os::raw::{c_char, c_int, c_long, c_ulong};
 use std::process::Command;
@@ -29,6 +30,7 @@ pub struct MonitorSample {
     pub disk_io_mb_s: f32,
     pub memory_available_mb: f32,
     pub swap_used_mb: f32,
+    pub memory_device: String,
     pub swap_total_mb: f32,
 }
 
@@ -188,7 +190,7 @@ impl CpuState {
             let start = index;
             while index < line.len() {
                 let byte = line[index];
-                if !(b'0'..=b'9').contains(&byte) {
+                if !byte.is_ascii_digit() {
                     break;
                 }
                 value = value
@@ -226,6 +228,7 @@ impl CpuState {
 struct NetworkState {
     previous: Option<(u64, u64, std::time::Instant)>,
     device: Option<String>,
+    gateway: Option<(Instant, Ipv4Addr)>,
     last_ping: Option<(Instant, f32)>,
 }
 
@@ -277,13 +280,17 @@ impl NetworkState {
 
     fn ping_ms(&mut self) -> f32 {
         let now = Instant::now();
+        // A one-second ping process is needlessly expensive for a dashboard.
+        // Keep the last measurement visible while probing occasionally; the
+        // graph remains fluid through the monitor's interpolator.
         if let Some((at, value)) = self.last_ping {
-            if now.duration_since(at) < std::time::Duration::from_secs(1) {
+            if now.duration_since(at) < std::time::Duration::from_secs(5) {
                 return value;
             }
         }
-        let value = Self::default_gateway()
-            .and_then(|gateway| {
+        let value = self.gateway().and_then(|gateway| {
+                // `-n` is important: this is an ICMP probe to a numeric
+                // gateway address, never a hostname lookup or DNS request.
                 let output = Command::new("ping")
                     .args(["-n", "-c", "1", "-W", "1", &gateway.to_string()])
                     .output()
@@ -301,13 +308,29 @@ impl NetworkState {
         value
     }
 
+    fn gateway(&mut self) -> Option<Ipv4Addr> {
+        let now = Instant::now();
+        if let Some((at, gateway)) = self.gateway {
+            if now.duration_since(at) < std::time::Duration::from_secs(30) {
+                return Some(gateway);
+            }
+        }
+        let gateway = Self::default_gateway()?;
+        self.gateway = Some((now, gateway));
+        Some(gateway)
+    }
+
     fn link_mbps(&mut self) -> f32 {
         let interface = Self::default_route_interface().or_else(|| {
             self.device.as_ref().and_then(|label| {
-                fs::read_dir("/sys/class/net").ok()?.flatten().find_map(|entry| {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    (Self::hardware_label(&name).as_deref() == Some(label.as_str())).then_some(name)
-                })
+                fs::read_dir("/sys/class/net")
+                    .ok()?
+                    .flatten()
+                    .find_map(|entry| {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        (Self::hardware_label(&name).as_deref() == Some(label.as_str()))
+                            .then_some(name)
+                    })
             })
         });
         interface
@@ -439,6 +462,7 @@ struct ProcessScanner {
     cursor: usize,
     collected: Vec<ProcessInfo>,
     stat_path: ProcessStatPath,
+    stat_reader: ProcessStatReader,
 }
 
 impl ProcessScanner {
@@ -472,10 +496,11 @@ impl ProcessScanner {
         let now = Instant::now();
         for &pid in &self.pending[self.cursor..end] {
             self.stat_path.set_pid(pid);
-            let Some(stat) = fs::read_to_string(self.stat_path.as_str()).ok() else {
+            let Some(stat) = self.stat_reader.read(self.stat_path.as_str()) else {
                 continue;
             };
-            let Some((name, ticks, resident_pages)) = MonitorReader::process_stat(&stat) else {
+            let Some((name, ticks, resident_pages)) = MonitorReader::process_stat_bytes(stat)
+            else {
                 continue;
             };
             self.collected.push(ProcessInfo {
@@ -516,6 +541,20 @@ impl ProcessStatPath {
 
     fn as_str(&self) -> &str {
         &self.value
+    }
+}
+
+#[derive(Default)]
+struct ProcessStatReader {
+    bytes: Vec<u8>,
+}
+
+impl ProcessStatReader {
+    fn read(&mut self, path: &str) -> Option<&[u8]> {
+        self.bytes.clear();
+        let mut file = File::open(path).ok()?;
+        file.read_to_end(&mut self.bytes).ok()?;
+        Some(&self.bytes)
     }
 }
 
@@ -635,6 +674,55 @@ impl DiskIoState {
     }
 }
 
+struct MemoryDevice;
+
+impl MemoryDevice {
+    fn read() -> String {
+        let root = "/sys/devices/system/edac/mc";
+        let Ok(controllers) = fs::read_dir(root) else {
+            return "RAM".to_owned();
+        };
+        let mut modules = Vec::new();
+        for controller in controllers.flatten() {
+            let Ok(entries) = fs::read_dir(controller.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("dimm") {
+                    continue;
+                }
+                let path = entry.path();
+                let part = Self::attribute(&path, "part_number");
+                let manufacturer = Self::attribute(&path, "dimm_label")
+                    .or_else(|| Self::attribute(&path, "mfg"));
+                let memory_type = Self::attribute(&path, "dimm_type")
+                    .or_else(|| Self::attribute(&path, "type"));
+                let label = [manufacturer, part, memory_type]
+                    .into_iter()
+                    .flatten()
+                    .filter(|value| !value.is_empty() && value != "Unknown")
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !label.is_empty() && !modules.contains(&label) {
+                    modules.push(label);
+                }
+            }
+        }
+        if modules.is_empty() {
+            "RAM".to_owned()
+        } else {
+            modules.join(" · ")
+        }
+    }
+
+    fn attribute(path: &std::path::Path, name: &str) -> Option<String> {
+        let value = fs::read_to_string(path.join(name)).ok()?.trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    }
+}
+
 struct CpuFrequency;
 
 impl CpuFrequency {
@@ -656,6 +744,7 @@ pub struct MonitorReader {
     cpu: CpuState,
     network: NetworkState,
     disk_io: DiskIoState,
+    memory_device: String,
     processes: ProcessCpuState,
     scanner: ProcessScanner,
 }
@@ -669,6 +758,7 @@ impl MonitorReader {
             processes: ProcessCpuState::new(),
             scanner: ProcessScanner::default(),
             disk_io: DiskIoState::default(),
+            memory_device: MemoryDevice::read(),
         }
     }
 
@@ -708,6 +798,7 @@ impl MonitorReader {
             memory_available_mb,
             swap_used_mb,
             swap_total_mb,
+            memory_device: self.memory_device.clone(),
         }
     }
 
@@ -739,10 +830,15 @@ impl MonitorReader {
     }
 
     fn process_stat(stat: &str) -> Option<(String, u64, u64)> {
-        let bytes = stat.as_bytes();
+        Self::process_stat_bytes(stat.as_bytes())
+    }
+
+    fn process_stat_bytes(bytes: &[u8]) -> Option<(String, u64, u64)> {
         let close = bytes.iter().rposition(|&byte| byte == b')')?;
         let open = bytes[..close].iter().position(|&byte| byte == b'(')?;
-        let name = stat.get(open + 1..close)?.to_owned();
+        let name = std::str::from_utf8(bytes.get(open + 1..close)?)
+            .ok()?
+            .to_owned();
         let mut index = close + 1;
         let mut field = 0;
         let mut user = None;

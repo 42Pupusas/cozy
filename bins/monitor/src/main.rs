@@ -116,6 +116,7 @@ impl SampleInterpolator {
             memory_available_mb: blend(from.memory_available_mb, to.memory_available_mb),
             swap_used_mb: blend(from.swap_used_mb, to.swap_used_mb),
             swap_total_mb: blend(from.swap_total_mb, to.swap_total_mb),
+            memory_device: to.memory_device.clone(),
         }
     }
 }
@@ -309,9 +310,14 @@ impl Painter {
         let hero_y = rect.y + 14 + 26;
         let details_y = rect.y + 14 + 26 + 82 - 8;
         title_text.draw_text(canvas, title, rect.x + 14, title_y, DIM, CARD_SURFACE);
+        // Keep card metadata inside the same safe right-side region used by
+        // the CPU brand. Truncate the end of long platform/device names so
+        // the title and metadata remain readable at narrow card widths.
+        let metadata_width = (rect.w * 3 / 4 - 14).max(1);
+        let metadata = Self::truncate_prefix(meta, subtitle_text, metadata_width);
         subtitle_text.draw_text_right(
             canvas,
-            meta,
+            &metadata,
             rect.x + rect.w - 14,
             title_y + 1,
             FAINT,
@@ -537,7 +543,7 @@ impl Painter {
                 canvas,
                 cards[1],
                 "MEMORY",
-                "SYSTEM",
+                &snap.sample.memory_device,
                 &format!("{:.0}", snap.sample.memory),
                 "%",
                 &memory_details,

@@ -108,6 +108,8 @@ impl SampleInterpolator {
             network_tx: blend(from.network_tx, to.network_tx),
             cpu_brand: to.cpu_brand.clone(),
             cpu_cores: to.cpu_cores,
+            cpu_frequency_ghz: blend(from.cpu_frequency_ghz, to.cpu_frequency_ghz),
+            disk_io_mb_s: blend(from.disk_io_mb_s, to.disk_io_mb_s),
         }
     }
 }
@@ -459,19 +461,33 @@ impl Painter {
             let details_y = cpu_card.y + CARD_INSET + HEADER_BAND + HERO_BAND - 8;
             let normal_details_y =
                 details_y + subtitle_text.baseline_offset() - text.baseline_offset();
-            // Divide the detail row into equal columns. Positions are based
-            // on measured label widths rather than fixed offsets, so a wide
-            // font cannot make DISK IO collide with its value.
+            // Lay out complete label/value pairs rather than anchoring each
+            // label to a fixed third. A value such as `12.4 MB/s` is wider
+            // than the DISK IO label, so equal columns can overlap the next
+            // pair. Measured pair widths let us distribute the spare space
+            // safely and keep every column readable.
             let row_x = cpu_card.x + 14;
             let row_width = cpu_card.w - 28;
-            let column_width = row_width / 3;
-            let labels = ["IPC", "DISK IO", "FREQ"];
-            let values = ["—", "—", "— GHz"];
-            for (column, (label, value)) in labels.iter().zip(values).enumerate() {
-                let x = row_x + i32::try_from(column).unwrap_or(0) * column_width;
+            let labels = ["LOAD", "DISK IO", "FREQ"];
+            // Load is available directly from /proc/loadavg and complements
+            // the instantaneous CPU percentage without requiring perf access.
+            let load = format!("{:.2}", snap.sample.load[0]);
+            let disk_io = format!("{:.1} MB/s", snap.sample.disk_io_mb_s);
+            let frequency = format!("{:.2} GHz", snap.sample.cpu_frequency_ghz);
+            let values = [load, disk_io, frequency];
+            let pair_widths: Vec<i32> = labels
+                .iter()
+                .zip(values.iter())
+                .map(|(label, value)| subtitle_text.measure(label) + 8 + text.measure(value))
+                .collect();
+            let used_width: i32 = pair_widths.iter().sum();
+            let gap = ((row_width - used_width) / 2).max(8);
+            let mut x = row_x;
+            for ((label, value), pair_width) in labels.iter().zip(values.iter()).zip(pair_widths) {
                 subtitle_text.draw_text(canvas, label, x, details_y, FAINT, CARD_SURFACE);
                 let value_x = x + subtitle_text.measure(label) + 8;
                 text.draw_text(canvas, value, value_x, normal_details_y, DIM, CARD_SURFACE);
+                x += pair_width + gap;
             }
         }
         if full_repaint {

@@ -17,6 +17,10 @@ pub struct MonitorSample {
     pub disk: f32,
     pub network_rx: f32,
     pub network_tx: f32,
+    pub cpu_brand: String,
+    pub cpu_cores: usize,
+    pub cpu_frequency_ghz: f32,
+    pub disk_io_mb_s: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -34,8 +38,11 @@ pub struct ProcessInfo {
 #[derive(Default)]
 struct CpuState {
     window: VecDeque<Vec<(u64, u64)>>,
+    scratch: Vec<(u64, u64)>,
     smoothed: Vec<f32>,
     last_sample: Option<Instant>,
+    brand: String,
+    core_count: usize,
 }
 
 impl CpuState {
@@ -43,17 +50,15 @@ impl CpuState {
 
     #[allow(clippy::cast_precision_loss)]
     fn usage(&mut self) -> (f32, Vec<f32>) {
-        let current = Self::read_times();
+        self.ensure_info();
+        Self::read_times_into(&mut self.scratch);
         let now = Instant::now();
-        self.window.push_back(current.clone());
-        if self.window.len() > Self::WINDOW_SAMPLES {
-            self.window.pop_front();
-        }
         let Some(previous) = self.window.front() else {
+            self.window.push_back(std::mem::take(&mut self.scratch));
             return (0.0, Vec::new());
         };
-        let mut values = Vec::with_capacity(current.len());
-        for (index, &(total, idle)) in current.iter().enumerate() {
+        let mut values = Vec::with_capacity(self.scratch.len());
+        for (index, &(total, idle)) in self.scratch.iter().enumerate() {
             values.push(previous.get(index).map_or(0.0, |&(old_total, old_idle)| {
                 #[allow(clippy::cast_precision_loss)]
                 let total_delta = total.saturating_sub(old_total);
@@ -63,6 +68,10 @@ impl CpuState {
                     100.0 * (1.0 - idle.saturating_sub(old_idle) as f32 / total_delta as f32)
                 }
             }));
+        }
+        self.window.push_back(std::mem::take(&mut self.scratch));
+        if self.window.len() > Self::WINDOW_SAMPLES {
+            self.scratch = self.window.pop_front().unwrap_or_default();
         }
         self.smooth(values, now);
         (
@@ -91,17 +100,48 @@ impl CpuState {
         self.last_sample = Some(now);
     }
 
-    fn read_times() -> Vec<(u64, u64)> {
-        fs::read_to_string("/proc/stat")
-            .map_or_else(|_| Vec::new(), |text| Self::parse_times(&text))
+    fn ensure_info(&mut self) {
+        if !self.brand.is_empty() && self.core_count != 0 {
+            return;
+        }
+        if let Ok(text) = fs::read_to_string("/proc/cpuinfo") {
+            let mut brand = None;
+            let mut core_count = 0;
+            for line in text.lines() {
+                if line.starts_with("processor") {
+                    core_count += 1;
+                } else if brand.is_none() {
+                    brand = line
+                        .split_once(':')
+                        .filter(|(key, _)| key.trim() == "model name")
+                        .map(|(_, value)| value.trim().to_owned());
+                }
+            }
+            self.brand = brand.unwrap_or_else(|| "unknown cpu".to_owned());
+            self.core_count = core_count;
+        }
+    }
+
+    fn brand(&self) -> &str {
+        &self.brand
+    }
+
+    fn core_count(&self) -> usize {
+        self.core_count
+    }
+
+    fn read_times_into(output: &mut Vec<(u64, u64)>) {
+        output.clear();
+        if let Ok(text) = fs::read_to_string("/proc/stat") {
+            Self::parse_times_into(&text, output);
+        }
     }
 
     /// Parse the CPU records in `/proc/stat` without creating line or field
     /// iterators. `/proc` is an ASCII kernel interface, so a byte scanner is
     /// both more precise and cheaper than Unicode whitespace parsing here.
-    fn parse_times(text: &str) -> Vec<(u64, u64)> {
+    fn parse_times_into(text: &str, result: &mut Vec<(u64, u64)>) {
         let bytes = text.as_bytes();
-        let mut result = Vec::with_capacity(8);
         let mut line_start = 0;
         while line_start < bytes.len() {
             let line_end = bytes[line_start..]
@@ -109,51 +149,56 @@ impl CpuState {
                 .position(|&byte| byte == b'\n')
                 .map_or(bytes.len(), |offset| line_start + offset);
             let line = &bytes[line_start..line_end];
-            if line.starts_with(b"cpu")
-                && let Some(times) = Self::parse_cpu_line(line)
-            {
+            if !line.starts_with(b"cpu") {
+                break;
+            }
+            if let Some(times) = Self::parse_cpu_line(line) {
                 result.push(times);
+            } else {
+                break;
             }
             line_start = line_end.saturating_add(1);
         }
-        result
     }
 
     fn parse_cpu_line(line: &[u8]) -> Option<(u64, u64)> {
         let mut index = 3;
-        while line
-            .get(index)
-            .is_some_and(|byte| !byte.is_ascii_whitespace())
-        {
+        while index < line.len() && line[index] > b' ' {
             index += 1;
         }
-        while line.get(index).is_some_and(u8::is_ascii_whitespace) {
+        while index < line.len() && line[index] <= b' ' {
             index += 1;
         }
+
         let mut field = 0;
         let mut total = 0u64;
         let mut idle = None;
         let mut iowait = 0u64;
         while index < line.len() {
+            let mut value = 0u64;
             let start = index;
-            while line.get(index).is_some_and(u8::is_ascii_digit) {
+            while index < line.len() {
+                let byte = line[index];
+                if !(b'0'..=b'9').contains(&byte) {
+                    break;
+                }
+                value = value
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(byte - b'0'));
                 index += 1;
             }
             if start == index {
                 return None;
             }
-            let mut value = 0u64;
-            for &byte in &line[start..index] {
-                value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
-            }
+
             total = total.saturating_add(value);
-            match field {
-                3 => idle = Some(value),
-                4 => iowait = value,
-                _ => {}
+            if field == 3 {
+                idle = Some(value);
+            } else if field == 4 {
+                iowait = value;
             }
             field += 1;
-            while line.get(index).is_some_and(u8::is_ascii_whitespace) {
+            while index < line.len() && line[index] <= b' ' {
                 index += 1;
             }
         }
@@ -162,7 +207,9 @@ impl CpuState {
 
     #[allow(dead_code)]
     pub fn parse_cpu_times_for_bench(text: &str) -> Vec<(u64, u64)> {
-        Self::parse_times(text)
+        let mut result = Vec::new();
+        Self::parse_times_into(text, &mut result);
+        result
     }
 }
 
@@ -351,9 +398,70 @@ impl ProcessCpuState {
     }
 }
 
+#[derive(Default)]
+struct DiskIoState {
+    previous_sectors: u64,
+    previous_at: Option<Instant>,
+}
+
+impl DiskIoState {
+    fn throughput_mb_s(&mut self) -> f32 {
+        let now = Instant::now();
+        let sectors = fs::read_to_string("/proc/diskstats")
+            .map(|contents| {
+                contents
+                    .lines()
+                    .filter_map(|line| {
+                        let fields: Vec<_> = line.split_whitespace().collect();
+                        let device = fields.get(2)?;
+                        if device.starts_with("loop") || device.starts_with("ram") {
+                            return None;
+                        }
+                        let read = fields.get(5)?.parse::<u64>().ok()?;
+                        let written = fields.get(9)?.parse::<u64>().ok()?;
+                        Some(read.saturating_add(written))
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        let Some(previous_at) = self.previous_at.replace(now) else {
+            self.previous_sectors = sectors;
+            return 0.0;
+        };
+        let elapsed = now.duration_since(previous_at).as_secs_f32();
+        let delta = sectors.saturating_sub(self.previous_sectors);
+        self.previous_sectors = sectors;
+        if elapsed <= 0.0 {
+            0.0
+        } else {
+            // Linux diskstats reports sectors; the kernel convention is
+            // 512 bytes per sector regardless of the device's physical size.
+            delta as f32 * 512.0 / elapsed / 1_048_576.0
+        }
+    }
+}
+
+struct CpuFrequency;
+
+impl CpuFrequency {
+    fn read_ghz() -> f32 {
+        [
+            "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq",
+            "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq",
+        ]
+        .iter()
+        .find_map(|path| {
+            let khz = fs::read_to_string(path).ok()?.trim().parse::<f32>().ok()?;
+            Some(khz / 1_000_000.0)
+        })
+        .unwrap_or(0.0)
+    }
+}
+
 pub struct MonitorReader {
     cpu: CpuState,
     network: NetworkState,
+    disk_io: DiskIoState,
     processes: ProcessCpuState,
     scanner: ProcessScanner,
 }
@@ -366,6 +474,7 @@ impl MonitorReader {
             network: NetworkState::default(),
             processes: ProcessCpuState::new(),
             scanner: ProcessScanner::default(),
+            disk_io: DiskIoState::default(),
         }
     }
 
@@ -382,6 +491,8 @@ impl MonitorReader {
         let (memory, _) = MemoryValues::read();
         let temperature = TemperatureValue::read();
         let disk = DiskValue::read();
+        let disk_io_mb_s = self.disk_io.throughput_mb_s();
+        let cpu_frequency_ghz = CpuFrequency::read_ghz();
         let (network_rx, network_tx) = self.network.throughput();
         MonitorSample {
             cpu,
@@ -392,6 +503,10 @@ impl MonitorReader {
             disk,
             network_rx,
             network_tx,
+            cpu_brand: self.cpu.brand().to_owned(),
+            cpu_cores: self.cpu.core_count(),
+            cpu_frequency_ghz,
+            disk_io_mb_s,
         }
     }
 
@@ -417,7 +532,9 @@ impl MonitorReader {
     /// Parse procfs CPU counters without performing the filesystem read.
     #[must_use]
     pub fn parse_cpu_times_for_bench(text: &str) -> Vec<(u64, u64)> {
-        CpuState::parse_times(text)
+        let mut result = Vec::with_capacity(8);
+        CpuState::parse_times_into(text, &mut result);
+        result
     }
 
     fn process_stat(stat: &str) -> Option<(String, u64, u64)> {
@@ -559,11 +676,18 @@ mod tests {
     #[test]
     fn cpu_times_byte_parser_preserves_aggregate_and_core_records() {
         let text = "cpu  123 45 67 890 12 3 4 5 6 7\ncpu0 1 2 3 4 5 6 7 8 9 10\nintr 99\n";
-        assert_eq!(CpuState::parse_times(text), vec![(1_162, 902), (55, 9)]);
+        assert_eq!(
+            {
+                let mut result = Vec::new();
+                CpuState::parse_times_into(text, &mut result);
+                result
+            },
+            vec![(1_162, 902), (55, 9)]
+        );
     }
 
     #[test]
     fn cpu_times_byte_parser_rejects_incomplete_records() {
-        assert!(CpuState::parse_times("cpu 1 2 3\ncpu0 x 2 3 4\n").is_empty());
+        assert!(CpuState::parse_cpu_times_for_bench("cpu 1 2 3\ncpu0 x 2 3 4\n").is_empty());
     }
 }

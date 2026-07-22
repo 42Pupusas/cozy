@@ -10,6 +10,15 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+# Forwards platform's opt-in frame-pacing instrumentation (present-busy
+# sub-phase timing, TERMINAL_DEBUG_FPS=log) so the dashboard's own paint-only
+# MONITOR_PROFILE numbers can be cross-checked against what actually costs
+# time in TermWindow::maybe_present -- the blit/overlay/shm-copy/submit work
+# that happens after the painter closure returns and that MONITOR_PROFILE's
+# PaintPhases timer structurally cannot see.
+trace = ["platform/trace"]
+
 [dependencies]
 statusbar = { path = "../../crates/statusbar" }
 platform = { path = "../../crates/platform" }

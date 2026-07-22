@@ -67,6 +67,12 @@ pub struct FrameProfile {
     other_chart_time: Duration,
     label_time: Duration,
     static_time: Duration,
+    /// Ticks where `RedrawGate` decided nothing changed and paint/present
+    /// were skipped entirely. Tracked separately from `frames` (painted
+    /// ticks) so the reported line makes the skip rate -- the entire point
+    /// of the redraw-gating change -- directly visible without needing a
+    /// live compositor to eyeball fps against.
+    skipped_ticks: u32,
 }
 
 impl FrameProfile {
@@ -84,6 +90,17 @@ impl FrameProfile {
             other_chart_time: Duration::ZERO,
             label_time: Duration::ZERO,
             static_time: Duration::ZERO,
+            skipped_ticks: 0,
+        }
+    }
+
+    /// Notes a tick where `RedrawGate` skipped paint entirely. Called from
+    /// `App::run`'s skip branch so the reported skip rate reflects reality
+    /// rather than being inferred from fps alone (which can't distinguish
+    /// "compositor throttled us" from "we chose not to present").
+    pub const fn record_skip(&mut self) {
+        if self.enabled {
+            self.skipped_ticks += 1;
         }
     }
 
@@ -115,8 +132,14 @@ impl FrameProfile {
             .as_secs_f64()
             / elapsed.as_secs_f64()
             * 100.0;
+        let total_ticks = self.frames + self.skipped_ticks;
+        let skip_percent = if total_ticks == 0 {
+            0.0
+        } else {
+            f64::from(self.skipped_ticks) / f64::from(total_ticks) * 100.0
+        };
         eprintln!(
-            "monitor ui: {:.1} fps | {cpu_percent:.1}% cpu | {:.2} ms frame | {:.2} ms paint [cpu {:.2}, charts {:.2}, labels {:.2}, static {:.2}] | {}/{} full",
+            "monitor ui: {:.1} fps | {cpu_percent:.1}% cpu | {:.2} ms frame | {:.2} ms paint [cpu {:.2}, charts {:.2}, labels {:.2}, static {:.2}] | {}/{} full | {}/{} ticks skipped ({skip_percent:.1}%)",
             frames / elapsed.as_secs_f64(),
             self.frame_time.as_secs_f64() * 1_000.0 / frames,
             self.paint_time.as_secs_f64() * 1_000.0 / frames,
@@ -126,6 +149,8 @@ impl FrameProfile {
             self.static_time.as_secs_f64() * 1_000.0 / frames,
             self.full_frames,
             self.frames,
+            self.skipped_ticks,
+            total_ticks,
         );
         self.started = Instant::now();
         self.cpu_started = ThreadClock::now();
@@ -137,6 +162,7 @@ impl FrameProfile {
         self.other_chart_time = Duration::ZERO;
         self.label_time = Duration::ZERO;
         self.static_time = Duration::ZERO;
+        self.skipped_ticks = 0;
     }
 }
 

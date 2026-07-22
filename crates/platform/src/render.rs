@@ -374,6 +374,12 @@ impl Renderer {
         self.bg_alpha < 255
     }
 
+    /// Alpha used for background pixels in custom software-painted surfaces.
+    #[must_use]
+    pub const fn background_alpha(&self) -> u8 {
+        self.bg_alpha
+    }
+
     /// Live-patch one palette index (an OSC 4 write from the grid thread)
     /// without rebuilding the renderer. The caller still owes a full repaint
     /// after this -- see [`crate::window::TermWindow::apply_palette_change`],

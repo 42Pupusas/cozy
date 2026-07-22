@@ -34,7 +34,7 @@ pub struct ChartCache {
     height: i32,
     panel: Color,
     scroll_remainder: f32,
-    seen_samples: usize,
+    seen_samples: u64,
 }
 
 impl ChartCache {
@@ -66,9 +66,7 @@ impl ChartCache {
         sequence: u64,
     ) {
         if self.needs_rebuild(bounds) {
-            self.rebuild(
-                bounds.w, bounds.h, primary, maximum, color, overlays, sequence,
-            );
+            self.rebuild(bounds, primary, maximum, color, overlays, sequence);
         } else {
             self.advance(
                 primary,
@@ -97,20 +95,19 @@ impl ChartCache {
 
     fn rebuild(
         &mut self,
-        width: i32,
-        height: i32,
+        bounds: Rect,
         primary: &VecDeque<f32>,
         maximum: f32,
         color: Color,
         overlays: &[Overlay<'_>],
         sequence: u64,
     ) {
-        self.width = width.max(0);
-        self.height = height.max(0);
+        self.width = bounds.w.max(0);
+        self.height = bounds.h.max(0);
         let area = self.width.cast_unsigned() as usize * self.height.cast_unsigned() as usize;
         self.pixels.resize(area, self.panel.to_xrgb8888());
         self.scroll_remainder = 0.0;
-        self.seen_samples = sequence as usize;
+        self.seen_samples = sequence;
         let mut canvas = Canvas::new(&mut self.pixels, self.width, self.height);
         let chart = Chart::new(Rect::new(0, 0, self.width, self.height), color, self.panel);
         chart.draw(&mut canvas, primary, maximum);
@@ -128,15 +125,17 @@ impl ChartCache {
         history_capacity: usize,
         sequence: u64,
     ) {
-        let previous = self.seen_samples as u64;
-        let added = sequence.saturating_sub(previous) as usize;
-        self.seen_samples = sequence as usize;
+        let previous = self.seen_samples;
+        let added = sequence.saturating_sub(previous);
+        self.seen_samples = sequence;
         if added == 0 || self.width <= 0 || self.height <= 0 || history_capacity == 0 {
             return;
         }
         #[allow(clippy::cast_precision_loss)]
         {
-            self.scroll_remainder += added as f32 * self.width as f32 / history_capacity as f32;
+            self.scroll_remainder += added.to_string().parse::<f32>().unwrap_or(f32::MAX)
+                * self.width as f32
+                / history_capacity as f32;
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let columns = self.scroll_remainder.floor() as i32;

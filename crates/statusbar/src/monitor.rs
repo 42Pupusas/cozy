@@ -274,9 +274,10 @@ impl NetworkState {
                     .find(|name| !Self::virtual_interface(name))
             })
             .or_else(|| interfaces.first());
-        let label = selected
-            .map(|name| Self::hardware_label(name).unwrap_or_else(|| name.clone()))
-            .unwrap_or_else(|| "NO NETWORK".to_owned());
+        let label = selected.map_or_else(
+            || "NO NETWORK".to_owned(),
+            |name| Self::hardware_label(name).unwrap_or_else(|| name.clone()),
+        );
         self.device = Some(label.clone());
         label
     }
@@ -286,10 +287,10 @@ impl NetworkState {
         // A one-second ping process is needlessly expensive for a dashboard.
         // Keep the last measurement visible while probing occasionally; the
         // graph remains fluid through the monitor's interpolator.
-        if let Some((at, value)) = self.last_ping {
-            if now.duration_since(at) < std::time::Duration::from_secs(5) {
-                return value;
-            }
+        if let Some((at, value)) = self.last_ping
+            && now.duration_since(at) < std::time::Duration::from_secs(5)
+        {
+            return value;
         }
         let value = self
             .gateway()
@@ -315,17 +316,17 @@ impl NetworkState {
 
     fn gateway(&mut self) -> Option<Ipv4Addr> {
         let now = Instant::now();
-        if let Some((at, gateway)) = self.gateway {
-            if now.duration_since(at) < std::time::Duration::from_secs(30) {
-                return Some(gateway);
-            }
+        if let Some((at, gateway)) = self.gateway
+            && now.duration_since(at) < std::time::Duration::from_secs(30)
+        {
+            return Some(gateway);
         }
         let gateway = Self::default_gateway()?;
         self.gateway = Some((now, gateway));
         Some(gateway)
     }
 
-    fn link_mbps(&mut self) -> f32 {
+    fn link_mbps(&self) -> f32 {
         let interface = Self::default_route_interface().or_else(|| {
             self.device.as_ref().and_then(|label| {
                 fs::read_dir("/sys/class/net")
@@ -376,8 +377,7 @@ impl NetworkState {
 
     fn interface_is_up(interface: &str) -> bool {
         fs::read_to_string(format!("/sys/class/net/{interface}/operstate"))
-            .map(|state| matches!(state.trim(), "up" | "unknown"))
-            .unwrap_or(false)
+            .is_ok_and(|state| matches!(state.trim(), "up" | "unknown"))
     }
 
     fn virtual_interface(interface: &str) -> bool {
@@ -693,23 +693,21 @@ struct DiskIoState {
 impl DiskIoState {
     fn throughput_mb_s(&mut self) -> f32 {
         let now = Instant::now();
-        let sectors = fs::read_to_string("/proc/diskstats")
-            .map(|contents| {
-                contents
-                    .lines()
-                    .filter_map(|line| {
-                        let fields: Vec<_> = line.split_whitespace().collect();
-                        let device = fields.get(2)?;
-                        if device.starts_with("loop") || device.starts_with("ram") {
-                            return None;
-                        }
-                        let read = fields.get(5)?.parse::<u64>().ok()?;
-                        let written = fields.get(9)?.parse::<u64>().ok()?;
-                        Some(read.saturating_add(written))
-                    })
-                    .sum()
-            })
-            .unwrap_or(0);
+        let sectors = fs::read_to_string("/proc/diskstats").map_or(0, |contents| {
+            contents
+                .lines()
+                .filter_map(|line| {
+                    let fields: Vec<_> = line.split_whitespace().collect();
+                    let device = fields.get(2)?;
+                    if device.starts_with("loop") || device.starts_with("ram") {
+                        return None;
+                    }
+                    let read = fields.get(5)?.parse::<u64>().ok()?;
+                    let written = fields.get(9)?.parse::<u64>().ok()?;
+                    Some(read.saturating_add(written))
+                })
+                .sum()
+        });
         let Some(previous_at) = self.previous_at.replace(now) else {
             self.previous_sectors = sectors;
             return 0.0;
@@ -722,7 +720,12 @@ impl DiskIoState {
         } else {
             // Linux diskstats reports sectors; the kernel convention is
             // 512 bytes per sector regardless of the device's physical size.
-            delta as f32 * 512.0 / elapsed / 1_048_576.0
+            // The renderer's public sample type is `f32`, while Linux sector
+            // counters are `u64`. Parsing the decimal representation delegates
+            // the intentionally lossy conversion to the standard library
+            // without a narrowing cast; an unrepresentable counter jump
+            // saturates instead of wrapping or producing a bogus low rate.
+            delta.to_string().parse::<f32>().unwrap_or(f32::MAX) * 512.0 / elapsed / 1_048_576.0
         }
     }
 }
@@ -732,10 +735,12 @@ struct MemoryDevice;
 impl MemoryDevice {
     fn read() -> String {
         let root = "/sys/devices/system/edac/mc";
-        let Ok(controllers) = fs::read_dir(root) else {
-            return "RAM".to_owned();
-        };
         let mut modules = Vec::new();
+        let Ok(controllers) = fs::read_dir(root) else {
+            return Self::read_smbios()
+                .or_else(Self::capacity_label)
+                .unwrap_or_else(|| "RAM".to_owned());
+        };
         for controller in controllers.flatten() {
             let Ok(entries) = fs::read_dir(controller.path()) else {
                 continue;
@@ -763,11 +768,86 @@ impl MemoryDevice {
                 }
             }
         }
-        if modules.is_empty() {
-            "RAM".to_owned()
-        } else {
-            modules.join(" · ")
+        if !modules.is_empty() {
+            return modules.join(" · ");
         }
+
+        Self::read_smbios()
+            .or_else(Self::capacity_label)
+            .unwrap_or_else(|| "RAM".to_owned())
+    }
+
+    /// The firmware table may be unreadable in an unprivileged sandbox. The
+    /// capacity is still a real kernel-provided identity and is more useful
+    /// than pretending the memory device is literally named `RAM`.
+    fn capacity_label() -> Option<String> {
+        let kilobytes = fs::read_to_string("/proc/meminfo")
+            .ok()?
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:")?.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())?;
+        let gigabytes = kilobytes / 1_048_576;
+        (gigabytes > 0).then(|| format!("{gigabytes} GB RAM"))
+    }
+
+    /// EDAC is optional, so many machines expose no DIMM directories even
+    /// though SMBIOS still has the firmware's memory-device records. Parse
+    /// those records directly instead of showing the generic `RAM` label.
+    fn read_smbios() -> Option<String> {
+        let data = fs::read("/sys/firmware/dmi/tables/DMI").ok()?;
+        let mut offset = 0;
+        let mut modules = Vec::new();
+        while offset + 4 <= data.len() {
+            let kind = data[offset];
+            let length = usize::from(data[offset + 1]);
+            if length < 4 || offset + length > data.len() {
+                break;
+            }
+            let end = data[offset + length..]
+                .windows(2)
+                .position(|pair| pair == [0, 0])
+                .map_or(data.len(), |terminator| offset + length + terminator + 2);
+            if kind == 17 {
+                if let Some(label) = Self::smbios_memory_label(
+                    &data[offset..offset + length],
+                    &data[offset + length..end],
+                ) && !modules.contains(&label)
+                {
+                    modules.push(label);
+                }
+            }
+            if kind == 127 {
+                break;
+            }
+            offset = end;
+        }
+        (!modules.is_empty()).then(|| modules.join(" · "))
+    }
+
+    fn smbios_memory_label(record: &[u8], strings: &[u8]) -> Option<String> {
+        let manufacturer = Self::smbios_string(record.get(0x17).copied(), strings);
+        let part = Self::smbios_string(record.get(0x1a).copied(), strings);
+        let memory_type = Self::smbios_string(record.get(0x12).copied(), strings);
+        let label = [manufacturer, part, memory_type]
+            .into_iter()
+            .flatten()
+            .filter(|value| {
+                !value.is_empty() && value != "Unknown" && value != "No Module Installed"
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        (!label.is_empty()).then_some(label)
+    }
+
+    fn smbios_string(index: Option<u8>, strings: &[u8]) -> Option<String> {
+        let index = usize::from(index?);
+        (index != 0).then(|| {
+            strings
+                .split(|byte| *byte == 0)
+                .filter(|value| !value.is_empty())
+                .nth(index.saturating_sub(1))
+                .map(|value| String::from_utf8_lossy(value).trim().to_owned())
+        })?
     }
 
     fn attribute(path: &std::path::Path, name: &str) -> Option<String> {
@@ -1028,9 +1108,15 @@ impl TemperatureValue {
             };
         };
         let maximum = readings.iter().map(|(value, _)| *value).fold(0.0, f32::max);
-        let average = readings.iter().map(|(value, _)| *value).sum::<f32>()
-            / readings.len() as f32;
-        let minimum = readings.iter().map(|(value, _)| *value).fold(f32::INFINITY, f32::min);
+        // Thermal-zone directory sizes are small in practice, but convert
+        // explicitly so a pathological sysfs tree cannot silently lose count
+        // precision in the displayed average.
+        let count = u16::try_from(readings.len()).unwrap_or(u16::MAX);
+        let average = readings.iter().map(|(value, _)| *value).sum::<f32>() / f32::from(count);
+        let minimum = readings
+            .iter()
+            .map(|(value, _)| *value)
+            .fold(f32::INFINITY, f32::min);
         let device = readings
             .iter()
             .map(|(_, kind)| kind.as_str())

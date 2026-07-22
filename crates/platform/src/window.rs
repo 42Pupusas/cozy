@@ -221,6 +221,15 @@ pub struct TermWindow {
     /// free on present. Without this, incremental dirty-row blits would only
     /// ever touch one of the two shm frames, leaving the rest black.
     backbuffer: Vec<u32>,
+    /// Cached premultiplied pixels for custom painters. Keeping this separate
+    /// from the stable XRGB backbuffer avoids re-premultiplying every stale
+    /// row on every shm-slot upload.
+    custom_argb: Vec<u32>,
+    /// SIMD dispatch for the premultiply loop above, probed once at
+    /// construction (see [`crate::premultiply::Premultiplier`]) instead of
+    /// per present -- feature detection is a cached atomic load, but even
+    /// that cost has no reason to repeat every frame.
+    premultiplier: crate::premultiply::Premultiplier,
     /// Glyph source (bitmap or loaded TTF/OTF face) + resolved color theme.
     renderer: render::Renderer,
     width: i32,
@@ -460,10 +469,13 @@ impl TermWindow {
         // backbuffer must carry the configured alpha from frame one, not
         // flash fully opaque until the first real paint.
         let backbuffer = vec![renderer.bg_packed(); (width * height) as usize];
+        let premultiplier = crate::premultiply::Premultiplier::new();
+        let mut custom_argb = vec![0u32; backbuffer.len()];
+        premultiplier.run(renderer.background_alpha(), &backbuffer, &mut custom_argb);
         // Both shm frames start as blank memory (freshly mmap'd), so every
         // row is "stale" relative to the backbuffer until the first present
         // copies it in -- `PresentState::new` seeds that.
-        let row_count = (rows as usize).max(1);
+        let row_count = ((height + cell_h - 1) / cell_h).max(1) as usize;
         let present =
             crate::present::PresentState::new(frames, shm_mem, pool, buf_format, row_count);
 
@@ -489,6 +501,8 @@ impl TermWindow {
             cursor,
             present,
             backbuffer,
+            custom_argb,
+            premultiplier,
             renderer,
             width,
             height,
@@ -726,6 +740,49 @@ impl TermWindow {
         if self.cursor_anim.advance(dt_ms) {
             self.present.mark_dirty();
         }
+    }
+
+    fn premultiply_pixel(pixel: u32, alpha: u8) -> u32 {
+        let a = u32::from(alpha);
+        let rgb = pixel & 0x00ff_ffff;
+        let r = ((rgb >> 16) & 0xff) * a / 255;
+        let g = ((rgb >> 8) & 0xff) * a / 255;
+        let b = (rgb & 0xff) * a / 255;
+        (a << 24) | (r << 16) | (g << 8) | b
+    }
+
+    /// Rebuilds the damaged rows of the premultiplied custom-painter cache
+    /// from the XRGB backbuffer, using [`crate::premultiply::Premultiplier`]'s
+    /// SIMD kernel (AVX2/SSE2 on `x86_64`, scalar elsewhere) rather than a
+    /// per-pixel scalar loop. This runs on every present of a translucent
+    /// custom-painted window (e.g. `monitor` under compositor opacity < 1.0);
+    /// profiling a live translucent session found the naive `channel * alpha
+    /// / 255` scalar loop alone costing ~18ms/frame, dwarfing the actual
+    /// dashboard paint (~0.2ms).
+    fn update_custom_argb(&mut self, damage: crate::draw::Rect) {
+        if !self.renderer.needs_alpha() {
+            return;
+        }
+        let width = self.width.max(0) as usize;
+        if width == 0 {
+            return;
+        }
+        // Configure dimensions and the allocated shm/backbuffer dimensions can
+        // differ by a partial final row. Clamp against the actual caches before
+        // forming slices; custom damage must never turn a compositor resize
+        // race into an out-of-bounds access.
+        let rows = (self.backbuffer.len() / width).min(self.custom_argb.len() / width);
+        let y0 = damage.y.max(0).min(rows as i32) as usize;
+        let y1 = damage.bottom().max(y0 as i32).min(rows as i32) as usize;
+        let alpha = self.renderer.background_alpha();
+        // One call over the whole damaged band rather than per-row: the
+        // rows are contiguous in both buffers, so this is a single premultiply
+        // pass instead of `rows` separate short ones, keeping the vector
+        // kernels' loop overhead amortized across the entire span.
+        let start = y0 * width;
+        let end = y1 * width;
+        self.premultiplier
+            .run(alpha, &self.backbuffer[start..end], &mut self.custom_argb[start..end]);
     }
 
     /// Whether the caller should keep polling at animation-frame-rate
@@ -1859,14 +1916,23 @@ impl TermWindow {
         let custom_painted = custom_paint.is_some();
         let custom_damage = custom_paint.map(|paint| paint(&mut canvas));
         let _ = canvas;
+        if custom_painted {
+            // Custom painters own the entire surface. Rebuild the complete
+            // premultiplied image so both shm slots always contain identical,
+            // initialized pixels; partial-row damage is unsafe for ARGB slots.
+            self.update_custom_argb(crate::draw::Rect::new(0, 0, self.width, self.height));
+        }
         // A custom painter owns pixels outside the terminal grid. Convert only
         // its reported pixel band to stale logical rows; marking every row here
         // used to make a 60 Hz graph animation memcpy the entire window.
-        if let Some(damage) = custom_damage {
-            let first = (damage.y.max(0) / self.cell_h).max(0);
-            let last_pixel = damage.bottom().min(self.height).saturating_sub(1);
-            let last = (last_pixel / self.cell_h).max(first);
-            touched_rows.extend((first..=last).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
+        if custom_damage.is_some() {
+            // Until custom ARGB surfaces have a dedicated per-slot damage
+            // protocol, present every row. Use a ceiling division: the final
+            // partial cell-height band is still real framebuffer memory and
+            // must be copied into both slots rather than retaining mmap-zero
+            // (transparent) pixels.
+            let rows = ((self.height + self.cell_h - 1) / self.cell_h).max(1);
+            touched_rows.extend((0..rows).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
         }
         // Sub-phase timers (only read when DebugFps::Log fires below on a slow
         // present): `t_blit` = the coalesce+blit_snapshot loop, the only phase
@@ -1994,6 +2060,27 @@ impl TermWindow {
         // partial strip is filled too -- otherwise the freshly-mmap'd (zeroed)
         // shm bottom shows through as a blank line.
         let buf_h = self.height as usize;
+        // Borrow the source before borrowing `present` mutably below. The
+        // caches and swap chain are disjoint state, but holding this narrow
+        // slice makes that separation explicit to both Rust and readers.
+        let (custom_source, custom_fill) = if custom_painted {
+            if self.renderer.needs_alpha() {
+                (
+                    self.custom_argb.as_slice(),
+                    Self::premultiply_pixel(
+                        self.renderer.bg_packed(),
+                        self.renderer.background_alpha(),
+                    ),
+                )
+            } else {
+                (self.backbuffer.as_slice(), self.renderer.bg_packed())
+            }
+        } else {
+            // This slice is never read on the terminal-grid path. Supplying an
+            // empty one keeps the later copy loop branch-free with respect to
+            // the swap-chain borrow.
+            (&[] as &[u32], self.renderer.bg_packed())
+        };
         let (dst, stale) = self.present.slot_pixels_and_stale(slot);
         let last_row = stale.len().saturating_sub(1);
         let mut damage_rects: Vec<(i32, i32)> = Vec::new(); // (y_px, height_px)
@@ -2018,11 +2105,22 @@ impl TermWindow {
             let y1 = if reaches_bottom { buf_h } else { row * cell_h };
             let src_off = y0 * cols_bytes;
             let len = (y1 - y0) * cols_bytes;
-            if let (Some(src_slice), Some(dst_slice)) = (
-                self.backbuffer.get(src_off..src_off + len),
-                dst.get_mut(src_off..src_off + len),
-            ) {
-                dst_slice.copy_from_slice(src_slice);
+            if let Some(dst_slice) = dst.get_mut(src_off..src_off + len) {
+                if custom_painted {
+                    // A custom surface can be made dirty by a resize/configure
+                    // even when the app had no new telemetry to paint. It must
+                    // therefore use its ARGB cache on *every* such present,
+                    // rather than only the tick that happened to repaint.
+                    let available = custom_source.len().saturating_sub(src_off);
+                    let copy_len = available.min(dst_slice.len());
+                    dst_slice[..copy_len]
+                        .copy_from_slice(&custom_source[src_off..src_off + copy_len]);
+                    if copy_len < dst_slice.len() {
+                        dst_slice[copy_len..].fill(custom_fill);
+                    }
+                } else if let Some(src_slice) = self.backbuffer.get(src_off..src_off + len) {
+                    dst_slice.copy_from_slice(src_slice);
+                }
             }
             damage_rects.push((y0 as i32, (y1 - y0) as i32));
         }
@@ -2109,6 +2207,14 @@ impl TermWindow {
             new_back[row * new_w..row * new_w + copy_w].copy_from_slice(src);
         }
         self.backbuffer = new_back;
+        // Rebuild the premultiplied custom-painter cache to the same physical
+        // dimensions as the resized backbuffer. Keeping the old cache here
+        // leaves the final rows stale and causes the bottom edge to oscillate
+        // while the compositor alternates shm slots.
+        let alpha = self.renderer.background_alpha();
+        let mut custom_argb = vec![0u32; self.backbuffer.len()];
+        self.premultiplier.run(alpha, &self.backbuffer, &mut custom_argb);
+        self.custom_argb = custom_argb;
 
         // `self.present`'s pool is unchanged — we reuse it across resizes now.
         self.width = w;
@@ -2122,7 +2228,7 @@ impl TermWindow {
         // force the next present to fire immediately (never leave the
         // surface showing a detached/blank buffer -- the cause of resize
         // flashing).
-        let row_count = ((h / self.cell_h).max(1)) as usize;
+        let row_count = ((h + self.cell_h - 1) / self.cell_h).max(1) as usize;
         self.present.reset_after_resize(row_count);
         Ok(())
     }

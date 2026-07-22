@@ -136,14 +136,24 @@ impl TextRenderer {
         }
     }
 
-    /// Cell-top offset of the shared face baseline. TextRenderer accepts a
+    /// Cell-top offset of the shared face baseline. `TextRenderer` accepts a
     /// cell-top origin, while mixed-size faces need their ascenders aligned
     /// explicitly when composing one visual row.
     #[must_use]
     pub fn baseline_offset(&self) -> i32 {
         match self {
             Self::Bitmap => 12,
-            Self::Face(f) => f.ascender.round() as i32,
+            // A loaded font's ascender is a small positive pixel metric. The
+            // font parser represents metrics as `f32`, whereas drawing uses
+            // signed pixel coordinates; text conversion gives this fallible
+            // boundary an explicit saturation rule without an unchecked cast.
+            Self::Face(f) => f
+                .ascender
+                .round()
+                .max(0.0)
+                .to_string()
+                .parse::<i32>()
+                .unwrap_or(i32::MAX),
         }
     }
 

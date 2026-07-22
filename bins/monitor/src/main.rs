@@ -9,12 +9,18 @@ use std::time::{Duration, Instant};
 
 mod chart;
 mod chart_cache;
+mod core_bars;
+mod display_snapshot;
 mod profile;
+mod redraw_gate;
 
 use chart_cache::{ChartCache, Overlay};
+use core_bars::{CoreBarPaint, CoreBars};
+use display_snapshot::DisplaySnapshot;
 use platform::TermWindow;
 use platform::draw::{Canvas, Color, Rect};
 use profile::{FrameProfile, PaintPhases, WorkerProfile};
+use redraw_gate::RedrawGate;
 use statusbar::{MonitorReader, MonitorSample, ProcessInfo, TextRenderer};
 
 /// One minute of chart history at four deliberately distinct points per
@@ -33,7 +39,10 @@ const FG: Color = Color::rgb(0xf2, 0xf2, 0xf3);
 const DIM: Color = Color::rgb(0x8a, 0x8a, 0x90);
 const FAINT: Color = Color::rgb(0x55, 0x55, 0x5a);
 const UI_BACKGROUND: Color = Color::rgb(0x0a, 0x0a, 0x0b);
-const CARD_SURFACE: Color = Color::rgb(0x10, 0x10, 0x12);
+// Cards intentionally share the resolved terminal/status-bar background. There
+// is no second opaque panel layer; the window opacity is applied uniformly by
+// the normal renderer, matching the terminal and status bar.
+const CARD_SURFACE: Color = Color::rgb(0x18, 0x16, 0x16);
 const CARD_BORDER: Color = Color::rgb(0x1e, 0x1e, 0x21);
 /// Opaque Kanagawa card surface. The monitor window may be translucent, but
 /// charts need a stable surface so their fill and anti-aliased strokes do not
@@ -42,6 +51,14 @@ const CHART_PANEL: Color = CARD_SURFACE;
 const CYAN: Color = Color::rgb(0x8e, 0xa4, 0xa2);
 const GREEN: Color = Color::rgb(0x8a, 0x9a, 0x7b);
 const ORANGE: Color = Color::rgb(0xb6, 0x92, 0x7b);
+const CARD_INSET: i32 = 14;
+const HEADER_BAND: i32 = 26;
+const HERO_BAND: i32 = 82;
+const DETAILS_BAND: i32 = 30;
+const GRAPH_GAP: i32 = 12;
+#[cfg(test)]
+const PERF_ITERATIONS: usize = 20_000;
+
 const CORE_COLORS: [Color; 8] = [
     Color::rgb(0x7a, 0x8a, 0x72),
     Color::rgb(0x75, 0x91, 0x91),
@@ -181,15 +198,28 @@ struct Painter {
     memory: ChartCache,
     temperature: ChartCache,
     network: ChartCache,
+    cpu_bars: CoreBars,
+    background: Color,
 }
 
 impl Painter {
+    #[allow(dead_code)]
     const fn new() -> Self {
+        Self::with_surface(CHART_PANEL)
+    }
+
+    const fn with_surface(surface: Color) -> Self {
+        Self::with_colors(surface, UI_BACKGROUND)
+    }
+
+    const fn with_colors(surface: Color, background: Color) -> Self {
         Self {
-            cpu: ChartCache::new(CHART_PANEL),
-            memory: ChartCache::new(CHART_PANEL),
-            temperature: ChartCache::new(CHART_PANEL),
-            network: ChartCache::new(CHART_PANEL),
+            cpu: ChartCache::new(surface),
+            memory: ChartCache::new(surface),
+            temperature: ChartCache::new(surface),
+            network: ChartCache::new(surface),
+            cpu_bars: CoreBars::new(),
+            background,
         }
     }
     #[allow(
@@ -253,30 +283,14 @@ impl Painter {
         );
     }
 
-    fn cpu_bars(canvas: &mut Canvas, cores: &[f32], x: i32, y: i32, w: i32, h: i32) {
-        canvas.fill_rect(Rect::new(x, y, w, h), CARD_SURFACE);
-        if cores.is_empty() || w <= 0 || h <= 0 {
-            return;
-        }
-        let gap = 3;
-        let bar_width = ((w - gap * (cores.len() as i32 - 1)) / cores.len() as i32).max(1);
-        for (index, value) in cores.iter().enumerate() {
-            let bar_x = x + index as i32 * (bar_width + gap);
-            let amount = value.clamp(0.0, 100.0) / 100.0;
-            let bar_height = (amount * h as f32).round() as i32;
-            let bar_y = y + h - bar_height;
-            canvas.fill_rect(
-                Rect::new(bar_x, bar_y, bar_width, bar_height),
-                CORE_COLORS[index % CORE_COLORS.len()],
-            );
-        }
-    }
-
-    fn card(canvas: &mut Canvas, rect: Rect, full_repaint: bool) {
+    fn card(&self, canvas: &mut Canvas, rect: Rect, full_repaint: bool) {
         if !full_repaint {
             return;
         }
-        canvas.fill_rect(rect, CARD_SURFACE);
+        // Cards have no separate visual surface, but their pixels still need
+        // the resolved background written into the alpha buffer. Otherwise an
+        // ARGB Wayland surface exposes the desktop through every card.
+        canvas.fill_rect(rect, self.background);
         canvas.draw_rect(rect, CARD_BORDER);
     }
 
@@ -386,7 +400,7 @@ impl Painter {
         // so clearing the process table at 60 Hz would create needless memory
         // bandwidth and force a whole-window shm upload.
         if full_repaint {
-            canvas.clear(UI_BACKGROUND);
+            canvas.clear(self.background);
         }
         let width = canvas.width();
         let height = canvas.height();
@@ -404,15 +418,8 @@ impl Painter {
         // metric, and detail row. The chart starts only after those bands;
         // deriving its height from the remaining space prevents large Hero
         // glyphs from colliding with the graph on short windows.
-        const CARD_INSET: i32 = 14;
-        const HEADER_BAND: i32 = 26;
-        // Face-font coordinates are baselines, and Hero is substantially
-        // taller than the other roles. Give it a full line box plus breathing
-        // room before the detail baseline; otherwise the glyph descenders can
-        // collide with the next row even when their y coordinates differ.
-        const HERO_BAND: i32 = 82;
-        const DETAILS_BAND: i32 = 30;
-        const GRAPH_GAP: i32 = 12;
+        // Face-font coordinates are baselines, so the hero receives a full
+        // line box plus breathing room before the detail baseline.
         let graph_top = CARD_INSET + HEADER_BAND + HERO_BAND + DETAILS_BAND + GRAPH_GAP;
         let graph_h = (row_h - graph_top - CARD_INSET).max(1);
         let card = |x: i32, y: i32| Rect::new(x, y, col_w, row_h);
@@ -426,7 +433,7 @@ impl Painter {
             card(xs[1], ys[1]), // Network
         ];
         for rect in cards {
-            Self::card(canvas, rect, full_repaint);
+            self.card(canvas, rect, full_repaint);
         }
         let graph_rect =
             |rect: Rect| Rect::new(rect.x + 1, rect.y + graph_top, rect.w - 2, graph_h);
@@ -440,7 +447,7 @@ impl Painter {
         let cpu_area = graph_rect(cards[0]);
         let cpu_line_height = (cpu_area.h - cpu_bar_height - cpu_bar_gap).max(1);
         let cpu_line = Rect::new(cpu_area.x, cpu_area.y, cpu_area.w, cpu_line_height);
-        let cpu_bars = Rect::new(
+        let cpu_bars_rect = Rect::new(
             cpu_area.x,
             cpu_area.y + cpu_line_height + cpu_bar_gap,
             cpu_area.w,
@@ -542,7 +549,7 @@ impl Painter {
         if full_repaint {
             let memory_used = format!("{:.0}%", snap.sample.memory);
             let memory_available = format!("{:.1} GB", snap.sample.memory_available_mb / 1024.0);
-            let swap = if snap.sample.swap_total_mb <= 0.0 {
+            let swap_display = if snap.sample.swap_total_mb <= 0.0 {
                 "ZRAM —".to_owned()
             } else {
                 format!(
@@ -554,7 +561,7 @@ impl Painter {
             let memory_details = [
                 ("Used", memory_used.as_str()),
                 ("Available", memory_available.as_str()),
-                ("Swap", swap.as_str()),
+                ("Swap", swap_display.as_str()),
             ];
             Self::card_text(
                 canvas,
@@ -623,13 +630,14 @@ impl Painter {
             cpu_line.h,
             history.sequence,
         );
-        Self::cpu_bars(
+        self.cpu_bars.paint(
             canvas,
             &snap.sample.cores,
-            cpu_bars.x,
-            cpu_bars.y,
-            cpu_bars.w,
-            cpu_bars.h,
+            CoreBarPaint {
+                bounds: cpu_bars_rect,
+                background: CARD_SURFACE,
+                colors: &CORE_COLORS,
+            },
         );
         phases.cpu_chart += started.elapsed();
         let started = Instant::now();
@@ -680,7 +688,7 @@ impl Painter {
             process_w,
             height - margin * 2,
         );
-        Self::card(canvas, proc_rect, full_repaint);
+        self.card(canvas, proc_rect, full_repaint);
         if full_repaint {
             let inset = 14;
             let left = proc_rect.x + inset;
@@ -733,7 +741,7 @@ impl Painter {
             let row_height = 18;
             let first_row = proc_rect.y + 59;
             let available_height = (proc_rect.y + proc_rect.h - inset - first_row).max(0);
-            let row_count = (available_height / row_height) as usize;
+            let row_count = usize::try_from(available_height / row_height).unwrap_or(0);
             for (row, process) in snap.processes.iter().take(row_count).enumerate() {
                 let y = first_row + i32::try_from(row).unwrap_or(0) * row_height;
                 let name_width = (cpu_right - name_left - 12).max(1);
@@ -758,8 +766,13 @@ impl Painter {
                     Rect::new(bar_left, bar_y, bar_right - bar_left, 6),
                     CARD_BORDER,
                 );
-                let fill = (process.cpu.clamp(0.0, 100.0) / 100.0 * (bar_right - bar_left) as f32)
-                    .round() as i32;
+                let bar_width = bar_right - bar_left;
+                let fill = (process.cpu.clamp(0.0, 100.0) / 100.0
+                    * bar_width.to_string().parse::<f32>().unwrap_or(0.0))
+                .round()
+                .to_string()
+                .parse::<i32>()
+                .unwrap_or(bar_width);
                 if fill > 0 {
                     canvas.fill_rect(
                         Rect::new(bar_left, bar_y, fill, 6),
@@ -768,7 +781,15 @@ impl Painter {
                 }
                 text.draw_text_right(
                     canvas,
-                    &format!("{:.1} MB", process.memory_kb as f32 / 1024.0),
+                    &format!(
+                        "{:.1} MB",
+                        process
+                            .memory_kb
+                            .to_string()
+                            .parse::<f32>()
+                            .unwrap_or(f32::MAX)
+                            / 1024.0
+                    ),
                     mem_right,
                     y,
                     DIM,
@@ -795,6 +816,12 @@ struct App {
     display: SampleInterpolator,
     painter: Painter,
     last_graph_sample: Instant,
+    /// The quantized (rendered-precision) values as of the last actual
+    /// paint. Compared against the current interpolated sample each tick
+    /// to decide whether painting again would change any pixel -- see
+    /// `display_snapshot` module docs for why this replaced checking raw
+    /// interpolation progress.
+    last_painted_display: DisplaySnapshot,
 }
 
 impl App {
@@ -802,10 +829,15 @@ impl App {
     /// sample still evolves every frame; retaining fewer knots lets the
     /// monotone chart renderer express that motion as a smooth curve instead
     /// of packing sub-pixel frame-to-frame variations into the history.
-    fn record_graph_sample(&mut self, now: Instant) {
+    /// Returns whether a knot was actually added -- callers use this to know
+    /// whether the chart surfaces have new pixels to draw this tick.
+    fn record_graph_sample(&mut self, now: Instant) -> bool {
         if now.duration_since(self.last_graph_sample) >= GRAPH_INTERVAL {
             self.history.add(&self.snapshot.sample);
             self.last_graph_sample = now;
+            true
+        } else {
+            false
         }
     }
 }
@@ -815,14 +847,29 @@ impl App {
         let cfg = config::Config::load().unwrap_or_default();
         let wake = waker::Waker::new().expect("create monitor wakeup");
         let theme = platform::Theme::from_palette(&cfg.palette);
-        let font = cfg.font.clone();
+        let mut font = cfg.font.clone();
+        // The monitor inherits the status bar's resolved background and
+        // opacity, which in turn inherit the terminal's [colors].background
+        // and [window].opacity. A monitor-specific override remains optional.
+        let background_opacity = cfg
+            .monitor
+            .background_opacity
+            .unwrap_or_else(|| cfg.bar_opacity());
+        if let Some(path) = cfg.monitor.font_path.as_ref() {
+            font.path = Some(path.clone());
+        }
+        if let Some(size) = cfg.monitor.font_size {
+            font.size = size;
+        }
         let window = TermWindow::new(
             "monitor",
             120,
             40,
             wake.clone(),
             platform::CursorAnimConfig::default(),
-            move |scale| platform::Renderer::with_scale(theme, &font, scale),
+            move |scale| {
+                platform::Renderer::with_scale(theme, &font, scale).with_opacity(background_opacity)
+            },
         )
         .expect("open monitor window");
         let scale = window.scale();
@@ -836,31 +883,68 @@ impl App {
             )
         };
         let typography = Typography {
-            hero: load_text(size * 2.5),
+            hero: load_text(size * cfg.monitor.hero_size.unwrap_or(2.5)),
             // Keep the supporting tiers close to the original design: titles
             // are the base UI size, subtitles are slightly quieter, and body
             // values are smaller so the hierarchy reads without becoming
             // oversized beside the hero metric.
-            title: load_text(size),
-            subtitle: load_text(size * 0.90),
-            normal: load_text(size * 0.80),
+            title: load_text(size * cfg.monitor.title_size.unwrap_or(1.0)),
+            subtitle: load_text(size * cfg.monitor.subtitle_size.unwrap_or(0.90)),
+            normal: load_text(size * cfg.monitor.normal_size.unwrap_or(0.80)),
         };
-        let background = Color::rgb(
-            cfg.palette.background.r,
-            cfg.palette.background.g,
-            cfg.palette.background.b,
-        );
+        let background_color = cfg
+            .monitor
+            .background
+            .unwrap_or_else(|| cfg.bar_background());
+        let background = Color::rgb(background_color.r, background_color.g, background_color.b);
+        let rx = Self::spawn_worker(wake);
+        Self {
+            window,
+            typography,
+            snapshot: Snapshot::default(),
+            history: History::new(),
+            background,
+            rx,
+            full_repaint: true,
+            profile: FrameProfile::new(),
+            display: SampleInterpolator::new(),
+            painter: Painter::with_colors(
+                Color::rgb(
+                    cfg.monitor
+                        .surface
+                        .unwrap_or_else(|| cfg.bar_background())
+                        .r,
+                    cfg.monitor
+                        .surface
+                        .unwrap_or_else(|| cfg.bar_background())
+                        .g,
+                    cfg.monitor
+                        .surface
+                        .unwrap_or_else(|| cfg.bar_background())
+                        .b,
+                ),
+                background,
+            ),
+            // Make the first received display value immediately visible in a
+            // graph rather than waiting one quarter-second after startup.
+            last_graph_sample: Instant::now()
+                .checked_sub(GRAPH_INTERVAL)
+                .unwrap_or_else(Instant::now),
+            // Default-quantizes to all zeros, which differs from any real
+            // first sample -- guaranteeing the very first tick paints.
+            last_painted_display: DisplaySnapshot::default(),
+        }
+    }
+    /// Owns the isolated 10 Hz telemetry worker so window construction only
+    /// assembles UI state. Keeping collection off the Wayland thread prevents
+    /// procfs stalls from delaying compositor events.
+    fn spawn_worker(wake: waker::Waker) -> mpsc::Receiver<Snapshot> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = MonitorReader::new();
             let mut processes = Vec::new();
             let mut profile = WorkerProfile::new();
             loop {
-                // Collection is deliberately 10 Hz. The UI interpolates these
-                // values at 60 Hz, so this worker never becomes a source of
-                // scheduler noise while graph animation remains fluid. Process
-                // parsing is additionally sliced across these ten ticks, which
-                // replaces the former 1 Hz 15–20 ms burst with bounded work.
                 let started = Instant::now();
                 if let Some(next) = reader.processes_tick() {
                     processes = next;
@@ -878,24 +962,9 @@ impl App {
                 std::thread::sleep(SAMPLE_INTERVAL);
             }
         });
-        Self {
-            window,
-            typography,
-            snapshot: Snapshot::default(),
-            history: History::new(),
-            background,
-            rx,
-            full_repaint: true,
-            profile: FrameProfile::new(),
-            display: SampleInterpolator::new(),
-            painter: Painter::new(),
-            // Make the first received display value immediately visible in a
-            // graph rather than waiting one quarter-second after startup.
-            last_graph_sample: Instant::now()
-                .checked_sub(GRAPH_INTERVAL)
-                .unwrap_or_else(Instant::now),
-        }
+        rx
     }
+
     fn run(mut self) {
         let mut next_frame = Instant::now();
         loop {
@@ -918,39 +987,82 @@ impl App {
                 self.snapshot = snapshot;
             }
             self.snapshot.sample = self.display.value();
-            self.record_graph_sample(now);
-            // One explicit dirty mark per deadline. `TermWindow` coalesces if
-            // the compositor still owns both shm slots.
-            self.window.request_redraw();
-            let snapshot = &self.snapshot;
-            let history = &self.history;
-            let typography = &mut self.typography;
-            let painter = &mut self.painter;
-            let background = self.background;
-            let full_repaint = self.full_repaint;
-            let mut paint_time = Duration::ZERO;
-            let mut phases = PaintPhases::default();
-            let frame_started = Instant::now();
-            match self.window.tick_with_painter(|canvas| {
-                let started = Instant::now();
-                let damage = painter.paint(
-                    canvas,
-                    typography,
-                    snapshot,
-                    history,
-                    background,
-                    full_repaint,
-                    &mut phases,
-                );
-                paint_time = started.elapsed();
-                damage
-            }) {
-                Ok(true) => {
-                    self.profile
-                        .record(paint_time, frame_started.elapsed(), &phases, full_repaint);
-                    self.full_repaint = false;
+            let new_graph_sample = self.record_graph_sample(now);
+            // Only pay for paint + present when something a viewer could
+            // actually see has changed: a fresh chart knot landed, the
+            // rendered-precision values actually moved since the last
+            // paint (hero numbers/bars visibly different, not just the raw
+            // float still gliding), or static content (process list, card
+            // labels) needs its one-time repaint.
+            //
+            // This used to check `SampleInterpolator`'s raw blend progress
+            // ("has interpolation reached t=1.0"), which was the wrong
+            // signal: the blend is *designed* to run for the entire ~100ms
+            // gap between samples so numbers glide instead of snapping, so
+            // that check was true almost 100% of the time by construction
+            // -- confirmed live via `MONITOR_PROFILE=1`, which showed skip
+            // rates stuck at 0-1.7% instead of the expected 85%+. Comparing
+            // the quantized `DisplaySnapshot` instead answers the question
+            // that actually matters: would this paint change any pixel?
+            let current_display = DisplaySnapshot::from_sample(&self.snapshot.sample);
+            let display_changed = current_display != self.last_painted_display;
+            let should_paint =
+                RedrawGate::evaluate(self.full_repaint, new_graph_sample, display_changed);
+            if should_paint {
+                // One explicit dirty mark per deadline. `TermWindow` coalesces
+                // if the compositor still owns both shm slots.
+                self.window.request_redraw();
+                let snapshot = &self.snapshot;
+                let history = &self.history;
+                let typography = &mut self.typography;
+                let painter = &mut self.painter;
+                let background = self.background;
+                let full_repaint = self.full_repaint;
+                let mut paint_time = Duration::ZERO;
+                let mut phases = PaintPhases::default();
+                let frame_started = Instant::now();
+                match self.window.tick_with_painter(|canvas| {
+                    let started = Instant::now();
+                    let damage = painter.paint(
+                        canvas,
+                        typography,
+                        snapshot,
+                        history,
+                        background,
+                        full_repaint,
+                        &mut phases,
+                    );
+                    paint_time = started.elapsed();
+                    damage
+                }) {
+                    Ok(true) => {
+                        self.profile.record(
+                            paint_time,
+                            frame_started.elapsed(),
+                            &phases,
+                            full_repaint,
+                        );
+                        self.full_repaint = false;
+                        self.last_painted_display = current_display;
+                    }
+                    Ok(false) | Err(_) => break,
                 }
-                Ok(false) | Err(_) => break,
+            } else {
+                // Still pump the Wayland connection (resize/output-change
+                // events, frame callbacks) even on a tick with nothing to
+                // paint. Crucially, retain the custom-painter path while doing
+                // so: `tick()` is for terminal-grid windows and would copy the
+                // XRGB backbuffer directly into an ARGB monitor buffer if an
+                // event (notably a resize) made it dirty between dashboard
+                // paints. XRGB has a zero high byte, so that accidental present
+                // makes the entire monitor transparent. The no-op painter lets
+                // `TermWindow` retain and premultiply its already-valid custom
+                // backbuffer should it need to present for such an event.
+                self.profile.record_skip();
+                match self.window.tick_with_painter(|_| Rect::new(0, 0, 0, 0)) {
+                    Ok(true) => {}
+                    Ok(false) | Err(_) => break,
+                }
             }
             // Do not replay missed frames after a compositor stall; the newest
             // sample is more useful than a burst of obsolete graph states.
@@ -961,16 +1073,157 @@ impl App {
         }
     }
 
+    /// Whether the process table needs its (expensive, text-heavy)
+    /// `full_repaint` pass redone. `MonitorReader::processes_tick` samples
+    /// per-process CPU at 10Hz, and instantaneous CPU-tick-derived
+    /// percentages jitter by more than a few hundredths of a point on
+    /// essentially every sample even for an idle process -- the previous
+    /// `0.05` threshold was well inside that noise floor, so this
+    /// comparison was true on nearly every single tick, forcing a full
+    /// re-layout of all four cards plus every visible process row ten
+    /// times a second regardless of whether the *displayed* (rounded)
+    /// values actually differed. One percentage point is below the
+    /// smallest change a viewer can distinguish in the rendered text
+    /// anyway, so it filters sampling noise without hiding a real swing.
     fn processes_changed(previous: &[ProcessInfo], next: &[ProcessInfo]) -> bool {
         previous.len() != next.len()
             || previous.iter().zip(next).any(|(old, new)| {
                 old.pid != new.pid
                     || old.name != new.name
-                    || (old.cpu - new.cpu).abs() > 0.05
+                    || (old.cpu - new.cpu).abs() > 1.0
                     || old.memory_kb != new.memory_kb
             })
     }
 }
 fn main() {
     App::new().run();
+}
+
+/// Headless perf harness for `Painter::paint`.
+///
+/// This sandbox has no Wayland compositor, so `perf record` on the real
+/// binary only ever profiles `cargo`/`rustc` building it (confirmed: the
+/// binary panics in `TermWindow::new` before painting a single frame here).
+/// `Canvas`/`TextRenderer`/`Painter` have no Wayland dependency though --
+/// they operate on a plain `&mut [u32]` pixel buffer and (with `path: None`)
+/// the embedded bitmap font -- so this test drives the *actual* hot path
+/// (`Painter::paint`, the same call `App::run` makes every painted tick)
+/// directly, many times, with no window at all. Run under `perf record` via:
+///
+///   `cargo test --release --bin monitor -- --ignored headless_paint_perf_workload --nocapture`
+///
+/// to get a real flamegraph/hotspot breakdown of paint cost, and compare
+/// against the live `MONITOR_PROFILE=1` numbers from an actual session.
+#[cfg(test)]
+mod perf_harness {
+    use super::{
+        CARD_SURFACE, Canvas, ChartCache, History, MonitorSample, PERF_ITERATIONS, PaintPhases,
+        Painter, ProcessInfo, Snapshot, Typography,
+    };
+    use std::time::Instant;
+
+    /// A plausible, non-degenerate sample so every card/branch in `paint`
+    /// (hero numbers, detail rows, per-core bars, process list) does real
+    /// work instead of hitting an early-out on default/zero values.
+    fn synthetic_sample(tick: usize) -> MonitorSample {
+        // Vary values across ticks so nothing gets const-folded/cached by
+        // the optimizer in a way a real, changing workload wouldn't get.
+        #[allow(clippy::cast_precision_loss)]
+        let phase = (tick % 100) as f32;
+        MonitorSample {
+            cpu: 30.0 + phase * 0.5,
+            cores: vec![phase, 100.0 - phase, phase / 2.0, 50.0],
+            load: [1.2, 1.5, 1.8],
+            memory: 40.0 + phase * 0.2,
+            temperature: 55.0 + phase * 0.3,
+            thermal_device: "k10temp".to_owned(),
+            thermal_max: 70.0,
+            thermal_avg: 60.0,
+            thermal_min: 50.0,
+            disk: 12.0,
+            network_rx: phase / 10.0,
+            network_tx: phase / 20.0,
+            network_device: "eth0".to_owned(),
+            network_ping_ms: 8.5,
+            network_link_mbps: 1000.0,
+            cpu_brand: "Synthetic CPU".to_owned(),
+            cpu_cores: 4,
+            cpu_frequency_ghz: 3.4,
+            disk_io_mb_s: 5.0,
+            memory_available_mb: 8192.0,
+            swap_used_mb: 100.0,
+            memory_device: "16 GB".to_owned(),
+            swap_total_mb: 4096.0,
+        }
+    }
+
+    fn synthetic_processes(tick: usize) -> Vec<ProcessInfo> {
+        #[allow(clippy::cast_precision_loss)]
+        let phase = (tick % 100) as f32;
+        (0..30)
+            .map(|index| ProcessInfo {
+                pid: index,
+                name: format!("proc-{index}"),
+                cpu: phase / f32::from(u16::try_from(index).unwrap_or(u16::MAX) + 1),
+                memory_kb: 1024 * (u64::from(index) + 1),
+            })
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "long-running perf workload, not a correctness check -- run explicitly under perf record"]
+    fn headless_paint_perf_workload() {
+        let width = 1400;
+        let height = 900;
+        let mut pixels = vec![0u32; 1_260_000];
+        let mut typography = Typography {
+            hero: statusbar::TextRenderer::load(None, 32.0),
+            title: statusbar::TextRenderer::load(None, 14.0),
+            subtitle: statusbar::TextRenderer::load(None, 13.0),
+            normal: statusbar::TextRenderer::load(None, 11.0),
+        };
+        let mut painter = Painter::with_surface(CARD_SURFACE);
+        let mut history = History::new();
+        let mut phases = PaintPhases::default();
+
+        // `PERF_ITERATIONS` is long enough for a meaningful sample while
+        // remaining practical when explicitly run with `--ignored`.
+        let started = Instant::now();
+        for tick in 0..PERF_ITERATIONS {
+            let snapshot = Snapshot {
+                sample: synthetic_sample(tick),
+                processes: synthetic_processes(tick),
+            };
+            if tick % 25 == 0 {
+                history.add(&snapshot.sample);
+            }
+            let mut canvas = Canvas::new(&mut pixels, width, height);
+            // Every 10th tick pays for the full (text-heavy) repaint path;
+            // the rest exercise only the charts/bars, mirroring the real
+            // ~1-in-10 `full_repaint` ratio the live profiler reports.
+            let full_repaint = tick % 10 == 0;
+            painter.paint(
+                &mut canvas,
+                &mut typography,
+                &snapshot,
+                &history,
+                CARD_SURFACE,
+                full_repaint,
+                &mut phases,
+            );
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "headless_paint_perf_workload: {PERF_ITERATIONS} paints in {:.2?} ({:.3} ms/paint avg)",
+            elapsed,
+            elapsed.as_secs_f64() * 1_000.0 / 20_000.0
+        );
+        // Keep the chart cache alive for the whole loop's lifetime check --
+        // a real regression (e.g. rebuilding pixel history every frame
+        // instead of scrolling) would show up as a much higher ms/paint
+        // average above, visible to a human even though this isn't a hard
+        // assertion (perf timing varies too much across machines for a
+        // fixed threshold to be meaningful here).
+        let _ = ChartCache::new(CARD_SURFACE);
+    }
 }

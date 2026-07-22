@@ -378,6 +378,24 @@ pub struct NotificationRule {
 /// resolve the mirroring. This struct only holds the raw overrides actually
 /// present in the file.
 #[derive(Debug, Clone, Default, PartialEq)]
+pub struct MonitorConfig {
+    pub background: Option<Color>,
+    pub background_opacity: Option<f64>,
+    pub surface: Option<Color>,
+    pub surface_opacity: Option<f64>,
+    pub font_path: Option<String>,
+    pub font_size: Option<u32>,
+    pub hero_size: Option<f32>,
+    pub title_size: Option<f32>,
+    pub subtitle_size: Option<f32>,
+    pub normal_size: Option<f32>,
+    pub cpu: Option<Color>,
+    pub memory: Option<Color>,
+    pub temperature: Option<Color>,
+    pub network: Option<Color>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BarConfig {
     /// Background color override. `None` mirrors `[colors].background`.
     pub background: Option<Color>,
@@ -428,6 +446,7 @@ pub struct Config {
     pub palette: Palette,
     pub keybinds: Vec<Keybind>,
     pub bar: BarConfig,
+    pub monitor: MonitorConfig,
 }
 
 impl Default for Config {
@@ -442,6 +461,7 @@ impl Default for Config {
             palette: Palette::default(),
             keybinds: Vec::new(),
             bar: BarConfig::default(),
+            monitor: MonitorConfig::default(),
         }
     }
 }
@@ -507,6 +527,7 @@ impl Config {
         cfg.apply_colors(&table)?;
         cfg.apply_keybinds(&table);
         cfg.apply_bar(&table)?;
+        cfg.apply_monitor(&table)?;
         Ok(cfg)
     }
 
@@ -676,6 +697,84 @@ impl Config {
         }
     }
 
+    /// Apply the `[monitor]` table, if present. It uses the same Shelby TOML
+    /// loader as the terminal and keeps dashboard styling independent.
+    fn apply_monitor(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(monitor) = table.get_table("monitor") else {
+            return Ok(());
+        };
+        macro_rules! color {
+            ($field:ident, $key:literal) => {
+                if let Some(value) = monitor.get_str($key) {
+                    self.monitor.$field =
+                        Some(Color::parse_hex(value).ok_or(ConfigError::InvalidValue {
+                            field: concat!("monitor.", $key),
+                            reason: "invalid #rrggbb hex color",
+                        })?);
+                }
+            };
+        }
+        color!(background, "background");
+        color!(surface, "surface");
+        color!(cpu, "cpu");
+        if let Some(value) = monitor.get_float_range(
+            "background_opacity",
+            "monitor.background_opacity",
+            0.0,
+            1.0,
+            "must be between 0.0 and 1.0",
+        )? {
+            self.monitor.background_opacity = Some(value);
+        }
+        if let Some(value) = monitor.get_float_range(
+            "surface_opacity",
+            "monitor.surface_opacity",
+            0.0,
+            1.0,
+            "must be between 0.0 and 1.0",
+        )? {
+            self.monitor.surface_opacity = Some(value);
+        }
+        color!(memory, "memory");
+        color!(temperature, "temperature");
+        color!(network, "network");
+        if let Some(path) = monitor.get_str("font_path") {
+            self.monitor.font_path = Some(path.to_owned());
+        }
+        if let Some(size) = monitor.get_int_range(
+            "font_size",
+            "monitor.font_size",
+            1,
+            256,
+            "must be between 1 and 256",
+        )? {
+            self.monitor.font_size = Some(u32::try_from(size).unwrap_or(14));
+        }
+        for (key, slot) in [
+            ("hero_size", &mut self.monitor.hero_size),
+            ("title_size", &mut self.monitor.title_size),
+            ("subtitle_size", &mut self.monitor.subtitle_size),
+            ("normal_size", &mut self.monitor.normal_size),
+        ] {
+            if let Some(size) = monitor.get_float_range(
+                key,
+                "monitor.typography",
+                0.1,
+                10.0,
+                "must be between 0.1 and 10.0",
+            )? {
+                // The validated 0.1..=10.0 range is exactly representable
+                // enough for the renderer's f32 font-scale API; precision
+                // beyond that API is intentionally discarded here.
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    *slot = Some(size as f32);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Apply the `[bar]` table, if present. Every key is an *override* --
     /// leaving one unset means the status bar mirrors the corresponding
     /// terminal setting; see [`Config::bar_background`] /
@@ -838,6 +937,15 @@ impl Config {
     #[must_use]
     pub fn bar_opacity(&self) -> f64 {
         self.bar.opacity.unwrap_or(self.window.opacity)
+    }
+
+    /// Resolved monitor font path, falling back to the terminal font.
+    #[must_use]
+    pub fn monitor_font_path(&self) -> Option<&str> {
+        self.monitor
+            .font_path
+            .as_deref()
+            .or(self.font.path.as_deref())
     }
 
     /// The apps to watch for a compositor-reported urgent window -- see

@@ -54,3 +54,7 @@ harness = false
 [[bench]]
 name    = "transport"
 harness = false
+
+[[bench]]
+name    = "premultiply"
+harness = false

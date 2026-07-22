@@ -22,6 +22,7 @@ pub mod font;
 pub mod id;
 mod key_repeat;
 pub mod keymap;
+pub mod premultiply;
 pub mod present;
 pub mod protocol;
 pub mod sys;
@@ -36,6 +37,7 @@ pub mod window;
 
 pub use cursor_anim::{CursorAnimConfig, CursorAnimator};
 pub use error::{Error, Result};
+pub use premultiply::Premultiplier;
 pub use render::{Renderer, Theme};
 pub use surface::{Frame, Routed};
 pub use waker::Waker;

@@ -763,9 +763,13 @@ impl App {
         };
         let typography = Typography {
             hero: load_text(size * 2.5),
-            title: load_text(size * 0.85),
-            subtitle: load_text(size * 0.72),
-            normal: load_text(size),
+            // Keep the supporting tiers close to the original design: titles
+            // are the base UI size, subtitles are slightly quieter, and body
+            // values are smaller so the hierarchy reads without becoming
+            // oversized beside the hero metric.
+            title: load_text(size),
+            subtitle: load_text(size * 0.90),
+            normal: load_text(size * 0.80),
         };
         let background = Color::rgb(
             cfg.palette.background.r,

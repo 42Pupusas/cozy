@@ -13,6 +13,11 @@ fn process_stat_streaming(bencher: divan::Bencher) {
 }
 
 #[divan::bench]
+fn process_stat_byte(bencher: divan::Bencher) {
+    bencher.bench(|| divan::black_box(MonitorReader::parse_process_stat(divan::black_box(PROC_STAT))));
+}
+
+#[divan::bench]
 fn process_stat_allocating(bencher: divan::Bencher) {
     bencher.bench(|| {
         let close = PROC_STAT.rfind(')').unwrap();

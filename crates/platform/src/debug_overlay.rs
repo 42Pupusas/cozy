@@ -126,13 +126,7 @@ impl DebugOverlay {
         );
         let mut canvas = crate::draw::Canvas::new(backbuffer, width, height);
         for (i, ch) in text.chars().enumerate() {
-            let cell = grid::Cell {
-                ch,
-                attrs,
-                wide: false,
-                spacer: false,
-                link_id: 0,
-            };
+            let cell = grid::Cell::new(ch, attrs, 0);
             renderer.blit_cell(
                 &mut canvas,
                 start_col + u16::try_from(i).unwrap_or(u16::MAX),

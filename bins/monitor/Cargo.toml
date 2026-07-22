@@ -1,0 +1,17 @@
+[package]
+name = "monitor"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "monitor"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+statusbar = { path = "../../crates/statusbar" }
+platform = { path = "../../crates/platform" }
+config = { path = "../../crates/config" }
+waker = { path = "../../crates/waker" }

@@ -557,7 +557,7 @@ impl Renderer {
         // Spacer cells are the trailing (invisible) half of a wide glyph: the
         // lead cell paints both columns already, so drawing here would just
         // stamp a redundant blank over it (harmless but wasteful) -- skip.
-        if cell.spacer {
+        if cell.spacer() {
             return;
         }
 
@@ -598,7 +598,7 @@ impl Renderer {
 
         match &mut self.glyphs {
             GlyphSource::Bitmap => {
-                Self::blit_cell_bitmap(canvas, cx, cy, cell.wide, ch, fg_px, bg_px, fill_bg);
+                Self::blit_cell_bitmap(canvas, cx, cy, cell.wide(), ch, fg_px, bg_px, fill_bg);
             }
             GlyphSource::Face(cache) => {
                 Self::blit_cell_face(
@@ -608,7 +608,7 @@ impl Renderer {
                     cy,
                     self.cell_w,
                     self.cell_h,
-                    cell.wide,
+                    cell.wide(),
                     ch,
                     fg,
                     bg,
@@ -621,7 +621,7 @@ impl Renderer {
             self.draw_underline(canvas, cx, cy, cell.attrs, fg);
         }
         if cell.attrs.strikethrough() {
-            self.draw_strikethrough(canvas, cx, cy, cell.wide, fg);
+            self.draw_strikethrough(canvas, cx, cy, cell.wide(), fg);
         }
     }
 
@@ -681,7 +681,7 @@ impl Renderer {
                 }
             }
         };
-        match attrs.underline_style {
+        match attrs.underline_style() {
             UnderlineStyle::Double if y_base >= 1 => {
                 plot_row(y_base, false);
                 plot_row(y_base - 1, false);
@@ -766,7 +766,7 @@ impl Renderer {
                 // where the wide lead filled both of its columns' backgrounds
                 // and the spacer filled nothing.
                 while c < cells.len() {
-                    let next_bg = if cells[c].spacer {
+                    let next_bg = if cells[c].spacer() {
                         self.row_color_cache[c] = colors;
                         base_bg
                     } else {
@@ -808,7 +808,7 @@ impl Renderer {
             // there's no glyph. `invisible()` forces a blank glyph AND
             // suppresses decorations (matches real terminals: invisible text
             // has no visible underline either).
-            if cell.spacer || cell.attrs.invisible() {
+            if cell.spacer() || cell.attrs.invisible() {
                 continue;
             }
             if cell.ch == ' ' && !cell.attrs.underline() && !cell.attrs.strikethrough() {
@@ -1390,13 +1390,7 @@ mod tests {
     use grid::{DirtyRow, DirtySnapshot};
 
     fn cell(ch: char) -> Cell {
-        Cell {
-            ch,
-            attrs: Attrs::default(),
-            wide: false,
-            spacer: false,
-            link_id: 0,
-        }
+        Cell::new(ch, Attrs::default(), 0)
     }
 
     #[test]
@@ -1406,13 +1400,7 @@ mod tests {
         let mut canvas = Canvas::new(&mut buf, renderer.cell_w, renderer.cell_h);
         let mut attrs = Attrs::default();
         attrs.set_underline(true);
-        let c = Cell {
-            ch: 'X',
-            attrs,
-            wide: false,
-            spacer: false,
-            link_id: 0,
-        };
+        let c = Cell::new('X', attrs, 0);
         renderer.blit_cell(&mut canvas, 0, 0, &c);
         let fg_px = renderer
             .theme
@@ -1436,13 +1424,7 @@ mod tests {
         let mut attrs = Attrs::default();
         attrs.set_underline(true);
         attrs.underline_color = grid::Color::Rgb(1, 2, 3);
-        let c = Cell {
-            ch: ' ',
-            attrs,
-            wide: false,
-            spacer: false,
-            link_id: 0,
-        };
+        let c = Cell::new(' ', attrs, 0);
         renderer.blit_cell(&mut canvas, 0, 0, &c);
         let expect = DrawColor::rgb(1, 2, 3).to_xrgb8888();
         let y = usize::try_from(renderer.cell_h - 1).unwrap_or(0);
@@ -1457,13 +1439,7 @@ mod tests {
         let mut canvas = Canvas::new(&mut buf, renderer.cell_w, renderer.cell_h);
         let mut attrs = Attrs::default();
         attrs.set_strikethrough(true);
-        let c = Cell {
-            ch: 'X',
-            attrs,
-            wide: false,
-            spacer: false,
-            link_id: 0,
-        };
+        let c = Cell::new('X', attrs, 0);
         renderer.blit_cell(&mut canvas, 0, 0, &c);
         let fg_px = renderer
             .theme
@@ -1493,12 +1469,14 @@ mod tests {
         let mut blue = Attrs::default();
         blue.bg = grid::Color::Indexed(4);
 
-        let attr_cell = |ch: char, a: &Attrs, wide: bool, spacer: bool| Cell {
-            ch,
-            attrs: *a,
-            wide,
-            spacer,
-            link_id: 0,
+        let attr_cell = |ch: char, a: &Attrs, wide: bool, spacer: bool| {
+            if wide {
+                Cell::wide_lead(ch, *a, 0)
+            } else if spacer {
+                Cell::wide_spacer(*a, 0)
+            } else {
+                Cell::new(ch, *a, 0)
+            }
         };
         let def = Attrs::default();
         let cells = vec![

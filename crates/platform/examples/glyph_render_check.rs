@@ -125,13 +125,7 @@ fn main() {
         let mut row_ok = true;
         for (col_idx, ch) in row.text.chars().enumerate() {
             let cp = ch as u32;
-            let cell = grid::Cell {
-                ch,
-                attrs: grid::Attrs::default(),
-                wide: false,
-                spacer: false,
-                link_id: 0,
-            };
+            let cell = grid::Cell::new(ch, grid::Attrs::default(), 0);
             {
                 let mut canvas = Canvas::new(&mut backbuffer, bw, bh);
                 renderer.blit_cell(&mut canvas, col_idx as u16, row_idx as u16, &cell);

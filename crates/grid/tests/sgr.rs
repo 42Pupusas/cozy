@@ -68,14 +68,14 @@ fn strikethrough_on() {
 fn plain_underline_is_single_style() {
     let a = attrs_after(b"\x1b[4m");
     assert!(a.underline());
-    assert_eq!(a.underline_style, UnderlineStyle::Single);
+    assert_eq!(a.underline_style(), UnderlineStyle::Single);
 }
 
 #[test]
 fn colon_underline_style_selects_curly() {
     let a = attrs_after(b"\x1b[4:3m");
     assert!(a.underline());
-    assert_eq!(a.underline_style, UnderlineStyle::Curly);
+    assert_eq!(a.underline_style(), UnderlineStyle::Curly);
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn underline_color_256_and_rgb_and_default() {
 fn reset_clears_underline_style_and_color() {
     let a = attrs_after(b"\x1b[4:3;58;5;9;0m");
     assert!(!a.underline());
-    assert_eq!(a.underline_style, UnderlineStyle::Single);
+    assert_eq!(a.underline_style(), UnderlineStyle::Single);
     assert_eq!(a.underline_color, Color::Default);
 }
 

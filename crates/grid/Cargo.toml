@@ -6,6 +6,11 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Scroll-path instrumentation (compaction/blank counters) for the benchmark
+# harness. Off by default: the default build carries no counter state.
+stats = []
+
 [dependencies]
 vt_parser    = { path = "../vt_parser" }
 text_layout  = { path = "../text_layout" }

@@ -91,6 +91,32 @@ impl Parser {
         let mut i = 0;
         let n = bytes.len();
         while i < n {
+            // ── Plain ASCII run fast path ────────────────────────────────
+            // Floods spend most of their bytes in Ground as printable ASCII.
+            // Emit one borrowed event for a long run so consumers can process
+            // the stream without one callback per byte. Short runs retain the
+            // ordinary Print event shape for small event-oriented callers.
+            // NOTE: `is_ascii_graphic()` is the WRONG predicate here -- it
+            // excludes space (0x20), and real text has a space every ~5
+            // characters, which chopped every line into sub-8-byte word
+            // fragments that all fell back to the per-char Print path (the
+            // run fast path almost never fired on prose). Space is printable,
+            // single-width, and charset-safe, so the run covers 0x20..=0x7E
+            // (DEL 0x7F stays excluded -- it is a control byte).
+            if self.state == State::Ground && matches!(bytes[i], 0x20..=0x7E) {
+                let start = i;
+                while i < n && matches!(bytes[i], 0x20..=0x7E) {
+                    i += 1;
+                }
+                if i - start >= 8 {
+                    callback(TermEvent::PrintRun(&bytes[start..i]));
+                } else {
+                    for &byte in &bytes[start..i] {
+                        callback(TermEvent::Print(char::from(byte)));
+                    }
+                }
+                continue;
+            }
             // ── CSI parameter-body fast path ─────────────────────────────
             // In `CsiParam` the body is a run of ASCII digits and `;`
             // separators. Neither trips an "anywhere" transition (0x30..=0x39

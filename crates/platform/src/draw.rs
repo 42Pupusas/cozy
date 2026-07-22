@@ -257,6 +257,25 @@ impl<'a> Canvas<'a> {
         self.pixels[idx] = color.to_xrgb8888();
     }
 
+    /// Alpha-blend opaque `color` over one canvas pixel.
+    ///
+    /// Canvas surfaces are XRGB, so the result is written back as an opaque
+    /// color. This is intended for software anti-aliasing and subtle fills.
+    pub fn blend_pixel(&mut self, x: i32, y: i32, color: Color, alpha: u8) {
+        if x < 0 || y < 0 || x >= self.width || y >= self.height {
+            return;
+        }
+        let idx = (y.cast_unsigned() as usize) * (self.width.cast_unsigned() as usize)
+            + (x.cast_unsigned() as usize);
+        let packed = self.pixels[idx];
+        let background = Color::rgb(
+            ((packed >> 16) & 0xff) as u8,
+            ((packed >> 8) & 0xff) as u8,
+            (packed & 0xff) as u8,
+        );
+        self.pixels[idx] = background.blend_opaque_to(color, alpha);
+    }
+
     /// Fill `rect` (clipped to the canvas) with `color`.
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
         let Some((x0, y0, x1, y1)) = self.clip(rect) else {

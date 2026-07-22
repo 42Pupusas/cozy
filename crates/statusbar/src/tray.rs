@@ -16,6 +16,9 @@ const ITEM_IFACE: &str = "org.kde.StatusNotifierItem";
 const ITEM_PATH: &str = "/StatusNotifierItem";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const REGISTER_ITEM: &str = "RegisterStatusNotifierItem";
+const PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
+const HOST_REGISTERED_PROPERTY: &str = "IsStatusNotifierHostRegistered";
+const PROTOCOL_VERSION_PROPERTY: &str = "ProtocolVersion";
 
 /// One visible system-tray item. `attention` selects the client's dedicated
 /// attention artwork when it supplied one; the renderer is otherwise unaware
@@ -82,7 +85,10 @@ impl TrayWatcher {
                 eprintln!("statusbar: system tray D-Bus connection closed");
                 return;
             };
-            let changed = if Self::is_item_registration(&message) {
+            let changed = if Self::is_watcher_property_get(&message) {
+                Self::reply_watcher_property(&mut conn, &message);
+                false
+            } else if Self::is_item_registration(&message) {
                 Self::register(&mut conn, &message, &mut items)
             } else {
                 Self::refresh_changed_item(&mut conn, &message, &mut items)
@@ -98,7 +104,33 @@ impl TrayWatcher {
 
     fn is_item_registration(message: &dbus::message::Reply) -> bool {
         message.path.as_deref() == Some(WATCHER_PATH)
+            && message.interface.as_deref() == Some(WATCHER_NAME)
             && message.member.as_deref() == Some(REGISTER_ITEM)
+    }
+
+    /// Electron probes this standard watcher property before deciding whether
+    /// an SNI host is usable. Owning the bus name alone is not enough: an
+    /// earlier implementation dropped this method call, causing Mattermost
+    /// to silently decide no tray host existed and never register its item.
+    fn is_watcher_property_get(message: &dbus::message::Reply) -> bool {
+        message.path.as_deref() == Some(WATCHER_PATH)
+            && message.interface.as_deref() == Some(PROPERTIES_IFACE)
+            && message.member.as_deref() == Some("Get")
+    }
+
+    fn reply_watcher_property(conn: &mut DbusConn, message: &dbus::message::Reply) {
+        let (Some(sender), values) = (message.sender.as_deref(), message.values()) else {
+            return;
+        };
+        let property = values.get(1).and_then(Value::as_display_string);
+        let value = match property.as_deref() {
+            Some(HOST_REGISTERED_PROPERTY) => Some(dbus::message::BodyArg::VariantBool(true)),
+            Some(PROTOCOL_VERSION_PROPERTY) => Some(dbus::message::BodyArg::VariantU32(0)),
+            _ => None,
+        };
+        if let Some(value) = value {
+            let _ = conn.send_method_return(sender, message.serial, &[value]);
+        }
     }
 
     /// Resolve the registration's single string argument. The specification
@@ -129,7 +161,7 @@ impl TrayWatcher {
         };
         // Registration has no return values. Reply before querying the item:
         // clients may not expose properties until their invocation completes.
-        if conn.send_method_return(sender, message.serial).is_err() {
+        if conn.send_method_return(sender, message.serial, &[]).is_err() {
             return false;
         }
         let Some(item) = Self::read_item(conn, sender, &service, &path) else {
@@ -241,7 +273,7 @@ mod tests {
             kind: dbus::message::MessageType::MethodCall,
             sender: Some(":1.9".into()),
             path: Some(WATCHER_PATH.into()),
-            interface: None,
+            interface: Some(WATCHER_NAME.into()),
             member: Some(REGISTER_ITEM.into()),
             serial: 1,
             error_name: None,

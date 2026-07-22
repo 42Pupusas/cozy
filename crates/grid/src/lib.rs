@@ -26,6 +26,7 @@ mod dirty;
 mod palette;
 mod screen;
 mod selection;
+mod stats;
 
 pub use cell::{Attrs, Cell, Color, UnderlineStyle};
 pub use cursor::{Cursor, CursorShape};
@@ -33,6 +34,7 @@ pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand, Sn
 pub use palette::XTERM_256;
 pub use screen::Screen;
 pub use selection::{Point as SelPoint, Selection};
+pub use stats::ScrollStats;
 
 use input::{KeyboardMode, MouseMode};
 use vt_parser::{C0, CsiAction, DcsCmd, OscCmd, SgrAttr, TermEvent};
@@ -569,6 +571,7 @@ impl Grid {
         self.snap_viewport_to_bottom();
         match event {
             TermEvent::Print(ch) => self.print(*ch),
+            TermEvent::PrintRun(bytes) => self.print_ascii_run(bytes),
             TermEvent::Control(c0) => self.control(*c0),
             TermEvent::Csi(action) => self.csi(action),
             TermEvent::Osc(cmd) => self.osc(cmd),
@@ -809,6 +812,21 @@ impl Grid {
         self.cursor.shape
     }
 
+    /// Read the primary screen's scroll-path counters (benchmark harness
+    /// only; flood workloads scroll the primary screen).
+    #[cfg(feature = "stats")]
+    #[must_use]
+    pub fn scroll_stats(&self) -> ScrollStats {
+        self.primary.scroll_stats()
+    }
+
+    /// Zero the primary screen's scroll-path counters (benchmark harness
+    /// only; e.g. between benchmark phases).
+    #[cfg(feature = "stats")]
+    pub fn reset_scroll_stats(&mut self) {
+        self.primary.reset_scroll_stats();
+    }
+
     // ── private ───────────────────────────────────────────────────────────
 
     const fn active_screen(&self) -> &Screen {
@@ -824,6 +842,76 @@ impl Grid {
             &mut self.alternate
         } else {
             &mut self.primary
+        }
+    }
+
+    fn print_ascii_run(&mut self, bytes: &[u8]) {
+        // DEC Special Graphics can translate printable ASCII into Unicode box
+        // glyphs, so the direct narrow-cell path is valid only for the ASCII
+        // charset. The fallback keeps the exact general-character semantics.
+        let active_charset = if self.shifted_to_g1 {
+            self.g1_charset
+        } else {
+            self.g0_charset
+        };
+        if active_charset != Charset::Ascii {
+            for &byte in bytes {
+                self.print(char::from(byte));
+            }
+            return;
+        }
+
+        // The parser has already established that every byte is printable
+        // ASCII, hence every character is one cell wide. Keep the cursor and
+        // row start in locals across the run: this removes the width-table
+        // lookup, CellWidth trait dispatch, repeated screen selection, and
+        // repeated physical-row arithmetic from the flood path. A deferred
+        // wrap is still handled exactly at the boundary before the next glyph.
+        let cols = self.active_screen().cols();
+        let attrs = self.attrs;
+        let link_id = self.active_link_id;
+        let mut col = self.cursor.col;
+        let mut row = self.cursor.row;
+
+        let mut offset = 0;
+        while offset < bytes.len() {
+            if self.pending_wrap {
+                self.active_screen_mut().set_wrapped(row, true);
+                col = 0;
+                self.cursor.col = 0;
+                self.cursor.row = row;
+                self.cursor_down(1, true);
+                row = self.cursor.row;
+                self.pending_wrap = false;
+            }
+
+            let available = usize::from(cols - col);
+            let count = (bytes.len() - offset).min(available);
+            let row_start = self.active_screen().visible_row_start_for(row);
+            let written = self.active_screen_mut().write_ascii_cells(
+                row_start,
+                col,
+                &bytes[offset..offset + count],
+                attrs,
+                link_id,
+            );
+            debug_assert_eq!(written, count);
+            self.dirty.mark_rows(row, row);
+            self.last_printed = Some(char::from(bytes[offset + count - 1]));
+            offset += count;
+
+            if offset < bytes.len() {
+                col = cols - 1;
+                self.cursor.col = col;
+                self.pending_wrap = self.autowrap;
+            } else if col + u16::try_from(count).unwrap_or(u16::MAX) < cols {
+                col += u16::try_from(count).expect("ASCII run segment fits terminal width");
+                self.cursor.col = col;
+            } else {
+                col = cols - 1;
+                self.cursor.col = col;
+                self.pending_wrap = self.autowrap;
+            }
         }
     }
 
@@ -856,13 +944,17 @@ impl Grid {
             self.pending_wrap = false;
         }
 
+        // Cache geometry before the single mutable screen borrow below. This
+        // keeps the ordinary printable path from repeatedly selecting the
+        // primary/alternate screen and recalculating its visible index.
         let cols = self.active_screen().cols();
         if width == 2 && self.cursor.col + 1 == cols && self.autowrap {
             let row = self.cursor.row;
             let c = self.cursor.col;
-            self.active_screen_mut().set_cell(c, row, Cell::default());
+            let screen = self.active_screen_mut();
+            screen.set_cell(c, row, Cell::default());
+            screen.set_wrapped(row, true);
             self.dirty.mark(c, row);
-            self.active_screen_mut().set_wrapped(row, true);
             self.cursor.col = 0;
             self.cursor_down(1, true);
         }
@@ -873,32 +965,21 @@ impl Grid {
         let attrs = self.attrs;
         let link_id = self.active_link_id;
         let is_wide = width == 2;
-        self.active_screen_mut().set_cell(
-            col,
-            row,
-            Cell {
-                ch,
-                attrs,
-                wide: is_wide,
-                spacer: false,
-                link_id,
-            },
-        );
+        {
+            let screen = self.active_screen_mut();
+            let row_start = screen.visible_row_start_for(row);
+            let lead = if is_wide {
+                Cell::wide_lead(ch, attrs, link_id)
+            } else {
+                Cell::new(ch, attrs, link_id)
+            };
+            screen.set_cell_at(row_start, col, lead);
+            if is_wide && col + 1 < cols {
+                screen.set_cell_at(row_start, col + 1, Cell::wide_spacer(attrs, link_id));
+            }
+        }
         self.dirty.mark(col, row);
-        let cols = self.active_screen().cols();
-
         if is_wide && col + 1 < cols {
-            self.active_screen_mut().set_cell(
-                col + 1,
-                row,
-                Cell {
-                    ch: ' ',
-                    attrs,
-                    wide: false,
-                    spacer: true,
-                    link_id,
-                },
-            );
             self.dirty.mark(col + 1, row);
         }
 
@@ -934,7 +1015,7 @@ impl Grid {
         let row = self.cursor.row;
         let c = self.cursor.col - 1;
         let screen = self.active_screen();
-        let base_col = if screen.get_cell(c, row).spacer && c > 0 {
+        let base_col = if screen.get_cell(c, row).spacer() && c > 0 {
             c - 1
         } else {
             c
@@ -1327,7 +1408,8 @@ impl Grid {
             SgrAttr::FgRgb(r, g, b) => self.attrs.fg = Color::Rgb(r, g, b),
             SgrAttr::BgRgb(r, g, b) => self.attrs.bg = Color::Rgb(r, g, b),
             SgrAttr::UnderlineStyle(n) => {
-                self.attrs.underline_style = crate::cell::UnderlineStyle::from_sgr(n);
+                self.attrs
+                    .set_underline_style(crate::cell::UnderlineStyle::from_sgr(n));
                 // A style of 0 ("CSI 4:0 m") is the colon-form way to turn
                 // underline off entirely -- everything else implies it's on
                 // (mirrors how a bare `CSI 4 m` always turns it on).
@@ -1763,6 +1845,15 @@ impl Grid {
         }
         if self.link_table.last().is_some_and(|last| last == uri) {
             self.active_link_id = u32::try_from(self.link_table.len()).unwrap_or(u32::MAX);
+            return;
+        }
+        // `Cell` stores link ids narrowed to u16 (see `Cell::link_id`), so
+        // stop issuing new ids at that boundary: further distinct URIs print
+        // as plain unlinked text instead of aliasing entry 65 535. 65k live
+        // hyperlinks in one grid is far beyond any real session; degrading
+        // gracefully beats widening every cell by 2 bytes for it.
+        if self.link_table.len() >= usize::from(u16::MAX) {
+            self.active_link_id = 0;
             return;
         }
         self.link_table.push(uri.to_string());
@@ -2502,10 +2593,10 @@ mod tests {
         let lead = g.screen().get_cell(0, 0);
         let spacer = g.screen().get_cell(1, 0);
         assert_eq!(lead.ch, CJK_ZHONG.chars().next().unwrap());
-        assert!(lead.wide);
-        assert!(!lead.spacer);
-        assert!(spacer.spacer);
-        assert!(!spacer.wide);
+        assert!(lead.wide());
+        assert!(!lead.spacer());
+        assert!(spacer.spacer());
+        assert!(!spacer.wide());
         assert_eq!(g.cursor(), (2, 0));
     }
 
@@ -2519,7 +2610,7 @@ mod tests {
             g.screen().get_cell(1, 0).ch,
             CJK_ZHONG.chars().next().unwrap()
         );
-        assert!(g.screen().get_cell(2, 0).spacer);
+        assert!(g.screen().get_cell(2, 0).spacer());
         assert_eq!(g.screen().get_cell(3, 0).ch, 'b');
         assert_eq!(g.cursor(), (4, 0));
     }
@@ -2537,7 +2628,7 @@ mod tests {
             g.screen().get_cell(0, 1).ch,
             CJK_ZHONG.chars().next().unwrap()
         );
-        assert!(g.screen().get_cell(1, 1).spacer);
+        assert!(g.screen().get_cell(1, 1).spacer());
         assert_eq!(g.cursor(), (2, 1));
     }
 
@@ -2558,7 +2649,7 @@ mod tests {
         apply_str(&mut g, b"\x1b[1;2H\x1b[K");
         let lead = g.screen().get_cell(0, 0);
         assert_eq!(lead.ch, ' ', "orphaned wide lead must be cleared too");
-        assert!(!lead.wide);
+        assert!(!lead.wide());
     }
 
     #[test]
@@ -2570,16 +2661,16 @@ mod tests {
         for row in 0..g.screen().rows() {
             for col in 0..g.screen().cols() {
                 let c = g.screen().get_cell(col, row);
-                if c.wide {
+                if c.wide() {
                     assert!(
                         col + 1 < g.screen().cols(),
                         "wide cell at last column with no room for spacer"
                     );
-                    assert!(g.screen().get_cell(col + 1, row).spacer);
+                    assert!(g.screen().get_cell(col + 1, row).spacer());
                 }
-                if c.spacer {
+                if c.spacer() {
                     assert!(col > 0);
-                    assert!(g.screen().get_cell(col - 1, row).wide);
+                    assert!(g.screen().get_cell(col - 1, row).wide());
                 }
             }
         }

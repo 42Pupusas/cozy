@@ -356,7 +356,7 @@ impl SelectionTracker {
             if !line.is_empty() {
                 let end = c1.min(line.len().saturating_sub(1));
                 for cell in &line[c0.min(end)..=end] {
-                    if !cell.spacer {
+                    if !cell.spacer() {
                         s.push(cell.ch);
                     }
                 }
@@ -379,10 +379,7 @@ mod tests {
     fn text_row(row: u16, s: &str) -> DirtyRow {
         let cells = s
             .chars()
-            .map(|ch| Cell {
-                ch,
-                ..Cell::default()
-            })
+            .map(|ch| Cell::new(ch, grid::Attrs::default(), 0))
             .collect();
         DirtyRow { row, cells }
     }
@@ -609,20 +606,12 @@ mod tests {
         // find the cell it's over.
         let mut sel = SelectionTracker::new();
         let cells = vec![
-            Cell {
-                ch: 'a',
-                link_id: 0,
-                ..Cell::default()
-            },
-            Cell {
-                ch: 'b',
-                link_id: 7,
-                ..Cell::default()
-            },
+            Cell::new('a', grid::Attrs::default(), 0),
+            Cell::new('b', grid::Attrs::default(), 7),
         ];
         sel.ingest_snapshot(&incremental(vec![DirtyRow { row: 0, cells }], 0));
-        assert_eq!(sel.mirror()[0][0].link_id, 0);
-        assert_eq!(sel.mirror()[0][1].link_id, 7);
+        assert_eq!(sel.mirror()[0][0].link_id(), 0);
+        assert_eq!(sel.mirror()[0][1].link_id(), 7);
     }
 
     #[test]

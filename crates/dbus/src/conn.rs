@@ -185,13 +185,15 @@ impl DbusConn {
         &mut self,
         destination: &str,
         call_serial: u32,
+        args: &[BodyArg],
     ) -> Result<(), DbusError> {
         let serial = self.next_serial;
         self.next_serial = self.next_serial.wrapping_add(1).max(1);
-        let frame = crate::message::MessageBuilder::build_empty_method_return(
+        let frame = crate::message::MessageBuilder::build_method_return(
             serial,
             destination,
             call_serial,
+            args,
         );
         self.send_raw(&frame)
     }

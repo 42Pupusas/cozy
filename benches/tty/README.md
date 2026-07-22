@@ -19,6 +19,32 @@ platform` (renderer), plus `text_layout` and `input` on the side.
   fixtures.
 - `benches/input.rs` — `input::Encoder::encode_key` across all three
   keyboard modes.
+- `examples/ascii_512mb.rs` — one-shot, production-shaped measurement of
+  feeding 512 MiB of ASCII through 4 KiB PTY chunks, parser/grid batching, and
+  the real renderer/backbuffer present path.
+
+## Measuring a 512 MiB ASCII flood
+
+Run the workload (release mode is important):
+
+    cargo run --release -p tty-benches --example ascii_512mb
+
+The default uses the embedded bitmap renderer. To exercise the real TTF glyph
+path, pass the same font file used by the terminal:
+
+    cargo run --release -p tty-benches --example ascii_512mb -- font=/path/to/font.ttf
+
+Use `bytes=...` for a short smoke test. The output reports elapsed wall time,
+MiB/s, the number of 4 KiB chunks, snapshots, and presents. The timed region
+includes VT parsing, grid application, dirty snapshot construction, and
+`Renderer::blit_snapshot` into a real backbuffer. It excludes the Wayland
+compositor, compositor queueing, and OS PTY scheduling; those cannot be made
+reproducible by a headless benchmark. Run it several times and use the median;
+the first run warms code/data pages.
+
+This is deliberately an example rather than a repeated Divan bench: 512 MiB
+is a sustained workload, and repeatedly rebuilding it would measure allocator
+and page-cache effects more than terminal throughput.
 
 `CORPORA` also includes `control_heavy`, which has no `scripts/stress/*.sh`
 analogue: it cycles mouse-tracking mode changes, DECCKM/DECAWM/DECOM/focus-

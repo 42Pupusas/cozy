@@ -78,8 +78,38 @@ impl DirtyRegion {
             return;
         }
         let n = n.min(bot - top + 1);
-        // Ascending: we write row `r` (lower) after reading row `r + n`
-        // (higher, not yet overwritten), so no mark is clobbered before use.
+        // The normal terminal geometry is 24 rows, so the entire dirty map is
+        // one machine word. Keep this common scroll path as one masked shift:
+        // the old row-by-row loop did 24 loads, shifts, and stores for every
+        // newline that reached the bottom margin. That cost compounds into
+        // hundreds of millions of operations during a sustained flood.
+        let first_word = top / 64;
+        let last_word = bot / 64;
+        if first_word == last_word {
+            let width = bot - top + 1;
+            let region_mask = if width == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << width) - 1) << top
+            };
+            let bottom_start = bot - n + 1;
+            let bottom_width = n;
+            let bottom_mask = if bottom_width == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << bottom_width) - 1) << bottom_start
+            };
+            let word = &mut self.words[first_word];
+            let shifted = if n == 64 {
+                0
+            } else {
+                (*word & region_mask) >> n
+            };
+            *word = (*word & !region_mask) | shifted | bottom_mask;
+            return;
+        }
+        // Unusual large geometries can span several words. Preserve the
+        // straightforward implementation there; it is not the flood hot path.
         for r in top..=bot {
             let src = r + n;
             let v = if src <= bot { self.get_bit(src) } else { true };
@@ -89,9 +119,28 @@ impl DirtyRegion {
 
     /// Mark a range of rows dirty (inclusive).
     pub(crate) fn mark_rows(&mut self, top: u16, bot: u16) {
-        for row in top..=bot {
-            self.mark_row(row);
+        debug_assert!(top <= bot);
+        let top = usize::from(top);
+        let bot = usize::from(bot);
+        let first_word = top / 64;
+        let last_word = bot / 64;
+        if first_word == last_word {
+            let start = top % 64;
+            let end = bot % 64;
+            let width = end - start + 1;
+            let mask = if width == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << width) - 1) << start
+            };
+            self.words[first_word] |= mask;
+            return;
         }
+        self.words[first_word] |= u64::MAX << (top % 64);
+        for word in &mut self.words[first_word + 1..last_word] {
+            *word = u64::MAX;
+        }
+        self.words[last_word] |= u64::MAX >> (63 - (bot % 64));
     }
 
     /// Mark every row dirty (full redraw).
@@ -463,10 +512,7 @@ mod tests {
     }
 
     fn cell(ch: char) -> Cell {
-        Cell {
-            ch,
-            ..Cell::default()
-        }
+        Cell::new(ch, crate::Attrs::default(), 0)
     }
 
     fn band(top: u16, bot: u16, delta: u16) -> ScrollBand {

@@ -5,6 +5,11 @@ edition.workspace = true
 publish     = false
 description = "divan micro-benchmarks (cycles + allocations) for the tty pipeline: vt_parser -> grid -> platform, plus text_layout and input"
 
+[features]
+# Forward grid's scroll-path instrumentation so `grid_hotspots` can report
+# compaction/blank counters: `--features stats`.
+stats = ["grid/stats"]
+
 [lints]
 workspace = true
 
@@ -14,6 +19,7 @@ grid        = { path = "../../crates/grid" }
 platform    = { path = "../../crates/platform" }
 text_layout = { path = "../../crates/text_layout" }
 input       = { path = "../../crates/input" }
+config      = { path = "../../crates/config" }
 quetzalcoatl = { workspace = true }
 divan       = "0.1"
 

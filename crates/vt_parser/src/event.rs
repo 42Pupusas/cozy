@@ -304,6 +304,14 @@ pub enum DcsCmd<'a> {
 pub enum TermEvent<'a> {
     /// A printable Unicode character (or a multi-byte sequence decoded to char).
     Print(char),
+    /// A run of plain printable ASCII bytes from the ground state.
+    ///
+    /// Keeping the run borrowed lets consumers process flood traffic in one
+    /// callback without allocating or changing parser state semantics. Runs
+    /// are emitted only for sufficiently long stretches; short text remains
+    /// `Print` events for simple consumers and compatibility with event-level
+    /// callers.
+    PrintRun(&'a [u8]),
     /// C0 control character.
     Control(C0),
     /// ESC followed by a single character (ESC `c` etc.).

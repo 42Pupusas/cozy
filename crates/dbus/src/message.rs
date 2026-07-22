@@ -99,17 +99,37 @@ impl MessageBuilder {
     /// body, handling the padding its type requires.
     fn write_value(buf: &mut Vec<u8>, v: &BodyArg) {
         match v {
-            BodyArg::Str(s) | BodyArg::ObjectPath(s) => {
-                Self::pad_to(buf, 4);
-                buf.extend_from_slice(&u32::try_from(s.len()).unwrap_or(u32::MAX).to_le_bytes());
-                buf.extend_from_slice(s.as_bytes());
-                buf.push(0);
-            }
+            BodyArg::Str(s) | BodyArg::ObjectPath(s) => Self::write_string(buf, s),
             BodyArg::U32(n) => {
                 Self::pad_to(buf, 4);
                 buf.extend_from_slice(&n.to_le_bytes());
             }
+            BodyArg::Bool(value) => {
+                Self::pad_to(buf, 4);
+                buf.extend_from_slice(&u32::from(*value).to_le_bytes());
+            }
+            BodyArg::VariantBool(value) => {
+                Self::write_variant_signature(buf, "b");
+                Self::write_value(buf, &BodyArg::Bool(*value));
+            }
+            BodyArg::VariantU32(value) => {
+                Self::write_variant_signature(buf, "u");
+                Self::write_value(buf, &BodyArg::U32(*value));
+            }
         }
+    }
+
+    fn write_string(buf: &mut Vec<u8>, value: &str) {
+        Self::pad_to(buf, 4);
+        buf.extend_from_slice(&u32::try_from(value.len()).unwrap_or(u32::MAX).to_le_bytes());
+        buf.extend_from_slice(value.as_bytes());
+        buf.push(0);
+    }
+
+    fn write_variant_signature(buf: &mut Vec<u8>, signature: &str) {
+        buf.push(u8::try_from(signature.len()).unwrap_or(u8::MAX));
+        buf.extend_from_slice(signature.as_bytes());
+        buf.push(0);
     }
 
     /// Build an empty `METHOD_RETURN` frame answering `call_serial` from
@@ -117,7 +137,18 @@ impl MessageBuilder {
     /// so this deliberately covers the only server reply the bar needs
     /// before adding a broad outbound-value encoder.
     #[must_use]
-    pub fn build_empty_method_return(serial: u32, destination: &str, call_serial: u32) -> Vec<u8> {
+    pub fn build_method_return(
+        serial: u32,
+        destination: &str,
+        call_serial: u32,
+        args: &[BodyArg],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut signature = String::new();
+        for arg in args {
+            signature.push_str(arg.signature());
+            Self::write_value(&mut body, arg);
+        }
         let mut header_fields = Vec::new();
         Self::write_string_field(
             &mut header_fields,
@@ -125,6 +156,9 @@ impl MessageBuilder {
             b's',
             destination,
         );
+        if !signature.is_empty() {
+            Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', &signature);
+        }
         Self::pad_to(&mut header_fields, 8);
         header_fields.push(field_code::REPLY_SERIAL);
         header_fields.extend_from_slice(&[1, b'u', 0]);
@@ -132,7 +166,9 @@ impl MessageBuilder {
         header_fields.extend_from_slice(&call_serial.to_le_bytes());
 
         let mut out = vec![b'l', MessageType::MethodReturn.as_byte(), 0, 1];
-        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes(),
+        );
         out.extend_from_slice(&serial.to_le_bytes());
         out.extend_from_slice(
             &u32::try_from(header_fields.len())
@@ -141,6 +177,7 @@ impl MessageBuilder {
         );
         out.extend_from_slice(&header_fields);
         Self::pad_to(&mut out, 8);
+        out.extend_from_slice(&body);
         out
     }
 
@@ -214,6 +251,11 @@ pub enum BodyArg {
     Str(String),
     ObjectPath(String),
     U32(u32),
+    Bool(bool),
+    /// A property `Get` result is always a single `v`; the watcher presently
+    /// exposes boolean properties, so retain this deliberately narrow shape.
+    VariantBool(bool),
+    VariantU32(u32),
 }
 
 impl BodyArg {
@@ -222,6 +264,18 @@ impl BodyArg {
             Self::Str(_) => b's',
             Self::ObjectPath(_) => b'o',
             Self::U32(_) => b'u',
+            Self::Bool(_) => b'b',
+            Self::VariantBool(_) | Self::VariantU32(_) => b'v',
+        }
+    }
+
+    const fn signature(&self) -> &'static str {
+        match self {
+            Self::Str(_) => "s",
+            Self::ObjectPath(_) => "o",
+            Self::U32(_) => "u",
+            Self::Bool(_) => "b",
+            Self::VariantBool(_) | Self::VariantU32(_) => "v",
         }
     }
 }

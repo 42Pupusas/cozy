@@ -520,6 +520,18 @@ impl TermWindow {
         })
     }
 
+    /// Request a full repaint for clients that draw their own canvas through
+    /// [`Self::tick_with_painter`] instead of pushing terminal grid snapshots.
+    pub const fn request_redraw(&mut self) {
+        self.present.mark_dirty();
+    }
+
+    /// Physical output scale used by this toplevel's framebuffer and renderer.
+    #[must_use]
+    pub const fn scale(&self) -> i32 {
+        self.scale
+    }
+
     /// Queue a dirty snapshot to be blitted on the next frame.
     pub fn push_dirty(&mut self, snap: grid::DirtySnapshot) {
         if !snap.is_empty() {
@@ -568,7 +580,7 @@ impl TermWindow {
             .mirror()
             .get(usize::from(row))
             .and_then(|line| line.get(usize::from(col)))
-            .map_or(0, |cell| cell.link_id)
+            .map_or(0, grid::Cell::link_id)
     }
 
     /// Recompute which link (if any) is under the pointer given the current
@@ -641,6 +653,16 @@ impl TermWindow {
     /// Process pending Wayland events (non-blocking).
     /// Returns `true` while the window should stay open.
     pub fn tick(&mut self) -> Result<bool> {
+        self.tick_inner(None)
+    }
+
+    /// Process events and paint a client-owned full-window canvas while
+    /// retaining the normal xdg-shell lifecycle and resize handling.
+    pub fn tick_with_painter(&mut self, mut paint: impl FnMut(&mut crate::draw::Canvas<'_>)) -> Result<bool> {
+        self.tick_inner(Some(&mut paint))
+    }
+
+    fn tick_inner(&mut self, custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>)>) -> Result<bool> {
         if self.lifecycle == Lifecycle::Closing {
             return Ok(false);
         }
@@ -675,7 +697,7 @@ impl TermWindow {
 
         self.advance_autoscroll();
         self.advance_cursor_anim();
-        self.maybe_present()?;
+        self.maybe_present(custom_paint)?;
         Ok(true)
     }
 
@@ -896,7 +918,7 @@ impl TermWindow {
             }
         }
         self.advance_cursor_anim();
-        self.maybe_present()?;
+        self.maybe_present(None)?;
         Ok(self.lifecycle != Lifecycle::Closing)
     }
 
@@ -1012,7 +1034,7 @@ impl TermWindow {
                     .u32(ev.serial(0).raw()),
             );
             self.lifecycle = Lifecycle::Mapped;
-            self.maybe_present()?;
+            self.maybe_present(None)?;
             return Ok(());
         }
 
@@ -1538,7 +1560,7 @@ impl TermWindow {
         let mut lo = None;
         let mut hi = None;
         for (col, cell) in line.iter().enumerate() {
-            if cell.link_id == id {
+            if cell.link_id() == id {
                 lo.get_or_insert(col);
                 hi = Some(col);
             }
@@ -1741,7 +1763,7 @@ impl TermWindow {
     ) {
     }
 
-    fn maybe_present(&mut self) -> Result<()> {
+    fn maybe_present(&mut self, custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>)>) -> Result<()> {
         if self.lifecycle != Lifecycle::Mapped {
             return Ok(());
         }
@@ -1823,7 +1845,19 @@ impl TermWindow {
         // its own (no `Drop` impl) -- this ends that borrow early so the code
         // below can use `self` again; `drop()` here is a borrow-checker nudge,
         // not resource cleanup.
+        let custom_painted = custom_paint.is_some();
+        if let Some(paint) = custom_paint {
+            paint(&mut canvas);
+        }
         let _ = canvas;
+        // A custom painter owns pixels outside the terminal grid, so there are
+        // no DirtySnapshots to populate `touched_rows`. Mark every logical row
+        // stale; otherwise the custom pixels remain only in the persistent
+        // backbuffer and never get copied into the shm slot the compositor sees.
+        if custom_painted {
+            let row_count = (self.height / self.cell_h).max(1);
+            touched_rows.extend(0..u16::try_from(row_count).unwrap_or(u16::MAX));
+        }
         // Sub-phase timers (only read when DebugFps::Log fires below on a slow
         // present): `t_blit` = the coalesce+blit_snapshot loop, the only phase
         // the `blit` bench covers. The gap to `t_overlay` is overlay repaint;
@@ -1865,55 +1899,67 @@ impl TermWindow {
             // full band so every moved row is re-copied + damaged.
             Self::extend_with_scrolled_bands(&mut touched_rows, &scrolls);
         }
-        // Selection highlight. Repaint the rows that *were* highlighted last
-        // frame (clean), plus the rows the selection touches now (so a moved
-        // drag doesn't double-tint), then tint the current selection. This
-        // keeps the effect idempotent and removable on deselect. The cursor
-        // overlay's old rows are included too, since the cursor may be
-        // sliding through (or resting on) a row the selection logic doesn't
-        // know about, and it must be repainted clean before either the
-        // selection tint or the cursor itself redraw on top.
-        let mut rows_to_repaint = std::mem::take(&mut self.prev_selection_rows);
-        for r in self.selection_rows() {
-            if !rows_to_repaint.contains(&r) {
+        if custom_painted {
+            // A painter-owned window has no terminal grid, selection, or text
+            // input. In particular, do not composite the terminal cursor over
+            // a dashboard merely because its normal toplevel has keyboard
+            // focus. The painter clears its own full frame, so stale terminal
+            // overlays need no cleanup on this path either.
+            self.prev_selection_rows.clear();
+            self.prev_cursor_rows.clear();
+            self.prev_hover_row = None;
+            let _ = self.debug_take_prev_rows();
+        } else {
+            // Selection highlight. Repaint the rows that *were* highlighted last
+            // frame (clean), plus the rows the selection touches now (so a moved
+            // drag doesn't double-tint), then tint the current selection. This
+            // keeps the effect idempotent and removable on deselect. The cursor
+            // overlay's old rows are included too, since the cursor may be
+            // sliding through (or resting on) a row the selection logic doesn't
+            // know about, and it must be repainted clean before either the
+            // selection tint or the cursor itself redraw on top.
+            let mut rows_to_repaint = std::mem::take(&mut self.prev_selection_rows);
+            for r in self.selection_rows() {
+                if !rows_to_repaint.contains(&r) {
+                    rows_to_repaint.push(r);
+                }
+            }
+            if let Some(r) = self.prev_hover_row.take()
+                && !rows_to_repaint.contains(&r)
+            {
                 rows_to_repaint.push(r);
             }
-        }
-        if let Some(r) = self.prev_hover_row.take()
-            && !rows_to_repaint.contains(&r)
-        {
-            rows_to_repaint.push(r);
-        }
-        if self.hover_link_id != 0 {
-            let (_, row) = self.pointer_cell();
-            if !rows_to_repaint.contains(&row) {
-                rows_to_repaint.push(row);
+            if self.hover_link_id != 0 {
+                let (_, row) = self.pointer_cell();
+                if !rows_to_repaint.contains(&row) {
+                    rows_to_repaint.push(row);
+                }
             }
-        }
-        for r in std::mem::take(&mut self.prev_cursor_rows) {
-            if !rows_to_repaint.contains(&r) {
-                rows_to_repaint.push(r);
+            for r in std::mem::take(&mut self.prev_cursor_rows) {
+                if !rows_to_repaint.contains(&r) {
+                    rows_to_repaint.push(r);
+                }
             }
-        }
-        for r in self.debug_take_prev_rows() {
-            if !rows_to_repaint.contains(&r) {
-                rows_to_repaint.push(r);
+            for r in self.debug_take_prev_rows() {
+                if !rows_to_repaint.contains(&r) {
+                    rows_to_repaint.push(r);
+                }
             }
+            self.repaint_rows(&rows_to_repaint);
+            touched_rows.extend_from_slice(&rows_to_repaint);
+            self.apply_selection_highlight();
+            touched_rows.extend(self.selection_rows());
+            self.prev_selection_rows = self.selection_rows();
+            self.apply_link_hover_underline();
+            if let Some(r) = self.prev_hover_row {
+                touched_rows.push(r);
+            }
+            let new_cursor_rows = self.draw_cursor_overlay();
+            touched_rows.extend_from_slice(&new_cursor_rows);
+            self.prev_cursor_rows = new_cursor_rows;
+            let new_fps_rows = self.debug_draw_overlay();
+            touched_rows.extend_from_slice(&new_fps_rows);
         }
-        self.repaint_rows(&rows_to_repaint);
-        touched_rows.extend_from_slice(&rows_to_repaint);
-        self.apply_selection_highlight();
-        touched_rows.extend(self.selection_rows());
-        self.prev_selection_rows = self.selection_rows();
-        self.apply_link_hover_underline();
-        if let Some(r) = self.prev_hover_row {
-            touched_rows.push(r);
-        }
-        let new_cursor_rows = self.draw_cursor_overlay();
-        touched_rows.extend_from_slice(&new_cursor_rows);
-        self.prev_cursor_rows = new_cursor_rows;
-        let new_fps_rows = self.debug_draw_overlay();
-        touched_rows.extend_from_slice(&new_fps_rows);
         let t_overlay = present_start.elapsed();
 
         // Every row touched this frame is now stale relative to *both* shm

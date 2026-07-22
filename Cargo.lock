@@ -171,6 +171,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "monitor"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "platform",
+ "statusbar",
+ "waker",
+]
+
+[[package]]
 name = "platform"
 version = "0.1.0"
 dependencies = [
@@ -333,6 +343,7 @@ version = "0.1.0"
 name = "tty-benches"
 version = "0.1.0"
 dependencies = [
+ "config",
  "divan",
  "grid",
  "input",

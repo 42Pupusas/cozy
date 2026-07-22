@@ -295,26 +295,26 @@ fn osc_title_is_captured_and_take_clears_it() {
 #[test]
 fn osc8_hyperlink_stamps_cells_with_a_link_id_resolvable_to_its_uri() {
     let mut g = Grid::new(20, 3);
-    assert_eq!(g.screen().get_cell(0, 0).link_id, 0);
+    assert_eq!(g.screen().get_cell(0, 0).link_id(), 0);
     feed(
         &mut g,
         b"\x1b]8;;https://example.com\x07link\x1b]8;;\x07plain",
     );
     let linked = g.screen().get_cell(0, 0);
-    assert_ne!(linked.link_id, 0);
-    assert_eq!(g.link_uri(linked.link_id), Some("https://example.com"));
+    assert_ne!(linked.link_id(), 0);
+    assert_eq!(g.link_uri(linked.link_id()), Some("https://example.com"));
     // The trailing "plain" text after the close form carries no link.
     let unlinked = g.screen().get_cell(4, 0);
-    assert_eq!(unlinked.link_id, 0);
+    assert_eq!(unlinked.link_id(), 0);
 }
 
 #[test]
 fn osc8_repeated_same_uri_reuses_the_link_id() {
     let mut g = Grid::new(20, 3);
     feed(&mut g, b"\x1b]8;;https://a\x07a\x1b]8;;\x07");
-    let id1 = g.screen().get_cell(0, 0).link_id;
+    let id1 = g.screen().get_cell(0, 0).link_id();
     feed(&mut g, b"\x1b]8;;https://a\x07b\x1b]8;;\x07");
-    let id2 = g.screen().get_cell(1, 0).link_id;
+    let id2 = g.screen().get_cell(1, 0).link_id();
     assert_eq!(
         id1, id2,
         "re-opening the same URI right after closing it should reuse the id"
@@ -332,7 +332,7 @@ fn osc8_link_uri_is_none_for_id_zero_and_stale_ids() {
 fn ris_clears_the_link_table() {
     let mut g = Grid::new(20, 3);
     feed(&mut g, b"\x1b]8;;https://a\x07x\x1b]8;;\x07");
-    let id = g.screen().get_cell(0, 0).link_id;
+    let id = g.screen().get_cell(0, 0).link_id();
     assert!(g.link_uri(id).is_some());
     feed(&mut g, b"\x1bc"); // RIS
     assert_eq!(g.link_uri(id), None);

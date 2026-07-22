@@ -122,7 +122,7 @@ impl Screen {
                 // Safe: `col` is bounded above by `row_width - 1`, and
                 // `row_width` came from `self.cols(): u16`.
                 let cell = self.abs_cell(u16::try_from(col).unwrap_or(u16::MAX), abs_row);
-                if cell.spacer {
+                if cell.spacer() {
                     continue;
                 }
                 line.push(cell.ch);
@@ -156,10 +156,7 @@ mod tests {
                 s.set_cell(
                     col,
                     row,
-                    Cell {
-                        ch,
-                        ..Cell::default()
-                    },
+                    Cell::new(ch, crate::Attrs::default(), 0),
                 );
             }
         }
@@ -237,28 +234,17 @@ mod tests {
         s.set_cell(
             0,
             0,
-            Cell {
-                ch: '中',
-                wide: true,
-                ..Cell::default()
-            },
+            Cell::wide_lead('中', crate::Attrs::default(), 0),
         );
         s.set_cell(
             1,
             0,
-            Cell {
-                ch: ' ',
-                spacer: true,
-                ..Cell::default()
-            },
+            Cell::wide_spacer(crate::Attrs::default(), 0),
         );
         s.set_cell(
             2,
             0,
-            Cell {
-                ch: 'x',
-                ..Cell::default()
-            },
+            Cell::new('x', crate::Attrs::default(), 0),
         );
         let sel = Selection {
             start: pt(0, 0),

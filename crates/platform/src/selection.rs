@@ -224,6 +224,22 @@ impl SelectionTracker {
             self.view_offset = new_off;
             if view_delta != 0 && !is_snap_to_bottom {
                 self.shift(view_delta);
+                // Stash the mirror's rows -- about to be wiped by the
+                // full-frame repaint below -- into `history` before we lose
+                // them, keyed by their now-shifted signed row. Mirrors the
+                // content-scroll path's identical safeguard just below:
+                // without this, a selected row that wheel-scrolls off-screen
+                // (rather than being pushed off by new output) would
+                // silently vanish from `selected_text` once the repaint
+                // rebuilds `mirror` from scratch -- even though scrolling
+                // the *viewport* is only supposed to move what's visible,
+                // not shrink the selection itself.
+                if !self.mirror.is_empty() && self.range.is_some() {
+                    for (i, cells) in self.mirror.drain(..).enumerate() {
+                        let row = i32::try_from(i).unwrap_or(i32::MAX) + view_delta;
+                        self.history.insert(row, cells);
+                    }
+                }
             }
             self.mirror.clear();
         } else if self.view_offset != 0 {
@@ -331,20 +347,23 @@ impl SelectionTracker {
             // never made it into either -- scrolled off before the selection
             // existed, or genuinely below the mirror -- are unrecoverable and
             // skipped, same as before.
-            let line = if row < 0 {
-                // `history` is keyed by the signed viewport row (see the
-                // field doc + `ingest_snapshot`'s insert at key `i - d`), so
-                // look it up by `row` directly, not a positional index.
-                match self.history.get(&row) {
-                    Some(line) => line,
-                    None => continue,
-                }
+            // Rows still on-screen live in `mirror` at a matching positional
+            // index; anything else -- scrolled off the top (negative rows)
+            // *or* pushed below the mirror's current extent by a viewport
+            // wheel-scroll (still non-negative, just past `mirror.len()`) --
+            // may still be recoverable from `history`. Try `mirror` first
+            // since it's the fresher/likelier source for on-screen rows, then
+            // fall back to `history` for anything it doesn't have, rather
+            // than assuming sign alone decides where a row lives: a wheel
+            // scroll can push a row out of `mirror`'s range without ever
+            // making its signed row negative.
+            let mirror_hit = if row >= 0 {
+                self.mirror.get(usize::try_from(row).unwrap_or(usize::MAX))
             } else {
-                // `row >= 0` per the `if row < 0` branch above.
-                match self.mirror.get(usize::try_from(row).unwrap_or(0)) {
-                    Some(line) => line,
-                    None => continue,
-                }
+                None
+            };
+            let Some(line) = mirror_hit.or_else(|| self.history.get(&row)) else {
+                continue;
             };
             let c0 = if row == sr { usize::from(sc) } else { 0 };
             let c1 = if row == er {
@@ -583,6 +602,29 @@ mod tests {
         // Wheel-scroll up into history by 3 lines: text appears to move down.
         sel.ingest_snapshot(&viewport(vec![], 3, 0));
         assert_eq!(sel.range().unwrap().0.1, 3);
+    }
+
+    #[test]
+    fn copy_recovers_full_text_after_a_wheel_scroll_pushes_selection_off_screen() {
+        // Regression test: a selection that scrolls out of view via a plain
+        // mouse-wheel viewport scroll (not new output) must still be fully
+        // recoverable on copy, exactly like the content-scroll case above.
+        // Previously the viewport branch called `mirror.clear()` without
+        // stashing the outgoing rows into `history` first, so scrolling the
+        // selected row off-screen silently dropped it from the clipboard.
+        let mut sel = with_two_rows();
+        sel.press_left((0, 0), false); // anchor at "hello world"
+        sel.drag_to((11, 0));
+        assert_eq!(sel.selected_text().as_deref(), Some("hello world"));
+        // Wheel-scroll the viewport down (offset -> 0 stays put here isn't
+        // enough -- push offset up first so scrolling back down moves the
+        // selection's row out of the visible range).
+        sel.ingest_snapshot(&viewport(vec![], 5, 0));
+        // The mirror was wiped for the full-frame repaint and never refilled
+        // (this test sends no rows), so the row is only recoverable via the
+        // `history` stash added by this fix -- exactly the scenario that
+        // used to silently drop the text.
+        assert_eq!(sel.selected_text().as_deref(), Some("hello world"));
     }
 
     #[test]

@@ -17,6 +17,7 @@
 use crate::error::PtyError;
 use ququmatz::RawFd;
 use std::ffi::CString;
+use std::os::unix::fs::PermissionsExt;
 
 // ── syscall numbers (x86_64 Linux) ─────────────────────────────────────────
 
@@ -577,6 +578,55 @@ impl RawPty {
         Ok(unsafe { CString::from_vec_with_nul_unchecked(path.into_bytes()) })
     }
 
+    /// Resolve `program` to an absolute path by searching `$PATH`, the way
+    /// a shell does before `exec`ing a bare command name.
+    ///
+    /// `execve(2)` -- unlike a shell's own builtin `exec`/`system(3)` --
+    /// does **not** consult `$PATH` itself: it only accepts an absolute
+    /// path or one containing a `/`. `Config::shell` is always already
+    /// absolute (it comes from `$SHELL`, itself an absolute path), so this
+    /// was never hit on the default startup path -- but `-e <program>`
+    /// (see `bins/terminal`'s `Cli`) hands a bare name like `"nvim"`
+    /// straight through. Without this step that `execve` call fails with
+    /// `ENOENT`, the child falls through to the documented `exit(127)`, and
+    /// the whole window opens and closes within microseconds with nothing
+    /// printed anywhere to explain why -- indistinguishable from "did
+    /// nothing".
+    ///
+    /// If `program` already contains a `/` (absolute or relative-to-cwd),
+    /// or no candidate on `$PATH` exists, it is returned unchanged:
+    /// `execve` itself is still the source of truth for the final error in
+    /// that case (nonexistent absolute path, no `$PATH` set, etc.), this
+    /// just restores the bare-name lookup a shell would normally have done
+    /// first.
+    fn resolve_program_path(program: &str) -> String {
+        if program.contains('/') {
+            return program.to_owned();
+        }
+        let Ok(path_var) = std::env::var("PATH") else {
+            return program.to_owned();
+        };
+        for dir in path_var.split(':') {
+            if dir.is_empty() {
+                continue;
+            }
+            let candidate = std::path::Path::new(dir).join(program);
+            // `execve` requires the file to be both present and
+            // executable; a metadata check that only confirms existence
+            // would let a non-executable same-named file win over a later,
+            // correct `$PATH` entry. `std::fs::metadata` plus the Unix
+            // executable bit is the same test a shell's `access(2)`-based
+            // lookup makes.
+            if let Ok(meta) = std::fs::metadata(&candidate)
+                && meta.is_file()
+                && meta.permissions().mode() & 0o111 != 0
+            {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        program.to_owned()
+    }
+
     /// Fork and exec the shell under the PTY slave.
     ///
     /// Returns `(master_fd, child_pid)` in the parent.
@@ -596,8 +646,10 @@ impl RawPty {
         master_fd.set_win_size(win_size)?;
         let slave_path = Self::pts_path(master_fd)?;
 
-        // Build execve argv.
-        let shell_cs = CString::new(shell).map_err(|_| PtyError::Exec(22))?;
+        // Build execve argv. `shell` is resolved against `$PATH` first --
+        // see `resolve_program_path`'s doc for why this is required at all.
+        let resolved_shell = Self::resolve_program_path(shell);
+        let shell_cs = CString::new(resolved_shell).map_err(|_| PtyError::Exec(22))?;
         let args_cs: Vec<CString> = args
             .iter()
             .map(|a| CString::new(*a).map_err(|_| PtyError::Exec(22)))
@@ -799,7 +851,35 @@ impl RawPty {
 
 #[cfg(test)]
 mod tests {
-    use super::{OpenFlags, RawSyscallReturn, SigSet, Signal, WaitStatus};
+    use super::{OpenFlags, RawPty, RawSyscallReturn, SigSet, Signal, WaitStatus};
+
+    #[test]
+    fn resolve_program_path_leaves_paths_containing_slash_untouched() {
+        // Anything with a `/` is already absolute or cwd-relative --
+        // `execve` handles those itself, no `$PATH` search applies.
+        assert_eq!(RawPty::resolve_program_path("/usr/bin/nvim"), "/usr/bin/nvim");
+        assert_eq!(RawPty::resolve_program_path("./nvim"), "./nvim");
+    }
+
+    #[test]
+    fn resolve_program_path_finds_bare_name_on_path() {
+        // `sh` is present on every POSIX system's `$PATH` (this is a Linux-
+        // only crate), typically as /bin/sh or /usr/bin/sh -- so this
+        // exercises the real search against the real filesystem rather
+        // than a mock.
+        let resolved = RawPty::resolve_program_path("sh");
+        assert!(
+            resolved.ends_with("/sh"),
+            "expected an absolute path ending in /sh, got {resolved:?}"
+        );
+        assert!(std::path::Path::new(&resolved).is_file());
+    }
+
+    #[test]
+    fn resolve_program_path_falls_back_unchanged_when_not_found() {
+        let name = "this-program-should-not-exist-anywhere-on-path";
+        assert_eq!(RawPty::resolve_program_path(name), name);
+    }
 
     #[test]
     fn wait_status_normal_exit_zero() {

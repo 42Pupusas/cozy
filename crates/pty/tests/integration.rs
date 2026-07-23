@@ -42,6 +42,20 @@ fn spawn_echo_roundtrip() {
 }
 
 #[test]
+fn bare_program_name_is_resolved_via_path() {
+    // A bare name with no `/` (like `-e nvim` hands `Pty::spawn` -- see
+    // `RawPty::resolve_program_path`'s doc) must still launch: `execve`
+    // itself never searches `$PATH`, so this exercises the fix directly
+    // through the same public entry point `bins/terminal`'s `-e` flag uses,
+    // not just the internal path-search helper in isolation.
+    let mut pty = PtySimple::spawn("sh", &["-c", "echo bare_name_works"], 80, 24)
+        .expect("spawn bare `sh` (no leading /) via $PATH search");
+    let out = read_until(&mut pty, Duration::from_secs(3));
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("bare_name_works"), "got: {text:?}");
+}
+
+#[test]
 fn write_is_echoed_back_by_shell_tty() {
     // A PTY in cooked mode echoes input back; catting stdin should give us
     // back whatever we write.

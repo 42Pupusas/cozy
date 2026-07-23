@@ -387,6 +387,51 @@ impl TermWindow {
     /// [`render::Renderer::with_scale`]); learning the scale, in turn,
     /// requires an open connection with `wl_output` bound, which is exactly
     /// the setup this function does.
+    /// Create the `wl_surface`/`xdg_surface`/`xdg_toplevel` object chain,
+    /// set its buffer scale/title/`app_id`, and commit the initial (empty)
+    /// state. Split out of `new` -- this whole block is one self-contained
+    /// "stand up the toplevel" step, entirely Wayland-request plumbing with
+    /// no data dependency on anything `new` builds afterwards (backbuffer,
+    /// present state, the `Self` struct literal), so it doesn't need to
+    /// share `new`'s complexity budget.
+    fn create_toplevel_surface(
+        sender: &mut Sender,
+        compositor: CompositorId,
+        wm_base: WmBaseId,
+        scale: i32,
+        title: &str,
+    ) -> Result<(SurfaceId, XdgSurfaceId, ToplevelId)> {
+        let surface: SurfaceId = sender.alloc_id();
+        sender.request(
+            MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
+        )?;
+        // Tell the compositor our buffer is already at `scale`x native
+        // density -- matches the physical pixels the font was rasterized at
+        // above, so it composites us 1:1 with no resampling blur.
+        sender.request(MessageBuilder::new(surface, SurfaceRequest::SetBufferScale).i32(scale))?;
+
+        let xdg_surface: XdgSurfaceId = sender.alloc_id();
+        sender.request(
+            MessageBuilder::new(wm_base, WmBaseRequest::GetXdgSurface)
+                .new_id(xdg_surface)
+                .object(surface),
+        )?;
+
+        let toplevel: ToplevelId = sender.alloc_id();
+        sender.request(
+            MessageBuilder::new(xdg_surface, XdgSurfaceRequest::GetToplevel).new_id(toplevel),
+        )?;
+        sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetTitle).string(title))?;
+        // Also advertise a fixed app_id. The title is human-facing and shells
+        // rewrite it at runtime (OSC 0/2), so it's a poor match key; app_id is
+        // stable, letting tools (e.g. scripts/stress/resize_storm.sh) target
+        // *this* window without also grabbing whatever terminal launched it.
+        sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetAppId).string(APP_ID))?;
+        sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
+
+        Ok((surface, xdg_surface, toplevel))
+    }
+
     pub fn new(
         title: &str,
         cols: u16,
@@ -440,33 +485,8 @@ impl TermWindow {
         let (frames, shm_mem, pool) =
             Frame::create_pair(&mut sender, shm, width, height, buf_format)?;
 
-        let surface: SurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
-        )?;
-        // Tell the compositor our buffer is already at `scale`x native
-        // density -- matches the physical pixels the font was rasterized at
-        // above, so it composites us 1:1 with no resampling blur.
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::SetBufferScale).i32(scale))?;
-
-        let xdg_surface: XdgSurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(wm_base, WmBaseRequest::GetXdgSurface)
-                .new_id(xdg_surface)
-                .object(surface),
-        )?;
-
-        let toplevel: ToplevelId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(xdg_surface, XdgSurfaceRequest::GetToplevel).new_id(toplevel),
-        )?;
-        sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetTitle).string(title))?;
-        // Also advertise a fixed app_id. The title is human-facing and shells
-        // rewrite it at runtime (OSC 0/2), so it's a poor match key; app_id is
-        // stable, letting tools (e.g. scripts/stress/resize_storm.sh) target
-        // *this* window without also grabbing whatever terminal launched it.
-        sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetAppId).string(APP_ID))?;
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
+        let (surface, xdg_surface, toplevel) =
+            Self::create_toplevel_surface(&mut sender, compositor, wm_base, scale, title)?;
 
         let cursor = cursor::PointerCursor::create(&mut sender, shm, compositor, scale).ok();
 

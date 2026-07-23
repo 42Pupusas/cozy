@@ -1121,13 +1121,7 @@ impl TermWindow {
         // wl_pointer.*
         if let Some(pointer) = self.pointer {
             if ev.is(pointer) {
-                match ev.event::<PointerEvent>() {
-                    Some(PointerEvent::Enter) => self.handle_pointer_enter(pointer, &ev),
-                    Some(PointerEvent::Motion) => self.handle_pointer_motion(&ev),
-                    Some(PointerEvent::Button) => self.handle_pointer_button(&ev),
-                    Some(PointerEvent::Axis) => self.handle_pointer_axis(&ev),
-                    _ => {}
-                }
+                self.dispatch_pointer_event(pointer, &ev);
                 return Ok(());
             }
         }
@@ -1135,15 +1129,7 @@ impl TermWindow {
         // wl_keyboard.*
         if let Some(keyboard) = self.keyboard {
             if ev.is(keyboard) {
-                match ev.event::<KeyboardEvent>() {
-                    Some(KeyboardEvent::Keymap) => self.handle_keyboard_keymap(&ev),
-                    Some(KeyboardEvent::Enter) => self.handle_keyboard_enter(&ev),
-                    Some(KeyboardEvent::Key) => self.handle_keyboard_key(&ev),
-                    Some(KeyboardEvent::RepeatInfo) => self.handle_keyboard_repeat_info(&ev),
-                    Some(KeyboardEvent::Leave) => self.handle_keyboard_leave(),
-                    Some(KeyboardEvent::Modifiers) => self.handle_keyboard_modifiers(&ev),
-                    _ => {}
-                }
+                self.dispatch_keyboard_event(&ev);
                 return Ok(());
             }
         }
@@ -1182,6 +1168,37 @@ impl TermWindow {
         }
 
         Ok(())
+    }
+
+    /// Dispatch one `wl_pointer.*` event to its handler. Split out of
+    /// `handle_event` -- the inner `match` was itself 4 branches contributing
+    /// straight to that function's cyclomatic complexity for a chunk of
+    /// dispatch that has nothing to do with the connection-level routing
+    /// around it.
+    fn dispatch_pointer_event(&mut self, pointer: PointerId, ev: &RawEvent) {
+        match ev.event::<PointerEvent>() {
+            Some(PointerEvent::Enter) => self.handle_pointer_enter(pointer, ev),
+            Some(PointerEvent::Motion) => self.handle_pointer_motion(ev),
+            Some(PointerEvent::Button) => self.handle_pointer_button(ev),
+            Some(PointerEvent::Axis) => self.handle_pointer_axis(ev),
+            _ => {}
+        }
+    }
+
+    /// Dispatch one `wl_keyboard.*` event to its handler. Same rationale as
+    /// [`Self::dispatch_pointer_event`]: an inline 6-armed match here inflated
+    /// `handle_event`'s complexity for dispatch logic unrelated to every
+    /// other protocol object it also routes.
+    fn dispatch_keyboard_event(&mut self, ev: &RawEvent) {
+        match ev.event::<KeyboardEvent>() {
+            Some(KeyboardEvent::Keymap) => self.handle_keyboard_keymap(ev),
+            Some(KeyboardEvent::Enter) => self.handle_keyboard_enter(ev),
+            Some(KeyboardEvent::Key) => self.handle_keyboard_key(ev),
+            Some(KeyboardEvent::RepeatInfo) => self.handle_keyboard_repeat_info(ev),
+            Some(KeyboardEvent::Leave) => self.handle_keyboard_leave(),
+            Some(KeyboardEvent::Modifiers) => self.handle_keyboard_modifiers(ev),
+            _ => {}
+        }
     }
 
     /// Re-apply the currently held key's motion on a repeat-timer tick (the

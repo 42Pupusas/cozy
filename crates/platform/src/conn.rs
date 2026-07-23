@@ -596,44 +596,18 @@ impl Reader {
             // here instead of tearing down the whole connection.
             self.ring.submit_and_wait_retry(1)?;
 
-            let mut closed = false;
-            let mut pushed = false;
-            while let Some(cqe) = self.ring.complete() {
-                // Route by the user_data we tagged each arm with: the timerfd
-                // poll vs. the socket recv. The timer poll has no buffer/MORE
-                // flags, so we must split on user_data, not on the flags.
-                if cqe.user_data == UD_TIMER {
-                    self.absorb_timer_cqe(cqe.result, producer)?;
-                    pushed = true;
-                } else if self.absorb_recv_cqe(cqe.result, cqe.flags)? {
-                    closed = true;
-                }
-            }
+            let (closed, mut pushed) = self.reap_completions(producer)?;
 
-            // Drain whole messages out of the inbox and forward them.
-            while let Some(size) = WireEvent::parse(&self.inbox).map(|(_, s)| s) {
-                let event = RawEvent::from_wire_msg(&self.inbox[..size]);
-                self.inbox.drain(..size);
-                // push_block waits if the consumer is behind; if the consumer
-                // has dropped, push returns the value back and we stop.
-                if producer.push_block(event).is_err() {
-                    return Ok(());
-                }
-                pushed = true;
+            // Drain whole messages out of the inbox and forward them, then
+            // forward any fds that arrived alongside them. Either can signal
+            // "the consumer dropped, stop the loop" via `ControlFlow::Break`.
+            match self.drain_inbox_events(producer) {
+                core::ops::ControlFlow::Break(()) => return Ok(()),
+                core::ops::ControlFlow::Continue(p) => pushed |= p,
             }
-
-            // Forward any fds that arrived with this recv batch as one `Fd`
-            // event, pushed after the message events above. Wayland attaches
-            // fds out of band to a single message (clipboard send/receive,
-            // keymap); in practice an fd-bearing event arrives as its own
-            // recvmsg, so the batch correlates with the message just pushed.
-            // The main thread consumes them by order.
-            if !self.pending_fds.is_empty() {
-                let fds = core::mem::take(&mut self.pending_fds);
-                if producer.push_block(RawEvent::Fd(fds)).is_err() {
-                    return Ok(());
-                }
-                pushed = true;
+            match self.forward_pending_fds(producer) {
+                core::ops::ControlFlow::Break(()) => return Ok(()),
+                core::ops::ControlFlow::Continue(p) => pushed |= p,
             }
 
             // Wake the UI thread, which polls a shared eventfd rather than
@@ -649,6 +623,81 @@ impl Reader {
                 return Ok(());
             }
         }
+    }
+
+    /// Reap every completion currently queued and route it by the
+    /// `user_data` we tagged each arm with (timerfd poll vs. socket recv).
+    /// Split out of `run` -- this was the loop's inner `while let` reaping
+    /// block, a self-contained "drain the ring" step that doesn't need to
+    /// share `run`'s complexity budget with the inbox-draining and
+    /// fd-forwarding steps that follow it.
+    ///
+    /// Returns `(closed, pushed)`: `closed` once the peer has hung up,
+    /// `pushed` if any event (so far) was pushed to `producer` this
+    /// iteration -- both feed back into `run`'s end-of-loop wake/exit logic.
+    fn reap_completions(
+        &mut self,
+        producer: &Producer<RawEvent>,
+    ) -> Result<(bool, bool), ConnError> {
+        let mut closed = false;
+        let mut pushed = false;
+        while let Some(cqe) = self.ring.complete() {
+            if cqe.user_data == UD_TIMER {
+                self.absorb_timer_cqe(cqe.result, producer)?;
+                pushed = true;
+            } else if self.absorb_recv_cqe(cqe.result, cqe.flags)? {
+                closed = true;
+            }
+        }
+        Ok((closed, pushed))
+    }
+
+    /// Drain whole Wayland messages out of `self.inbox` and forward each as
+    /// a [`RawEvent`]. Split out of `run` for the same reason as
+    /// [`Self::reap_completions`].
+    ///
+    /// Returns `Continue(pushed)` normally, or `Break(())` the moment
+    /// `push_block` reports the consumer has dropped -- `run` treats that
+    /// as "stop the whole receive loop", matching the original inline
+    /// `return Ok(())`.
+    fn drain_inbox_events(
+        &mut self,
+        producer: &Producer<RawEvent>,
+    ) -> core::ops::ControlFlow<(), bool> {
+        let mut pushed = false;
+        while let Some(size) = WireEvent::parse(&self.inbox).map(|(_, s)| s) {
+            let event = RawEvent::from_wire_msg(&self.inbox[..size]);
+            self.inbox.drain(..size);
+            // push_block waits if the consumer is behind; if the consumer
+            // has dropped, push returns the value back and we stop.
+            if producer.push_block(event).is_err() {
+                return core::ops::ControlFlow::Break(());
+            }
+            pushed = true;
+        }
+        core::ops::ControlFlow::Continue(pushed)
+    }
+
+    /// Forward any fds that arrived with this recv batch as one `Fd` event,
+    /// pushed after the message events [`Self::drain_inbox_events`] already
+    /// pushed. Wayland attaches fds out of band to a single message
+    /// (clipboard send/receive, keymap); in practice an fd-bearing event
+    /// arrives as its own recvmsg, so the batch correlates with the message
+    /// just pushed. The main thread consumes them by order.
+    ///
+    /// Same `ControlFlow` contract as [`Self::drain_inbox_events`].
+    fn forward_pending_fds(
+        &mut self,
+        producer: &Producer<RawEvent>,
+    ) -> core::ops::ControlFlow<(), bool> {
+        if self.pending_fds.is_empty() {
+            return core::ops::ControlFlow::Continue(false);
+        }
+        let fds = core::mem::take(&mut self.pending_fds);
+        if producer.push_block(RawEvent::Fd(fds)).is_err() {
+            return core::ops::ControlFlow::Break(());
+        }
+        core::ops::ControlFlow::Continue(true)
     }
 
     /// Arm (or re-arm) the multishot recvmsg against the buffer pool.

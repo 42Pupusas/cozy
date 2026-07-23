@@ -279,43 +279,55 @@ impl Unmarshaller {
     fn unmarshal_fixed_width(type_byte: u8, buf: &[u8], offset: usize) -> Option<(Value, usize)> {
         match type_byte {
             b'y' => Some((Value::Byte(*buf.get(offset)?), offset + 1)),
-            b'b' => {
-                let aligned = Self::align_up(offset, 4);
-                let raw: u32 = read_le!(buf, aligned, u32)?;
-                Some((Value::Bool(raw != 0), aligned + 4))
-            }
-            b'n' => {
-                let aligned = Self::align_up(offset, 2);
-                Some((Value::I16(read_le!(buf, aligned, i16)?), aligned + 2))
-            }
-            b'q' => {
-                let aligned = Self::align_up(offset, 2);
-                Some((Value::U16(read_le!(buf, aligned, u16)?), aligned + 2))
-            }
-            b'i' => {
-                let aligned = Self::align_up(offset, 4);
-                Some((Value::I32(read_le!(buf, aligned, i32)?), aligned + 4))
-            }
-            b'u' => {
-                let aligned = Self::align_up(offset, 4);
-                Some((Value::U32(read_le!(buf, aligned, u32)?), aligned + 4))
-            }
-            b'x' => {
-                let aligned = Self::align_up(offset, 8);
-                Some((Value::I64(read_le!(buf, aligned, i64)?), aligned + 8))
-            }
-            b't' => {
-                let aligned = Self::align_up(offset, 8);
-                Some((Value::U64(read_le!(buf, aligned, u64)?), aligned + 8))
-            }
-            b'd' => {
-                let aligned = Self::align_up(offset, 8);
-                Some((Value::Double(read_le!(buf, aligned, f64)?), aligned + 8))
-            }
+            b'n' | b'q' => Self::unmarshal_2byte(type_byte, buf, offset),
+            b'b' | b'i' | b'u' => Self::unmarshal_4byte(type_byte, buf, offset),
+            b'x' | b't' | b'd' => Self::unmarshal_8byte(type_byte, buf, offset),
             // Unreachable: unmarshal only calls this for one of the 9 bytes
             // matched above.
             _ => None,
         }
+    }
+
+    /// The 2-byte-aligned fixed-width types: `n` (i16), `q` (u16).
+    fn unmarshal_2byte(type_byte: u8, buf: &[u8], offset: usize) -> Option<(Value, usize)> {
+        let aligned = Self::align_up(offset, 2);
+        Some(match type_byte {
+            b'n' => (Value::I16(read_le!(buf, aligned, i16)?), aligned + 2),
+            b'q' => (Value::U16(read_le!(buf, aligned, u16)?), aligned + 2),
+            // Unreachable: unmarshal_fixed_width only calls this for 'n'/'q'.
+            _ => return None,
+        })
+    }
+
+    /// The 4-byte-aligned fixed-width types: `b` (bool, as a u32 0/nonzero),
+    /// `i` (i32), `u` (u32).
+    fn unmarshal_4byte(type_byte: u8, buf: &[u8], offset: usize) -> Option<(Value, usize)> {
+        let aligned = Self::align_up(offset, 4);
+        Some(match type_byte {
+            b'b' => {
+                let raw: u32 = read_le!(buf, aligned, u32)?;
+                (Value::Bool(raw != 0), aligned + 4)
+            }
+            b'i' => (Value::I32(read_le!(buf, aligned, i32)?), aligned + 4),
+            b'u' => (Value::U32(read_le!(buf, aligned, u32)?), aligned + 4),
+            // Unreachable: unmarshal_fixed_width only calls this for
+            // 'b'/'i'/'u'.
+            _ => return None,
+        })
+    }
+
+    /// The 8-byte-aligned fixed-width types: `x` (i64), `t` (u64), `d`
+    /// (f64).
+    fn unmarshal_8byte(type_byte: u8, buf: &[u8], offset: usize) -> Option<(Value, usize)> {
+        let aligned = Self::align_up(offset, 8);
+        Some(match type_byte {
+            b'x' => (Value::I64(read_le!(buf, aligned, i64)?), aligned + 8),
+            b't' => (Value::U64(read_le!(buf, aligned, u64)?), aligned + 8),
+            b'd' => (Value::Double(read_le!(buf, aligned, f64)?), aligned + 8),
+            // Unreachable: unmarshal_fixed_width only calls this for
+            // 'x'/'t'/'d'.
+            _ => return None,
+        })
     }
 
     /// Decode one of the string-like types (`s`/`o`/`g`/`v`) at `offset`.

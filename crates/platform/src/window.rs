@@ -359,6 +359,18 @@ impl Drop for TermWindow {
     }
 }
 
+/// Result of [`TermWindow::left_button_bypass`]'s ownership decision for one
+/// `wl_pointer.button` event -- whether Shift was held, whether this press
+/// starts a terminal-selection bypass, and whether the app's own report
+/// should be suppressed. A named struct rather than a 3-tuple purely so the
+/// call site in `handle_pointer_button`/`drive_selection_from_left_button`
+/// reads `bypass.starts` instead of `bypass.0`.
+struct LeftButtonBypass {
+    shift: bool,
+    starts: bool,
+    suppress_report: bool,
+}
+
 impl TermWindow {
     /// Open a Wayland terminal window of `cols × rows` cells.
     ///
@@ -1335,64 +1347,102 @@ impl TermWindow {
     fn handle_pointer_button(&mut self, ev: &RawEvent) {
         let button = PointerButton::from_code(ev.arg(2));
         let state = ButtonState::from_raw(ev.arg(3));
+        let bypass = self.left_button_bypass(button, state);
+        self.report_pointer_button_to_app(button, state, bypass.suppress_report);
+        self.drive_selection_from_left_button(button, state, &bypass);
+    }
+
+    /// Left-button ownership decision (kitty/foot/xterm convention): while
+    /// an app has negotiated mouse tracking it owns bare clicks (reported,
+    /// no terminal selection); Shift+click bypasses the app and drives the
+    /// terminal's own selection instead (selection runs, report suppressed
+    /// for the whole drag). With no tracking the terminal owns the mouse
+    /// outright. Split out of `handle_pointer_button` so the three booleans
+    /// it used to compute inline (each folding in `button`/`state`/modifier
+    /// state) are one named, testable-in-isolation calculation instead of
+    /// contributing straight to that function's branch count.
+    const fn left_button_bypass(
+        &self,
+        button: Option<PointerButton>,
+        state: Option<ButtonState>,
+    ) -> LeftButtonBypass {
         let shift =
             (self.modifiers.depressed | self.modifiers.latched | self.modifiers.locked) & 0x01 != 0;
-        // Ownership of the left button (kitty/foot/xterm
-        // convention): while an app has negotiated mouse
-        // tracking it owns bare clicks (reported, no terminal
-        // selection); Shift+click bypasses the app and drives
-        // the terminal's own selection instead (selection
-        // runs, report suppressed for the whole drag). With
-        // no tracking the terminal owns the mouse outright.
         let is_left = matches!(button, Some(PointerButton::Left));
-        let bypass_starts =
+        let starts =
             is_left && matches!(state, Some(ButtonState::Pressed)) && (!self.app_mouse || shift);
-        let bypass_ends =
-            is_left && matches!(state, Some(ButtonState::Released)) && self.selection_bypass;
-        // Suppress the app report for both halves of a bypassed
-        // drag — an orphan press or release confuses the app.
-        let suppress_report = self.app_mouse && (bypass_starts && shift || bypass_ends);
-        if let (Some(button), Some(state)) = (button, state) {
-            let (cc, cr) = self.pointer_cell();
-            let mb = match button {
-                PointerButton::Left => MouseButton::Left,
-                PointerButton::Right => MouseButton::Right,
-                PointerButton::Middle => MouseButton::Middle,
-            };
-            self.mouse_pressed = matches!(state, ButtonState::Pressed).then_some(mb);
-            if !suppress_report {
-                self.input_queue.push_back(InputEvent::Mouse {
-                    button: mb,
-                    kind: if matches!(state, ButtonState::Pressed) {
-                        MouseEventKind::Press
-                    } else {
-                        MouseEventKind::Release
-                    },
-                    col: cc,
-                    row: cr,
-                    modifiers: self.modifiers,
-                });
-            }
+        let ends = is_left && matches!(state, Some(ButtonState::Released)) && self.selection_bypass;
+        // Suppress the app report for both halves of a bypassed drag -- an
+        // orphan press or release confuses the app.
+        let suppress_report = self.app_mouse && (starts && shift || ends);
+        LeftButtonBypass {
+            shift,
+            starts,
+            suppress_report,
         }
+    }
+
+    /// Queue the `InputEvent::Mouse` report for the app, unless this press/
+    /// release is being consumed entirely by a terminal-selection bypass.
+    fn report_pointer_button_to_app(
+        &mut self,
+        button: Option<PointerButton>,
+        state: Option<ButtonState>,
+        suppress_report: bool,
+    ) {
+        let (Some(button), Some(state)) = (button, state) else {
+            return;
+        };
+        let (cc, cr) = self.pointer_cell();
+        let mb = match button {
+            PointerButton::Left => MouseButton::Left,
+            PointerButton::Right => MouseButton::Right,
+            PointerButton::Middle => MouseButton::Middle,
+        };
+        self.mouse_pressed = matches!(state, ButtonState::Pressed).then_some(mb);
+        if suppress_report {
+            return;
+        }
+        self.input_queue.push_back(InputEvent::Mouse {
+            button: mb,
+            kind: if matches!(state, ButtonState::Pressed) {
+                MouseEventKind::Press
+            } else {
+                MouseEventKind::Release
+            },
+            col: cc,
+            row: cr,
+            modifiers: self.modifiers,
+        });
+    }
+
+    /// Press/release the terminal's own text selection when the left button
+    /// is (or was) bypassing the app, per [`Self::left_button_bypass`].
+    fn drive_selection_from_left_button(
+        &mut self,
+        button: Option<PointerButton>,
+        state: Option<ButtonState>,
+        bypass: &LeftButtonBypass,
+    ) {
         match (button, state) {
             (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
-                if bypass_starts {
+                if bypass.starts {
                     self.selection_bypass = self.app_mouse;
                     let (cc, cr) = self.pointer_cell();
                     // Press semantics (shift-extend / dismiss-click /
-                    // begin-potential-selection) live in the model.
-                    // Under app-mouse bypass shift is the *trigger*,
-                    // not an extend request, so only pass it through
-                    // when the terminal owns the mouse anyway.
+                    // begin-potential-selection) live in the model. Under
+                    // app-mouse bypass shift is the *trigger*, not an
+                    // extend request, so only pass it through when the
+                    // terminal owns the mouse anyway.
                     self.selection
-                        .press_left((cc, i32::from(cr)), shift && !self.app_mouse);
+                        .press_left((cc, i32::from(cr)), bypass.shift && !self.app_mouse);
                     self.present.mark_dirty();
                 }
             }
             (Some(PointerButton::Left), Some(ButtonState::Released)) => {
-                // Release ends the drag. If the pointer never
-                // moved since press, this was a bare click on
-                // empty space — nothing to keep.
+                // Release ends the drag. If the pointer never moved since
+                // press, this was a bare click on empty space -- nothing
+                // to keep.
                 self.selection_bypass = false;
                 self.selection.release_left();
                 self.present.mark_dirty();

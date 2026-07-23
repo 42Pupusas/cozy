@@ -5,7 +5,7 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use statusbar::{ModuleKind, ScrollAccumulator, TrayItem, Volume, steps_to_delta_pct};
+use statusbar::{ModuleKind, ScrollAccumulator, TrayItem, Volume};
 
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
@@ -42,6 +42,47 @@ const IDLE_POLL_MS: u64 = 100;
 const CLICK_DEBOUNCE_MS: u64 = 400;
 
 const DASH: &str = "—";
+
+/// Tracks "has at least `period` elapsed since the last time this fired."
+///
+/// Every module-refresh timer (clock/fast/slow/notifications) and every
+/// debounce guard (control-refresh/scroll-apply/click-spawn) in this file is
+/// the exact same shape: an `Instant` plus a fixed `Duration`, checked with
+/// hand-rolled `now.duration_since(last) >= PERIOD` arithmetic at each call
+/// site. Bundling that pattern here means each site becomes one
+/// `.is_due(now)` / `.mark(now)` pair instead of seven near-identical
+/// copies of the same two-line check that could individually drift (e.g.
+/// one site comparing with `>` instead of `>=`).
+#[derive(Debug, Clone, Copy)]
+struct Cadence {
+    period: Duration,
+    last: Instant,
+}
+
+impl Cadence {
+    /// A cadence that fires the instant it's first polled -- back-dated by
+    /// an hour (dwarfing every period used in this module) rather than
+    /// requiring a real elapsed period, so the worker's very first refresh
+    /// after startup populates every module immediately instead of leaving
+    /// the bar blank until the first period elapses.
+    fn due_now(period: Duration, now: Instant) -> Self {
+        let last = now.checked_sub(Duration::from_hours(1)).unwrap_or(now);
+        Self { period, last }
+    }
+
+    /// Whether at least `period` has elapsed since the last `mark`. Doesn't
+    /// mutate -- callers only pay for the corresponding work (and call
+    /// `mark`) when this is true, the same "check first, act second" shape
+    /// every site already had.
+    fn is_due(&self, now: Instant) -> bool {
+        now.duration_since(self.last) >= self.period
+    }
+
+    /// Record that this cadence just fired, resetting its wait.
+    const fn mark(&mut self, now: Instant) {
+        self.last = now;
+    }
+}
 
 /// A fully-rendered set of module strings, sent to the render thread
 /// whenever any of them changes. Deliberately just owned `String`s (not a
@@ -152,20 +193,20 @@ impl KnownPct {
 
 struct State {
     snap: Snapshot,
-    last_clock: Instant,
-    last_fast: Instant,
-    last_slow: Instant,
-    last_notifications: Instant,
+    clock: Cadence,
+    fast: Cadence,
+    slow: Cadence,
+    notifications: Cadence,
     #[allow(dead_code)]
-    last_cpu: Instant,
+    cpu: Cadence,
     /// `[[bar.notifications]]` rules read from config at startup -- static
     /// for the process lifetime (same posture as every other config-driven
     /// bar setting; no live config-reload support anywhere in this bar).
     notification_rules: Vec<config::NotificationRule>,
-    last_control_refresh: Instant,
+    control_refresh: Cadence,
     pending_scroll: Option<(ModuleKind, ScrollAccumulator)>,
-    last_scroll_apply: Instant,
-    last_click_spawn: Instant,
+    scroll_apply: Cadence,
+    click_spawn: Cadence,
     vol_out_known: Option<KnownPct>,
     vol_in_known: Option<KnownPct>,
     brightness_known: Option<KnownPct>,
@@ -174,22 +215,24 @@ struct State {
 impl State {
     fn new(notification_rules: Vec<config::NotificationRule>) -> Self {
         let now = Instant::now();
-        // Back-date every timer so the very first `refresh` call (right
-        // after the bar maps) populates every module immediately instead of
-        // waiting out a full period on a blank bar.
-        let stale = now.checked_sub(Duration::from_hours(1)).unwrap_or(now);
+        // Every cadence starts "already due" so the very first `refresh`
+        // call (right after the bar maps) populates every module
+        // immediately instead of waiting out a full period on a blank bar.
         Self {
             snap: Snapshot::default(),
-            last_clock: stale,
-            last_fast: stale,
-            last_slow: stale,
-            last_notifications: stale,
-            last_cpu: stale,
+            clock: Cadence::due_now(CLOCK_PERIOD, now),
+            fast: Cadence::due_now(FAST_PERIOD, now),
+            slow: Cadence::due_now(SLOW_PERIOD, now),
+            notifications: Cadence::due_now(NOTIFICATIONS_PERIOD, now),
+            cpu: Cadence::due_now(CPU_PERIOD, now),
             notification_rules,
-            last_control_refresh: stale,
+            control_refresh: Cadence::due_now(
+                Duration::from_millis(CONTROL_REFRESH_DEBOUNCE_MS),
+                now,
+            ),
             pending_scroll: None,
-            last_scroll_apply: stale,
-            last_click_spawn: stale,
+            scroll_apply: Cadence::due_now(Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS), now),
+            click_spawn: Cadence::due_now(Duration::from_millis(CLICK_DEBOUNCE_MS), now),
             vol_out_known: None,
             vol_in_known: None,
             brightness_known: None,
@@ -201,16 +244,16 @@ impl State {
         let now = Instant::now();
         let mut changed = false;
 
-        if now.duration_since(self.last_clock) >= CLOCK_PERIOD {
-            self.last_clock = now;
+        if self.clock.is_due(now) {
+            self.clock.mark(now);
             if let Some(c) = statusbar::Clock::time() {
                 changed |= self.snap.clock != c;
                 self.snap.clock = c;
             }
         }
 
-        if now.duration_since(self.last_fast) >= FAST_PERIOD {
-            self.last_fast = now;
+        if self.fast.is_due(now) {
+            self.fast.mark(now);
             let d = statusbar::Clock::date().unwrap_or_else(|| DASH.into());
             changed |= self.snap.date != d;
             self.snap.date = d;
@@ -230,11 +273,11 @@ impl State {
         // (two `/proc/stat` samples straddling a `thread::sleep`); even on
         // the worker thread (which no longer stalls Wayland event
         // processing) there's no point paying that for a number nothing
-        // draws. Re-enable with a `last_cpu`/`CPU_PERIOD`-gated call here
+        // draws. Re-enable with a `self.cpu`/`CPU_PERIOD`-gated call here
         // alongside uncommenting the segment.
 
-        if now.duration_since(self.last_slow) >= SLOW_PERIOD {
-            self.last_slow = now;
+        if self.slow.is_due(now) {
+            self.slow.mark(now);
             let w = statusbar::Wifi::read().unwrap_or_else(|| DASH.into());
             changed |= self.snap.wifi != w;
             self.snap.wifi = w;
@@ -270,8 +313,8 @@ impl State {
             }
         }
 
-        if now.duration_since(self.last_notifications) >= NOTIFICATIONS_PERIOD {
-            self.last_notifications = now;
+        if self.notifications.is_due(now) {
+            self.notifications.mark(now);
             let rendered: Vec<String> = statusbar::Notifications::query(&self.notification_rules)
                 .unwrap_or_default()
                 .into_iter()
@@ -302,12 +345,10 @@ impl State {
     #[allow(dead_code)]
     fn force_refresh_control(&mut self, kind: ModuleKind) -> bool {
         let now = Instant::now();
-        if now.duration_since(self.last_control_refresh)
-            < Duration::from_millis(CONTROL_REFRESH_DEBOUNCE_MS)
-        {
+        if !self.control_refresh.is_due(now) {
             return false;
         }
-        self.last_control_refresh = now;
+        self.control_refresh.mark(now);
         match kind {
             ModuleKind::VolOut => {
                 if let Some((s, pct, muted)) = Volume::sink_raw() {
@@ -432,7 +473,7 @@ impl State {
         if steps == 0 {
             return false;
         }
-        let delta = steps_to_delta_pct(steps, SCROLL_STEP_PCT);
+        let delta = ScrollAccumulator::steps_to_delta_pct(steps, SCROLL_STEP_PCT);
         match kind {
             ModuleKind::VolOut => {
                 let Some(known) = self.vol_out_known else {
@@ -477,18 +518,16 @@ impl State {
             return false;
         };
         let now = Instant::now();
-        if now.duration_since(self.last_scroll_apply)
-            < Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS)
-        {
+        if !self.scroll_apply.is_due(now) {
             return false;
         }
-        self.last_scroll_apply = now;
+        self.scroll_apply.mark(now);
         let steps = acc.take_steps();
         self.pending_scroll = Some((kind, acc));
         if steps == 0 {
             return false;
         }
-        let delta = steps_to_delta_pct(steps, SCROLL_STEP_PCT);
+        let delta = ScrollAccumulator::steps_to_delta_pct(steps, SCROLL_STEP_PCT);
         match kind {
             ModuleKind::VolOut => Volume::adjust_sink(delta),
             ModuleKind::VolIn => Volume::adjust_source(delta),
@@ -513,10 +552,10 @@ impl State {
             return;
         };
         let now = Instant::now();
-        if now.duration_since(self.last_click_spawn) < Duration::from_millis(CLICK_DEBOUNCE_MS) {
+        if !self.click_spawn.is_due(now) {
             return;
         }
-        self.last_click_spawn = now;
+        self.click_spawn.mark(now);
         // Prefer the user's own `cosmic-popup` wrapper (auto-closes the
         // settings window on focus loss, exactly like waybar's binding
         // does) when it's on PATH; fall back to bare `cosmic-settings`
@@ -599,12 +638,12 @@ impl Worker {
             // one arrives (each one repaints the optimistic percentage as it
             // goes -- see `queue_scroll`), same coalescing behavior as before
             // for the real mutation.
-            let wait_ms = if state.pending_scroll.is_some() {
-                SCROLL_APPLY_DEBOUNCE_MS
+            let wait = if state.pending_scroll.is_some() {
+                Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS)
             } else {
-                IDLE_POLL_MS
+                Duration::from_millis(IDLE_POLL_MS)
             };
-            match scroll_rx.recv_timeout(Duration::from_millis(wait_ms)) {
+            match scroll_rx.recv_timeout(wait) {
                 Ok((kind, raw_px)) => {
                     changed |= state.queue_scroll(kind, raw_px);
                     loop {

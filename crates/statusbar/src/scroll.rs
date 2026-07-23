@@ -89,17 +89,22 @@ impl ScrollAccumulator {
     pub const fn reset(&mut self) {
         self.pending_px = 0;
     }
-}
 
-/// Convert a wheel step count into a percentage-point delta to apply to a
-/// volume/brightness control.
-///
-/// Wheel up (negative steps, matching `wl_pointer.axis`'s sign convention
-/// where negative = up/away) increases the value; wheel down decreases it
-/// -- the usual volume-knob feel (push up = louder).
-#[must_use]
-pub const fn steps_to_delta_pct(steps: i32, step_pct: i32) -> i32 {
-    -steps * step_pct
+    /// Convert a wheel step count into a percentage-point delta to apply to
+    /// a volume/brightness control.
+    ///
+    /// Wheel up (negative steps, matching `wl_pointer.axis`'s sign
+    /// convention where negative = up/away) increases the value; wheel down
+    /// decreases it -- the usual volume-knob feel (push up = louder).
+    ///
+    /// An associated fn (rather than a free one) because the `steps` it
+    /// consumes are exactly what [`Self::take_steps`] produces: the two
+    /// halves of one "wheel pixels in, control delta out" pipeline belong
+    /// in the same namespace.
+    #[must_use]
+    pub const fn steps_to_delta_pct(steps: i32, step_pct: i32) -> i32 {
+        -steps * step_pct
+    }
 }
 
 #[cfg(test)]
@@ -168,11 +173,11 @@ mod tests {
     #[test]
     fn steps_to_delta_pct_flips_sign() {
         // Wheel up (negative steps) => positive (increase) delta.
-        assert_eq!(steps_to_delta_pct(-1, 5), 5);
+        assert_eq!(ScrollAccumulator::steps_to_delta_pct(-1, 5), 5);
         // Wheel down (positive steps) => negative (decrease) delta.
-        assert_eq!(steps_to_delta_pct(1, 5), -5);
-        assert_eq!(steps_to_delta_pct(0, 5), 0);
-        assert_eq!(steps_to_delta_pct(-3, 5), 15);
+        assert_eq!(ScrollAccumulator::steps_to_delta_pct(1, 5), -5);
+        assert_eq!(ScrollAccumulator::steps_to_delta_pct(0, 5), 0);
+        assert_eq!(ScrollAccumulator::steps_to_delta_pct(-3, 5), 15);
     }
 
     #[test]

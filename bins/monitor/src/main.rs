@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 // benches can drive them headlessly with an allocation profiler. The binary
 // only adds the modules that need the live window/thread context.
 mod profile;
+mod snapshot_cli;
 
 use monitor::chart_cache::{ChartCache, Overlay};
 use monitor::core_bars::{CoreBarPaint, CoreBars};
 use monitor::damage::DamageList;
+use monitor::dashboard_report::DashboardReport;
 use monitor::display_snapshot::DisplaySnapshot;
 use monitor::redraw_gate::RedrawGate;
 use monitor::sample_interpolator::SampleInterpolator;
@@ -50,30 +52,66 @@ const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// frame. Text readouts stay at 60 Hz, so this reduces visual density without
 /// making the dashboard feel sluggish.
 const GRAPH_INTERVAL: Duration = Duration::from_millis(250);
-const FG: Color = Color::rgb(0xf2, 0xf2, 0xf3);
-const DIM: Color = Color::rgb(0x8a, 0x8a, 0x90);
-const FAINT: Color = Color::rgb(0x55, 0x55, 0x5a);
-const UI_BACKGROUND: Color = Color::rgb(0x0a, 0x0a, 0x0b);
-// Cards intentionally share the resolved terminal/status-bar background. There
-// is no second opaque panel layer; the window opacity is applied uniformly by
-// the normal renderer, matching the terminal and status bar.
-const CARD_SURFACE: Color = Color::rgb(0x18, 0x16, 0x16);
-const CARD_BORDER: Color = Color::rgb(0x1e, 0x1e, 0x21);
-/// Opaque Kanagawa card surface. The monitor window may be translucent, but
-/// charts need a stable surface so their fill and anti-aliased strokes do not
-/// visually blend into whatever happens to be behind the window.
-const CHART_PANEL: Color = CARD_SURFACE;
-const CYAN: Color = Color::rgb(0x8e, 0xa4, 0xa2);
-const GREEN: Color = Color::rgb(0x8a, 0x9a, 0x7b);
-const ORANGE: Color = Color::rgb(0xb6, 0x92, 0x7b);
-const CARD_INSET: i32 = 14;
-const HEADER_BAND: i32 = 26;
-const HERO_BAND: i32 = 82;
-const DETAILS_BAND: i32 = 30;
-const GRAPH_GAP: i32 = 12;
+/// The vertical rhythm shared by every metric card: a compact identity row,
+/// a hero value row, a mixed-type detail row, then the graph consuming
+/// whatever height remains. Bundling the five band sizes here (rather than
+/// leaving them as five bare `const i32`s added up ad-hoc at each call site)
+/// means every y-coordinate in `card`/`metric`/`card_text` is derived from
+/// the *same* arithmetic, so a future tweak to one band can't silently drift
+/// out of sync between the CPU card's hand-laid-out path and the generic
+/// `card_text` path other cards use.
+struct CardBands {
+    inset: i32,
+    header: i32,
+    hero: i32,
+    details: i32,
+    graph_gap: i32,
+}
+
+impl CardBands {
+    const fn new() -> Self {
+        Self {
+            inset: 14,
+            header: 26,
+            hero: 82,
+            details: 30,
+            graph_gap: 12,
+        }
+    }
+
+    /// Baseline y for the hero metric row.
+    const fn hero_baseline(&self, card_top: i32) -> i32 {
+        card_top + self.inset + self.header
+    }
+
+    /// Baseline y for the detail row (label/value pairs beneath the hero).
+    const fn details_y(&self, card_top: i32) -> i32 {
+        self.hero_baseline(card_top) + self.hero - 8
+    }
+
+    /// Y offset (relative to the card's top) where the chart viewport begins,
+    /// i.e. the total height consumed by the header/hero/details bands plus
+    /// one gap before the graph.
+    const fn graph_top(&self) -> i32 {
+        self.inset + self.header + self.hero + self.details + self.graph_gap
+    }
+
+    /// Chart viewport height given the card's total row height, reserving
+    /// the same `inset` at the bottom that's reserved at the top.
+    fn graph_h(&self, row_h: i32) -> i32 {
+        (row_h - self.graph_top() - self.inset).max(1)
+    }
+}
+
 #[cfg(test)]
 const PERF_ITERATIONS: usize = 20_000;
 
+// A fixed 8-color rotation for per-core CPU bars. Unlike `MonitorPalette`'s
+// fields below, this has no sensible single `[monitor]` key to hang off of
+// (it's a *cycle*, not a semantic "this metric is this color" mapping, and
+// real CPUs commonly have far more than 8 cores) -- so it stays a plain
+// internal decoration constant rather than growing eight more TOML keys
+// nobody would tune individually.
 const CORE_COLORS: [Color; 8] = [
     Color::rgb(0x7a, 0x8a, 0x72),
     Color::rgb(0x75, 0x91, 0x91),
@@ -84,6 +122,91 @@ const CORE_COLORS: [Color; 8] = [
     Color::rgb(0x92, 0x86, 0x70),
     Color::rgb(0x6f, 0x87, 0x91),
 ];
+
+/// Every color the dashboard paints with, resolved once from [`config::Config`]
+/// at startup instead of scattered as bare `const Color`s throughout this
+/// file.
+///
+/// This replaced `FG`/`DIM`/`FAINT`/`UI_BACKGROUND`/`CARD_SURFACE`/
+/// `CARD_BORDER`/`CHART_PANEL`/`CYAN`/`GREEN`/`ORANGE` -- ten module consts
+/// that were completely disconnected from `config::MonitorConfig`'s
+/// `cpu`/`memory`/`temperature`/`network` override fields (which existed in
+/// the config format but were never actually read anywhere in this binary --
+/// setting them in a TOML file silently did nothing). Worse, `card()` filled
+/// each card rect with the *resolved* `self.background`, while every text
+/// draw call anti-aliased against the *hardcoded* `CARD_SURFACE` literal as
+/// its blend background -- so as soon as `[monitor]`/`[bar]`/`[colors]`
+/// diverged from the built-in defaults, every glyph edge in every card would
+/// visibly fringe against the real (different) background color underneath
+/// it. Centralizing the resolution here means there is exactly one place
+/// that can drift, and it's covered by `config::tests`.
+struct MonitorPalette {
+    /// Window background (canvas clear color).
+    background: Color,
+    /// Card / chart-panel fill -- also the anti-aliasing blend background
+    /// for every piece of text drawn over a card (see the struct doc for
+    /// the bug this fixes).
+    surface: Color,
+    /// Card border / bar-track color.
+    border: Color,
+    /// Hero/metric text.
+    foreground: Color,
+    /// Secondary text (card titles, hero units, process names/PIDs,
+    /// non-highlighted process CPU bars).
+    dim: Color,
+    /// Tertiary text (detail-row labels, table headers).
+    faint: Color,
+    /// CPU card accent (hero line, core bar 0's row-0 process highlight).
+    cpu: Color,
+    /// Memory card accent.
+    memory: Color,
+    /// Temperature card accent.
+    temperature: Color,
+    /// Network card accent (download line; upload uses `temperature` as its
+    /// overlay color, matching the original hardcoded `ORANGE`).
+    network: Color,
+}
+
+impl MonitorPalette {
+    fn from_config(cfg: &config::Config) -> Self {
+        Self {
+            background: cfg.monitor_background().into(),
+            surface: cfg.monitor_surface().into(),
+            border: cfg.monitor_border().into(),
+            foreground: cfg.monitor_foreground().into(),
+            dim: cfg.monitor_dim().into(),
+            faint: cfg.monitor_faint().into(),
+            cpu: cfg.monitor_cpu().into(),
+            memory: cfg.monitor_memory().into(),
+            temperature: cfg.monitor_temperature().into(),
+            network: cfg.monitor_network().into(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl MonitorPalette {
+    /// The dashboard's original hardcoded defaults, reconstructed here so
+    /// `perf_harness` (a headless paint-cost microbenchmark, not a Wayland
+    /// session) keeps exercising the exact geometry/contrast it always has
+    /// without needing to parse a `config::Config` -- see module docs on
+    /// [`Self::from_config`] for why those defaults now live in
+    /// `config::Config::monitor_*` instead of here.
+    const fn builtin() -> Self {
+        Self {
+            background: Color::rgb(0x0a, 0x0a, 0x0b),
+            surface: Color::rgb(0x18, 0x16, 0x16),
+            border: Color::rgb(0x1e, 0x1e, 0x21),
+            foreground: Color::rgb(0xf2, 0xf2, 0xf3),
+            dim: Color::rgb(0x8a, 0x8a, 0x90),
+            faint: Color::rgb(0x55, 0x55, 0x5a),
+            cpu: Color::rgb(0x8a, 0x9a, 0x7b),
+            memory: Color::rgb(0x8e, 0xa4, 0xa2),
+            temperature: Color::rgb(0xb6, 0x92, 0x7b),
+            network: Color::rgb(0x8e, 0xa4, 0xa2),
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct Snapshot {
@@ -155,27 +278,24 @@ struct Painter {
     temperature: ChartCache,
     network: ChartCache,
     cpu_bars: CoreBars,
-    background: Color,
+    palette: MonitorPalette,
+    bands: CardBands,
 }
 
 impl Painter {
-    #[allow(dead_code)]
-    const fn new() -> Self {
-        Self::with_surface(CHART_PANEL)
-    }
-
-    const fn with_surface(surface: Color) -> Self {
-        Self::with_colors(surface, UI_BACKGROUND)
-    }
-
-    const fn with_colors(surface: Color, background: Color) -> Self {
+    /// Every chart's private surface shares the same card fill
+    /// (`palette.surface`) -- see [`MonitorPalette::surface`]'s doc for why
+    /// this is also the anti-aliasing blend background every text draw call
+    /// in [`Self::paint`] uses.
+    const fn with_palette(palette: MonitorPalette) -> Self {
         Self {
-            cpu: ChartCache::new(surface),
-            memory: ChartCache::new(surface),
-            temperature: ChartCache::new(surface),
-            network: ChartCache::new(surface),
+            cpu: ChartCache::new(palette.surface),
+            memory: ChartCache::new(palette.surface),
+            temperature: ChartCache::new(palette.surface),
+            network: ChartCache::new(palette.surface),
             cpu_bars: CoreBars::new(),
-            background,
+            palette,
+            bands: CardBands::new(),
         }
     }
     #[allow(
@@ -224,6 +344,7 @@ impl Painter {
         y: i32,
         w: i32,
         h: i32,
+        color: Color,
         sequence: u64,
         background_cleared: bool,
     ) -> DamageList {
@@ -235,7 +356,7 @@ impl Painter {
             Rect::new(x, y, w, h),
             aggregate,
             100.0,
-            GREEN,
+            color,
             &[],
             HISTORY,
             sequence,
@@ -250,12 +371,12 @@ impl Painter {
         // Cards have no separate visual surface, but their pixels still need
         // the resolved background written into the alpha buffer. Otherwise an
         // ARGB Wayland surface exposes the desktop through every card.
-        canvas.fill_rect(rect, self.background);
-        canvas.draw_rect(rect, CARD_BORDER);
+        canvas.fill_rect(rect, self.palette.background);
+        canvas.draw_rect(rect, self.palette.border);
     }
 
-    fn metric(text: &mut TextRenderer, canvas: &mut Canvas, value: &str, x: i32, y: i32) -> i32 {
-        text.draw_text(canvas, value, x, y, FG, CARD_SURFACE)
+    fn metric(&self, text: &mut TextRenderer, canvas: &mut Canvas, value: &str, x: i32, y: i32) -> i32 {
+        text.draw_text(canvas, value, x, y, self.palette.foreground, self.palette.surface)
     }
 
     /// Retain the beginning of a string and replace its overflowing end with
@@ -288,6 +409,7 @@ impl Painter {
 
     #[allow(clippy::too_many_arguments)]
     fn card_text(
+        &self,
         canvas: &mut Canvas,
         rect: Rect,
         title: &str,
@@ -300,10 +422,11 @@ impl Painter {
         subtitle_text: &mut TextRenderer,
         normal_text: &mut TextRenderer,
     ) {
+        let surface = self.palette.surface;
         let title_y = rect.y + 12;
-        let hero_y = rect.y + 14 + 26;
-        let details_y = rect.y + 14 + 26 + 82 - 8;
-        title_text.draw_text(canvas, title, rect.x + 14, title_y, DIM, CARD_SURFACE);
+        let hero_y = self.bands.hero_baseline(rect.y);
+        let details_y = self.bands.details_y(rect.y);
+        title_text.draw_text(canvas, title, rect.x + 14, title_y, self.palette.dim, surface);
         // Keep card metadata inside the same safe right-side region used by
         // the CPU brand. Truncate the end of long platform/device names so
         // the title and metadata remain readable at narrow card widths.
@@ -314,12 +437,12 @@ impl Painter {
             &metadata,
             rect.x + rect.w - 14,
             title_y + 1,
-            FAINT,
-            CARD_SURFACE,
+            self.palette.faint,
+            surface,
         );
-        let hero_end = Self::metric(hero_text, canvas, hero, rect.x + 14, hero_y);
+        let hero_end = self.metric(hero_text, canvas, hero, rect.x + 14, hero_y);
         let unit_y = hero_y + hero_text.baseline_offset() - subtitle_text.baseline_offset();
-        subtitle_text.draw_text(canvas, unit, hero_end + 6, unit_y, DIM, CARD_SURFACE);
+        subtitle_text.draw_text(canvas, unit, hero_end + 6, unit_y, self.palette.dim, surface);
         let row_width = rect.w - 28;
         let normal_y = details_y + subtitle_text.baseline_offset() - normal_text.baseline_offset();
         let pair_widths: Vec<i32> = details
@@ -332,9 +455,9 @@ impl Painter {
         .max(8);
         let mut x = rect.x + 14;
         for ((label, value), pair_width) in details.iter().zip(pair_widths) {
-            subtitle_text.draw_text(canvas, label, x, details_y, FAINT, CARD_SURFACE);
+            subtitle_text.draw_text(canvas, label, x, details_y, self.palette.faint, surface);
             let value_x = x + subtitle_text.measure(label) + 8;
-            normal_text.draw_text(canvas, value, value_x, normal_y, DIM, CARD_SURFACE);
+            normal_text.draw_text(canvas, value, value_x, normal_y, self.palette.dim, surface);
             x += pair_width + gap;
         }
     }
@@ -367,7 +490,7 @@ impl Painter {
         // so clearing the process table at 60 Hz would create needless memory
         // bandwidth and force a whole-window shm upload.
         if full_repaint {
-            canvas.clear(self.background);
+            canvas.clear(self.palette.background);
         }
         let width = canvas.width();
         let height = canvas.height();
@@ -387,8 +510,8 @@ impl Painter {
         // glyphs from colliding with the graph on short windows.
         // Face-font coordinates are baselines, so the hero receives a full
         // line box plus breathing room before the detail baseline.
-        let graph_top = CARD_INSET + HEADER_BAND + HERO_BAND + DETAILS_BAND + GRAPH_GAP;
-        let graph_h = (row_h - graph_top - CARD_INSET).max(1);
+        let graph_top = self.bands.graph_top();
+        let graph_h = self.bands.graph_h(row_h);
         let card = |x: i32, y: i32| Rect::new(x, y, col_w, row_h);
 
         // The dashboard intentionally has no separate top bar. The cards and
@@ -420,6 +543,11 @@ impl Painter {
             cpu_area.w,
             cpu_bar_height,
         );
+        // Every number/label drawn below is sourced from `DashboardReport`
+        // rather than re-derived with local `format!` calls. That report is
+        // the exact same struct the headless `--snapshot` CLI prints, so the
+        // GUI and the text report can never drift apart on rounding or units.
+        let report = DashboardReport::from_sample(&snap.sample, &snap.processes);
         if full_repaint {
             // CPU card follows the mockup's four-row rhythm: a compact
             // identity row, a hero value row, a mixed-type detail row, and
@@ -427,42 +555,32 @@ impl Painter {
             let cpu_card = cards[0];
             title_text.draw_text(
                 canvas,
-                "CPU",
+                report.cpu.title,
                 cpu_card.x + 14,
                 cpu_card.y + 12,
-                DIM,
-                CARD_SURFACE,
+                self.palette.dim,
+                self.palette.surface,
             );
-            // Keep the metadata in the right half of the title row.  A full
-            // CPU brand can be much wider than the card, so truncate the
-            // brand before adding the core count; truncating the combined
-            // string can preserve the suffix while still allowing the brand
-            // to consume nearly the whole row.
-            let core_suffix = format!(" · {} cores", snap.sample.cpu_cores);
-            // The title is short, so let the metadata use most of the card
-            // rather than truncating a perfectly readable brand too early.
-            // Keep a left-side safety gap so it can never collide with `CPU`.
+            // Keep the metadata in the right half of the title row. The
+            // report's `meta` is the untruncated brand + core count; a full
+            // CPU brand can be much wider than the card, so truncate it here
+            // at paint time, where the measured glyph widths live.
             let metadata_width = (cpu_card.w * 3 / 4 - 14).max(1);
-            let brand_width =
-                (metadata_width - subtitle_text.measure(&core_suffix) - subtitle_text.measure("…"))
-                    .max(1);
-            let brand = Self::truncate_prefix(&snap.sample.cpu_brand, subtitle_text, brand_width);
-            let cpu_meta = format!("{brand}{core_suffix}");
-            let cpu_meta = Self::truncate_prefix(&cpu_meta, subtitle_text, metadata_width);
+            let cpu_meta = Self::truncate_prefix(&report.cpu.meta, subtitle_text, metadata_width);
             subtitle_text.draw_text_right(
                 canvas,
                 &cpu_meta,
                 cpu_card.x + cpu_card.w - 14,
                 cpu_card.y + 13,
-                FAINT,
-                CARD_SURFACE,
+                self.palette.faint,
+                self.palette.surface,
             );
-            let hero_end = Self::metric(
+            let hero_end = self.metric(
                 hero_text,
                 canvas,
-                &format!("{:.0}", snap.sample.cpu),
+                &report.cpu.hero,
                 cpu_card.x + 14,
-                cpu_card.y + CARD_INSET + HEADER_BAND,
+                self.bands.hero_baseline(cpu_card.y),
             );
             // Use the actual Hero glyph advance instead of a fixed x offset;
             // font metrics vary with configured typeface and scale.
@@ -470,18 +588,18 @@ impl Painter {
             // subtitle has a shorter ascent, so using the same origin would
             // place its glyphs above the Hero baseline. Offset by the measured
             // line-height difference to align the two baselines visually.
-            let hero_baseline = cpu_card.y + CARD_INSET + HEADER_BAND;
+            let hero_baseline = self.bands.hero_baseline(cpu_card.y);
             let percent_baseline =
                 hero_baseline + hero_text.baseline_offset() - subtitle_text.baseline_offset();
             subtitle_text.draw_text(
                 canvas,
-                "%",
+                report.cpu.unit,
                 hero_end + 6,
                 percent_baseline,
-                DIM,
-                CARD_SURFACE,
+                self.palette.dim,
+                self.palette.surface,
             );
-            let details_y = cpu_card.y + CARD_INSET + HEADER_BAND + HERO_BAND - 8;
+            let details_y = self.bands.details_y(cpu_card.y);
             let normal_details_y =
                 details_y + subtitle_text.baseline_offset() - text.baseline_offset();
             // Lay out complete label/value pairs rather than anchoring each
@@ -491,95 +609,75 @@ impl Painter {
             // safely and keep every column readable.
             let row_x = cpu_card.x + 14;
             let row_width = cpu_card.w - 28;
-            let labels = ["Load", "Disk I/O", "Freq"];
-            // Load is available directly from /proc/loadavg and complements
-            // the instantaneous CPU percentage without requiring perf access.
-            let load = format!("{:.2}", snap.sample.load[0]);
-            let disk_io = format!("{:.1} MB/s", snap.sample.disk_io_mb_s);
-            let frequency = format!("{:.2} GHz", snap.sample.cpu_frequency_ghz);
-            let values = [load, disk_io, frequency];
-            let pair_widths: Vec<i32> = labels
+            let pair_widths: Vec<i32> = report
+                .cpu
+                .details
                 .iter()
-                .zip(values.iter())
                 .map(|(label, value)| subtitle_text.measure(label) + 8 + text.measure(value))
                 .collect();
             let used_width: i32 = pair_widths.iter().sum();
             let gap = ((row_width - used_width) / 2).max(8);
             let mut x = row_x;
-            for ((label, value), pair_width) in labels.iter().zip(values.iter()).zip(pair_widths) {
-                subtitle_text.draw_text(canvas, label, x, details_y, FAINT, CARD_SURFACE);
+            for ((label, value), pair_width) in report.cpu.details.iter().zip(pair_widths) {
+                subtitle_text.draw_text(canvas, label, x, details_y, self.palette.faint, self.palette.surface);
                 let value_x = x + subtitle_text.measure(label) + 8;
-                text.draw_text(canvas, value, value_x, normal_details_y, DIM, CARD_SURFACE);
+                text.draw_text(canvas, value, value_x, normal_details_y, self.palette.dim, self.palette.surface);
                 x += pair_width + gap;
             }
         }
         if full_repaint {
-            let memory_used = format!("{:.0}%", snap.sample.memory);
-            let memory_available = format!("{:.1} GB", snap.sample.memory_available_mb / 1024.0);
-            let swap_display = if snap.sample.swap_total_mb <= 0.0 {
-                "ZRAM —".to_owned()
-            } else {
-                format!(
-                    "{:.1}/{:.1} GB",
-                    snap.sample.swap_used_mb / 1024.0,
-                    snap.sample.swap_total_mb / 1024.0
-                )
-            };
-            let memory_details = [
-                ("Used", memory_used.as_str()),
-                ("Available", memory_available.as_str()),
-                ("Swap", swap_display.as_str()),
-            ];
-            Self::card_text(
+            let memory_details: Vec<(&str, &str)> = report
+                .memory
+                .details
+                .iter()
+                .map(|(label, value)| (*label, value.as_str()))
+                .collect();
+            self.card_text(
                 canvas,
                 cards[1],
-                "Memory",
-                &snap.sample.memory_device,
-                &format!("{:.0}", snap.sample.memory),
-                "%",
+                report.memory.title,
+                &report.memory.meta,
+                &report.memory.hero,
+                report.memory.unit,
                 &memory_details,
                 hero_text,
                 title_text,
                 subtitle_text,
                 text,
             );
-            Self::card_text(
+            let temperature_details: Vec<(&str, &str)> = report
+                .temperature
+                .details
+                .iter()
+                .map(|(label, value)| (*label, value.as_str()))
+                .collect();
+            self.card_text(
                 canvas,
                 cards[2],
-                "Temperature",
-                &snap.sample.thermal_device,
-                &format!("{:.0}", snap.sample.temperature),
-                "°C",
-                &[
-                    ("Max", &format!("{:.1} °C", snap.sample.thermal_max)),
-                    ("Average", &format!("{:.1} °C", snap.sample.thermal_avg)),
-                    ("Min", &format!("{:.1} °C", snap.sample.thermal_min)),
-                ],
+                report.temperature.title,
+                &report.temperature.meta,
+                &report.temperature.hero,
+                report.temperature.unit,
+                &temperature_details,
                 hero_text,
                 title_text,
                 subtitle_text,
                 text,
             );
-            let network_ping = format!("{:.1}", snap.sample.network_ping_ms);
-            let network_rx = format!("{:.2} MB/s", snap.sample.network_rx);
-            let network_tx = format!("{:.2} MB/s", snap.sample.network_tx);
-            let network_link = if snap.sample.network_link_mbps > 0.0 {
-                format!("{:.0} Mb/s", snap.sample.network_link_mbps)
-            } else {
-                "Up".to_owned()
-            };
-            Self::card_text(
+            let network_details: Vec<(&str, &str)> = report
+                .network
+                .details
+                .iter()
+                .map(|(label, value)| (*label, value.as_str()))
+                .collect();
+            self.card_text(
                 canvas,
                 cards[3],
-                "Network",
-                &snap.sample.network_device,
-                &network_ping,
-                "ms",
-                &[
-                    ("RX", &network_rx),
-                    ("TX", &network_tx),
-                    ("LINK", &network_link),
-                ],
+                report.network.title,
+                &report.network.meta,
+                &report.network.hero,
+                report.network.unit,
+                &network_details,
                 hero_text,
                 title_text,
                 subtitle_text,
@@ -587,6 +685,7 @@ impl Painter {
             );
         }
         let started = Instant::now();
+        let cpu_color = self.palette.cpu;
         let cpu_chart_damage = Self::cpu_graph(
             &mut self.cpu,
             canvas,
@@ -595,6 +694,7 @@ impl Painter {
             cpu_line.y,
             cpu_line.w,
             cpu_line.h,
+            cpu_color,
             history.sequence,
             full_repaint,
         );
@@ -605,7 +705,7 @@ impl Painter {
             &snap.sample.cores,
             CoreBarPaint {
                 bounds: cpu_bars_rect,
-                background: CARD_SURFACE,
+                background: self.palette.surface,
                 colors: &CORE_COLORS,
                 background_cleared: full_repaint,
             },
@@ -619,7 +719,7 @@ impl Painter {
             graph_rect(cards[1]).x,
             graph_rect(cards[1]).y,
             graph_rect(cards[1]).w,
-            CYAN,
+            self.palette.memory,
             100.0,
             graph_h,
             history.sequence,
@@ -635,7 +735,7 @@ impl Painter {
             graph_rect(cards[2]).x,
             graph_rect(cards[2]).y,
             graph_rect(cards[2]).w,
-            ORANGE,
+            self.palette.temperature,
             100.0,
             graph_h,
             history.sequence,
@@ -651,11 +751,11 @@ impl Painter {
             graph_rect(cards[3]).x,
             graph_rect(cards[3]).y,
             graph_rect(cards[3]).w,
-            CYAN,
+            self.palette.network,
             10.0,
             graph_h,
             history.sequence,
-            &[Overlay::new(&history.tx, ORANGE)],
+            &[Overlay::new(&history.tx, self.palette.temperature)],
             full_repaint,
         );
         phases.charts_active += u32::from(!network_damage.is_empty());
@@ -682,41 +782,41 @@ impl Painter {
                 "Processes",
                 left,
                 proc_rect.y + 14,
-                DIM,
-                CARD_SURFACE,
+                self.palette.dim,
+                self.palette.surface,
             );
             subtitle_text.draw_text_right(
                 canvas,
                 &format!("{} tasks", snap.processes.len()),
                 right,
                 proc_rect.y + 15,
-                FAINT,
-                CARD_SURFACE,
+                self.palette.faint,
+                self.palette.surface,
             );
-            subtitle_text.draw_text(canvas, "PID", left, proc_rect.y + 40, FAINT, CARD_SURFACE);
+            subtitle_text.draw_text(canvas, "PID", left, proc_rect.y + 40, self.palette.faint, self.palette.surface);
             subtitle_text.draw_text(
                 canvas,
                 "Name",
                 name_left,
                 proc_rect.y + 40,
-                FAINT,
-                CARD_SURFACE,
+                self.palette.faint,
+                self.palette.surface,
             );
             subtitle_text.draw_text_right(
                 canvas,
                 "CPU",
                 cpu_right,
                 proc_rect.y + 40,
-                FAINT,
-                CARD_SURFACE,
+                self.palette.faint,
+                self.palette.surface,
             );
             subtitle_text.draw_text_right(
                 canvas,
                 "Memory",
                 mem_right,
                 proc_rect.y + 40,
-                FAINT,
-                CARD_SURFACE,
+                self.palette.faint,
+                self.palette.surface,
             );
             let row_height = 18;
             let first_row = proc_rect.y + 59;
@@ -726,14 +826,14 @@ impl Painter {
                 let y = first_row + i32::try_from(row).unwrap_or(0) * row_height;
                 let name_width = (cpu_right - name_left - 12).max(1);
                 let name = Self::truncate_prefix(&process.name, text, name_width);
-                text.draw_text(canvas, &process.pid.to_string(), left, y, DIM, CARD_SURFACE);
+                text.draw_text(canvas, &process.pid.to_string(), left, y, self.palette.dim, self.palette.surface);
                 text.draw_text(
                     canvas,
                     &name,
                     name_left,
                     y,
-                    if row == 0 { ORANGE } else { FG },
-                    CARD_SURFACE,
+                    if row == 0 { self.palette.temperature } else { self.palette.foreground },
+                    self.palette.surface,
                 );
                 // Process CPU remains measured in one-core percentage, but
                 // the table uses a visual bar instead of another numeric wall
@@ -744,7 +844,7 @@ impl Painter {
                 let bar_y = y + 5;
                 canvas.fill_rect(
                     Rect::new(bar_left, bar_y, bar_right - bar_left, 6),
-                    CARD_BORDER,
+                    self.palette.border,
                 );
                 let bar_width = bar_right - bar_left;
                 let fill = (process.cpu.clamp(0.0, 100.0) / 100.0
@@ -756,7 +856,7 @@ impl Painter {
                 if fill > 0 {
                     canvas.fill_rect(
                         Rect::new(bar_left, bar_y, fill, 6),
-                        if row == 0 { ORANGE } else { CYAN },
+                        if row == 0 { self.palette.temperature } else { self.palette.cpu },
                     );
                 }
                 text.draw_text_right(
@@ -772,8 +872,8 @@ impl Painter {
                     ),
                     mem_right,
                     y,
-                    DIM,
-                    CARD_SURFACE,
+                    self.palette.dim,
+                    self.palette.surface,
                 );
             }
             phases.static_content += Instant::now().duration_since(started);
@@ -893,11 +993,8 @@ impl App {
             subtitle: TextRenderer::load(None, subtitle_size),
             normal: TextRenderer::load(None, normal_size),
         };
-        let background_color = cfg
-            .monitor
-            .background
-            .unwrap_or_else(|| cfg.bar_background());
-        let background = Color::rgb(background_color.r, background_color.g, background_color.b);
+        let palette = MonitorPalette::from_config(&cfg);
+        let background = palette.background;
         let rx = Self::spawn_worker(wake);
         Self {
             window,
@@ -912,23 +1009,7 @@ impl App {
             typography_pending: 4,
             profile: FrameProfile::new(),
             display: SampleInterpolator::new(),
-            painter: Painter::with_colors(
-                Color::rgb(
-                    cfg.monitor
-                        .surface
-                        .unwrap_or_else(|| cfg.bar_background())
-                        .r,
-                    cfg.monitor
-                        .surface
-                        .unwrap_or_else(|| cfg.bar_background())
-                        .g,
-                    cfg.monitor
-                        .surface
-                        .unwrap_or_else(|| cfg.bar_background())
-                        .b,
-                ),
-                background,
-            ),
+            painter: Painter::with_palette(palette),
             // Make the first received display value immediately visible in a
             // graph rather than waiting one quarter-second after startup.
             last_graph_sample: Instant::now()
@@ -1268,6 +1349,14 @@ impl App {
     }
 }
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if snapshot_cli::SnapshotCli::requested(&args) {
+        // Headless path: never touches Wayland/the window/the paint loop.
+        // `App::new` unconditionally opens a `TermWindow`, so the snapshot
+        // report must branch before it, not skip presenting after one.
+        snapshot_cli::SnapshotCli::new().run();
+        return;
+    }
     App::new().run();
 }
 
@@ -1289,7 +1378,7 @@ fn main() {
 #[cfg(test)]
 mod perf_harness {
     use super::{
-        CARD_SURFACE, Canvas, History, MonitorSample, PERF_ITERATIONS, PaintPhases, Painter,
+        Canvas, History, MonitorPalette, MonitorSample, PERF_ITERATIONS, PaintPhases, Painter,
         ProcessInfo, Rect, Snapshot, Typography,
     };
     use std::time::{Duration, Instant};
@@ -1402,7 +1491,7 @@ mod perf_harness {
                     subtitle: statusbar::TextRenderer::load(None, 13.0),
                     normal: statusbar::TextRenderer::load(None, 11.0),
                 },
-                painter: Painter::with_surface(CARD_SURFACE),
+                painter: Painter::with_palette(MonitorPalette::builtin()),
                 history: History::new(),
                 premultiplier: platform::premultiply::Premultiplier::new(),
             }
@@ -1445,7 +1534,7 @@ mod perf_harness {
                     &mut self.typography,
                     &snapshot,
                     &self.history,
-                    CARD_SURFACE,
+                    MonitorPalette::builtin().surface,
                     full_repaint,
                     phases,
                 )

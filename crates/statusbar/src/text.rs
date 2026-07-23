@@ -143,20 +143,6 @@ impl TextRenderer {
         }
     }
 
-    /// Load one fallback face on demand. Diagnoses (but doesn't abort on) a
-    /// bad path, same treatment as the primary face's own failure handling.
-    fn load_fallback(path: &str, px_size: f32) -> Option<FontFace> {
-        match FontFace::load(path, px_size) {
-            Ok(f) => Some(f),
-            Err(e) => {
-                eprintln!(
-                    "statusbar: failed to load fallback font {path:?}: {e} — its glyphs will render as tofu"
-                );
-                None
-            }
-        }
-    }
-
     /// Line height in pixels, for vertically centering a row of text in a
     /// bar of a given thickness.
     #[must_use]
@@ -378,8 +364,24 @@ impl FaceRenderer {
                 break;
             };
             self.fallback_paths.remove(0);
-            if let Some(face) = TextRenderer::load_fallback(&path, self.fallback_px_size) {
+            if let Some(face) = Self::load_fallback(&path, self.fallback_px_size) {
                 self.fallbacks.push(face);
+            }
+        }
+    }
+
+    /// Load one fallback face on demand. Diagnoses (but doesn't abort on) a
+    /// bad path, same treatment as the primary face's own failure handling.
+    /// Lives here — on the sole consumer of fallback faces — rather than on
+    /// the owning `TextRenderer`, so ownership flows parent -> child.
+    fn load_fallback(path: &str, px_size: f32) -> Option<FontFace> {
+        match FontFace::load(path, px_size) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                eprintln!(
+                    "statusbar: failed to load fallback font {path:?}: {e} — its glyphs will render as tofu"
+                );
+                None
             }
         }
     }

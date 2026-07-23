@@ -2481,7 +2481,12 @@ impl GlobalsBuilder {
 
     /// Bind `interface` if it's one this window needs and hasn't already
     /// bound (a compositor could in principle advertise a duplicate; the
-    /// first one wins). A no-op for any interface not in the list below.
+    /// first one wins), delegating the repeated "already bound? else
+    /// negotiate a version and bind" shape to `Self::bind_if_missing` so
+    /// each match arm here is a single call rather than an inline `&&`-guard
+    /// plus a 2-line body -- the guard conditions alone had been contributing
+    /// 6 extra decision points to this function's complexity. A no-op for
+    /// any interface not in the list below.
     fn bind_named_global(
         &mut self,
         sender: &mut Sender,
@@ -2491,33 +2496,83 @@ impl GlobalsBuilder {
         version: u32,
     ) -> Result<()> {
         match interface {
-            s if s == proto::WL_COMPOSITOR.name && self.compositor.is_none() => {
-                let v = proto::WL_COMPOSITOR.version.min(version);
-                self.compositor = Some(Registry::bind(sender, registry, name, interface, v)?);
-            }
-            s if s == proto::WL_SHM.name && self.shm.is_none() => {
-                let v = proto::WL_SHM.version.min(version);
-                self.shm = Some(Registry::bind(sender, registry, name, interface, v)?);
-            }
-            s if s == proto::XDG_WM_BASE.name && self.wm_base.is_none() => {
-                let v = proto::XDG_WM_BASE.version.min(version);
-                self.wm_base = Some(Registry::bind(sender, registry, name, interface, v)?);
-            }
-            s if s == proto::WL_SEAT.name && self.seat.is_none() => {
-                let v = proto::WL_SEAT.version.min(version);
-                self.seat = Some(Registry::bind(sender, registry, name, interface, v)?);
-            }
-            s if s == proto::WL_OUTPUT.name && self.output.is_none() => {
-                let v = proto::WL_OUTPUT.version.min(version);
-                self.output = Some(Registry::bind(sender, registry, name, interface, v)?);
-            }
-            s if s == proto::WL_DATA_DEVICE_MANAGER.name && self.data_device_manager.is_none() => {
-                let v = proto::WL_DATA_DEVICE_MANAGER.version.min(version);
-                self.data_device_manager =
-                    Some(Registry::bind(sender, registry, name, interface, v)?);
-            }
-            _ => {}
+            s if s == proto::WL_COMPOSITOR.name => Self::bind_if_missing(
+                &mut self.compositor,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_COMPOSITOR.version,
+            ),
+            s if s == proto::WL_SHM.name => Self::bind_if_missing(
+                &mut self.shm,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_SHM.version,
+            ),
+            s if s == proto::XDG_WM_BASE.name => Self::bind_if_missing(
+                &mut self.wm_base,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::XDG_WM_BASE.version,
+            ),
+            s if s == proto::WL_SEAT.name => Self::bind_if_missing(
+                &mut self.seat,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_SEAT.version,
+            ),
+            s if s == proto::WL_OUTPUT.name => Self::bind_if_missing(
+                &mut self.output,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_OUTPUT.version,
+            ),
+            s if s == proto::WL_DATA_DEVICE_MANAGER.name => Self::bind_if_missing(
+                &mut self.data_device_manager,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_DATA_DEVICE_MANAGER.version,
+            ),
+            _ => Ok(()),
         }
+    }
+
+    /// Bind one global into `slot` if it's still empty, negotiating the
+    /// version as `known_version.min(advertised_version)`. Shared body for
+    /// every arm of [`Self::bind_named_global`] -- factored out so the
+    /// per-interface "already bound?" check doesn't inflate that function's
+    /// branch count arm-by-arm.
+    fn bind_if_missing<T: ObjectId>(
+        slot: &mut Option<T>,
+        sender: &mut Sender,
+        registry: RegistryId,
+        name: u32,
+        interface: &str,
+        advertised_version: u32,
+        known_version: u32,
+    ) -> Result<()> {
+        if slot.is_some() {
+            return Ok(());
+        }
+        let v = known_version.min(advertised_version);
+        *slot = Some(Registry::bind(sender, registry, name, interface, v)?);
         Ok(())
     }
 

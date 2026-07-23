@@ -168,8 +168,11 @@ impl GlobalsBuilder {
             && self.seat.is_some()
     }
 
-    /// Bind `interface` if it's one this bar needs and hasn't already bound.
-    /// A no-op for any interface not in the list below.
+    /// Bind `interface` if it's one this bar needs and hasn't already bound,
+    /// delegating to `Self::bind_if_missing` so each match arm is a single
+    /// call instead of an inline `&&`-guard plus a 2-line body (see
+    /// `platform::window::GlobalsBuilder`'s identical split for the same
+    /// rationale). A no-op for any interface not in the list below.
     fn bind_named_global(
         &mut self,
         sender: &mut Sender,
@@ -179,28 +182,72 @@ impl GlobalsBuilder {
         version: u32,
     ) -> Result<()> {
         match interface {
-            s if s == proto::WL_COMPOSITOR.name && self.compositor.is_none() => {
-                let v = proto::WL_COMPOSITOR.version.min(version);
-                self.compositor = Some(BarWindow::bind(sender, registry, name, interface, v)?);
-            }
-            s if s == proto::WL_SHM.name && self.shm.is_none() => {
-                let v = proto::WL_SHM.version.min(version);
-                self.shm = Some(BarWindow::bind(sender, registry, name, interface, v)?);
-            }
-            s if s == proto::ZWLR_LAYER_SHELL_V1.name && self.layer_shell.is_none() => {
-                let v = proto::ZWLR_LAYER_SHELL_V1.version.min(version);
-                self.layer_shell = Some(BarWindow::bind(sender, registry, name, interface, v)?);
-            }
-            s if s == proto::WL_SEAT.name && self.seat.is_none() => {
-                let v = proto::WL_SEAT.version.min(version);
-                self.seat = Some(BarWindow::bind(sender, registry, name, interface, v)?);
-            }
-            s if s == proto::WL_OUTPUT.name && self.output.is_none() => {
-                let v = proto::WL_OUTPUT.version.min(version);
-                self.output = Some(BarWindow::bind(sender, registry, name, interface, v)?);
-            }
-            _ => {}
+            s if s == proto::WL_COMPOSITOR.name => Self::bind_if_missing(
+                &mut self.compositor,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_COMPOSITOR.version,
+            ),
+            s if s == proto::WL_SHM.name => Self::bind_if_missing(
+                &mut self.shm,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_SHM.version,
+            ),
+            s if s == proto::ZWLR_LAYER_SHELL_V1.name => Self::bind_if_missing(
+                &mut self.layer_shell,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::ZWLR_LAYER_SHELL_V1.version,
+            ),
+            s if s == proto::WL_SEAT.name => Self::bind_if_missing(
+                &mut self.seat,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_SEAT.version,
+            ),
+            s if s == proto::WL_OUTPUT.name => Self::bind_if_missing(
+                &mut self.output,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_OUTPUT.version,
+            ),
+            _ => Ok(()),
         }
+    }
+
+    /// Bind one global into `slot` if it's still empty, negotiating the
+    /// version as `known_version.min(advertised_version)`. Shared body for
+    /// every arm of [`Self::bind_named_global`].
+    fn bind_if_missing<T: ObjectId>(
+        slot: &mut Option<T>,
+        sender: &mut Sender,
+        registry: RegistryId,
+        name: u32,
+        interface: &str,
+        advertised_version: u32,
+        known_version: u32,
+    ) -> Result<()> {
+        if slot.is_some() {
+            return Ok(());
+        }
+        let v = known_version.min(advertised_version);
+        *slot = Some(BarWindow::bind(sender, registry, name, interface, v)?);
         Ok(())
     }
 

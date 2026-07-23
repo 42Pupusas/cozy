@@ -1,0 +1,13 @@
+[package]
+name    = "launcher"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# No path deps: this crate is pure app-discovery/matching/launch logic --
+# ".desktop" file parsing, fuzzy scoring, and Exec= spawning -- with zero
+# Wayland/rendering knowledge, so it's unit-testable headlessly and reusable
+# by any future launcher UI, not just bins/launcher.

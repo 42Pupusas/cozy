@@ -20,7 +20,7 @@ pub mod error;
 pub mod event;
 pub mod font;
 pub mod id;
-mod key_repeat;
+pub mod key_repeat;
 pub mod keymap;
 pub mod link_scan;
 pub mod pixel_buffers;

@@ -1,0 +1,20 @@
+[package]
+name    = "launcher-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "launcher"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+launcher  = { path = "../../crates/launcher" }
+statusbar = { path = "../../crates/statusbar" }
+platform  = { path = "../../crates/platform" }
+config    = { path = "../../crates/config" }
+waker        = { path = "../../crates/waker" }
+xkb          = { path = "../../crates/xkb" }
+quetzalcoatl = { workspace = true }

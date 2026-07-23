@@ -196,9 +196,12 @@ impl DebugOverlay {
     /// the Attach/Damage/Commit ring writes -- if the socket is applying
     /// backpressure (compositor can't drain), the write blocks there and this
     /// phase, not blit, will own the time.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn log_slow_present(
         &self,
         total: std::time::Duration,
+        t_snapshot: std::time::Duration,
+        t_paint: std::time::Duration,
         t_blit: std::time::Duration,
         t_overlay: std::time::Duration,
         folded_len: usize,
@@ -206,12 +209,20 @@ impl DebugOverlay {
         painted_cells: usize,
     ) {
         if self.mode == DebugFps::Log && total.as_micros() > 5_000 {
-            let blit_us = t_blit.as_micros();
+            // Split the old `blit` bucket into its three real sub-phases so a
+            // custom-painter window (empty snapshot loop) shows whether the
+            // spike lives in the paint callback or the premultiply, not just
+            // "blit". `snapshot` = grid blit loop, `paint` = custom callback,
+            // `premul` = update_custom_argb.
+            let snapshot_us = t_snapshot.as_micros();
+            let paint_us = t_paint.saturating_sub(t_snapshot).as_micros();
+            let premul_us = t_blit.saturating_sub(t_paint).as_micros();
             let overlay_us = t_overlay.saturating_sub(t_blit).as_micros();
             let submit_us = total.saturating_sub(t_overlay).as_micros();
             eprintln!(
-                "terminal:   slow present {}us = blit {blit_us}us ({folded_len} folded, \
+                "terminal:   slow present {}us = snapshot {snapshot_us}us ({folded_len} folded, \
                  {painted_rows} rows / {painted_cells} cells) \
+                 + paint {paint_us}us + premul {premul_us}us \
                  + overlay {overlay_us}us + shm-copy/submit {submit_us}us",
                 total.as_micros()
             );

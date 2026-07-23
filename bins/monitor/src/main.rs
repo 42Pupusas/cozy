@@ -7,30 +7,44 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-mod chart;
-mod chart_cache;
-mod core_bars;
-mod display_snapshot;
+// Paint/data leaf modules live in the library face (`lib.rs`) so `divan`
+// benches can drive them headlessly with an allocation profiler. The binary
+// only adds the modules that need the live window/thread context.
 mod profile;
-mod redraw_gate;
 
-use chart_cache::{ChartCache, Overlay};
-use core_bars::{CoreBarPaint, CoreBars};
-use display_snapshot::DisplaySnapshot;
+use monitor::chart_cache::{ChartCache, Overlay};
+use monitor::core_bars::{CoreBarPaint, CoreBars};
+use monitor::damage::DamageList;
+use monitor::display_snapshot::DisplaySnapshot;
+use monitor::redraw_gate::RedrawGate;
+use monitor::sample_interpolator::SampleInterpolator;
 use platform::TermWindow;
 use platform::draw::{Canvas, Color, Rect};
 use profile::{FrameProfile, PaintPhases, WorkerProfile};
-use redraw_gate::RedrawGate;
 use statusbar::{MonitorReader, MonitorSample, ProcessInfo, TextRenderer};
 
 /// One minute of chart history at four deliberately distinct points per
 /// second. At typical card widths this gives each interval visible horizontal
 /// room, while the chart's monotone curve keeps the coarser time series fluid.
 const HISTORY: usize = 60 * 4;
+/// Tick cadence: how often the loop wakes to *check* whether a frame is worth
+/// presenting. This is deliberately the full display refresh (60 Hz) rather
+/// than a lower presentation cap, because the redraw gate decouples the two:
+/// a present only happens when the quantized `DisplaySnapshot` actually
+/// changes (a hero number crosses an integer, a bar moves a whole percent),
+/// so the number of *presents* is bounded by how fast the displayed values
+/// cross rendering boundaries -- NOT by this tick rate. Raising the tick rate
+/// from 20 to 60 Hz therefore does not multiply present cost; it only lets the
+/// eased glide land its integer steps on finer ticks (smoother motion) at the
+/// price of more idle gate checks. Those checks were made allocation-cheap on
+/// purpose (`DisplaySnapshot::from_sample` is ~110ns/1-alloc, proven by the
+/// `idle_tick` bench) precisely so 60 Hz ticking stays affordable. ~16.67ms =
+/// one 60 Hz frame.
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
-/// Kernel counters and sysfs values do not benefit from 60 reads per second.
-/// Samples arrive at 10 Hz; visual frames interpolate them at 60 Hz.
-const SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+/// Kernel counters and sysfs values do not benefit from many reads per second:
+/// a system dashboard's numbers are meaningful at ~1 Hz. Sampling once a second
+/// keeps the worker thread near idle.
+const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Graphs retain one point every quarter-second rather than one per presented
 /// frame. Text readouts stay at 60 Hz, so this reduces visual density without
 /// making the dashboard feel sluggish.
@@ -74,72 +88,6 @@ const CORE_COLORS: [Color; 8] = [
 struct Snapshot {
     sample: MonitorSample,
     processes: Vec<ProcessInfo>,
-}
-
-/// Bridges low-cost 10 Hz collection to fluid 60 Hz graph motion. Keeping this
-/// as a dedicated owner makes presentation interpolation explicit rather than
-/// accidentally turning rendering cadence into system-I/O cadence.
-struct SampleInterpolator {
-    from: MonitorSample,
-    to: MonitorSample,
-    started: Instant,
-}
-
-impl SampleInterpolator {
-    fn new() -> Self {
-        Self {
-            from: MonitorSample::default(),
-            to: MonitorSample::default(),
-            started: Instant::now(),
-        }
-    }
-
-    fn accept(&mut self, next: MonitorSample) {
-        self.from = self.value();
-        self.to = next;
-        self.started = Instant::now();
-    }
-
-    fn value(&self) -> MonitorSample {
-        let t = (self.started.elapsed().as_secs_f32() / SAMPLE_INTERVAL.as_secs_f32()).min(1.0);
-        Self::blend(&self.from, &self.to, t)
-    }
-
-    fn blend(from: &MonitorSample, to: &MonitorSample, t: f32) -> MonitorSample {
-        let blend = |a: f32, b: f32| (b - a).mul_add(t, a);
-        let mut cores = Vec::with_capacity(to.cores.len());
-        for (index, &value) in to.cores.iter().enumerate() {
-            cores.push(blend(
-                from.cores.get(index).copied().unwrap_or(value),
-                value,
-            ));
-        }
-        MonitorSample {
-            cpu: blend(from.cpu, to.cpu),
-            cores,
-            load: std::array::from_fn(|index| blend(from.load[index], to.load[index])),
-            memory: blend(from.memory, to.memory),
-            temperature: blend(from.temperature, to.temperature),
-            thermal_device: to.thermal_device.clone(),
-            thermal_max: blend(from.thermal_max, to.thermal_max),
-            thermal_avg: blend(from.thermal_avg, to.thermal_avg),
-            thermal_min: blend(from.thermal_min, to.thermal_min),
-            disk: blend(from.disk, to.disk),
-            network_rx: blend(from.network_rx, to.network_rx),
-            network_tx: blend(from.network_tx, to.network_tx),
-            network_device: to.network_device.clone(),
-            network_ping_ms: blend(from.network_ping_ms, to.network_ping_ms),
-            network_link_mbps: blend(from.network_link_mbps, to.network_link_mbps),
-            cpu_brand: to.cpu_brand.clone(),
-            cpu_cores: to.cpu_cores,
-            cpu_frequency_ghz: blend(from.cpu_frequency_ghz, to.cpu_frequency_ghz),
-            disk_io_mb_s: blend(from.disk_io_mb_s, to.disk_io_mb_s),
-            memory_available_mb: blend(from.memory_available_mb, to.memory_available_mb),
-            swap_used_mb: blend(from.swap_used_mb, to.swap_used_mb),
-            swap_total_mb: blend(from.swap_total_mb, to.swap_total_mb),
-            memory_device: to.memory_device.clone(),
-        }
-    }
 }
 
 struct History {
@@ -193,6 +141,13 @@ struct Typography {
     normal: TextRenderer,
 }
 
+enum TypographyTier {
+    Hero(TextRenderer),
+    Title(TextRenderer),
+    Subtitle(TextRenderer),
+    Normal(TextRenderer),
+}
+
 struct Painter {
     cpu: ChartCache,
     memory: ChartCache,
@@ -240,7 +195,8 @@ impl Painter {
         height: i32,
         sequence: u64,
         overlays: &[Overlay<'_>],
-    ) {
+        background_cleared: bool,
+    ) -> DamageList {
         // The chart deliberately has no grid or frame: at this small size they
         // compete with the data. Its private surface advances like the
         // terminal's pixel-scrolled backbuffer, then only its finished pixels
@@ -254,7 +210,8 @@ impl Painter {
             overlays,
             HISTORY,
             sequence,
-        );
+            background_cleared,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -267,7 +224,8 @@ impl Painter {
         w: i32,
         h: i32,
         sequence: u64,
-    ) {
+        background_cleared: bool,
+    ) -> DamageList {
         // The line is intentionally aggregate-only. Per-core activity is a
         // current-state comparison and is much easier to read as bars than as
         // a stack of nearly indistinguishable historical overlays.
@@ -280,7 +238,8 @@ impl Painter {
             &[],
             HISTORY,
             sequence,
-        );
+            background_cleared,
+        )
     }
 
     fn card(&self, canvas: &mut Canvas, rect: Rect, full_repaint: bool) {
@@ -390,11 +349,18 @@ impl Painter {
         _background: Color,
         full_repaint: bool,
         phases: &mut PaintPhases,
-    ) -> Rect {
+    ) -> DamageList {
         let text = &mut typography.normal;
         let title_text = &mut typography.title;
         let subtitle_text = &mut typography.subtitle;
         let hero_text = &mut typography.hero;
+        // Accumulates the exact rectangles this frame draws. On a full repaint
+        // everything (text, cards, process table) changes, so we short-circuit
+        // to a single whole-window rect below; otherwise only the animated
+        // chart edges and moved core bars are pushed, which is the whole point
+        // -- premultiply/upload then touch ~0.15% of the window instead of all
+        // of it.
+        let mut damage = DamageList::new();
         // Clearing is needed only when static dashboard content changes. The
         // graph cards repaint their own opaque rectangles each animation frame,
         // so clearing the process table at 60 Hz would create needless memory
@@ -620,7 +586,7 @@ impl Painter {
             );
         }
         let started = Instant::now();
-        Self::cpu_graph(
+        let cpu_chart_damage = Self::cpu_graph(
             &mut self.cpu,
             canvas,
             &history.cpu,
@@ -629,19 +595,23 @@ impl Painter {
             cpu_line.w,
             cpu_line.h,
             history.sequence,
+            full_repaint,
         );
-        self.cpu_bars.paint(
+        phases.charts_active += u32::from(!cpu_chart_damage.is_empty());
+        damage.extend(&cpu_chart_damage);
+        damage.extend(&self.cpu_bars.paint(
             canvas,
             &snap.sample.cores,
             CoreBarPaint {
                 bounds: cpu_bars_rect,
                 background: CARD_SURFACE,
                 colors: &CORE_COLORS,
+                background_cleared: full_repaint,
             },
-        );
+        ));
         phases.cpu_chart += started.elapsed();
         let started = Instant::now();
-        Self::graph(
+        let memory_damage = Self::graph(
             &mut self.memory,
             canvas,
             &history.memory,
@@ -653,8 +623,11 @@ impl Painter {
             graph_h,
             history.sequence,
             &[],
+            full_repaint,
         );
-        Self::graph(
+        phases.charts_active += u32::from(!memory_damage.is_empty());
+        damage.extend(&memory_damage);
+        let temp_damage = Self::graph(
             &mut self.temperature,
             canvas,
             &history.temp,
@@ -666,8 +639,11 @@ impl Painter {
             graph_h,
             history.sequence,
             &[],
+            full_repaint,
         );
-        Self::graph(
+        phases.charts_active += u32::from(!temp_damage.is_empty());
+        damage.extend(&temp_damage);
+        let network_damage = Self::graph(
             &mut self.network,
             canvas,
             &history.rx,
@@ -679,7 +655,10 @@ impl Painter {
             graph_h,
             history.sequence,
             &[Overlay::new(&history.tx, ORANGE)],
+            full_repaint,
         );
+        phases.charts_active += u32::from(!network_damage.is_empty());
+        damage.extend(&network_damage);
         phases.other_charts += started.elapsed();
 
         let proc_rect = Rect::new(
@@ -797,9 +776,16 @@ impl Painter {
                 );
             }
             phases.static_content += Instant::now().duration_since(started);
-            canvas.bounds()
+            // A full repaint rewrote text, cards, and the process table across
+            // the whole surface, so the entire window is damage. Collapsing to
+            // one rect (rather than the accumulated chart/bar regions) is both
+            // correct and cheaper for the consumer to premultiply as one span.
+            DamageList::single(canvas.bounds())
         } else {
-            Rect::new(0, margin, width, height - margin * 2)
+            // Steady state: only the animated chart edges and moved core bars
+            // were drawn; return exactly those so the platform layer
+            // premultiplies and uploads a tiny fraction of the window.
+            damage
         }
     }
 }
@@ -807,11 +793,14 @@ impl Painter {
 struct App {
     window: TermWindow,
     typography: Typography,
+    typography_rx: mpsc::Receiver<TypographyTier>,
     snapshot: Snapshot,
     history: History,
     background: Color,
     rx: mpsc::Receiver<Snapshot>,
     full_repaint: bool,
+    has_received_snapshot: bool,
+    typography_pending: usize,
     profile: FrameProfile,
     display: SampleInterpolator,
     painter: Painter,
@@ -875,22 +864,33 @@ impl App {
         let scale = window.scale();
         let scale_f32 = f32::from(i16::try_from(scale).unwrap_or(i16::MAX));
         let size = cfg.font.px_size() * scale_f32;
-        let load_text = |px_size: f32| {
-            TextRenderer::load_with_fallbacks(
-                cfg.font.path.as_deref(),
-                &[cfg.font.emoji_path.as_deref()],
-                px_size,
-            )
-        };
+        // The four typography tiers share the same font file. Read it once;
+        // repeatedly opening a large TTF/OTF during window creation made the
+        // first frame wait on avoidable filesystem work.
+        let font_path = cfg.font.path.clone();
+        let emoji_path = cfg.font.emoji_path.clone();
+        let font_data = font_path
+            .as_deref()
+            .and_then(|path| std::fs::read(path).ok());
+        let hero_size = size * cfg.monitor.hero_size.unwrap_or(2.5);
+        let title_size = size * cfg.monitor.title_size.unwrap_or(1.0);
+        let subtitle_size = size * cfg.monitor.subtitle_size.unwrap_or(0.90);
+        let normal_size = size * cfg.monitor.normal_size.unwrap_or(0.80);
+        let typography_rx = Self::spawn_typography_loaders(
+            font_path.as_deref(),
+            emoji_path.as_deref(),
+            font_data.as_deref(),
+            [hero_size, title_size, subtitle_size, normal_size],
+        );
+        // Paint immediately with the embedded font while the configured face
+        // is parsed off the Wayland thread. The real typography is swapped in
+        // as soon as it is ready, turning the multi-second startup stall into
+        // a progressive upgrade instead of delaying text and graphs together.
         let typography = Typography {
-            hero: load_text(size * cfg.monitor.hero_size.unwrap_or(2.5)),
-            // Keep the supporting tiers close to the original design: titles
-            // are the base UI size, subtitles are slightly quieter, and body
-            // values are smaller so the hierarchy reads without becoming
-            // oversized beside the hero metric.
-            title: load_text(size * cfg.monitor.title_size.unwrap_or(1.0)),
-            subtitle: load_text(size * cfg.monitor.subtitle_size.unwrap_or(0.90)),
-            normal: load_text(size * cfg.monitor.normal_size.unwrap_or(0.80)),
+            hero: TextRenderer::load(None, hero_size),
+            title: TextRenderer::load(None, title_size),
+            subtitle: TextRenderer::load(None, subtitle_size),
+            normal: TextRenderer::load(None, normal_size),
         };
         let background_color = cfg
             .monitor
@@ -901,11 +901,14 @@ impl App {
         Self {
             window,
             typography,
+            typography_rx,
             snapshot: Snapshot::default(),
             history: History::new(),
             background,
             rx,
             full_repaint: true,
+            has_received_snapshot: false,
+            typography_pending: 4,
             profile: FrameProfile::new(),
             display: SampleInterpolator::new(),
             painter: Painter::with_colors(
@@ -957,8 +960,12 @@ impl App {
                     sample,
                     processes: processes.clone(),
                 });
-                profile.report();
+                // Wake the UI immediately after useful telemetry is ready.
+                // Reporting and the optional latency probe must not delay the
+                // first graph frame after this notification.
                 wake.signal();
+                profile.report();
+                reader.refresh_network_ping();
                 std::thread::sleep(SAMPLE_INTERVAL);
             }
         });
@@ -979,14 +986,40 @@ impl App {
                 self.window.wait(millis);
                 continue;
             }
+            while let Ok(update) = self.typography_rx.try_recv() {
+                match update {
+                    TypographyTier::Hero(renderer) => self.typography.hero = renderer,
+                    TypographyTier::Title(renderer) => self.typography.title = renderer,
+                    TypographyTier::Subtitle(renderer) => self.typography.subtitle = renderer,
+                    TypographyTier::Normal(renderer) => self.typography.normal = renderer,
+                }
+                // Each tier is independently useful. Repaint as soon as one
+                // arrives instead of waiting for the slowest face/size parse.
+                self.typography_pending = self.typography_pending.saturating_sub(1);
+                self.full_repaint = true;
+            }
             while let Ok(snapshot) = self.rx.try_recv() {
+                // The first frame can already contain card backgrounds and
+                // chart surfaces, but the text layout is deliberately gated
+                // behind `full_repaint`. Mark the first real sample as a
+                // static-content repaint so labels and values are not left
+                // waiting for the font loader or a later process sweep.
+                if !self.has_received_snapshot {
+                    self.full_repaint = true;
+                    self.has_received_snapshot = true;
+                }
                 if Self::processes_changed(&self.snapshot.processes, &snapshot.processes) {
                     self.full_repaint = true;
                 }
                 self.display.accept(snapshot.sample.clone());
                 self.snapshot = snapshot;
             }
-            self.snapshot.sample = self.display.value();
+            // Blend in place into the existing sample buffer: this runs every
+            // 60 Hz tick (including skipped ones), so allocating a fresh sample
+            // here -- as the old `= self.display.value()` did -- cloned four
+            // device strings and a cores Vec ~60x/sec for byte-identical
+            // output during the glide's hold. `blend_into` reuses the buffer.
+            self.display.blend_into(&mut self.snapshot.sample);
             let new_graph_sample = self.record_graph_sample(now);
             // Only pay for paint + present when something a viewer could
             // actually see has changed: a fresh chart knot landed, the
@@ -1009,60 +1042,11 @@ impl App {
             let should_paint =
                 RedrawGate::evaluate(self.full_repaint, new_graph_sample, display_changed);
             if should_paint {
-                // One explicit dirty mark per deadline. `TermWindow` coalesces
-                // if the compositor still owns both shm slots.
-                self.window.request_redraw();
-                let snapshot = &self.snapshot;
-                let history = &self.history;
-                let typography = &mut self.typography;
-                let painter = &mut self.painter;
-                let background = self.background;
-                let full_repaint = self.full_repaint;
-                let mut paint_time = Duration::ZERO;
-                let mut phases = PaintPhases::default();
-                let frame_started = Instant::now();
-                match self.window.tick_with_painter(|canvas| {
-                    let started = Instant::now();
-                    let damage = painter.paint(
-                        canvas,
-                        typography,
-                        snapshot,
-                        history,
-                        background,
-                        full_repaint,
-                        &mut phases,
-                    );
-                    paint_time = started.elapsed();
-                    damage
-                }) {
-                    Ok(true) => {
-                        self.profile.record(
-                            paint_time,
-                            frame_started.elapsed(),
-                            &phases,
-                            full_repaint,
-                        );
-                        self.full_repaint = false;
-                        self.last_painted_display = current_display;
-                    }
-                    Ok(false) | Err(_) => break,
+                if !self.paint_and_present(current_display) {
+                    break;
                 }
-            } else {
-                // Still pump the Wayland connection (resize/output-change
-                // events, frame callbacks) even on a tick with nothing to
-                // paint. Crucially, retain the custom-painter path while doing
-                // so: `tick()` is for terminal-grid windows and would copy the
-                // XRGB backbuffer directly into an ARGB monitor buffer if an
-                // event (notably a resize) made it dirty between dashboard
-                // paints. XRGB has a zero high byte, so that accidental present
-                // makes the entire monitor transparent. The no-op painter lets
-                // `TermWindow` retain and premultiply its already-valid custom
-                // backbuffer should it need to present for such an event.
-                self.profile.record_skip();
-                match self.window.tick_with_painter(|_| Rect::new(0, 0, 0, 0)) {
-                    Ok(true) => {}
-                    Ok(false) | Err(_) => break,
-                }
+            } else if !self.pump_idle() {
+                break;
             }
             // Do not replay missed frames after a compositor stall; the newest
             // sample is more useful than a burst of obsolete graph states.
@@ -1071,6 +1055,175 @@ impl App {
                 next_frame = Instant::now() + FRAME_INTERVAL;
             }
         }
+    }
+
+    /// Spawn one background thread per typography tier to parse and prewarm
+    /// the configured font off the Wayland thread, returning the receiver the
+    /// run loop drains as each tier arrives.
+    ///
+    /// Font parsing (a large TTF/OTF plus glyph prewarming) is the multi-
+    /// second cost that used to stall the first frame. Each of the four tiers
+    /// -- hero, title, subtitle, normal, passed in that order via `sizes` --
+    /// loads independently so the dashboard can swap each in the instant it is
+    /// ready rather than waiting for the slowest face. Kept off `new` so that
+    /// constructor stays a straight-line assembly of fields.
+    fn spawn_typography_loaders(
+        font_path: Option<&str>,
+        emoji_path: Option<&str>,
+        font_data: Option<&[u8]>,
+        sizes: [f32; 4],
+    ) -> mpsc::Receiver<TypographyTier> {
+        let (typography_tx, typography_rx) = mpsc::channel();
+        // Own the borrowed inputs once so each spawned thread can capture its
+        // own clone; the borrows don't outlive this call but the threads do.
+        let font_path = font_path.map(str::to_owned);
+        let emoji_path = emoji_path.map(str::to_owned);
+        let font_data = font_data.map(<[u8]>::to_vec);
+        for (tier, px_size) in (0_u8..).zip(sizes) {
+            let tx = typography_tx.clone();
+            let path = font_path.clone();
+            let emoji = emoji_path.clone();
+            let data = font_data.clone();
+            std::thread::spawn(move || {
+                let renderer = if let (Some(path), Some(data)) = (path.as_deref(), data.as_deref())
+                {
+                    TextRenderer::load_with_fallbacks_from_bytes(
+                        path,
+                        data,
+                        &[emoji.as_deref()],
+                        px_size,
+                    )
+                } else {
+                    TextRenderer::load_with_fallbacks(path.as_deref(), &[emoji.as_deref()], px_size)
+                };
+                let mut renderer = renderer;
+                renderer.prewarm_common_glyphs();
+                let update = match tier {
+                    0 => TypographyTier::Hero(renderer),
+                    1 => TypographyTier::Title(renderer),
+                    2 => TypographyTier::Subtitle(renderer),
+                    _ => TypographyTier::Normal(renderer),
+                };
+                let _ = tx.send(update);
+            });
+        }
+        typography_rx
+    }
+
+    /// Paint one frame and hand its damage to the compositor. Returns whether
+    /// the run loop should continue (false only on a fatal `tick` error).
+    ///
+    /// Extracted from `run` so that loop stays a readable dispatcher: this is
+    /// the whole "a viewer would see a change" branch -- request the redraw,
+    /// run the painter inside `tick_with_painter`, and record the frame's
+    /// profile. `current_display` is the quantized snapshot that justified
+    /// this paint; it becomes `last_painted_display` only once the frame
+    /// actually presented (a compositor that owned both shm slots skips the
+    /// closure, so we must not advance the gate's baseline on a dropped tick).
+    fn paint_and_present(&mut self, current_display: DisplaySnapshot) -> bool {
+        // One explicit dirty mark per deadline. `TermWindow` coalesces
+        // if the compositor still owns both shm slots.
+        self.window.request_redraw();
+        let snapshot = &self.snapshot;
+        let history = &self.history;
+        let typography = &mut self.typography;
+        let painter = &mut self.painter;
+        let background = self.background;
+        let full_repaint = self.full_repaint;
+        let mut paint_time = Duration::ZERO;
+        let mut damage_rows = 0.0;
+        let mut phases = PaintPhases::default();
+        // Proof-of-paint. `tick_with_painter` returns `Ok(true)` even
+        // when the compositor still owns both shm slots
+        // (`NotReady`/`NoFreeSlot`): in that case it returns *before*
+        // running this closure, so no pixels were produced. Text and
+        // card chrome are drawn ONLY on a `full_repaint` frame, so if
+        // we cleared `full_repaint` on such a dropped frame the static
+        // content would never be redrawn -- it vanishes permanently.
+        // The closure runs exactly when a slot was claimed and the
+        // frame really presented, so setting this inside it is the one
+        // reliable signal that the paint landed.
+        let mut frame_presented = false;
+        let frame_started = Instant::now();
+        match self.window.tick_with_painter(|canvas| {
+            let started = Instant::now();
+            let damage = painter.paint(
+                canvas,
+                typography,
+                snapshot,
+                history,
+                background,
+                full_repaint,
+                &mut phases,
+            );
+            paint_time = started.elapsed();
+            frame_presented = true;
+            // Measure the row coverage the shm path will actually
+            // upload (row-band granular), so the profile shows whether
+            // present cost is dominated by many separated chart bands
+            // or is already minimal. A full repaint uploads everything.
+            damage_rows = if full_repaint {
+                1.0
+            } else {
+                damage.row_coverage_fraction(canvas.height())
+            };
+            // A full repaint touched the whole surface; signal that
+            // explicitly so the platform takes its whole-window premul
+            // path. Otherwise hand over exactly the animated regions.
+            if full_repaint {
+                platform::draw::Damage::full()
+            } else {
+                damage.to_platform()
+            }
+        }) {
+            Ok(true) => {
+                if frame_presented {
+                    self.profile.record(
+                        paint_time,
+                        frame_started.elapsed(),
+                        &phases,
+                        full_repaint,
+                        damage_rows,
+                    );
+                    // Keep the static/text pass alive until every
+                    // custom tier has arrived. This is intentionally
+                    // limited to startup: it guarantees the temporary
+                    // bitmap text is actually presented even if
+                    // telemetry/chart damage would otherwise let the
+                    // first full repaint get coalesced away.
+                    self.full_repaint = self.typography_pending != 0;
+                    self.last_painted_display = current_display;
+                }
+                // else: the compositor owned both slots this tick, so
+                // nothing was drawn. Leave `full_repaint` and
+                // `last_painted_display` untouched so the very next
+                // tick retries the same paint instead of dropping the
+                // static content on the floor.
+                true
+            }
+            Ok(false) | Err(_) => false,
+        }
+    }
+
+    /// Pump the Wayland connection on a tick with nothing to paint. Returns
+    /// whether the run loop should continue.
+    ///
+    /// Still pump the connection (resize/output-change events, frame
+    /// callbacks) even when the redraw gate skipped this tick. Crucially,
+    /// retain the custom-painter path while doing so: `tick()` is for
+    /// terminal-grid windows and would copy the XRGB backbuffer directly into
+    /// an ARGB monitor buffer if an event (notably a resize) made it dirty
+    /// between dashboard paints. XRGB has a zero high byte, so that accidental
+    /// present makes the entire monitor transparent. The no-op painter lets
+    /// `TermWindow` retain and premultiply its already-valid custom
+    /// backbuffer should it need to present for such an event.
+    fn pump_idle(&mut self) -> bool {
+        self.profile.record_skip();
+        matches!(
+            self.window
+                .tick_with_painter(|_| platform::draw::Damage::none()),
+            Ok(true)
+        )
     }
 
     /// Whether the process table needs its (expensive, text-heavy)
@@ -1117,10 +1270,10 @@ fn main() {
 #[cfg(test)]
 mod perf_harness {
     use super::{
-        CARD_SURFACE, Canvas, ChartCache, History, MonitorSample, PERF_ITERATIONS, PaintPhases,
-        Painter, ProcessInfo, Snapshot, Typography,
+        CARD_SURFACE, Canvas, History, MonitorSample, PERF_ITERATIONS, PaintPhases, Painter,
+        ProcessInfo, Rect, Snapshot, Typography,
     };
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     /// A plausible, non-degenerate sample so every card/branch in `paint`
     /// (hero numbers, detail rows, per-core bars, process list) does real
@@ -1173,57 +1326,269 @@ mod perf_harness {
     #[test]
     #[ignore = "long-running perf workload, not a correctness check -- run explicitly under perf record"]
     fn headless_paint_perf_workload() {
-        let width = 1400;
-        let height = 900;
-        let mut pixels = vec![0u32; 1_260_000];
-        let mut typography = Typography {
-            hero: statusbar::TextRenderer::load(None, 32.0),
-            title: statusbar::TextRenderer::load(None, 14.0),
-            subtitle: statusbar::TextRenderer::load(None, 13.0),
-            normal: statusbar::TextRenderer::load(None, 11.0),
-        };
-        let mut painter = Painter::with_surface(CARD_SURFACE);
-        let mut history = History::new();
-        let mut phases = PaintPhases::default();
+        let iterations = std::env::var("MONITOR_BENCH_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PERF_ITERATIONS);
+        HeadlessPresent::new().run(iterations);
+    }
 
-        // `PERF_ITERATIONS` is long enough for a meaningful sample while
-        // remaining practical when explicitly run with `--ignored`.
-        let started = Instant::now();
-        for tick in 0..PERF_ITERATIONS {
+    /// Headless reproduction of the *entire* present pipeline a translucent
+    /// custom-painter window pays each frame -- paint into the backbuffer,
+    /// premultiply into the ARGB cache, copy to a simulated shm slot -- so the
+    /// growing `blit`/present spike the live `TERMINAL_DEBUG_FPS=log` trace
+    /// showed (2.4ms -> 67ms over a session) can be reproduced, bucketed, and
+    /// bisected here with no compositor. The old harness reported only a
+    /// whole-run *average*, which mathematically masks growth; this reports
+    /// per-bucket timing so a rising trend is visible in the numbers alone.
+    struct HeadlessPresent {
+        width: i32,
+        height: i32,
+        backbuffer: Vec<u32>,
+        prev_backbuffer: Vec<u32>,
+        custom_argb: Vec<u32>,
+        shm_slot: Vec<u32>,
+        last_dirty_pixels: usize,
+        typography: Typography,
+        painter: Painter,
+        history: History,
+        premultiplier: platform::premultiply::Premultiplier,
+    }
+
+    impl HeadlessPresent {
+        fn new() -> Self {
+            // Window pixel dimensions dominate premul + shm-copy cost (both
+            // run over the *whole* surface every present). Override via env to
+            // test the area-scaling hypothesis: `MONITOR_BENCH_W`/`_H`.
+            let width: usize = std::env::var("MONITOR_BENCH_W")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1400);
+            let height: usize = std::env::var("MONITOR_BENCH_H")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(900);
+            let area = width as usize * height as usize;
+            Self {
+                width: width as i32,
+                height: height as i32,
+                backbuffer: vec![0u32; area],
+                prev_backbuffer: vec![0u32; area],
+                custom_argb: vec![0u32; area],
+                shm_slot: vec![0u32; area],
+                last_dirty_pixels: 0,
+                typography: Typography {
+                    hero: statusbar::TextRenderer::load(None, 32.0),
+                    title: statusbar::TextRenderer::load(None, 14.0),
+                    subtitle: statusbar::TextRenderer::load(None, 13.0),
+                    normal: statusbar::TextRenderer::load(None, 11.0),
+                },
+                painter: Painter::with_surface(CARD_SURFACE),
+                history: History::new(),
+                premultiplier: platform::premultiply::Premultiplier::new(),
+            }
+        }
+
+        /// One present: the same three phases the live trace splits into
+        /// (`paint`, `premul`, `shm-copy`). Returns each phase's duration so
+        /// the caller can bucket them and expose any growth trend.
+        fn present(
+            &mut self,
+            tick: usize,
+            phases: &mut PaintPhases,
+        ) -> (Duration, Duration, Duration) {
             let snapshot = Snapshot {
                 sample: synthetic_sample(tick),
                 processes: synthetic_processes(tick),
             };
             if tick % 25 == 0 {
-                history.add(&snapshot.sample);
+                self.history.add(&snapshot.sample);
             }
-            let mut canvas = Canvas::new(&mut pixels, width, height);
-            // Every 10th tick pays for the full (text-heavy) repaint path;
-            // the rest exercise only the charts/bars, mirroring the real
-            // ~1-in-10 `full_repaint` ratio the live profiler reports.
             let full_repaint = tick % 10 == 0;
-            painter.paint(
-                &mut canvas,
-                &mut typography,
-                &snapshot,
-                &history,
-                CARD_SURFACE,
-                full_repaint,
-                &mut phases,
-            );
+
+            // Snapshot the backbuffer so the exact number of pixels this paint
+            // actually mutates can be counted by diffing afterwards. premul and
+            // shm-copy are both strictly linear in pixel count, so the true
+            // floor of *any* damage scheme -- single-rect, row-band, or
+            // multi-region -- is "premultiply only the changed pixels". Diffing
+            // gives that floor with no guessing about layout geometry: it's the
+            // ground truth the multi-region damage list would have to match.
+            let measure_dirty = std::env::var_os("MONITOR_BENCH_DIRTY").is_some();
+            if measure_dirty {
+                self.prev_backbuffer.copy_from_slice(&self.backbuffer);
+            }
+
+            let t0 = Instant::now();
+            let damage = {
+                let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height);
+                self.painter.paint(
+                    &mut canvas,
+                    &mut self.typography,
+                    &snapshot,
+                    &self.history,
+                    CARD_SURFACE,
+                    full_repaint,
+                    phases,
+                )
+            };
+            let paint = t0.elapsed();
+
+            let width = self.width.max(0) as usize;
+            let rows = self.backbuffer.len() / width.max(1);
+            let total_area = self.backbuffer.len();
+            // Three scoping models to compare in one framework:
+            // * FULL    -> whole window (the pre-fix behaviour, the bug)
+            // * DIRTY   -> only pixels that actually changed (the true ceiling)
+            // * default -> the SHIPPED behaviour: premultiply each region the
+            //              painter's `DamageList` actually reported, per row
+            //              band, exactly like `TermWindow::maybe_present` now
+            //              does. On a full-repaint frame the list collapses to
+            //              the whole window; steady state is a few small rects.
+            if std::env::var_os("MONITOR_BENCH_FULL").is_some() {
+                let t1 = Instant::now();
+                self.premultiplier
+                    .run(220, &self.backbuffer, &mut self.custom_argb);
+                let premul = t1.elapsed();
+                let t2 = Instant::now();
+                self.shm_slot.copy_from_slice(&self.custom_argb);
+                let shm = t2.elapsed();
+                self.last_dirty_pixels = total_area;
+                return (paint, premul, shm);
+            }
+            if measure_dirty {
+                let (start, end) = self.dirty_span();
+                let t1 = Instant::now();
+                self.premultiplier.run(
+                    220,
+                    &self.backbuffer[start..end],
+                    &mut self.custom_argb[start..end],
+                );
+                let premul = t1.elapsed();
+                let t2 = Instant::now();
+                self.shm_slot[start..end].copy_from_slice(&self.custom_argb[start..end]);
+                let shm = t2.elapsed();
+                return (paint, premul, shm);
+            }
+            // Shipped path: premultiply + upload each reported region as a row
+            // band (the row-granular shm damage protocol). Full repaints report
+            // one whole-window rect.
+            let regions: Vec<Rect> = if full_repaint {
+                vec![Rect::new(0, 0, self.width, self.height)]
+            } else {
+                damage.regions().to_vec()
+            };
+            let mut premul = Duration::ZERO;
+            let mut shm = Duration::ZERO;
+            let mut dirty_px = 0usize;
+            for rect in regions {
+                let y0 = (rect.y.max(0).min(self.height) as usize).min(rows);
+                let y1 = (rect.bottom().max(rect.y).min(self.height) as usize).min(rows);
+                let start = y0 * width;
+                let end = y1 * width;
+                if start >= end {
+                    continue;
+                }
+                dirty_px += end - start;
+                let t1 = Instant::now();
+                self.premultiplier.run(
+                    220,
+                    &self.backbuffer[start..end],
+                    &mut self.custom_argb[start..end],
+                );
+                premul += t1.elapsed();
+                let t2 = Instant::now();
+                self.shm_slot[start..end].copy_from_slice(&self.custom_argb[start..end]);
+                shm += t2.elapsed();
+            }
+            self.last_dirty_pixels = dirty_px;
+            (paint, premul, shm)
         }
-        let elapsed = started.elapsed();
-        eprintln!(
-            "headless_paint_perf_workload: {PERF_ITERATIONS} paints in {:.2?} ({:.3} ms/paint avg)",
-            elapsed,
-            elapsed.as_secs_f64() * 1_000.0 / 20_000.0
-        );
-        // Keep the chart cache alive for the whole loop's lifetime check --
-        // a real regression (e.g. rebuilding pixel history every frame
-        // instead of scrolling) would show up as a much higher ms/paint
-        // average above, visible to a human even though this isn't a hard
-        // assertion (perf timing varies too much across machines for a
-        // fixed threshold to be meaningful here).
-        let _ = ChartCache::new(CARD_SURFACE);
+
+        /// The contiguous `[first_changed, last_changed]` pixel span between
+        /// `prev_backbuffer` and `backbuffer`, and the count of genuinely
+        /// changed pixels within it (reported via `last_dirty_pixels`). A
+        /// contiguous span (rather than a scatter list) is the fair proxy for
+        /// premul cost: the kernel is linear and cache-friendly over any run,
+        /// so timing one span of the same length as the true dirty *area* is
+        /// within noise of premultiplying the real scattered regions.
+        fn dirty_span(&mut self) -> (usize, usize) {
+            let mut first = self.backbuffer.len();
+            let mut last = 0usize;
+            let mut count = 0usize;
+            for (i, (a, b)) in self
+                .prev_backbuffer
+                .iter()
+                .zip(self.backbuffer.iter())
+                .enumerate()
+            {
+                if a != b {
+                    first = first.min(i);
+                    last = i;
+                    count += 1;
+                }
+            }
+            self.last_dirty_pixels = count;
+            if first > last {
+                (0, 0)
+            } else {
+                // Compress the span to the changed *area*: the scattered charts
+                // span nearly the whole window, but only `count` pixels moved,
+                // so premultiply a run of exactly that many to model a perfect
+                // damage list rather than the (useless) bounding box.
+                (0, count)
+            }
+        }
+
+        fn run(&mut self, iterations: usize) {
+            let mut phases = PaintPhases::default();
+            let buckets = 8;
+            let per = (iterations / buckets).max(1);
+            let started = Instant::now();
+            eprintln!(
+                "headless present pipeline: {iterations} frames, {buckets} buckets of {per}\n\
+                 bucket |  paint ms |  premul ms |  shm ms | worst-frame ms | dirty%"
+            );
+            let total_px = (self.width.max(0) as usize) * (self.height.max(0) as usize);
+            for bucket in 0..buckets {
+                let mut paint_sum = Duration::ZERO;
+                let mut premul_sum = Duration::ZERO;
+                let mut shm_sum = Duration::ZERO;
+                let mut worst = Duration::ZERO;
+                let mut dirty_sum = 0usize;
+                for i in 0..per {
+                    let tick = bucket * per + i;
+                    let (paint, premul, shm) = self.present(tick, &mut phases);
+                    paint_sum += paint;
+                    premul_sum += premul;
+                    shm_sum += shm;
+                    dirty_sum += self.last_dirty_pixels;
+                    worst = worst.max(paint + premul + shm);
+                }
+                #[allow(clippy::cast_precision_loss)]
+                let n = per as f64;
+                // Average fraction of the window actually mutated this bucket --
+                // the number that decides whether damage-scoping is worth it.
+                #[allow(clippy::cast_precision_loss)]
+                let dirty_pct = if total_px > 0 {
+                    dirty_sum as f64 / n / total_px as f64 * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "{bucket:>6} | {:>9.4} | {:>10.4} | {:>7.4} | {:>10.4} | {dirty_pct:>7.3}%",
+                    paint_sum.as_secs_f64() * 1e3 / n,
+                    premul_sum.as_secs_f64() * 1e3 / n,
+                    shm_sum.as_secs_f64() * 1e3 / n,
+                    worst.as_secs_f64() * 1e3,
+                );
+            }
+            let elapsed = started.elapsed();
+            #[allow(clippy::cast_precision_loss)]
+            let avg_ms = elapsed.as_secs_f64() * 1e3 / iterations as f64;
+            eprintln!("total {elapsed:.2?} ({avg_ms:.4} ms/frame avg over {iterations})");
+            // If any bucket's average climbs materially over bucket 0, the
+            // phase whose column grows is the accumulator -- exactly the
+            // 2.4->67ms drift the live trace showed, now reproducible here.
+        }
     }
 }

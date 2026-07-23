@@ -42,9 +42,9 @@ fn main() {
 /// and a plausible large monitor (3440x1440 ultrawide) -- the size class
 /// where the live 18-30ms/frame regression was actually observed.
 const PIXEL_COUNTS: &[usize] = &[
-    80 * 24 * 8 * 16,   // COLS x ROWS at an 8x16 cell -> small terminal window
-    240 * 70 * 8 * 16,  // BIG_COLS x BIG_ROWS at an 8x16 cell
-    3440 * 1440,        // ultrawide monitor, the reported live regression size
+    80 * 24 * 8 * 16,  // COLS x ROWS at an 8x16 cell -> small terminal window
+    240 * 70 * 8 * 16, // BIG_COLS x BIG_ROWS at an 8x16 cell
+    3440 * 1440,       // ultrawide monitor, the reported live regression size
 ];
 
 /// Deterministic non-constant pixel data -- constant input risks the

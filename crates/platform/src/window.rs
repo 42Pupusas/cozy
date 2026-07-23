@@ -676,14 +676,14 @@ impl TermWindow {
     /// without copying an otherwise-static full window every frame.
     pub fn tick_with_painter(
         &mut self,
-        mut paint: impl FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Rect,
+        mut paint: impl FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Damage,
     ) -> Result<bool> {
         self.tick_inner(Some(&mut paint))
     }
 
     fn tick_inner(
         &mut self,
-        custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Rect>,
+        custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Damage>,
     ) -> Result<bool> {
         if self.lifecycle == Lifecycle::Closing {
             return Ok(false);
@@ -781,8 +781,11 @@ impl TermWindow {
         // kernels' loop overhead amortized across the entire span.
         let start = y0 * width;
         let end = y1 * width;
-        self.premultiplier
-            .run(alpha, &self.backbuffer[start..end], &mut self.custom_argb[start..end]);
+        self.premultiplier.run(
+            alpha,
+            &self.backbuffer[start..end],
+            &mut self.custom_argb[start..end],
+        );
     }
 
     /// Whether the caller should keep polling at animation-frame-rate
@@ -1795,9 +1798,12 @@ impl TermWindow {
     /// Debug-instrumentation hook: record this present's busy time and, on a
     /// slow present, log the phase breakdown. No-op without `trace`.
     #[cfg(feature = "trace")]
+    #[allow(clippy::too_many_arguments)]
     fn debug_record_busy_and_log(
         &mut self,
         total: std::time::Duration,
+        t_snapshot: std::time::Duration,
+        t_paint: std::time::Duration,
         t_blit: std::time::Duration,
         t_overlay: std::time::Duration,
         folded_len: usize,
@@ -1807,6 +1813,8 @@ impl TermWindow {
         self.debug.record_busy(total);
         self.debug.log_slow_present(
             total,
+            t_snapshot,
+            t_paint,
             t_blit,
             t_overlay,
             folded_len,
@@ -1816,10 +1824,12 @@ impl TermWindow {
     }
 
     #[cfg(not(feature = "trace"))]
-    #[allow(clippy::unused_self)]
+    #[allow(clippy::unused_self, clippy::too_many_arguments)]
     const fn debug_record_busy_and_log(
         &self,
         _total: std::time::Duration,
+        _t_snapshot: std::time::Duration,
+        _t_paint: std::time::Duration,
         _t_blit: std::time::Duration,
         _t_overlay: std::time::Duration,
         _folded_len: usize,
@@ -1830,7 +1840,7 @@ impl TermWindow {
 
     fn maybe_present(
         &mut self,
-        custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Rect>,
+        custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Damage>,
     ) -> Result<()> {
         if self.lifecycle != Lifecycle::Mapped {
             return Ok(());
@@ -1913,26 +1923,56 @@ impl TermWindow {
         // its own (no `Drop` impl) -- this ends that borrow early so the code
         // below can use `self` again; `drop()` here is a borrow-checker nudge,
         // not resource cleanup.
+        // Sub-phase split of the (misnamed) `blit` region for custom-painter
+        // windows: the snapshot-blit loop above is empty for them, so the time
+        // the trace was attributing to `blit` is really the paint callback and
+        // the premultiply. Capture a fence after the snapshot loop, another
+        // after the paint callback, so a slow present names WHICH of the three
+        // owns the spike instead of lumping them under `blit`.
+        let t_snapshot = present_start.elapsed();
         let custom_painted = custom_paint.is_some();
         let custom_damage = custom_paint.map(|paint| paint(&mut canvas));
         let _ = canvas;
-        if custom_painted {
-            // Custom painters own the entire surface. Rebuild the complete
-            // premultiplied image so both shm slots always contain identical,
-            // initialized pixels; partial-row damage is unsafe for ARGB slots.
-            self.update_custom_argb(crate::draw::Rect::new(0, 0, self.width, self.height));
+        let t_paint = present_start.elapsed();
+        if let Some(damage) = &custom_damage {
+            // Premultiply only what the painter actually drew. A full repaint
+            // (or a painter that doesn't track regions) reports `Full` and
+            // rebuilds the whole image; a steady-state dashboard frame reports
+            // a handful of small rects (chart edges, moved bars) and pays for
+            // only those pixels -- the difference between premultiplying ~2M
+            // pixels and ~3K every frame. Partial premul is safe because the
+            // ARGB cache is persistent: untouched regions still hold last
+            // frame's correct premultiplied pixels.
+            if damage.is_full() {
+                self.update_custom_argb(crate::draw::Rect::new(0, 0, self.width, self.height));
+            } else {
+                for rect in damage.rects() {
+                    self.update_custom_argb(*rect);
+                }
+            }
         }
-        // A custom painter owns pixels outside the terminal grid. Convert only
-        // its reported pixel band to stale logical rows; marking every row here
-        // used to make a 60 Hz graph animation memcpy the entire window.
-        if custom_damage.is_some() {
-            // Until custom ARGB surfaces have a dedicated per-slot damage
-            // protocol, present every row. Use a ceiling division: the final
-            // partial cell-height band is still real framebuffer memory and
-            // must be copied into both slots rather than retaining mmap-zero
-            // (transparent) pixels.
-            let rows = ((self.height + self.cell_h - 1) / self.cell_h).max(1);
-            touched_rows.extend((0..rows).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
+        // Convert the painter's damage into stale logical rows so the shm
+        // upload copies only the touched bands into both slots. A full repaint
+        // marks every row; a region set marks just the rows its rectangles
+        // span. Both slots must see the same rows since either may be the one
+        // presented next.
+        if let Some(damage) = &custom_damage {
+            if damage.is_full() {
+                let rows = ((self.height + self.cell_h - 1) / self.cell_h).max(1);
+                touched_rows.extend((0..rows).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
+            } else {
+                for rect in damage.rects() {
+                    // Ceiling-expand the rect's pixel span to whole cell rows:
+                    // the shm damage protocol is row-granular, and a partial
+                    // final row is still real framebuffer memory that must be
+                    // copied rather than left as transparent mmap-zero.
+                    let top = (rect.y.max(0)) / self.cell_h;
+                    let bottom = ((rect.bottom().max(0) + self.cell_h - 1) / self.cell_h)
+                        .min(((self.height + self.cell_h - 1) / self.cell_h).max(1));
+                    touched_rows
+                        .extend((top..bottom).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
+                }
+            }
         }
         // Sub-phase timers (only read when DebugFps::Log fires below on a slow
         // present): `t_blit` = the coalesce+blit_snapshot loop, the only phase
@@ -2154,6 +2194,8 @@ impl TermWindow {
         // so we can see WHICH one owns the ~16ms.
         self.debug_record_busy_and_log(
             total,
+            t_snapshot,
+            t_paint,
             t_blit,
             t_overlay,
             folded_len,
@@ -2213,7 +2255,8 @@ impl TermWindow {
         // while the compositor alternates shm slots.
         let alpha = self.renderer.background_alpha();
         let mut custom_argb = vec![0u32; self.backbuffer.len()];
-        self.premultiplier.run(alpha, &self.backbuffer, &mut custom_argb);
+        self.premultiplier
+            .run(alpha, &self.backbuffer, &mut custom_argb);
         self.custom_argb = custom_argb;
 
         // `self.present`'s pool is unchanged — we reuse it across resizes now.

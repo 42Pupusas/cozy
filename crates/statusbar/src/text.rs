@@ -9,6 +9,7 @@
 //! `cell_w` grid column).
 
 use std::collections::HashMap;
+use std::fs;
 
 use font::{Atlas, FontFace, GlyphEntry};
 use platform::draw::{Canvas, Color};
@@ -36,6 +37,11 @@ pub struct FaceRenderer {
     /// configured (or all failed to load), in which case an uncovered
     /// codepoint rasterizes `face`'s own `.notdef`.
     fallbacks: Vec<FontFace>,
+    /// Paths are retained instead of loading every fallback face during bar
+    /// startup. Emoji/icon fonts can be much larger than the primary face and
+    /// are only needed when a label actually contains one of their glyphs.
+    fallback_paths: Vec<String>,
+    fallback_px_size: f32,
 }
 
 impl TextRenderer {
@@ -78,14 +84,44 @@ impl TextRenderer {
         let Some(path) = path else {
             return Self::Bitmap;
         };
-        match FontFace::load(path, px_size) {
-            Ok(mut face) => {
+        let Ok(data) = fs::read(path) else {
+            return Self::load_with_fallbacks_from_data(path, &[], fallback_paths, px_size);
+        };
+        Self::load_with_fallbacks_from_data(path, &data, fallback_paths, px_size)
+    }
+
+    /// Load a primary face from bytes already read by the caller. This is
+    /// useful when several UI text sizes share one font file: the file is
+    /// read once while each size still gets its own metrics and atlas.
+    #[must_use]
+    pub fn load_with_fallbacks_from_bytes(
+        path: &str,
+        data: &[u8],
+        fallback_paths: &[Option<&str>],
+        px_size: f32,
+    ) -> Self {
+        Self::load_with_fallbacks_from_data(path, data, fallback_paths, px_size)
+    }
+
+    fn load_with_fallbacks_from_data(
+        path: &str,
+        data: &[u8],
+        fallback_paths: &[Option<&str>],
+        px_size: f32,
+    ) -> Self {
+        match FontFace::from_bytes(data.to_vec(), px_size) {
+            Ok(face) => {
                 let ascender = face.line.ascender;
                 let cell_height = face.line.cell_height;
-                let (atlas, map) = face.build_ascii_atlas(2048);
-                let fallbacks = fallback_paths
+                // Keep startup responsive: rasterize glyphs on first use instead
+                // of blocking the first frame while building every ASCII and
+                // box-drawing glyph. The atlas still has ample room for the
+                // statusbar's small, usually stable set of labels.
+                let atlas = Atlas::new(2048, 2048);
+                let map = HashMap::new();
+                let fallback_paths = fallback_paths
                     .iter()
-                    .filter_map(|p| Self::load_fallback(*p, px_size))
+                    .filter_map(|path| (*path).map(str::to_owned))
                     .collect();
                 Self::Face(Box::new(FaceRenderer {
                     face,
@@ -93,7 +129,9 @@ impl TextRenderer {
                     map,
                     ascender,
                     cell_height,
-                    fallbacks,
+                    fallbacks: Vec::new(),
+                    fallback_paths,
+                    fallback_px_size: px_size,
                 }))
             }
             Err(e) => {
@@ -105,11 +143,9 @@ impl TextRenderer {
         }
     }
 
-    /// Load one fallback face, if `path` is set. Diagnoses (but doesn't
-    /// abort on) a bad path, same treatment as the primary face's own
-    /// failure handling.
-    fn load_fallback(path: Option<&str>, px_size: f32) -> Option<FontFace> {
-        let path = path?;
+    /// Load one fallback face on demand. Diagnoses (but doesn't abort on) a
+    /// bad path, same treatment as the primary face's own failure handling.
+    fn load_fallback(path: &str, px_size: f32) -> Option<FontFace> {
         match FontFace::load(path, px_size) {
             Ok(f) => Some(f),
             Err(e) => {
@@ -162,6 +198,19 @@ impl TextRenderer {
     #[must_use]
     pub fn baseline_y(&self, bar_height: i32) -> i32 {
         ((bar_height - self.line_height()) / 2).max(0)
+    }
+
+    /// Populate the common dashboard glyphs before a renderer is handed to the
+    /// UI thread. Font parsing and the first rasterization wave are both
+    /// expensive; doing this on the loader thread avoids a several-second
+    /// hitch when the configured face is first displayed.
+    pub fn prewarm_common_glyphs(&mut self) {
+        let common = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz%.-+_/():[]… ·";
+        if let Self::Face(face) = self {
+            for codepoint in common.chars().map(u32::from) {
+                let _ = face.entry(codepoint);
+            }
+        }
     }
 
     /// Width in pixels `text` would occupy if drawn now (rasterizing any
@@ -296,10 +345,13 @@ impl FaceRenderer {
         // as `platform::render::GlyphCache::entry`.
         let g = if self.face.has_glyph(codepoint) {
             self.face.rasterize(codepoint)
-        } else if let Some(f) = self.fallbacks.iter_mut().find(|f| f.has_glyph(codepoint)) {
-            f.rasterize(codepoint)
         } else {
-            self.face.rasterize(codepoint)
+            self.load_fallbacks_until_match(codepoint);
+            if let Some(f) = self.fallbacks.iter_mut().find(|f| f.has_glyph(codepoint)) {
+                f.rasterize(codepoint)
+            } else {
+                self.face.rasterize(codepoint)
+            }
         };
         // Float source, no lossless-widening path available (see the font
         // crate's raster.rs doc for the full float<->int cast rationale) --
@@ -315,5 +367,20 @@ impl FaceRenderer {
             self.map.insert(codepoint, e);
         }
         entry
+    }
+
+    /// Load configured fallback faces only when the primary face misses a
+    /// glyph. Most bars never use emoji or icon glyphs, so deferring this work
+    /// keeps the first frame independent of those large font files.
+    fn load_fallbacks_until_match(&mut self, codepoint: u32) {
+        while !self.fallbacks.iter().any(|face| face.has_glyph(codepoint)) {
+            let Some(path) = self.fallback_paths.first().cloned() else {
+                break;
+            };
+            self.fallback_paths.remove(0);
+            if let Some(face) = TextRenderer::load_fallback(&path, self.fallback_px_size) {
+                self.fallbacks.push(face);
+            }
+        }
     }
 }

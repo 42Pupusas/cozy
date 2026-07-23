@@ -52,6 +52,13 @@ pub struct PaintPhases {
     pub other_charts: Duration,
     pub labels: Duration,
     pub static_content: Duration,
+    /// How many chart cards this frame returned *non-empty* damage -- i.e.
+    /// actually scrolled/rebuilt and blitted, rather than hitting the idle
+    /// early-return. The live trace shows `charts` dominating paint even
+    /// though knots arrive only ~4/sec, which is impossible if idle charts
+    /// are free; this counter measures whether they truly are, ending the
+    /// model-vs-measurement contradiction instead of guessing at it.
+    pub charts_active: u32,
 }
 
 /// Aggregates one-second costs for the Wayland/render thread.
@@ -73,6 +80,19 @@ pub struct FrameProfile {
     /// of the redraw-gating change -- directly visible without needing a
     /// live compositor to eyeball fps against.
     skipped_ticks: u32,
+    /// Sum over painted frames of the fraction of window *rows* each frame's
+    /// damage actually forced uploaded. The shipped shm path is row-band
+    /// granular -- it premultiplies and copies every full-width row a damage
+    /// rect touches, ignoring the rect's x/width -- so this row coverage, not
+    /// the rect area, is what determines present cost. Averaged per frame in
+    /// the report, it answers whether the present bill is spread across many
+    /// vertically-separated chart bands (reducible) or already minimal.
+    damage_row_fraction: f64,
+    /// Sum over painted frames of how many chart cards were active (non-empty
+    /// damage). Divided by frames in the report to show the average number of
+    /// charts doing real copy work per painted frame -- the direct test of
+    /// whether the idle-chart skip is actually firing in the live loop.
+    charts_active: u64,
 }
 
 impl FrameProfile {
@@ -91,6 +111,8 @@ impl FrameProfile {
             label_time: Duration::ZERO,
             static_time: Duration::ZERO,
             skipped_ticks: 0,
+            damage_row_fraction: 0.0,
+            charts_active: 0,
         }
     }
 
@@ -110,6 +132,7 @@ impl FrameProfile {
         frame_time: Duration,
         phases: &PaintPhases,
         full_frame: bool,
+        damage_row_fraction: f64,
     ) {
         if !self.enabled {
             return;
@@ -118,6 +141,7 @@ impl FrameProfile {
         self.full_frames += u32::from(full_frame);
         self.paint_time += paint_time;
         self.frame_time += frame_time;
+        self.damage_row_fraction += damage_row_fraction;
         self.cpu_chart_time += phases.cpu_chart;
         self.other_chart_time += phases.other_charts;
         self.label_time += phases.labels;
@@ -139,7 +163,7 @@ impl FrameProfile {
             f64::from(self.skipped_ticks) / f64::from(total_ticks) * 100.0
         };
         eprintln!(
-            "monitor ui: {:.1} fps | {cpu_percent:.1}% cpu | {:.2} ms frame | {:.2} ms paint [cpu {:.2}, charts {:.2}, labels {:.2}, static {:.2}] | {}/{} full | {}/{} ticks skipped ({skip_percent:.1}%)",
+            "monitor ui: {:.1} fps | {cpu_percent:.1}% cpu | {:.2} ms frame | {:.2} ms paint [cpu {:.2}, charts {:.2}, labels {:.2}, static {:.2}] | {:.1} charts/f | {:.0}% rows up | {}/{} full | {}/{} ticks skipped ({skip_percent:.1}%)",
             frames / elapsed.as_secs_f64(),
             self.frame_time.as_secs_f64() * 1_000.0 / frames,
             self.paint_time.as_secs_f64() * 1_000.0 / frames,
@@ -147,6 +171,15 @@ impl FrameProfile {
             self.other_chart_time.as_secs_f64() * 1_000.0 / frames,
             self.label_time.as_secs_f64() * 1_000.0 / frames,
             self.static_time.as_secs_f64() * 1_000.0 / frames,
+            {
+                // charts_active is a small per-second count; the f64 cast is
+                // exact far below the mantissa limit. Annotated locally rather
+                // than widening the cast, to keep the intent obvious.
+                #[allow(clippy::cast_precision_loss)]
+                let active = self.charts_active as f64;
+                active / frames
+            },
+            self.damage_row_fraction / frames * 100.0,
             self.full_frames,
             self.frames,
             self.skipped_ticks,
@@ -163,6 +196,8 @@ impl FrameProfile {
         self.label_time = Duration::ZERO;
         self.static_time = Duration::ZERO;
         self.skipped_ticks = 0;
+        self.damage_row_fraction = 0.0;
+        self.charts_active = 0;
     }
 }
 

@@ -181,6 +181,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "monitor-benches"
+version = "0.1.0"
+dependencies = [
+ "divan",
+ "monitor",
+ "platform",
+ "statusbar",
+]
+
+[[package]]
 name = "platform"
 version = "0.1.0"
 dependencies = [

@@ -3,6 +3,10 @@ name = "monitor"
 version = "0.1.0"
 edition.workspace = true
 
+[lib]
+name = "monitor"
+path = "src/lib.rs"
+
 [[bin]]
 name = "monitor"
 path = "src/main.rs"

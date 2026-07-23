@@ -115,8 +115,8 @@ impl Premultiplier {
     fn run_sse2(alpha: u8, src: &[u32], dst: &mut [u32]) {
         use std::arch::x86_64::{
             __m128i, _mm_loadu_si128, _mm_mullo_epi16, _mm_or_si128, _mm_packus_epi16,
-            _mm_set1_epi16, _mm_set1_epi32, _mm_setzero_si128, _mm_storeu_si128,
-            _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+            _mm_set1_epi16, _mm_set1_epi32, _mm_setzero_si128, _mm_storeu_si128, _mm_unpackhi_epi8,
+            _mm_unpacklo_epi8,
         };
 
         let alpha_shifted = u32::from(alpha) << 24;
@@ -225,7 +225,7 @@ impl Default for Premultiplier {
 
 #[cfg(test)]
 mod tests {
-    use super::{div255, Premultiplier};
+    use super::{Premultiplier, div255};
 
     /// Independent oracle so a bug in the shared div255 path can't
     /// self-certify; matches `TermWindow::premultiply_pixel`'s original

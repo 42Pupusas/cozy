@@ -9,6 +9,25 @@ members = [
 [workspace.package]
 edition = "2024"
 
+# Optimize the SIMD-heavy pixel/parse crates even in dev builds. Their hot
+# paths are hand-written SSE2/AVX2 intrinsic loops (premultiply, cell-store
+# widening, parser scan); unoptimized, every `_mm_*` intrinsic degrades to a
+# non-inlined, bounds-checked function call, making them ~100x slower than
+# release -- e.g. the monitor's per-frame premultiply measured 67ms in a debug
+# build vs 0.6ms optimized, pinning a whole core (~65% CPU) just from running
+# `cargo run` without `--release`. The kernels are numerically identical across
+# opt-levels (proven by premultiply's exhaustive div255 + oracle tests), so
+# optimizing only these crates in dev carries no correctness risk and leaves
+# the rest of the workspace fully debuggable with a fast edit-compile loop.
+[profile.dev.package.platform]
+opt-level = 3
+
+[profile.dev.package.grid]
+opt-level = 3
+
+[profile.dev.package.vt_parser]
+opt-level = 3
+
 [workspace.dependencies]
 ququmatz      = { path = "/home/cuarentaydos/Code/tooling/ququmatz" }
 quetzal-uring = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl-uring" }

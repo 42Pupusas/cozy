@@ -1,7 +1,18 @@
 //! Isolated procfs parser benchmarks. These intentionally exclude filesystem
 //! latency so representation/allocation changes are measurable.
+//!
+//! `AllocProfiler` is installed as the global allocator so every bench here
+//! reports allocation count and bytes alongside cycles. This is the worker
+//! thread's path -- it runs once a second collecting `/proc` data -- and the
+//! whole reason to profile it is cross-thread allocation churn: a per-sample
+//! `Vec`/`String` that the streaming parsers were written to avoid. The
+//! `*_allocating` variants are deliberate baselines so the streaming parsers'
+//! zero-allocation claim is a measured ratio, not an assertion.
 
 use statusbar::monitor::MonitorReader;
+
+#[global_allocator]
+static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
 
 const PROC_STAT: &str =
     "42 (worker with spaces) S 1 2 3 4 5 6 7 8 9 10 123 456 13 14 15 16 17 18 19 20 321";

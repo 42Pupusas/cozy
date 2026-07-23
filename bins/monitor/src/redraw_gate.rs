@@ -88,9 +88,9 @@ mod tests {
     fn steady_state_skips_the_large_majority_of_60hz_ticks() {
         // Simulate one second: 60 ticks, a new sample arriving every 6th
         // tick (10Hz), a new graph knot arriving every 15th tick (4/sec),
-        // and interpolation settling well within one 16.7ms tick after each
-        // sample (it settles at the *next* sample's arrival in this model,
-        // matching `SampleInterpolator`'s 100ms/frame settle window).
+        // and interpolation settling partway through the gap between samples
+        // (the eased glide reaches its endpoint in ~450ms and then holds,
+        // matching `SampleInterpolator::eased_progress`'s settle-and-hold).
         let mut painted = 0;
         for tick in 0..60 {
             let new_graph_sample = tick % 15 == 0;

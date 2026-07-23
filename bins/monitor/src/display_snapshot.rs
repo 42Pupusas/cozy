@@ -15,10 +15,11 @@
 
 use statusbar::MonitorSample;
 
-/// The rendered-precision projection of one [`MonitorSample`]. Every field
-/// here is quantized to match the `format!` precision used at its one draw
-/// site in `Painter::paint` (see the module doc for why this matters more
-/// than raw interpolation progress).
+/// The rendered-precision projection of one [`MonitorSample`].
+///
+/// Every field here is quantized to match the `format!` precision used at its
+/// one draw site in `Painter::paint` (see the module doc for why this matters
+/// more than raw interpolation progress).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DisplaySnapshot {
     cpu_hero: i32,         // "{:.0}"
@@ -44,22 +45,28 @@ impl DisplaySnapshot {
     /// nearest integer. Comparing these integers is equivalent to comparing
     /// the strings `format!("{value:.decimals$}")` would produce, without
     /// paying for string allocation on every frame.
+    ///
+    /// This runs on *every* redraw-gate tick, including skipped ones, so at
+    /// 60Hz it executes ~16 times per frame, 60 times a second. It must not
+    /// allocate. An earlier version routed through `.to_string().parse()`
+    /// purely to saturate cleanly on a non-finite/out-of-range source; that
+    /// cost a heap `String` per field (measured: 32 allocs/tick on a 16-core
+    /// box via the `idle_tick` bench). `f32 as i32` already saturates at the
+    /// type bounds and yields 0 for NaN in Rust, so a plain checked cast gives
+    /// identical saturation behaviour with zero allocation -- the property
+    /// that makes a 60Hz idle tick affordable.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "the saturating f32->i32 cast IS the intended quantization/clamp; see doc above"
+    )]
     fn quantize(value: f32, decimals: i32) -> i32 {
         let scale = 10f32.powi(decimals);
-        // Display values are finite telemetry. Convert through the standard
-        // parser so an unexpected non-finite/out-of-range source saturates
-        // instead of using an unchecked narrowing cast.
-        (value * scale)
-            .round()
-            .to_string()
-            .parse::<i32>()
-            .unwrap_or_else(|_| {
-                if value.is_sign_negative() {
-                    i32::MIN
-                } else {
-                    i32::MAX
-                }
-            })
+        // `as i32` is a saturating cast in Rust: values above i32::MAX clamp to
+        // i32::MAX, below i32::MIN to i32::MIN, and NaN maps to 0. That matches
+        // the previous parse-based saturation for all finite telemetry while
+        // never touching the heap.
+        (value * scale).round() as i32
     }
 
     #[must_use]
@@ -138,6 +145,20 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(a, b, "both round to the displayed \"1.23\"");
+    }
+
+    #[test]
+    fn non_finite_and_extreme_values_saturate_without_panicking() {
+        // The allocation-free `quantize` relies on `f32 as i32` saturation to
+        // replace the old `to_string().parse()` guard. Prove the edge cases
+        // the guard used to cover: NaN and out-of-range magnitudes must not
+        // panic and must land at stable clamped values, so a garbage telemetry
+        // reading can never crash the render loop or thrash the redraw gate.
+        let nan = DisplaySnapshot::from_sample(&sample_with_cpu(f32::NAN));
+        assert_eq!(nan, DisplaySnapshot::from_sample(&sample_with_cpu(f32::NAN)));
+        let huge = DisplaySnapshot::from_sample(&sample_with_cpu(f32::INFINITY));
+        let huge2 = DisplaySnapshot::from_sample(&sample_with_cpu(1e30));
+        assert_eq!(huge, huge2, "both saturate to the same clamped hero value");
     }
 
     #[test]

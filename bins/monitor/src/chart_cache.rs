@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use platform::draw::{Canvas, Color, Rect};
 
 use crate::chart::Chart;
+use crate::damage::DamageList;
 
 /// One unfilled comparison series, used by the CPU card's per-core overlays.
 pub struct Overlay<'a> {
@@ -25,9 +26,11 @@ impl<'a> Overlay<'a> {
     }
 }
 
-/// Persistent pixels for a single card. `scroll_remainder` retains fractional
-/// pixel motion, so a 60 Hz source can advance a chart whose width is smaller
-/// than its history length without losing elapsed time to integer rounding.
+/// Persistent pixels for a single card.
+///
+/// `scroll_remainder` retains fractional pixel motion, so a 60 Hz source can
+/// advance a chart whose width is smaller than its history length without
+/// losing elapsed time to integer rounding.
 pub struct ChartCache {
     pixels: Vec<u32>,
     width: i32,
@@ -53,6 +56,16 @@ impl ChartCache {
     /// Paint this cached card into the window canvas. A resize or initial paint
     /// rebuilds history once; steady-state calls scroll only enough whole pixels
     /// to represent new samples, then render the exposed right-edge columns.
+    ///
+    /// `background_cleared` must be true exactly when the caller wiped the
+    /// target canvas this frame (the monitor's `full_repaint` path clears the
+    /// whole window). It controls the single most expensive line here: the
+    /// full-surface `copy_pixels`. When the chart did not change *and* the
+    /// target still holds last frame's identical pixels, that blit is pure
+    /// waste -- and it is the common case, because hero-number glide triggers
+    /// ~10 paints/sec while chart knots only arrive ~4/sec, so most frames
+    /// scroll the chart by zero columns. Skipping the copy on those frames is
+    /// what takes the four charts off the frame's critical path.
     #[allow(clippy::too_many_arguments)]
     pub fn paint(
         &mut self,
@@ -64,9 +77,17 @@ impl ChartCache {
         overlays: &[Overlay<'_>],
         history_capacity: usize,
         sequence: u64,
-    ) {
-        if self.needs_rebuild(bounds) {
+        background_cleared: bool,
+    ) -> DamageList {
+        // How many right-edge columns this frame actually rewrote in the
+        // cached surface -- a full rebuild rewrites everything, a steady-state
+        // advance rewrites only the freshly scrolled-in strip (often zero when
+        // no whole pixel of time elapsed). This is exactly the region that
+        // differs in the parent canvas after `copy_pixels`, so it is the
+        // chart's true damage.
+        let dirty_columns = if self.needs_rebuild(bounds) {
             self.rebuild(bounds, primary, maximum, color, overlays, sequence);
+            self.width
         } else {
             self.advance(
                 primary,
@@ -75,12 +96,29 @@ impl ChartCache {
                 overlays,
                 history_capacity,
                 sequence,
-            );
+            )
+        };
+        // The cached surface is unchanged this frame (no new whole pixel of
+        // time scrolled in). If the target still holds our pixels from last
+        // frame -- i.e. the caller did NOT clear the background -- the blit
+        // would copy identical bytes, so skip it and report no damage. When
+        // the background *was* cleared, the target no longer has our pixels
+        // and we must re-blit the whole surface even though it is unchanged.
+        if dirty_columns <= 0 && !background_cleared {
+            return DamageList::new();
         }
         target.copy_pixels(
             Rect::new(bounds.x, bounds.y, self.width, self.height),
             &self.pixels,
         );
+        if dirty_columns <= 0 {
+            return DamageList::new();
+        }
+        // The rewritten columns are the rightmost `dirty_columns` of the card
+        // (the scroll exposes new pixels on the right edge); a rebuild sets
+        // `dirty_columns == width`, covering the whole card.
+        let x = bounds.x + (self.width - dirty_columns).max(0);
+        DamageList::single(Rect::new(x, bounds.y, dirty_columns, self.height))
     }
 
     const fn needs_rebuild(&self, bounds: Rect) -> bool {
@@ -116,6 +154,10 @@ impl ChartCache {
         }
     }
 
+    /// Scroll the cached surface left by however many whole pixels of elapsed
+    /// time accumulated, redraw that many columns on the right edge, and
+    /// return the count of columns rewritten (0 when no whole pixel elapsed) so
+    /// the caller can report exactly that strip as damage.
     fn advance(
         &mut self,
         primary: &VecDeque<f32>,
@@ -124,12 +166,12 @@ impl ChartCache {
         overlays: &[Overlay<'_>],
         history_capacity: usize,
         sequence: u64,
-    ) {
+    ) -> i32 {
         let previous = self.seen_samples;
         let added = sequence.saturating_sub(previous);
         self.seen_samples = sequence;
         if added == 0 || self.width <= 0 || self.height <= 0 || history_capacity == 0 {
-            return;
+            return 0;
         }
         #[allow(clippy::cast_precision_loss)]
         {
@@ -140,7 +182,7 @@ impl ChartCache {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let columns = self.scroll_remainder.floor() as i32;
         if columns <= 0 {
-            return;
+            return 0;
         }
         #[allow(clippy::cast_precision_loss)]
         {
@@ -149,6 +191,7 @@ impl ChartCache {
         let moved = columns.min(self.width);
         self.scroll_left(moved);
         self.draw_right_edge(moved, primary, maximum, color, overlays);
+        moved
     }
 
     fn scroll_left(&mut self, columns: i32) {
@@ -260,6 +303,7 @@ mod tests {
             &[],
             2,
             2,
+            true,
         );
         values.push_back(0.5);
         cache.paint(
@@ -271,7 +315,90 @@ mod tests {
             &[],
             2,
             3,
+            false,
         );
         assert_eq!(cache.seen_samples, 3);
+    }
+
+    /// A frame that scrolls the chart by zero columns and does not clear the
+    /// background must not touch the target canvas at all -- that is the
+    /// idle-glide fast path that keeps the four charts off the critical path.
+    #[test]
+    fn unchanged_chart_over_intact_background_does_not_touch_target() {
+        let mut cache = ChartCache::new(Color::BLACK);
+        let values = VecDeque::from([0.0, 1.0]);
+        // First paint (background cleared) establishes the cached surface and
+        // blits it into the target.
+        let mut target = vec![0u32; 20];
+        cache.paint(
+            &mut Canvas::new(&mut target, 5, 4),
+            Rect::new(0, 0, 5, 4),
+            &values,
+            1.0,
+            Color::WHITE,
+            &[],
+            2,
+            2,
+            true,
+        );
+        // Poison the target: if the second paint blits, it will overwrite this.
+        let sentinel = 0xDEAD_BEEF;
+        target.iter_mut().for_each(|p| *p = sentinel);
+        // Same sequence => zero new columns, and background NOT cleared.
+        let damage = cache.paint(
+            &mut Canvas::new(&mut target, 5, 4),
+            Rect::new(0, 0, 5, 4),
+            &values,
+            1.0,
+            Color::WHITE,
+            &[],
+            2,
+            2,
+            false,
+        );
+        assert!(damage.is_empty(), "an unchanged chart reports no damage");
+        assert!(
+            target.iter().all(|&p| p == sentinel),
+            "the blit must be skipped, leaving the target untouched"
+        );
+    }
+
+    /// The same unchanged chart, but with the background cleared, MUST re-blit
+    /// its full surface -- otherwise the freshly-wiped canvas would show a hole
+    /// where the chart belongs.
+    #[test]
+    fn unchanged_chart_over_cleared_background_reblits() {
+        let mut cache = ChartCache::new(Color::BLACK);
+        let values = VecDeque::from([0.0, 1.0]);
+        let mut target = vec![0u32; 20];
+        cache.paint(
+            &mut Canvas::new(&mut target, 5, 4),
+            Rect::new(0, 0, 5, 4),
+            &values,
+            1.0,
+            Color::WHITE,
+            &[],
+            2,
+            2,
+            true,
+        );
+        let sentinel = 0xDEAD_BEEF;
+        target.iter_mut().for_each(|p| *p = sentinel);
+        // Zero new columns, but background WAS cleared: must re-blit.
+        cache.paint(
+            &mut Canvas::new(&mut target, 5, 4),
+            Rect::new(0, 0, 5, 4),
+            &values,
+            1.0,
+            Color::WHITE,
+            &[],
+            2,
+            2,
+            true,
+        );
+        assert!(
+            target.iter().any(|&p| p != sentinel),
+            "a cleared background forces the chart to re-blit its surface"
+        );
     }
 }

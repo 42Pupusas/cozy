@@ -168,8 +168,8 @@ impl Theme {
 // ── Glyph sources ─────────────────────────────────────────────────────────────
 
 /// A real TTF/OTF face plus its glyph atlas, growing on demand as new
-/// codepoints are drawn. Pre-seeded with printable ASCII + box-drawing so the
-/// common case never rasterizes at paint time.
+/// codepoints are drawn. The atlas starts empty so renderer construction does
+/// not synchronously rasterize glyphs that may never be displayed.
 ///
 /// Optionally chained to a `fallback` face (see [`Self::with_fallback`]):
 /// codepoints the primary `face` doesn't cover (most commonly emoji --
@@ -195,13 +195,12 @@ struct GlyphCache {
 }
 
 impl GlyphCache {
-    fn new(mut face: font::FontFace) -> Self {
+    fn new(face: font::FontFace) -> Self {
         let ascender = face.line.ascender;
-        let (atlas, map) = face.build_ascii_atlas(2048);
         Self {
             face,
-            atlas,
-            map,
+            atlas: font::Atlas::new(2048, 2048),
+            map: HashMap::new(),
             ascender,
             fallback: None,
         }

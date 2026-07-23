@@ -282,15 +282,19 @@ impl NetworkState {
         label
     }
 
-    fn ping_ms(&mut self) -> f32 {
+    fn ping_ms(&self) -> f32 {
+        self.last_ping.map_or(0.0, |(_, value)| value)
+    }
+
+    fn refresh_ping(&mut self) {
         let now = Instant::now();
         // A one-second ping process is needlessly expensive for a dashboard.
         // Keep the last measurement visible while probing occasionally; the
         // graph remains fluid through the monitor's interpolator.
-        if let Some((at, value)) = self.last_ping
+        if let Some((at, _)) = self.last_ping
             && now.duration_since(at) < std::time::Duration::from_secs(5)
         {
-            return value;
+            return;
         }
         let value = self
             .gateway()
@@ -311,7 +315,6 @@ impl NetworkState {
             })
             .unwrap_or(0.0);
         self.last_ping = Some((now, value));
-        value
     }
 
     fn gateway(&mut self) -> Option<Ipv4Addr> {
@@ -807,14 +810,14 @@ impl MemoryDevice {
                 .windows(2)
                 .position(|pair| pair == [0, 0])
                 .map_or(data.len(), |terminator| offset + length + terminator + 2);
-            if kind == 17 {
-                if let Some(label) = Self::smbios_memory_label(
+            if kind == 17
+                && let Some(label) = Self::smbios_memory_label(
                     &data[offset..offset + length],
                     &data[offset + length..end],
-                ) && !modules.contains(&label)
-                {
-                    modules.push(label);
-                }
+                )
+                && !modules.contains(&label)
+            {
+                modules.push(label);
             }
             if kind == 127 {
                 break;
@@ -945,6 +948,13 @@ impl MonitorReader {
     #[must_use]
     pub fn processes_tick(&mut self) -> Option<Vec<ProcessInfo>> {
         self.scanner.advance(&mut self.processes)
+    }
+
+    /// Refresh the optional network latency probe after the normal sample has
+    /// been published. The probe may block for up to a second, so it must never
+    /// delay the first telemetry frame or the graph data that depends on it.
+    pub fn refresh_network_ping(&mut self) {
+        self.network.refresh_ping();
     }
 
     /// Extract fields from `/proc/<pid>/stat` without being confused by a

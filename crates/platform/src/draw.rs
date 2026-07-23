@@ -200,6 +200,90 @@ impl Rect {
     }
 }
 
+/// The set of pixel rectangles a custom painter actually drew this frame.
+///
+/// A translucent custom-painted window must premultiply its backbuffer into the
+/// ARGB cache before upload. Doing that over the whole surface when a
+/// steady-state frame changes a tiny fraction of it is the dominant per-frame
+/// cost (measured at tens of milliseconds for a full-HD monitor dashboard).
+/// A painter that knows exactly which regions it touched returns them here so
+/// [`crate::window::TermWindow`] premultiplies and uploads only those.
+///
+/// `Full` means "treat the whole window as damaged" (a full repaint, or a
+/// painter that doesn't track regions); an empty `Regions` means nothing
+/// changed. The rectangles are in window pixel coordinates.
+#[derive(Clone, Debug, Default)]
+pub struct Damage {
+    regions: Vec<Rect>,
+    full: bool,
+}
+
+impl Damage {
+    /// Nothing was drawn.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            regions: Vec::new(),
+            full: false,
+        }
+    }
+
+    /// The whole window is damaged (full repaint / non-tracking painter).
+    #[must_use]
+    pub const fn full() -> Self {
+        Self {
+            regions: Vec::new(),
+            full: true,
+        }
+    }
+
+    /// Damage described by an explicit set of rectangles.
+    #[must_use]
+    pub const fn regions(rects: Vec<Rect>) -> Self {
+        Self {
+            regions: rects,
+            full: false,
+        }
+    }
+
+    /// Whether the whole window should be treated as damaged.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.full
+    }
+
+    /// Whether nothing was damaged (no regions and not full).
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.full && self.regions.is_empty()
+    }
+
+    /// The damaged rectangles (empty when `full` or nothing changed).
+    #[must_use]
+    pub fn rects(&self) -> &[Rect] {
+        &self.regions
+    }
+
+    /// The bounding box over all damage, or an empty rect if none. `full`
+    /// callers should special-case before calling this.
+    #[must_use]
+    pub fn bounding(&self) -> Rect {
+        let mut it = self.regions.iter();
+        let Some(&first) = it.next() else {
+            return Rect::new(0, 0, 0, 0);
+        };
+        let (mut x0, mut y0) = (first.x, first.y);
+        let (mut x1, mut y1) = (first.right(), first.bottom());
+        for r in it {
+            x0 = x0.min(r.x);
+            y0 = y0.min(r.y);
+            x1 = x1.max(r.right());
+            y1 = y1.max(r.bottom());
+        }
+        Rect::new(x0, y0, x1 - x0, y1 - y0)
+    }
+}
+
 /// A drawable view over a pixel buffer: the `u32` slice plus its dimensions.
 ///
 /// Borrows the buffer mutably for the lifetime of the canvas, so drawing is just

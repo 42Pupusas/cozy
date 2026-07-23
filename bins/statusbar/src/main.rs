@@ -97,8 +97,13 @@ impl Painter {
         // Nerd-Font text, and therefore keep their own brand artwork.
         for item in snapshot.tray_items() {
             let icon_size = (bar_height - 8 * scale).max(1);
-            item.icon
-                .paint(canvas, left_edge, (bar_height - icon_size) / 2, icon_size);
+            item.icon.paint(
+                canvas,
+                left_edge,
+                (bar_height - icon_size) / 2,
+                icon_size,
+                bg_alpha,
+            );
             if item.attention {
                 Self::draw_attention_dot(
                     canvas,
@@ -215,10 +220,7 @@ impl BarApp {
             };
 
         let scale = window.scale();
-        let bg = {
-            let c = cfg.bar_background();
-            Color::rgb(c.r, c.g, c.b)
-        };
+        let bg: Color = cfg.bar_background().into();
         // Pixel-alpha float->int conversion: `.clamp(0.0, 1.0)` before
         // multiplying guarantees the result is in `0.0..=255.0`, so the
         // truncation/sign-loss this cast could otherwise cause can't actually
@@ -329,10 +331,27 @@ impl BarApp {
     /// last tick (cheap `Vec<String>` moves, not I/O) -- only the most
     /// recent one matters for painting -- and request a redraw if anything
     /// changed.
+    ///
+    /// The polling worker's own `Snapshot` (clock/battery/wifi/...) and the
+    /// D-Bus tray watcher's `TraySnapshot` arrive on two independent
+    /// channels and never share a payload: `Snapshot::tray` is left at its
+    /// `Vec::new()` default by the worker (only `replace_tray` -- fed from
+    /// `tray_rx` -- ever populates it). The clock module changes every
+    /// second, so the worker sends a fresh `Snapshot` about once a second
+    /// regardless of whether the tray changed. A bare `self.snapshot = s`
+    /// here would blindly overwrite the whole struct with that empty-tray
+    /// default and erase whatever tray items the *previous* tick had set,
+    /// unless a `TraySnapshot` happened to land in the very same drain --
+    /// which is exactly why a Mattermost icon used to flash in at
+    /// registration and then vanish again within about a second. Carry the
+    /// current tray items forward across every worker-snapshot replacement
+    /// instead; the loop below still applies any real tray update on top.
     fn drain_worker_updates(&mut self) {
         let mut changed = false;
         while let Ok(s) = self.snapshot_rx.try_recv() {
+            let tray = self.snapshot.tray_items().to_vec();
             self.snapshot = s;
+            self.snapshot.replace_tray(tray);
             changed = true;
         }
         while let Ok(TraySnapshot { items }) = self.tray_rx.try_recv() {

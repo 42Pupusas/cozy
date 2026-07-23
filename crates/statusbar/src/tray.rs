@@ -31,6 +31,15 @@ pub struct TrayItem {
     service: String,
     /// The item's object path, needed to recognize its change signals.
     path: String,
+    /// The unique connection name (e.g. `:1.55`) that registered this item,
+    /// captured at registration time regardless of whether `service` is
+    /// itself a well-known name. `NameOwnerChanged` always reports the
+    /// disappearing owner as a unique name, so this is the only thing safe
+    /// to compare it against -- see `drop_items_for_lost_owner`, which used
+    /// to compare with `str::starts_with` and could evict an unrelated
+    /// item whenever any other client's unique name (e.g. `:1.5`) happened
+    /// to be a string prefix of this one's (e.g. `:1.55`).
+    owner: String,
     pub icon: TrayIcon,
     pub attention: bool,
 }
@@ -78,6 +87,18 @@ impl TrayWatcher {
             eprintln!("statusbar: could not subscribe to tray item updates: {e}");
             return;
         }
+        // Clients like Mattermost/Electron sometimes reconnect to the bus
+        // (a fresh unique name) and re-register rather than reusing their
+        // original connection. Without watching for the old connection's
+        // disappearance, its item's `id` (keyed on that stale unique name)
+        // never matches the new registration's id, so `register`'s dedup
+        // never fires and the stale entry lingers forever as a duplicate.
+        if let Err(e) = conn
+            .add_match("type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged'")
+        {
+            eprintln!("statusbar: could not subscribe to tray owner changes: {e}");
+            return;
+        }
 
         let mut items = Vec::new();
         loop {
@@ -90,6 +111,8 @@ impl TrayWatcher {
                 false
             } else if Self::is_item_registration(&message) {
                 Self::register(&mut conn, &message, &mut items)
+            } else if Self::is_name_owner_lost(&message) {
+                Self::drop_items_for_lost_owner(&message, &mut items)
             } else {
                 Self::refresh_changed_item(&mut conn, &message, &mut items)
             };
@@ -106,6 +129,51 @@ impl TrayWatcher {
         message.path.as_deref() == Some(WATCHER_PATH)
             && message.interface.as_deref() == Some(WATCHER_NAME)
             && message.member.as_deref() == Some(REGISTER_ITEM)
+    }
+
+    /// `NameOwnerChanged(name, old_owner, new_owner)` reports a unique or
+    /// well-known name losing its owner when `new_owner` is empty. That is
+    /// the only reliable "this client is gone" signal on the bus -- clients
+    /// never unregister their tray item explicitly, they just disconnect.
+    fn is_name_owner_lost(message: &dbus::message::Reply) -> bool {
+        if message.interface.as_deref() != Some("org.freedesktop.DBus")
+            || message.member.as_deref() != Some("NameOwnerChanged")
+        {
+            return false;
+        }
+        let values = message.values();
+        matches!(values.get(2).and_then(Value::as_display_string), Some(new_owner) if new_owner.is_empty())
+    }
+
+    /// Drop every item registered by the connection that just disappeared.
+    /// `NameOwnerChanged(name, old_owner, new_owner)` reports either a
+    /// unique name itself dying (`name == old_owner`, both unique) or a
+    /// well-known name's owner changing (`old_owner` is the unique name that
+    /// used to hold it) -- either way `old_owner` is the unique connection
+    /// name to compare against `TrayItem::owner`, which was captured
+    /// verbatim from `message.sender` at registration time.
+    ///
+    /// This must be an *exact* match, not a prefix match: unique names look
+    /// like `:1.5` and `:1.55`, and `str::starts_with` treated the former as
+    /// a match for the latter, evicting an unrelated still-live tray item
+    /// (e.g. Mattermost's) the moment any other, unrelated client with a
+    /// shorter numeric suffix happened to disconnect -- which explained the
+    /// icon flashing in once at registration and then vanishing almost
+    /// immediately.
+    fn drop_items_for_lost_owner(
+        message: &dbus::message::Reply,
+        items: &mut Vec<TrayItem>,
+    ) -> bool {
+        let values = message.values();
+        let Some(old_owner) = values.get(1).and_then(Value::as_display_string) else {
+            return false;
+        };
+        if old_owner.is_empty() {
+            return false;
+        }
+        let before = items.len();
+        items.retain(|item| item.owner != old_owner);
+        items.len() != before
     }
 
     /// Electron probes this standard watcher property before deciding whether
@@ -232,6 +300,7 @@ impl TrayWatcher {
             id: format!("{sender}{path}"),
             service: service.to_owned(),
             path: path.to_owned(),
+            owner: sender.to_owned(),
             icon: TrayIcon::new(icon),
             attention,
         })

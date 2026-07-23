@@ -23,6 +23,7 @@ pub mod id;
 mod key_repeat;
 pub mod keymap;
 pub mod link_scan;
+pub mod pixel_buffers;
 pub mod premultiply;
 pub mod present;
 pub mod protocol;

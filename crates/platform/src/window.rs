@@ -154,6 +154,11 @@ enum Lifecycle {
 use crate::debug_overlay::DebugOverlay;
 use crate::surface::Frame;
 
+/// FPS/frame-pacing debug-instrumentation dispatch -- see the module doc
+/// there for why this is a separate file with block-level (not per-method)
+/// `#[cfg(feature = "trace")]` gating.
+mod window_debug;
+
 /// A Wayland window that renders a terminal grid using a software framebuffer.
 ///
 /// Feed [`grid::DirtySnapshot`]s via [`TermWindow::push_dirty`]; the window
@@ -216,20 +221,11 @@ pub struct TermWindow {
     /// struct so the swap-chain lifecycle lives (and is tested) in one
     /// place; see [`crate::present::PresentState`].
     present: crate::present::PresentState,
-    /// Persistent full-window backbuffer. Dirty rows are blitted here (it keeps
-    /// the complete last-known image), then copied into whichever shm frame is
-    /// free on present. Without this, incremental dirty-row blits would only
-    /// ever touch one of the two shm frames, leaving the rest black.
-    backbuffer: Vec<u32>,
-    /// Cached premultiplied pixels for custom painters. Keeping this separate
-    /// from the stable XRGB backbuffer avoids re-premultiplying every stale
-    /// row on every shm-slot upload.
-    custom_argb: Vec<u32>,
-    /// SIMD dispatch for the premultiply loop above, probed once at
-    /// construction (see [`crate::premultiply::Premultiplier`]) instead of
-    /// per present -- feature detection is a cached atomic load, but even
-    /// that cost has no reason to repeat every frame.
-    premultiplier: crate::premultiply::Premultiplier,
+    /// The persistent XRGB backbuffer plus the premultiplied-ARGB cache
+    /// custom painters read on present. Extracted from this struct so the
+    /// pixel-level buffer bookkeeping lives (and is tested) in one place;
+    /// see [`crate::pixel_buffers::PixelBuffers`].
+    pixels: crate::pixel_buffers::PixelBuffers,
     /// Glyph source (bitmap or loaded TTF/OTF face) + resolved color theme.
     renderer: render::Renderer,
     width: i32,
@@ -505,13 +501,16 @@ impl TermWindow {
         let clipboard =
             crate::clipboard::ClipboardState::new(data_device_manager, seat, &mut window_tx);
 
-        // Use `bg_packed()`, not `bg_xrgb()`: a translucent window's initial
-        // backbuffer must carry the configured alpha from frame one, not
-        // flash fully opaque until the first real paint.
-        let backbuffer = vec![renderer.bg_packed(); (width * height) as usize];
-        let premultiplier = crate::premultiply::Premultiplier::new();
-        let mut custom_argb = vec![0u32; backbuffer.len()];
-        premultiplier.run(renderer.background_alpha(), &backbuffer, &mut custom_argb);
+        // `PixelBuffers::new` uses `bg_packed()`, not `bg_xrgb()`: a
+        // translucent window's initial backbuffer must carry the configured
+        // alpha from frame one, not flash fully opaque until the first real
+        // paint.
+        let pixels = crate::pixel_buffers::PixelBuffers::new(
+            width,
+            height,
+            renderer.bg_packed(),
+            renderer.background_alpha(),
+        );
         // Both shm frames start as blank memory (freshly mmap'd), so every
         // row is "stale" relative to the backbuffer until the first present
         // copies it in -- `PresentState::new` seeds that.
@@ -540,9 +539,7 @@ impl TermWindow {
             xkb: None,
             cursor,
             present,
-            backbuffer,
-            custom_argb,
-            premultiplier,
+            pixels,
             renderer,
             width,
             height,
@@ -806,50 +803,17 @@ impl TermWindow {
         }
     }
 
-    fn premultiply_pixel(pixel: u32, alpha: u8) -> u32 {
-        let a = u32::from(alpha);
-        let rgb = pixel & 0x00ff_ffff;
-        let r = ((rgb >> 16) & 0xff) * a / 255;
-        let g = ((rgb >> 8) & 0xff) * a / 255;
-        let b = (rgb & 0xff) * a / 255;
-        (a << 24) | (r << 16) | (g << 8) | b
-    }
-
     /// Rebuilds the damaged rows of the premultiplied custom-painter cache
-    /// from the XRGB backbuffer, using [`crate::premultiply::Premultiplier`]'s
-    /// SIMD kernel (AVX2/SSE2 on `x86_64`, scalar elsewhere) rather than a
-    /// per-pixel scalar loop. This runs on every present of a translucent
+    /// from the XRGB backbuffer. This runs on every present of a translucent
     /// custom-painted window (e.g. `monitor` under compositor opacity < 1.0);
-    /// profiling a live translucent session found the naive `channel * alpha
-    /// / 255` scalar loop alone costing ~18ms/frame, dwarfing the actual
-    /// dashboard paint (~0.2ms).
+    /// see [`crate::pixel_buffers::PixelBuffers::update_custom_argb`] for the
+    /// SIMD kernel this delegates to.
     fn update_custom_argb(&mut self, damage: crate::draw::Rect) {
         if !self.renderer.needs_alpha() {
             return;
         }
-        let width = self.width.max(0) as usize;
-        if width == 0 {
-            return;
-        }
-        // Configure dimensions and the allocated shm/backbuffer dimensions can
-        // differ by a partial final row. Clamp against the actual caches before
-        // forming slices; custom damage must never turn a compositor resize
-        // race into an out-of-bounds access.
-        let rows = (self.backbuffer.len() / width).min(self.custom_argb.len() / width);
-        let y0 = damage.y.max(0).min(rows as i32) as usize;
-        let y1 = damage.bottom().max(y0 as i32).min(rows as i32) as usize;
         let alpha = self.renderer.background_alpha();
-        // One call over the whole damaged band rather than per-row: the
-        // rows are contiguous in both buffers, so this is a single premultiply
-        // pass instead of `rows` separate short ones, keeping the vector
-        // kernels' loop overhead amortized across the entire span.
-        let start = y0 * width;
-        let end = y1 * width;
-        self.premultiplier.run(
-            alpha,
-            &self.backbuffer[start..end],
-            &mut self.custom_argb[start..end],
-        );
+        self.pixels.update_custom_argb(self.width, damage, alpha);
     }
 
     /// Whether the caller should keep polling at animation-frame-rate
@@ -1734,7 +1698,7 @@ impl TermWindow {
 
     fn repaint_rows(&mut self, rows: &[u16]) {
         let cols = (self.width / self.cell_w).max(1) as u16;
-        let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
+        let mut canvas = self.pixels.canvas(self.width, self.height);
         for &row in rows {
             let Some(line) = self.selection.mirror().get(usize::from(row)) else {
                 continue;
@@ -1798,17 +1762,18 @@ impl TermWindow {
             let py0 = usize::from(row) * self.cell_h as usize;
             let px0 = usize::from(c0) * self.cell_w as usize;
             let px1 = (usize::from(c1) + 1) * self.cell_w as usize;
+            let backbuffer = self.pixels.backbuffer_mut();
             for py in py0..py0 + self.cell_h as usize {
                 let base = py * buf_w;
-                if base >= self.backbuffer.len() {
+                if base >= backbuffer.len() {
                     break;
                 }
                 for px in px0..px1.min(buf_w) {
                     let idx = base + px;
-                    if idx >= self.backbuffer.len() {
+                    if idx >= backbuffer.len() {
                         break;
                     }
-                    let p = self.backbuffer[idx];
+                    let p = backbuffer[idx];
                     let r = (p >> 16) & 0xff;
                     let g = (p >> 8) & 0xff;
                     let b = p & 0xff;
@@ -1816,7 +1781,7 @@ impl TermWindow {
                     let ng = (g * INV + HG * ALPHA) / 255;
                     let nb = (b * INV + HB * ALPHA) / 255;
                     // Preserve the top byte (alpha for translucent windows).
-                    self.backbuffer[idx] = (p & 0xff00_0000) | (nr << 16) | (ng << 8) | nb;
+                    backbuffer[idx] = (p & 0xff00_0000) | (nr << 16) | (ng << 8) | nb;
                 }
             }
         }
@@ -1872,10 +1837,11 @@ impl TermWindow {
         let x0 = lo * self.cell_w as usize;
         let x1 = ((hi + 1) * self.cell_w as usize).min(buf_w);
         let base = y * buf_w;
+        let backbuffer = self.pixels.backbuffer_mut();
         for x in x0..x1 {
             let idx = base + x;
-            if idx < self.backbuffer.len() {
-                self.backbuffer[idx] = (self.backbuffer[idx] & 0xFF00_0000) | UNDERLINE_RGB;
+            if idx < backbuffer.len() {
+                backbuffer[idx] = (backbuffer[idx] & 0xFF00_0000) | UNDERLINE_RGB;
             }
         }
         self.prev_hover_row = Some(row);
@@ -1898,8 +1864,7 @@ impl TermWindow {
 
         let shape = self.cursor_anim.shape();
         {
-            let mut canvas =
-                crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
+            let mut canvas = self.pixels.canvas(self.width, self.height);
             if alpha > 0.0 {
                 self.renderer.draw_cursor(&mut canvas, vc, vr, shape, alpha);
             }
@@ -1918,152 +1883,6 @@ impl TermWindow {
             (row_top, row_bot)
         };
         (lo..=hi).collect()
-    }
-
-    /// Debug-instrumentation hook: note the current `pending_dirty` backlog
-    /// depth and emit the once-a-second frame-pacing log line. No-op without
-    /// `trace` (see [`crate::debug_overlay`]).
-    ///
-    /// Every `debug_*` no-op twin below deliberately keeps `&self` (unused
-    /// in the non-`trace` build) rather than becoming an associated fn:
-    /// call sites (`self.debug_pre_present()` etc.) must compile unchanged
-    /// under either `cfg`, so both twins need the same method signature --
-    /// the resulting `clippy::unused_self` is structural to the pattern,
-    /// not fixable per-twin without forcing every call site to branch on
-    /// the feature itself.
-    #[cfg(feature = "trace")]
-    fn debug_pre_present(&mut self) {
-        self.debug.note_backlog(self.pending_dirty.len());
-        self.debug.log_frame_pacing();
-    }
-
-    #[cfg(not(feature = "trace"))]
-    #[allow(clippy::unused_self)]
-    const fn debug_pre_present(&self) {}
-
-    /// Debug-instrumentation hook: record that a present was skipped because
-    /// the frame callback hadn't arrived yet (vsync pacing). No-op without
-    /// `trace`.
-    #[cfg(feature = "trace")]
-    const fn debug_note_skipped_not_ready(&mut self) {
-        self.debug.note_skipped_not_ready();
-    }
-
-    #[cfg(not(feature = "trace"))]
-    #[allow(clippy::unused_self)]
-    const fn debug_note_skipped_not_ready(&self) {}
-
-    /// Debug-instrumentation hook: record that a present was skipped because
-    /// no shm buffer slot was free (buffer starvation). No-op without `trace`.
-    #[cfg(feature = "trace")]
-    const fn debug_note_skipped_no_slot(&mut self) {
-        self.debug.note_skipped_no_slot();
-    }
-
-    #[cfg(not(feature = "trace"))]
-    #[allow(clippy::unused_self)]
-    const fn debug_note_skipped_no_slot(&self) {}
-
-    /// Debug-instrumentation hook: remap the fps overlay's dirty-row tracker
-    /// by a signed whole-screen shift (a viewport pixel-scroll). No-op
-    /// without `trace`.
-    #[cfg(feature = "trace")]
-    fn debug_shift_prev_rows_signed(&mut self, shifts: &[i32], row_count: u16) {
-        Self::shift_overlay_rows_signed(&mut self.debug.prev_rows, shifts, row_count);
-    }
-
-    #[cfg(not(feature = "trace"))]
-    #[allow(clippy::unused_self)]
-    const fn debug_shift_prev_rows_signed(&self, _shifts: &[i32], _row_count: u16) {}
-
-    /// Debug-instrumentation hook: remap the fps overlay's dirty-row tracker
-    /// by an upward scroll band. No-op without `trace`.
-    #[cfg(feature = "trace")]
-    fn debug_shift_prev_rows(&mut self, scrolls: &[grid::ScrollBand]) {
-        Self::shift_overlay_rows(&mut self.debug.prev_rows, scrolls);
-    }
-
-    #[cfg(not(feature = "trace"))]
-    #[allow(clippy::unused_self)]
-    const fn debug_shift_prev_rows(&self, _scrolls: &[grid::ScrollBand]) {}
-
-    /// Debug-instrumentation hook: take the fps overlay's previously-touched
-    /// rows for this frame's repaint-clean pass. Empty without `trace`.
-    #[cfg(feature = "trace")]
-    fn debug_take_prev_rows(&mut self) -> Vec<u16> {
-        std::mem::take(&mut self.debug.prev_rows)
-    }
-
-    #[cfg(not(feature = "trace"))]
-    #[allow(clippy::unused_self)]
-    const fn debug_take_prev_rows(&self) -> Vec<u16> {
-        Vec::new()
-    }
-
-    /// Debug-instrumentation hook: record this present in the rolling fps
-    /// average and draw the "NN.N fps" overlay text, returning the rows it
-    /// touched. Always empty (and free) without `trace`.
-    #[cfg(feature = "trace")]
-    fn debug_draw_overlay(&mut self) -> Vec<u16> {
-        self.debug.record_present();
-        let rows = self.debug.draw(
-            &mut self.backbuffer,
-            self.width,
-            self.height,
-            self.cell_w,
-            &mut self.renderer,
-        );
-        self.debug.prev_rows.clone_from(&rows);
-        rows
-    }
-
-    #[cfg(not(feature = "trace"))]
-    #[allow(clippy::unused_self)]
-    const fn debug_draw_overlay(&self) -> Vec<u16> {
-        Vec::new()
-    }
-
-    /// Debug-instrumentation hook: record this present's busy time and, on a
-    /// slow present, log the phase breakdown. No-op without `trace`.
-    #[cfg(feature = "trace")]
-    #[allow(clippy::too_many_arguments)]
-    fn debug_record_busy_and_log(
-        &mut self,
-        total: std::time::Duration,
-        t_snapshot: std::time::Duration,
-        t_paint: std::time::Duration,
-        t_blit: std::time::Duration,
-        t_overlay: std::time::Duration,
-        folded_len: usize,
-        painted_rows: usize,
-        painted_cells: usize,
-    ) {
-        self.debug.record_busy(total);
-        self.debug.log_slow_present(
-            total,
-            t_snapshot,
-            t_paint,
-            t_blit,
-            t_overlay,
-            folded_len,
-            painted_rows,
-            painted_cells,
-        );
-    }
-
-    #[cfg(not(feature = "trace"))]
-    #[allow(clippy::unused_self, clippy::too_many_arguments)]
-    const fn debug_record_busy_and_log(
-        &self,
-        _total: std::time::Duration,
-        _t_snapshot: std::time::Duration,
-        _t_paint: std::time::Duration,
-        _t_blit: std::time::Duration,
-        _t_overlay: std::time::Duration,
-        _folded_len: usize,
-        _painted_rows: usize,
-        _painted_cells: usize,
-    ) {
     }
 
     /// Coalesce a backlog of pending dirty snapshots into the fewest
@@ -2276,14 +2095,14 @@ impl TermWindow {
         let (custom_source, custom_fill) = if custom_painted {
             if self.renderer.needs_alpha() {
                 (
-                    self.custom_argb.as_slice(),
-                    Self::premultiply_pixel(
+                    self.pixels.custom_argb(),
+                    crate::pixel_buffers::PixelBuffers::premultiply_pixel(
                         self.renderer.bg_packed(),
                         self.renderer.background_alpha(),
                     ),
                 )
             } else {
-                (self.backbuffer.as_slice(), self.renderer.bg_packed())
+                (self.pixels.backbuffer(), self.renderer.bg_packed())
             }
         } else {
             // This slice is never read on the terminal-grid path. Supplying an
@@ -2328,7 +2147,7 @@ impl TermWindow {
                     if copy_len < dst_slice.len() {
                         dst_slice[copy_len..].fill(custom_fill);
                     }
-                } else if let Some(src_slice) = self.backbuffer.get(src_off..src_off + len) {
+                } else if let Some(src_slice) = self.pixels.backbuffer().get(src_off..src_off + len) {
                     dst_slice.copy_from_slice(src_slice);
                 }
             }
@@ -2407,14 +2226,14 @@ impl TermWindow {
         // upward-only band), these are signed and cover the full screen, so
         // baked overlays (fps readout, a resting cursor/selection) get dragged
         // by the memmove and their row trackers must be remapped to match.
-        let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
+        let mut canvas = self.pixels.canvas(self.width, self.height);
         let (viewport_shifts, painted_rows, painted_cells) = self.renderer.blit_folded_snapshots(
             &mut canvas,
             &folded,
             &mut scrolls,
             &mut touched_rows,
         );
-        // `Canvas` borrows `self.backbuffer` mutably and holds no resources of
+        // `Canvas` borrows the backbuffer mutably and holds no resources of
         // its own (no `Drop` impl) -- this ends that borrow early so the code
         // below can use `self` again; `drop()` here is a borrow-checker nudge,
         // not resource cleanup.
@@ -2504,32 +2323,20 @@ impl TermWindow {
 
         self.present.recreate_buffers(&mut self.window_tx, w, h);
         // Carry the old image into the new backbuffer (top-left aligned) instead
-        // of clearing to background. The grid reflow + full snapshot arrives a
-        // round-trip later via the parser thread; until then we keep showing the
-        // previous content so the window doesn't flash blank mid-drag. Use
-        // `bg_packed()` (not `bg_xrgb()`) so newly-exposed area on a grow
-        // carries the configured window alpha instead of flashing opaque.
-        let new_w = w as usize;
-        let new_h = h as usize;
-        let mut new_back = vec![self.renderer.bg_packed(); new_w * new_h];
-        let old_w = self.width as usize;
-        let old_h = self.height as usize;
-        let copy_w = old_w.min(new_w);
-        let copy_h = old_h.min(new_h);
-        for row in 0..copy_h {
-            let src = &self.backbuffer[row * old_w..row * old_w + copy_w];
-            new_back[row * new_w..row * new_w + copy_w].copy_from_slice(src);
-        }
-        self.backbuffer = new_back;
-        // Rebuild the premultiplied custom-painter cache to the same physical
-        // dimensions as the resized backbuffer. Keeping the old cache here
-        // leaves the final rows stale and causes the bottom edge to oscillate
-        // while the compositor alternates shm slots.
-        let alpha = self.renderer.background_alpha();
-        let mut custom_argb = vec![0u32; self.backbuffer.len()];
-        self.premultiplier
-            .run(alpha, &self.backbuffer, &mut custom_argb);
-        self.custom_argb = custom_argb;
+        // of clearing to background, and rebuild the premultiplied custom-
+        // painter cache at the new size. The grid reflow + full snapshot
+        // arrives a round-trip later via the parser thread; until then we
+        // keep showing the previous content so the window doesn't flash
+        // blank mid-drag. See [`crate::pixel_buffers::PixelBuffers::resize`]
+        // for why `bg_packed()` (not `bg_xrgb()`) is used for the fill.
+        self.pixels.resize(
+            self.width,
+            self.height,
+            w,
+            h,
+            self.renderer.bg_packed(),
+            self.renderer.background_alpha(),
+        );
 
         // `self.present`'s pool is unchanged — we reuse it across resizes now.
         self.width = w;

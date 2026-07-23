@@ -127,31 +127,34 @@ unsafe extern "C" {
     fn dlerror() -> *mut c_char;
 }
 
-/// Fetch one symbol by name, transmuting to the caller-specified function
-/// pointer type. Returns `None` (after draining `dlerror`) if missing.
-///
-/// # Safety
-/// `T` must exactly match the C signature of `sym` in the loaded library.
-unsafe fn sym<T: Copy>(handle: *mut c_void, name: &CStr) -> Option<T> {
-    // SAFETY: `handle` is a live dlopen handle for the caller's lifetime;
-    // `name` is NUL-terminated by construction (`CStr`).
-    let ptr = unsafe { dlsym(handle, name.as_ptr()) };
-    if ptr.is_null() {
-        // SAFETY: dlerror() takes no arguments; the returned pointer (if
-        // any) is a static/thread-local string libc owns, we don't free it.
-        unsafe {
-            dlerror();
-        }
-        return None;
-    }
-    // SAFETY: `T` is a function-pointer-sized type (guaranteed by the
-    // `Copy` bound this module only ever instantiates with `unsafe extern
-    // "C" fn(...)` types), and the caller-provided signature is asserted to
-    // match by this function's own safety contract.
-    Some(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&ptr) })
-}
-
 impl Lib {
+    /// Fetch one symbol by name, transmuting to the caller-specified
+    /// function pointer type. Returns `None` (after draining `dlerror`) if
+    /// missing. An associated fn rather than a free one -- it's the
+    /// primitive [`Self::open`] is built from, so it belongs to `Lib`.
+    ///
+    /// # Safety
+    /// `T` must exactly match the C signature of `name` in the loaded
+    /// library.
+    unsafe fn sym<T: Copy>(handle: *mut c_void, name: &CStr) -> Option<T> {
+        // SAFETY: `handle` is a live dlopen handle for the caller's lifetime;
+        // `name` is NUL-terminated by construction (`CStr`).
+        let ptr = unsafe { dlsym(handle, name.as_ptr()) };
+        if ptr.is_null() {
+            // SAFETY: dlerror() takes no arguments; the returned pointer (if
+            // any) is a static/thread-local string libc owns, we don't free it.
+            unsafe {
+                dlerror();
+            }
+            return None;
+        }
+        // SAFETY: `T` is a function-pointer-sized type (guaranteed by the
+        // `Copy` bound this module only ever instantiates with `unsafe extern
+        // "C" fn(...)` types), and the caller-provided signature is asserted to
+        // match by this function's own safety contract.
+        Some(unsafe { std::mem::transmute_copy::<*mut c_void, T>(&ptr) })
+    }
+
     /// The process-wide `Lib` singleton, resolved once on first use and
     /// cached for every subsequent call. An associated fn rather than a
     /// bare free `lib()` function elsewhere in this crate -- `Lib` is what's
@@ -182,7 +185,7 @@ impl Lib {
                 // SAFETY: `handle` is the live handle just opened above;
                 // `cname` is NUL-terminated by construction.
                 unsafe {
-                    sym(
+                    Self::sym(
                         handle,
                         CStr::from_bytes_with_nul_unchecked(cname.as_bytes()),
                     )

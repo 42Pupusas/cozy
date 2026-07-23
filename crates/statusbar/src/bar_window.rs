@@ -500,14 +500,7 @@ impl BarWindow {
 
         // wl_seat.capabilities
         if ev.is(self.seat) && ev.event::<SeatEvent>() == Some(SeatEvent::Capabilities) {
-            let caps = ev.arg(0);
-            if self.pointer.id().is_none() && SeatCapability::Pointer.in_mask(caps) {
-                let pointer: platform::id::PointerId = self.window_tx.alloc_id();
-                self.window_tx.request(
-                    MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer),
-                );
-                self.pointer.set_id(pointer);
-            }
+            self.handle_seat_capabilities(ev);
             return Ok(());
         }
 
@@ -522,31 +515,57 @@ impl BarWindow {
         }
 
         if ev.is(self.layer_surface) {
-            match ev.event::<LayerSurfaceEvent>() {
-                Some(LayerSurfaceEvent::Configure) => {
-                    let serial = ev.arg(0);
-                    // Wayland surface dimensions never approach i32::MAX,
-                    // so this is never actually a sign-changing wrap.
-                    let w = ev.arg(1).cast_signed() * self.scale;
-                    self.window_tx.request(
-                        MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
-                            .u32(serial),
-                    );
-                    if w > 0 {
-                        self.resize(w)?;
-                    }
-                    self.configured = true;
-                    self.present.mark_dirty();
-                    return Ok(());
-                }
-                Some(LayerSurfaceEvent::Closed) => {
-                    self.closing = true;
-                    return Ok(());
-                }
-                None => {}
-            }
+            return self.handle_layer_surface_event(ev);
         }
         Ok(())
+    }
+
+    /// Handle `wl_seat.capabilities`: request a `wl_pointer` the first time
+    /// the seat advertises one. Split out of `handle_event` -- this whole
+    /// block is one self-contained concern (bind-once pointer discovery)
+    /// that doesn't need to share stack frame with the connection-level
+    /// dispatch around it.
+    fn handle_seat_capabilities(&mut self, ev: &RawEvent) {
+        let caps = ev.arg(0);
+        if self.pointer.id().is_none() && SeatCapability::Pointer.in_mask(caps) {
+            let pointer: platform::id::PointerId = self.window_tx.alloc_id();
+            self.window_tx
+                .request(MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer));
+            self.pointer.set_id(pointer);
+        }
+    }
+
+    /// Handle `zwlr_layer_surface_v1.*`: `Configure` (ack + resize to the
+    /// compositor-assigned width) and `Closed` (mark the bar for teardown).
+    /// Split out of `handle_event` for the same reason as
+    /// [`Self::handle_seat_capabilities`] -- this is the only branch group
+    /// in `handle_event` that can itself fail (via `resize`), so giving it
+    /// its own `Result`-returning method keeps that fallibility local
+    /// instead of threading through an inline match arm.
+    fn handle_layer_surface_event(&mut self, ev: &RawEvent) -> Result<()> {
+        match ev.event::<LayerSurfaceEvent>() {
+            Some(LayerSurfaceEvent::Configure) => {
+                let serial = ev.arg(0);
+                // Wayland surface dimensions never approach i32::MAX, so
+                // this is never actually a sign-changing wrap.
+                let w = ev.arg(1).cast_signed() * self.scale;
+                self.window_tx.request(
+                    MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
+                        .u32(serial),
+                );
+                if w > 0 {
+                    self.resize(w)?;
+                }
+                self.configured = true;
+                self.present.mark_dirty();
+                Ok(())
+            }
+            Some(LayerSurfaceEvent::Closed) => {
+                self.closing = true;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     /// Resize to `width` (physical pixels; height is fixed for the bar's

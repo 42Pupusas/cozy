@@ -29,6 +29,17 @@ struct Theme {
     fg: Color,
     dim: Color,
     highlight_bg: Color,
+    /// The window's own background alpha (`0-255`, `255` = opaque), passed
+    /// through to every `draw_text_alpha` call so anti-aliased glyph edges
+    /// blend correctly against a translucent backbuffer -- "translucent
+    /// glass, solid text": ink itself always stays fully opaque regardless
+    /// of this value (see `platform::Canvas::blit_glyph`'s doc), but the
+    /// edge-blend math needs to know the *real* alpha to composite toward,
+    /// not the always-255 default `TextRenderer::draw_text` assumes. Mirrors
+    /// `bins/statusbar`'s `PaintStyle::bg_alpha` exactly -- the bug this
+    /// field fixes was the launcher never plumbing it at all, so glyph edges
+    /// picked up the window's transparency instead of staying solid.
+    bg_alpha: u8,
 }
 
 impl Theme {
@@ -41,11 +52,18 @@ impl Theme {
     fn from_config(cfg: &config::Config) -> Self {
         let bg: Color = cfg.launcher_background().into();
         let fg: Color = cfg.launcher_foreground().into();
+        // Same float->u8 pixel-alpha conversion as `BarWindow::new` and
+        // `LauncherWindow::new` (see either's doc for why the clippy allow
+        // is deliberate): clamping to `0.0..=1.0` first guarantees the cast
+        // is always in-range, so truncation/sign-loss can't actually occur.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let bg_alpha = (cfg.launcher_opacity().clamp(0.0, 1.0) * 255.0).round() as u8;
         Self {
             bg,
             fg,
             dim: Color::rgb(0x6c, 0x70, 0x86),
             highlight_bg: Color::rgb(0x31, 0x32, 0x44),
+            bg_alpha,
         }
     }
 }
@@ -219,15 +237,16 @@ impl Painter {
             fg,
             dim,
             highlight_bg,
+            bg_alpha,
         } = *theme;
 
         // Query line, with a simple caret-less text field look: just the
         // typed text (or a placeholder) at the top.
         let query_y = pad;
         if query.is_empty() {
-            text.draw_text(canvas, "Type to search…", pad, query_y, dim, bg);
+            text.draw_text_alpha(canvas, "Type to search…", pad, query_y, dim, bg, bg_alpha);
         } else {
-            text.draw_text(canvas, query, pad, query_y, fg, bg);
+            text.draw_text_alpha(canvas, query, pad, query_y, fg, bg, bg_alpha);
         }
 
         let line_h = text.line_height() + 10;
@@ -240,11 +259,11 @@ impl Painter {
                 canvas.fill_rect(Rect::new(0, row_y - 4, canvas.width(), line_h), highlight_bg);
             }
             let color = if i == selected { fg } else { dim };
-            text.draw_text(canvas, &ranked.entry.name, pad, row_y, color, bg);
+            text.draw_text_alpha(canvas, &ranked.entry.name, pad, row_y, color, bg, bg_alpha);
         }
 
         if results.is_empty() && !query.is_empty() {
-            text.draw_text(canvas, "No matching applications", pad, list_top, dim, bg);
+            text.draw_text_alpha(canvas, "No matching applications", pad, list_top, dim, bg, bg_alpha);
         }
     }
 }

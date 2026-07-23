@@ -1,7 +1,7 @@
 //! Long-running monitor workload for perf. Unlike the Divan benchmark, this
 //! keeps the sampler hot long enough for symbol-level profiles to stabilize.
 
-use statusbar::MonitorReader;
+use sysmon::MonitorReader;
 use std::hint::black_box;
 
 struct MonitorProfile {

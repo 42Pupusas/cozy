@@ -11,7 +11,7 @@
 //!   cargo bench -p monitor-benches --bench blend
 
 use monitor::sample_interpolator::SampleInterpolator;
-use statusbar::MonitorSample;
+use sysmon::MonitorSample;
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();

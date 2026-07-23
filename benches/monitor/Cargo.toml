@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 monitor   = { path = "../../bins/monitor" }
 platform  = { path = "../../crates/platform" }
+sysmon    = { path = "../../crates/sysmon" }
 statusbar = { path = "../../crates/statusbar" }
 divan     = "0.1"
 

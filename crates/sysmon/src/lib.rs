@@ -1,6 +1,8 @@
-//! Structured system-monitor readings shared by graphical monitor clients.
-//! The readers stay here beside the status-bar sensors so `/proc` parsing and
-//! sysfs policy are not duplicated by a second binary.
+//! Structured system-monitor readings shared by the status bar and the
+//! graphical `monitor` dashboard. Owns `/proc` parsing and sysfs policy in one
+//! place so neither binary duplicates acquisition: [`MonitorReader`] is the
+//! stateful sampler (CPU history, sliced process scanner), while the plain
+//! reading structs expose one-shot telemetry for lighter consumers.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};

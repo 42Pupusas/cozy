@@ -19,7 +19,13 @@
 //!                    test). If this still allocates or moves bytes, the skip
 //!                    is not working.
 
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::doc_overindented_list_items,
+    clippy::suboptimal_flops
+)]
 
 use std::collections::VecDeque;
 

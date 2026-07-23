@@ -9,7 +9,13 @@
 //! Run:
 //!   cargo bench -p monitor-benches --bench core_bars
 
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::doc_markdown,
+    clippy::missing_const_for_fn
+)]
 
 use monitor::core_bars::{CoreBarPaint, CoreBars};
 use platform::draw::{Canvas, Color, Rect};

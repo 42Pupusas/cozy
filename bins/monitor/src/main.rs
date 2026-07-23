@@ -21,7 +21,8 @@ use monitor::sample_interpolator::SampleInterpolator;
 use platform::TermWindow;
 use platform::draw::{Canvas, Color, Rect};
 use profile::{FrameProfile, PaintPhases, WorkerProfile};
-use statusbar::{MonitorReader, MonitorSample, ProcessInfo, TextRenderer};
+use statusbar::TextRenderer;
+use sysmon::{MonitorReader, MonitorSample, ProcessInfo};
 
 /// One minute of chart history at four deliberately distinct points per
 /// second. At typical card widths this gives each interval visible horizontal

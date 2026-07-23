@@ -12,10 +12,14 @@
 //! Run:
 //!   cargo bench -p monitor-benches --bench idle_tick
 
-#![allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::doc_markdown
+)]
 
 use monitor::display_snapshot::DisplaySnapshot;
-use statusbar::MonitorSample;
+use sysmon::MonitorSample;
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();
@@ -38,8 +42,8 @@ fn sample(cores: usize) -> MonitorSample {
         thermal_avg: 55.5,
         thermal_min: 48.1,
         disk: 12.0,
-        network_rx: 3.14,
-        network_tx: 2.71,
+        network_rx: 3.05,
+        network_tx: 2.6,
         network_ping_ms: 18.4,
         network_link_mbps: 940.0,
         cpu_frequency_ghz: 3.87,

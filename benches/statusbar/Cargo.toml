@@ -9,6 +9,7 @@ description = "divan micro-benchmarks for the statusbar crate's hot spots: text 
 workspace = true
 
 [dependencies]
+sysmon       = { path = "../../crates/sysmon" }
 statusbar    = { path = "../../crates/statusbar" }
 platform     = { path = "../../crates/platform" }
 quetzalcoatl = { workspace = true }

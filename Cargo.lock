@@ -177,6 +177,7 @@ dependencies = [
  "config",
  "platform",
  "statusbar",
+ "sysmon",
  "waker",
 ]
 
@@ -188,6 +189,7 @@ dependencies = [
  "monitor",
  "platform",
  "statusbar",
+ "sysmon",
 ]
 
 [[package]]
@@ -292,6 +294,7 @@ dependencies = [
  "platform",
  "quetzalcoatl",
  "statusbar",
+ "sysmon",
 ]
 
 [[package]]
@@ -314,6 +317,10 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "sysmon"
+version = "0.1.0"
 
 [[package]]
 name = "terminal"

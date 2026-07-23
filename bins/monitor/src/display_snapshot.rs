@@ -1,4 +1,4 @@
-//! Quantizes a [`statusbar::MonitorSample`] down to the precision the
+//! Quantizes a [`sysmon::MonitorSample`] down to the precision the
 //! dashboard actually renders, so the render loop can tell whether a new
 //! interpolated value would produce different pixels at all.
 //!
@@ -13,7 +13,7 @@
 //! place, core bars rounded to the nearest whole percent) rather than the
 //! raw, continuously-moving interpolation state.
 
-use statusbar::MonitorSample;
+use sysmon::MonitorSample;
 
 /// The rendered-precision projection of one [`MonitorSample`].
 ///
@@ -95,7 +95,7 @@ impl DisplaySnapshot {
 #[cfg(test)]
 mod tests {
     use super::DisplaySnapshot;
-    use statusbar::MonitorSample;
+    use sysmon::MonitorSample;
 
     fn sample_with_cpu(cpu: f32) -> MonitorSample {
         MonitorSample {

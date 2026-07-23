@@ -24,6 +24,7 @@ workspace = true
 trace = ["platform/trace"]
 
 [dependencies]
+sysmon = { path = "../../crates/sysmon" }
 statusbar = { path = "../../crates/statusbar" }
 platform = { path = "../../crates/platform" }
 config = { path = "../../crates/config" }

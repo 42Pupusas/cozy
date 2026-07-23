@@ -9,7 +9,7 @@
 //! `*_allocating` variants are deliberate baselines so the streaming parsers'
 //! zero-allocation claim is a measured ratio, not an assertion.
 
-use statusbar::monitor::MonitorReader;
+use sysmon::MonitorReader;
 
 #[global_allocator]
 static ALLOC: divan::AllocProfiler = divan::AllocProfiler::system();

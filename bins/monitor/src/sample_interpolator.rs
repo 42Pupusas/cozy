@@ -19,7 +19,7 @@
 //! and only rewrites a device string when its identity actually changed
 //! (hotplug / first sample), so the hold path allocates nothing.
 
-use statusbar::MonitorSample;
+use sysmon::MonitorSample;
 use std::time::{Duration, Instant};
 
 /// How long a fresh sample takes to glide to its new value, independent of the
@@ -164,7 +164,7 @@ impl SampleInterpolator {
 #[cfg(test)]
 mod tests {
     use super::{SampleInterpolator, GLIDE_DURATION};
-    use statusbar::MonitorSample;
+    use sysmon::MonitorSample;
     use std::time::Duration;
 
     #[test]

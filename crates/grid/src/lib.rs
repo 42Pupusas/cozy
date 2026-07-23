@@ -24,6 +24,7 @@ mod cell;
 pub mod cell_store;
 mod cursor;
 mod dirty;
+mod line_wrap;
 mod palette;
 mod screen;
 mod selection;
@@ -2417,6 +2418,171 @@ mod tests {
     }
 
     #[test]
+    fn resize_drag_roundtrip_does_not_grow_lines_or_drop_content() {
+        // Regression: word-aware reflow leaves ragged (blank-padded) soft-wrap
+        // rows. The resize stitch step must trim that padding and restore only
+        // ONE separator space per word break; otherwise every narrow<->wide
+        // cycle injected an extra space, growing each line until it spilled a
+        // physical row into scrollback -- so a drag silently deleted visible
+        // lines from the top. Dragging the width down and back must be a
+        // perfect round-trip of the visible text.
+        let visible = |g: &Grid| -> Vec<String> {
+            let s = g.screen();
+            (0..s.rows())
+                .map(|r| {
+                    (0..s.cols())
+                        .map(|c| s.get_cell(c, r).ch)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        };
+        let mut g = Grid::new(80, 24);
+        for i in 0..20 {
+            apply_str(
+                &mut g,
+                format!("line{i:02} some words here to fill the row nicely\r\n").as_bytes(),
+            );
+        }
+        let before = visible(&g);
+        // A realistic horizontal drag: many width steps down, then back to 80.
+        for w in [72u16, 64, 56, 48, 40, 48, 56, 64, 72, 80] {
+            g.resize(w, 24);
+        }
+        assert_eq!(before, visible(&g), "drag roundtrip lost or mutated lines");
+        // No line grew a phantom space at the old wrap column.
+        assert!(
+            visible(&g).iter().all(|l| !l.contains("  ")),
+            "a reflow injected a double space"
+        );
+    }
+
+    #[test]
+    fn resize_drag_many_short_prompt_lines_no_phantoms() {
+        // Reproduce the user's real corruption: a scrollback full of SHORT
+        // hard-newline-separated prompt lines (each fits a wide width but
+        // wraps at a narrow one), dragged down through many widths and back.
+        // The reported artifact was truncated fragments (e.g. `~/C/f/term`,
+        // 10 cols) and several prompts concatenated onto one row -- i.e. the
+        // stitch/reflow mangling short lines across repeated narrow<->wide
+        // steps, not the single long-line growth the other roundtrip covers.
+        let visible = |g: &Grid| -> Vec<String> {
+            let s = g.screen();
+            (0..s.rows())
+                .map(|r| {
+                    (0..s.cols())
+                        .map(|c| s.get_cell(c, r).ch)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        };
+        let mut g = Grid::new(80, 24);
+        // 30 short prompt lines, each its own hard-newline logical line.
+        for _ in 0..30 {
+            apply_str(&mut g, b"~/C/f/terminal > \r\n");
+        }
+        let before = visible(&g);
+        // A thrashing horizontal drag: many steps down (narrow enough to wrap
+        // the 16-char prompt) and back up to 80.
+        for w in [40u16, 10, 30, 8, 24, 12, 50, 16, 64, 10, 72, 80] {
+            g.resize(w, 24);
+        }
+        assert_eq!(
+            before,
+            visible(&g),
+            "short-line drag roundtrip corrupted the scrollback"
+        );
+        // No row holds two prompts stitched together, and none is a truncated
+        // fragment left from a narrow width.
+        for line in visible(&g) {
+            assert!(
+                line.matches('>').count() <= 1,
+                "two prompts concatenated on one row: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resize_interleaved_with_shell_reprompt_no_fragments() {
+        // The faithful repro of the user's corruption: during a fast drag the
+        // shell gets a SIGWINCH at EVERY intermediate width and redraws its
+        // prompt (zsh `reset-prompt`: CR, erase-to-end-of-display, reprint).
+        // Our reflow and the shell's reprint interleave, so a reprint made at
+        // width 10 can be reflowed by the next step before the shell clears
+        // it -- stranding a truncated fragment. After the drag settles at a
+        // wide width and the shell does its FINAL redraw, the screen must hold
+        // exactly one clean prompt with no leftover fragments above it.
+        let visible = |g: &Grid| -> Vec<String> {
+            let s = g.screen();
+            (0..s.rows())
+                .map(|r| {
+                    (0..s.cols())
+                        .map(|c| s.get_cell(c, r).ch)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        };
+        // zsh reset-prompt: return to the prompt's first row, clear from there
+        // to end of screen, reprint. Modelled as CR + ED0 + prompt text. (The
+        // cursor is on the prompt's own line; for a single-row-at-wide prompt
+        // the up-count is 0, but at narrow widths the prompt wrapped, so the
+        // shell moves up by however many rows IT thinks the prompt spans.)
+        let reprompt = |g: &mut Grid, width: u16| {
+            // The shell computes its own wrap for a 17-cell prompt over
+            // `width`: rows_used = ceil(len/width), cursor on the last row, so
+            // it moves up rows_used-1 to reach the prompt's first row.
+            let len = 17u16;
+            let rows_used = len.div_ceil(width.max(1));
+            let up = rows_used.saturating_sub(1);
+            let mut seq = Vec::new();
+            seq.push(b'\r');
+            if up > 0 {
+                seq.extend_from_slice(format!("\x1b[{up}A").as_bytes());
+            }
+            seq.extend_from_slice(b"\x1b[J~/C/f/terminal > ");
+            apply_str(g, &seq);
+        };
+        let mut g = Grid::new(80, 24);
+        // Some committed history so the prompt sits mid-screen.
+        for i in 0..5 {
+            apply_str(&mut g, format!("output line {i}\r\n").as_bytes());
+        }
+        apply_str(&mut g, b"~/C/f/terminal > ");
+        // Thrash: resize then shell-reprompt. A real shell remembers how many
+        // rows it drew at the PREVIOUS width and moves up by THAT count (its
+        // own bookkeeping), not the current one -- the terminal has already
+        // reflowed underneath it. Feed the previous width to `reprompt` to
+        // model that lag.
+        let mut prev_w = 80u16;
+        for w in [40u16, 10, 30, 8, 24, 12, 50, 16, 64, 10, 72, 80] {
+            g.resize(w, 24);
+            reprompt(&mut g, prev_w);
+            prev_w = w;
+        }
+        // Final settle: the shell's last redraw is consistent with the
+        // settled width (SIGWINCH coalesced to the final size).
+        reprompt(&mut g, 80);
+        let vis = visible(&g);
+        // Exactly one prompt, no fragments: count rows containing '>'.
+        let prompt_rows = vis.iter().filter(|l| l.contains('>')).count();
+        assert_eq!(
+            prompt_rows, 1,
+            "expected one clean prompt, got fragments: {vis:?}"
+        );
+        // And the committed output above must be intact and un-fragmented.
+        let joined: String = vis.join("\n");
+        assert!(
+            joined.contains("output line 0"),
+            "history corrupted: {vis:?}"
+        );
+    }
+
+    #[test]
     fn resize_narrow_reflows_wrapped_line() {
         // 10 cols: print 15 chars -> auto-wraps to 2 rows (10 + 5).
         let mut g = Grid::new(10, 5);
@@ -2489,6 +2655,55 @@ mod tests {
         assert_eq!(g.screen().get_cell(0, 1).ch, '@');
         assert_eq!(g.screen().get_cell(0, 3).ch, 'd');
         assert_eq!(g.cursor(), (1, 4));
+    }
+
+    #[test]
+    fn resize_then_shell_redraw_leaves_no_phantom_prompt_rows() {
+        // Reproduce the "phantom copies of the prompt on the line above" bug.
+        // A shell (zsh/fish) redraws its prompt on SIGWINCH by moving the
+        // cursor to the prompt's start column/row and reprinting. If our
+        // reflow parks the cursor on a DIFFERENT row than where the shell
+        // believes its prompt begins, the reprint lands offset and the old
+        // wrapped fragment above is never overwritten -> a phantom row.
+        //
+        // Model: a 24-col prompt that wraps once at width 20, then the window
+        // is dragged to width 10 (prompt now spans 3 rows). The shell reacts
+        // by returning to column 0 of the CURRENT cursor row via CR and
+        // reprinting the whole prompt from there. After the redraw the visible
+        // area must contain exactly ONE copy of the prompt tail, with no
+        // orphaned fragment on an earlier row.
+        let mut g = Grid::new(20, 6);
+        // A 25-column prompt so it soft-wraps at the old width of 20.
+        let prompt = b"~/Code/forfun/terminal > ";
+        assert_eq!(prompt.len(), 25);
+        apply_str(&mut g, prompt);
+        // Drag narrower: reflow to width 10. A shell's own layout model
+        // character-wraps, so it believes the 25-col prompt now occupies
+        // ceil(25/10)=3 rows with the cursor on row index 2. Our reflow must
+        // agree, or the shell's redraw lands offset.
+        g.resize(10, 6);
+        let (_, cy) = g.cursor();
+        assert_eq!(
+            cy, 2,
+            "reflowed cursor row must match the shell's char-wrap model"
+        );
+        // The shell's SIGWINCH handler: move the cursor UP to the prompt's
+        // first row (by its own row count), carriage-return to column 0,
+        // clear from there to the end of screen (CSI J), then reprint. This
+        // only erases the whole prompt if our cursor sat where the shell
+        // thinks it did.
+        apply_str(&mut g, b"\x1b[2A\r\x1b[J~/Code/forfun/terminal > ");
+        // Concatenate every visible row (no separators) and count how many
+        // times the prompt appears. A phantom leaves a second, offset copy;
+        // a clean redraw leaves exactly one. Wrap boundaries fall inside the
+        // string, so join with no separator before matching.
+        let text = format!("{g}");
+        let concatenated: String = text.lines().map(str::trim_end).collect();
+        let occurrences = concatenated.matches("~/Code/forfun/terminal >").count();
+        assert_eq!(
+            occurrences, 1,
+            "prompt duplicated after resize+redraw: {concatenated:?}"
+        );
     }
 
     #[test]

@@ -953,6 +953,10 @@ impl UiWorker<'_> {
         // Track the grid's current row count for page-scroll sizing (updated on
         // resize). Seeded from the startup dimensions.
         let mut grid_rows = ROWS;
+        // Holds back the PTY SIGWINCH during a drag so the shell reprompts once
+        // at the settled size instead of at every intermediate width (which
+        // strands truncated prompt fragments). The grid still reflows live.
+        let mut resize_debounce = ResizeDebounce::new();
         // Mirror of the grid's OSC 8 link table, id -> URI, built incrementally
         // from `UiEvent::Link`. Lets a Ctrl+click resolve the cell under the
         // pointer's `link_id` without reaching across to the parser thread.
@@ -1015,12 +1019,15 @@ impl UiWorker<'_> {
                     }
                     InputEvent::Resize { cols, rows } => {
                         grid_rows = rows;
-                        // PTY gets the winsize (SIGWINCH); the grid gets the new
-                        // extent to reflow. Pushing to the parser MPSC ring unparks
-                        // the parser directly — no separate wake needed.
-                        let _ = input_tx.push(InputMsg::Resize { cols, rows });
+                        // Reflow the grid NOW (live visual feedback), pushing to
+                        // the parser MPSC ring which unparks the parser directly
+                        // — no separate wake needed. But DEFER the PTY winsize:
+                        // sending SIGWINCH on every drag step makes the shell
+                        // reprompt at each intermediate width, stranding
+                        // truncated prompt fragments. `ResizeDebounce` releases
+                        // one winsize once the drag settles.
                         let _ = resize_tx.push(ParserMsg::Resize { cols, rows });
-                        sent_input = true;
+                        resize_debounce.note(cols, rows);
                     }
                     InputEvent::Scroll {
                         lines,
@@ -1243,6 +1250,13 @@ impl UiWorker<'_> {
                 }
             }
 
+            // Release a debounced winsize once the drag has settled: send ONE
+            // SIGWINCH at the final size so the shell reprompts exactly once.
+            if let Some((cols, rows)) = resize_debounce.take_if_settled() {
+                let _ = input_tx.push(InputMsg::Resize { cols, rows });
+                sent_input = true;
+            }
+
             // Rouse the PTY thread once for the whole batch of queued input.
             if sent_input {
                 pty_wake.signal();
@@ -1270,17 +1284,99 @@ impl UiWorker<'_> {
             // otherwise it stays the full 100ms, bounding only quit-flag latency
             // as before.
             if !did_work {
-                let cap = if win.wants_animation_frame() {
+                let mut cap = if win.wants_animation_frame() {
                     anim_poll_cap_ms
                 } else {
                     100
                 };
+                // A pending debounced resize must wake the loop when its quiet
+                // period elapses, even if nothing else arrives — otherwise the
+                // held winsize could sit unsent until the next unrelated event.
+                if let Some(resize_cap) = resize_debounce.wait_cap_ms() {
+                    cap = cap.min(resize_cap.max(1));
+                }
                 win.wait(cap);
             }
         }
 
         quit.store(true, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+// ── Resize debounce ────────────────────────────────────────────────────────────────────
+
+/// Debounces the SIGWINCH sent to the PTY during a window drag.
+///
+/// A drag emits a flood of cell-count changes. The *grid* is reflowed on
+/// every one of them (immediate, so the visible text tracks the window
+/// crisply), but the *PTY* winsize must NOT be — every winsize raises
+/// SIGWINCH, and the shell answers each by repainting its prompt. At
+/// intermediate widths those repaints land on a grid that the very next
+/// reflow step immediately re-lays-out, stranding the half-drawn prompt as a
+/// truncated fragment (`~/C/f/te`, `~/C/f/term`, …) one row above the live
+/// one — and a fast drag piles dozens of them up.
+///
+/// So we hold back the winsize: record the latest (cols, rows) and a
+/// deadline a short quiet-period into the future, pushing it forward on each
+/// new step. Only once the drag goes quiet for `QUIET` do we send ONE winsize
+/// at the settled size, so the shell reprompts exactly once, cleanly. The
+/// terminal already sizes the kernel PTY correctly at startup, and any app
+/// that truly cares about live size (a full-screen TUI) re-queries on its own
+/// SIGWINCH once the drag stops — the debounce only delays the signal by a
+/// few frames, never drops it.
+struct ResizeDebounce {
+    /// The latest proposed size, plus the instant we may release it. `None`
+    /// when no resize is pending (steady state).
+    pending: Option<(u16, u16, Instant)>,
+}
+
+impl ResizeDebounce {
+    /// Quiet period a drag must be idle before the held winsize is flushed to
+    /// the PTY. ~80ms is below perceptible lag on drag-release yet long
+    /// enough to swallow a whole drag's configure storm (which arrives at
+    /// screen-refresh cadence, ≤16ms apart).
+    const QUIET: Duration = Duration::from_millis(80);
+
+    /// No resize pending.
+    const fn new() -> Self {
+        Self { pending: None }
+    }
+
+    /// Record a new proposed size, (re)arming the quiet-period deadline. The
+    /// grid is reflowed by the caller regardless; only the PTY winsize is
+    /// what this gate defers.
+    fn note(&mut self, cols: u16, rows: u16) {
+        self.pending = Some((cols, rows, Instant::now() + Self::QUIET));
+    }
+
+    /// If a size is pending and its quiet period has elapsed, consume and
+    /// return it (the caller then sends the single winsize). Returns `None`
+    /// while a drag is still in flight or nothing is pending.
+    fn take_if_settled(&mut self) -> Option<(u16, u16)> {
+        match self.pending {
+            Some((cols, rows, deadline)) if Instant::now() >= deadline => {
+                self.pending = None;
+                Some((cols, rows))
+            }
+            _ => None,
+        }
+    }
+
+    /// Milliseconds until the pending winsize should be flushed, if any — so
+    /// the event loop can cap its idle `poll` wait and wake to release it
+    /// even when no other event arrives. `None` when nothing is pending.
+    fn wait_cap_ms(&self) -> Option<i32> {
+        self.pending.map(|(_, _, deadline)| {
+            let now = Instant::now();
+            if now >= deadline {
+                0
+            } else {
+                // The remaining window is at most QUIET (~80ms), far inside
+                // i32 range; saturate defensively anyway.
+                i32::try_from((deadline - now).as_millis()).unwrap_or(i32::MAX)
+            }
+        })
     }
 }
 
@@ -1927,5 +2023,50 @@ mod key_translation_tests {
             ..Default::default()
         };
         assert_eq!(m.to_input(), Modifiers::SHIFT);
+    }
+
+    #[test]
+    fn resize_debounce_holds_until_quiet_then_releases_latest() {
+        let mut d = ResizeDebounce::new();
+        // Nothing pending yet.
+        assert_eq!(d.take_if_settled(), None);
+        assert_eq!(d.wait_cap_ms(), None);
+
+        // A burst of drag steps: each re-arms the deadline, so none release
+        // immediately (the quiet period hasn't elapsed).
+        d.note(80, 24);
+        d.note(40, 24);
+        d.note(20, 24);
+        assert_eq!(
+            d.take_if_settled(),
+            None,
+            "must not release mid-drag"
+        );
+        // A wait cap is advertised so the loop wakes to flush later.
+        assert!(d.wait_cap_ms().is_some());
+
+        // After the quiet period elapses, the LATEST size (not an
+        // intermediate one) is released exactly once.
+        std::thread::sleep(ResizeDebounce::QUIET + Duration::from_millis(20));
+        assert_eq!(d.take_if_settled(), Some((20, 24)));
+        // And it's consumed: a second poll yields nothing.
+        assert_eq!(d.take_if_settled(), None);
+        assert_eq!(d.wait_cap_ms(), None);
+    }
+
+    #[test]
+    fn resize_debounce_deadline_pushes_forward_on_each_step() {
+        let mut d = ResizeDebounce::new();
+        d.note(80, 24);
+        let first = d.wait_cap_ms().expect("pending after first note");
+        // A later step should reset the countdown to roughly the full quiet
+        // period again (>= the tail of the first), never shrink toward zero.
+        std::thread::sleep(Duration::from_millis(10));
+        d.note(40, 24);
+        let second = d.wait_cap_ms().expect("pending after second note");
+        assert!(
+            second >= first - 10,
+            "deadline did not re-arm: first={first} second={second}"
+        );
     }
 }

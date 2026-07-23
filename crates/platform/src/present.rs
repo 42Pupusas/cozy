@@ -64,6 +64,12 @@ pub struct PresentState {
     frame_ready: bool,
     /// The in-flight `wl_callback` we're waiting on, if any.
     frame_cb: Option<CallbackId>,
+    /// The slot presented into last (i.e. the pool region the compositor is
+    /// currently scanning out), if any. `begin_present` prefers the *other*
+    /// slot so it never overwrites memory that's still on screen -- the
+    /// source of the resize/drag "diagonal tear". `None` before the first
+    /// present, when either slot is equally safe.
+    last_slot: Option<usize>,
 }
 
 impl PresentState {
@@ -88,6 +94,7 @@ impl PresentState {
             dirty: true,
             frame_ready: true,
             frame_cb: None,
+            last_slot: None,
         }
     }
 
@@ -157,10 +164,23 @@ impl PresentState {
         if !self.frame_ready {
             return PresentAttempt::NotReady;
         }
-        let Some(slot) = self.frames.iter().position(|f| f.free) else {
+        // Ping-pong: prefer the slot we did NOT present into last time. The
+        // last-presented slot's pool memory is what the compositor is still
+        // scanning out, so reusing it -- which the old "first free slot"
+        // choice did on every resize (`recreate_buffers` force-frees both
+        // slots, making slot 0 always win) and whenever releases were prompt
+        // -- overwrites on-screen pixels mid-scanout and tears the frame
+        // diagonally. Only fall back to the last slot if its sibling is still
+        // held by the compositor.
+        let sibling = self.last_slot.map(|s| 1 - s);
+        let slot = sibling
+            .filter(|&s| self.frames.get(s).is_some_and(|f| f.free))
+            .or_else(|| self.frames.iter().position(|f| f.free));
+        let Some(slot) = slot else {
             return PresentAttempt::NoFreeSlot;
         };
         self.frames[slot].free = false;
+        self.last_slot = Some(slot);
         PresentAttempt::Ready(slot)
     }
 
@@ -345,6 +365,19 @@ mod tests {
     }
 
     #[test]
+    fn reset_after_resize_keeps_ping_pong_history() {
+        // After a resize the on-screen buffer is still the last-presented
+        // slot; `reset_after_resize` must not forget it, or the immediate
+        // post-resize present could reuse the scanned-out region and tear.
+        let mut st = make_state();
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
+        st.frames[0].free = true;
+        st.frames[1].free = true;
+        st.reset_after_resize(4);
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(1)));
+    }
+
+    #[test]
     fn reset_after_resize_forces_ready_and_dirty() {
         let mut st = make_state();
         st.finish_present(CallbackId(1));
@@ -352,6 +385,41 @@ mod tests {
         st.reset_after_resize(4);
         assert!(matches!(st.begin_present(), PresentAttempt::Ready(_)));
         assert!(st.stale_rows_for_test(0).iter().all(|&s| s));
+    }
+
+    #[test]
+    fn begin_present_ping_pongs_between_slots() {
+        let mut st = make_state();
+        // First present: no history, takes the first free slot (0).
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
+        // Compositor releases slot 0 and answers the frame callback.
+        st.frames[0].free = true;
+        st.finish_present(CallbackId(1));
+        st.frame_ready = true;
+        st.mark_dirty();
+        // Even though slot 0 is free again, we must NOT reuse it -- it's the
+        // one on screen. Ping-pong to slot 1.
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(1)));
+        st.frames[1].free = true;
+        st.finish_present(CallbackId(2));
+        st.frame_ready = true;
+        st.mark_dirty();
+        // And back to slot 0.
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
+    }
+
+    #[test]
+    fn begin_present_falls_back_to_last_slot_when_sibling_busy() {
+        let mut st = make_state();
+        // Present into slot 0, leave it free, but keep slot 1 held busy.
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
+        st.frames[0].free = true;
+        st.frames[1].free = false;
+        st.finish_present(CallbackId(1));
+        st.frame_ready = true;
+        st.mark_dirty();
+        // Sibling (1) is busy, so we have no choice but to reuse slot 0.
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
     }
 
     #[test]

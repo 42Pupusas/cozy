@@ -742,8 +742,34 @@ impl Screen {
                     cursor_line = li;
                     cursor_offset = cells.len() + cursor_col;
                 }
-                cells.extend(self.buf.cells(base..base + old_cols));
                 let cont = self.wrapped[phys];
+                if cont {
+                    // A soft-wrapped (continuation) row that our own word-aware
+                    // reflow produced may be RAGGED -- broken before the margin
+                    // and padded with blanks -- unlike a terminal-autowrapped
+                    // row, which always fills to the last column. Concatenating
+                    // that padding would reappear as phantom spaces in the
+                    // logical line; and since a word-break's separator space is
+                    // byte-identical to a padding blank (`Cell::default()`),
+                    // every narrow<->wide reflow cycle would inject an extra
+                    // space, growing lines until bottom-anchored repack pushed
+                    // visible content off into scrollback (the "resize deletes
+                    // lines" bug). So trim this row's trailing blanks: if that
+                    // leaves it short of full width the break was a WORD break,
+                    // so restore exactly one separator space; a still-full row
+                    // was a hard break (an over-long word) and joins seamlessly.
+                    let row = self.buf.cells(base..base + old_cols);
+                    let mut end = row.len();
+                    while end > 0 && row[end - 1] == Cell::default() {
+                        end -= 1;
+                    }
+                    cells.extend_from_slice(&row[..end]);
+                    if end < old_cols {
+                        cells.push(Cell::default());
+                    }
+                } else {
+                    cells.extend(self.buf.cells(base..base + old_cols));
+                }
                 r += 1;
                 if !cont || r >= total_old {
                     break;
@@ -770,25 +796,37 @@ impl Screen {
         let mut new_cursor_idx = 0usize;
         let mut new_cursor_col = 0usize;
         for (li, line) in lines.iter().enumerate() {
-            let pieces = if line.is_empty() {
-                1
+            // Break the logical line at word boundaries where possible, only
+            // hard-splitting a word that is itself wider than the row. This is
+            // what replaced the old fixed-stride `p * new_cols_u` slice, which
+            // chopped words mid-glyph on every reflow.
+            //
+            // EXCEPT the cursor's own logical line (the shell's active prompt +
+            // input): word-wrapping it would move its physical rows/columns
+            // away from where the shell — which redraws on SIGWINCH using its
+            // own character-wrap layout model — expects the cursor to be. The
+            // mismatch makes the shell's clear-and-reprint land offset, leaving
+            // the old wrapped fragment stranded above as a phantom copy. So the
+            // active line is character-wrapped (`hard_pieces`), matching the
+            // shell exactly; committed history stays word-wrapped for looks.
+            let wrapper = crate::line_wrap::LineWrapper::new(line, new_cols_u);
+            let pieces = if li == cursor_line {
+                wrapper.hard_pieces()
             } else {
-                line.len().div_ceil(new_cols_u)
+                wrapper.pieces()
             };
+            let piece_count = pieces.len();
             let base_idx = rows_out.len();
-            for p in 0..pieces {
-                let start = p * new_cols_u;
-                let end = ((p + 1) * new_cols_u).min(line.len());
+            for (p, &(start, end)) in pieces.iter().enumerate() {
                 let mut row_cells = vec![Cell::default(); new_cols_u];
                 if start < end {
                     row_cells[..end - start].copy_from_slice(&line[start..end]);
                 }
-                // The naive slice-at-new_cols_u break can land exactly on a
-                // wide-char pair's seam, leaving an orphaned lead (no spacer
-                // to its right) or an orphaned spacer (no lead to its left).
-                // Blank the orphan rather than let a half-glyph render or
-                // corrupt the next row's read. (Full width-aware line
-                // breaking that never splits a pair is a follow-up.)
+                // A word-aware break never lands inside a wide-glyph pair (the
+                // wrapper pulls back off a spacer seam), but a *hard* break of
+                // an over-long word still can. Blank any orphaned lead (no
+                // spacer to its right) or spacer (no lead to its left) rather
+                // than let a half-glyph render or corrupt the next row's read.
                 if let Some(last) = row_cells.last_mut()
                     && last.wide()
                 {
@@ -799,23 +837,43 @@ impl Screen {
                 {
                     *first = Cell::default();
                 }
-                rows_out.push((row_cells, p + 1 < pieces));
+                rows_out.push((row_cells, p + 1 < piece_count));
             }
             if li == cursor_line {
-                let piece = cursor_offset / new_cols_u;
-                if piece >= pieces {
+                // Find the piece whose cell range contains the cursor offset.
+                // Pieces partition `[0, line.len())`, so a cursor offset at or
+                // past the line length sits one position beyond the content.
+                let hit = pieces
+                    .iter()
+                    .position(|&(start, end)| cursor_offset >= start && cursor_offset < end);
+                if let Some(p) = hit {
+                    let (start, _) = pieces[p];
+                    new_cursor_idx = base_idx + p;
+                    new_cursor_col = (cursor_offset - start).min(new_cols_u - 1);
+                } else {
                     // The cursor sits one position past the line's content (an
                     // eager-wrap terminal parks it at the start of a fresh row
                     // after filling the last column). That row was trimmed as a
                     // trailing blank, so re-materialize it instead of clamping
                     // the cursor back onto the final glyph — clamping is what
                     // made the shell's SIGWINCH repaint clear the wrong rows.
-                    rows_out.push((vec![Cell::default(); new_cols_u], false));
-                    new_cursor_idx = rows_out.len() - 1;
-                    new_cursor_col = cursor_offset - piece * new_cols_u;
-                } else {
-                    new_cursor_idx = base_idx + piece;
-                    new_cursor_col = (cursor_offset - piece * new_cols_u).min(new_cols_u - 1);
+                    let (last_start, last_end) = *pieces.last().unwrap();
+                    let last_fits = last_end - last_start < new_cols_u;
+                    if last_fits {
+                        // Room on the final piece's row: park the cursor just
+                        // past its last cell rather than opening a new row.
+                        new_cursor_idx = base_idx + piece_count - 1;
+                        new_cursor_col = (cursor_offset - last_start).min(new_cols_u - 1);
+                    } else {
+                        // The last content row is packed full, so the parked
+                        // cursor opens a fresh row. Its column is how far the
+                        // offset sits past the content end (`last_end`), matching
+                        // the old fixed-stride `cursor_offset mod new_cols_u`
+                        // when the line length was a multiple of the width.
+                        rows_out.push((vec![Cell::default(); new_cols_u], false));
+                        new_cursor_idx = rows_out.len() - 1;
+                        new_cursor_col = (cursor_offset - last_end).min(new_cols_u - 1);
+                    }
                 }
             }
         }

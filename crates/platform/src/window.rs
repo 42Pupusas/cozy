@@ -271,6 +271,12 @@ pub struct TermWindow {
     /// Latest window size proposed by `xdg_toplevel.configure`, applied once per
     /// frame so a drag's flood of configures collapses into one resize.
     pending_resize: Option<(i32, i32)>,
+    /// The last cell-grid dimensions (cols, rows) we handed to the grid via an
+    /// `InputEvent::Resize`. A window drag emits a flood of pixel-level
+    /// configures whose sub-cell jitter leaves the *cell* count unchanged;
+    /// re-reflowing the whole grid on each of those is what made the text
+    /// judder. We only emit a fresh grid Resize when this actually changes.
+    last_grid_size: (u16, u16),
     /// Pending dirty snapshots to blit on the next frame.
     pending_dirty: Vec<grid::DirtySnapshot>,
     /// Pending input events for the caller.
@@ -515,6 +521,7 @@ impl TermWindow {
             selection_bypass: false,
             lifecycle: Lifecycle::Unconfigured,
             pending_resize: None,
+            last_grid_size: (cols, rows),
             pending_dirty: Vec::new(),
             input_queue: std::collections::VecDeque::new(),
             clipboard,
@@ -1445,10 +1452,19 @@ impl TermWindow {
             return Ok(());
         }
         self.resize(w, h)?;
+        // The shm buffers/backbuffer always track the exact pixel size (so the
+        // window paints crisply at any drag position), but the *grid* only
+        // cares about whole cells. A drag's sub-cell pixel jitter leaves the
+        // cell count unchanged; re-reflowing on each such configure is what made
+        // long-line wrapping judder. Only emit a grid Resize when the cell
+        // count actually moves.
         let cols = (w / self.cell_w) as u16;
         let rows = (h / self.cell_h) as u16;
-        self.input_queue
-            .push_back(InputEvent::Resize { cols, rows });
+        if (cols, rows) != self.last_grid_size {
+            self.last_grid_size = (cols, rows);
+            self.input_queue
+                .push_back(InputEvent::Resize { cols, rows });
+        }
         self.present.mark_dirty();
         Ok(())
     }

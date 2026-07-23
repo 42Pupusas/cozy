@@ -535,6 +535,27 @@ impl ProcessScanner {
         Some(std::mem::take(&mut self.collected))
     }
 
+    /// Run one *complete* sweep in a single call, collapsing the ten-tick
+    /// slicing that `advance` normally spreads across worker ticks.
+    ///
+    /// The slicing keeps steady-state cost low (one `/proc` sweep per ten 1 Hz
+    /// ticks), but that same spreading is disastrous at startup: it leaves the
+    /// process table empty for ten ticks (~10 s) and withholds real
+    /// per-process CPU% -- a delta that needs two sweeps -- for ~20 s. Priming
+    /// with a couple of full sweeps at launch populates names/memory instantly
+    /// and real CPU% within one tick, after which the caller returns to the
+    /// cheap sliced `advance`. Each `advance` guarantees forward progress
+    /// (`begin` seeds `pending`, every batch advances the cursor by at least
+    /// one, an empty `/proc` short-circuits to `Some`), so this loop always
+    /// terminates in exactly one sweep's worth of work.
+    fn full_sweep(&mut self, cpu: &mut ProcessCpuState) -> Vec<ProcessInfo> {
+        loop {
+            if let Some(list) = self.advance(cpu) {
+                return list;
+            }
+        }
+    }
+
     /// Parses a `/proc` directory-entry name as a PID directly from its raw
     /// bytes, skipping the `OsStr -> String` UTF-8 validation and allocation
     /// that `to_string_lossy().parse()` pays for every directory entry
@@ -948,6 +969,19 @@ impl MonitorReader {
     #[must_use]
     pub fn processes_tick(&mut self) -> Option<Vec<ProcessInfo>> {
         self.scanner.advance(&mut self.processes)
+    }
+
+    /// Run one *complete* process sweep in a single call, bypassing the
+    /// ten-tick slicing that `processes_tick` uses for cheap steady-state
+    /// scanning.
+    ///
+    /// Used to prime the process table at startup. Per-process CPU% is a delta
+    /// over elapsed time, so the *first* sweep can only report names and
+    /// memory (0% CPU until a baseline exists); the caller runs a second sweep
+    /// after a short real gap to obtain true utilisation. Either way the table
+    /// is populated on the first frame instead of staying empty for ~10 s.
+    pub fn prime_processes(&mut self) -> Vec<ProcessInfo> {
+        self.scanner.full_sweep(&mut self.processes)
     }
 
     /// Refresh the optional network latency probe after the normal sample has

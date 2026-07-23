@@ -945,8 +945,26 @@ impl App {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = MonitorReader::new();
-            let mut processes = Vec::new();
             let mut profile = WorkerProfile::new();
+            // Prime the process table before entering the steady-state loop.
+            // `processes_tick` deliberately spreads one `/proc` sweep across ten
+            // 1 Hz ticks to keep steady-state cost low, but that leaves the
+            // table empty for ~10 s at launch and withholds per-process CPU%
+            // (a two-sweep delta) for ~20 s. Two full sweeps here -- separated
+            // by a real gap so the second can compute a CPU rate against the
+            // first's baseline -- populate names/memory on the very first frame
+            // and real CPU% one interval later, after which we fall into the
+            // cheap sliced cadence. The first sweep's sample is sent too so the
+            // hero numbers and charts are not held hostage to the CPU baseline.
+            let mut processes = reader.prime_processes();
+            let sample = reader.sample();
+            let _ = tx.send(Snapshot {
+                sample,
+                processes: processes.clone(),
+            });
+            wake.signal();
+            std::thread::sleep(SAMPLE_INTERVAL);
+            processes = reader.prime_processes();
             loop {
                 let started = Instant::now();
                 if let Some(next) = reader.processes_tick() {

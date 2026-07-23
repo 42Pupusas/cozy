@@ -1920,52 +1920,24 @@ impl TermWindow {
     ) {
     }
 
-    fn maybe_present(
-        &mut self,
-        custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Damage>,
-    ) -> Result<()> {
-        if self.lifecycle != Lifecycle::Mapped {
-            return Ok(());
-        }
-        self.apply_pending_resize()?;
-        self.debug_pre_present();
-        let slot = match self.present.begin_present() {
-            crate::present::PresentAttempt::NotDirty => return Ok(()),
-            crate::present::PresentAttempt::NotReady => {
-                self.debug_note_skipped_not_ready();
-                return Ok(());
-            }
-            crate::present::PresentAttempt::NoFreeSlot => {
-                self.debug_note_skipped_no_slot();
-                return Ok(());
-            }
-            crate::present::PresentAttempt::Ready(slot) => slot,
-        };
-        // Time the real work below (blit + shm copy + damage), excluding the
-        // early-return checks and the compositor wait that gated us getting
-        // here. See `FrameStats::record_busy`.
-        let present_start = std::time::Instant::now();
-
-        // Blit pending dirty snapshots into the persistent backbuffer, which
-        // always holds the full image, then copy only the rows that actually
-        // changed into the free shm frame -- tracked in `touched_rows` and
-        // reconciled against `stale_rows` below.
-        let pending = std::mem::take(&mut self.pending_dirty);
-        // Coalesce the whole backlog before blitting. Under a hard scroll flood
-        // the parser publishes ~30 snapshots per vsync -- each a full-band
-        // pixel-scroll (`scroll_span`) plus its freshly-revealed rows -- and
-        // the old `for snap in &pending` loop blitted every one: ~30 full-
-        // screen `copy_within` memmoves for a single presented frame (measured
-        // on niri: a 29-47 deep backlog took 17-23 ms in one present, flipping
-        // the loop CPU-bound and dropping 60 -> ~43 fps).
-        //
-        // `DirtySnapshot::compose` folds a run into one snapshot that, blitted
-        // once, reproduces the ordered result: same-band scrolls sum their
-        // deltas (N shifts of the band collapse to one shift of the summed
-        // delta) and rows merge last-writer-wins, relabelled up by later
-        // scrolls. A snapshot that can't compose (viewport repaint, geometry
-        // change, or a different scroll band) closes the current accumulator
-        // and starts a fresh one, so ordering across barriers is preserved.
+    /// Coalesce a backlog of pending dirty snapshots into the fewest
+    /// snapshots that, blitted in order, reproduce the same result.
+    ///
+    /// Under a hard scroll flood the parser publishes ~30 snapshots per
+    /// vsync -- each a full-band pixel-scroll (`scroll_span`) plus its
+    /// freshly-revealed rows -- and blitting every one individually did ~30
+    /// full-screen `copy_within` memmoves for a single presented frame
+    /// (measured on niri: a 29-47 deep backlog took 17-23 ms in one present,
+    /// flipping the loop CPU-bound and dropping 60 -> ~43 fps).
+    ///
+    /// `DirtySnapshot::compose` folds a run into one snapshot that, blitted
+    /// once, reproduces the ordered result: same-band scrolls sum their
+    /// deltas (N shifts of the band collapse to one shift of the summed
+    /// delta) and rows merge last-writer-wins, relabelled up by later
+    /// scrolls. A snapshot that can't compose (viewport repaint, geometry
+    /// change, or a different scroll band) closes the current accumulator and
+    /// starts a fresh one, so ordering across barriers is preserved.
+    fn fold_dirty_snapshots(pending: Vec<grid::DirtySnapshot>) -> Vec<grid::DirtySnapshot> {
         let mut folded: Vec<grid::DirtySnapshot> = Vec::new();
         for snap in pending {
             let composed = folded.last_mut().is_some_and(|acc| acc.compose(&snap));
@@ -1973,203 +1945,172 @@ impl TermWindow {
                 folded.push(snap);
             }
         }
-        let mut touched_rows: Vec<u16> = Vec::new();
-        let mut scrolls: Vec<grid::ScrollBand> = Vec::new();
-        // Signed whole-screen shifts from viewport (scrollback) pixel-scrolls
-        // that `blit_snapshot` performed this frame. Unlike `scrolls` (an
-        // upward-only band), these are signed and cover the full screen, so
-        // baked overlays (fps readout, a resting cursor/selection) get dragged
-        // by the memmove and their row trackers must be remapped to match.
-        let mut viewport_shifts: Vec<i32> = Vec::new();
-        let mut painted_rows: usize = 0;
-        let mut painted_cells: usize = 0;
-        let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
-        for snap in &folded {
-            if let Some(scroll) = self.renderer.blit_snapshot(&mut canvas, snap) {
-                scrolls.push(scroll);
-            }
-            // A viewport frame that actually pixel-shifted carries a signed
-            // shift AND an offset (a full-frame repaint carries `shift: None`).
-            if snap.viewport_offset().is_some() {
-                if let Some(s) = snap.viewport_shift() {
-                    if s != 0 {
-                        viewport_shifts.push(s);
-                    }
-                }
-            }
-            painted_rows += snap.rows.len();
-            painted_cells += snap.rows.iter().map(|r| r.cells.len()).sum::<usize>();
-            touched_rows.extend(snap.rows.iter().map(|r| r.row));
-        }
-        // `Canvas` borrows `self.backbuffer` mutably and holds no resources of
-        // its own (no `Drop` impl) -- this ends that borrow early so the code
-        // below can use `self` again; `drop()` here is a borrow-checker nudge,
-        // not resource cleanup.
-        // Sub-phase split of the (misnamed) `blit` region for custom-painter
-        // windows: the snapshot-blit loop above is empty for them, so the time
-        // the trace was attributing to `blit` is really the paint callback and
-        // the premultiply. Capture a fence after the snapshot loop, another
-        // after the paint callback, so a slow present names WHICH of the three
-        // owns the spike instead of lumping them under `blit`.
-        let t_snapshot = present_start.elapsed();
-        let custom_painted = custom_paint.is_some();
-        let custom_damage = custom_paint.map(|paint| paint(&mut canvas));
-        let _ = canvas;
-        let t_paint = present_start.elapsed();
-        if let Some(damage) = &custom_damage {
-            // Premultiply only what the painter actually drew. A full repaint
-            // (or a painter that doesn't track regions) reports `Full` and
-            // rebuilds the whole image; a steady-state dashboard frame reports
-            // a handful of small rects (chart edges, moved bars) and pays for
-            // only those pixels -- the difference between premultiplying ~2M
-            // pixels and ~3K every frame. Partial premul is safe because the
-            // ARGB cache is persistent: untouched regions still hold last
-            // frame's correct premultiplied pixels.
-            if damage.is_full() {
-                self.update_custom_argb(crate::draw::Rect::new(0, 0, self.width, self.height));
-            } else {
-                for rect in damage.rects() {
-                    self.update_custom_argb(*rect);
-                }
+        folded
+    }
+
+    /// Premultiply only the pixels a custom painter actually touched this
+    /// frame. A full repaint (or a painter that doesn't track regions)
+    /// reports `Full` and rebuilds the whole image; a steady-state dashboard
+    /// frame reports a handful of small rects (chart edges, moved bars) and
+    /// pays for only those pixels -- the difference between premultiplying
+    /// ~2M pixels and ~3K every frame. Partial premul is safe because the
+    /// ARGB cache is persistent: untouched regions still hold last frame's
+    /// correct premultiplied pixels.
+    fn update_custom_argb_for_damage(&mut self, damage: &crate::draw::Damage) {
+        if damage.is_full() {
+            self.update_custom_argb(crate::draw::Rect::new(0, 0, self.width, self.height));
+        } else {
+            for rect in damage.rects() {
+                self.update_custom_argb(*rect);
             }
         }
-        // Convert the painter's damage into stale logical rows so the shm
-        // upload copies only the touched bands into both slots. A full repaint
-        // marks every row; a region set marks just the rows its rectangles
-        // span. Both slots must see the same rows since either may be the one
-        // presented next.
-        if let Some(damage) = &custom_damage {
-            if damage.is_full() {
-                let rows = ((self.height + self.cell_h - 1) / self.cell_h).max(1);
-                touched_rows.extend((0..rows).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
-            } else {
-                for rect in damage.rects() {
-                    // Ceiling-expand the rect's pixel span to whole cell rows:
-                    // the shm damage protocol is row-granular, and a partial
-                    // final row is still real framebuffer memory that must be
-                    // copied rather than left as transparent mmap-zero.
-                    let top = (rect.y.max(0)) / self.cell_h;
-                    let bottom = ((rect.bottom().max(0) + self.cell_h - 1) / self.cell_h)
-                        .min(((self.height + self.cell_h - 1) / self.cell_h).max(1));
-                    touched_rows
-                        .extend((top..bottom).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
-                }
+    }
+
+    /// Convert a custom painter's damage into stale logical rows so the shm
+    /// upload copies only the touched bands into both slots. A full repaint
+    /// marks every row; a region set marks just the rows its rectangles span.
+    /// Both slots must see the same rows since either may be the one
+    /// presented next.
+    fn extend_touched_rows_for_custom_damage(
+        &self,
+        damage: &crate::draw::Damage,
+        touched_rows: &mut Vec<u16>,
+    ) {
+        if damage.is_full() {
+            let rows = ((self.height + self.cell_h - 1) / self.cell_h).max(1);
+            touched_rows.extend((0..rows).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
+        } else {
+            for rect in damage.rects() {
+                // Ceiling-expand the rect's pixel span to whole cell rows: the
+                // shm damage protocol is row-granular, and a partial final row
+                // is still real framebuffer memory that must be copied rather
+                // than left as transparent mmap-zero.
+                let top = (rect.y.max(0)) / self.cell_h;
+                let bottom = ((rect.bottom().max(0) + self.cell_h - 1) / self.cell_h)
+                    .min(((self.height + self.cell_h - 1) / self.cell_h).max(1));
+                touched_rows.extend((top..bottom).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
             }
         }
-        // Sub-phase timers (only read when DebugFps::Log fires below on a slow
-        // present): `t_blit` = the coalesce+blit_snapshot loop, the only phase
-        // the `blit` bench covers. The gap to `t_overlay` is overlay repaint;
-        // the gap from there to the end is the stale-row shm memcpy + Wayland
-        // Attach/Damage/Commit submission -- the phases the bench never sees,
-        // and the prime suspects for the ~16ms `present-busy` spikes.
-        let t_blit = present_start.elapsed();
-        let folded_len = folded.len();
-        // A pixel-scroll `copy_within` shifted the backbuffer up -- and with it
-        // any overlay we baked last frame (cursor, selection, fps). The row
-        // lists that tell us where to repaint those clean now point one screen-
-        // position too low, so remap them by the same shift before use, or the
-        // dragged-up overlay pixels get left behind as a static imprint.
-        // A viewport pixel-scroll `copy_within`-shifted the whole backbuffer by
-        // a signed amount, dragging any baked overlay with it. Remap the
-        // overlay-row trackers the same way so last frame's imprint is cleaned
-        // at its NEW position, not its old one. The full row set already made
-        // `touched_rows` span the screen, so the shm re-copy needs nothing
-        // extra here (unlike the incremental band, which must extend it).
+    }
+
+    /// Remap this frame's baked-overlay row trackers (cursor, selection,
+    /// debug fps) through any pixel-scroll `copy_within` that `blit_snapshot`
+    /// performed, and extend `touched_rows` so every row a scroll physically
+    /// moved gets re-copied into the shm slot.
+    ///
+    /// A pixel-scroll shifts the backbuffer's content up (or, for a viewport
+    /// scroll, up or down by a signed amount) -- and with it any overlay we
+    /// baked last frame. The row lists that say where to repaint those clean
+    /// now point to the WRONG screen position unless remapped by the same
+    /// shift, or the dragged pixels get left behind as a static imprint.
+    ///
+    /// The two scroll kinds need different handling because they cover
+    /// different spans: `viewport_shifts` are signed and span the whole
+    /// screen (a viewport/scrollback pixel-scroll), so `touched_rows` already
+    /// spans the screen and needs no further extension here. `scrolls` are an
+    /// upward-only content-scroll BAND -- the snapshot's dirty rows only
+    /// cover the genuinely-new bottom rows (the grid shifts its dirty marks
+    /// up with the content), so without marking the WHOLE band stale the
+    /// shifted-but-unchanged rows never get re-copied from the backbuffer
+    /// into the shm slots (the actual presented pixels), producing the "only
+    /// a few lines scroll, the rest is stale" flood artifact.
+    fn remap_baked_overlays_for_this_frames_scrolls(
+        &mut self,
+        viewport_shifts: &[i32],
+        scrolls: &[grid::ScrollBand],
+        touched_rows: &mut Vec<u16>,
+    ) {
         if !viewport_shifts.is_empty() {
             let rows = (self.height / self.cell_h).max(1) as u16;
-            Self::shift_overlay_rows_signed(&mut self.prev_cursor_rows, &viewport_shifts, rows);
-            Self::shift_overlay_rows_signed(&mut self.prev_selection_rows, &viewport_shifts, rows);
-            self.debug_shift_prev_rows_signed(&viewport_shifts, rows);
+            Self::shift_overlay_rows_signed(&mut self.prev_cursor_rows, viewport_shifts, rows);
+            Self::shift_overlay_rows_signed(&mut self.prev_selection_rows, viewport_shifts, rows);
+            self.debug_shift_prev_rows_signed(viewport_shifts, rows);
         }
         if !scrolls.is_empty() {
-            Self::shift_overlay_rows(&mut self.prev_cursor_rows, &scrolls);
-            Self::shift_overlay_rows(&mut self.prev_selection_rows, &scrolls);
-            self.debug_shift_prev_rows(&scrolls);
-            // The pixel-scroll `copy_within` rewrote EVERY backbuffer row in
-            // the band `[top, bot]` (their content shifted up), but the
-            // snapshot's dirty rows -- what feeds `touched_rows` -- only cover
-            // the genuinely-new bottom rows, since the grid shifts its dirty
-            // marks up with the content. Without marking the whole band stale,
-            // the shifted rows never get re-copied from the backbuffer into the
-            // shm slots (which are the actual presented pixels), so the screen
-            // freezes everything except the bottom few new rows -- the "only a
-            // few lines scroll, the rest is stale" flood artifact. Mark the
-            // full band so every moved row is re-copied + damaged.
-            Self::extend_with_scrolled_bands(&mut touched_rows, &scrolls);
+            Self::shift_overlay_rows(&mut self.prev_cursor_rows, scrolls);
+            Self::shift_overlay_rows(&mut self.prev_selection_rows, scrolls);
+            self.debug_shift_prev_rows(scrolls);
+            Self::extend_with_scrolled_bands(touched_rows, scrolls);
         }
-        if custom_painted {
-            // A painter-owned window has no terminal grid, selection, or text
-            // input. In particular, do not composite the terminal cursor over
-            // a dashboard merely because its normal toplevel has keyboard
-            // focus. The painter clears its own full frame, so stale terminal
-            // overlays need no cleanup on this path either.
-            self.prev_selection_rows.clear();
-            self.prev_cursor_rows.clear();
-            self.prev_hover_row = None;
-            let _ = self.debug_take_prev_rows();
-        } else {
-            // Selection highlight. Repaint the rows that *were* highlighted last
-            // frame (clean), plus the rows the selection touches now (so a moved
-            // drag doesn't double-tint), then tint the current selection. This
-            // keeps the effect idempotent and removable on deselect. The cursor
-            // overlay's old rows are included too, since the cursor may be
-            // sliding through (or resting on) a row the selection logic doesn't
-            // know about, and it must be repainted clean before either the
-            // selection tint or the cursor itself redraw on top.
-            let mut rows_to_repaint = std::mem::take(&mut self.prev_selection_rows);
-            for r in self.selection_rows() {
-                if !rows_to_repaint.contains(&r) {
-                    rows_to_repaint.push(r);
-                }
-            }
-            if let Some(r) = self.prev_hover_row.take()
-                && !rows_to_repaint.contains(&r)
-            {
+    }
+
+    /// Drop all terminal-only overlay tracking for a custom-painter window.
+    /// A painter-owned window has no terminal grid, selection, or text input.
+    /// In particular, we must not composite the terminal cursor over a
+    /// dashboard merely because its normal toplevel has keyboard focus. The
+    /// painter clears its own full frame, so stale terminal overlays need no
+    /// cleanup on this path either.
+    fn clear_terminal_overlays_for_custom_paint(&mut self) {
+        self.prev_selection_rows.clear();
+        self.prev_cursor_rows.clear();
+        self.prev_hover_row = None;
+        let _ = self.debug_take_prev_rows();
+    }
+
+    /// Composite the terminal's own overlays (selection highlight, link-hover
+    /// underline, blinking cursor, debug fps readout) onto the backbuffer for
+    /// this frame, appending every row any of them touched to `touched_rows`.
+    ///
+    /// Repaints the rows that *were* highlighted/tracked last frame (clean)
+    /// first, plus the rows each overlay touches now (so a moved drag or
+    /// sliding cursor doesn't double-tint), then redraws each overlay on top.
+    /// This keeps every overlay idempotent and fully removable on deselect /
+    /// blur / hover-exit -- the reason the "clean" pass gathers ALL stale rows
+    /// (selection + hover + cursor + fps) before any single overlay repaints,
+    /// since e.g. the cursor may be sliding through a row the selection logic
+    /// doesn't know about, and it must be clean before either draws over it.
+    fn composite_terminal_overlays(&mut self, touched_rows: &mut Vec<u16>) {
+        let mut rows_to_repaint = std::mem::take(&mut self.prev_selection_rows);
+        for r in self.selection_rows() {
+            if !rows_to_repaint.contains(&r) {
                 rows_to_repaint.push(r);
             }
-            if self.hover_link_id != 0 {
-                let (_, row) = self.pointer_cell();
-                if !rows_to_repaint.contains(&row) {
-                    rows_to_repaint.push(row);
-                }
-            }
-            for r in std::mem::take(&mut self.prev_cursor_rows) {
-                if !rows_to_repaint.contains(&r) {
-                    rows_to_repaint.push(r);
-                }
-            }
-            for r in self.debug_take_prev_rows() {
-                if !rows_to_repaint.contains(&r) {
-                    rows_to_repaint.push(r);
-                }
-            }
-            self.repaint_rows(&rows_to_repaint);
-            touched_rows.extend_from_slice(&rows_to_repaint);
-            self.apply_selection_highlight();
-            touched_rows.extend(self.selection_rows());
-            self.prev_selection_rows = self.selection_rows();
-            self.apply_link_hover_underline();
-            if let Some(r) = self.prev_hover_row {
-                touched_rows.push(r);
-            }
-            let new_cursor_rows = self.draw_cursor_overlay();
-            touched_rows.extend_from_slice(&new_cursor_rows);
-            self.prev_cursor_rows = new_cursor_rows;
-            let new_fps_rows = self.debug_draw_overlay();
-            touched_rows.extend_from_slice(&new_fps_rows);
         }
-        let t_overlay = present_start.elapsed();
+        if let Some(r) = self.prev_hover_row.take()
+            && !rows_to_repaint.contains(&r)
+        {
+            rows_to_repaint.push(r);
+        }
+        if self.hover_link_id != 0 {
+            let (_, row) = self.pointer_cell();
+            if !rows_to_repaint.contains(&row) {
+                rows_to_repaint.push(row);
+            }
+        }
+        for r in std::mem::take(&mut self.prev_cursor_rows) {
+            if !rows_to_repaint.contains(&r) {
+                rows_to_repaint.push(r);
+            }
+        }
+        for r in self.debug_take_prev_rows() {
+            if !rows_to_repaint.contains(&r) {
+                rows_to_repaint.push(r);
+            }
+        }
+        self.repaint_rows(&rows_to_repaint);
+        touched_rows.extend_from_slice(&rows_to_repaint);
+        self.apply_selection_highlight();
+        touched_rows.extend(self.selection_rows());
+        self.prev_selection_rows = self.selection_rows();
+        self.apply_link_hover_underline();
+        if let Some(r) = self.prev_hover_row {
+            touched_rows.push(r);
+        }
+        let new_cursor_rows = self.draw_cursor_overlay();
+        touched_rows.extend_from_slice(&new_cursor_rows);
+        self.prev_cursor_rows = new_cursor_rows;
+        let new_fps_rows = self.debug_draw_overlay();
+        touched_rows.extend_from_slice(&new_fps_rows);
+    }
 
-        // Every row touched this frame is now stale relative to *both* shm
-        // slots (whichever one isn't presented into this time still needs
-        // catching up next time it's used).
-        self.present.mark_rows_stale(touched_rows);
-
-        // Copy + damage only the rows this slot is actually stale for --
-        // typically just the handful that changed (e.g. one line of typing),
-        // not the whole window. Contiguous stale rows are coalesced into one
-        // Damage rect each, to keep the common single-row case at one
-        // message instead of one per row.
+    /// Copy every row `slot` is stale for from its true source (the shared
+    /// backbuffer for a terminal-grid window, the persistent ARGB cache for a
+    /// custom-painter one) into that shm slot, clearing each row's stale bit
+    /// as it's caught up. Contiguous stale rows are coalesced into one
+    /// `(y_px, height_px)` damage rect each, so the common single-row case
+    /// (e.g. one line of typing) costs one Wayland `Damage` message instead
+    /// of one per row. Returns the damage rects for [`Self::submit_frame`].
+    fn copy_stale_rows_into_slot(&mut self, slot: usize, custom_painted: bool) -> Vec<(i32, i32)> {
         let buf_w = self.width;
         let cols_bytes = buf_w as usize;
         let cell_h = self.cell_h as usize;
@@ -2246,7 +2187,15 @@ impl TermWindow {
             }
             damage_rects.push((y0 as i32, (y1 - y0) as i32));
         }
+        damage_rects
+    }
 
+    /// Attach `slot`'s buffer, damage every rect the stale-row copy touched,
+    /// request the next frame callback, and commit -- the standard Wayland
+    /// present sequence. `finish_present` records the callback so
+    /// `route_common` can clear `frame_ready` when the compositor answers it.
+    fn submit_frame(&mut self, slot: usize, damage_rects: Vec<(i32, i32)>) {
+        let buf_w = self.width;
         let buf = self.present.frame_buffer(slot);
         self.window_tx.request(
             MessageBuilder::new(self.surface, SurfaceRequest::Attach)
@@ -2270,6 +2219,97 @@ impl TermWindow {
             .request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
 
         self.present.finish_present(cb);
+    }
+
+    fn maybe_present(
+        &mut self,
+        custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Damage>,
+    ) -> Result<()> {
+        if self.lifecycle != Lifecycle::Mapped {
+            return Ok(());
+        }
+        self.apply_pending_resize()?;
+        self.debug_pre_present();
+        let slot = match self.present.begin_present() {
+            crate::present::PresentAttempt::NotDirty => return Ok(()),
+            crate::present::PresentAttempt::NotReady => {
+                self.debug_note_skipped_not_ready();
+                return Ok(());
+            }
+            crate::present::PresentAttempt::NoFreeSlot => {
+                self.debug_note_skipped_no_slot();
+                return Ok(());
+            }
+            crate::present::PresentAttempt::Ready(slot) => slot,
+        };
+        // Time the real work below (blit + shm copy + damage), excluding the
+        // early-return checks and the compositor wait that gated us getting
+        // here. See `FrameStats::record_busy`.
+        let present_start = std::time::Instant::now();
+
+        // Blit pending dirty snapshots into the persistent backbuffer, which
+        // always holds the full image, then copy only the rows that actually
+        // changed into the free shm frame -- tracked in `touched_rows` and
+        // reconciled against `stale_rows` below.
+        let pending = std::mem::take(&mut self.pending_dirty);
+        let folded = Self::fold_dirty_snapshots(pending);
+        let mut touched_rows: Vec<u16> = Vec::new();
+        let mut scrolls: Vec<grid::ScrollBand> = Vec::new();
+        // Signed whole-screen shifts from viewport (scrollback) pixel-scrolls
+        // that `blit_snapshot` performed this frame. Unlike `scrolls` (an
+        // upward-only band), these are signed and cover the full screen, so
+        // baked overlays (fps readout, a resting cursor/selection) get dragged
+        // by the memmove and their row trackers must be remapped to match.
+        let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
+        let (viewport_shifts, painted_rows, painted_cells) = self
+            .renderer
+            .blit_folded_snapshots(&mut canvas, &folded, &mut scrolls, &mut touched_rows);
+        // `Canvas` borrows `self.backbuffer` mutably and holds no resources of
+        // its own (no `Drop` impl) -- this ends that borrow early so the code
+        // below can use `self` again; `drop()` here is a borrow-checker nudge,
+        // not resource cleanup.
+        // Sub-phase split of the (misnamed) `blit` region for custom-painter
+        // windows: the snapshot-blit loop above is empty for them, so the time
+        // the trace was attributing to `blit` is really the paint callback and
+        // the premultiply. Capture a fence after the snapshot loop, another
+        // after the paint callback, so a slow present names WHICH of the three
+        // owns the spike instead of lumping them under `blit`.
+        let t_snapshot = present_start.elapsed();
+        let custom_painted = custom_paint.is_some();
+        let custom_damage = custom_paint.map(|paint| paint(&mut canvas));
+        let _ = canvas;
+        let t_paint = present_start.elapsed();
+        if let Some(damage) = &custom_damage {
+            self.update_custom_argb_for_damage(damage);
+            self.extend_touched_rows_for_custom_damage(damage, &mut touched_rows);
+        }
+        // Sub-phase timers (only read when DebugFps::Log fires below on a slow
+        // present): `t_blit` = the coalesce+blit_snapshot loop, the only phase
+        // the `blit` bench covers. The gap to `t_overlay` is overlay repaint;
+        // the gap from there to the end is the stale-row shm memcpy + Wayland
+        // Attach/Damage/Commit submission -- the phases the bench never sees,
+        // and the prime suspects for the ~16ms `present-busy` spikes.
+        let t_blit = present_start.elapsed();
+        let folded_len = folded.len();
+        self.remap_baked_overlays_for_this_frames_scrolls(
+            &viewport_shifts,
+            &scrolls,
+            &mut touched_rows,
+        );
+        if custom_painted {
+            self.clear_terminal_overlays_for_custom_paint();
+        } else {
+            self.composite_terminal_overlays(&mut touched_rows);
+        }
+        let t_overlay = present_start.elapsed();
+
+        // Every row touched this frame is now stale relative to *both* shm
+        // slots (whichever one isn't presented into this time still needs
+        // catching up next time it's used).
+        self.present.mark_rows_stale(touched_rows);
+
+        let damage_rects = self.copy_stale_rows_into_slot(slot, custom_painted);
+        self.submit_frame(slot, damage_rects);
         let total = present_start.elapsed();
         // On a slow present (>5ms -- never the 60fps steady state, always the
         // spikes we're chasing), break the timed region into its three phases

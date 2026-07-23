@@ -1079,6 +1079,44 @@ impl Renderer {
         scrolled
     }
 
+    /// Blit every snapshot in an already-folded (coalesced) run via
+    /// [`Self::blit_snapshot`], collecting the signed whole-screen viewport
+    /// pixel-shifts (as opposed to `scrolls`' upward-only content-scroll
+    /// bands) plus row/cell paint totals for the caller's frame stats.
+    ///
+    /// `scrolls` and `touched_rows` are accumulated into rather than
+    /// returned, since the caller (`TermWindow::maybe_present`) already owns
+    /// them and needs to keep filling them from other sources (custom-paint
+    /// damage, etc) after this call.
+    pub fn blit_folded_snapshots(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        folded: &[DirtySnapshot],
+        scrolls: &mut Vec<ScrollBand>,
+        touched_rows: &mut Vec<u16>,
+    ) -> (Vec<i32>, usize, usize) {
+        let mut viewport_shifts: Vec<i32> = Vec::new();
+        let mut painted_rows: usize = 0;
+        let mut painted_cells: usize = 0;
+        for snap in folded {
+            if let Some(scroll) = self.blit_snapshot(canvas, snap) {
+                scrolls.push(scroll);
+            }
+            // A viewport frame that actually pixel-shifted carries a signed
+            // shift AND an offset (a full-frame repaint carries `shift: None`).
+            if snap.viewport_offset().is_some()
+                && let Some(s) = snap.viewport_shift()
+                && s != 0
+            {
+                viewport_shifts.push(s);
+            }
+            painted_rows += snap.rows.len();
+            painted_cells += snap.rows.iter().map(|r| r.cells.len()).sum::<usize>();
+            touched_rows.extend(snap.rows.iter().map(|r| r.row));
+        }
+        (viewport_shifts, painted_rows, painted_cells)
+    }
+
     /// The viewport (scrollback) half of [`Self::blit_snapshot`]: either
     /// `copy_within`-shift the backbuffer and rasterize only the freshly
     /// revealed edge rows, or -- when there's no usable prior offset, the

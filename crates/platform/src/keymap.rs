@@ -95,49 +95,59 @@ pub(crate) enum XkbKeysym {
 }
 
 impl XkbKeysym {
-    pub(crate) const fn from_raw(raw: u32) -> Option<Self> {
-        Some(match raw {
-            0xff08 => Self::BackSpace,
-            0xff09 => Self::Tab,
-            0xff0d => Self::Return,
-            0xff1b => Self::Escape,
-            0xffff => Self::Delete,
-            0xff63 => Self::Insert,
-            0xff50 => Self::Home,
-            0xff57 => Self::End,
-            0xff55 => Self::PageUp,
-            0xff56 => Self::PageDown,
-            0xff51 => Self::Left,
-            0xff52 => Self::Up,
-            0xff53 => Self::Right,
-            0xff54 => Self::Down,
-            0xffbe => Self::F1,
-            0xffbf => Self::F2,
-            0xffc0 => Self::F3,
-            0xffc1 => Self::F4,
-            0xffc2 => Self::F5,
-            0xffc3 => Self::F6,
-            0xffc4 => Self::F7,
-            0xffc5 => Self::F8,
-            0xffc6 => Self::F9,
-            0xffc7 => Self::F10,
-            0xffc8 => Self::F11,
-            0xffc9 => Self::F12,
-            0xffe1 => Self::ShiftL,
-            0xffe2 => Self::ShiftR,
-            0xffe3 => Self::ControlL,
-            0xffe4 => Self::ControlR,
-            0xffe5 => Self::CapsLock,
-            0xff7f => Self::NumLock,
-            0xff14 => Self::ScrollLock,
-            0xffe9 => Self::AltL,
-            0xffea => Self::AltR,
-            0xffeb => Self::SuperL,
-            0xffec => Self::SuperR,
-            0xff67 => Self::Menu,
-            0xff8d => Self::KpEnter,
-            _ => return None,
-        })
+    /// (raw XKB keysym, variant) rows -- a plain fact table, not a decision
+    /// tree, so a linear scan over it replaces what used to be a 39-arm
+    /// `match` (CC 41, the highest in the crate after `Charset::translate`'s
+    /// analogous table). Each variant's discriminant already carries this
+    /// value (see the enum above), but matching on a `#[repr(u32)]` enum's
+    /// own discriminants isn't expressible as a safe transmute, so the pair
+    /// is spelled out explicitly instead of relying on layout.
+    const RAW_TABLE: &[(u32, Self)] = &[
+        (0xff08, Self::BackSpace),
+        (0xff09, Self::Tab),
+        (0xff0d, Self::Return),
+        (0xff1b, Self::Escape),
+        (0xffff, Self::Delete),
+        (0xff63, Self::Insert),
+        (0xff50, Self::Home),
+        (0xff57, Self::End),
+        (0xff55, Self::PageUp),
+        (0xff56, Self::PageDown),
+        (0xff51, Self::Left),
+        (0xff52, Self::Up),
+        (0xff53, Self::Right),
+        (0xff54, Self::Down),
+        (0xffbe, Self::F1),
+        (0xffbf, Self::F2),
+        (0xffc0, Self::F3),
+        (0xffc1, Self::F4),
+        (0xffc2, Self::F5),
+        (0xffc3, Self::F6),
+        (0xffc4, Self::F7),
+        (0xffc5, Self::F8),
+        (0xffc6, Self::F9),
+        (0xffc7, Self::F10),
+        (0xffc8, Self::F11),
+        (0xffc9, Self::F12),
+        (0xffe1, Self::ShiftL),
+        (0xffe2, Self::ShiftR),
+        (0xffe3, Self::ControlL),
+        (0xffe4, Self::ControlR),
+        (0xffe5, Self::CapsLock),
+        (0xff7f, Self::NumLock),
+        (0xff14, Self::ScrollLock),
+        (0xffe9, Self::AltL),
+        (0xffea, Self::AltR),
+        (0xffeb, Self::SuperL),
+        (0xffec, Self::SuperR),
+        (0xff67, Self::Menu),
+        (0xff8d, Self::KpEnter),
+    ];
+
+    pub(crate) fn from_raw(raw: u32) -> Option<Self> {
+        Self::RAW_TABLE
+            .iter()
+            .find_map(|&(r, variant)| (r == raw).then_some(variant))
     }
 }
 

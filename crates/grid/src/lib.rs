@@ -315,41 +315,50 @@ impl Charset {
         if self != Self::DecSpecialGraphics {
             return ch;
         }
-        match ch {
-            '`' => '\u{25c6}', // diamond
-            'a' => '\u{2592}', // checkerboard
-            'b' => '\u{2409}', // HT symbol
-            'c' => '\u{240c}', // FF symbol
-            'd' => '\u{240d}', // CR symbol
-            'e' => '\u{240a}', // LF symbol
-            'f' => '\u{00b0}', // degree
-            'g' => '\u{00b1}', // plus/minus
-            'h' => '\u{2424}', // NL symbol
-            'i' => '\u{240b}', // VT symbol
-            'j' => '\u{2518}', // bottom-right corner
-            'k' => '\u{2510}', // top-right corner
-            'l' => '\u{250c}', // top-left corner
-            'm' => '\u{2514}', // bottom-left corner
-            'n' => '\u{253c}', // crossing lines
-            'o' => '\u{23ba}', // scan line 1
-            'p' => '\u{23bb}', // scan line 3
-            'q' => '\u{2500}', // horizontal line
-            'r' => '\u{23bc}', // scan line 7
-            's' => '\u{23bd}', // scan line 9
-            't' => '\u{251c}', // left tee
-            'u' => '\u{2524}', // right tee
-            'v' => '\u{2534}', // bottom tee
-            'w' => '\u{252c}', // top tee
-            'x' => '\u{2502}', // vertical line
-            'y' => '\u{2264}', // less-or-equal
-            'z' => '\u{2265}', // greater-or-equal
-            '{' => '\u{03c0}', // pi
-            '|' => '\u{2260}', // not-equal
-            '}' => '\u{00a3}', // pound sterling
-            '~' => '\u{00b7}', // centered dot
-            _ => ch,
-        }
+        Self::DEC_SPECIAL_GRAPHICS_TABLE
+            .iter()
+            .find_map(|&(from, to)| (from == ch).then_some(to))
+            .unwrap_or(ch)
     }
+
+    /// (plain ASCII byte, DEC Special Graphics glyph) rows for
+    /// [`Self::translate`]. A fixed fact table (which ASCII byte the VT100
+    /// line-drawing charset remaps to which box/symbol glyph) rather than a
+    /// 31-arm match -- see [`ComposeWithMark`]'s table just below for the
+    /// same rationale applied to combining-mark composition.
+    const DEC_SPECIAL_GRAPHICS_TABLE: &[(char, char)] = &[
+        ('`', '\u{25c6}'), // diamond
+        ('a', '\u{2592}'), // checkerboard
+        ('b', '\u{2409}'), // HT symbol
+        ('c', '\u{240c}'), // FF symbol
+        ('d', '\u{240d}'), // CR symbol
+        ('e', '\u{240a}'), // LF symbol
+        ('f', '\u{00b0}'), // degree
+        ('g', '\u{00b1}'), // plus/minus
+        ('h', '\u{2424}'), // NL symbol
+        ('i', '\u{240b}'), // VT symbol
+        ('j', '\u{2518}'), // bottom-right corner
+        ('k', '\u{2510}'), // top-right corner
+        ('l', '\u{250c}'), // top-left corner
+        ('m', '\u{2514}'), // bottom-left corner
+        ('n', '\u{253c}'), // crossing lines
+        ('o', '\u{23ba}'), // scan line 1
+        ('p', '\u{23bb}'), // scan line 3
+        ('q', '\u{2500}'), // horizontal line
+        ('r', '\u{23bc}'), // scan line 7
+        ('s', '\u{23bd}'), // scan line 9
+        ('t', '\u{251c}'), // left tee
+        ('u', '\u{2524}'), // right tee
+        ('v', '\u{2534}'), // bottom tee
+        ('w', '\u{252c}'), // top tee
+        ('x', '\u{2502}'), // vertical line
+        ('y', '\u{2264}'), // less-or-equal
+        ('z', '\u{2265}'), // greater-or-equal
+        ('{', '\u{03c0}'), // pi
+        ('|', '\u{2260}'), // not-equal
+        ('}', '\u{00a3}'), // pound sterling
+        ('~', '\u{00b7}'), // centered dot
+    ];
 }
 
 /// Extends `char` with precomposed-accent composition, as a method instead

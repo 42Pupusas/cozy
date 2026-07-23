@@ -103,7 +103,12 @@ impl LauncherApp {
                 // workspace.
                 break;
             }
-            self.window.wait(1000);
+            // `request_redraw` (called from `handle_keys` above whenever a
+            // key changed anything) signals the waker itself, so this cap
+            // is only a safety net for the rare tick where nothing queued a
+            // signal -- keep it short so any missed wake is still
+            // imperceptible instead of a visible stall.
+            self.window.wait(100);
         }
     }
 

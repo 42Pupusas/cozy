@@ -301,13 +301,24 @@ impl LauncherWindow {
         self.scale
     }
 
-    pub const fn set_background(&mut self, color: platform::draw::Color) {
+    pub fn set_background(&mut self, color: platform::draw::Color) {
         self.background = color;
-        self.present.mark_dirty();
+        self.request_redraw();
     }
 
-    pub const fn request_redraw(&mut self) {
+    /// Mark the frame dirty *and* wake a blocked `wait` immediately.
+    ///
+    /// Marking dirty alone isn't enough: `wait` parks on the Wayland
+    /// reader's wakeup eventfd, which only fires for genuine protocol
+    /// events. Without this signal, a redraw requested right before the
+    /// run loop's `wait(1000)` (e.g. every keystroke, since `main.rs`
+    /// handles keys *then* waits) would sit unpainted for up to a second --
+    /// or until the next real Wayland event happened to arrive -- which is
+    /// exactly the "laggy typing" symptom: each character only appeared
+    /// once you typed the *next* one, or after a long stall.
+    pub fn request_redraw(&mut self) {
         self.present.mark_dirty();
+        self.wake.signal();
     }
 
     /// Drain every resolved key event queued since the last call.

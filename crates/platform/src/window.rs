@@ -1082,21 +1082,13 @@ impl TermWindow {
 
         // Key repeat timer.
         if matches!(ev, RawEvent::Repeat) {
-            if let Some(key) = self.key_repeat.held_key() {
-                self.input_queue.push_back(InputEvent::Key {
-                    key: Some(key),
-                    state: Some(KeyState::Pressed),
-                    modifiers: self.modifiers,
-                });
-            }
+            self.handle_key_repeat_tick();
             return Ok(());
         }
 
         // xdg_wm_base.ping
         if ev.is(self.wm_base) && ev.event::<WmBaseEvent>() == Some(WmBaseEvent::Ping) {
-            self.window_tx.request(
-                MessageBuilder::new(self.wm_base, WmBaseRequest::Pong).u32(ev.serial(0).raw()),
-            );
+            self.handle_wm_base_ping(&ev);
             return Ok(());
         }
 
@@ -1104,59 +1096,25 @@ impl TermWindow {
         if ev.is(self.xdg_surface)
             && ev.event::<XdgSurfaceEvent>() == Some(XdgSurfaceEvent::Configure)
         {
-            self.window_tx.request(
-                MessageBuilder::new(self.xdg_surface, XdgSurfaceRequest::AckConfigure)
-                    .u32(ev.serial(0).raw()),
-            );
-            self.lifecycle = Lifecycle::Mapped;
-            self.maybe_present(None)?;
+            self.handle_xdg_surface_configure(&ev)?;
             return Ok(());
         }
 
         // xdg_toplevel.close
         if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Close) {
-            self.lifecycle = Lifecycle::Closing;
-            self.input_queue.push_back(InputEvent::Close);
+            self.handle_toplevel_close();
             return Ok(());
         }
 
         // xdg_toplevel.configure (resize)
         if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Configure) {
-            // xdg_toplevel.configure args: (width, height, states[]), in
-            // *logical* (surface-local) coordinates -- xdg-shell sizes are
-            // always pre-scale, regardless of our `wl_surface.buffer_scale`.
-            // Our shm buffers are physical pixels (`scale`x the logical
-            // size), so this must be scaled up before it's usable as a
-            // buffer/backbuffer dimension -- see `apply_pending_resize`, the
-            // only reader of `pending_resize`, which now receives already-
-            // scaled physical pixels and no longer needs to know about scale
-            // itself. A drag emits these dozens of times a second; just
-            // record the latest and coalesce into a single resize per frame.
-            let w = ev.arg_i32(0) * self.scale;
-            let h = ev.arg_i32(1) * self.scale;
-            if w > 0 && h > 0 {
-                self.pending_resize = Some((w, h));
-            }
+            self.handle_toplevel_configure(&ev);
             return Ok(());
         }
 
         // wl_seat.capabilities
         if ev.is(self.seat) && ev.event::<SeatEvent>() == Some(SeatEvent::Capabilities) {
-            let caps = ev.arg(0);
-            if self.pointer.is_none() && SeatCapability::Pointer.in_mask(caps) {
-                let pointer: PointerId = self.window_tx.alloc_id();
-                self.window_tx.request(
-                    MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer),
-                );
-                self.pointer = Some(pointer);
-            }
-            if self.keyboard.is_none() && SeatCapability::Keyboard.in_mask(caps) {
-                let keyboard: KeyboardId = self.window_tx.alloc_id();
-                self.window_tx.request(
-                    MessageBuilder::new(self.seat, SeatRequest::GetKeyboard).new_id(keyboard),
-                );
-                self.keyboard = Some(keyboard);
-            }
+            self.handle_seat_capabilities(&ev);
             return Ok(());
         }
 
@@ -1164,147 +1122,10 @@ impl TermWindow {
         if let Some(pointer) = self.pointer {
             if ev.is(pointer) {
                 match ev.event::<PointerEvent>() {
-                    Some(PointerEvent::Enter) => {
-                        self.pointer_pos = ev.point(2, 3);
-                        if let Some(ref cursor) = self.cursor {
-                            self.window_tx.request(
-                                MessageBuilder::new(pointer, PointerRequest::SetCursor)
-                                    .u32(ev.serial(0).raw())
-                                    .object(cursor.surface)
-                                    .i32(cursor.hotspot_x)
-                                    .i32(cursor.hotspot_y),
-                            );
-                        }
-                    }
-                    Some(PointerEvent::Motion) => {
-                        self.pointer_pos = ev.point(1, 2);
-                        // Extend the selection only while the left button is
-                        // held — releasing ends the drag.
-                        let (cc, cr) = self.pointer_cell();
-                        if self.selection.drag_to((cc, i32::from(cr))) {
-                            self.present.mark_dirty();
-                        }
-                        self.update_hover_link(cc, cr);
-                        // VT mouse reporting: forward every motion report:
-                        // the `Encoder` (which knows the negotiated tracking
-                        // granularity) decides whether a bare hover
-                        // (`mouse_pressed == None`) or only a drag gets
-                        // encoded -- same division of labor as `Key`.
-                        // Except during a Shift+drag selection bypass: the
-                        // app never saw that press, so it must not see the
-                        // drag's motion either (orphan drag reports confuse
-                        // vim et al).
-                        if !(self.selection_bypass && self.mouse_pressed == Some(MouseButton::Left))
-                        {
-                            self.input_queue.push_back(InputEvent::Mouse {
-                                button: self.mouse_pressed.unwrap_or(MouseButton::None),
-                                kind: MouseEventKind::Motion,
-                                col: cc,
-                                row: cr,
-                                modifiers: self.modifiers,
-                            });
-                        }
-                    }
-                    Some(PointerEvent::Button) => {
-                        let button = PointerButton::from_code(ev.arg(2));
-                        let state = ButtonState::from_raw(ev.arg(3));
-                        let shift = (self.modifiers.depressed
-                            | self.modifiers.latched
-                            | self.modifiers.locked)
-                            & 0x01
-                            != 0;
-                        // Ownership of the left button (kitty/foot/xterm
-                        // convention): while an app has negotiated mouse
-                        // tracking it owns bare clicks (reported, no terminal
-                        // selection); Shift+click bypasses the app and drives
-                        // the terminal's own selection instead (selection
-                        // runs, report suppressed for the whole drag). With
-                        // no tracking the terminal owns the mouse outright.
-                        let is_left = matches!(button, Some(PointerButton::Left));
-                        let bypass_starts = is_left
-                            && matches!(state, Some(ButtonState::Pressed))
-                            && (!self.app_mouse || shift);
-                        let bypass_ends = is_left
-                            && matches!(state, Some(ButtonState::Released))
-                            && self.selection_bypass;
-                        // Suppress the app report for both halves of a bypassed
-                        // drag — an orphan press or release confuses the app.
-                        let suppress_report =
-                            self.app_mouse && (bypass_starts && shift || bypass_ends);
-                        if let (Some(button), Some(state)) = (button, state) {
-                            let (cc, cr) = self.pointer_cell();
-                            let mb = match button {
-                                PointerButton::Left => MouseButton::Left,
-                                PointerButton::Right => MouseButton::Right,
-                                PointerButton::Middle => MouseButton::Middle,
-                            };
-                            self.mouse_pressed =
-                                matches!(state, ButtonState::Pressed).then_some(mb);
-                            if !suppress_report {
-                                self.input_queue.push_back(InputEvent::Mouse {
-                                    button: mb,
-                                    kind: if matches!(state, ButtonState::Pressed) {
-                                        MouseEventKind::Press
-                                    } else {
-                                        MouseEventKind::Release
-                                    },
-                                    col: cc,
-                                    row: cr,
-                                    modifiers: self.modifiers,
-                                });
-                            }
-                        }
-                        match (button, state) {
-                            (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
-                                if bypass_starts {
-                                    self.selection_bypass = self.app_mouse;
-                                    let (cc, cr) = self.pointer_cell();
-                                    // Press semantics (shift-extend / dismiss-click /
-                                    // begin-potential-selection) live in the model.
-                                    // Under app-mouse bypass shift is the *trigger*,
-                                    // not an extend request, so only pass it through
-                                    // when the terminal owns the mouse anyway.
-                                    self.selection
-                                        .press_left((cc, i32::from(cr)), shift && !self.app_mouse);
-                                    self.present.mark_dirty();
-                                }
-                            }
-                            (Some(PointerButton::Left), Some(ButtonState::Released)) => {
-                                // Release ends the drag. If the pointer never
-                                // moved since press, this was a bare click on
-                                // empty space — nothing to keep.
-                                self.selection_bypass = false;
-                                self.selection.release_left();
-                                self.present.mark_dirty();
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some(PointerEvent::Axis) => {
-                        // Axis args: (time, axis, value). axis 0 = vertical.
-                        // value is wl_fixed (24.8): positive = wheel down
-                        // (content moves down = view scrolls DOWN toward the
-                        // prompt); negative = wheel up (into history).
-                        let axis = ev.arg(1);
-                        let value = ev.fixed(2);
-                        if axis == 0 {
-                            // Convert the scroll magnitude to whole lines. A
-                            // typical wheel detent is 15 (|value| ~ 15.0); map
-                            // each such step to 1 line, for fine-grained
-                            // line-at-a-time scrolling.
-                            let px = value.to_pixels().abs();
-                            let steps = ((px + 7) / 15).max(1);
-                            let lines = steps;
-                            let signed = if value.0 < 0 { lines } else { -lines };
-                            let (cc, cr) = self.pointer_cell();
-                            self.input_queue.push_back(InputEvent::Scroll {
-                                lines: signed,
-                                col: cc,
-                                row: cr,
-                                modifiers: self.modifiers,
-                            });
-                        }
-                    }
+                    Some(PointerEvent::Enter) => self.handle_pointer_enter(pointer, &ev),
+                    Some(PointerEvent::Motion) => self.handle_pointer_motion(&ev),
+                    Some(PointerEvent::Button) => self.handle_pointer_button(&ev),
+                    Some(PointerEvent::Axis) => self.handle_pointer_axis(&ev),
                     _ => {}
                 }
                 return Ok(());
@@ -1315,91 +1136,12 @@ impl TermWindow {
         if let Some(keyboard) = self.keyboard {
             if ev.is(keyboard) {
                 match ev.event::<KeyboardEvent>() {
-                    Some(KeyboardEvent::Keymap) => {
-                        // arg(0) = format (always XKB_V1 in practice), the
-                        // fd rides out-of-band as the very next `Fd` event,
-                        // arg(1) = size (the mapping's byte length -- the
-                        // fd carries no length of its own).
-                        self.awaiting_keymap_fd = Some(ev.arg(1) as usize);
-                    }
-                    Some(KeyboardEvent::Enter) => {
-                        // Keyboard focus gained: arg(0) is the serial we must
-                        // present to `set_selection` to prove we own focus.
-                        self.clipboard.set_focus_serial(ev.arg(0));
-                        // Gaining focus makes the cursor solid (not
-                        // mid-fade) immediately, then lets it resume
-                        // blinking -- see `set_focused`.
-                        self.cursor_anim.set_focused(true);
-                        self.present.mark_dirty();
-                        self.input_queue.push_back(InputEvent::Focus(true));
-                    }
-                    Some(KeyboardEvent::Key) => {
-                        let physical = Key::from_code(ev.arg(2));
-                        let logical = self.resolve_logical_key(physical, ev.arg(2));
-                        let state = KeyState::from_raw(ev.arg(3));
-                        // Start/stop repeat timer. Modifier keys never repeat.
-                        match (logical, state) {
-                            (Some(k), Some(KeyState::Pressed))
-                                if !physical.is_some_and(Key::is_modifier) =>
-                            {
-                                self.key_repeat.on_key_press(k);
-                            }
-                            (Some(k), Some(KeyState::Released)) => {
-                                self.key_repeat.on_key_release(k);
-                            }
-                            _ => {}
-                        }
-                        // Esc clears any active selection (and still passes
-                        // through to the application as a normal Esc).
-                        if logical == Some(Key::Esc) && state == Some(KeyState::Pressed) {
-                            if self.selection.clear() {
-                                self.present.mark_dirty();
-                            }
-                        }
-                        self.input_queue.push_back(InputEvent::Key {
-                            key: logical,
-                            state,
-                            modifiers: self.modifiers,
-                        });
-                    }
-                    Some(KeyboardEvent::RepeatInfo) => {
-                        self.key_repeat.set_repeat_info(ev.arg(0), ev.arg(1));
-                    }
-                    Some(KeyboardEvent::Leave) => {
-                        self.key_repeat.on_leave();
-                        // Losing focus freezes the cursor fully hidden so it
-                        // stops blinking -- the classic "which window is
-                        // focused" cue: only the focused window's cursor is
-                        // ever visible.
-                        self.cursor_anim.set_focused(false);
-                        self.present.mark_dirty();
-                        self.input_queue.push_back(InputEvent::Focus(false));
-                    }
-                    Some(KeyboardEvent::Modifiers) => {
-                        self.modifiers = Modifiers {
-                            depressed: ev.arg(1),
-                            latched: ev.arg(2),
-                            locked: ev.arg(3),
-                            group: ev.arg(4),
-                        };
-                        if let Some(xkb) = &mut self.xkb {
-                            // Feed the raw masks straight through -- XKB
-                            // owns what depressed/latched/locked mean for
-                            // whatever keymap is loaded, we don't decode
-                            // them ourselves.
-                            let _ = xkb.update_mask(
-                                self.modifiers.depressed,
-                                self.modifiers.latched,
-                                self.modifiers.locked,
-                                self.modifiers.group,
-                            );
-                        }
-                        // Ctrl toggling while the pointer sits over a link
-                        // must start/stop the hover-underline immediately,
-                        // not wait for the next pointer motion.
-                        let (cc, cr) = self.pointer_cell();
-                        self.update_hover_link(cc, cr);
-                    }
+                    Some(KeyboardEvent::Keymap) => self.handle_keyboard_keymap(&ev),
+                    Some(KeyboardEvent::Enter) => self.handle_keyboard_enter(&ev),
+                    Some(KeyboardEvent::Key) => self.handle_keyboard_key(&ev),
+                    Some(KeyboardEvent::RepeatInfo) => self.handle_keyboard_repeat_info(&ev),
+                    Some(KeyboardEvent::Leave) => self.handle_keyboard_leave(),
+                    Some(KeyboardEvent::Modifiers) => self.handle_keyboard_modifiers(&ev),
                     _ => {}
                 }
                 return Ok(());
@@ -1440,6 +1182,330 @@ impl TermWindow {
         }
 
         Ok(())
+    }
+
+    /// Re-apply the currently held key's motion on a repeat-timer tick (the
+    /// reader thread's timerfd poll fired). Split out of `handle_event` so
+    /// the dispatcher stays a flat list of one-line branches -- each handler
+    /// below is independently testable and readable without wading through
+    /// every other protocol object's logic.
+    fn handle_key_repeat_tick(&mut self) {
+        if let Some(key) = self.key_repeat.held_key() {
+            self.input_queue.push_back(InputEvent::Key {
+                key: Some(key),
+                state: Some(KeyState::Pressed),
+                modifiers: self.modifiers,
+            });
+        }
+    }
+
+    /// Answer an `xdg_wm_base.ping` with the matching `pong` -- keeps the
+    /// compositor from deciding we've hung.
+    fn handle_wm_base_ping(&self, ev: &RawEvent) {
+        self.window_tx.request(
+            MessageBuilder::new(self.wm_base, WmBaseRequest::Pong).u32(ev.serial(0).raw()),
+        );
+    }
+
+    /// Ack an `xdg_surface.configure` and flip to `Mapped` -- the surface is
+    /// now allowed its first `wl_surface.commit`.
+    fn handle_xdg_surface_configure(&mut self, ev: &RawEvent) -> Result<()> {
+        self.window_tx.request(
+            MessageBuilder::new(self.xdg_surface, XdgSurfaceRequest::AckConfigure)
+                .u32(ev.serial(0).raw()),
+        );
+        self.lifecycle = Lifecycle::Mapped;
+        self.maybe_present(None)
+    }
+
+    /// Handle `xdg_toplevel.close` -- the compositor (or user) asked us to
+    /// quit; queue it for the caller rather than exiting from inside dispatch.
+    fn handle_toplevel_close(&mut self) {
+        self.lifecycle = Lifecycle::Closing;
+        self.input_queue.push_back(InputEvent::Close);
+    }
+
+    /// Record a proposed `xdg_toplevel.configure` (resize) for the next frame
+    /// to apply. Args are `(width, height, states[])` in *logical*
+    /// (surface-local) coordinates -- xdg-shell sizes are always pre-scale,
+    /// regardless of our `wl_surface.buffer_scale`. Our shm buffers are
+    /// physical pixels (`scale`x the logical size), so this must be scaled up
+    /// before it's usable as a buffer/backbuffer dimension -- see
+    /// `apply_pending_resize`, the only reader of `pending_resize`, which now
+    /// receives already-scaled physical pixels and no longer needs to know
+    /// about scale itself. A drag emits these dozens of times a second; just
+    /// record the latest and coalesce into a single resize per frame.
+    const fn handle_toplevel_configure(&mut self, ev: &RawEvent) {
+        let w = ev.arg_i32(0) * self.scale;
+        let h = ev.arg_i32(1) * self.scale;
+        if w > 0 && h > 0 {
+            self.pending_resize = Some((w, h));
+        }
+    }
+
+    /// Handle `wl_seat.capabilities`: bind a pointer and/or keyboard the
+    /// first time the seat advertises them (never re-binds one we already
+    /// hold).
+    fn handle_seat_capabilities(&mut self, ev: &RawEvent) {
+        let caps = ev.arg(0);
+        if self.pointer.is_none() && SeatCapability::Pointer.in_mask(caps) {
+            let pointer: PointerId = self.window_tx.alloc_id();
+            self.window_tx.request(
+                MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer),
+            );
+            self.pointer = Some(pointer);
+        }
+        if self.keyboard.is_none() && SeatCapability::Keyboard.in_mask(caps) {
+            let keyboard: KeyboardId = self.window_tx.alloc_id();
+            self.window_tx.request(
+                MessageBuilder::new(self.seat, SeatRequest::GetKeyboard).new_id(keyboard),
+            );
+            self.keyboard = Some(keyboard);
+        }
+    }
+
+    /// `wl_pointer.enter`: remember the entry position and, if we have a
+    /// custom cursor image, ask the compositor to show it (the request must
+    /// be re-sent on every enter -- the compositor forgets it once the
+    /// pointer leaves).
+    fn handle_pointer_enter(&mut self, pointer: PointerId, ev: &RawEvent) {
+        self.pointer_pos = ev.point(2, 3);
+        if let Some(ref cursor) = self.cursor {
+            self.window_tx.request(
+                MessageBuilder::new(pointer, PointerRequest::SetCursor)
+                    .u32(ev.serial(0).raw())
+                    .object(cursor.surface)
+                    .i32(cursor.hotspot_x)
+                    .i32(cursor.hotspot_y),
+            );
+        }
+    }
+
+    /// `wl_pointer.motion`: track the cursor, extend an in-flight selection,
+    /// refresh link-hover state, and forward a VT mouse-motion report (unless
+    /// a Shift+drag selection bypass is hiding the whole drag from the app).
+    fn handle_pointer_motion(&mut self, ev: &RawEvent) {
+        self.pointer_pos = ev.point(1, 2);
+        // Extend the selection only while the left button is
+        // held — releasing ends the drag.
+        let (cc, cr) = self.pointer_cell();
+        if self.selection.drag_to((cc, i32::from(cr))) {
+            self.present.mark_dirty();
+        }
+        self.update_hover_link(cc, cr);
+        // VT mouse reporting: forward every motion report:
+        // the `Encoder` (which knows the negotiated tracking
+        // granularity) decides whether a bare hover
+        // (`mouse_pressed == None`) or only a drag gets
+        // encoded -- same division of labor as `Key`.
+        // Except during a Shift+drag selection bypass: the
+        // app never saw that press, so it must not see the
+        // drag's motion either (orphan drag reports confuse
+        // vim et al).
+        if !(self.selection_bypass && self.mouse_pressed == Some(MouseButton::Left)) {
+            self.input_queue.push_back(InputEvent::Mouse {
+                button: self.mouse_pressed.unwrap_or(MouseButton::None),
+                kind: MouseEventKind::Motion,
+                col: cc,
+                row: cr,
+                modifiers: self.modifiers,
+            });
+        }
+    }
+
+    /// `wl_pointer.button`: decides left-button ownership between the app's
+    /// VT mouse tracking and the terminal's own text selection (the
+    /// kitty/foot/xterm Shift-bypass convention), reports the click to the
+    /// app when appropriate, and drives the selection press/release.
+    fn handle_pointer_button(&mut self, ev: &RawEvent) {
+        let button = PointerButton::from_code(ev.arg(2));
+        let state = ButtonState::from_raw(ev.arg(3));
+        let shift =
+            (self.modifiers.depressed | self.modifiers.latched | self.modifiers.locked) & 0x01
+                != 0;
+        // Ownership of the left button (kitty/foot/xterm
+        // convention): while an app has negotiated mouse
+        // tracking it owns bare clicks (reported, no terminal
+        // selection); Shift+click bypasses the app and drives
+        // the terminal's own selection instead (selection
+        // runs, report suppressed for the whole drag). With
+        // no tracking the terminal owns the mouse outright.
+        let is_left = matches!(button, Some(PointerButton::Left));
+        let bypass_starts = is_left
+            && matches!(state, Some(ButtonState::Pressed))
+            && (!self.app_mouse || shift);
+        let bypass_ends =
+            is_left && matches!(state, Some(ButtonState::Released)) && self.selection_bypass;
+        // Suppress the app report for both halves of a bypassed
+        // drag — an orphan press or release confuses the app.
+        let suppress_report = self.app_mouse && (bypass_starts && shift || bypass_ends);
+        if let (Some(button), Some(state)) = (button, state) {
+            let (cc, cr) = self.pointer_cell();
+            let mb = match button {
+                PointerButton::Left => MouseButton::Left,
+                PointerButton::Right => MouseButton::Right,
+                PointerButton::Middle => MouseButton::Middle,
+            };
+            self.mouse_pressed = matches!(state, ButtonState::Pressed).then_some(mb);
+            if !suppress_report {
+                self.input_queue.push_back(InputEvent::Mouse {
+                    button: mb,
+                    kind: if matches!(state, ButtonState::Pressed) {
+                        MouseEventKind::Press
+                    } else {
+                        MouseEventKind::Release
+                    },
+                    col: cc,
+                    row: cr,
+                    modifiers: self.modifiers,
+                });
+            }
+        }
+        match (button, state) {
+            (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
+                if bypass_starts {
+                    self.selection_bypass = self.app_mouse;
+                    let (cc, cr) = self.pointer_cell();
+                    // Press semantics (shift-extend / dismiss-click /
+                    // begin-potential-selection) live in the model.
+                    // Under app-mouse bypass shift is the *trigger*,
+                    // not an extend request, so only pass it through
+                    // when the terminal owns the mouse anyway.
+                    self.selection
+                        .press_left((cc, i32::from(cr)), shift && !self.app_mouse);
+                    self.present.mark_dirty();
+                }
+            }
+            (Some(PointerButton::Left), Some(ButtonState::Released)) => {
+                // Release ends the drag. If the pointer never
+                // moved since press, this was a bare click on
+                // empty space — nothing to keep.
+                self.selection_bypass = false;
+                self.selection.release_left();
+                self.present.mark_dirty();
+            }
+            _ => {}
+        }
+    }
+
+    /// `wl_pointer.axis`: converts a vertical scroll-wheel delta into whole
+    /// scrollback lines and queues a `Scroll` input event.
+    fn handle_pointer_axis(&mut self, ev: &RawEvent) {
+        // Axis args: (time, axis, value). axis 0 = vertical.
+        // value is wl_fixed (24.8): positive = wheel down
+        // (content moves down = view scrolls DOWN toward the
+        // prompt); negative = wheel up (into history).
+        let axis = ev.arg(1);
+        let value = ev.fixed(2);
+        if axis == 0 {
+            // Convert the scroll magnitude to whole lines. A
+            // typical wheel detent is 15 (|value| ~ 15.0); map
+            // each such step to 1 line, for fine-grained
+            // line-at-a-time scrolling.
+            let px = value.to_pixels().abs();
+            let steps = ((px + 7) / 15).max(1);
+            let lines = steps;
+            let signed = if value.0 < 0 { lines } else { -lines };
+            let (cc, cr) = self.pointer_cell();
+            self.input_queue.push_back(InputEvent::Scroll {
+                lines: signed,
+                col: cc,
+                row: cr,
+                modifiers: self.modifiers,
+            });
+        }
+    }
+
+    /// `wl_keyboard.keymap`: stash the mapping's byte length; the fd itself
+    /// rides out-of-band as the very next `Fd` event (Wayland attaches fds to
+    /// a specific message, not as a standalone one).
+    const fn handle_keyboard_keymap(&mut self, ev: &RawEvent) {
+        self.awaiting_keymap_fd = Some(ev.arg(1) as usize);
+    }
+
+    /// `wl_keyboard.enter`: keyboard focus gained. Remembers the serial
+    /// `set_selection` needs to prove clipboard ownership, and makes the
+    /// cursor solid (not mid-fade) before it resumes blinking.
+    fn handle_keyboard_enter(&mut self, ev: &RawEvent) {
+        self.clipboard.set_focus_serial(ev.arg(0));
+        self.cursor_anim.set_focused(true);
+        self.present.mark_dirty();
+        self.input_queue.push_back(InputEvent::Focus(true));
+    }
+
+    /// `wl_keyboard.key`: resolves the physical keycode to a logical key,
+    /// drives the repeat timer, lets Esc clear an active selection, and
+    /// queues the key for the caller.
+    fn handle_keyboard_key(&mut self, ev: &RawEvent) {
+        let physical = Key::from_code(ev.arg(2));
+        let logical = self.resolve_logical_key(physical, ev.arg(2));
+        let state = KeyState::from_raw(ev.arg(3));
+        // Start/stop repeat timer. Modifier keys never repeat.
+        match (logical, state) {
+            (Some(k), Some(KeyState::Pressed)) if !physical.is_some_and(Key::is_modifier) => {
+                self.key_repeat.on_key_press(k);
+            }
+            (Some(k), Some(KeyState::Released)) => {
+                self.key_repeat.on_key_release(k);
+            }
+            _ => {}
+        }
+        // Esc clears any active selection (and still passes
+        // through to the application as a normal Esc).
+        if logical == Some(Key::Esc) && state == Some(KeyState::Pressed) && self.selection.clear()
+        {
+            self.present.mark_dirty();
+        }
+        self.input_queue.push_back(InputEvent::Key {
+            key: logical,
+            state,
+            modifiers: self.modifiers,
+        });
+    }
+
+    /// `wl_keyboard.repeat_info`: the compositor's preferred repeat rate/delay.
+    const fn handle_keyboard_repeat_info(&mut self, ev: &RawEvent) {
+        self.key_repeat.set_repeat_info(ev.arg(0), ev.arg(1));
+    }
+
+    /// `wl_keyboard.leave`: focus lost. Freezes the cursor fully hidden so it
+    /// stops blinking -- the classic "which window is focused" cue: only the
+    /// focused window's cursor is ever visible.
+    fn handle_keyboard_leave(&mut self) {
+        self.key_repeat.on_leave();
+        self.cursor_anim.set_focused(false);
+        self.present.mark_dirty();
+        self.input_queue.push_back(InputEvent::Focus(false));
+    }
+
+    /// `wl_keyboard.modifiers`: updates the raw depressed/latched/locked/group
+    /// masks, feeds them to XKB (which alone knows what they mean for the
+    /// loaded keymap), and refreshes link-hover state since Ctrl toggling
+    /// while hovering a link must react immediately, not wait for motion.
+    fn handle_keyboard_modifiers(&mut self, ev: &RawEvent) {
+        self.modifiers = Modifiers {
+            depressed: ev.arg(1),
+            latched: ev.arg(2),
+            locked: ev.arg(3),
+            group: ev.arg(4),
+        };
+        if let Some(xkb) = &mut self.xkb {
+            // Feed the raw masks straight through -- XKB
+            // owns what depressed/latched/locked mean for
+            // whatever keymap is loaded, we don't decode
+            // them ourselves.
+            let _ = xkb.update_mask(
+                self.modifiers.depressed,
+                self.modifiers.latched,
+                self.modifiers.locked,
+                self.modifiers.group,
+            );
+        }
+        // Ctrl toggling while the pointer sits over a link
+        // must start/stop the hover-underline immediately,
+        // not wait for the next pointer motion.
+        let (cc, cr) = self.pointer_cell();
+        self.update_hover_link(cc, cr);
     }
 
     /// Apply the most recent pending `configure` size, if any, as a single

@@ -141,6 +141,82 @@ struct Globals {
     output: Option<OutputId>,
 }
 
+/// Accumulates globals as `wl_registry.global` events arrive. Mirrors
+/// `platform::window`'s `GlobalsBuilder`: pulled out of `BarWindow::discover`
+/// (which had the same shape -- a `while` loop over 5 Option<Id> locals plus
+/// a 5-armed match, each arm repeating "already bound? else bind and stash")
+/// so the loop condition and per-event dispatch are each one named,
+/// independently readable method.
+#[derive(Default)]
+struct GlobalsBuilder {
+    compositor: Option<CompositorId>,
+    shm: Option<ShmId>,
+    layer_shell: Option<LayerShellId>,
+    seat: Option<SeatId>,
+    output: Option<OutputId>,
+}
+
+impl GlobalsBuilder {
+    /// Whether every global `BarWindow::discover`'s caller needs has been
+    /// bound. `wl_output` is optional (not every compositor advertises one
+    /// at startup), so it's excluded -- the registry burst loop stops as
+    /// soon as the required set is complete.
+    const fn has_every_required_global(&self) -> bool {
+        self.compositor.is_some()
+            && self.shm.is_some()
+            && self.layer_shell.is_some()
+            && self.seat.is_some()
+    }
+
+    /// Bind `interface` if it's one this bar needs and hasn't already bound.
+    /// A no-op for any interface not in the list below.
+    fn bind_named_global(
+        &mut self,
+        sender: &mut Sender,
+        registry: RegistryId,
+        name: u32,
+        interface: &str,
+        version: u32,
+    ) -> Result<()> {
+        match interface {
+            s if s == proto::WL_COMPOSITOR.name && self.compositor.is_none() => {
+                let v = proto::WL_COMPOSITOR.version.min(version);
+                self.compositor = Some(BarWindow::bind(sender, registry, name, interface, v)?);
+            }
+            s if s == proto::WL_SHM.name && self.shm.is_none() => {
+                let v = proto::WL_SHM.version.min(version);
+                self.shm = Some(BarWindow::bind(sender, registry, name, interface, v)?);
+            }
+            s if s == proto::ZWLR_LAYER_SHELL_V1.name && self.layer_shell.is_none() => {
+                let v = proto::ZWLR_LAYER_SHELL_V1.version.min(version);
+                self.layer_shell = Some(BarWindow::bind(sender, registry, name, interface, v)?);
+            }
+            s if s == proto::WL_SEAT.name && self.seat.is_none() => {
+                let v = proto::WL_SEAT.version.min(version);
+                self.seat = Some(BarWindow::bind(sender, registry, name, interface, v)?);
+            }
+            s if s == proto::WL_OUTPUT.name && self.output.is_none() => {
+                let v = proto::WL_OUTPUT.version.min(version);
+                self.output = Some(BarWindow::bind(sender, registry, name, interface, v)?);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Consume the builder into the final [`Globals`], failing if any
+    /// required global never arrived.
+    fn finish(self) -> Result<Globals> {
+        Ok(Globals {
+            compositor: self.compositor.ok_or(Error::ReaderStopped)?,
+            shm: self.shm.ok_or(Error::ReaderStopped)?,
+            layer_shell: self.layer_shell.ok_or(Error::ReaderStopped)?,
+            seat: self.seat.ok_or(Error::ReaderStopped)?,
+            output: self.output,
+        })
+    }
+}
+
 impl BarWindow {
     /// Open a layer-shell bar `height` pixels thick, docked at `edge`, and
     /// reserving that much exclusive space, with the given background
@@ -535,13 +611,8 @@ impl BarWindow {
                 .new_id(registry),
         )?;
 
-        let mut compositor: Option<CompositorId> = None;
-        let mut shm: Option<ShmId> = None;
-        let mut layer_shell: Option<LayerShellId> = None;
-        let mut seat: Option<SeatId> = None;
-        let mut output: Option<OutputId> = None;
-
-        while compositor.is_none() || shm.is_none() || layer_shell.is_none() || seat.is_none() {
+        let mut globals = GlobalsBuilder::default();
+        while !globals.has_every_required_global() {
             let event = events.pop_block().ok_or(Error::ReaderStopped)?;
             let RawEvent::Bytes(bytes) = event else {
                 continue;
@@ -566,38 +637,10 @@ impl BarWindow {
                 let name = ev.u32();
                 let interface = ev.string();
                 let version = ev.u32();
-                match interface.as_str() {
-                    s if s == proto::WL_COMPOSITOR.name && compositor.is_none() => {
-                        let v = proto::WL_COMPOSITOR.version.min(version);
-                        compositor = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    s if s == proto::WL_SHM.name && shm.is_none() => {
-                        let v = proto::WL_SHM.version.min(version);
-                        shm = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    s if s == proto::ZWLR_LAYER_SHELL_V1.name && layer_shell.is_none() => {
-                        let v = proto::ZWLR_LAYER_SHELL_V1.version.min(version);
-                        layer_shell = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    s if s == proto::WL_SEAT.name && seat.is_none() => {
-                        let v = proto::WL_SEAT.version.min(version);
-                        seat = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    s if s == proto::WL_OUTPUT.name && output.is_none() => {
-                        let v = proto::WL_OUTPUT.version.min(version);
-                        output = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    _ => {}
-                }
+                globals.bind_named_global(sender, registry, name, &interface, version)?;
             }
         }
-        Ok(Globals {
-            compositor: compositor.ok_or(Error::ReaderStopped)?,
-            shm: shm.ok_or(Error::ReaderStopped)?,
-            layer_shell: layer_shell.ok_or(Error::ReaderStopped)?,
-            seat: seat.ok_or(Error::ReaderStopped)?,
-            output,
-        })
+        globals.finish()
     }
 
     /// Delegates to the role-agnostic

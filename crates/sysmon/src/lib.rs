@@ -509,7 +509,7 @@ impl ProcessScanner {
             let Some(stat) = self.stat_reader.read(self.stat_path.as_str()) else {
                 continue;
             };
-            let Some((name, ticks, resident_pages)) = MonitorReader::process_stat_bytes(stat)
+            let Some((name, ticks, resident_pages)) = Self::process_stat_bytes(stat)
             else {
                 continue;
             };
@@ -556,6 +556,70 @@ impl ProcessScanner {
                 return list;
             }
         }
+    }
+
+    /// Parse one `/proc/<pid>/stat` record into (name, cpu-ticks, resident
+    /// pages). Lives here — on the scanner that is the sole consumer of
+    /// pid-stat files — rather than on the owning `MonitorReader`, so ownership
+    /// flows parent -> child with no back-edge.
+    fn process_stat(stat: &str) -> Option<(String, u64, u64)> {
+        Self::process_stat_bytes(stat.as_bytes())
+    }
+
+    fn process_stat_bytes(bytes: &[u8]) -> Option<(String, u64, u64)> {
+        let close = bytes.iter().rposition(|&byte| byte == b')')?;
+        let open = bytes[..close].iter().position(|&byte| byte == b'(')?;
+        let name = std::str::from_utf8(bytes.get(open + 1..close)?)
+            .ok()?
+            .to_owned();
+        let mut index = close + 1;
+        let mut field = 0;
+        let mut user = None;
+        let mut system = None;
+        let mut resident_pages = None;
+        while field <= 21 {
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            let token_start = index;
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if token_start == index {
+                return None;
+            }
+            if field == 0 {
+                // The state field is a single alphabetic byte; all later
+                // fields needed here are decimal counters.
+                field += 1;
+                continue;
+            }
+            // Only the three counters below are needed. Other stat fields
+            // include signed values (notably `nice`), so parsing every token
+            // as u64 silently discarded most otherwise valid processes.
+            match field {
+                11 | 12 | 21 => {
+                    let mut value = 0u64;
+                    for &byte in &bytes[token_start..index] {
+                        if !byte.is_ascii_digit() {
+                            return None;
+                        }
+                        value = value
+                            .saturating_mul(10)
+                            .saturating_add(u64::from(byte - b'0'));
+                    }
+                    match field {
+                        11 => user = Some(value),
+                        12 => system = Some(value),
+                        21 => resident_pages = Some(value),
+                        _ => unreachable!(),
+                    }
+                }
+                _ => {}
+            }
+            field += 1;
+        }
+        Some((name, user?.saturating_add(system?), resident_pages?))
     }
 
     /// Parses a `/proc` directory-entry name as a PID directly from its raw
@@ -1001,7 +1065,9 @@ impl MonitorReader {
     /// benchmarks that need to isolate parsing from procfs latency.
     #[must_use]
     pub fn parse_process_stat(stat: &str) -> Option<(String, u64, u64)> {
-        Self::process_stat(stat)
+        // Delegate down to the scanner that owns pid-stat parsing, rather than
+        // keeping a copy here — the scanner is the sole real consumer.
+        ProcessScanner::process_stat(stat)
     }
 
     /// Parse procfs CPU counters without performing the filesystem read.
@@ -1012,65 +1078,6 @@ impl MonitorReader {
         result
     }
 
-    fn process_stat(stat: &str) -> Option<(String, u64, u64)> {
-        Self::process_stat_bytes(stat.as_bytes())
-    }
-
-    fn process_stat_bytes(bytes: &[u8]) -> Option<(String, u64, u64)> {
-        let close = bytes.iter().rposition(|&byte| byte == b')')?;
-        let open = bytes[..close].iter().position(|&byte| byte == b'(')?;
-        let name = std::str::from_utf8(bytes.get(open + 1..close)?)
-            .ok()?
-            .to_owned();
-        let mut index = close + 1;
-        let mut field = 0;
-        let mut user = None;
-        let mut system = None;
-        let mut resident_pages = None;
-        while field <= 21 {
-            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-                index += 1;
-            }
-            let token_start = index;
-            while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
-                index += 1;
-            }
-            if token_start == index {
-                return None;
-            }
-            if field == 0 {
-                // The state field is a single alphabetic byte; all later
-                // fields needed here are decimal counters.
-                field += 1;
-                continue;
-            }
-            // Only the three counters below are needed. Other stat fields
-            // include signed values (notably `nice`), so parsing every token
-            // as u64 silently discarded most otherwise valid processes.
-            match field {
-                11 | 12 | 21 => {
-                    let mut value = 0u64;
-                    for &byte in &bytes[token_start..index] {
-                        if !byte.is_ascii_digit() {
-                            return None;
-                        }
-                        value = value
-                            .saturating_mul(10)
-                            .saturating_add(u64::from(byte - b'0'));
-                    }
-                    match field {
-                        11 => user = Some(value),
-                        12 => system = Some(value),
-                        21 => resident_pages = Some(value),
-                        _ => unreachable!(),
-                    }
-                }
-                _ => {}
-            }
-            field += 1;
-        }
-        Some((name, user?.saturating_add(system?), resident_pages?))
-    }
 }
 
 struct MemoryValues;
@@ -1270,7 +1277,7 @@ mod tests {
     fn process_stat_reads_cpu_ticks_after_a_parenthesized_name() {
         let stat = "42 (worker) S 1 2 3 4 5 6 7 8 9 10 123 456 13 14 15 16 17 18 19 20 321";
         let (name, ticks, resident_pages) =
-            MonitorReader::process_stat(stat).expect("valid proc stat");
+            ProcessScanner::process_stat(stat).expect("valid proc stat");
         assert_eq!(name, "worker");
         assert_eq!(ticks, 579);
         assert_eq!(resident_pages, 321);

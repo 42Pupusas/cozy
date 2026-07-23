@@ -897,11 +897,70 @@ struct UiWorker<'a> {
 
 impl UiWorker<'_> {
     /// Run the UI event loop on the calling (main) thread until quit.
-    #[allow(clippy::too_many_lines)] // one event loop; was already this long as a free fn
     fn run(self) -> platform::Result<()> {
+        UiLoop::new(self)?.run()
+    }
+}
+
+/// Owns every piece of mutable state one iteration of the UI event loop
+/// touches -- the Wayland window, the VT input encoder, resize/link
+/// bookkeeping -- plus the channel endpoints and shared flags `UiWorker`
+/// was built with. Splitting this out of `UiWorker` (which stays the plain
+/// "here are your channels" argument bundle `App::run` constructs) is what
+/// lets each `InputEvent` variant get its own small, independently-readable
+/// handler method instead of one 400-line match arm.
+struct UiLoop<'a> {
+    dirty_rx: quetzalcoatl::spsc::Consumer<DirtySnapshot>,
+    input_tx: mpsc::Producer<InputMsg>,
+    resize_tx: mpsc::Producer<ParserMsg>,
+    scroll_tx: mpsc::Producer<ParserMsg>,
+    pty_wake: waker::Waker,
+    bracketed_paste: &'a AtomicBool,
+    term_modes: &'a AtomicU32,
+    ui_events_rx: quetzalcoatl::spsc::Consumer<UiEvent>,
+    quit: &'a AtomicBool,
+    /// See `App::shell_pid`. Read on Ctrl+Shift+Enter to resolve where to
+    /// open the new terminal window.
+    shell_pid: &'a AtomicI32,
+
+    win: TermWindow,
+    encoder: Encoder,
+    /// Idle poll cap while an animation (cursor slide/blink) is in flight, in
+    /// milliseconds -- derived from `[window] target_fps`. This is a *target*
+    /// poll cadence, not a guaranteed frame rate: the actual ceiling is the
+    /// compositor's own vsync (`wl_callback.done` gates every present in
+    /// `TermWindow::maybe_present`), so on a 60Hz output setting this above 60
+    /// just means the loop wakes more often than it can usefully present,
+    /// spending a little extra CPU for lower input-to-animation latency. On a
+    /// 90/120/144Hz+ output it lets the animation actually track the higher
+    /// refresh rate. `target_fps` is validated to `1..=1000` by config, so
+    /// this is always `>= 1`.
+    anim_poll_cap_ms: i32,
+    /// The grid's current row count for page-scroll sizing (updated on
+    /// resize). Seeded from the startup dimensions.
+    grid_rows: u16,
+    /// Holds back the PTY SIGWINCH during a drag so the shell reprompts once
+    /// at the settled size instead of at every intermediate width (which
+    /// strands truncated prompt fragments). The grid still reflows live.
+    resize_debounce: ResizeDebounce,
+    /// Mirror of the grid's OSC 8 link table, id -> URI, built incrementally
+    /// from `UiEvent::Link`. Lets a Ctrl+click resolve the cell under the
+    /// pointer's `link_id` without reaching across to the parser thread.
+    links: std::collections::HashMap<u32, String>,
+    /// See `ConfigWatcher`'s doc for the save-detection strategy and why
+    /// it's best-effort.
+    config_watcher: ConfigWatcher,
+}
+
+impl<'a> UiLoop<'a> {
+    /// Build the window, encoder, and loop bookkeeping from a `UiWorker`'s
+    /// channels/config. Split out of `run` purely so construction (setting
+    /// up the theme/cursor/window) doesn't compete for attention with the
+    /// loop body below.
+    fn new(worker: UiWorker<'a>) -> platform::Result<Self> {
         let UiWorker {
             cfg,
-            mut dirty_rx,
+            dirty_rx,
             input_tx,
             resize_tx,
             scroll_tx,
@@ -909,10 +968,10 @@ impl UiWorker<'_> {
             pty_wake,
             bracketed_paste,
             term_modes,
-            mut ui_events_rx,
+            ui_events_rx,
             quit,
             shell_pid,
-        } = self;
+        } = worker;
         let theme = platform::Theme::from_palette(&cfg.palette);
         let font = cfg.font.clone();
         let opacity = cfg.window.opacity;
@@ -933,41 +992,35 @@ impl UiWorker<'_> {
         };
         // TermWindow reads the output scale and calls this closure to rasterize
         // the font at native density (HiDPI-aware).
-        let mut win = TermWindow::new("terminal", COLS, ROWS, ui_wake, cursor_cfg, move |scale| {
+        let win = TermWindow::new("terminal", COLS, ROWS, ui_wake, cursor_cfg, move |scale| {
             platform::Renderer::with_scale(theme, &font, scale).with_opacity(opacity)
         })?;
-        let mut encoder = Encoder::new();
-
-        // Idle poll cap while an animation (cursor slide/blink) is in flight, in
-        // milliseconds -- derived from `[window] target_fps`. This is a *target*
-        // poll cadence, not a guaranteed frame rate: the actual ceiling is the
-        // compositor's own vsync (`wl_callback.done` gates every present in
-        // `TermWindow::maybe_present`), so on a 60Hz output setting this above 60
-        // just means the loop wakes more often than it can usefully present,
-        // spending a little extra CPU for lower input-to-animation latency. On a
-        // 90/120/144Hz+ output it lets the animation actually track the higher
-        // refresh rate. `target_fps` is validated to `1..=1000` by config, so
-        // this is always `>= 1`.
         let anim_poll_cap_ms = (1000 / cfg.window.target_fps.max(1)).max(1).cast_signed();
+        Ok(Self {
+            dirty_rx,
+            input_tx,
+            resize_tx,
+            scroll_tx,
+            pty_wake,
+            bracketed_paste,
+            term_modes,
+            ui_events_rx,
+            quit,
+            shell_pid,
+            win,
+            encoder: Encoder::new(),
+            anim_poll_cap_ms,
+            grid_rows: ROWS,
+            resize_debounce: ResizeDebounce::new(),
+            links: std::collections::HashMap::new(),
+            config_watcher: ConfigWatcher::new(),
+        })
+    }
 
-        // Track the grid's current row count for page-scroll sizing (updated on
-        // resize). Seeded from the startup dimensions.
-        let mut grid_rows = ROWS;
-        // Holds back the PTY SIGWINCH during a drag so the shell reprompts once
-        // at the settled size instead of at every intermediate width (which
-        // strands truncated prompt fragments). The grid still reflows live.
-        let mut resize_debounce = ResizeDebounce::new();
-        // Mirror of the grid's OSC 8 link table, id -> URI, built incrementally
-        // from `UiEvent::Link`. Lets a Ctrl+click resolve the cell under the
-        // pointer's `link_id` without reaching across to the parser thread.
-        let mut links: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
-
-        // Config live-reload -- see `ConfigWatcher`'s doc for the save-
-        // detection strategy and why it's best-effort.
-        let config_watcher = ConfigWatcher::new();
-
+    /// Run the event loop until quit.
+    fn run(mut self) -> platform::Result<()> {
         loop {
-            if quit.load(Ordering::Relaxed) {
+            if self.quit.load(Ordering::Relaxed) {
                 break;
             }
 
@@ -975,332 +1028,418 @@ impl UiWorker<'_> {
             // True if we pushed input the PTY thread must be roused for.
             let mut sent_input = false;
 
-            // Pick up whatever mode changes the parser thread negotiated
-            // since the last iteration (mouse tracking/SGR, keyboard
-            // protocol, app-cursor/keypad, focus events) before encoding any
-            // input this iteration produces.
-            let negotiated = TermModes::unpack(term_modes.load(Ordering::Relaxed));
-            negotiated.apply_to(&mut encoder);
-            // Let the window know whether the app owns the pointer (mouse
-            // tracking negotiated): gates the terminal-side selection so
-            // clicking in vim doesn't paint a stray highlight over its UI.
-            win.set_app_mouse(negotiated.mouse_mode != MouseMode::Off);
-
-            // Drain one-shot bell/title events the parser thread queued
-            // over the SPSC ui_events_rx ring.
-            while let Some(ev) = ui_events_rx.pop() {
-                match ev {
-                    UiEvent::Bell => win.bell(),
-                    UiEvent::Title(title) => win.set_title(&title),
-                    UiEvent::Link(id, uri) => {
-                        links.insert(id, uri);
-                    }
-                    UiEvent::Clipboard(text) => win.write_clipboard(text),
-                    UiEvent::PaletteColor(idx, rgb) => win.apply_palette_change(idx, rgb),
-                }
-                did_work = true;
+            self.apply_negotiated_modes();
+            self.drain_ui_events(&mut did_work);
+            self.drain_dirty_snapshots(&mut did_work);
+            // `Close` bypasses the normal end-of-iteration batching below (the
+            // PTY is being told to hang up right now), so a `true` return
+            // means "stop the whole loop and return `Ok(())` immediately".
+            if self.drain_input_events(&mut did_work, &mut sent_input) {
+                return Ok(());
             }
-
-            // Push dirty snapshots into the Wayland renderer.
-            while let Some(snap) = dirty_rx.pop() {
-                win.push_dirty(snap);
-                did_work = true;
-            }
-
-            // Process window input events.
-            while let Some(ev) = win.next_input() {
-                did_work = true;
-                match ev {
-                    InputEvent::Close => {
-                        quit.store(true, Ordering::Relaxed);
-                        let _ = input_tx.push(InputMsg::Quit);
-                        pty_wake.signal();
-                        return Ok(());
-                    }
-                    InputEvent::Resize { cols, rows } => {
-                        grid_rows = rows;
-                        // Reflow the grid NOW (live visual feedback), pushing to
-                        // the parser MPSC ring which unparks the parser directly
-                        // — no separate wake needed. But DEFER the PTY winsize:
-                        // sending SIGWINCH on every drag step makes the shell
-                        // reprompt at each intermediate width, stranding
-                        // truncated prompt fragments. `ResizeDebounce` releases
-                        // one winsize once the drag settles.
-                        let _ = resize_tx.push(ParserMsg::Resize { cols, rows });
-                        resize_debounce.note(cols, rows);
-                    }
-                    InputEvent::Scroll {
-                        lines,
-                        col,
-                        row,
-                        modifiers,
-                    } => {
-                        // Route the wheel by what the app negotiated
-                        // (kitty/foot semantics; Shift bypasses to the
-                        // terminal's own scrollback in every case):
-                        //  1. app mouse tracking → encode wheel-button press
-                        //     reports (vim's `mouse=a` scrolls its buffer);
-                        //  2. alt screen, no tracking → "alternate scroll":
-                        //     arrow keys per line (`less`, pagers);
-                        //  3. otherwise → scroll the grid viewport into
-                        //     scrollback (the shell prompt case).
-                        let mods = modifiers.to_input();
-                        let negotiated = TermModes::unpack(term_modes.load(Ordering::Relaxed));
-                        if negotiated.mouse_mode != MouseMode::Off && !mods.shift() {
-                            let button = if lines > 0 {
-                                MouseButton::WheelUp
-                            } else {
-                                MouseButton::WheelDown
-                            };
-                            let mev = MouseEvent {
-                                button,
-                                state: input::mouse::ButtonState::Pressed,
-                                col,
-                                row,
-                                mods,
-                            };
-                            let mut mbuf = [0u8; 32];
-                            for _ in 0..lines.unsigned_abs() {
-                                if let Some(n) = encoder.encode_mouse(mev, &mut mbuf) {
-                                    let _ = input_tx.push(InputMsg::Bytes(mbuf[..n].into()));
-                                    sent_input = true;
-                                }
-                            }
-                        } else if negotiated.alt_screen && !mods.shift() {
-                            // Alternate scroll: Up/Down arrows, one per line,
-                            // honoring DECCKM (SS3 vs CSI) via the encoder.
-                            let key = if lines > 0 { Key::Up } else { Key::Down };
-                            let mut kbuf = [0u8; 16];
-                            for _ in 0..lines.unsigned_abs() {
-                                if let Some(n) = encoder.encode_key(
-                                    key,
-                                    KeyState::Pressed,
-                                    input::Modifiers::default(),
-                                    &mut kbuf,
-                                ) {
-                                    let _ = input_tx.push(InputMsg::Bytes(kbuf[..n].into()));
-                                    sent_input = true;
-                                }
-                            }
-                        } else {
-                            let _ = scroll_tx.push(ParserMsg::Scroll { delta: lines });
-                        }
-                    }
-                    InputEvent::Paste(bytes) => {
-                        // Clipboard contents from another client: write to the PTY
-                        // so the shell/app receives them as input. When the app
-                        // enabled bracketed paste (DECSET 2004), wrap in the
-                        // 200~/201~ markers so pasted newlines are treated as text,
-                        // not as typed Enter (fish/zsh/neovim rely on this).
-                        let data = if bracketed_paste.load(Ordering::Relaxed) {
-                            let mut wrapped = Vec::with_capacity(bytes.len() + 12);
-                            wrapped.extend_from_slice(b"\x1b[200~");
-                            wrapped.extend_from_slice(&bytes);
-                            wrapped.extend_from_slice(b"\x1b[201~");
-                            wrapped
-                        } else {
-                            bytes
-                        };
-                        let _ = input_tx.push(InputMsg::Bytes(data.into_boxed_slice()));
-                        sent_input = true;
-                    }
-                    InputEvent::Key {
-                        key,
-                        state,
-                        modifiers,
-                    } => {
-                        use platform::protocol::KeyState as PKeyState;
-                        let kstate = match state {
-                            Some(PKeyState::Pressed) => KeyState::Pressed,
-                            Some(PKeyState::Released) => KeyState::Released,
-                            None => continue,
-                        };
-                        if kstate == KeyState::Released
-                            && encoder.keyboard_mode == input::KeyboardMode::Legacy
-                        {
-                            continue;
-                        }
-                        let mods = modifiers.to_input();
-                        let Some(ikey) = key.to_input() else {
-                            continue;
-                        };
-                        // Shift+PgUp/PgDn scroll the grid viewport by a page,
-                        // instead of sending the escape to the shell (bare
-                        // PgUp/PgDn still go to the shell for history search).
-                        if kstate == KeyState::Pressed && mods.shift() {
-                            let page = i32::from(grid_rows);
-                            match ikey {
-                                Key::PageUp => {
-                                    let _ = scroll_tx.push(ParserMsg::Scroll { delta: page });
-                                    continue;
-                                }
-                                Key::PageDown => {
-                                    let _ = scroll_tx.push(ParserMsg::Scroll { delta: -page });
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                        }
-                        // Ctrl+Shift+C / Ctrl+Shift+V: copy / paste via the system
-                        // clipboard (handled by the window, not sent to the shell).
-                        if kstate == KeyState::Pressed && mods.ctrl() && mods.shift() {
-                            match ikey {
-                                Key::Char('c') => {
-                                    win.copy_selection();
-                                    continue;
-                                }
-                                Key::Char('v') => {
-                                    win.request_paste();
-                                    continue;
-                                }
-                                Key::Enter => {
-                                    SiblingSpawner::open_here(shell_pid.load(Ordering::Relaxed));
-                                    continue;
-                                }
-                                _ => {}
-                            }
-                        }
-                        let mut ibuf = [0u8; 64];
-                        if let Some(n) = encoder.encode_key(ikey, kstate, mods, &mut ibuf) {
-                            let _ = input_tx.push(InputMsg::Bytes(ibuf[..n].into()));
-                            sent_input = true;
-                            // Any real keystroke snaps the cursor blink back to
-                            // full opacity -- it should never be caught mid-fade
-                            // by what you just typed.
-                            win.notify_activity();
-                        }
-                    }
-                    InputEvent::Mouse {
-                        button,
-                        kind,
-                        col,
-                        row,
-                        modifiers,
-                    } => {
-                        use platform::window::MouseEventKind;
-                        // Ctrl+click on an OSC 8 hyperlink opens it in the
-                        // user's default handler instead of being forwarded
-                        // to the shell -- matching every other terminal's
-                        // hyperlink convention (kitty, foot, WezTerm, ...).
-                        // Only fires when no app has claimed mouse reporting
-                        // (`mouse_mode == Off`): a mouse-aware app like vim
-                        // gets the click as usual and can handle OSC 8 itself.
-                        if kind == MouseEventKind::Press
-                            && button == platform::window::MouseButton::Left
-                            && modifiers.to_input().ctrl()
-                            && TermModes::unpack(term_modes.load(Ordering::Relaxed)).mouse_mode
-                                == MouseMode::Off
-                        {
-                            let link_id = win.link_id_at(col, row);
-                            if link_id != 0
-                                && let Some(uri) = links.get(&link_id)
-                            {
-                                // `spawn()` alone leaves a zombie once
-                                // xdg-open exits -- dropping a `Child`
-                                // does not reap it, and nothing here ever
-                                // calls `wait()` on repeated Ctrl+clicks.
-                                // Reap it on a throwaway thread instead of
-                                // blocking the UI loop on `wait()`
-                                // ourselves.
-                                if let Ok(mut child) =
-                                    std::process::Command::new("xdg-open").arg(uri).spawn()
-                                {
-                                    std::thread::spawn(move || {
-                                        let _ = child.wait();
-                                    });
-                                }
-                                continue;
-                            }
-                        }
-                        let mev = MouseEvent {
-                            button: match button {
-                                platform::window::MouseButton::Left => MouseButton::Left,
-                                platform::window::MouseButton::Middle => MouseButton::Middle,
-                                platform::window::MouseButton::Right => MouseButton::Right,
-                                platform::window::MouseButton::WheelUp => MouseButton::WheelUp,
-                                platform::window::MouseButton::WheelDown => MouseButton::WheelDown,
-                                platform::window::MouseButton::None => MouseButton::None,
-                            },
-                            state: match kind {
-                                MouseEventKind::Press => input::mouse::ButtonState::Pressed,
-                                MouseEventKind::Release => input::mouse::ButtonState::Released,
-                                MouseEventKind::Motion => input::mouse::ButtonState::Moved,
-                            },
-                            col,
-                            row,
-                            mods: modifiers.to_input(),
-                        };
-                        let mut mbuf = [0u8; 32];
-                        if let Some(n) = encoder.encode_mouse(mev, &mut mbuf) {
-                            let _ = input_tx.push(InputMsg::Bytes(mbuf[..n].into()));
-                            sent_input = true;
-                        }
-                    }
-                    InputEvent::Focus(gained) => {
-                        // DECSET 1004: report focus in/out as CSI I / CSI O.
-                        // Gated on the negotiated flag so a plain shell
-                        // (which never asked for this) doesn't see stray
-                        // escapes land on its prompt.
-                        if TermModes::unpack(term_modes.load(Ordering::Relaxed)).focus_events {
-                            let bytes: &[u8] = if gained { b"\x1b[I" } else { b"\x1b[O" };
-                            let _ = input_tx.push(InputMsg::Bytes(bytes.into()));
-                            sent_input = true;
-                        }
-                    }
-                }
-            }
-
-            // Release a debounced winsize once the drag has settled: send ONE
-            // SIGWINCH at the final size so the shell reprompts exactly once.
-            if let Some((cols, rows)) = resize_debounce.take_if_settled() {
-                let _ = input_tx.push(InputMsg::Resize { cols, rows });
-                sent_input = true;
-            }
+            self.flush_debounced_resize(&mut sent_input);
 
             // Rouse the PTY thread once for the whole batch of queued input.
             if sent_input {
-                pty_wake.signal();
+                self.pty_wake.signal();
             }
 
             // Config live-reload: see `ConfigWatcher::poll_reload`.
-            if config_watcher.poll_reload(&mut win) {
+            if self.config_watcher.poll_reload(&mut self.win) {
                 did_work = true;
             }
 
-            if !win.tick()? {
+            if !self.win.tick()? {
                 break;
             }
 
-            // Idle: block in poll(2) on the UI wakeup eventfd instead of
-            // busy-spinning. The Wayland reader signals it after pushing protocol
-            // events; the parser signals it after producing a dirty snapshot.
-            // `win.wait` drains the counter after waking; any signal that raced in
-            // during this iteration's reads leaves the counter set, so the poll
-            // returns at once (no lost wakeup).
-            //
-            // While the cursor is mid-slide or blinking-and-visible, cap the wait
-            // at ANIM_POLL_CAP_MS instead of the normal 100ms so the animation
-            // actually advances smoothly instead of updating in big 100ms jumps;
-            // otherwise it stays the full 100ms, bounding only quit-flag latency
-            // as before.
             if !did_work {
-                let mut cap = if win.wants_animation_frame() {
-                    anim_poll_cap_ms
-                } else {
-                    100
-                };
-                // A pending debounced resize must wake the loop when its quiet
-                // period elapses, even if nothing else arrives — otherwise the
-                // held winsize could sit unsent until the next unrelated event.
-                if let Some(resize_cap) = resize_debounce.wait_cap_ms() {
-                    cap = cap.min(resize_cap.max(1));
-                }
-                win.wait(cap);
+                self.idle_wait();
             }
         }
 
-        quit.store(true, Ordering::Relaxed);
+        self.quit.store(true, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Pick up whatever mode changes the parser thread negotiated since the
+    /// last iteration (mouse tracking/SGR, keyboard protocol, app-cursor/
+    /// keypad, focus events) before encoding any input this iteration
+    /// produces, and let the window know whether the app owns the pointer
+    /// (mouse tracking negotiated): gates the terminal-side selection so
+    /// clicking in vim doesn't paint a stray highlight over its UI.
+    fn apply_negotiated_modes(&mut self) {
+        let negotiated = TermModes::unpack(self.term_modes.load(Ordering::Relaxed));
+        negotiated.apply_to(&mut self.encoder);
+        self.win.set_app_mouse(negotiated.mouse_mode != MouseMode::Off);
+    }
+
+    /// Drain one-shot bell/title/link/clipboard/palette events the parser
+    /// thread queued over the SPSC `ui_events_rx` ring.
+    fn drain_ui_events(&mut self, did_work: &mut bool) {
+        while let Some(ev) = self.ui_events_rx.pop() {
+            match ev {
+                UiEvent::Bell => self.win.bell(),
+                UiEvent::Title(title) => self.win.set_title(&title),
+                UiEvent::Link(id, uri) => {
+                    self.links.insert(id, uri);
+                }
+                UiEvent::Clipboard(text) => self.win.write_clipboard(text),
+                UiEvent::PaletteColor(idx, rgb) => self.win.apply_palette_change(idx, rgb),
+            }
+            *did_work = true;
+        }
+    }
+
+    /// Push every pending dirty snapshot into the Wayland renderer.
+    fn drain_dirty_snapshots(&mut self, did_work: &mut bool) {
+        while let Some(snap) = self.dirty_rx.pop() {
+            self.win.push_dirty(snap);
+            *did_work = true;
+        }
+    }
+
+    /// Drain and dispatch every queued window input event this iteration.
+    /// Returns `true` when the caller should return `Ok(())` from `run`
+    /// right now -- only `InputEvent::Close` does this.
+    fn drain_input_events(&mut self, did_work: &mut bool, sent_input: &mut bool) -> bool {
+        while let Some(ev) = self.win.next_input() {
+            *did_work = true;
+            match ev {
+                InputEvent::Close => {
+                    self.quit.store(true, Ordering::Relaxed);
+                    let _ = self.input_tx.push(InputMsg::Quit);
+                    self.pty_wake.signal();
+                    return true;
+                }
+                InputEvent::Resize { cols, rows } => self.handle_resize(cols, rows),
+                InputEvent::Scroll {
+                    lines,
+                    col,
+                    row,
+                    modifiers,
+                } => {
+                    if self.handle_scroll(lines, col, row, modifiers) {
+                        *sent_input = true;
+                    }
+                }
+                InputEvent::Paste(bytes) => {
+                    if self.handle_paste(bytes) {
+                        *sent_input = true;
+                    }
+                }
+                InputEvent::Key {
+                    key,
+                    state,
+                    modifiers,
+                } => {
+                    if self.handle_key_event(key, state, modifiers) {
+                        *sent_input = true;
+                    }
+                }
+                InputEvent::Mouse {
+                    button,
+                    kind,
+                    col,
+                    row,
+                    modifiers,
+                } => {
+                    if self.handle_mouse_event(button, kind, col, row, modifiers) {
+                        *sent_input = true;
+                    }
+                }
+                InputEvent::Focus(gained) => {
+                    if self.handle_focus_event(gained) {
+                        *sent_input = true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `InputEvent::Resize`: reflow the grid NOW (live visual feedback),
+    /// pushing to the parser MPSC ring which unparks the parser directly --
+    /// no separate wake needed. But DEFER the PTY winsize: sending SIGWINCH
+    /// on every drag step makes the shell reprompt at each intermediate
+    /// width, stranding truncated prompt fragments. `ResizeDebounce` releases
+    /// one winsize once the drag settles.
+    fn handle_resize(&mut self, cols: u16, rows: u16) {
+        self.grid_rows = rows;
+        let _ = self.resize_tx.push(ParserMsg::Resize { cols, rows });
+        self.resize_debounce.note(cols, rows);
+    }
+
+    /// `InputEvent::Scroll`: route the wheel by what the app negotiated
+    /// (kitty/foot semantics; Shift bypasses to the terminal's own
+    /// scrollback in every case):
+    ///  1. app mouse tracking → encode wheel-button press reports (vim's
+    ///     `mouse=a` scrolls its buffer);
+    ///  2. alt screen, no tracking → "alternate scroll": arrow keys per line
+    ///     (`less`, pagers);
+    ///  3. otherwise → scroll the grid viewport into scrollback (the shell
+    ///     prompt case).
+    ///
+    /// Returns whether any bytes were queued for the PTY.
+    fn handle_scroll(
+        &self,
+        lines: i32,
+        col: u16,
+        row: u16,
+        modifiers: platform::protocol::Modifiers,
+    ) -> bool {
+        let mods = modifiers.to_input();
+        let negotiated = TermModes::unpack(self.term_modes.load(Ordering::Relaxed));
+        let mut sent = false;
+        if negotiated.mouse_mode != MouseMode::Off && !mods.shift() {
+            let button = if lines > 0 {
+                MouseButton::WheelUp
+            } else {
+                MouseButton::WheelDown
+            };
+            let mev = MouseEvent {
+                button,
+                state: input::mouse::ButtonState::Pressed,
+                col,
+                row,
+                mods,
+            };
+            let mut mbuf = [0u8; 32];
+            for _ in 0..lines.unsigned_abs() {
+                if let Some(n) = self.encoder.encode_mouse(mev, &mut mbuf) {
+                    let _ = self.input_tx.push(InputMsg::Bytes(mbuf[..n].into()));
+                    sent = true;
+                }
+            }
+        } else if negotiated.alt_screen && !mods.shift() {
+            // Alternate scroll: Up/Down arrows, one per line,
+            // honoring DECCKM (SS3 vs CSI) via the encoder.
+            let key = if lines > 0 { Key::Up } else { Key::Down };
+            let mut kbuf = [0u8; 16];
+            for _ in 0..lines.unsigned_abs() {
+                if let Some(n) = self.encoder.encode_key(
+                    key,
+                    KeyState::Pressed,
+                    input::Modifiers::default(),
+                    &mut kbuf,
+                ) {
+                    let _ = self.input_tx.push(InputMsg::Bytes(kbuf[..n].into()));
+                    sent = true;
+                }
+            }
+        } else {
+            let _ = self.scroll_tx.push(ParserMsg::Scroll { delta: lines });
+        }
+        sent
+    }
+
+    /// `InputEvent::Paste`: clipboard contents from another client, written
+    /// to the PTY so the shell/app receives them as input. When the app
+    /// enabled bracketed paste (DECSET 2004), wrap in the 200~/201~ markers
+    /// so pasted newlines are treated as text, not as typed Enter (fish/zsh/
+    /// neovim rely on this). Always sends, so always returns `true`.
+    fn handle_paste(&self, bytes: Vec<u8>) -> bool {
+        let data = if self.bracketed_paste.load(Ordering::Relaxed) {
+            let mut wrapped = Vec::with_capacity(bytes.len() + 12);
+            wrapped.extend_from_slice(b"\x1b[200~");
+            wrapped.extend_from_slice(&bytes);
+            wrapped.extend_from_slice(b"\x1b[201~");
+            wrapped
+        } else {
+            bytes
+        };
+        let _ = self.input_tx.push(InputMsg::Bytes(data.into_boxed_slice()));
+        true
+    }
+
+    /// `InputEvent::Key`: resolves a released/unmapped key to nothing,
+    /// handles the terminal's own Shift+PgUp/PgDn scrollback paging and
+    /// Ctrl+Shift+C/V/Enter clipboard/sibling-window shortcuts (never sent
+    /// to the shell), and otherwise encodes + queues the key for the PTY.
+    /// Returns whether any bytes were queued.
+    fn handle_key_event(
+        &mut self,
+        key: Option<platform::protocol::Key>,
+        state: Option<platform::protocol::KeyState>,
+        modifiers: platform::protocol::Modifiers,
+    ) -> bool {
+        use platform::protocol::KeyState as PKeyState;
+        let Some(kstate) = (match state {
+            Some(PKeyState::Pressed) => Some(KeyState::Pressed),
+            Some(PKeyState::Released) => Some(KeyState::Released),
+            None => None,
+        }) else {
+            return false;
+        };
+        if kstate == KeyState::Released && self.encoder.keyboard_mode == input::KeyboardMode::Legacy
+        {
+            return false;
+        }
+        let mods = modifiers.to_input();
+        let Some(ikey) = key.to_input() else {
+            return false;
+        };
+        // Shift+PgUp/PgDn scroll the grid viewport by a page,
+        // instead of sending the escape to the shell (bare
+        // PgUp/PgDn still go to the shell for history search).
+        if kstate == KeyState::Pressed && mods.shift() {
+            let page = i32::from(self.grid_rows);
+            match ikey {
+                Key::PageUp => {
+                    let _ = self.scroll_tx.push(ParserMsg::Scroll { delta: page });
+                    return false;
+                }
+                Key::PageDown => {
+                    let _ = self.scroll_tx.push(ParserMsg::Scroll { delta: -page });
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        // Ctrl+Shift+C / Ctrl+Shift+V: copy / paste via the system
+        // clipboard (handled by the window, not sent to the shell).
+        if kstate == KeyState::Pressed && mods.ctrl() && mods.shift() {
+            match ikey {
+                Key::Char('c') => {
+                    self.win.copy_selection();
+                    return false;
+                }
+                Key::Char('v') => {
+                    self.win.request_paste();
+                    return false;
+                }
+                Key::Enter => {
+                    SiblingSpawner::open_here(self.shell_pid.load(Ordering::Relaxed));
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        let mut ibuf = [0u8; 64];
+        if let Some(n) = self.encoder.encode_key(ikey, kstate, mods, &mut ibuf) {
+            let _ = self.input_tx.push(InputMsg::Bytes(ibuf[..n].into()));
+            // Any real keystroke snaps the cursor blink back to
+            // full opacity -- it should never be caught mid-fade
+            // by what you just typed.
+            self.win.notify_activity();
+            return true;
+        }
+        false
+    }
+
+    /// `InputEvent::Mouse`: Ctrl+click on an OSC 8 hyperlink opens it in the
+    /// user's default handler instead of being forwarded to the shell --
+    /// matching every other terminal's hyperlink convention (kitty, foot,
+    /// `WezTerm`, ...). Only fires when no app has claimed mouse reporting
+    /// (`mouse_mode == Off`): a mouse-aware app like vim gets the click as
+    /// usual and can handle OSC 8 itself. Otherwise encodes + queues a VT
+    /// mouse report. Returns whether any bytes were queued.
+    fn handle_mouse_event(
+        &self,
+        button: platform::window::MouseButton,
+        kind: platform::window::MouseEventKind,
+        col: u16,
+        row: u16,
+        modifiers: platform::protocol::Modifiers,
+    ) -> bool {
+        use platform::window::MouseEventKind;
+        if kind == MouseEventKind::Press
+            && button == platform::window::MouseButton::Left
+            && modifiers.to_input().ctrl()
+            && TermModes::unpack(self.term_modes.load(Ordering::Relaxed)).mouse_mode
+                == MouseMode::Off
+        {
+            let link_id = self.win.link_id_at(col, row);
+            if link_id != 0
+                && let Some(uri) = self.links.get(&link_id)
+            {
+                // `spawn()` alone leaves a zombie once
+                // xdg-open exits -- dropping a `Child`
+                // does not reap it, and nothing here ever
+                // calls `wait()` on repeated Ctrl+clicks.
+                // Reap it on a throwaway thread instead of
+                // blocking the UI loop on `wait()`
+                // ourselves.
+                if let Ok(mut child) = std::process::Command::new("xdg-open").arg(uri).spawn() {
+                    std::thread::spawn(move || {
+                        let _ = child.wait();
+                    });
+                }
+                return false;
+            }
+        }
+        let mev = MouseEvent {
+            button: match button {
+                platform::window::MouseButton::Left => MouseButton::Left,
+                platform::window::MouseButton::Middle => MouseButton::Middle,
+                platform::window::MouseButton::Right => MouseButton::Right,
+                platform::window::MouseButton::WheelUp => MouseButton::WheelUp,
+                platform::window::MouseButton::WheelDown => MouseButton::WheelDown,
+                platform::window::MouseButton::None => MouseButton::None,
+            },
+            state: match kind {
+                MouseEventKind::Press => input::mouse::ButtonState::Pressed,
+                MouseEventKind::Release => input::mouse::ButtonState::Released,
+                MouseEventKind::Motion => input::mouse::ButtonState::Moved,
+            },
+            col,
+            row,
+            mods: modifiers.to_input(),
+        };
+        let mut mbuf = [0u8; 32];
+        if let Some(n) = self.encoder.encode_mouse(mev, &mut mbuf) {
+            let _ = self.input_tx.push(InputMsg::Bytes(mbuf[..n].into()));
+            return true;
+        }
+        false
+    }
+
+    /// `InputEvent::Focus`: DECSET 1004 focus in/out reporting (`CSI I` /
+    /// `CSI O`), gated on the negotiated flag so a plain shell (which never
+    /// asked for this) doesn't see stray escapes land on its prompt. Returns
+    /// whether the escape was queued.
+    fn handle_focus_event(&self, gained: bool) -> bool {
+        if TermModes::unpack(self.term_modes.load(Ordering::Relaxed)).focus_events {
+            let bytes: &[u8] = if gained { b"\x1b[I" } else { b"\x1b[O" };
+            let _ = self.input_tx.push(InputMsg::Bytes(bytes.into()));
+            return true;
+        }
+        false
+    }
+
+    /// Release a debounced winsize once the drag has settled: send ONE
+    /// SIGWINCH at the final size so the shell reprompts exactly once.
+    fn flush_debounced_resize(&mut self, sent_input: &mut bool) {
+        if let Some((cols, rows)) = self.resize_debounce.take_if_settled() {
+            let _ = self.input_tx.push(InputMsg::Resize { cols, rows });
+            *sent_input = true;
+        }
+    }
+
+    /// Idle: block in poll(2) on the UI wakeup eventfd instead of
+    /// busy-spinning. The Wayland reader signals it after pushing protocol
+    /// events; the parser signals it after producing a dirty snapshot.
+    /// `win.wait` drains the counter after waking; any signal that raced in
+    /// during this iteration's reads leaves the counter set, so the poll
+    /// returns at once (no lost wakeup).
+    ///
+    /// While the cursor is mid-slide or blinking-and-visible, cap the wait at
+    /// `anim_poll_cap_ms` instead of the normal 100ms so the animation
+    /// actually advances smoothly instead of updating in big 100ms jumps;
+    /// otherwise it stays the full 100ms, bounding only quit-flag latency as
+    /// before. A pending debounced resize must also wake the loop when its
+    /// quiet period elapses, even if nothing else arrives — otherwise the
+    /// held winsize could sit unsent until the next unrelated event.
+    fn idle_wait(&self) {
+        let mut cap = if self.win.wants_animation_frame() {
+            self.anim_poll_cap_ms
+        } else {
+            100
+        };
+        if let Some(resize_cap) = self.resize_debounce.wait_cap_ms() {
+            cap = cap.min(resize_cap.max(1));
+        }
+        self.win.wait(cap);
     }
 }
 

@@ -622,6 +622,7 @@ impl RawPty {
         // already-constructed pointers.
         let mut have_term = false;
         let mut have_colorterm = false;
+        let mut have_force_hyperlink = false;
         let mut env_cs: Vec<CString> = Vec::new();
         for (k, v) in std::env::vars() {
             if k == "TERM" {
@@ -629,6 +630,9 @@ impl RawPty {
             }
             if k == "COLORTERM" {
                 have_colorterm = true;
+            }
+            if k == "FORCE_HYPERLINK" {
+                have_force_hyperlink = true;
             }
             if let Ok(cs) = CString::new(format!("{k}={v}")) {
                 env_cs.push(cs);
@@ -639,6 +643,23 @@ impl RawPty {
         }
         if !have_colorterm {
             env_cs.push(CString::new("COLORTERM=truecolor").unwrap());
+        }
+        // We DO parse and render OSC 8 hyperlinks (see `grid`'s
+        // `set_active_link`/`link_table` and the UI thread's Ctrl+click
+        // handler), but nothing above announces that to the child: `TERM`
+        // is a plain `xterm-256color`, not one of the few values (`TERM=
+        // xterm-kitty`/`alacritty`, `TERM_PROGRAM=iTerm.app`/`WezTerm`/...,
+        // `VTE_VERSION`, `WT_SESSION`, `KONSOLE_VERSION`) that hyperlink
+        // detection crates like `supports-hyperlinks` (used by trunk, and
+        // widely copied) special-case. Left unset, those tools correctly
+        // conclude -- from their own env-sniffing logic -- that this
+        // terminal can't render hyperlinks, and silently print plain text
+        // instead of ever emitting OSC 8. `FORCE_HYPERLINK=1` is the
+        // universal override that same crate ecosystem checks first,
+        // ahead of every other heuristic, so set it unless the user
+        // already has their own opinion via an inherited value.
+        if !have_force_hyperlink {
+            env_cs.push(CString::new("FORCE_HYPERLINK=1").unwrap());
         }
         let envp_ptrs: Vec<*const u8> = env_cs
             .iter()

@@ -375,8 +375,22 @@ impl Painter {
         canvas.draw_rect(rect, self.palette.border);
     }
 
-    fn metric(&self, text: &mut TextRenderer, canvas: &mut Canvas, value: &str, x: i32, y: i32) -> i32 {
-        text.draw_text(canvas, value, x, y, self.palette.foreground, self.palette.surface)
+    fn metric(
+        &self,
+        text: &mut TextRenderer,
+        canvas: &mut Canvas,
+        value: &str,
+        x: i32,
+        y: i32,
+    ) -> i32 {
+        text.draw_text(
+            canvas,
+            value,
+            x,
+            y,
+            self.palette.foreground,
+            self.palette.surface,
+        )
     }
 
     /// Retain the beginning of a string and replace its overflowing end with
@@ -426,7 +440,14 @@ impl Painter {
         let title_y = rect.y + 12;
         let hero_y = self.bands.hero_baseline(rect.y);
         let details_y = self.bands.details_y(rect.y);
-        title_text.draw_text(canvas, title, rect.x + 14, title_y, self.palette.dim, surface);
+        title_text.draw_text(
+            canvas,
+            title,
+            rect.x + 14,
+            title_y,
+            self.palette.dim,
+            surface,
+        );
         // Keep card metadata inside the same safe right-side region used by
         // the CPU brand. Truncate the end of long platform/device names so
         // the title and metadata remain readable at narrow card widths.
@@ -442,7 +463,14 @@ impl Painter {
         );
         let hero_end = self.metric(hero_text, canvas, hero, rect.x + 14, hero_y);
         let unit_y = hero_y + hero_text.baseline_offset() - subtitle_text.baseline_offset();
-        subtitle_text.draw_text(canvas, unit, hero_end + 6, unit_y, self.palette.dim, surface);
+        subtitle_text.draw_text(
+            canvas,
+            unit,
+            hero_end + 6,
+            unit_y,
+            self.palette.dim,
+            surface,
+        );
         let row_width = rect.w - 28;
         let normal_y = details_y + subtitle_text.baseline_offset() - normal_text.baseline_offset();
         let pair_widths: Vec<i32> = details
@@ -619,9 +647,23 @@ impl Painter {
             let gap = ((row_width - used_width) / 2).max(8);
             let mut x = row_x;
             for ((label, value), pair_width) in report.cpu.details.iter().zip(pair_widths) {
-                subtitle_text.draw_text(canvas, label, x, details_y, self.palette.faint, self.palette.surface);
+                subtitle_text.draw_text(
+                    canvas,
+                    label,
+                    x,
+                    details_y,
+                    self.palette.faint,
+                    self.palette.surface,
+                );
                 let value_x = x + subtitle_text.measure(label) + 8;
-                text.draw_text(canvas, value, value_x, normal_details_y, self.palette.dim, self.palette.surface);
+                text.draw_text(
+                    canvas,
+                    value,
+                    value_x,
+                    normal_details_y,
+                    self.palette.dim,
+                    self.palette.surface,
+                );
                 x += pair_width + gap;
             }
         }
@@ -793,7 +835,14 @@ impl Painter {
                 self.palette.faint,
                 self.palette.surface,
             );
-            subtitle_text.draw_text(canvas, "PID", left, proc_rect.y + 40, self.palette.faint, self.palette.surface);
+            subtitle_text.draw_text(
+                canvas,
+                "PID",
+                left,
+                proc_rect.y + 40,
+                self.palette.faint,
+                self.palette.surface,
+            );
             subtitle_text.draw_text(
                 canvas,
                 "Name",
@@ -826,13 +875,24 @@ impl Painter {
                 let y = first_row + i32::try_from(row).unwrap_or(0) * row_height;
                 let name_width = (cpu_right - name_left - 12).max(1);
                 let name = Self::truncate_prefix(&process.name, text, name_width);
-                text.draw_text(canvas, &process.pid.to_string(), left, y, self.palette.dim, self.palette.surface);
+                text.draw_text(
+                    canvas,
+                    &process.pid.to_string(),
+                    left,
+                    y,
+                    self.palette.dim,
+                    self.palette.surface,
+                );
                 text.draw_text(
                     canvas,
                     &name,
                     name_left,
                     y,
-                    if row == 0 { self.palette.temperature } else { self.palette.foreground },
+                    if row == 0 {
+                        self.palette.temperature
+                    } else {
+                        self.palette.foreground
+                    },
                     self.palette.surface,
                 );
                 // Process CPU remains measured in one-core percentage, but
@@ -856,7 +916,11 @@ impl Painter {
                 if fill > 0 {
                     canvas.fill_rect(
                         Rect::new(bar_left, bar_y, fill, 6),
-                        if row == 0 { self.palette.temperature } else { self.palette.cpu },
+                        if row == 0 {
+                            self.palette.temperature
+                        } else {
+                            self.palette.cpu
+                        },
                     );
                 }
                 text.draw_text_right(

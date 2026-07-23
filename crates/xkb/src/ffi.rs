@@ -128,10 +128,10 @@ unsafe extern "C" {
 }
 
 impl Lib {
-    /// Fetch one symbol by name, transmuting to the caller-specified
-    /// function pointer type. Returns `None` (after draining `dlerror`) if
-    /// missing. An associated fn rather than a free one -- it's the
-    /// primitive [`Self::open`] is built from, so it belongs to `Lib`.
+    /// Fetch one symbol by name, transmuting to the caller-specified function
+    /// pointer type. Returns `None` (after draining `dlerror`) if missing.
+    /// An associated fn rather than a free one -- it's the primitive
+    /// [`Self::open`] is built from, so it belongs to `Lib`.
     ///
     /// # Safety
     /// `T` must exactly match the C signature of `name` in the loaded

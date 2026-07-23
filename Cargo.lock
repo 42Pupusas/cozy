@@ -159,6 +159,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "launcher"
+version = "0.1.0"
+
+[[package]]
+name = "launcher-bin"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "launcher",
+ "platform",
+ "quetzalcoatl",
+ "statusbar",
+ "waker",
+ "xkb",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -72,7 +72,9 @@ fn make_target() -> Vec<u32> {
 fn rebuild(bencher: divan::Bencher) {
     let values = make_history(HISTORY);
     bencher
-        .counter(BytesCount::new((CARD_W * CARD_H) as usize * size_of::<u32>()))
+        .counter(BytesCount::new(
+            (CARD_W * CARD_H) as usize * size_of::<u32>(),
+        ))
         .bench_local(|| {
             // A fresh cache each iteration forces `needs_rebuild` every time.
             let mut cache = ChartCache::new(Color::rgb(0x12, 0x14, 0x18));
@@ -120,7 +122,9 @@ fn advance_one(bencher: divan::Bencher) {
     }
     let mut sequence = HISTORY as u64;
     bencher
-        .counter(BytesCount::new((CARD_W * CARD_H) as usize * size_of::<u32>()))
+        .counter(BytesCount::new(
+            (CARD_W * CARD_H) as usize * size_of::<u32>(),
+        ))
         .bench_local(|| {
             sequence += 1;
             let mut canvas = Canvas::new(&mut target, CARD_W, CARD_H);
@@ -163,7 +167,9 @@ fn idle_glide(bencher: divan::Bencher) {
         );
     }
     bencher
-        .counter(BytesCount::new((CARD_W * CARD_H) as usize * size_of::<u32>()))
+        .counter(BytesCount::new(
+            (CARD_W * CARD_H) as usize * size_of::<u32>(),
+        ))
         .bench_local(|| {
             let mut canvas = Canvas::new(&mut target, CARD_W, CARD_H);
             cache.paint(

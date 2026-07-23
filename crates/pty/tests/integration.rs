@@ -154,6 +154,24 @@ fn colorterm_env_var_is_always_set_in_child() {
 }
 
 #[test]
+fn force_hyperlink_env_var_is_always_set_in_child() {
+    // Hyperlink-capability detection crates (e.g. `supports-hyperlinks`,
+    // used by trunk and widely copied) only emit OSC 8 when they recognize
+    // TERM/TERM_PROGRAM/VTE_VERSION/etc, none of which this terminal sets
+    // to a value they know. FORCE_HYPERLINK=1 is the universal override
+    // that same ecosystem checks first, so it must always reach the child
+    // (unless the parent env already expressed its own opinion).
+    let cmd = "if [ -z \"$FORCE_HYPERLINK\" ]; then echo FH_EMPTY; else echo FH_OK; fi";
+    let mut pty = PtySimple::spawn("/bin/sh", &["-c", cmd], 80, 24).expect("spawn");
+    let out = read_until(&mut pty, Duration::from_secs(3));
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("FH_OK"),
+        "FORCE_HYPERLINK was unset in child: {text:?}"
+    );
+}
+
+#[test]
 fn embedded_nul_in_shell_path_is_rejected_not_panicking() {
     let result = PtySimple::spawn("/bin/sh\0evil", &[], 80, 24);
     assert!(result.is_err(), "a NUL byte in the path must be rejected");

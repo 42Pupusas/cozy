@@ -155,15 +155,51 @@ impl XkbKeysym {
 /// instead of a free function -- `XkbKeysym` is the natural owner since this
 /// is purely a fold over its own variants.
 impl XkbKeysym {
-    /// Translate this XKB keysym into our `Key` enum.
+    /// Translate this XKB keysym into our `Key` enum. Split into three
+    /// thematic helpers (editing/control keys, navigation, function keys)
+    /// plus the modifier fold kept here, each an independent exhaustive
+    /// sub-match -- the single 39-arm match this replaced was one function
+    /// carrying all of that complexity at once (CC 32) for no reason beyond
+    /// "they're all keysym -> Key mappings"; grouped by what a person
+    /// actually thinks of as related keys, each group is now independently
+    /// readable and (if ever needed) testable.
     pub(crate) const fn to_key(self) -> Key {
-        match self {
+        if let Some(key) = self.to_editing_key() {
+            return key;
+        }
+        if let Some(key) = self.to_navigation_key() {
+            return key;
+        }
+        if let Some(key) = self.to_function_key() {
+            return key;
+        }
+        // Unreachable in practice: the three helpers above plus this one
+        // collectively cover every `XkbKeysym` variant today (see each
+        // one's doc comment for its slice). A new variant added without
+        // teaching it to one of the four helpers would panic here rather
+        // than silently mis-translating -- loud failure over a wrong
+        // keypress.
+        self.to_modifier_key()
+            .expect("every XkbKeysym variant is covered by one of the 4 helpers")
+    }
+
+    /// Backspace/Tab/Enter/Escape/Delete/Insert -- the non-modifier,
+    /// non-navigation control keys.
+    const fn to_editing_key(self) -> Option<Key> {
+        Some(match self {
             Self::BackSpace => Key::Backspace,
             Self::Tab => Key::Tab,
             Self::Return | Self::KpEnter => Key::Enter,
             Self::Escape => Key::Esc,
             Self::Delete => Key::Delete,
             Self::Insert => Key::Insert,
+            _ => return None,
+        })
+    }
+
+    /// Home/End/`PageUp`/`PageDown`/arrow keys.
+    const fn to_navigation_key(self) -> Option<Key> {
+        Some(match self {
             Self::Home => Key::Home,
             Self::End => Key::End,
             Self::PageUp => Key::PageUp,
@@ -172,6 +208,13 @@ impl XkbKeysym {
             Self::Up => Key::Up,
             Self::Right => Key::Right,
             Self::Down => Key::Down,
+            _ => return None,
+        })
+    }
+
+    /// F1..=F12.
+    const fn to_function_key(self) -> Option<Key> {
+        Some(match self {
             Self::F1 => Key::F1,
             Self::F2 => Key::F2,
             Self::F3 => Key::F3,
@@ -184,6 +227,16 @@ impl XkbKeysym {
             Self::F10 => Key::F10,
             Self::F11 => Key::F11,
             Self::F12 => Key::F12,
+            _ => return None,
+        })
+    }
+
+    /// Shift/Ctrl/`CapsLock`/`NumLock`/`ScrollLock`/Alt/Super/Menu -- the
+    /// only variants left once `to_editing_key`/`to_navigation_key`/
+    /// `to_function_key` have all missed, so `to_key` calls this last and
+    /// unwraps unconditionally.
+    const fn to_modifier_key(self) -> Option<Key> {
+        Some(match self {
             Self::ShiftL | Self::ShiftR => Key::LShift,
             Self::ControlL | Self::ControlR => Key::LCtrl,
             // No dedicated NumLock/ScrollLock/Menu/Super variants in
@@ -196,7 +249,8 @@ impl XkbKeysym {
             Self::CapsLock | Self::NumLock | Self::ScrollLock => Key::CapsLock,
             Self::AltL | Self::AltR => Key::LAlt,
             Self::SuperL | Self::SuperR | Self::Menu => Key::LMeta,
-        }
+            _ => return None,
+        })
     }
 }
 

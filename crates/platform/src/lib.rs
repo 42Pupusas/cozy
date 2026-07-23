@@ -22,6 +22,7 @@ pub mod font;
 pub mod id;
 mod key_repeat;
 pub mod keymap;
+pub mod link_scan;
 pub mod premultiply;
 pub mod present;
 pub mod protocol;

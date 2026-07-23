@@ -141,129 +141,6 @@ struct Globals {
     output: Option<OutputId>,
 }
 
-/// Accumulates globals as `wl_registry.global` events arrive. Mirrors
-/// `platform::window`'s `GlobalsBuilder`: pulled out of `BarWindow::discover`
-/// (which had the same shape -- a `while` loop over 5 Option<Id> locals plus
-/// a 5-armed match, each arm repeating "already bound? else bind and stash")
-/// so the loop condition and per-event dispatch are each one named,
-/// independently readable method.
-#[derive(Default)]
-struct GlobalsBuilder {
-    compositor: Option<CompositorId>,
-    shm: Option<ShmId>,
-    layer_shell: Option<LayerShellId>,
-    seat: Option<SeatId>,
-    output: Option<OutputId>,
-}
-
-impl GlobalsBuilder {
-    /// Whether every global `BarWindow::discover`'s caller needs has been
-    /// bound. `wl_output` is optional (not every compositor advertises one
-    /// at startup), so it's excluded -- the registry burst loop stops as
-    /// soon as the required set is complete.
-    const fn has_every_required_global(&self) -> bool {
-        self.compositor.is_some()
-            && self.shm.is_some()
-            && self.layer_shell.is_some()
-            && self.seat.is_some()
-    }
-
-    /// Bind `interface` if it's one this bar needs and hasn't already bound,
-    /// delegating to `Self::bind_if_missing` so each match arm is a single
-    /// call instead of an inline `&&`-guard plus a 2-line body (see
-    /// `platform::window::GlobalsBuilder`'s identical split for the same
-    /// rationale). A no-op for any interface not in the list below.
-    fn bind_named_global(
-        &mut self,
-        sender: &mut Sender,
-        registry: RegistryId,
-        name: u32,
-        interface: &str,
-        version: u32,
-    ) -> Result<()> {
-        match interface {
-            s if s == proto::WL_COMPOSITOR.name => Self::bind_if_missing(
-                &mut self.compositor,
-                sender,
-                registry,
-                name,
-                interface,
-                version,
-                proto::WL_COMPOSITOR.version,
-            ),
-            s if s == proto::WL_SHM.name => Self::bind_if_missing(
-                &mut self.shm,
-                sender,
-                registry,
-                name,
-                interface,
-                version,
-                proto::WL_SHM.version,
-            ),
-            s if s == proto::ZWLR_LAYER_SHELL_V1.name => Self::bind_if_missing(
-                &mut self.layer_shell,
-                sender,
-                registry,
-                name,
-                interface,
-                version,
-                proto::ZWLR_LAYER_SHELL_V1.version,
-            ),
-            s if s == proto::WL_SEAT.name => Self::bind_if_missing(
-                &mut self.seat,
-                sender,
-                registry,
-                name,
-                interface,
-                version,
-                proto::WL_SEAT.version,
-            ),
-            s if s == proto::WL_OUTPUT.name => Self::bind_if_missing(
-                &mut self.output,
-                sender,
-                registry,
-                name,
-                interface,
-                version,
-                proto::WL_OUTPUT.version,
-            ),
-            _ => Ok(()),
-        }
-    }
-
-    /// Bind one global into `slot` if it's still empty, negotiating the
-    /// version as `known_version.min(advertised_version)`. Shared body for
-    /// every arm of [`Self::bind_named_global`].
-    fn bind_if_missing<T: ObjectId>(
-        slot: &mut Option<T>,
-        sender: &mut Sender,
-        registry: RegistryId,
-        name: u32,
-        interface: &str,
-        advertised_version: u32,
-        known_version: u32,
-    ) -> Result<()> {
-        if slot.is_some() {
-            return Ok(());
-        }
-        let v = known_version.min(advertised_version);
-        *slot = Some(BarWindow::bind(sender, registry, name, interface, v)?);
-        Ok(())
-    }
-
-    /// Consume the builder into the final [`Globals`], failing if any
-    /// required global never arrived.
-    fn finish(self) -> Result<Globals> {
-        Ok(Globals {
-            compositor: self.compositor.ok_or(Error::ReaderStopped)?,
-            shm: self.shm.ok_or(Error::ReaderStopped)?,
-            layer_shell: self.layer_shell.ok_or(Error::ReaderStopped)?,
-            seat: self.seat.ok_or(Error::ReaderStopped)?,
-            output: self.output,
-        })
-    }
-}
-
 impl BarWindow {
     /// Open a layer-shell bar `height` pixels thick, docked at `edge`, and
     /// reserving that much exclusive space, with the given background
@@ -500,7 +377,14 @@ impl BarWindow {
 
         // wl_seat.capabilities
         if ev.is(self.seat) && ev.event::<SeatEvent>() == Some(SeatEvent::Capabilities) {
-            self.handle_seat_capabilities(ev);
+            let caps = ev.arg(0);
+            if self.pointer.id().is_none() && SeatCapability::Pointer.in_mask(caps) {
+                let pointer: platform::id::PointerId = self.window_tx.alloc_id();
+                self.window_tx.request(
+                    MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer),
+                );
+                self.pointer.set_id(pointer);
+            }
             return Ok(());
         }
 
@@ -515,57 +399,31 @@ impl BarWindow {
         }
 
         if ev.is(self.layer_surface) {
-            return self.handle_layer_surface_event(ev);
+            match ev.event::<LayerSurfaceEvent>() {
+                Some(LayerSurfaceEvent::Configure) => {
+                    let serial = ev.arg(0);
+                    // Wayland surface dimensions never approach i32::MAX,
+                    // so this is never actually a sign-changing wrap.
+                    let w = ev.arg(1).cast_signed() * self.scale;
+                    self.window_tx.request(
+                        MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
+                            .u32(serial),
+                    );
+                    if w > 0 {
+                        self.resize(w)?;
+                    }
+                    self.configured = true;
+                    self.present.mark_dirty();
+                    return Ok(());
+                }
+                Some(LayerSurfaceEvent::Closed) => {
+                    self.closing = true;
+                    return Ok(());
+                }
+                None => {}
+            }
         }
         Ok(())
-    }
-
-    /// Handle `wl_seat.capabilities`: request a `wl_pointer` the first time
-    /// the seat advertises one. Split out of `handle_event` -- this whole
-    /// block is one self-contained concern (bind-once pointer discovery)
-    /// that doesn't need to share stack frame with the connection-level
-    /// dispatch around it.
-    fn handle_seat_capabilities(&mut self, ev: &RawEvent) {
-        let caps = ev.arg(0);
-        if self.pointer.id().is_none() && SeatCapability::Pointer.in_mask(caps) {
-            let pointer: platform::id::PointerId = self.window_tx.alloc_id();
-            self.window_tx
-                .request(MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer));
-            self.pointer.set_id(pointer);
-        }
-    }
-
-    /// Handle `zwlr_layer_surface_v1.*`: `Configure` (ack + resize to the
-    /// compositor-assigned width) and `Closed` (mark the bar for teardown).
-    /// Split out of `handle_event` for the same reason as
-    /// [`Self::handle_seat_capabilities`] -- this is the only branch group
-    /// in `handle_event` that can itself fail (via `resize`), so giving it
-    /// its own `Result`-returning method keeps that fallibility local
-    /// instead of threading through an inline match arm.
-    fn handle_layer_surface_event(&mut self, ev: &RawEvent) -> Result<()> {
-        match ev.event::<LayerSurfaceEvent>() {
-            Some(LayerSurfaceEvent::Configure) => {
-                let serial = ev.arg(0);
-                // Wayland surface dimensions never approach i32::MAX, so
-                // this is never actually a sign-changing wrap.
-                let w = ev.arg(1).cast_signed() * self.scale;
-                self.window_tx.request(
-                    MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
-                        .u32(serial),
-                );
-                if w > 0 {
-                    self.resize(w)?;
-                }
-                self.configured = true;
-                self.present.mark_dirty();
-                Ok(())
-            }
-            Some(LayerSurfaceEvent::Closed) => {
-                self.closing = true;
-                Ok(())
-            }
-            None => Ok(()),
-        }
     }
 
     /// Resize to `width` (physical pixels; height is fixed for the bar's
@@ -677,8 +535,13 @@ impl BarWindow {
                 .new_id(registry),
         )?;
 
-        let mut globals = GlobalsBuilder::default();
-        while !globals.has_every_required_global() {
+        let mut compositor: Option<CompositorId> = None;
+        let mut shm: Option<ShmId> = None;
+        let mut layer_shell: Option<LayerShellId> = None;
+        let mut seat: Option<SeatId> = None;
+        let mut output: Option<OutputId> = None;
+
+        while compositor.is_none() || shm.is_none() || layer_shell.is_none() || seat.is_none() {
             let event = events.pop_block().ok_or(Error::ReaderStopped)?;
             let RawEvent::Bytes(bytes) = event else {
                 continue;
@@ -703,10 +566,38 @@ impl BarWindow {
                 let name = ev.u32();
                 let interface = ev.string();
                 let version = ev.u32();
-                globals.bind_named_global(sender, registry, name, &interface, version)?;
+                match interface.as_str() {
+                    s if s == proto::WL_COMPOSITOR.name && compositor.is_none() => {
+                        let v = proto::WL_COMPOSITOR.version.min(version);
+                        compositor = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
+                    s if s == proto::WL_SHM.name && shm.is_none() => {
+                        let v = proto::WL_SHM.version.min(version);
+                        shm = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
+                    s if s == proto::ZWLR_LAYER_SHELL_V1.name && layer_shell.is_none() => {
+                        let v = proto::ZWLR_LAYER_SHELL_V1.version.min(version);
+                        layer_shell = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
+                    s if s == proto::WL_SEAT.name && seat.is_none() => {
+                        let v = proto::WL_SEAT.version.min(version);
+                        seat = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
+                    s if s == proto::WL_OUTPUT.name && output.is_none() => {
+                        let v = proto::WL_OUTPUT.version.min(version);
+                        output = Some(Self::bind(sender, registry, name, &interface, v)?);
+                    }
+                    _ => {}
+                }
             }
         }
-        globals.finish()
+        Ok(Globals {
+            compositor: compositor.ok_or(Error::ReaderStopped)?,
+            shm: shm.ok_or(Error::ReaderStopped)?,
+            layer_shell: layer_shell.ok_or(Error::ReaderStopped)?,
+            seat: seat.ok_or(Error::ReaderStopped)?,
+            output,
+        })
     }
 
     /// Delegates to the role-agnostic

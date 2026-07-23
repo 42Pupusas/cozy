@@ -43,7 +43,7 @@ pub use colors::ModuleKind;
 pub use cpu::Cpu;
 pub use memory::Memory;
 pub use notifications::{NotificationSegment, Notifications};
-pub use scroll::ScrollAccumulator;
+pub use scroll::{ScrollAccumulator, steps_to_delta_pct};
 pub use temperature::Temperature;
 pub use text::TextRenderer;
 pub use tray::{TrayItem, TraySnapshot, TrayWatcher};

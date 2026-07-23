@@ -302,12 +302,14 @@ pub struct TermWindow {
     /// clean on the next frame before the (possibly moved/cleared) selection
     /// is re-tinted, so highlight never lingers after deselect or drag.
     prev_selection_rows: Vec<u16>,
-    /// `link_id` of the cell the pointer is over while Ctrl is held (`0` for
-    /// "none"), and the viewport row that hover-underline was last drawn on
-    /// (so the next frame knows what to repaint clean before redrawing or
-    /// removing it). Set from pointer motion in `handle_pointer`; consumed by
+    /// What the pointer is over while Ctrl is held (`None` for "nothing"),
+    /// either a real OSC 8 link or a detected plain-text URL -- see
+    /// [`crate::link_scan::LinkTarget`]. Paired with the viewport row
+    /// hover-underline was last drawn on (so the next frame knows what to
+    /// repaint clean before redrawing or removing it). Set from pointer
+    /// motion in `handle_pointer`; consumed by
     /// [`Self::apply_link_hover_underline`] in the present path.
-    hover_link_id: u32,
+    hover_link: Option<crate::link_scan::LinkTarget>,
     prev_hover_row: Option<u16>,
     /// Viewport rows the cursor overlay touched on the previous frame.
     /// Repainted clean before drawing the cursor at its new (possibly
@@ -560,7 +562,7 @@ impl TermWindow {
             selection: crate::selection::SelectionTracker::new(),
             awaiting_keymap_fd: None,
             prev_selection_rows: Vec::new(),
-            hover_link_id: 0,
+            hover_link: None,
             prev_hover_row: None,
             prev_cursor_rows: Vec::new(),
             cursor_anim: crate::cursor_anim::CursorAnimator::new(cursor_cfg),
@@ -627,6 +629,10 @@ impl TermWindow {
     /// cell is out of bounds, blank, or genuinely unlinked. Used to decide
     /// whether a Ctrl+click should open a URL, and to drive the
     /// hover-underline.
+    ///
+    /// Only sees *real* OSC 8 links -- callers that also want to catch
+    /// plain-text URLs (no application-side escape at all, e.g. `trunk
+    /// serve`'s banner) should go through [`Self::link_target_at`] instead.
     #[must_use]
     pub fn link_id_at(&self, col: u16, row: u16) -> u32 {
         self.selection
@@ -636,19 +642,38 @@ impl TermWindow {
             .map_or(0, grid::Cell::link_id)
     }
 
-    /// Recompute which link (if any) is under the pointer given the current
-    /// Ctrl state, and mark the window dirty if that changed the on-screen
-    /// hover-underline (either a different link, or Ctrl toggled while over
-    /// the same one). Called on every pointer motion and every modifier
-    /// change, since either can start or end a hover.
+    /// What's clickable at viewport `(col, row)`: a real OSC 8 link if the
+    /// cell carries one, else a plain-text URL if [`crate::link_scan`]
+    /// detects one running through this column, else `None`. Checking the
+    /// real link first is what lets `UrlScanner::scan_line` skip
+    /// already-linked cells cheaply (see its doc comment) without this
+    /// caller needing to duplicate that precedence.
+    #[must_use]
+    pub fn link_target_at(&self, col: u16, row: u16) -> Option<crate::link_scan::LinkTarget> {
+        let id = self.link_id_at(col, row);
+        if id != 0 {
+            return Some(crate::link_scan::LinkTarget::Real(id));
+        }
+        let line = self.selection.mirror().get(usize::from(row))?;
+        crate::link_scan::UrlScanner::find_at(line, col).map(crate::link_scan::LinkTarget::Url)
+    }
+
+    /// Recompute which link (if any) is under the pointer, and mark the
+    /// window dirty if that changed the on-screen hover-underline. Called on
+    /// every pointer motion.
+    ///
+    /// The underline itself is shown unconditionally (not gated on Ctrl) --
+    /// matching kitty/`WezTerm`: it's the "this is clickable" affordance a
+    /// user needs *before* deciding to hold Ctrl and click, so gating it on
+    /// Ctrl already being held made it useless (you'd only ever see the
+    /// underline on a link you'd already committed to clicking). Ctrl is
+    /// still required to actually *open* it -- see
+    /// [`crate::window::TermWindow`]'s caller of `try_open_hyperlink` (in
+    /// `bins/terminal`), which checks the modifier at click time instead.
     fn update_hover_link(&mut self, col: u16, row: u16) {
-        // XKB modifier index 2 (bit 0x04) is Ctrl -- same bit `press_left`'s
-        // shift check above reads for its own index (0x01).
-        let ctrl =
-            (self.modifiers.depressed | self.modifiers.latched | self.modifiers.locked) & 0x04 != 0;
-        let new = if ctrl { self.link_id_at(col, row) } else { 0 };
-        if new != self.hover_link_id {
-            self.hover_link_id = new;
+        let new = self.link_target_at(col, row);
+        if new != self.hover_link {
+            self.hover_link = new;
             self.present.mark_dirty();
         }
     }
@@ -1797,38 +1822,47 @@ impl TermWindow {
         }
     }
 
-    /// Draw a one-pixel underline across the hovered link's row-span (the
-    /// contiguous run of cells sharing `hover_link_id` that includes the
-    /// pointer's column), so the user gets the familiar "this is clickable"
-    /// feedback before committing to the Ctrl+click. `None` when nothing is
-    /// hovered -- the caller is responsible for repainting `prev_hover_row`
-    /// clean first (same pattern as the selection highlight).
+    /// Draw a one-pixel underline across the hovered link's row-span (either
+    /// the contiguous run of cells sharing a real OSC 8 link id, or a
+    /// detected plain-text URL's own span), so the user gets the familiar
+    /// "this is clickable" feedback before committing to the Ctrl+click.
+    /// No-op when nothing is hovered -- the caller is responsible for
+    /// repainting `prev_hover_row` clean first (same pattern as the
+    /// selection highlight).
     fn apply_link_hover_underline(&mut self) {
         // Light blue underline, preserving whatever alpha byte the pixel
         // already carried (top byte, only meaningful on a translucent
         // window -- see `Renderer::pack_bg`).
         const UNDERLINE_RGB: u32 = 0x00A0_C0FF;
 
-        if self.hover_link_id == 0 {
+        let Some(target) = &self.hover_link else {
             return;
-        }
+        };
         let (_, row) = self.pointer_cell();
         let Some(line) = self.selection.mirror().get(usize::from(row)) else {
             return;
         };
-        // Find the contiguous run of cells sharing the hovered link id.
-        // (`line` came straight from `row` above, so no need to re-check it.)
-        let id = self.hover_link_id;
-        let mut lo = None;
-        let mut hi = None;
-        for (col, cell) in line.iter().enumerate() {
-            if cell.link_id() == id {
-                lo.get_or_insert(col);
-                hi = Some(col);
+        // Find the span to underline: a real link's contiguous same-id run,
+        // or a detected URL's own pre-computed span. (`line` came straight
+        // from `row` above, so no need to re-check it.)
+        let (lo, hi) = match target {
+            crate::link_scan::LinkTarget::Real(id) => {
+                let mut lo = None;
+                let mut hi = None;
+                for (col, cell) in line.iter().enumerate() {
+                    if cell.link_id() == *id {
+                        lo.get_or_insert(col);
+                        hi = Some(col);
+                    }
+                }
+                let (Some(lo), Some(hi)) = (lo, hi) else {
+                    return;
+                };
+                (lo, hi)
             }
-        }
-        let (Some(lo), Some(hi)) = (lo, hi) else {
-            return;
+            crate::link_scan::LinkTarget::Url(span) => {
+                (usize::from(span.start_col), usize::from(span.end_col))
+            }
         };
         let y = usize::from(row) * self.cell_h as usize + self.cell_h as usize - 1;
         let buf_w = self.width as usize;
@@ -2184,7 +2218,7 @@ impl TermWindow {
         {
             rows_to_repaint.push(r);
         }
-        if self.hover_link_id != 0 {
+        if self.hover_link.is_some() {
             let (_, row) = self.pointer_cell();
             if !rows_to_repaint.contains(&row) {
                 rows_to_repaint.push(row);

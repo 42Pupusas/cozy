@@ -1118,35 +1118,7 @@ impl TermWindow {
             return Ok(());
         }
 
-        // xdg_wm_base.ping
-        if ev.is(self.wm_base) && ev.event::<WmBaseEvent>() == Some(WmBaseEvent::Ping) {
-            self.handle_wm_base_ping(&ev);
-            return Ok(());
-        }
-
-        // xdg_surface.configure
-        if ev.is(self.xdg_surface)
-            && ev.event::<XdgSurfaceEvent>() == Some(XdgSurfaceEvent::Configure)
-        {
-            self.handle_xdg_surface_configure(&ev)?;
-            return Ok(());
-        }
-
-        // xdg_toplevel.close
-        if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Close) {
-            self.handle_toplevel_close();
-            return Ok(());
-        }
-
-        // xdg_toplevel.configure (resize)
-        if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Configure) {
-            self.handle_toplevel_configure(&ev);
-            return Ok(());
-        }
-
-        // wl_seat.capabilities
-        if ev.is(self.seat) && ev.event::<SeatEvent>() == Some(SeatEvent::Capabilities) {
-            self.handle_seat_capabilities(&ev);
+        if self.dispatch_shell_event(&ev)? {
             return Ok(());
         }
 
@@ -1166,12 +1138,73 @@ impl TermWindow {
             }
         }
 
+        self.dispatch_clipboard_data_event(&ev);
+
+        Ok(())
+    }
+
+    /// Dispatch the desktop-shell events every toplevel window handles:
+    /// `xdg_wm_base.ping`, `xdg_surface.configure`, `xdg_toplevel.close`/
+    /// `.configure`, and `wl_seat.capabilities`. Split out of `handle_event`
+    /// -- these five `if`s were each contributing their own branch (and, for
+    /// `xdg_surface.configure`, its own `?`) to `handle_event`'s cyclomatic
+    /// complexity despite having nothing to do with the pointer/keyboard/
+    /// clipboard dispatch that follows them, or with the connection-level
+    /// routing (`route_common`) that precedes them. Returns whether one of
+    /// them matched (and thus `handle_event` should return early).
+    fn dispatch_shell_event(&mut self, ev: &RawEvent) -> Result<bool> {
+        // xdg_wm_base.ping
+        if ev.is(self.wm_base) && ev.event::<WmBaseEvent>() == Some(WmBaseEvent::Ping) {
+            self.handle_wm_base_ping(ev);
+            return Ok(true);
+        }
+
+        // xdg_surface.configure
+        if ev.is(self.xdg_surface)
+            && ev.event::<XdgSurfaceEvent>() == Some(XdgSurfaceEvent::Configure)
+        {
+            self.handle_xdg_surface_configure(ev)?;
+            return Ok(true);
+        }
+
+        // xdg_toplevel.close
+        if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Close) {
+            self.handle_toplevel_close();
+            return Ok(true);
+        }
+
+        // xdg_toplevel.configure (resize)
+        if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Configure) {
+            self.handle_toplevel_configure(ev);
+            return Ok(true);
+        }
+
+        // wl_seat.capabilities
+        if ev.is(self.seat) && ev.event::<SeatEvent>() == Some(SeatEvent::Capabilities) {
+            self.handle_seat_capabilities(ev);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    /// Dispatch the three clipboard-related protocol objects --
+    /// `wl_data_device` (selection offers from other clients),
+    /// `wl_data_offer` (MIME types a peer advertises), and `wl_data_source`
+    /// (a peer wants our clipboard, or replaced it) -- to
+    /// [`crate::clipboard::ClipboardState`]. Split out of `handle_event` for
+    /// the same reason as [`Self::dispatch_shell_event`]: three more
+    /// independent `if let Some(id) = ...` checks that don't interact with
+    /// anything else in the dispatcher. This is the tail of `handle_event`,
+    /// so unlike the other extracted dispatchers it doesn't need to report
+    /// back whether it matched -- there's nothing left to fall through to.
+    fn dispatch_clipboard_data_event(&mut self, ev: &RawEvent) {
         // wl_data_device.* — clipboard selection offers from other clients.
         if let Some(dev) = self.clipboard.device_id() {
             if ev.is(dev) && ev.event::<DataDeviceEvent>() == Some(DataDeviceEvent::Selection) {
                 // arg(0) = new wl_data_offer id (0 = selection cleared).
                 self.clipboard.on_selection_event(ev.arg(0));
-                return Ok(());
+                return;
             }
         }
 
@@ -1182,7 +1215,7 @@ impl TermWindow {
                 if let Some(offer_ev) = ev.event::<DataOfferEvent>() {
                     crate::clipboard::ClipboardState::on_offer_event(offer_ev);
                 }
-                return Ok(());
+                return;
             }
         }
 
@@ -1195,11 +1228,8 @@ impl TermWindow {
                 if let Some(src_ev) = ev.event::<DataSourceEvent>() {
                     self.clipboard.on_source_event(src_ev);
                 }
-                return Ok(());
             }
         }
-
-        Ok(())
     }
 
     /// Dispatch one `wl_pointer.*` event to its handler. Split out of

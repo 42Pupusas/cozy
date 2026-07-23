@@ -62,7 +62,8 @@ fn sample(cores: usize) -> MonitorSample {
 #[divan::bench]
 fn from_sample_16_cores(bencher: divan::Bencher) {
     let sample = sample(16);
-    bencher.bench_local(|| divan::black_box(DisplaySnapshot::from_sample(divan::black_box(&sample))));
+    bencher
+        .bench_local(|| divan::black_box(DisplaySnapshot::from_sample(divan::black_box(&sample))));
 }
 
 /// A smaller machine, to see how much of the cost scales with core count (the
@@ -70,5 +71,6 @@ fn from_sample_16_cores(bencher: divan::Bencher) {
 #[divan::bench]
 fn from_sample_4_cores(bencher: divan::Bencher) {
     let sample = sample(4);
-    bencher.bench_local(|| divan::black_box(DisplaySnapshot::from_sample(divan::black_box(&sample))));
+    bencher
+        .bench_local(|| divan::black_box(DisplaySnapshot::from_sample(divan::black_box(&sample))));
 }

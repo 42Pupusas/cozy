@@ -19,8 +19,8 @@
 //! and only rewrites a device string when its identity actually changed
 //! (hotplug / first sample), so the hold path allocates nothing.
 
-use sysmon::MonitorSample;
 use std::time::{Duration, Instant};
+use sysmon::MonitorSample;
 
 /// How long a fresh sample takes to glide to its new value, independent of the
 /// 1 Hz sampling cadence.
@@ -92,9 +92,10 @@ impl SampleInterpolator {
         // Reuse the buffer's `cores` capacity: clear keeps the allocation, and
         // `extend` refills it without a new one once it has grown to core count.
         out.cores.clear();
-        out.cores.extend(self.to.cores.iter().enumerate().map(|(index, &value)| {
-            lerp(self.from.cores.get(index).copied().unwrap_or(value), value)
-        }));
+        out.cores
+            .extend(self.to.cores.iter().enumerate().map(|(index, &value)| {
+                lerp(self.from.cores.get(index).copied().unwrap_or(value), value)
+            }));
 
         out.cpu = lerp(self.from.cpu, self.to.cpu);
         out.load = std::array::from_fn(|index| lerp(self.from.load[index], self.to.load[index]));
@@ -163,9 +164,9 @@ impl SampleInterpolator {
 
 #[cfg(test)]
 mod tests {
-    use super::{SampleInterpolator, GLIDE_DURATION};
-    use sysmon::MonitorSample;
+    use super::{GLIDE_DURATION, SampleInterpolator};
     use std::time::Duration;
+    use sysmon::MonitorSample;
 
     #[test]
     fn glide_starts_at_zero_and_moves_immediately() {
@@ -195,7 +196,10 @@ mod tests {
             1.0
         );
         let held = SampleInterpolator::eased_progress(Duration::from_secs(1), GLIDE_DURATION);
-        assert_eq!(held, 1.0, "progress must hold at 1.0 after the glide window");
+        assert_eq!(
+            held, 1.0,
+            "progress must hold at 1.0 after the glide window"
+        );
     }
 
     #[test]
@@ -206,7 +210,10 @@ mod tests {
         for step in 0..=20 {
             let elapsed = GLIDE_DURATION * step / 20;
             let p = SampleInterpolator::eased_progress(elapsed, GLIDE_DURATION);
-            assert!(p >= last, "progress went backwards at step {step}: {p} < {last}");
+            assert!(
+                p >= last,
+                "progress went backwards at step {step}: {p} < {last}"
+            );
             last = p;
         }
         assert_eq!(last, 1.0);

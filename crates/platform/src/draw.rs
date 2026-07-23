@@ -22,6 +22,21 @@ pub struct Color {
     pub a: u8,
 }
 
+/// Every one of `config::Color`'s 24-bit RGB values is fully opaque -- the
+/// config file format has no per-color alpha concept (window/bar/monitor
+/// opacity are separate scalar fields) -- so this conversion always produces
+/// `a: 0xff`, same as [`Color::rgb`].
+///
+/// Was three call sites (`bins/monitor`, `bins/statusbar`, `render.rs`) each
+/// hand-rolling `Color::rgb(c.r, c.g, c.b)`; a `From` impl is the idiomatic
+/// single place for a conversion this mechanical, and lets callers write
+/// `.into()` instead of repeating the field-by-field destructuring.
+impl From<config::Color> for Color {
+    fn from(c: config::Color) -> Self {
+        Self::rgb(c.r, c.g, c.b)
+    }
+}
+
 impl Color {
     /// Opaque color from 8-bit channels.
     #[must_use]

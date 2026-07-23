@@ -509,8 +509,7 @@ impl ProcessScanner {
             let Some(stat) = self.stat_reader.read(self.stat_path.as_str()) else {
                 continue;
             };
-            let Some((name, ticks, resident_pages)) = Self::process_stat_bytes(stat)
-            else {
+            let Some((name, ticks, resident_pages)) = Self::process_stat_bytes(stat) else {
                 continue;
             };
             self.collected.push(ProcessInfo {
@@ -1077,7 +1076,6 @@ impl MonitorReader {
         CpuState::parse_times_into(text, &mut result);
         result
     }
-
 }
 
 struct MemoryValues;

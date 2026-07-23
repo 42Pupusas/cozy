@@ -415,6 +415,73 @@ fn bar_notifications_missing_icon_is_a_validation_error() {
     assert!(err.contains("bar.notifications.icon"));
 }
 
+// ── [monitor] ─────────────────────────────────────────────────────────────
+
+#[test]
+fn monitor_defaults_mirror_bar_background_and_opacity() {
+    let cfg = Config::parse("[colors]\nbackground = \"#222222\"\n[window]\nopacity = 0.75\n");
+    assert_eq!(cfg.monitor_background(), Color::from_rgb(0x22, 0x22, 0x22));
+    assert_eq!(cfg.monitor_surface(), Color::from_rgb(0x22, 0x22, 0x22));
+    assert!((cfg.monitor_background_opacity() - 0.75).abs() < 1e-9);
+}
+
+#[test]
+fn monitor_color_overrides_win_over_mirrored_bar_background() {
+    let cfg = Config::parse(
+        "[colors]\nbackground = \"#222222\"\n[monitor]\nbackground = \"#0a0a0b\"\nsurface = \"#181616\"\n",
+    );
+    assert_eq!(cfg.monitor_background(), Color::from_rgb(0x0a, 0x0a, 0x0b));
+    assert_eq!(cfg.monitor_surface(), Color::from_rgb(0x18, 0x16, 0x16));
+}
+
+#[test]
+fn monitor_text_and_accent_colors_default_to_built_ins() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.monitor_foreground(), Color::from_rgb(0xf2, 0xf2, 0xf3));
+    assert_eq!(cfg.monitor_dim(), Color::from_rgb(0x8a, 0x8a, 0x90));
+    assert_eq!(cfg.monitor_faint(), Color::from_rgb(0x55, 0x55, 0x5a));
+    assert_eq!(cfg.monitor_border(), Color::from_rgb(0x1e, 0x1e, 0x21));
+    assert_eq!(cfg.monitor_cpu(), Color::from_rgb(0x8a, 0x9a, 0x7b));
+    assert_eq!(cfg.monitor_memory(), Color::from_rgb(0x8e, 0xa4, 0xa2));
+    assert_eq!(cfg.monitor_temperature(), Color::from_rgb(0xb6, 0x92, 0x7b));
+    assert_eq!(cfg.monitor_network(), Color::from_rgb(0x8e, 0xa4, 0xa2));
+}
+
+#[test]
+fn monitor_text_and_accent_colors_are_overridable() {
+    let cfg = Config::parse(
+        "[monitor]\nforeground = \"#ffffff\"\ndim = \"#aaaaaa\"\nfaint = \"#333333\"\nborder = \"#444444\"\ncpu = \"#ff0000\"\nmemory = \"#00ff00\"\ntemperature = \"#0000ff\"\nnetwork = \"#123456\"\n",
+    );
+    assert_eq!(cfg.monitor_foreground(), Color::from_rgb(0xff, 0xff, 0xff));
+    assert_eq!(cfg.monitor_dim(), Color::from_rgb(0xaa, 0xaa, 0xaa));
+    assert_eq!(cfg.monitor_faint(), Color::from_rgb(0x33, 0x33, 0x33));
+    assert_eq!(cfg.monitor_border(), Color::from_rgb(0x44, 0x44, 0x44));
+    assert_eq!(cfg.monitor_cpu(), Color::from_rgb(0xff, 0x00, 0x00));
+    assert_eq!(cfg.monitor_memory(), Color::from_rgb(0x00, 0xff, 0x00));
+    assert_eq!(cfg.monitor_temperature(), Color::from_rgb(0x00, 0x00, 0xff));
+    assert_eq!(cfg.monitor_network(), Color::from_rgb(0x12, 0x34, 0x56));
+}
+
+#[test]
+fn monitor_bad_color_is_a_validation_error() {
+    let err = Config::fail("[monitor]\nforeground = \"not-a-color\"\n");
+    assert!(err.contains("monitor.foreground"));
+}
+
+#[test]
+fn monitor_font_path_falls_back_to_terminal_font() {
+    let cfg = Config::parse("[font]\npath = \"/terminal.ttf\"\n");
+    assert_eq!(cfg.monitor_font_path(), Some("/terminal.ttf"));
+}
+
+#[test]
+fn monitor_font_path_override_wins() {
+    let cfg = Config::parse(
+        "[font]\npath = \"/terminal.ttf\"\n[monitor]\nfont_path = \"/monitor.ttf\"\n",
+    );
+    assert_eq!(cfg.monitor_font_path(), Some("/monitor.ttf"));
+}
+
 // ── ConfigError ───────────────────────────────────────────────────────────
 
 #[test]

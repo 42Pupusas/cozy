@@ -86,8 +86,8 @@ impl Theme {
         }
         Self {
             ansi,
-            fg: DrawColor::rgb(p.foreground.r, p.foreground.g, p.foreground.b),
-            bg: DrawColor::rgb(p.background.r, p.background.g, p.background.b),
+            fg: p.foreground.into(),
+            bg: p.background.into(),
             cube_overrides: Box::new([None; 256]),
         }
     }

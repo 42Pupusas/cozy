@@ -155,7 +155,10 @@ mod tests {
         // panic and must land at stable clamped values, so a garbage telemetry
         // reading can never crash the render loop or thrash the redraw gate.
         let nan = DisplaySnapshot::from_sample(&sample_with_cpu(f32::NAN));
-        assert_eq!(nan, DisplaySnapshot::from_sample(&sample_with_cpu(f32::NAN)));
+        assert_eq!(
+            nan,
+            DisplaySnapshot::from_sample(&sample_with_cpu(f32::NAN))
+        );
         let huge = DisplaySnapshot::from_sample(&sample_with_cpu(f32::INFINITY));
         let huge2 = DisplaySnapshot::from_sample(&sample_with_cpu(1e30));
         assert_eq!(huge, huge2, "both saturate to the same clamped hero value");

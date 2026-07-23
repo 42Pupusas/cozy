@@ -14,6 +14,7 @@ pub mod chart;
 pub mod chart_cache;
 pub mod core_bars;
 pub mod damage;
+pub mod dashboard_report;
 pub mod display_snapshot;
 pub mod redraw_gate;
 pub mod sample_interpolator;

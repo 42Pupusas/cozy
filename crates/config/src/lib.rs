@@ -88,6 +88,30 @@
 //! [[bar.notifications]]
 //! app_id = "Slack"
 //! icon   = "nf-md-slack"
+//!
+//! # Everything here is optional and defaults to *mirroring* the bar's own
+//! # resolved background/opacity (which itself mirrors the terminal's), or
+//! # a built-in Kanagawa-ish dark palette for the roles ([colors] has no
+//! # equivalent of).
+//! [monitor]
+//! background         = "#0a0a0b"   # window background; defaults to bar_background()
+//! background_opacity = 1.0         # defaults to bar_opacity()
+//! surface            = "#181616"   # card/chart-panel fill; defaults to bar_background()
+//! surface_opacity    = 1.0         # currently unused by the renderer; reserved
+//! foreground         = "#f2f2f3"   # hero/metric text
+//! dim                = "#8a8a90"   # secondary text (titles, units, process rows)
+//! faint              = "#55555a"  # tertiary text (detail labels, table headers)
+//! border             = "#1e1e21"  # card outline / bar track
+//! cpu                = "#8a9a7b"   # CPU card accent
+//! memory             = "#8ea4a2"   # memory card accent
+//! temperature        = "#b6927b"   # temperature card accent
+//! network            = "#8ea4a2"   # network card accent
+//! font_path          = "/path/to/font.ttf"  # defaults to [font].path
+//! font_size          = 14          # points; defaults to [font].size
+//! hero_size          = 2.5         # hero text size, as a multiple of font_size
+//! title_size         = 1.0         # card title size, as a multiple of font_size
+//! subtitle_size      = 0.90        # unit/metadata size, as a multiple of font_size
+//! normal_size        = 0.80        # detail-row/process-table size, as a multiple of font_size
 //! ```
 
 mod color;
@@ -389,6 +413,21 @@ pub struct MonitorConfig {
     pub title_size: Option<f32>,
     pub subtitle_size: Option<f32>,
     pub normal_size: Option<f32>,
+    /// Hero/metric text color override. `None` uses a built-in near-white
+    /// -- there's no single terminal-side setting to mirror (unlike
+    /// `background`/`surface`, which mirror the bar's own resolved
+    /// colors), since the dashboard's typography tiers (foreground/dim/
+    /// faint) have no equivalent concept in `[colors]`.
+    pub foreground: Option<Color>,
+    /// Secondary label/value text color override (card titles, hero units,
+    /// process names/PIDs). `None` uses a built-in mid-grey.
+    pub dim: Option<Color>,
+    /// Tertiary label color override (detail-row labels, table headers).
+    /// `None` uses a built-in dark grey.
+    pub faint: Option<Color>,
+    /// Card outline / bar-track color override. `None` uses a built-in
+    /// near-black grey.
+    pub border: Option<Color>,
     pub cpu: Option<Color>,
     pub memory: Option<Color>,
     pub temperature: Option<Color>,
@@ -717,6 +756,10 @@ impl Config {
         color!(background, "background");
         color!(surface, "surface");
         color!(cpu, "cpu");
+        color!(foreground, "foreground");
+        color!(dim, "dim");
+        color!(faint, "faint");
+        color!(border, "border");
         if let Some(value) = monitor.get_float_range(
             "background_opacity",
             "monitor.background_opacity",
@@ -946,6 +989,118 @@ impl Config {
             .font_path
             .as_deref()
             .or(self.font.path.as_deref())
+    }
+
+    /// The dashboard's window background: `[monitor].background` if set,
+    /// otherwise mirrors [`Config::bar_background`] (which itself mirrors
+    /// `[colors].background` unless the bar overrides it) -- so a monitor
+    /// with no `[monitor]` overrides matches the bar, which matches the
+    /// terminal, by default.
+    #[must_use]
+    pub fn monitor_background(&self) -> Color {
+        self.monitor
+            .background
+            .unwrap_or_else(|| self.bar_background())
+    }
+
+    /// The dashboard's card/chart-panel surface color: `[monitor].surface`
+    /// if set, otherwise mirrors [`Config::bar_background`] (same mirroring
+    /// rationale as [`Config::monitor_background`] -- there is no separate
+    /// `[colors]` concept of a "panel" color to mirror instead).
+    #[must_use]
+    pub fn monitor_surface(&self) -> Color {
+        self.monitor
+            .surface
+            .unwrap_or_else(|| self.bar_background())
+    }
+
+    /// The dashboard's background opacity, `0.0`-`1.0`: `[monitor].background_opacity`
+    /// if set, otherwise mirrors [`Config::bar_opacity`].
+    #[must_use]
+    pub fn monitor_background_opacity(&self) -> f64 {
+        self.monitor
+            .background_opacity
+            .unwrap_or_else(|| self.bar_opacity())
+    }
+
+    /// The dashboard's hero/metric text color: `[monitor].foreground` if
+    /// set, otherwise a built-in near-white (`#f2f2f3`) chosen for contrast
+    /// against the default dark surface -- unlike `background`/`surface`,
+    /// there's no terminal-side `[colors]` field this specific role
+    /// ("brightest dashboard text") naturally mirrors.
+    #[must_use]
+    pub fn monitor_foreground(&self) -> Color {
+        self.monitor
+            .foreground
+            .unwrap_or_else(|| Color::from_rgb(0xf2, 0xf2, 0xf3))
+    }
+
+    /// The dashboard's secondary text color (card titles, hero units,
+    /// process names/PIDs): `[monitor].dim` if set, otherwise a built-in
+    /// mid-grey (`#8a8a90`).
+    #[must_use]
+    pub fn monitor_dim(&self) -> Color {
+        self.monitor
+            .dim
+            .unwrap_or_else(|| Color::from_rgb(0x8a, 0x8a, 0x90))
+    }
+
+    /// The dashboard's tertiary text color (detail-row labels, table
+    /// headers): `[monitor].faint` if set, otherwise a built-in dark grey
+    /// (`#55555a`).
+    #[must_use]
+    pub fn monitor_faint(&self) -> Color {
+        self.monitor
+            .faint
+            .unwrap_or_else(|| Color::from_rgb(0x55, 0x55, 0x5a))
+    }
+
+    /// The dashboard's card outline / bar-track color: `[monitor].border`
+    /// if set, otherwise a built-in near-black grey (`#1e1e21`).
+    #[must_use]
+    pub fn monitor_border(&self) -> Color {
+        self.monitor
+            .border
+            .unwrap_or_else(|| Color::from_rgb(0x1e, 0x1e, 0x21))
+    }
+
+    /// The CPU card's accent color (hero line, per-core bar 0): `[monitor].cpu`
+    /// if set, otherwise a built-in muted green (`#8a9a7b`).
+    #[must_use]
+    pub fn monitor_cpu(&self) -> Color {
+        self.monitor
+            .cpu
+            .unwrap_or_else(|| Color::from_rgb(0x8a, 0x9a, 0x7b))
+    }
+
+    /// The memory card's accent color: `[monitor].memory` if set, otherwise
+    /// a built-in muted cyan (`#8ea4a2`).
+    #[must_use]
+    pub fn monitor_memory(&self) -> Color {
+        self.monitor
+            .memory
+            .unwrap_or_else(|| Color::from_rgb(0x8e, 0xa4, 0xa2))
+    }
+
+    /// The temperature card's accent color: `[monitor].temperature` if set,
+    /// otherwise a built-in muted orange (`#b6927b`).
+    #[must_use]
+    pub fn monitor_temperature(&self) -> Color {
+        self.monitor
+            .temperature
+            .unwrap_or_else(|| Color::from_rgb(0xb6, 0x92, 0x7b))
+    }
+
+    /// The network card's accent color (download line/bars): `[monitor].network`
+    /// if set, otherwise a built-in muted cyan (`#8ea4a2`, same as
+    /// [`Config::monitor_memory`]'s default -- the two cards don't collide
+    /// on-screen so sharing a hue is fine, matching the dashboard's
+    /// original hardcoded palette).
+    #[must_use]
+    pub fn monitor_network(&self) -> Color {
+        self.monitor
+            .network
+            .unwrap_or_else(|| Color::from_rgb(0x8e, 0xa4, 0xa2))
     }
 
     /// The apps to watch for a compositor-reported urgent window -- see

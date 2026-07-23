@@ -2798,7 +2798,6 @@ impl Registry {
     fn output_scale(sender: &mut Sender, events: &mut Consumer<RawEvent>, output: OutputId) -> i32 {
         crate::surface::SurfaceBootstrap::output_scale(sender, events, output)
     }
-
 }
 
 #[cfg(test)]

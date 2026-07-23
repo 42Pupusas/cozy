@@ -1071,7 +1071,8 @@ impl<'a> UiLoop<'a> {
     fn apply_negotiated_modes(&mut self) {
         let negotiated = TermModes::unpack(self.term_modes.load(Ordering::Relaxed));
         negotiated.apply_to(&mut self.encoder);
-        self.win.set_app_mouse(negotiated.mouse_mode != MouseMode::Off);
+        self.win
+            .set_app_mouse(negotiated.mouse_mode != MouseMode::Off);
     }
 
     /// Drain one-shot bell/title/link/clipboard/palette events the parser
@@ -1279,41 +1280,10 @@ impl<'a> UiLoop<'a> {
         let Some(ikey) = key.to_input() else {
             return false;
         };
-        // Shift+PgUp/PgDn scroll the grid viewport by a page,
-        // instead of sending the escape to the shell (bare
-        // PgUp/PgDn still go to the shell for history search).
-        if kstate == KeyState::Pressed && mods.shift() {
-            let page = i32::from(self.grid_rows);
-            match ikey {
-                Key::PageUp => {
-                    let _ = self.scroll_tx.push(ParserMsg::Scroll { delta: page });
-                    return false;
-                }
-                Key::PageDown => {
-                    let _ = self.scroll_tx.push(ParserMsg::Scroll { delta: -page });
-                    return false;
-                }
-                _ => {}
-            }
-        }
-        // Ctrl+Shift+C / Ctrl+Shift+V: copy / paste via the system
-        // clipboard (handled by the window, not sent to the shell).
-        if kstate == KeyState::Pressed && mods.ctrl() && mods.shift() {
-            match ikey {
-                Key::Char('c') => {
-                    self.win.copy_selection();
-                    return false;
-                }
-                Key::Char('v') => {
-                    self.win.request_paste();
-                    return false;
-                }
-                Key::Enter => {
-                    SiblingSpawner::open_here(self.shell_pid.load(Ordering::Relaxed));
-                    return false;
-                }
-                _ => {}
-            }
+        if self.try_shift_page_scroll(kstate, mods, ikey)
+            || self.try_clipboard_shortcut(kstate, mods, ikey)
+        {
+            return false;
         }
         let mut ibuf = [0u8; 64];
         if let Some(n) = self.encoder.encode_key(ikey, kstate, mods, &mut ibuf) {
@@ -1325,6 +1295,59 @@ impl<'a> UiLoop<'a> {
             return true;
         }
         false
+    }
+
+    /// Shift+PgUp/PgDn scroll the grid viewport by a page instead of
+    /// sending the escape to the shell (bare `PgUp`/`PgDn` still go to the
+    /// shell for history search). Split out of `handle_key_event` -- this
+    /// and [`Self::try_clipboard_shortcut`] are two independent
+    /// "intercept this key combo before it reaches the shell" checks that
+    /// were each contributing their own match arms to one function's
+    /// complexity. Returns whether the combo was recognised (and thus
+    /// already fully handled).
+    fn try_shift_page_scroll(&self, kstate: KeyState, mods: input::Modifiers, ikey: Key) -> bool {
+        if kstate != KeyState::Pressed || !mods.shift() {
+            return false;
+        }
+        let page = i32::from(self.grid_rows);
+        match ikey {
+            Key::PageUp => {
+                let _ = self.scroll_tx.push(ParserMsg::Scroll { delta: page });
+                true
+            }
+            Key::PageDown => {
+                let _ = self.scroll_tx.push(ParserMsg::Scroll { delta: -page });
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Ctrl+Shift+C / Ctrl+Shift+V / Ctrl+Shift+Enter: copy / paste via the
+    /// system clipboard, or spawn a sibling shell in the same directory --
+    /// all handled by the window, never sent to the shell. Split out of
+    /// `handle_key_event` for the same reason as
+    /// [`Self::try_shift_page_scroll`]. Returns whether the combo was
+    /// recognised.
+    fn try_clipboard_shortcut(&mut self, kstate: KeyState, mods: input::Modifiers, ikey: Key) -> bool {
+        if kstate != KeyState::Pressed || !mods.ctrl() || !mods.shift() {
+            return false;
+        }
+        match ikey {
+            Key::Char('c') => {
+                self.win.copy_selection();
+                true
+            }
+            Key::Char('v') => {
+                self.win.request_paste();
+                true
+            }
+            Key::Enter => {
+                SiblingSpawner::open_here(self.shell_pid.load(Ordering::Relaxed));
+                true
+            }
+            _ => false,
+        }
     }
 
     /// `InputEvent::Mouse`: Ctrl+click on an OSC 8 hyperlink opens it in the
@@ -1343,30 +1366,8 @@ impl<'a> UiLoop<'a> {
         modifiers: platform::protocol::Modifiers,
     ) -> bool {
         use platform::window::MouseEventKind;
-        if kind == MouseEventKind::Press
-            && button == platform::window::MouseButton::Left
-            && modifiers.to_input().ctrl()
-            && TermModes::unpack(self.term_modes.load(Ordering::Relaxed)).mouse_mode
-                == MouseMode::Off
-        {
-            let link_id = self.win.link_id_at(col, row);
-            if link_id != 0
-                && let Some(uri) = self.links.get(&link_id)
-            {
-                // `spawn()` alone leaves a zombie once
-                // xdg-open exits -- dropping a `Child`
-                // does not reap it, and nothing here ever
-                // calls `wait()` on repeated Ctrl+clicks.
-                // Reap it on a throwaway thread instead of
-                // blocking the UI loop on `wait()`
-                // ourselves.
-                if let Ok(mut child) = std::process::Command::new("xdg-open").arg(uri).spawn() {
-                    std::thread::spawn(move || {
-                        let _ = child.wait();
-                    });
-                }
-                return false;
-            }
+        if self.try_open_hyperlink(button, kind, col, row, modifiers) {
+            return false;
         }
         let mev = MouseEvent {
             button: match button {
@@ -1392,6 +1393,52 @@ impl<'a> UiLoop<'a> {
             return true;
         }
         false
+    }
+
+    /// Ctrl+click on an OSC 8 hyperlink: open it in the user's default
+    /// handler instead of forwarding to the shell -- matching every other
+    /// terminal's hyperlink convention (kitty, foot, `WezTerm`, ...). Only
+    /// fires when no app has claimed mouse reporting (`mouse_mode ==
+    /// Off`): a mouse-aware app like vim gets the click as usual and can
+    /// handle OSC 8 itself. Split out of `handle_mouse_event` -- this
+    /// whole precondition-laden branch was one self-contained "is this a
+    /// hyperlink click" concern folded into a function whose real job is
+    /// building + encoding a VT mouse report. Returns whether a link was
+    /// opened (and the click should NOT also be forwarded to the shell).
+    fn try_open_hyperlink(
+        &self,
+        button: platform::window::MouseButton,
+        kind: platform::window::MouseEventKind,
+        col: u16,
+        row: u16,
+        modifiers: platform::protocol::Modifiers,
+    ) -> bool {
+        use platform::window::MouseEventKind;
+        if kind != MouseEventKind::Press
+            || button != platform::window::MouseButton::Left
+            || !modifiers.to_input().ctrl()
+            || TermModes::unpack(self.term_modes.load(Ordering::Relaxed)).mouse_mode
+                != MouseMode::Off
+        {
+            return false;
+        }
+        let link_id = self.win.link_id_at(col, row);
+        if link_id == 0 {
+            return false;
+        }
+        let Some(uri) = self.links.get(&link_id) else {
+            return false;
+        };
+        // `spawn()` alone leaves a zombie once xdg-open exits -- dropping a
+        // `Child` does not reap it, and nothing here ever calls `wait()` on
+        // repeated Ctrl+clicks. Reap it on a throwaway thread instead of
+        // blocking the UI loop on `wait()` ourselves.
+        if let Ok(mut child) = std::process::Command::new("xdg-open").arg(uri).spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        true
     }
 
     /// `InputEvent::Focus`: DECSET 1004 focus in/out reporting (`CSI I` /
@@ -2176,11 +2223,7 @@ mod key_translation_tests {
         d.note(80, 24);
         d.note(40, 24);
         d.note(20, 24);
-        assert_eq!(
-            d.take_if_settled(),
-            None,
-            "must not release mid-drag"
-        );
+        assert_eq!(d.take_if_settled(), None, "must not release mid-drag");
         // A wait cap is advertised so the loop wakes to flush later.
         assert!(d.wait_cap_ms().is_some());
 

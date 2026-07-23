@@ -1250,16 +1250,14 @@ impl TermWindow {
         let caps = ev.arg(0);
         if self.pointer.is_none() && SeatCapability::Pointer.in_mask(caps) {
             let pointer: PointerId = self.window_tx.alloc_id();
-            self.window_tx.request(
-                MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer),
-            );
+            self.window_tx
+                .request(MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer));
             self.pointer = Some(pointer);
         }
         if self.keyboard.is_none() && SeatCapability::Keyboard.in_mask(caps) {
             let keyboard: KeyboardId = self.window_tx.alloc_id();
-            self.window_tx.request(
-                MessageBuilder::new(self.seat, SeatRequest::GetKeyboard).new_id(keyboard),
-            );
+            self.window_tx
+                .request(MessageBuilder::new(self.seat, SeatRequest::GetKeyboard).new_id(keyboard));
             self.keyboard = Some(keyboard);
         }
     }
@@ -1321,8 +1319,7 @@ impl TermWindow {
         let button = PointerButton::from_code(ev.arg(2));
         let state = ButtonState::from_raw(ev.arg(3));
         let shift =
-            (self.modifiers.depressed | self.modifiers.latched | self.modifiers.locked) & 0x01
-                != 0;
+            (self.modifiers.depressed | self.modifiers.latched | self.modifiers.locked) & 0x01 != 0;
         // Ownership of the left button (kitty/foot/xterm
         // convention): while an app has negotiated mouse
         // tracking it owns bare clicks (reported, no terminal
@@ -1331,9 +1328,8 @@ impl TermWindow {
         // runs, report suppressed for the whole drag). With
         // no tracking the terminal owns the mouse outright.
         let is_left = matches!(button, Some(PointerButton::Left));
-        let bypass_starts = is_left
-            && matches!(state, Some(ButtonState::Pressed))
-            && (!self.app_mouse || shift);
+        let bypass_starts =
+            is_left && matches!(state, Some(ButtonState::Pressed)) && (!self.app_mouse || shift);
         let bypass_ends =
             is_left && matches!(state, Some(ButtonState::Released)) && self.selection_bypass;
         // Suppress the app report for both halves of a bypassed
@@ -1452,8 +1448,7 @@ impl TermWindow {
         }
         // Esc clears any active selection (and still passes
         // through to the application as a normal Esc).
-        if logical == Some(Key::Esc) && state == Some(KeyState::Pressed) && self.selection.clear()
-        {
+        if logical == Some(Key::Esc) && state == Some(KeyState::Pressed) && self.selection.clear() {
             self.present.mark_dirty();
         }
         self.input_queue.push_back(InputEvent::Key {
@@ -1988,7 +1983,8 @@ impl TermWindow {
                 let top = (rect.y.max(0)) / self.cell_h;
                 let bottom = ((rect.bottom().max(0) + self.cell_h - 1) / self.cell_h)
                     .min(((self.height + self.cell_h - 1) / self.cell_h).max(1));
-                touched_rows.extend((top..bottom).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
+                touched_rows
+                    .extend((top..bottom).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
             }
         }
     }
@@ -2261,9 +2257,12 @@ impl TermWindow {
         // baked overlays (fps readout, a resting cursor/selection) get dragged
         // by the memmove and their row trackers must be remapped to match.
         let mut canvas = crate::draw::Canvas::new(&mut self.backbuffer, self.width, self.height);
-        let (viewport_shifts, painted_rows, painted_cells) = self
-            .renderer
-            .blit_folded_snapshots(&mut canvas, &folded, &mut scrolls, &mut touched_rows);
+        let (viewport_shifts, painted_rows, painted_cells) = self.renderer.blit_folded_snapshots(
+            &mut canvas,
+            &folded,
+            &mut scrolls,
+            &mut touched_rows,
+        );
         // `Canvas` borrows `self.backbuffer` mutably and holds no resources of
         // its own (no `Drop` impl) -- this ends that borrow early so the code
         // below can use `self` again; `drop()` here is a borrow-checker nudge,
@@ -2432,6 +2431,96 @@ struct Globals {
     data_device_manager: Option<DataDeviceManagerId>,
 }
 
+/// Accumulates globals as `wl_registry.global` events arrive, one field per
+/// interface this window cares about. Pulled out of `Registry::discover`'s
+/// body (which was one `while` loop containing a 6-armed match, each arm
+/// duplicating the same "already bound? else bind and stash" shape) so the
+/// per-event dispatch and the "have we seen everything required yet?" check
+/// are each a single named, independently readable method instead of being
+/// interleaved inline.
+#[derive(Default)]
+struct GlobalsBuilder {
+    compositor: Option<CompositorId>,
+    shm: Option<ShmId>,
+    wm_base: Option<WmBaseId>,
+    seat: Option<SeatId>,
+    output: Option<OutputId>,
+    data_device_manager: Option<DataDeviceManagerId>,
+}
+
+impl GlobalsBuilder {
+    /// Whether every global `Registry::discover`'s caller cannot proceed
+    /// without has been bound. `wl_output` and `wl_data_device_manager` are
+    /// optional (not every compositor advertises them), so they're excluded
+    /// from this check -- the registry burst loop stops as soon as the
+    /// required set is complete, giving the optional ones only whatever
+    /// chance they had to arrive first.
+    const fn has_every_required_global(&self) -> bool {
+        self.compositor.is_some()
+            && self.shm.is_some()
+            && self.wm_base.is_some()
+            && self.seat.is_some()
+    }
+
+    /// Bind `interface` if it's one this window needs and hasn't already
+    /// bound (a compositor could in principle advertise a duplicate; the
+    /// first one wins). A no-op for any interface not in the list below.
+    fn bind_named_global(
+        &mut self,
+        sender: &mut Sender,
+        registry: RegistryId,
+        name: u32,
+        interface: &str,
+        version: u32,
+    ) -> Result<()> {
+        match interface {
+            s if s == proto::WL_COMPOSITOR.name && self.compositor.is_none() => {
+                let v = proto::WL_COMPOSITOR.version.min(version);
+                self.compositor = Some(Registry::bind(sender, registry, name, interface, v)?);
+            }
+            s if s == proto::WL_SHM.name && self.shm.is_none() => {
+                let v = proto::WL_SHM.version.min(version);
+                self.shm = Some(Registry::bind(sender, registry, name, interface, v)?);
+            }
+            s if s == proto::XDG_WM_BASE.name && self.wm_base.is_none() => {
+                let v = proto::XDG_WM_BASE.version.min(version);
+                self.wm_base = Some(Registry::bind(sender, registry, name, interface, v)?);
+            }
+            s if s == proto::WL_SEAT.name && self.seat.is_none() => {
+                let v = proto::WL_SEAT.version.min(version);
+                self.seat = Some(Registry::bind(sender, registry, name, interface, v)?);
+            }
+            s if s == proto::WL_OUTPUT.name && self.output.is_none() => {
+                let v = proto::WL_OUTPUT.version.min(version);
+                self.output = Some(Registry::bind(sender, registry, name, interface, v)?);
+            }
+            s if s == proto::WL_DATA_DEVICE_MANAGER.name && self.data_device_manager.is_none() => {
+                let v = proto::WL_DATA_DEVICE_MANAGER.version.min(version);
+                self.data_device_manager =
+                    Some(Registry::bind(sender, registry, name, interface, v)?);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Consume the builder into the final [`Globals`], failing if any
+    /// required global never arrived (`has_every_required_global` guards
+    /// the caller's loop, so in practice these `ok_or`s only fire if the
+    /// loop was exited some other way -- kept as a defensive check rather
+    /// than an `unwrap`, since a protocol violation here shouldn't panic).
+    fn finish(self) -> Result<Globals> {
+        Ok(Globals {
+            compositor: self.compositor.ok_or(Error::ReaderStopped)?,
+            shm: self.shm.ok_or(Error::ReaderStopped)?,
+            wm_base: self.wm_base.ok_or(Error::ReaderStopped)?,
+            seat: self.seat.ok_or(Error::ReaderStopped)?,
+            output: self.output,
+            data_device_manager: self.data_device_manager,
+        })
+    }
+}
+
 impl Registry {
     /// Bind the globals every window needs off the wire, including (if the
     /// compositor advertises one) the first `wl_output` -- so
@@ -2447,18 +2536,12 @@ impl Registry {
             MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
         )?;
 
-        let mut compositor: Option<CompositorId> = None;
-        let mut shm: Option<ShmId> = None;
-        let mut wm_base: Option<WmBaseId> = None;
-        let mut seat: Option<SeatId> = None;
-        let mut output: Option<OutputId> = None;
-        let mut data_device_manager: Option<DataDeviceManagerId> = None;
-
+        let mut globals = GlobalsBuilder::default();
         // A registry burst is unbounded and unordered -- there is no event
         // that says "no more globals", so we can only wait for the globals we
         // actually require (`wl_output` isn't one; see `sync_roundtrip`
         // below for how we still give it a chance to appear).
-        while compositor.is_none() || shm.is_none() || wm_base.is_none() || seat.is_none() {
+        while !globals.has_every_required_global() {
             let event = events.pop_block().ok_or(Error::ReaderStopped)?;
             let RawEvent::Bytes(bytes) = event else {
                 continue;
@@ -2483,46 +2566,10 @@ impl Registry {
                 let name = ev.u32();
                 let interface = ev.string();
                 let version = ev.u32();
-                match interface.as_str() {
-                    s if s == proto::WL_COMPOSITOR.name && compositor.is_none() => {
-                        let v = proto::WL_COMPOSITOR.version.min(version);
-                        compositor = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    s if s == proto::WL_SHM.name && shm.is_none() => {
-                        let v = proto::WL_SHM.version.min(version);
-                        shm = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    s if s == proto::XDG_WM_BASE.name && wm_base.is_none() => {
-                        let v = proto::XDG_WM_BASE.version.min(version);
-                        wm_base = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    s if s == proto::WL_SEAT.name && seat.is_none() => {
-                        let v = proto::WL_SEAT.version.min(version);
-                        seat = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    s if s == proto::WL_OUTPUT.name && output.is_none() => {
-                        let v = proto::WL_OUTPUT.version.min(version);
-                        output = Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    s if s == proto::WL_DATA_DEVICE_MANAGER.name
-                        && data_device_manager.is_none() =>
-                    {
-                        let v = proto::WL_DATA_DEVICE_MANAGER.version.min(version);
-                        data_device_manager =
-                            Some(Self::bind(sender, registry, name, &interface, v)?);
-                    }
-                    _ => {}
-                }
+                globals.bind_named_global(sender, registry, name, &interface, version)?;
             }
         }
-        Ok(Globals {
-            compositor: compositor.ok_or(Error::ReaderStopped)?,
-            shm: shm.ok_or(Error::ReaderStopped)?,
-            wm_base: wm_base.ok_or(Error::ReaderStopped)?,
-            seat: seat.ok_or(Error::ReaderStopped)?,
-            output,
-            data_device_manager,
-        })
+        globals.finish()
     }
 
     /// Read `output`'s advertised buffer scale via `wl_display.sync`: send a

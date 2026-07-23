@@ -6,7 +6,6 @@ use std::fmt;
 use std::io;
 
 use crate::conn::ConnError;
-use crate::sys::SysError;
 
 /// Anything that can go wrong opening or running the terminal window.
 #[derive(Debug)]
@@ -56,12 +55,6 @@ impl std::error::Error for Error {
 impl From<ConnError> for Error {
     fn from(e: ConnError) -> Self {
         Self::Conn(e)
-    }
-}
-
-impl From<SysError> for Error {
-    fn from(e: SysError) -> Self {
-        Self::Conn(ConnError::Sys(e))
     }
 }
 
@@ -133,10 +126,15 @@ mod tests {
     }
 
     #[test]
-    fn from_sys_error_wraps_through_conn_sys_variant() {
+    fn sys_error_reaches_error_only_through_the_conn_layer() {
+        // `SysError` has no direct `From` into `Error`; it converts up one
+        // layer at a time (`SysError -> ConnError -> Error`), keeping the
+        // error dependency a strict chain rather than a layer-skipping cycle.
+        use crate::sys::SysError;
         let inner = SysError::Memfd(io::Error::other("x"));
         let msg = inner.to_string();
-        let e: Error = inner.into();
+        let conn: ConnError = inner.into();
+        let e: Error = conn.into();
         match e {
             Error::Conn(ConnError::Sys(s)) => assert_eq!(s.to_string(), msg),
             other => panic!("expected Error::Conn(ConnError::Sys(_)), got {other:?}"),

@@ -19,6 +19,37 @@ const WINDOW_WIDTH: i32 = 640;
 const WINDOW_HEIGHT: i32 = 400;
 const MAX_VISIBLE_RESULTS: usize = 8;
 
+/// The launcher's resolved colors, pulled from `config::Config`'s
+/// `[launcher]` table (mirroring `[colors]`/`[font]` when unset) instead of
+/// the hardcoded palette the first version shipped with -- same pattern as
+/// `bins/monitor`'s `Theme` derived from `config::Config::monitor_*`.
+#[derive(Clone, Copy)]
+struct Theme {
+    bg: Color,
+    fg: Color,
+    dim: Color,
+    highlight_bg: Color,
+}
+
+impl Theme {
+    /// Derive every color this binary paints with from `cfg` in one place,
+    /// mirroring `bins/monitor`'s `Theme::from_config` -- `dim` and
+    /// `highlight_bg` have no direct `[launcher]` config knob (same as the
+    /// monitor dashboard's typography tiers have no `[colors]` equivalent),
+    /// so they're derived from the resolved background/foreground instead
+    /// of hardcoded literals.
+    fn from_config(cfg: &config::Config) -> Self {
+        let bg: Color = cfg.launcher_background().into();
+        let fg: Color = cfg.launcher_foreground().into();
+        Self {
+            bg,
+            fg,
+            dim: Color::rgb(0x6c, 0x70, 0x86),
+            highlight_bg: Color::rgb(0x31, 0x32, 0x44),
+        }
+    }
+}
+
 /// The launcher's whole UI state: the query text, the currently selected
 /// result, and the catalog it's searching. A fresh [`Catalog::search`] runs
 /// every keystroke -- app counts in the hundreds make that cheap enough to
@@ -27,6 +58,7 @@ struct LauncherApp {
     window: LauncherWindow,
     text: TextRenderer,
     catalog: Catalog,
+    theme: Theme,
     query: String,
     selected: usize,
     /// Set once the user picks an app (Enter) or bails (Esc) -- the next
@@ -42,22 +74,23 @@ impl LauncherApp {
         });
 
         let wake = waker::Waker::new().expect("create waker");
-        let mut window = match LauncherWindow::new(WINDOW_WIDTH, WINDOW_HEIGHT, wake) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("launcher: failed to open layer-shell window: {e}");
-                std::process::exit(1);
-            }
-        };
+        let mut window =
+            match LauncherWindow::new(WINDOW_WIDTH, WINDOW_HEIGHT, cfg.launcher_opacity(), wake) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("launcher: failed to open layer-shell window: {e}");
+                    std::process::exit(1);
+                }
+            };
 
-        let bg: Color = cfg.bar_background().into();
-        window.set_background(bg);
+        let theme = Theme::from_config(&cfg);
+        window.set_background(theme.bg);
 
         let scale_f32 = f32::from(i16::try_from(window.scale()).unwrap_or(i16::MAX));
-        let px_size = cfg.bar_font_px_size() * scale_f32;
+        let px_size = cfg.launcher_font_px_size() * scale_f32;
         let text = TextRenderer::load_with_fallbacks(
-            cfg.bar_font_path(),
-            &[cfg.bar_emoji_path(), cfg.bar_icon_path()],
+            cfg.launcher_font_path(),
+            &[cfg.launcher_emoji_path(), cfg.launcher_icon_path()],
             px_size,
         );
 
@@ -65,6 +98,7 @@ impl LauncherApp {
             window,
             text,
             catalog: Catalog::load(),
+            theme,
             query: String::new(),
             selected: 0,
             done: false,
@@ -80,12 +114,13 @@ impl LauncherApp {
                 window,
                 text,
                 catalog,
+                theme,
                 query,
                 selected,
                 ..
             } = &mut self;
             match window.tick(|canvas| {
-                Painter::paint(canvas, text, catalog, query, *selected);
+                Painter::paint(canvas, text, catalog, theme, query, *selected);
             }) {
                 Ok(true) => {}
                 Ok(false) => break,
@@ -174,14 +209,17 @@ impl Painter {
         canvas: &mut Canvas,
         text: &mut TextRenderer,
         catalog: &Catalog,
+        theme: &Theme,
         query: &str,
         selected: usize,
     ) {
         let pad = 20;
-        let fg = Color::rgb(0xcd, 0xd6, 0xf4);
-        let dim = Color::rgb(0x6c, 0x70, 0x86);
-        let highlight_bg = Color::rgb(0x31, 0x32, 0x44);
-        let bg = Color::rgb(0x1e, 0x1e, 0x2e);
+        let Theme {
+            bg,
+            fg,
+            dim,
+            highlight_bg,
+        } = *theme;
 
         // Query line, with a simple caret-less text field look: just the
         // typed text (or a placeholder) at the top.

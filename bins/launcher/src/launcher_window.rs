@@ -82,6 +82,12 @@ pub struct LauncherWindow {
     present: PresentState,
     backbuffer: Vec<u32>,
     background: platform::draw::Color,
+    /// Alpha applied to background pixels, `0-255` (`255` = opaque). Same
+    /// role as `statusbar::BarWindow`'s `bg_alpha` -- fixed for the
+    /// window's whole lifetime from the `opacity` passed to
+    /// [`LauncherWindow::new`], since it determines which `wl_shm` format
+    /// (`Argb8888` vs `Xrgb8888`) we negotiate at construction.
+    bg_alpha: u8,
 
     pending_keys: Vec<LauncherKey>,
     configured: bool,
@@ -200,8 +206,11 @@ impl Drop for LauncherWindow {
 
 impl LauncherWindow {
     /// Open a centered, keyboard-exclusive overlay `width`x`height` logical
-    /// pixels (scaled to physical pixels by the output's buffer scale).
-    pub fn new(width: i32, height: i32, wake: waker::Waker) -> Result<Self> {
+    /// pixels (scaled to physical pixels by the output's buffer scale),
+    /// with the given background `opacity` (`0.0` fully transparent ..
+    /// `1.0` opaque -- mirrors `config::Config::launcher_opacity`, same
+    /// convention as `statusbar::BarWindow::new`'s `opacity` parameter).
+    pub fn new(width: i32, height: i32, opacity: f64, wake: waker::Waker) -> Result<Self> {
         let (mut sender, repeat_timer, mut events, reader_handle) =
             surface::SurfaceBootstrap::connect(EVENT_RING_CAP, "launcher-wayland-reader", &wake)?;
 
@@ -221,6 +230,13 @@ impl LauncherWindow {
         let scale = 1;
         let px_w = width * scale;
         let px_h = height * scale;
+
+        // Same deliberate, reviewed float->int cast as
+        // `statusbar::BarWindow::new`'s identical conversion --
+        // `.clamp(0.0, 1.0)` before multiplying guarantees the result is in
+        // `0.0..=255.0`, so truncation/sign-loss can't actually happen.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let bg_alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u8;
 
         let (frames, shm_mem, pool) =
             Frame::create_pair(&mut sender, shm, px_w, px_h, Format::Argb8888)?;
@@ -290,6 +306,7 @@ impl LauncherWindow {
                 usize::try_from(px_w * px_h).unwrap_or(0)
             ],
             background: platform::draw::Color::rgb(0x1e, 0x1e, 0x2e),
+            bg_alpha,
             pending_keys: Vec::new(),
             configured: false,
             closing: false,
@@ -582,7 +599,7 @@ impl LauncherWindow {
     }
 
     fn pack_bg(&self) -> u32 {
-        surface::SurfaceBootstrap::pack_bg(self.background, 255)
+        surface::SurfaceBootstrap::pack_bg(self.background, self.bg_alpha)
     }
 
     fn do_present(&mut self, slot: usize, paint: &mut impl FnMut(&mut Canvas)) {

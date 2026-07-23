@@ -5,7 +5,7 @@
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
-use statusbar::{ModuleKind, ScrollAccumulator, TrayItem, Volume, steps_to_delta_pct};
+use statusbar::{ModuleKind, ScrollAccumulator, TrayItem, Volume};
 
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
@@ -432,7 +432,7 @@ impl State {
         if steps == 0 {
             return false;
         }
-        let delta = steps_to_delta_pct(steps, SCROLL_STEP_PCT);
+        let delta = ScrollAccumulator::steps_to_delta_pct(steps, SCROLL_STEP_PCT);
         match kind {
             ModuleKind::VolOut => {
                 let Some(known) = self.vol_out_known else {
@@ -488,7 +488,7 @@ impl State {
         if steps == 0 {
             return false;
         }
-        let delta = steps_to_delta_pct(steps, SCROLL_STEP_PCT);
+        let delta = ScrollAccumulator::steps_to_delta_pct(steps, SCROLL_STEP_PCT);
         match kind {
             ModuleKind::VolOut => Volume::adjust_sink(delta),
             ModuleKind::VolIn => Volume::adjust_source(delta),

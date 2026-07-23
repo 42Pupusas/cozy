@@ -23,16 +23,6 @@
 //! alpha-compositing trick; see the `div255_matches_floor_division_over_the_full_domain`
 //! test for a proof-by-exhaustion over every reachable product.
 
-/// `floor(x / 255)` via the branch-free fixed-point identity, shared by
-/// every kernel (scalar included) so all paths agree on rounding exactly.
-/// Valid for `x <= 255 * 255` -- the max product of two `u8`s -- which is
-/// exactly the domain `channel * alpha` produces.
-#[inline]
-const fn div255(x: u32) -> u32 {
-    let a = x + 1;
-    (a + (a >> 8)) >> 8
-}
-
 /// Premultiplies a whole slice of packed `0x00RRGGBB` pixels into
 /// `0xAARRGGBB`, using the fastest kernel this CPU supports.
 ///
@@ -46,6 +36,18 @@ pub struct Premultiplier {
 }
 
 impl Premultiplier {
+    /// `floor(x / 255)` via the branch-free fixed-point identity, shared by
+    /// every kernel (scalar included) so all paths agree on rounding exactly.
+    /// Valid for `x <= 255 * 255` -- the max product of two `u8`s -- which is
+    /// exactly the domain `channel * alpha` produces. An associated fn rather
+    /// than a free one so the scalar path and the `div255_vec_*` vector
+    /// siblings all live in one namespace: the kernel that owns them.
+    #[inline]
+    const fn div255(x: u32) -> u32 {
+        let a = x + 1;
+        (a + (a >> 8)) >> 8
+    }
+
     /// Probe CPU features once. `x86_64` always has SSE2; AVX2 needs a
     /// runtime check.
     #[cfg(target_arch = "x86_64")]
@@ -96,9 +98,9 @@ impl Premultiplier {
         let alpha_shifted = alpha << 24;
         for (source, dest) in src.iter().zip(dst.iter_mut()) {
             let pixel = *source & 0x00ff_ffff;
-            let red = div255(((pixel >> 16) & 0xff) * alpha) << 16;
-            let green = div255(((pixel >> 8) & 0xff) * alpha) << 8;
-            let blue = div255((pixel & 0xff) * alpha);
+            let red = Self::div255(((pixel >> 16) & 0xff) * alpha) << 16;
+            let green = Self::div255(((pixel >> 8) & 0xff) * alpha) << 8;
+            let blue = Self::div255((pixel & 0xff) * alpha);
             *dest = alpha_shifted | red | green | blue;
         }
     }
@@ -106,7 +108,7 @@ impl Premultiplier {
     /// SSE2 path: 4 pixels (16 bytes) per iteration. Widens every byte of
     /// all 4 pixels to a 16-bit lane (`punpcklbw`/`punpckhbw` against an
     /// all-zero register), multiplies every lane by alpha in one
-    /// `pmullw`, applies [`div255`] with vector shifts/adds, then narrows
+    /// `pmullw`, applies [`Self::div255`] with vector shifts/adds, then narrows
     /// back to bytes with `packuswb` -- real SIMD arithmetic, not a
     /// vectorized store around a scalar gather.
     #[cfg(target_arch = "x86_64")]
@@ -144,7 +146,7 @@ impl Premultiplier {
         Self::run_scalar(alpha, &src[i..], &mut dst[i..]);
     }
 
-    /// Vector [`div255`]: `((x+1) + ((x+1)>>8)) >> 8` applied to all eight
+    /// Vector [`Self::div255`]: `((x+1) + ((x+1)>>8)) >> 8` applied to all eight
     /// 16-bit lanes at once.
     #[cfg(target_arch = "x86_64")]
     #[inline]
@@ -200,7 +202,7 @@ impl Premultiplier {
         Self::run_sse2(alpha, &src[i..], &mut dst[i..]);
     }
 
-    /// Vector [`div255`] over sixteen 16-bit lanes (AVX2 width).
+    /// Vector [`Self::div255`] over sixteen 16-bit lanes (AVX2 width).
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn div255_vec_avx2(
@@ -225,7 +227,7 @@ impl Default for Premultiplier {
 
 #[cfg(test)]
 mod tests {
-    use super::{Premultiplier, div255};
+    use super::Premultiplier;
 
     /// Independent oracle so a bug in the shared div255 path can't
     /// self-certify; matches `TermWindow::premultiply_pixel`'s original
@@ -248,7 +250,7 @@ mod tests {
             for alpha in 0u32..=255 {
                 let product = channel * alpha;
                 assert_eq!(
-                    div255(product),
+                    Premultiplier::div255(product),
                     product / 255,
                     "channel {channel} alpha {alpha} product {product}"
                 );

@@ -376,65 +376,79 @@ trait ComposeWithMark {
 
 impl ComposeWithMark for char {
     fn compose_with(self, mark: char) -> Option<char> {
-        Some(match (self, mark) {
-            ('a', '\u{301}') => '\u{e1}',
-            ('a', '\u{300}') => '\u{e0}',
-            ('a', '\u{302}') => '\u{e2}',
-            ('a', '\u{303}') => '\u{e3}',
-            ('a', '\u{308}') => '\u{e4}',
-            ('a', '\u{30a}') => '\u{e5}',
-            ('A', '\u{301}') => '\u{c1}',
-            ('A', '\u{300}') => '\u{c0}',
-            ('A', '\u{302}') => '\u{c2}',
-            ('A', '\u{303}') => '\u{c3}',
-            ('A', '\u{308}') => '\u{c4}',
-            ('A', '\u{30a}') => '\u{c5}',
-            ('e', '\u{301}') => '\u{e9}',
-            ('e', '\u{300}') => '\u{e8}',
-            ('e', '\u{302}') => '\u{ea}',
-            ('e', '\u{308}') => '\u{eb}',
-            ('E', '\u{301}') => '\u{c9}',
-            ('E', '\u{300}') => '\u{c8}',
-            ('E', '\u{302}') => '\u{ca}',
-            ('E', '\u{308}') => '\u{cb}',
-            ('i', '\u{301}') => '\u{ed}',
-            ('i', '\u{300}') => '\u{ec}',
-            ('i', '\u{302}') => '\u{ee}',
-            ('i', '\u{308}') => '\u{ef}',
-            ('I', '\u{301}') => '\u{cd}',
-            ('I', '\u{300}') => '\u{cc}',
-            ('I', '\u{302}') => '\u{ce}',
-            ('I', '\u{308}') => '\u{cf}',
-            ('o', '\u{301}') => '\u{f3}',
-            ('o', '\u{300}') => '\u{f2}',
-            ('o', '\u{302}') => '\u{f4}',
-            ('o', '\u{303}') => '\u{f5}',
-            ('o', '\u{308}') => '\u{f6}',
-            ('O', '\u{301}') => '\u{d3}',
-            ('O', '\u{300}') => '\u{d2}',
-            ('O', '\u{302}') => '\u{d4}',
-            ('O', '\u{303}') => '\u{d5}',
-            ('O', '\u{308}') => '\u{d6}',
-            ('u', '\u{301}') => '\u{fa}',
-            ('u', '\u{300}') => '\u{f9}',
-            ('u', '\u{302}') => '\u{fb}',
-            ('u', '\u{308}') => '\u{fc}',
-            ('U', '\u{301}') => '\u{da}',
-            ('U', '\u{300}') => '\u{d9}',
-            ('U', '\u{302}') => '\u{db}',
-            ('U', '\u{308}') => '\u{dc}',
-            ('n', '\u{303}') => '\u{f1}',
-            ('N', '\u{303}') => '\u{d1}',
-            ('c', '\u{327}') => '\u{e7}',
-            ('C', '\u{327}') => '\u{c7}',
-            ('y', '\u{301}') => '\u{fd}',
-            ('y', '\u{308}') => '\u{ff}',
-            ('Y', '\u{301}') => '\u{dd}',
-            ('Y', '\u{308}') => '\u{178}',
-            _ => return None,
-        })
+        // A plain data table, not a giant match: every real keyboard/IME
+        // combining-mark pair this crate handles is a fact, not a branch --
+        // encoding them as `match` arms only inflated cyclomatic complexity
+        // (56 arms = 56 paths for a tool to worry could each behave
+        // differently) for something that's actually one code path (a
+        // lookup) exercised over dozens of rows of data. A linear scan is
+        // fine: the table is small and this only runs once per typed
+        // combining mark, nowhere near a hot path.
+        COMPOSE_TABLE
+            .iter()
+            .find_map(|&(base, m, composed)| (base == self && m == mark).then_some(composed))
     }
 }
+
+/// (base, combining mark, precomposed NFC form) rows for
+/// [`ComposeWithMark::compose_with`]. See that method's doc comment for
+/// what this table covers and why it's deliberately small.
+const COMPOSE_TABLE: &[(char, char, char)] = &[
+        ('a', '\u{301}', '\u{e1}'),
+        ('a', '\u{300}', '\u{e0}'),
+        ('a', '\u{302}', '\u{e2}'),
+        ('a', '\u{303}', '\u{e3}'),
+        ('a', '\u{308}', '\u{e4}'),
+        ('a', '\u{30a}', '\u{e5}'),
+        ('A', '\u{301}', '\u{c1}'),
+        ('A', '\u{300}', '\u{c0}'),
+        ('A', '\u{302}', '\u{c2}'),
+        ('A', '\u{303}', '\u{c3}'),
+        ('A', '\u{308}', '\u{c4}'),
+        ('A', '\u{30a}', '\u{c5}'),
+        ('e', '\u{301}', '\u{e9}'),
+        ('e', '\u{300}', '\u{e8}'),
+        ('e', '\u{302}', '\u{ea}'),
+        ('e', '\u{308}', '\u{eb}'),
+        ('E', '\u{301}', '\u{c9}'),
+        ('E', '\u{300}', '\u{c8}'),
+        ('E', '\u{302}', '\u{ca}'),
+        ('E', '\u{308}', '\u{cb}'),
+        ('i', '\u{301}', '\u{ed}'),
+        ('i', '\u{300}', '\u{ec}'),
+        ('i', '\u{302}', '\u{ee}'),
+        ('i', '\u{308}', '\u{ef}'),
+        ('I', '\u{301}', '\u{cd}'),
+        ('I', '\u{300}', '\u{cc}'),
+        ('I', '\u{302}', '\u{ce}'),
+        ('I', '\u{308}', '\u{cf}'),
+        ('o', '\u{301}', '\u{f3}'),
+        ('o', '\u{300}', '\u{f2}'),
+        ('o', '\u{302}', '\u{f4}'),
+        ('o', '\u{303}', '\u{f5}'),
+        ('o', '\u{308}', '\u{f6}'),
+        ('O', '\u{301}', '\u{d3}'),
+        ('O', '\u{300}', '\u{d2}'),
+        ('O', '\u{302}', '\u{d4}'),
+        ('O', '\u{303}', '\u{d5}'),
+        ('O', '\u{308}', '\u{d6}'),
+        ('u', '\u{301}', '\u{fa}'),
+        ('u', '\u{300}', '\u{f9}'),
+        ('u', '\u{302}', '\u{fb}'),
+        ('u', '\u{308}', '\u{fc}'),
+        ('U', '\u{301}', '\u{da}'),
+        ('U', '\u{300}', '\u{d9}'),
+        ('U', '\u{302}', '\u{db}'),
+        ('U', '\u{308}', '\u{dc}'),
+        ('n', '\u{303}', '\u{f1}'),
+        ('N', '\u{303}', '\u{d1}'),
+        ('c', '\u{327}', '\u{e7}'),
+        ('C', '\u{327}', '\u{c7}'),
+        ('y', '\u{301}', '\u{fd}'),
+        ('y', '\u{308}', '\u{ff}'),
+        ('Y', '\u{301}', '\u{dd}'),
+        ('Y', '\u{308}', '\u{178}'),
+];
 
 impl Grid {
     /// Create a new grid with the given dimensions.

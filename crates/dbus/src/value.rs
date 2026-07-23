@@ -258,6 +258,26 @@ impl Unmarshaller {
     pub fn unmarshal(buf: &[u8], offset: usize, sig: &str) -> Option<(Value, usize)> {
         let type_byte = *sig.as_bytes().first()?;
         match type_byte {
+            b'y' | b'b' | b'n' | b'q' | b'i' | b'u' | b'x' | b't' | b'd' => {
+                Self::unmarshal_fixed_width(type_byte, buf, offset)
+            }
+            b's' | b'o' | b'g' | b'v' => Self::unmarshal_string_like(type_byte, buf, offset),
+            b'a' => Self::unmarshal_array(buf, offset, &sig[1..]),
+            b'(' => Self::unmarshal_struct(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
+            b'{' => Self::unmarshal_dict_entry(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
+            _ => None,
+        }
+    }
+
+    /// Decode one of the fixed-width scalar types (`y`/`b`/`n`/`q`/`i`/`u`/
+    /// `x`/`t`/`d`) at `offset`. Split out of [`Self::unmarshal`] -- these
+    /// nine arms are all "align, read a fixed-size little-endian value,
+    /// wrap it, advance by its width" with nothing in common with the
+    /// string-like or container arms beyond being part of the same grammar,
+    /// so folding them into `unmarshal`'s own complexity budget bought
+    /// nothing.
+    fn unmarshal_fixed_width(type_byte: u8, buf: &[u8], offset: usize) -> Option<(Value, usize)> {
+        match type_byte {
             b'y' => Some((Value::Byte(*buf.get(offset)?), offset + 1)),
             b'b' => {
                 let aligned = Self::align_up(offset, 4);
@@ -292,6 +312,20 @@ impl Unmarshaller {
                 let aligned = Self::align_up(offset, 8);
                 Some((Value::Double(read_le!(buf, aligned, f64)?), aligned + 8))
             }
+            // Unreachable: unmarshal only calls this for one of the 9 bytes
+            // matched above.
+            _ => None,
+        }
+    }
+
+    /// Decode one of the string-like types (`s`/`o`/`g`/`v`) at `offset`.
+    /// Split out of [`Self::unmarshal`] for the same reason as
+    /// [`Self::unmarshal_fixed_width`] -- `s`/`o` share a 4-byte length
+    /// prefix, `g` a 1-byte one, and `v` recurses back into `unmarshal`
+    /// with the inner signature it just decoded as a string; none of that
+    /// has anything to do with the fixed-width or container arms.
+    fn unmarshal_string_like(type_byte: u8, buf: &[u8], offset: usize) -> Option<(Value, usize)> {
+        match type_byte {
             b's' | b'o' => {
                 let aligned = Self::align_up(offset, 4);
                 let len: u32 = read_le!(buf, aligned, u32)?;
@@ -314,9 +348,8 @@ impl Unmarshaller {
                 let (inner, end) = Self::unmarshal(buf, val_start, &inner_sig)?;
                 Some((Value::Variant(Box::new(inner)), end))
             }
-            b'a' => Self::unmarshal_array(buf, offset, &sig[1..]),
-            b'(' => Self::unmarshal_struct(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
-            b'{' => Self::unmarshal_dict_entry(buf, offset, &sig[1..sig.len().saturating_sub(1)]),
+            // Unreachable: unmarshal only calls this for one of the 4 bytes
+            // matched above.
             _ => None,
         }
     }

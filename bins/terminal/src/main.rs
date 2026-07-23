@@ -292,9 +292,95 @@ fn main() {
         Config::default()
     });
 
-    if let Err(e) = App::new(&cfg).run() {
+    let cli = Cli::parse(std::env::args().skip(1));
+
+    if let Err(e) = App::new(&cfg, cli).run() {
         eprintln!("terminal: {e}");
         std::process::exit(1);
+    }
+}
+
+/// Command-line arguments this binary understands. Currently just `-e`/
+/// `--exec`, xterm/foot/alacritty's convention for "run this command instead
+/// of the configured shell, and exit the terminal window when it exits" --
+/// the mechanism a `.desktop` file's `Terminal=true` entry (e.g. `nvim`,
+/// `htop`) needs a terminal to launch it *through*, rather than launching
+/// the TUI program directly with no controlling terminal at all.
+#[derive(Clone)]
+struct Cli {
+    /// `Some((program, args))` when `-e`/`--exec` was given; `None` runs the
+    /// configured shell as normal. Everything after the flag is consumed
+    /// verbatim as the command's own argv (not re-parsed for further terminal
+    /// flags), matching how xterm/foot/alacritty's `-e` works: it must be the
+    /// last thing on the command line.
+    exec: Option<(String, Vec<String>)>,
+}
+
+impl Cli {
+    /// Parse an argv iterator (already stripped of `argv[0]`). Unrecognized
+    /// leading arguments are ignored rather than erroring -- this binary has
+    /// no other flags yet, and silently ignoring stray tokens is friendlier
+    /// to callers (window managers, desktop files) than aborting startup.
+    fn parse<I: Iterator<Item = String>>(mut args: I) -> Self {
+        while let Some(arg) = args.next() {
+            if arg == "-e" || arg == "--exec" {
+                if let Some(program) = args.next() {
+                    return Self {
+                        exec: Some((program, args.collect())),
+                    };
+                }
+                return Self { exec: None };
+            }
+        }
+        Self { exec: None }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::Cli;
+
+    fn args(items: &[&str]) -> impl Iterator<Item = String> + use<> {
+        items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>().into_iter()
+    }
+
+    #[test]
+    fn no_flags_runs_default_shell() {
+        let cli = Cli::parse(args(&[]));
+        assert!(cli.exec.is_none());
+    }
+
+    #[test]
+    fn dash_e_with_program_only() {
+        let cli = Cli::parse(args(&["-e", "nvim"]));
+        assert_eq!(cli.exec, Some(("nvim".to_owned(), vec![])));
+    }
+
+    #[test]
+    fn dash_e_with_program_and_args() {
+        let cli = Cli::parse(args(&["-e", "nvim", "--", "foo.txt"]));
+        assert_eq!(
+            cli.exec,
+            Some(("nvim".to_owned(), vec!["--".to_owned(), "foo.txt".to_owned()]))
+        );
+    }
+
+    #[test]
+    fn long_flag_form_also_works() {
+        let cli = Cli::parse(args(&["--exec", "htop"]));
+        assert_eq!(cli.exec, Some(("htop".to_owned(), vec![])));
+    }
+
+    #[test]
+    fn dash_e_with_no_program_falls_back_to_default_shell() {
+        let cli = Cli::parse(args(&["-e"]));
+        assert!(cli.exec.is_none());
+    }
+
+    #[test]
+    fn unrecognized_leading_args_are_ignored() {
+        let cli = Cli::parse(args(&["--some-future-flag", "-e", "nvim"]));
+        assert_eq!(cli.exec, Some(("nvim".to_owned(), vec![])));
     }
 }
 
@@ -310,6 +396,9 @@ fn main() {
 /// are fields.
 struct App<'cfg> {
     cfg: &'cfg Config,
+    /// `-e`/`--exec` override from the command line: run this instead of
+    /// `cfg.shell`. See [`Cli`]'s doc for why a terminal needs this at all.
+    cli: Cli,
     /// Set once by whichever thread first decides to exit; every worker loop
     /// polls it to unwind. Cloned into each worker.
     quit: Arc<AtomicBool>,
@@ -329,9 +418,10 @@ struct App<'cfg> {
 }
 
 impl<'cfg> App<'cfg> {
-    fn new(cfg: &'cfg Config) -> Self {
+    fn new(cfg: &'cfg Config, cli: Cli) -> Self {
         Self {
             cfg,
+            cli,
             quit: Arc::new(AtomicBool::new(false)),
             bracketed_paste: Arc::new(AtomicBool::new(false)),
             term_modes: Arc::new(AtomicU32::new(0)),
@@ -396,9 +486,18 @@ impl<'cfg> App<'cfg> {
         let shutdown_pty_wake = pty_wake.clone();
 
         // ── Spawn PTY thread ────────────────────────────────────────────────────
-        let shell = self.cfg.shell.clone();
+        // `-e`/`--exec` replaces the configured shell wholesale (program +
+        // its own argv) rather than being appended to it -- exactly what
+        // xterm/foot/alacritty's `-e` does, and what a `.desktop` entry's
+        // `Terminal=true` `Exec=` line needs: run *that* command, with the
+        // shell nowhere in the picture.
+        let (shell, shell_args): (String, Vec<String>) = match self.cli.exec.clone() {
+            Some((program, args)) => (program, args),
+            None => (self.cfg.shell.clone(), Vec::new()),
+        };
         let pty_handle = PtyWorker {
             shell,
+            shell_args,
             parser_tx: parser_data_tx,
             input_rx,
             input_wake: pty_wake,
@@ -505,6 +604,9 @@ impl<'cfg> App<'cfg> {
 /// structurally impossible.
 struct PtyWorker {
     shell: String,
+    /// Argv for `shell` beyond argv[0] -- empty for the default login shell,
+    /// populated when `-e`/`--exec` named a command with its own arguments.
+    shell_args: Vec<String>,
     parser_tx: mpsc::Producer<ParserMsg>,
     input_rx: mpsc::Consumer<InputMsg>,
     input_wake: waker::Waker,
@@ -526,6 +628,7 @@ impl PtyWorker {
     fn run(self) {
         let Self {
             shell,
+            shell_args,
             parser_tx,
             mut input_rx,
             input_wake,
@@ -548,7 +651,8 @@ impl PtyWorker {
             xpixel: 0,
             ypixel: 0,
         };
-        let pty = match Pty::spawn(&shell, &[], win, input_wake.raw_fd(), Arc::clone(&quit)) {
+        let shell_args_ref: Vec<&str> = shell_args.iter().map(String::as_str).collect();
+        let pty = match Pty::spawn(&shell, &shell_args_ref, win, input_wake.raw_fd(), Arc::clone(&quit)) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("pty: spawn failed: {e}");

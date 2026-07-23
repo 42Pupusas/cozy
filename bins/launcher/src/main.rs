@@ -209,7 +209,7 @@ impl LauncherApp {
     fn launch_selected(&mut self) {
         let results = self.catalog.search(&self.query);
         if let Some(ranked) = results.get(self.selected)
-            && let Some(cmd) = launcher::launch::ExecCommand::parse(&ranked.entry.exec)
+            && let Some(cmd) = launcher::launch::ExecCommand::for_entry(ranked.entry)
             && let Err(e) = cmd.spawn_detached()
         {
             eprintln!("launcher: failed to launch {:?}: {e}", ranked.entry.name);

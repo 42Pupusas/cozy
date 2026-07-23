@@ -12,6 +12,7 @@
 //! than substituted -- exactly what every desktop shell does when
 //! launching with nothing selected.
 
+use crate::desktop_entry::DesktopEntry;
 use std::process::{Command, Stdio};
 
 /// One `.desktop` file's `Exec=` line, parsed into a spawnable command.
@@ -36,6 +37,48 @@ impl ExecCommand {
             program,
             args: iter.collect(),
         })
+    }
+
+    /// Build the command to actually spawn for `entry`: [`Self::parse`]'s
+    /// result as-is for a normal GUI app, or that same command **wrapped**
+    /// in a terminal emulator when `entry.terminal` (`Terminal=true`) says
+    /// it needs one -- e.g. `nvim`, `htop`, `bpytop`. Without this, a
+    /// `Terminal=true` entry gets spawned directly with stdio nulled (see
+    /// [`Self::spawn_detached`]): the TUI program starts, immediately finds
+    /// no real terminal attached, and exits within milliseconds -- from the
+    /// user's perspective, "the launcher entry does nothing".
+    ///
+    /// Field codes are stripped the same way [`Self::parse`] always does
+    /// (no file/URL argument to substitute); `None` under the same
+    /// conditions `parse` returns `None`.
+    #[must_use]
+    pub fn for_entry(entry: &DesktopEntry) -> Option<Self> {
+        let inner = Self::parse(&entry.exec)?;
+        if entry.terminal {
+            Some(Self::wrapped_in_terminal(inner))
+        } else {
+            Some(inner)
+        }
+    }
+
+    /// Wrap `inner` as `<terminal emulator> -e <inner.program> <inner.args...>`.
+    /// `-e`/`--exec` is the convention xterm, foot, alacritty, and this
+    /// workspace's own `terminal` binary all understand: run this command
+    /// instead of the default shell.
+    ///
+    /// The terminal emulator itself is resolved from `$TERMINAL` if set
+    /// (the same env var GNOME/`xdg-terminal-exec` and countless scripts
+    /// already respect), falling back to this workspace's own `terminal`
+    /// binary -- the natural default for a launcher that's part of the same
+    /// "replace every OS tool" project as the terminal it launches into.
+    fn wrapped_in_terminal(inner: Self) -> Self {
+        let terminal = std::env::var("TERMINAL").unwrap_or_else(|_| "terminal".to_owned());
+        let mut args = vec!["-e".to_owned(), inner.program];
+        args.extend(inner.args);
+        Self {
+            program: terminal,
+            args,
+        }
     }
 
     /// Split `Exec=`'s value on unquoted whitespace, honoring single/double
@@ -154,6 +197,103 @@ impl ExecCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desktop_entry::DesktopEntry;
+
+    /// Serializes every test that touches the process-wide `TERMINAL` env
+    /// var, same rationale as `app_index`'s `ENV_MUTEX`: `cargo test`'s
+    /// default multithreading means concurrent tests would otherwise stomp
+    /// each other's override mid-check.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var("TERMINAL").ok();
+            // SAFETY: serialized by `_lock` above; no other thread reads/
+            // writes `TERMINAL` while this guard is alive.
+            unsafe { std::env::set_var("TERMINAL", value) };
+            Self { prev, _lock: lock }
+        }
+
+        fn unset() -> Self {
+            let lock = ENV_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var("TERMINAL").ok();
+            // SAFETY: see `set` above.
+            unsafe { std::env::remove_var("TERMINAL") };
+            Self { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                // SAFETY: see `set` above.
+                Some(v) => unsafe { std::env::set_var("TERMINAL", v) },
+                None => unsafe { std::env::remove_var("TERMINAL") },
+            }
+        }
+    }
+
+    #[test]
+    fn for_entry_runs_gui_apps_directly() {
+        let _guard = EnvGuard::unset();
+        let entry = DesktopEntry {
+            name: "Firefox".to_owned(),
+            exec: "firefox %u".to_owned(),
+            icon: None,
+            terminal: false,
+        };
+        let cmd = ExecCommand::for_entry(&entry).unwrap();
+        assert_eq!(cmd.program, "firefox");
+        assert!(cmd.args.is_empty());
+    }
+
+    #[test]
+    fn for_entry_wraps_terminal_apps_in_the_default_terminal() {
+        let _guard = EnvGuard::unset();
+        let entry = DesktopEntry {
+            name: "Neovim".to_owned(),
+            exec: "nvim %F".to_owned(),
+            icon: None,
+            terminal: true,
+        };
+        let cmd = ExecCommand::for_entry(&entry).unwrap();
+        assert_eq!(cmd.program, "terminal");
+        assert_eq!(cmd.args, vec!["-e", "nvim"]);
+    }
+
+    #[test]
+    fn for_entry_respects_terminal_env_override() {
+        let _guard = EnvGuard::set("foot");
+        let entry = DesktopEntry {
+            name: "Htop".to_owned(),
+            exec: "htop".to_owned(),
+            icon: None,
+            terminal: true,
+        };
+        let cmd = ExecCommand::for_entry(&entry).unwrap();
+        assert_eq!(cmd.program, "foot");
+        assert_eq!(cmd.args, vec!["-e", "htop"]);
+    }
+
+    #[test]
+    fn for_entry_keeps_terminal_apps_own_args() {
+        let _guard = EnvGuard::unset();
+        let entry = DesktopEntry {
+            name: "Shell script".to_owned(),
+            exec: "sh -c 'echo hi'".to_owned(),
+            icon: None,
+            terminal: true,
+        };
+        let cmd = ExecCommand::for_entry(&entry).unwrap();
+        assert_eq!(cmd.program, "terminal");
+        assert_eq!(cmd.args, vec!["-e", "sh", "-c", "echo hi"]);
+    }
 
     #[test]
     fn parses_simple_command() {

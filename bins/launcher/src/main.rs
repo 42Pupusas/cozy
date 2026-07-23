@@ -135,12 +135,18 @@ impl LauncherApp {
             }
             LauncherKey::Esc => self.done = true,
             LauncherKey::Up => {
-                self.selected = self.selected.saturating_sub(1);
+                // Wrap to the last row from the first (and vice versa below)
+                // instead of clamping, so repeated Up/Down cycles the list
+                // like most launcher/menu UIs rather than dead-ending.
+                let count = self.catalog.search(&self.query).len().min(MAX_VISIBLE_RESULTS);
+                if count > 0 {
+                    self.selected = (self.selected + count - 1) % count;
+                }
             }
             LauncherKey::Down => {
-                let count = self.catalog.search(&self.query).len();
-                if self.selected + 1 < count.min(MAX_VISIBLE_RESULTS) {
-                    self.selected += 1;
+                let count = self.catalog.search(&self.query).len().min(MAX_VISIBLE_RESULTS);
+                if count > 0 {
+                    self.selected = (self.selected + 1) % count;
                 }
             }
             LauncherKey::Enter => self.launch_selected(),

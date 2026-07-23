@@ -256,7 +256,18 @@ impl Painter {
         for (i, ranked) in results.iter().take(MAX_VISIBLE_RESULTS).enumerate() {
             let row_y = list_top + i32::try_from(i).unwrap_or(0) * line_h;
             if i == selected {
-                canvas.fill_rect(Rect::new(0, row_y - 4, canvas.width(), line_h), highlight_bg);
+                // `fill_rect_alpha`, not `fill_rect`: the launcher window is
+                // translucent by default (`launcher_opacity`), so its
+                // backbuffer is a premultiplied Argb8888 surface where the
+                // top byte is the alpha the compositor reads -- `fill_rect`
+                // always packs a zero top byte, which would make the
+                // selection highlight invisible instead of just slightly
+                // translucent (see fill_rect's own doc for why).
+                canvas.fill_rect_alpha(
+                    Rect::new(0, row_y - 4, canvas.width(), line_h),
+                    highlight_bg,
+                    bg_alpha,
+                );
             }
             let color = if i == selected { fg } else { dim };
             text.draw_text_alpha(canvas, &ranked.entry.name, pad, row_y, color, bg, bg_alpha);

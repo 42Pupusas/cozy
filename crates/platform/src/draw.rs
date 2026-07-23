@@ -385,12 +385,45 @@ impl<'a> Canvas<'a> {
         self.pixels[idx] = background.blend_opaque_to(color, alpha);
     }
 
-    /// Fill `rect` (clipped to the canvas) with `color`.
+    /// Fill `rect` (clipped to the canvas) with `color`, fully opaque.
+    ///
+    /// Packs `color` as plain `0x00RRGGBB` (top byte zero). That is correct
+    /// only when the destination buffer is genuinely `Xrgb8888` (the
+    /// compositor ignores the top byte) -- on a translucent window's
+    /// `Argb8888` backbuffer the top byte **is** the alpha channel the
+    /// compositor reads, so this call would paint an invisible (alpha-0)
+    /// rectangle. Use [`Self::fill_rect_alpha`] for anything drawn onto a
+    /// window that might be translucent (any `bg_alpha < 255`); this
+    /// opaque-only entry point stays for buffers that are always Xrgb8888
+    /// (e.g. an always-opaque widget) and for the tests below.
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
+        self.fill_rect_packed(rect, color.to_xrgb8888());
+    }
+
+    /// Fill `rect` (clipped to the canvas) with `color`, packed the same way
+    /// glyph ink is in [`Self::blit_glyph`]: plain `0x00RRGGBB` when
+    /// `bg_alpha == 255` (the fast, common opaque-window path, byte-
+    /// identical to [`Self::fill_rect`]), or **premultiplied** ARGB8888 at
+    /// full alpha (solid ink -- `premultiplied_argb8888(255)` is the
+    /// identity) otherwise, so the fill is fully opaque paint over a
+    /// translucent "glass" window instead of itself carrying the window's
+    /// alpha. Mirrors `platform::Color`'s "translucent glass, solid text"
+    /// contract for any solid-color UI chrome (selection highlights, etc.),
+    /// not just glyphs.
+    pub fn fill_rect_alpha(&mut self, rect: Rect, color: Color, bg_alpha: u8) {
+        let packed = if bg_alpha == 255 {
+            color.to_xrgb8888()
+        } else {
+            color.premultiplied_argb8888(255)
+        };
+        self.fill_rect_packed(rect, packed);
+    }
+
+    /// Shared clip + row-fill loop for [`Self::fill_rect`]/[`Self::fill_rect_alpha`].
+    fn fill_rect_packed(&mut self, rect: Rect, v: u32) {
         let Some((x0, y0, x1, y1)) = self.clip(rect) else {
             return;
         };
-        let v = color.to_xrgb8888();
         // `self.width` is always non-negative (checked in Canvas::new), and
         // `clip` guarantees `y0/y1/x0/x1` are all non-negative in-bounds
         // coordinates, so these sign-preserving casts are exact.
@@ -592,6 +625,32 @@ mod tests {
         // ...corners untouched.
         assert_eq!(buf[0], 0);
         assert_eq!(buf[3 * 4 + 3], 0);
+    }
+
+    #[test]
+    fn fill_rect_alpha_opaque_matches_fill_rect() {
+        // bg_alpha == 255 must be byte-identical to the plain fill_rect
+        // path -- both should pack the same zero-top-byte XRGB8888 word.
+        let mut buf_a = canvas_buf(4, 4);
+        let mut buf_b = canvas_buf(4, 4);
+        Canvas::new(&mut buf_a, 4, 4).fill_rect(Rect::new(1, 1, 2, 2), Color::WHITE);
+        Canvas::new(&mut buf_b, 4, 4).fill_rect_alpha(Rect::new(1, 1, 2, 2), Color::WHITE, 255);
+        assert_eq!(buf_a, buf_b);
+    }
+
+    #[test]
+    fn fill_rect_alpha_translucent_packs_premultiplied_argb_not_zero_alpha() {
+        // On a translucent window (bg_alpha < 255) the destination buffer is
+        // Argb8888, where the top byte is the alpha the compositor reads.
+        // fill_rect's plain to_xrgb8888() packs a zero top byte there,
+        // which would make the fill invisible; fill_rect_alpha must pack a
+        // fully-opaque (0xff) top byte instead ("solid ink" over glass),
+        // regardless of the window's own bg_alpha.
+        let mut buf = canvas_buf(2, 1);
+        Canvas::new(&mut buf, 2, 1).fill_rect_alpha(Rect::new(0, 0, 2, 1), Color::WHITE, 128);
+        // premultiplied_argb8888(255) on white is 0xff_ff_ff_ff.
+        assert_eq!(buf[0], 0xff_ff_ff_ff);
+        assert_eq!(buf[1], 0xff_ff_ff_ff);
     }
 
     #[test]

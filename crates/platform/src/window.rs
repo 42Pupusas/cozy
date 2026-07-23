@@ -2706,7 +2706,9 @@ impl GlobalsBuilder {
             return Ok(());
         }
         let v = known_version.min(advertised_version);
-        *slot = Some(Registry::bind(sender, registry, name, interface, v)?);
+        *slot = Some(crate::surface::SurfaceBootstrap::bind(
+            sender, registry, name, interface, v,
+        )?);
         Ok(())
     }
 
@@ -2797,18 +2799,6 @@ impl Registry {
         crate::surface::SurfaceBootstrap::output_scale(sender, events, output)
     }
 
-    /// Bind one global by name/interface/version off the registry.
-    /// Delegates to the role-agnostic
-    /// [`crate::surface::SurfaceBootstrap::bind`].
-    fn bind<T: ObjectId>(
-        sender: &mut Sender,
-        registry: RegistryId,
-        name: u32,
-        interface: &str,
-        version: u32,
-    ) -> Result<T> {
-        crate::surface::SurfaceBootstrap::bind(sender, registry, name, interface, version)
-    }
 }
 
 #[cfg(test)]

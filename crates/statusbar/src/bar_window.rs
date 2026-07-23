@@ -247,7 +247,9 @@ impl GlobalsBuilder {
             return Ok(());
         }
         let v = known_version.min(advertised_version);
-        *slot = Some(BarWindow::bind(sender, registry, name, interface, v)?);
+        *slot = Some(surface::SurfaceBootstrap::bind(
+            sender, registry, name, interface, v,
+        )?);
         Ok(())
     }
 
@@ -716,16 +718,5 @@ impl BarWindow {
         surface::SurfaceBootstrap::output_scale(sender, events, output)
     }
 
-    /// Delegates to the role-agnostic
-    /// [`platform::surface::SurfaceBootstrap::bind`], shared with
-    /// `platform::TermWindow`.
-    fn bind<T: ObjectId>(
-        sender: &mut Sender,
-        registry: RegistryId,
-        name: u32,
-        interface: &str,
-        version: u32,
-    ) -> Result<T> {
-        surface::SurfaceBootstrap::bind(sender, registry, name, interface, version)
-    }
+
 }

@@ -103,6 +103,8 @@
 //! emoji_path  = "/path/to/emoji-font.ttf" # defaults to [font].emoji_path
 //! icon_path   = "/path/to/NerdFont.ttf"    # defaults to [bar].icon_path
 //! opacity     = 0.85               # defaults to 0.85 (darker than the bar's default)
+//! highlight   = "#313244"          # selected-result row background; defaults to
+//!                                   # a built-in dark slate (no [colors] equivalent)
 //!
 //! # Everything here is optional and defaults to *mirroring* the bar's own
 //! # resolved background/opacity (which itself mirrors the terminal's), or
@@ -510,6 +512,11 @@ pub struct LauncherConfig {
     /// `0.85` -- darker (more transparent) than the bar's mirrored-opaque
     /// default, per the launcher's own overlay styling; see the struct doc.
     pub opacity: Option<f64>,
+    /// Selected-result highlight background color override. `None` uses a
+    /// built-in dark slate (`#313244`) -- unlike every other field here,
+    /// this one has no `[colors]`/`[font]` equivalent to mirror, since the
+    /// terminal itself has no concept of a "selected row".
+    pub highlight: Option<Color>,
 }
 
 // ── Root config ───────────────────────────────────────────────────────────────
@@ -1002,6 +1009,13 @@ impl Config {
         )? {
             self.launcher.opacity = Some(n);
         }
+        if let Some(s) = launcher.get_str("highlight") {
+            self.launcher.highlight =
+                Some(Color::parse_hex(s).ok_or(ConfigError::InvalidValue {
+                    field: "launcher.highlight",
+                    reason: "invalid #rrggbb hex color",
+                })?);
+        }
         Ok(())
     }
 
@@ -1280,5 +1294,15 @@ impl Config {
     #[must_use]
     pub fn launcher_opacity(&self) -> f64 {
         self.launcher.opacity.unwrap_or(0.85)
+    }
+
+    /// The selected-result row's highlight background: `[launcher].highlight`
+    /// if set, otherwise a built-in dark slate (`#313244`) -- see
+    /// [`LauncherConfig::highlight`] for why this has no mirror source.
+    #[must_use]
+    pub fn launcher_highlight(&self) -> Color {
+        self.launcher
+            .highlight
+            .unwrap_or_else(|| Color::from_rgb(0x31, 0x32, 0x44))
     }
 }

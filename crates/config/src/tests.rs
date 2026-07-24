@@ -465,6 +465,24 @@ fn launcher_opacity_out_of_range_rejected() {
 }
 
 #[test]
+fn launcher_highlight_defaults_to_built_in_slate() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.launcher_highlight(), Color::from_rgb(0x31, 0x32, 0x44));
+}
+
+#[test]
+fn launcher_highlight_override_wins() {
+    let cfg = Config::parse("[launcher]\nhighlight = \"#2a2a37\"\n");
+    assert_eq!(cfg.launcher_highlight(), Color::parse_hex("#2a2a37").unwrap());
+}
+
+#[test]
+fn launcher_highlight_bad_color_is_a_validation_error() {
+    let err = Config::fail("[launcher]\nhighlight = \"nope\"\n");
+    assert!(err.contains("launcher.highlight"));
+}
+
+#[test]
 fn launcher_emoji_and_icon_path_mirror_font_and_bar() {
     let cfg = Config::parse(
         "[font]\nemoji_path = \"/x/emoji.ttf\"\n[bar]\nicon_path = \"/nerd.ttf\"\n",

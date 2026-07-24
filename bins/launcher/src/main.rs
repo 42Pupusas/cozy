@@ -58,11 +58,12 @@ impl Theme {
         // is always in-range, so truncation/sign-loss can't actually occur.
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let bg_alpha = (cfg.launcher_opacity().clamp(0.0, 1.0) * 255.0).round() as u8;
+        let highlight_bg: Color = cfg.launcher_highlight().into();
         Self {
             bg,
             fg,
             dim: Color::rgb(0x6c, 0x70, 0x86),
-            highlight_bg: Color::rgb(0x31, 0x32, 0x44),
+            highlight_bg,
             bg_alpha,
         }
     }

@@ -14,6 +14,7 @@ mod clipboard;
 pub mod conn;
 pub mod cursor;
 pub mod cursor_anim;
+pub mod cursor_gate;
 mod debug_overlay;
 pub mod draw;
 pub mod error;

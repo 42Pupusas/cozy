@@ -209,6 +209,21 @@ impl BarApp {
         });
 
         let wake = waker::Waker::new().expect("create waker");
+
+        // Claim the StatusNotifier watcher name *before* any Wayland/font work.
+        //
+        // Tray clients (Electron in particular) probe for the watcher once
+        // during their own startup; if the name is unowned at that instant
+        // they decide no tray host exists and never register an item. Opening
+        // the layer-shell window and loading+rasterizing fallback fonts costs
+        // real milliseconds, and doing it first put all of that latency
+        // *inside* the window where a concurrently-launching client could
+        // lose the race. Nothing below needs the tray to exist yet -- the
+        // watcher only feeds `tray_rx` -- so hoisting the claim shrinks the
+        // race to the process's own startup rather than its first frame.
+        let (tray_tx, tray_rx) = mpsc::channel::<TraySnapshot>();
+        TrayWatcher::spawn(tray_tx, wake.clone());
+
         let bar_height = i32::try_from(cfg.bar_height()).unwrap_or(i32::MAX);
         let mut window =
             match BarWindow::new(Edge::Top, bar_height, cfg.bar_opacity(), wake.clone()) {
@@ -255,7 +270,6 @@ impl BarApp {
         // forwards raw wheel-pixel deltas the worker accumulates and, once a
         // whole detent's built up, turns into a debounced `pactl`/sysfs nudge.
         let (snapshot_tx, snapshot_rx) = mpsc::channel::<Snapshot>();
-        let (tray_tx, tray_rx) = mpsc::channel::<TraySnapshot>();
         let (scroll_tx, scroll_rx) = mpsc::channel::<(ModuleKind, i32)>();
         let (click_tx, click_rx) = mpsc::channel::<ModuleKind>();
         let notification_rules = cfg.bar_notifications().to_vec();
@@ -263,10 +277,9 @@ impl BarApp {
             snapshot_tx,
             scroll_rx,
             click_rx,
-            wake.clone(),
+            wake,
             notification_rules,
         );
-        TrayWatcher::spawn(tray_tx, wake);
 
         let bar_height = window.height();
         let paint_style = PaintStyle {

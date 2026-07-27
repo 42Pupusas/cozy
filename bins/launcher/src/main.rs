@@ -8,10 +8,17 @@
 //! presentation layer: paint the query + result list, react to keys, spawn
 //! on Enter, exit on Esc or after a successful launch.
 
+mod dmenu_app;
 mod icon_cache;
+mod launcher_options;
 mod launcher_window;
 
+use std::io::Read;
 use std::path::PathBuf;
+
+use dmenu_app::DmenuApp;
+use launcher::dmenu::ChoiceList;
+use launcher_options::{LauncherMode, LauncherOptions};
 
 use icon_cache::IconCache;
 use launcher::Catalog;
@@ -29,16 +36,18 @@ const MAX_VISIBLE_RESULTS: usize = 8;
 /// from whatever size actually got resolved on disk.
 const ICON_SIZE: i32 = 32;
 
-/// The launcher's resolved colors, pulled from `config::Config`'s
-/// `[launcher]` table (mirroring `[colors]`/`[font]` when unset) instead of
-/// the hardcoded palette the first version shipped with -- same pattern as
-/// `bins/monitor`'s `Theme` derived from `config::Config::monitor_*`.
+/// The launcher's resolved colors.
+///
+/// Pulled from `config::Config`'s `[launcher]` table (mirroring
+/// `[colors]`/`[font]` when unset) instead of the hardcoded palette the
+/// first version shipped with -- same pattern as `bins/monitor`'s `Theme`
+/// derived from `config::Config::monitor_*`.
 #[derive(Clone, Copy)]
-struct Theme {
-    bg: Color,
-    fg: Color,
-    helper: Color,
-    highlight_bg: Color,
+pub struct Theme {
+    pub bg: Color,
+    pub fg: Color,
+    pub helper: Color,
+    pub highlight_bg: Color,
     /// The window's own background alpha (`0-255`, `255` = opaque), passed
     /// through to every `draw_text_alpha` call so anti-aliased glyph edges
     /// blend correctly against a translucent backbuffer -- "translucent
@@ -49,7 +58,7 @@ struct Theme {
     /// `bins/statusbar`'s `PaintStyle::bg_alpha` exactly -- the bug this
     /// field fixes was the launcher never plumbing it at all, so glyph edges
     /// picked up the window's transparency instead of staying solid.
-    bg_alpha: u8,
+    pub bg_alpha: u8,
 }
 
 impl Theme {
@@ -59,7 +68,8 @@ impl Theme {
     /// monitor dashboard's typography tiers have no `[colors]` equivalent),
     /// so they're derived from the resolved background/foreground instead
     /// of hardcoded literals.
-    fn from_config(cfg: &config::Config) -> Self {
+    #[must_use]
+    pub fn from_config(cfg: &config::Config) -> Self {
         let bg: Color = cfg.launcher_background().into();
         let fg: Color = cfg.launcher_foreground().into();
         // Same float->u8 pixel-alpha conversion as `BarWindow::new` and
@@ -426,14 +436,71 @@ fn singleton_socket_path() -> PathBuf {
     dir.join("launcher.sock")
 }
 
-fn main() {
+/// Everything `main` does before a window opens, grouped so the two modes
+/// stay separable (this workspace prefers a named owner over free
+/// functions).
+struct Cli;
+
+impl Cli {
+    /// Drain stdin fully -- dmenu's input is a pipe whose writer usually
+    /// exits immediately (`clipboard list` does), so this returns quickly;
+    /// reading it *before* opening the window also means a caller that
+    /// pipes nothing gets an immediate "nothing to choose from" rather
+    /// than a window built around an empty list.
+    fn read_stdin() -> String {
+        let mut buf = String::new();
+        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
+            eprintln!("launcher: failed to read stdin: {e}");
+        }
+        buf
+    }
+
+    /// Run the dmenu picker, printing the chosen line.
+    ///
+    /// Exit status is the contract downstream tools read: `0` only when
+    /// something was actually picked, so `xargs -r` and `&&` chains behave
+    /// correctly when the user hits Esc.
+    fn run_dmenu(prompt: String) -> std::process::ExitCode {
+        let choices = ChoiceList::parse(&Self::read_stdin());
+        if choices.is_empty() {
+            eprintln!("launcher: --dmenu got no input lines on stdin");
+            return std::process::ExitCode::FAILURE;
+        }
+        let Some(app) = DmenuApp::new(choices, prompt) else {
+            return std::process::ExitCode::FAILURE;
+        };
+        // Cancelled (`None`) prints nothing at all, so the caller can't
+        // mistake a default for a decision.
+        app.run().map_or(std::process::ExitCode::FAILURE, |choice| {
+            println!("{choice}");
+            std::process::ExitCode::SUCCESS
+        })
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    let opts = match LauncherOptions::parse(std::env::args().skip(1)) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("launcher: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    // dmenu mode deliberately skips the singleton: it's one step of a shell
+    // pipeline with a caller blocked on our stdout, so "another instance is
+    // open, exit silently" would hand that caller an empty answer.
+    if let LauncherMode::Dmenu { prompt } = opts.mode {
+        return Cli::run_dmenu(prompt);
+    }
+
     let path = singleton_socket_path();
     let guard = match SingletonGuard::acquire(&path) {
         Ok(SingletonAcquire::Primary(guard)) => guard,
         Ok(SingletonAcquire::AlreadyRunning) => {
             // A running instance was notified to close (toggle behavior) --
             // this invocation's job is done.
-            return;
+            return std::process::ExitCode::SUCCESS;
         }
         Err(e) => {
             eprintln!(
@@ -448,7 +515,7 @@ fn main() {
             let fallback = std::env::temp_dir().join(format!("launcher-{}.sock", std::process::id()));
             match SingletonGuard::acquire(&fallback) {
                 Ok(SingletonAcquire::Primary(guard)) => guard,
-                _ => return,
+                _ => return std::process::ExitCode::FAILURE,
             }
         }
     };
@@ -456,4 +523,5 @@ fn main() {
         eprintln!("launcher: failed to set singleton socket nonblocking: {e}");
     }
     LauncherApp::new(guard).run();
+    std::process::ExitCode::SUCCESS
 }

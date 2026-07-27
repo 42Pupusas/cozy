@@ -4,6 +4,7 @@
 
 pub mod app_index;
 pub mod desktop_entry;
+pub mod dmenu;
 pub mod fuzzy;
 pub mod icon_lookup;
 pub mod launch;

@@ -143,7 +143,7 @@ mod tests {
         let data_dir = tmp.join("data");
         touch(&data_dir.join("icons/hicolor/48x48/apps/firefox.png"));
 
-        let lookup = IconLookup::with_roots(&[data_dir.clone()], Path::new("/nonexistent"));
+        let lookup = IconLookup::with_roots(std::slice::from_ref(&data_dir), Path::new("/nonexistent"));
         assert_eq!(
             lookup.resolve("firefox"),
             Some(data_dir.join("icons/hicolor/48x48/apps/firefox.png"))
@@ -159,7 +159,7 @@ mod tests {
         touch(&data_dir.join("icons/hicolor/128x128/apps/spotify.png"));
         touch(&data_dir.join("icons/hicolor/32x32/apps/spotify.png"));
 
-        let lookup = IconLookup::with_roots(&[data_dir.clone()], Path::new("/nonexistent"));
+        let lookup = IconLookup::with_roots(std::slice::from_ref(&data_dir), Path::new("/nonexistent"));
         assert_eq!(
             lookup.resolve("spotify"),
             Some(data_dir.join("icons/hicolor/32x32/apps/spotify.png"))

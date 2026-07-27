@@ -210,6 +210,11 @@ pub struct TermWindow {
     /// Smooth cursor-slide + blink animation state. Advanced by wall-clock
     /// time in [`Self::tick`]; see [`crate::cursor_anim`].
     cursor_anim: crate::cursor_anim::CursorAnimator,
+    /// Whether this window is driven by a client-owned painter rather than
+    /// the terminal grid renderer, and what that implies for the cursor
+    /// animation. See [`crate::cursor_gate::CursorAnimGate`] for why a
+    /// client-painted window must not run the animator at all.
+    cursor_gate: crate::cursor_gate::CursorAnimGate,
     /// Wall-clock instant of the last [`Self::tick`] call, for computing the
     /// animator's `dt_ms`.
     last_tick: std::time::Instant,
@@ -562,6 +567,7 @@ impl TermWindow {
             prev_hover_row: None,
             prev_cursor_rows: Vec::new(),
             cursor_anim: crate::cursor_anim::CursorAnimator::new(cursor_cfg),
+            cursor_gate: crate::cursor_gate::CursorAnimGate::new(),
             last_tick: std::time::Instant::now(),
             #[cfg(feature = "trace")]
             debug: DebugOverlay::new(),
@@ -738,6 +744,9 @@ impl TermWindow {
         &mut self,
         mut paint: impl FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Damage,
     ) -> Result<bool> {
+        // Latch the window's role on first use: from here on the terminal
+        // cursor animation is suppressed. See `CursorAnimGate`.
+        self.cursor_gate.note_custom_paint();
         self.tick_inner(Some(&mut paint))
     }
 
@@ -791,6 +800,16 @@ impl TermWindow {
     /// enough (~60fps) while an animation is in flight instead of idling on
     /// the full event-wait timeout.
     fn advance_cursor_anim(&mut self) {
+        // A client-painted window draws no terminal cursor, so advancing the
+        // animator could only ever produce spurious `mark_dirty` calls --
+        // and because blink never stops animating, it would produce one on
+        // *every* tick, forcing a full present at the tick rate forever.
+        // Bail before touching `last_tick`: it is only ever read to compute
+        // this function's own `dt_ms`, so leaving it stale is harmless, and
+        // it keeps this a pure early-out.
+        if !self.cursor_gate.may_advance_cursor() {
+            return;
+        }
         let now = std::time::Instant::now();
         let dt_ms = now.duration_since(self.last_tick).as_secs_f32() * 1000.0;
         self.last_tick = now;
@@ -824,7 +843,11 @@ impl TermWindow {
     /// nothing but a wall-clock timer wakes it from.
     #[must_use]
     pub fn wants_animation_frame(&self) -> bool {
-        self.cursor_anim.is_animating() || self.autoscroll_active()
+        // The gate keeps this in agreement with `advance_cursor_anim`: a
+        // client-painted window never advances the animator, so its
+        // permanently-true blink must not be reported here.
+        self.cursor_gate
+            .wants_animation_frame(self.cursor_anim.is_animating(), self.autoscroll_active())
     }
 
     /// Whether the pointer currently sits within [`AUTOSCROLL_MARGIN_PX`] of

@@ -60,6 +60,26 @@ name = "clipboard"
 version = "0.1.0"
 
 [[package]]
+name = "clipboard-bin"
+version = "0.1.0"
+dependencies = [
+ "clipboard",
+ "clipboard-wayland",
+ "platform",
+ "quetzalcoatl",
+ "waker",
+]
+
+[[package]]
+name = "clipboard-wayland"
+version = "0.1.0"
+dependencies = [
+ "clipboard",
+ "platform",
+ "quetzalcoatl",
+]
+
+[[package]]
 name = "condtype"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -319,6 +339,7 @@ name = "shot-bin"
 version = "0.1.0"
 dependencies = [
  "clipboard",
+ "clipboard-wayland",
  "ixiptla-core",
  "platform",
  "quetzalcoatl",

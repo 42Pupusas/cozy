@@ -6,9 +6,13 @@
 //! these rules stay headlessly testable.
 
 mod history;
+mod incoming;
+mod offer_registry;
 mod storage;
 
 pub use history::{ClipboardHistory, HistoryEntry};
+pub use incoming::{IncomingClipboard, IncomingState};
+pub use offer_registry::OfferRegistry;
 pub use storage::{HistoryStore, HistoryStoreError};
 
 /// A byte payload advertised under one MIME type.

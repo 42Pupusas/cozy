@@ -1,0 +1,16 @@
+[package]
+name    = "clipboard-wayland"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The pure data policy this crate is a transport for. The split exists so the
+# MIME/history/offer rules stay headlessly testable while everything that
+# needs a live compositor lives here.
+clipboard = { path = "../clipboard" }
+# Wire vocabulary, connection, and event ring.
+platform = { path = "../platform" }
+quetzalcoatl.workspace = true

@@ -1,8 +1,10 @@
-//! Persistent Wayland clipboard ownership for screenshot payloads.
+//! Persistent Wayland clipboard ownership.
 //!
 //! This uses `zwlr_data_control_unstable_v1`, rather than core
-//! `wl_data_device`, because a keybind-driven screenshot has no input serial.
-//! The owner stays in this process until the compositor reports `cancelled`.
+//! `wl_data_device`, because a keybind-driven publisher has no input serial.
+//! The owner stays alive in this process until the compositor reports
+//! `cancelled` — that is what "the clipboard holds it" means on Wayland: there
+//! is no server-side storage, only a live client promising to serve bytes.
 
 use clipboard::{ClipboardOwner as PayloadOwner, ClipboardPayload, OwnerRequest, OwnerResponse};
 use platform::conn::Sender;
@@ -76,31 +78,45 @@ impl<'a> ClipboardSession<'a> {
     /// Serve requests until the clipboard is replaced or the connection ends.
     pub fn run(&mut self, events: &mut Consumer<RawEvent>) {
         while let Some(event) = events.pop_block() {
-            if event.is(self.source) {
-                match event.event::<DataControlSourceEvent>() {
-                    Some(DataControlSourceEvent::Send) => {
-                        let Some(bytes) = event.wire_bytes() else {
-                            continue;
-                        };
-                        let Some((mut wire, _)) = WireEvent::parse(bytes) else {
-                            continue;
-                        };
-                        self.pending_mime = Some(wire.string());
-                    }
-                    Some(DataControlSourceEvent::Cancelled) => {
-                        let _ = self.payload.handle(OwnerRequest::Cancelled);
-                        return;
-                    }
-                    None => {}
-                }
-                continue;
-            }
-            if let RawEvent::Fd(fds) = event
-                && let Some(fd) = fds.into_iter().next()
-            {
-                self.serve(fd);
+            if !self.handle(event) {
+                return;
             }
         }
+    }
+
+    /// Handle one event; `false` means the owner should stop.
+    ///
+    /// Split out of [`Self::run`] so a caller with its own event loop — a
+    /// daemon that is simultaneously watching for new selections — can drive
+    /// the same logic without surrendering its ring.
+    pub fn handle(&mut self, event: RawEvent) -> bool {
+        if event.is(self.source) {
+            match event.event::<DataControlSourceEvent>() {
+                Some(DataControlSourceEvent::Send) => {
+                    // The mime arrives on the message; the pipe to write it
+                    // into arrives as the *next* event, out of band.
+                    let Some(bytes) = event.wire_bytes() else {
+                        return true;
+                    };
+                    let Some((mut wire, _)) = WireEvent::parse(bytes) else {
+                        return true;
+                    };
+                    self.pending_mime = Some(wire.string());
+                }
+                Some(DataControlSourceEvent::Cancelled) => {
+                    let _ = self.payload.handle(OwnerRequest::Cancelled);
+                    return false;
+                }
+                None => {}
+            }
+            return true;
+        }
+        if let RawEvent::Fd(fds) = event
+            && let Some(fd) = fds.into_iter().next()
+        {
+            self.serve(fd);
+        }
+        true
     }
 
     fn serve(&mut self, fd: OwnedFd) {
@@ -129,11 +145,11 @@ impl Drop for ClipboardSession<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use clipboard::ClipboardPayload;
 
     #[test]
     fn owner_type_is_built_around_payload_decisions() {
         let payload = ClipboardPayload::new();
-        let _ = PayloadOwner::new(&payload);
+        let _ = clipboard::ClipboardOwner::new(&payload);
     }
 }

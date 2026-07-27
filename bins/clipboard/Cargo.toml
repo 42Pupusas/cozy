@@ -1,0 +1,23 @@
+[package]
+name    = "clipboard-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "clipboard"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# History, retention, persistence, and MIME policy -- all headlessly testable.
+clipboard = { path = "../../crates/clipboard" }
+# The data-control transport, shared with `bins/shot`.
+clipboard-wayland = { path = "../../crates/clipboard-wayland" }
+# Connection bootstrap and registry discovery.
+platform = { path = "../../crates/platform" }
+# The event ring the platform reader delivers into.
+quetzalcoatl.workspace = true
+# Waking the main thread from the reader thread.
+waker = { path = "../../crates/waker" }

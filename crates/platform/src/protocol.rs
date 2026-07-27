@@ -1213,11 +1213,36 @@ requests! {
     }
 }
 
+events! {
+    /// `zwlr_data_control_device_v1` events.
+    DataControlDeviceEvent {
+        DataOffer = 0,
+        Selection = 1,
+        Finished = 2,
+        PrimarySelection = 3,
+    }
+}
+
+requests! {
+    /// `zwlr_data_control_offer_v1` requests.
+    DataControlOfferRequest {
+        Receive = 0,
+        Destroy = 1,
+    }
+}
+
 requests! {
     /// `zwlr_data_control_source_v1` requests.
     DataControlSourceRequest {
         Offer = 0,
         Destroy = 1,
+    }
+}
+
+events! {
+    /// `zwlr_data_control_offer_v1` events.
+    DataControlOfferEvent {
+        Offer = 0,
     }
 }
 
@@ -1436,6 +1461,11 @@ mod tests {
         assert_eq!(DataControlManagerRequest::Destroy.opcode(), 2);
         assert_eq!(DataControlDeviceRequest::SetSelection.opcode(), 0);
         assert_eq!(DataControlDeviceRequest::Destroy.opcode(), 1);
+        assert_eq!(DataControlDeviceEvent::from_opcode(0), Some(DataControlDeviceEvent::DataOffer));
+        assert_eq!(DataControlDeviceEvent::from_opcode(1), Some(DataControlDeviceEvent::Selection));
+        assert_eq!(DataControlOfferRequest::Receive.opcode(), 0);
+        assert_eq!(DataControlOfferRequest::Destroy.opcode(), 1);
+        assert_eq!(DataControlOfferEvent::from_opcode(0), Some(DataControlOfferEvent::Offer));
         assert_eq!(DataControlSourceRequest::Offer.opcode(), 0);
         assert_eq!(DataControlSourceRequest::Destroy.opcode(), 1);
         assert_eq!(

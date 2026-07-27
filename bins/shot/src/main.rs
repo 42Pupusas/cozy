@@ -6,10 +6,8 @@
 //! the capture protocol, `ixiptla-core` the encoding -- so this file is just
 //! wiring: connect, discover, pick a target, capture, write.
 
-mod clipboard_owner;
-
 use clipboard::ScreenshotPayload;
-use clipboard_owner::ClipboardSession;
+use clipboard_wayland::ClipboardSession;
 mod drag_selection;
 mod output_registry;
 mod seat_devices;

@@ -15,6 +15,10 @@ workspace = true
 # pixel/handshake logic lives there rather than in this bin.
 screencopy = { path = "../../crates/screencopy" }
 clipboard = { path = "../../crates/clipboard" }
+# The data-control transport, shared with `bins/clipboard` rather than
+# duplicated: publishing a screenshot and publishing a history entry are the
+# same Wayland conversation.
+clipboard-wayland = { path = "../../crates/clipboard-wayland" }
 # Connection bootstrap, registry discovery, and the wire vocabulary.
 platform = { path = "../../crates/platform" }
 # The event ring the platform reader delivers into.

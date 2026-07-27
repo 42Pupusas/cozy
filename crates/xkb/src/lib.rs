@@ -138,15 +138,16 @@ impl Drop for Keymap {
 struct State {
     ptr: NonNull<ffi::xkb_state>,
     _keymap: Keymap,
-    /// Cached `xkb_keymap_mod_get_index("Lock")` — the modifier index for
-    /// `CapsLock`, looked up once so [`Translator::caps_lock_active`] doesn't
-    /// re-resolve the name every call.
+    /// Cached modifier indices, looked up once so modifier queries do not
+    /// repeatedly resolve names through libxkbcommon on every key event.
     caps_mod_index: ffi::xkb_mod_index_t,
+    ctrl_mod_index: ffi::xkb_mod_index_t,
 }
 
 /// XKB's canonical name for the `CapsLock` modifier (`XKB_MOD_NAME_CAPS`
 /// in the C headers) -- resolved once per `State` and cached.
 const XKB_MOD_NAME_CAPS: &str = "Lock\0";
+const XKB_MOD_NAME_CTRL: &str = "Control\0";
 
 impl State {
     fn new(keymap: Keymap) -> Result<Self, XkbError> {
@@ -161,10 +162,17 @@ impl State {
                 XKB_MOD_NAME_CAPS.as_ptr().cast::<c_char>(),
             )
         };
+        let ctrl_mod_index = unsafe {
+            (lib.keymap_mod_get_index)(
+                keymap.ptr.as_ptr(),
+                XKB_MOD_NAME_CTRL.as_ptr().cast::<c_char>(),
+            )
+        };
         Ok(Self {
             ptr,
             _keymap: keymap,
             caps_mod_index,
+            ctrl_mod_index,
         })
     }
 }
@@ -268,6 +276,27 @@ impl Translator {
         let keycode = evdev_code + EVDEV_XKB_OFFSET;
         // SAFETY: same as `keysym` above.
         unsafe { (lib.state_key_get_utf32)(self.state.ptr.as_ptr(), keycode) }
+    }
+
+    /// Whether `CapsLock` is currently latched on, per the *effective*
+    /// modifier state (so a remapped keymap where some other physical key
+    /// drives `CapsLock` is still reported correctly).
+    #[must_use]
+    pub fn control_active(&self) -> bool {
+        let Ok(lib) = ffi::Lib::global() else {
+            return false;
+        };
+        if self.state.ctrl_mod_index == u32::MAX {
+            return false;
+        }
+        let active = unsafe {
+            (lib.state_mod_index_is_active)(
+                self.state.ptr.as_ptr(),
+                self.state.ctrl_mod_index,
+                ffi::StateComponent::ModsEffective,
+            )
+        };
+        active != 0
     }
 
     /// Whether `CapsLock` is currently latched on, per the *effective*

@@ -98,6 +98,7 @@
 //! [launcher]
 //! background  = "#181818"          # defaults to [colors].background
 //! foreground  = "#d8d8d8"          # defaults to [colors].foreground
+//! helper      = "#727169"          # secondary launcher hints/placeholder
 //! font_path   = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf" # defaults to [font].path
 //! font_size   = 12                 # points; defaults to [font].size
 //! emoji_path  = "/path/to/emoji-font.ttf" # defaults to [font].emoji_path
@@ -499,6 +500,9 @@ pub struct LauncherConfig {
     pub background: Option<Color>,
     /// Foreground (text) color override. `None` mirrors `[colors].foreground`.
     pub foreground: Option<Color>,
+    /// Secondary helper text color (shortcut hints and search placeholder).
+    /// `None` uses a built-in muted color.
+    pub helper: Option<Color>,
     /// Font file override. `None` mirrors `[font].path`.
     pub font_path: Option<String>,
     /// Font point size override. `None` mirrors `[font].size`.
@@ -982,6 +986,13 @@ impl Config {
                     reason: "invalid #rrggbb hex color",
                 })?);
         }
+        if let Some(s) = launcher.get_str("helper") {
+            self.launcher.helper =
+                Some(Color::parse_hex(s).ok_or(ConfigError::InvalidValue {
+                    field: "launcher.helper",
+                    reason: "invalid #rrggbb hex color",
+                })?);
+        }
         if let Some(s) = launcher.get_str("font_path") {
             self.launcher.font_path = Some(s.to_owned());
         }
@@ -1238,6 +1249,15 @@ impl Config {
     #[must_use]
     pub fn launcher_foreground(&self) -> Color {
         self.launcher.foreground.unwrap_or(self.palette.foreground)
+    }
+
+    /// The launcher's helper text color: `[launcher].helper` if set,
+    /// otherwise a muted Kanagawa Dragon-style gray.
+    #[must_use]
+    pub fn launcher_helper(&self) -> Color {
+        self.launcher
+            .helper
+            .unwrap_or_else(|| Color::from_rgb(0x72, 0x71, 0x69))
     }
 
     /// The launcher's font file: `[launcher].font_path` if set, otherwise

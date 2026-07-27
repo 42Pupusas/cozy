@@ -97,6 +97,12 @@ object_ids! {
     ScreencopyManagerId,
     /// `zwlr_screencopy_frame_v1` — one single-use capture of an output.
     ScreencopyFrameId,
+    /// `zwlr_data_control_manager_v1` — privileged clipboard factory.
+    DataControlManagerId,
+    /// `zwlr_data_control_device_v1` — privileged clipboard endpoint.
+    DataControlDeviceId,
+    /// `zwlr_data_control_source_v1` — privileged outgoing clipboard source.
+    DataControlSourceId,
 }
 
 /// An event serial — echoed back in acks/pongs. Distinct from an object id so

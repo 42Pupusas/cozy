@@ -6,6 +6,10 @@
 //! the capture protocol, `ixiptla-core` the encoding -- so this file is just
 //! wiring: connect, discover, pick a target, capture, write.
 
+mod clipboard_owner;
+
+use clipboard::ScreenshotPayload;
+use clipboard_owner::ClipboardSession;
 mod drag_selection;
 mod output_registry;
 mod seat_devices;
@@ -40,6 +44,7 @@ struct Globals {
     /// The version `screencopy` was bound at -- below 3 the compositor never
     /// sends `buffer_done`, which the session must know.
     screencopy_version: u32,
+    data_control: Option<(platform::id::DataControlManagerId, u32)>,
     /// Only the interactive picker needs these, so they stay optional: a
     /// compositor without layer-shell can still take a plain screenshot, and
     /// refusing to start over a global that this run will never use would be
@@ -61,6 +66,7 @@ struct Globals {
 struct GlobalsBuilder {
     shm: Option<ShmId>,
     screencopy: Option<(ScreencopyManagerId, u32)>,
+    data_control: Option<(platform::id::DataControlManagerId, u32)>,
     compositor: Option<CompositorId>,
     layer_shell: Option<LayerShellId>,
     seat: Option<(u32, u32)>,
@@ -87,6 +93,7 @@ impl GlobalsBuilder {
                 shm,
                 screencopy,
                 screencopy_version,
+                data_control: self.data_control,
                 compositor: self.compositor,
                 layer_shell: self.layer_shell,
                 seat: self.seat,
@@ -128,6 +135,11 @@ impl GlobalCollector for GlobalsBuilder {
                 let bound = proto::ZWLR_SCREENCOPY_MANAGER_V1.version.min(version);
                 let manager = SurfaceBootstrap::bind(sender, registry, name, interface, bound)?;
                 self.screencopy = Some((manager, bound));
+            }
+            n if n == proto::ZWLR_DATA_CONTROL_MANAGER_V1.name && self.data_control.is_none() => {
+                let bound = proto::ZWLR_DATA_CONTROL_MANAGER_V1.version.min(version);
+                let manager = SurfaceBootstrap::bind(sender, registry, name, interface, bound)?;
+                self.data_control = Some((manager, bound));
             }
             n if n == proto::WL_COMPOSITOR.name && self.compositor.is_none() => {
                 self.compositor = Some(SurfaceBootstrap::bind(
@@ -238,7 +250,12 @@ impl ShotApp {
             )
             .map_err(|e| e.to_string())?;
         let png = ShotWriter::encode(&frame)?;
-        ShotWriter::write(&png, options.output_path.as_deref())
+        if options.clipboard {
+            self.publish_clipboard(&png, options.output_path.as_deref())?;
+        } else {
+            ShotWriter::write(&png, options.output_path.as_deref())?;
+        }
+        Ok(())
     }
 
     /// Resolve what to capture, running the interactive picker when asked.
@@ -257,6 +274,40 @@ impl ShotApp {
                 .map(|region| (output, Some(region))));
         }
         self.resolve_target(target).map(Some)
+    }
+
+    /// Publish the PNG and remain alive until another clipboard source replaces it.
+    fn publish_clipboard(
+        &mut self,
+        png: &[u8],
+        output_path: Option<&std::path::Path>,
+    ) -> std::result::Result<(), String> {
+        let Some((manager, _version)) = self.globals.data_control else {
+            return Err("compositor does not offer zwlr_data_control_manager_v1; clipboard mode needs data-control support".to_string());
+        };
+        let path = output_path.map_or_else(
+            || std::env::temp_dir().join(format!("shot-clipboard-{}.png", std::process::id())),
+            std::path::Path::to_path_buf,
+        );
+        ShotWriter::write(png, Some(&path))?;
+        let uri = format!("file://{}", path.display());
+        let payload = ScreenshotPayload::from_png(png.to_vec(), uri);
+        let Some((seat_global, seat_version)) = self.globals.seat else {
+            return Err("clipboard mode needs a wl_seat".to_string());
+        };
+        let cleanup_path = output_path.is_none().then_some(path);
+        let mut owner = ClipboardSession::publish(
+            &mut self.sender,
+            manager,
+            self.registry,
+            seat_global,
+            seat_version,
+            &payload,
+            cleanup_path,
+        )
+        .map_err(|e| e.to_string())?;
+        owner.run(&mut self.events);
+        Ok(())
     }
 
     /// Show the overlay on `output` and wait for a region or a cancel.

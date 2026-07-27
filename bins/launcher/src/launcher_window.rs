@@ -50,6 +50,7 @@ pub enum LauncherKey {
     Esc,
     Up,
     Down,
+    CtrlDigit(u8),
 }
 
 /// A centered, keyboard-grabbing layer-shell overlay window.
@@ -495,6 +496,11 @@ impl LauncherWindow {
         };
 
         let sym = xkb.keysym(evdev_code);
+        if xkb.control_active()
+            && let Some(digit) = Self::digit_for_keysym(sym)
+        {
+            return Some(LauncherKey::CtrlDigit(digit));
+        }
         match sym {
             XKB_KEY_BACKSPACE => return Some(LauncherKey::Backspace),
             XKB_KEY_RETURN | XKB_KEY_KP_ENTER => return Some(LauncherKey::Enter),
@@ -531,6 +537,22 @@ impl LauncherWindow {
                 Key::Enter => self.pending_keys.push(LauncherKey::Enter),
                 _ => {}
             }
+        }
+    }
+
+    const fn digit_for_keysym(sym: u32) -> Option<u8> {
+        match sym {
+            0x30 => Some(0),
+            0x31 => Some(1),
+            0x32 => Some(2),
+            0x33 => Some(3),
+            0x34 => Some(4),
+            0x35 => Some(5),
+            0x36 => Some(6),
+            0x37 => Some(7),
+            0x38 => Some(8),
+            0x39 => Some(9),
+            _ => None,
         }
     }
 

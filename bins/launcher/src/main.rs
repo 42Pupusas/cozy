@@ -21,13 +21,13 @@ use platform::draw::{Canvas, Color, Rect};
 use statusbar::TextRenderer;
 
 const WINDOW_WIDTH: i32 = 640;
-const WINDOW_HEIGHT: i32 = 400;
+const WINDOW_HEIGHT: i32 = 520;
 const MAX_VISIBLE_RESULTS: usize = 8;
 /// Icon glyph edge, in pixels -- square, drawn left of each result row's
 /// text with a small gap. Sized to roughly match a result row's text
 /// height rather than any XDG icon-theme size, since it's blitted (scaled)
 /// from whatever size actually got resolved on disk.
-const ICON_SIZE: i32 = 20;
+const ICON_SIZE: i32 = 32;
 
 /// The launcher's resolved colors, pulled from `config::Config`'s
 /// `[launcher]` table (mirroring `[colors]`/`[font]` when unset) instead of
@@ -37,7 +37,7 @@ const ICON_SIZE: i32 = 20;
 struct Theme {
     bg: Color,
     fg: Color,
-    dim: Color,
+    helper: Color,
     highlight_bg: Color,
     /// The window's own background alpha (`0-255`, `255` = opaque), passed
     /// through to every `draw_text_alpha` call so anti-aliased glyph edges
@@ -72,7 +72,7 @@ impl Theme {
         Self {
             bg,
             fg,
-            dim: Color::rgb(0x6c, 0x70, 0x86),
+            helper: cfg.launcher_helper().into(),
             highlight_bg,
             bg_alpha,
         }
@@ -86,6 +86,8 @@ impl Theme {
 struct LauncherApp {
     window: LauncherWindow,
     text: TextRenderer,
+    title_text: TextRenderer,
+    command_text: TextRenderer,
     catalog: Catalog,
     icons: IconCache,
     theme: Theme,
@@ -131,10 +133,22 @@ impl LauncherApp {
             &[cfg.launcher_emoji_path(), cfg.launcher_icon_path()],
             px_size,
         );
+        let title_text = TextRenderer::load_with_fallbacks(
+            cfg.launcher_font_path(),
+            &[cfg.launcher_emoji_path(), cfg.launcher_icon_path()],
+            px_size * 1.15,
+        );
+        let command_text = TextRenderer::load_with_fallbacks(
+            cfg.launcher_font_path(),
+            &[cfg.launcher_emoji_path(), cfg.launcher_icon_path()],
+            px_size * 0.72,
+        );
 
         Self {
             window,
             text,
+            title_text,
+            command_text,
             catalog: Catalog::load(),
             icons: IconCache::new(),
             theme,
@@ -157,6 +171,8 @@ impl LauncherApp {
             let Self {
                 window,
                 text,
+                title_text,
+                command_text,
                 catalog,
                 icons,
                 theme,
@@ -165,7 +181,7 @@ impl LauncherApp {
                 ..
             } = &mut self;
             match window.tick(|canvas| {
-                Painter::paint(canvas, text, catalog, icons, theme, query, *selected);
+                Painter::paint(canvas, text, title_text, command_text, catalog, icons, theme, query, *selected);
             }) {
                 Ok(true) => {}
                 Ok(false) => break,
@@ -246,6 +262,16 @@ impl LauncherApp {
                     self.selected = (self.selected + 1) % count;
                 }
             }
+            LauncherKey::CtrlDigit(digit) => {
+                if (1..=9).contains(&digit) {
+                    let count = self.catalog.search(&self.query).len().min(MAX_VISIBLE_RESULTS);
+                    let index = usize::from(digit - 1);
+                    if index < count {
+                        self.selected = index;
+                        self.launch_selected();
+                    }
+                }
+            }
             LauncherKey::Enter => self.launch_selected(),
         }
     }
@@ -267,9 +293,12 @@ impl LauncherApp {
 struct Painter;
 
 impl Painter {
+    #[allow(clippy::too_many_arguments)]
     fn paint(
         canvas: &mut Canvas,
         text: &mut TextRenderer,
+        title_text: &mut TextRenderer,
+        command_text: &mut TextRenderer,
         catalog: &Catalog,
         icons: &mut IconCache,
         theme: &Theme,
@@ -280,7 +309,7 @@ impl Painter {
         let Theme {
             bg,
             fg,
-            dim,
+            helper,
             highlight_bg,
             bg_alpha,
         } = *theme;
@@ -289,18 +318,22 @@ impl Painter {
         // typed text (or a placeholder) at the top.
         let query_y = pad;
         if query.is_empty() {
-            text.draw_text_alpha(canvas, "Type to search…", pad, query_y, dim, bg, bg_alpha);
+            text.draw_text_alpha(canvas, "Type to search…", pad, query_y, helper, bg, bg_alpha);
         } else {
             text.draw_text_alpha(canvas, query, pad, query_y, fg, bg, bg_alpha);
         }
 
-        let text_h = text.line_height();
-        let line_h = text_h + 10;
-        let list_top = query_y + line_h + 10;
+        let title_h = title_text.line_height();
+        let hint_h = command_text.line_height();
+        let row_padding = 12;
+        let row_gap = 10;
+        let content_h = title_h.max(hint_h).max(ICON_SIZE);
+        let line_h = content_h + row_padding * 2;
+        let list_top = query_y + text.line_height() + 18;
 
         let results = catalog.search(query);
         for (i, ranked) in results.iter().take(MAX_VISIBLE_RESULTS).enumerate() {
-            let row_top = list_top + i32::try_from(i).unwrap_or(0) * line_h;
+            let row_top = list_top + i32::try_from(i).unwrap_or(0) * (line_h + row_gap);
             // Both the icon and the text glyphs are drawn from a cell-top
             // origin, but the icon's cell height (`ICON_SIZE`) and the
             // font's own `line_height()` are unrelated numbers -- aligning
@@ -310,7 +343,8 @@ impl Painter {
             // independently within the row's full height (`line_h`,
             // already the font's line height plus row padding) instead.
             let icon_y = row_top + (line_h - ICON_SIZE) / 2;
-            let row_y = row_top + (line_h - text_h) / 2;
+            let title_y = row_top + (line_h - title_h) / 2;
+            let hint_y = title_y + title_text.baseline_offset() - command_text.baseline_offset();
             if i == selected {
                 // `fill_rect_alpha`, not `fill_rect`: the launcher window is
                 // translucent by default (`launcher_opacity`), so its
@@ -325,13 +359,13 @@ impl Painter {
                     bg_alpha,
                 );
             }
-            let color = if i == selected { fg } else { dim };
+            let row_bg = if i == selected { highlight_bg } else { bg };
+            let color = if i == selected { fg } else { helper };
+            let command_color = if i == selected { fg } else { helper };
 
-            // Icon, if this entry has one and it actually resolved+decoded
-            // -- entries without a usable icon just start their label at
-            // `pad` as before (`text_x` degenerates to `pad`), so a mix of
-            // icon/no-icon apps in one result list doesn't look broken.
-            let text_x = if let Some(icon_name) = &ranked.entry.icon
+            // Reserve the same icon column for every row, even when an app
+            // has no usable icon. This keeps all titles on one vertical axis.
+            if let Some(icon_name) = &ranked.entry.icon
                 && let Some(icon) = icons.get(icon_name)
             {
                 canvas.blit_rgba_scaled(
@@ -342,11 +376,29 @@ impl Painter {
                     bg,
                     bg_alpha,
                 );
-                pad + ICON_SIZE + 8
-            } else {
-                pad
-            };
-            text.draw_text_alpha(canvas, &ranked.entry.name, text_x, row_y, color, bg, bg_alpha);
+            }
+            let text_x = pad + ICON_SIZE + 8;
+            title_text.draw_text_alpha(
+                canvas,
+                &ranked.entry.name,
+                text_x,
+                title_y,
+                color,
+                row_bg,
+                bg_alpha,
+            );
+            if i < 9 {
+                let hint = format!("Ctrl+{}", i + 1);
+                command_text.draw_text_right_alpha(
+                    canvas,
+                    &hint,
+                    canvas.width() - pad,
+                    hint_y,
+                    command_color,
+                    row_bg,
+                    bg_alpha,
+                );
+            }
         }
 
         if results.is_empty() && !query.is_empty() {
@@ -355,7 +407,7 @@ impl Painter {
                 "No matching applications",
                 pad,
                 list_top,
-                dim,
+                helper,
                 bg,
                 bg_alpha,
             );

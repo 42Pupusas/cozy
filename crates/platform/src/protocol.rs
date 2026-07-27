@@ -1190,6 +1190,50 @@ impl ScreencopyFrameFlags {
     }
 }
 
+// ── zwlr_data_control_unstable_v1 ───────────────────────────────────────
+//
+// Unlike core `wl_data_device.set_selection`, data-control does not require
+// an input serial. That makes it suitable for a screenshot keybind that
+// captures without first mapping an interactive surface.
+
+requests! {
+    /// `zwlr_data_control_manager_v1` requests.
+    DataControlManagerRequest {
+        CreateSource = 0,
+        GetDevice = 1,
+        Destroy = 2,
+    }
+}
+
+requests! {
+    /// `zwlr_data_control_device_v1` requests.
+    DataControlDeviceRequest {
+        SetSelection = 0,
+        Destroy = 1,
+    }
+}
+
+requests! {
+    /// `zwlr_data_control_source_v1` requests.
+    DataControlSourceRequest {
+        Offer = 0,
+        Destroy = 1,
+    }
+}
+
+events! {
+    /// `zwlr_data_control_source_v1` events.
+    DataControlSourceEvent {
+        Send = 0,
+        Cancelled = 1,
+    }
+}
+
+pub const ZWLR_DATA_CONTROL_MANAGER_V1: Interface = Interface {
+    name: "zwlr_data_control_manager_v1",
+    version: 2,
+};
+
 pub const ZWLR_SCREENCOPY_MANAGER_V1: Interface = Interface {
     name: "zwlr_screencopy_manager_v1",
     // v3 adds `buffer_done`, which is what makes the parameter handshake
@@ -1383,6 +1427,25 @@ mod tests {
         assert_eq!(ScreencopyFrameRequest::Copy.opcode(), 0);
         assert_eq!(ScreencopyFrameRequest::Destroy.opcode(), 1);
         assert_eq!(ScreencopyFrameRequest::CopyWithDamage.opcode(), 2);
+    }
+
+    #[test]
+    fn data_control_opcodes_match_the_protocol_xml() {
+        assert_eq!(DataControlManagerRequest::CreateSource.opcode(), 0);
+        assert_eq!(DataControlManagerRequest::GetDevice.opcode(), 1);
+        assert_eq!(DataControlManagerRequest::Destroy.opcode(), 2);
+        assert_eq!(DataControlDeviceRequest::SetSelection.opcode(), 0);
+        assert_eq!(DataControlDeviceRequest::Destroy.opcode(), 1);
+        assert_eq!(DataControlSourceRequest::Offer.opcode(), 0);
+        assert_eq!(DataControlSourceRequest::Destroy.opcode(), 1);
+        assert_eq!(
+            DataControlSourceEvent::from_opcode(0),
+            Some(DataControlSourceEvent::Send)
+        );
+        assert_eq!(
+            DataControlSourceEvent::from_opcode(1),
+            Some(DataControlSourceEvent::Cancelled)
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ workspace = true
 # The capture protocol itself; see `crates/screencopy` for why the pure
 # pixel/handshake logic lives there rather than in this bin.
 screencopy = { path = "../../crates/screencopy" }
+clipboard = { path = "../../crates/clipboard" }
 # Connection bootstrap, registry discovery, and the wire vocabulary.
 platform = { path = "../../crates/platform" }
 # The event ring the platform reader delivers into.

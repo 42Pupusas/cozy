@@ -874,7 +874,10 @@ mod tests {
         // pure white and not pure black.
         let packed = buf[0];
         let r = (packed >> 16) & 0xff;
-        assert!(r > 0x30 && r < 0xd0, "expected mid-gray blend, got {packed:#x}");
+        assert!(
+            r > 0x30 && r < 0xd0,
+            "expected mid-gray blend, got {packed:#x}"
+        );
     }
 
     #[test]

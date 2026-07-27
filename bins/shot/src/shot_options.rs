@@ -37,6 +37,8 @@ pub struct ShotOptions {
     pub output_path: Option<PathBuf>,
     /// Composite the cursor into the image (`grim -c`).
     pub overlay_cursor: bool,
+    /// Keep a Wayland clipboard owner alive and offer the image to paste.
+    pub clipboard: bool,
 }
 
 impl ShotOptions {
@@ -53,11 +55,13 @@ impl ShotOptions {
         let mut geometry = None;
         let mut output_path = None;
         let mut overlay_cursor = false;
+        let mut clipboard = false;
 
         while let Some(argument) = arguments.next() {
             let text = argument.to_string_lossy().into_owned();
             match text.as_str() {
                 "-c" | "--cursor" => overlay_cursor = true,
+                "-C" | "--clipboard" => clipboard = true,
                 "-s" | "--select" => {
                     target = match target {
                         CaptureTarget::Output(name) => CaptureTarget::Selection(Some(name)),
@@ -100,6 +104,7 @@ impl ShotOptions {
             target,
             output_path,
             overlay_cursor,
+            clipboard,
         })
     }
 
@@ -168,6 +173,7 @@ impl ShotOptions {
                -o, --output NAME     capture only this output (e.g. DP-1)\n  \
                -g, --geometry GEOM   capture output-local region, as `X,Y WxH`\n  \
                -c, --cursor          include the cursor in the capture\n  \
+               -C, --clipboard       offer the PNG through the Wayland clipboard\n  \
                -h, --help            show this help\n  \
                -v, --version         show the version\n"
         )

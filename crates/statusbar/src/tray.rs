@@ -16,6 +16,7 @@ const ITEM_IFACE: &str = "org.kde.StatusNotifierItem";
 const ITEM_PATH: &str = "/StatusNotifierItem";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const REGISTER_ITEM: &str = "RegisterStatusNotifierItem";
+const HOST_REGISTERED: &str = "StatusNotifierHostRegistered";
 const PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
 const HOST_REGISTERED_PROPERTY: &str = "IsStatusNotifierHostRegistered";
 const PROTOCOL_VERSION_PROPERTY: &str = "ProtocolVersion";
@@ -48,6 +49,49 @@ pub struct TrayItem {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TraySnapshot {
     pub items: Vec<TrayItem>,
+}
+
+/// A registration the watcher has acknowledged but cannot paint yet because
+/// the client brought its D-Bus object online a moment after registering it.
+///
+/// Electron clients commonly make those two steps asynchronous during session
+/// startup. Keeping this small identity record lets the first later icon/status
+/// signal promote the same registration instead of permanently losing it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingTrayItem {
+    id: String,
+    service: String,
+    path: String,
+    owner: String,
+}
+
+impl PendingTrayItem {
+    fn from_registration(sender: &str, service: String, path: String) -> Self {
+        Self {
+            id: format!("{sender}{path}"),
+            service,
+            path,
+            owner: sender.to_owned(),
+        }
+    }
+
+    /// Whether two registrations name the same exported tray object.
+    ///
+    /// A client is permitted to call `RegisterStatusNotifierItem` more than
+    /// once while it is coming up. The calls can even arrive from separate
+    /// D-Bus connections, so the transient sender-based `id` is not a safe
+    /// de-duplication key. The registration target is the stable identity.
+    fn targets(&self, service: &str, path: &str) -> bool {
+        self.service == service && self.path == path
+    }
+
+    /// Remove and return the registration matching a later item signal.
+    /// Keeping this operation with the pending-record type prevents the
+    /// dispatch loop from duplicating identity/removal semantics.
+    fn take_matching(items: &mut Vec<Self>, id: &str) -> Option<Self> {
+        let index = items.iter().position(|item| item.id == id)?;
+        Some(items.remove(index))
+    }
 }
 
 /// Owns the long-lived `StatusNotifier` watcher loop on a dedicated thread.
@@ -83,6 +127,16 @@ impl TrayWatcher {
                 return;
             }
         }
+        // Claiming the watcher name is only half of the StatusNotifier
+        // handshake. Existing Electron clients (Mattermost included) wait
+        // for this watcher-interface signal before treating the watcher as a
+        // real visualization host and registering their item. We previously
+        // returned `true` to a later property Get but never announced this
+        // state transition, so already-running clients stayed unregistered.
+        if let Err(e) = conn.send_signal(WATCHER_PATH, WATCHER_NAME, HOST_REGISTERED, &[]) {
+            eprintln!("statusbar: could not announce tray host registration: {e}");
+            return;
+        }
         if let Err(e) = conn.add_match("type='signal',interface='org.kde.StatusNotifierItem'") {
             eprintln!("statusbar: could not subscribe to tray item updates: {e}");
             return;
@@ -113,6 +167,7 @@ impl TrayWatcher {
         }
 
         let mut items = Vec::new();
+        let mut pending = Vec::new();
         loop {
             let Ok(message) = conn.recv_message() else {
                 eprintln!("statusbar: system tray D-Bus connection closed");
@@ -122,11 +177,11 @@ impl TrayWatcher {
                 Self::reply_watcher_property(&mut conn, &message);
                 false
             } else if Self::is_item_registration(&message) {
-                Self::register(&mut conn, &message, &mut items)
+                Self::register(&mut conn, &message, &mut items, &mut pending)
             } else if Self::is_name_owner_lost(&message) {
-                Self::drop_items_for_lost_owner(&message, &mut items)
+                Self::drop_items_for_lost_owner(&message, &mut items, &mut pending)
             } else {
-                Self::refresh_changed_item(&mut conn, &message, &mut items)
+                Self::refresh_changed_item(&mut conn, &message, &mut items, &mut pending)
             };
             if changed {
                 let _ = snapshot_tx.send(TraySnapshot {
@@ -175,6 +230,7 @@ impl TrayWatcher {
     fn drop_items_for_lost_owner(
         message: &dbus::message::Reply,
         items: &mut Vec<TrayItem>,
+        pending: &mut Vec<PendingTrayItem>,
     ) -> bool {
         let values = message.values();
         let Some(old_owner) = values.get(1).and_then(Value::as_display_string) else {
@@ -183,9 +239,10 @@ impl TrayWatcher {
         if old_owner.is_empty() {
             return false;
         }
-        let before = items.len();
+        let before = items.len() + pending.len();
         items.retain(|item| item.owner != old_owner);
-        items.len() != before
+        pending.retain(|item| item.owner != old_owner);
+        items.len() + pending.len() != before
     }
 
     /// Electron probes this standard watcher property before deciding whether
@@ -232,6 +289,7 @@ impl TrayWatcher {
         conn: &mut DbusConn,
         message: &dbus::message::Reply,
         items: &mut Vec<TrayItem>,
+        pending: &mut Vec<PendingTrayItem>,
     ) -> bool {
         let Some(sender) = message.sender.as_deref() else {
             return false;
@@ -247,12 +305,31 @@ impl TrayWatcher {
         {
             return false;
         }
-        let Some(item) = Self::read_item(conn, sender, &service, &path) else {
-            return false;
-        };
-        items.retain(|old| old.id != item.id);
-        items.push(item);
-        true
+        let registration = PendingTrayItem::from_registration(sender, service, path);
+        // A successful Register call only means the client accepted our
+        // watcher. It does *not* guarantee that Electron has exported the
+        // Status/IconPixmap properties yet. Preserve the identity on that
+        // short-lived failure so its subsequent NewIcon/PropertiesChanged
+        // signal gets a chance to promote it instead of disappearing until a
+        // whole statusbar restart.
+        if let Some(item) = Self::read_item(conn, sender, &registration.service, &registration.path)
+        {
+            // The exported service/path pair, rather than the caller's
+            // ephemeral unique name, identifies an SNI object. Electron can
+            // repeat registration from another connection during startup;
+            // replacing that target prevents a second Mattermost icon.
+            items
+                .retain(|old| old.service != registration.service || old.path != registration.path);
+            pending.retain(|old| !old.targets(&registration.service, &registration.path));
+            items.push(item);
+            true
+        } else {
+            items
+                .retain(|old| old.service != registration.service || old.path != registration.path);
+            pending.retain(|old| !old.targets(&registration.service, &registration.path));
+            pending.push(registration);
+            false
+        }
     }
 
     /// `NewIcon`/`NewStatus` and generic `PropertiesChanged` signals carry
@@ -261,7 +338,8 @@ impl TrayWatcher {
     fn refresh_changed_item(
         conn: &mut DbusConn,
         message: &dbus::message::Reply,
-        items: &mut [TrayItem],
+        items: &mut Vec<TrayItem>,
+        pending: &mut Vec<PendingTrayItem>,
     ) -> bool {
         let (Some(sender), Some(path)) = (message.sender.as_deref(), message.path.as_deref())
         else {
@@ -271,14 +349,25 @@ impl TrayWatcher {
             return false;
         }
         let id = format!("{sender}{path}");
-        let Some(index) = items.iter().position(|item| item.id == id) else {
+        if let Some(index) = items.iter().position(|item| item.id == id) {
+            let item = &items[index];
+            let Some(replacement) = Self::read_item(conn, sender, &item.service, &item.path) else {
+                return false;
+            };
+            items[index] = replacement;
+            return true;
+        }
+        let Some(pending_item) = pending.iter().find(|item| item.id == id) else {
             return false;
         };
-        let item = &items[index];
-        let Some(replacement) = Self::read_item(conn, sender, &item.service, &item.path) else {
+        let Some(replacement) =
+            Self::read_item(conn, sender, &pending_item.service, &pending_item.path)
+        else {
             return false;
         };
-        items[index] = replacement;
+        let _ = PendingTrayItem::take_matching(pending, &id);
+        items.retain(|old| old.service != replacement.service || old.path != replacement.path);
+        items.push(replacement);
         true
     }
 
@@ -375,6 +464,52 @@ impl TrayWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_registered_signal_has_the_standard_watcher_member() {
+        assert_eq!(HOST_REGISTERED, "StatusNotifierHostRegistered");
+    }
+
+    #[test]
+    fn repeated_registrations_for_one_exported_object_share_a_target() {
+        let first = PendingTrayItem::from_registration(
+            ":1.42",
+            "org.mattermost.Desktop".into(),
+            ITEM_PATH.into(),
+        );
+        let retry = PendingTrayItem::from_registration(
+            ":1.77",
+            "org.mattermost.Desktop".into(),
+            ITEM_PATH.into(),
+        );
+        assert_ne!(first.id, retry.id, "callers are different connections");
+        assert!(first.targets(&retry.service, &retry.path));
+    }
+
+    #[test]
+    fn pending_registration_promotes_only_after_its_properties_become_readable() {
+        let mut pending = vec![PendingTrayItem::from_registration(
+            ":1.42",
+            ":1.42".into(),
+            ITEM_PATH.into(),
+        )];
+        let replacement = TrayItem {
+            id: format!(":1.42{ITEM_PATH}"),
+            service: ":1.42".into(),
+            path: ITEM_PATH.into(),
+            owner: ":1.42".into(),
+            icon: TrayIcon::default(),
+            attention: true,
+        };
+        let mut items = Vec::new();
+        let promoted = PendingTrayItem::take_matching(&mut pending, &replacement.id)
+            .expect("registration stays reachable until an icon signal");
+        assert_eq!(promoted.service, ":1.42");
+        items.push(replacement);
+        assert!(pending.is_empty());
+        assert_eq!(items.len(), 1);
+        assert!(items[0].attention);
+    }
 
     #[test]
     fn object_path_registration_uses_the_call_sender() {

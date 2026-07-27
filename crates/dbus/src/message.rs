@@ -179,6 +179,47 @@ impl MessageBuilder {
         out
     }
 
+    /// Build a broadcast `SIGNAL` frame. A `StatusNotifier` watcher uses this
+    /// to announce that it is an active visualization host; clients which
+    /// were already running before the bar started rely on that transition
+    /// rather than discovering a host only from the bus-name owner change.
+    #[must_use]
+    pub fn build_signal(
+        serial: u32,
+        path: &str,
+        interface: &str,
+        member: &str,
+        args: &[BodyArg],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        let mut signature = String::new();
+        for arg in args {
+            signature.push_str(arg.signature());
+            Self::write_value(&mut body, arg);
+        }
+
+        let mut header_fields = Vec::new();
+        Self::write_string_field(&mut header_fields, field_code::PATH, b'o', path);
+        Self::write_string_field(&mut header_fields, field_code::INTERFACE, b's', interface);
+        Self::write_string_field(&mut header_fields, field_code::MEMBER, b's', member);
+        if !signature.is_empty() {
+            Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', &signature);
+        }
+
+        let mut out = vec![b'l', MessageType::Signal.as_byte(), 0, 1];
+        out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(header_fields.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&header_fields);
+        Self::pad_to(&mut out, 8);
+        out.extend_from_slice(&body);
+        out
+    }
+
     /// Build a `METHOD_CALL` message frame: header + body, ready to write
     /// to the socket.
     ///
@@ -531,5 +572,28 @@ mod tests {
     fn prelude_rejects_short_or_big_endian_buffers() {
         assert!(Prelude::parse(&[]).is_none());
         assert!(Prelude::parse(&[b'B'; 16]).is_none());
+    }
+
+    #[test]
+    fn signal_frame_has_the_declared_route_and_no_reply_serial() {
+        let frame = MessageBuilder::build_signal(
+            9,
+            "/StatusNotifierWatcher",
+            "org.kde.StatusNotifierWatcher",
+            "StatusNotifierHostRegistered",
+            &[],
+        );
+        let reply = Reply::parse_message(&frame).expect("built signal parses");
+        assert_eq!(reply.kind, MessageType::Signal);
+        assert_eq!(reply.path.as_deref(), Some("/StatusNotifierWatcher"));
+        assert_eq!(
+            reply.interface.as_deref(),
+            Some("org.kde.StatusNotifierWatcher")
+        );
+        assert_eq!(
+            reply.member.as_deref(),
+            Some("StatusNotifierHostRegistered")
+        );
+        assert_eq!(reply.reply_serial, None);
     }
 }

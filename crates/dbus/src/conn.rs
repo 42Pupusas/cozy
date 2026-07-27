@@ -204,8 +204,7 @@ impl DbusConn {
         call_serial: u32,
         args: &[BodyArg],
     ) -> Result<(), DbusError> {
-        let serial = self.next_serial;
-        self.next_serial = self.next_serial.wrapping_add(1).max(1);
+        let serial = self.take_serial();
         let frame = crate::message::MessageBuilder::build_method_return(
             serial,
             destination,
@@ -213,6 +212,34 @@ impl DbusConn {
             args,
         );
         self.send_raw(&frame)
+    }
+
+    /// Broadcast a signal from one of the D-Bus objects this connection
+    /// serves. `StatusNotifier` clients use `StatusNotifierHostRegistered` as
+    /// the authoritative transition from "a watcher name exists" to "there
+    /// is a live visual host", so a watcher must publish it after claiming
+    /// its name instead of merely answering a later property probe.
+    pub fn send_signal(
+        &mut self,
+        path: &str,
+        interface: &str,
+        member: &str,
+        args: &[BodyArg],
+    ) -> Result<(), DbusError> {
+        let frame = crate::message::MessageBuilder::build_signal(
+            self.take_serial(),
+            path,
+            interface,
+            member,
+            args,
+        );
+        self.send_raw(&frame)
+    }
+
+    fn take_serial(&mut self) -> u32 {
+        let serial = self.next_serial;
+        self.next_serial = self.next_serial.wrapping_add(1).max(1);
+        serial
     }
 
     fn send_raw(&mut self, bytes: &[u8]) -> Result<(), DbusError> {
@@ -354,8 +381,7 @@ impl DbusConn {
         member: &str,
         args: &[BodyArg],
     ) -> Result<Reply, DbusError> {
-        let serial = self.next_serial;
-        self.next_serial = self.next_serial.wrapping_add(1).max(1);
+        let serial = self.take_serial();
         let msg = crate::message::MessageBuilder::build_method_call(
             serial,
             destination,

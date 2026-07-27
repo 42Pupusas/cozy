@@ -17,9 +17,13 @@ pub enum CaptureTarget {
     /// One output by connector name (`DP-1`, `eDP-1`), matched against
     /// `wl_output.name`.
     Output(String),
-    /// A fixed rectangle, skipping the interactive overlay entirely -- the
-    /// scriptable path that makes this usable from a keybind.
+    /// A fixed rectangle in the only output's local coordinates, skipping the
+    /// interactive overlay entirely -- the scriptable path for one display.
     Region(CaptureRegion),
+    /// A fixed rectangle in a named output's local coordinates. Keeping the
+    /// output attached to the region prevents multi-monitor captures from
+    /// silently applying coordinates to the wrong display.
+    OutputRegion(String, CaptureRegion),
     /// Drag a rectangle out interactively, optionally on one named output.
     /// `None` chooses the first output for single-output use.
     Selection(Option<String>),
@@ -45,6 +49,8 @@ impl ShotOptions {
     pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Self, String> {
         let mut arguments = args.into_iter().skip(1);
         let mut target = CaptureTarget::AllOutputs;
+        let mut selected_output = None;
+        let mut geometry = None;
         let mut output_path = None;
         let mut overlay_cursor = false;
 
@@ -60,17 +66,14 @@ impl ShotOptions {
                     };
                 }
                 "-o" | "--output" => {
-                    let name = Self::value_for(&mut arguments, &text)?;
-                    target = match target {
-                        CaptureTarget::Selection(_) => {
-                            CaptureTarget::Selection(Some(name.to_string_lossy().into_owned()))
-                        }
-                        _ => CaptureTarget::Output(name.to_string_lossy().into_owned()),
-                    };
+                    let name = Self::value_for(&mut arguments, &text)?
+                        .to_string_lossy()
+                        .into_owned();
+                    selected_output = Some(name);
                 }
                 "-g" | "--geometry" => {
                     let spec = Self::value_for(&mut arguments, &text)?;
-                    target = CaptureTarget::Region(Self::parse_geometry(&spec.to_string_lossy())?);
+                    geometry = Some(Self::parse_geometry(&spec.to_string_lossy())?);
                 }
                 // A bare `-` means stdout, so it must be checked before the
                 // generic leading-dash rejection below.
@@ -80,6 +83,17 @@ impl ShotOptions {
                 }
                 _ => output_path = Some(PathBuf::from(argument)),
             }
+        }
+
+        if let Some(region) = geometry {
+            target = selected_output.map_or(CaptureTarget::Region(region), |name| {
+                CaptureTarget::OutputRegion(name, region)
+            });
+        } else if let Some(name) = selected_output {
+            target = match target {
+                CaptureTarget::Selection(_) => CaptureTarget::Selection(Some(name)),
+                _ => CaptureTarget::Output(name),
+            };
         }
 
         Ok(Self {
@@ -152,7 +166,7 @@ impl ShotOptions {
              options:\n  \
                -s, --select          drag out a region interactively\n  \
                -o, --output NAME     capture only this output (e.g. DP-1)\n  \
-               -g, --geometry GEOM   capture a region, as `X,Y WxH`\n  \
+               -g, --geometry GEOM   capture output-local region, as `X,Y WxH`\n  \
                -c, --cursor          include the cursor in the capture\n  \
                -h, --help            show this help\n  \
                -v, --version         show the version\n"
@@ -211,6 +225,28 @@ mod tests {
                 height: 400
             })
         );
+    }
+
+    #[test]
+    fn geometry_can_be_attached_to_a_named_output_in_either_order() {
+        for args in [
+            ["--output", "DP-1", "--geometry", "10,20 300x400"],
+            ["--geometry", "10,20 300x400", "--output", "DP-1"],
+        ] {
+            let options = ShotOptions::parse(argv(&args)).expect("valid");
+            assert_eq!(
+                options.target,
+                CaptureTarget::OutputRegion(
+                    "DP-1".into(),
+                    CaptureRegion {
+                        x: 10,
+                        y: 20,
+                        width: 300,
+                        height: 400
+                    }
+                )
+            );
+        }
     }
 
     #[test]
@@ -310,6 +346,6 @@ mod tests {
     #[test]
     fn later_targets_override_earlier_ones() {
         let options = ShotOptions::parse(argv(&["-o", "DP-1", "-g", "0,0 10x10"])).expect("valid");
-        assert!(matches!(options.target, CaptureTarget::Region(_)));
+        assert!(matches!(options.target, CaptureTarget::OutputRegion(_, _)));
     }
 }

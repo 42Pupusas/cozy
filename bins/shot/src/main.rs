@@ -334,6 +334,9 @@ impl ShotApp {
         match target {
             CaptureTarget::AllOutputs => Ok((self.first_output()?, None)),
             CaptureTarget::Region(region) => Ok((self.first_output()?, Some(*region))),
+            CaptureTarget::OutputRegion(name, region) => {
+                Ok((self.output_named(name)?, Some(*region)))
+            }
             // Handled by `resolve_capture`, which can run an event loop.
             CaptureTarget::Selection(_) => Err(
                 "internal: interactive selection must be resolved before this point".to_string(),

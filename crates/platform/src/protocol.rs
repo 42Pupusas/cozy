@@ -283,6 +283,11 @@ events! {
         /// Integer buffer scale factor this output expects (1 = normal,
         /// 2 = `HiDPI` @ 2x, ...). This is the one we actually read.
         Scale = 3,
+        /// Stable compositor-provided connector name, introduced by v4.
+        /// Wallpaper rules use this value for swaybg-compatible `--output`.
+        Name = 4,
+        /// Human-facing output description, also introduced by v4.
+        Description = 5,
     }
 }
 
@@ -842,8 +847,8 @@ pub const ZXDG_DECORATION_MANAGER_V1: Interface = Interface {
 };
 pub const WL_OUTPUT: Interface = Interface {
     name: "wl_output",
-    // v2 adds `done`/`scale` events, which is the whole reason we bind this.
-    version: 2,
+    // v4 adds the stable `name` event used by per-output appearance rules.
+    version: 4,
 };
 pub const WL_DATA_DEVICE_MANAGER: Interface = Interface {
     name: "wl_data_device_manager",

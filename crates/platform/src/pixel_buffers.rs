@@ -125,8 +125,11 @@ impl PixelBuffers {
         // kernels' loop overhead amortized across the entire span.
         let start = y0 * width;
         let end = y1 * width;
-        self.premultiplier
-            .run(alpha, &self.backbuffer[start..end], &mut self.custom_argb[start..end]);
+        self.premultiplier.run(
+            alpha,
+            &self.backbuffer[start..end],
+            &mut self.custom_argb[start..end],
+        );
     }
 
     /// Resize both buffers to `new_w x new_h`, carrying the old backbuffer's
@@ -193,7 +196,17 @@ mod tests {
         // row 2: all fill.
         assert_eq!(
             buf.backbuffer(),
-            &[1, 2, 0x00_ff_ff_ff, 3, 4, 0x00_ff_ff_ff, 0x00_ff_ff_ff, 0x00_ff_ff_ff, 0x00_ff_ff_ff]
+            &[
+                1,
+                2,
+                0x00_ff_ff_ff,
+                3,
+                4,
+                0x00_ff_ff_ff,
+                0x00_ff_ff_ff,
+                0x00_ff_ff_ff,
+                0x00_ff_ff_ff
+            ]
         );
     }
 

@@ -488,7 +488,10 @@ mod tests {
         let out_a = out >> 24 & 0xff;
         // Coverage alpha is 0x80 (128); output alpha must reflect that
         // real coverage, not 0.
-        assert!(out_a > 0, "alpha byte must not be zeroed on a translucent bar");
+        assert!(
+            out_a > 0,
+            "alpha byte must not be zeroed on a translucent bar"
+        );
         // Premultiplied invariant: every colour channel must stay <= alpha,
         // never exceed it (the bug produced non-zero RGB behind a zero
         // alpha, i.e. maximally violating this).

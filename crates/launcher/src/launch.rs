@@ -212,7 +212,9 @@ mod tests {
 
     impl EnvGuard {
         fn set(value: &str) -> Self {
-            let lock = ENV_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev = std::env::var("TERMINAL").ok();
             // SAFETY: serialized by `_lock` above; no other thread reads/
             // writes `TERMINAL` while this guard is alive.
@@ -221,7 +223,9 @@ mod tests {
         }
 
         fn unset() -> Self {
-            let lock = ENV_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev = std::env::var("TERMINAL").ok();
             // SAFETY: see `set` above.
             unsafe { std::env::remove_var("TERMINAL") };

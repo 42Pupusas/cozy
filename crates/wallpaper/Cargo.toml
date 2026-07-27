@@ -1,0 +1,21 @@
+[package]
+name    = "wallpaper"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Pure PNG decode -- turning file bytes into RGBA8 pixels. No Wayland, no
+# `platform` dependency: this crate is the same "isolable core, thin
+# compositor shell" split as `crates/launcher`'s catalog/fuzzy-match logic,
+# so it's unit-testable headlessly (see `wallpaper_image.rs`/`scale_mode.rs`'s
+# tests) with no live compositor required.
+ixiptla-core = { workspace = true }
+
+[dev-dependencies]
+# Only needed to build well-formed PNG fixtures in tests (zlib-compress raw
+# scanline bytes) -- `ixiptla-core` itself already depends on this for its
+# own IDAT inflate, so this adds nothing new to the dependency graph.
+ixchel = { path = "/home/cuarentaydos/Code/tooling/ixchel" }

@@ -857,7 +857,10 @@ mod tests {
     fn resolve_program_path_leaves_paths_containing_slash_untouched() {
         // Anything with a `/` is already absolute or cwd-relative --
         // `execve` handles those itself, no `$PATH` search applies.
-        assert_eq!(RawPty::resolve_program_path("/usr/bin/nvim"), "/usr/bin/nvim");
+        assert_eq!(
+            RawPty::resolve_program_path("/usr/bin/nvim"),
+            "/usr/bin/nvim"
+        );
         assert_eq!(RawPty::resolve_program_path("./nvim"), "./nvim");
     }
 

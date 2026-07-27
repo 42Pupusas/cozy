@@ -34,6 +34,11 @@ quetzal-uring = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl-uring" }
 quetzalcoatl  = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl" }
 shelby        = { path = "/home/cuarentaydos/Code/tooling/shelby/crates/shelby", features = ["std"] }
 json-bourne   = { path = "/home/cuarentaydos/Code/tooling/bourne/crates/bourne", features = ["derive"] }
+# Zero-dependency PNG encode/decode, shared by `bins/wallpaper` (decode, for
+# loading a wallpaper image) and any future `bins/shot`-style screenshot tool
+# (encode) -- see its own doc comment for why it exists as a standalone
+# `tooling/` crate rather than something reinvented per bin.
+ixiptla-core  = { path = "/home/cuarentaydos/Code/tooling/ixiptla/crates/ixiptla-core" }
 
 [workspace.lints.clippy]
 # groups

@@ -46,6 +46,9 @@ pub enum RawEvent {
         opcode: u16,
         args: [u32; 4],
         nargs: u8,
+        /// Full encoded bytes retained for known string-bearing events from
+        /// non-singleton objects such as `wl_output.name`.
+        bytes: Box<[u8]>,
     },
     /// A message that doesn't fit the fixed-arg shape (strings, >4 words). The
     /// main thread re-parses the raw message bytes. Used for `wl_display.error`
@@ -97,8 +100,13 @@ impl RawEvent {
             return Self::Bytes(msg.to_vec().into_boxed_slice());
         }
 
-        // Read up to four u32 args from the message body (after the header).
+        // The reader deliberately has no object-interface map. Keep the full
+        // wire message for the main thread, which *does* know whether a given
+        // event is string-bearing; guessing from the first argument can
+        // misclassify perfectly ordinary numeric protocol events.
         let body = &msg[8..];
+
+        // Read up to four u32 args from the message body (after the header).
         let mut args = [0u32; 4];
         let n = (body.len() / 4).min(4);
         for (i, slot) in args.iter_mut().enumerate().take(n) {
@@ -115,6 +123,7 @@ impl RawEvent {
             args,
             // `n <= 4` from the `.min(4)` above, always fits a `u8`.
             nargs: u8::try_from(n).unwrap_or(4),
+            bytes: msg.to_vec().into_boxed_slice(),
         }
     }
 
@@ -149,6 +158,15 @@ impl RawEvent {
     #[must_use]
     pub fn event<E: FromOpcode>(&self) -> Option<E> {
         E::from_opcode(self.opcode())
+    }
+
+    /// Full encoded message for a [`Self::Wire`] event, including its header.
+    #[must_use]
+    pub fn wire_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Wire { bytes, .. } => Some(bytes),
+            Self::Bytes(_) | Self::Repeat | Self::Fd(_) => None,
+        }
     }
 
     /// Read fixed arg `i` as a `u32` (0 if out of range).

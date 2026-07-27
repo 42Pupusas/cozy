@@ -103,7 +103,11 @@ impl FuzzyMatch {
     /// (a contiguous run reads as "the same word") and for matching at a
     /// word boundary (start of string, or just after `-`/`_`/` `/`.`) --
     /// the two strongest positional signals fzf-style matchers use.
-    fn position_bonus(pos: usize, candidate_lower: &[char], prev_matched_pos: Option<usize>) -> i32 {
+    fn position_bonus(
+        pos: usize,
+        candidate_lower: &[char],
+        prev_matched_pos: Option<usize>,
+    ) -> i32 {
         let mut bonus = 1;
 
         if let Some(prev) = prev_matched_pos

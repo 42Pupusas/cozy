@@ -23,20 +23,19 @@ use crate::draw::Point;
 use crate::error::{Error, Result};
 use crate::event::RawEvent;
 use crate::id::{
-    CallbackId, CompositorId, DataDeviceManagerId, DisplayId, KeyboardId, ObjectId, OutputId,
-    PointerId, RegistryId, SeatId, ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
+    CallbackId, CompositorId, DataDeviceManagerId, KeyboardId, ObjectId, OutputId, PointerId,
+    RegistryId, SeatId, ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
 };
 use crate::keymap;
 use crate::protocol::Modifiers;
 use crate::protocol::{
     self as proto, ButtonState, CompositorRequest, DataDeviceEvent, DataOfferEvent,
-    DataSourceEvent, DisplayEvent, DisplayRequest, Format, Key, KeyState, KeyboardEvent,
-    PointerButton, PointerEvent, PointerRequest, RegistryEvent, SeatCapability, SeatEvent,
-    SeatRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent, WmBaseRequest,
-    XdgSurfaceEvent, XdgSurfaceRequest,
+    DataSourceEvent, Format, Key, KeyState, KeyboardEvent, PointerButton, PointerEvent,
+    PointerRequest, SeatCapability, SeatEvent, SeatRequest, SurfaceRequest, ToplevelEvent,
+    ToplevelRequest, WmBaseEvent, WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
 };
 use crate::render;
-use crate::wire::{MessageBuilder, WireEvent};
+use crate::wire::MessageBuilder;
 
 const EVENT_RING_CAP: usize = 1024;
 
@@ -2147,7 +2146,8 @@ impl TermWindow {
                     if copy_len < dst_slice.len() {
                         dst_slice[copy_len..].fill(custom_fill);
                     }
-                } else if let Some(src_slice) = self.pixels.backbuffer().get(src_off..src_off + len) {
+                } else if let Some(src_slice) = self.pixels.backbuffer().get(src_off..src_off + len)
+                {
                     dst_slice.copy_from_slice(src_slice);
                 }
             }
@@ -2406,14 +2406,14 @@ struct GlobalsBuilder {
     data_device_manager: Option<DataDeviceManagerId>,
 }
 
-impl GlobalsBuilder {
+impl crate::surface::GlobalCollector for GlobalsBuilder {
     /// Whether every global `Registry::discover`'s caller cannot proceed
     /// without has been bound. `wl_output` and `wl_data_device_manager` are
     /// optional (not every compositor advertises them), so they're excluded
     /// from this check -- the registry burst loop stops as soon as the
     /// required set is complete, giving the optional ones only whatever
     /// chance they had to arrive first.
-    const fn has_every_required_global(&self) -> bool {
+    fn is_complete(&self) -> bool {
         self.compositor.is_some()
             && self.shm.is_some()
             && self.wm_base.is_some()
@@ -2428,7 +2428,7 @@ impl GlobalsBuilder {
     /// plus a 2-line body -- the guard conditions alone had been contributing
     /// 6 extra decision points to this function's complexity. A no-op for
     /// any interface not in the list below.
-    fn bind_named_global(
+    fn bind_global(
         &mut self,
         sender: &mut Sender,
         registry: RegistryId,
@@ -2494,12 +2494,14 @@ impl GlobalsBuilder {
             _ => Ok(()),
         }
     }
+}
 
+impl GlobalsBuilder {
     /// Bind one global into `slot` if it's still empty, negotiating the
     /// version as `known_version.min(advertised_version)`. Shared body for
-    /// every arm of [`Self::bind_named_global`] -- factored out so the
-    /// per-interface "already bound?" check doesn't inflate that function's
-    /// branch count arm-by-arm.
+    /// every arm of [`crate::surface::GlobalCollector::bind_global`] --
+    /// factored out so the per-interface "already bound?" check doesn't
+    /// inflate that function's branch count arm-by-arm.
     fn bind_if_missing<T: ObjectId>(
         slot: &mut Option<T>,
         sender: &mut Sender,
@@ -2546,44 +2548,8 @@ impl Registry {
     /// Was a free `bind_globals(sender, events)` function -- moved onto
     /// `Registry` as its entry point.
     fn discover(sender: &mut Sender, events: &mut Consumer<RawEvent>) -> Result<Globals> {
-        let registry: RegistryId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(DisplayId(1), DisplayRequest::GetRegistry).new_id(registry),
-        )?;
-
         let mut globals = GlobalsBuilder::default();
-        // A registry burst is unbounded and unordered -- there is no event
-        // that says "no more globals", so we can only wait for the globals we
-        // actually require (`wl_output` isn't one; see `sync_roundtrip`
-        // below for how we still give it a chance to appear).
-        while !globals.has_every_required_global() {
-            let event = events.pop_block().ok_or(Error::ReaderStopped)?;
-            let RawEvent::Bytes(bytes) = event else {
-                continue;
-            };
-            let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
-                continue;
-            };
-
-            if ev.object_id == DisplayId(1).raw()
-                && DisplayEvent::from_opcode(ev.opcode) == Some(DisplayEvent::Error)
-            {
-                return Err(Error::Protocol {
-                    object: ev.u32(),
-                    code: ev.u32(),
-                    message: ev.string(),
-                });
-            }
-
-            if ev.object_id == registry.raw()
-                && RegistryEvent::from_opcode(ev.opcode) == Some(RegistryEvent::Global)
-            {
-                let name = ev.u32();
-                let interface = ev.string();
-                let version = ev.u32();
-                globals.bind_named_global(sender, registry, name, &interface, version)?;
-            }
-        }
+        crate::surface::RegistryDiscovery::collect(sender, events, &mut globals)?;
         globals.finish()
     }
 

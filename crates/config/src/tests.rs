@@ -426,8 +426,14 @@ fn launcher_defaults_mirror_terminal_settings() {
     );
     assert_eq!(cfg.launcher_font_path(), Some("/x/y.ttf"));
     assert_eq!(cfg.launcher_font_size(), 16);
-    assert_eq!(cfg.launcher_background(), Color::parse_hex("#222222").unwrap());
-    assert_eq!(cfg.launcher_foreground(), Color::parse_hex("#111111").unwrap());
+    assert_eq!(
+        cfg.launcher_background(),
+        Color::parse_hex("#222222").unwrap()
+    );
+    assert_eq!(
+        cfg.launcher_foreground(),
+        Color::parse_hex("#111111").unwrap()
+    );
 }
 
 #[test]
@@ -437,8 +443,14 @@ fn launcher_overrides_win_over_mirrored_terminal_settings() {
     );
     assert_eq!(cfg.launcher_font_path(), Some("/launcher.ttf"));
     assert_eq!(cfg.launcher_font_size(), 11);
-    assert_eq!(cfg.launcher_background(), Color::parse_hex("#abcdef").unwrap());
-    assert_eq!(cfg.launcher_foreground(), Color::parse_hex("#fedcba").unwrap());
+    assert_eq!(
+        cfg.launcher_background(),
+        Color::parse_hex("#abcdef").unwrap()
+    );
+    assert_eq!(
+        cfg.launcher_foreground(),
+        Color::parse_hex("#fedcba").unwrap()
+    );
 }
 
 #[test]
@@ -473,7 +485,10 @@ fn launcher_highlight_defaults_to_built_in_slate() {
 #[test]
 fn launcher_highlight_override_wins() {
     let cfg = Config::parse("[launcher]\nhighlight = \"#2a2a37\"\n");
-    assert_eq!(cfg.launcher_highlight(), Color::parse_hex("#2a2a37").unwrap());
+    assert_eq!(
+        cfg.launcher_highlight(),
+        Color::parse_hex("#2a2a37").unwrap()
+    );
 }
 
 #[test]
@@ -484,9 +499,8 @@ fn launcher_highlight_bad_color_is_a_validation_error() {
 
 #[test]
 fn launcher_emoji_and_icon_path_mirror_font_and_bar() {
-    let cfg = Config::parse(
-        "[font]\nemoji_path = \"/x/emoji.ttf\"\n[bar]\nicon_path = \"/nerd.ttf\"\n",
-    );
+    let cfg =
+        Config::parse("[font]\nemoji_path = \"/x/emoji.ttf\"\n[bar]\nicon_path = \"/nerd.ttf\"\n");
     assert_eq!(cfg.launcher_emoji_path(), Some("/x/emoji.ttf"));
     assert_eq!(cfg.launcher_icon_path(), Some("/nerd.ttf"));
 }

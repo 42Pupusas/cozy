@@ -26,11 +26,11 @@ use platform::id::{
 };
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
-    self as proto, Anchor, CompositorRequest, DisplayEvent, DisplayRequest, Format,
-    KeyboardInteractivity, Layer, LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest,
-    RegistryEvent, SeatCapability, SeatEvent, SeatRequest, SurfaceRequest,
+    self as proto, Anchor, CompositorRequest, Format, KeyboardInteractivity, Layer,
+    LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest, SeatCapability, SeatEvent,
+    SeatRequest, SurfaceRequest,
 };
-use platform::wire::{MessageBuilder, WireEvent};
+use platform::wire::MessageBuilder;
 use platform::{Error, Result};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc;
@@ -156,12 +156,12 @@ struct GlobalsBuilder {
     output: Option<OutputId>,
 }
 
-impl GlobalsBuilder {
+impl surface::GlobalCollector for GlobalsBuilder {
     /// Whether every global `BarWindow::discover`'s caller needs has been
     /// bound. `wl_output` is optional (not every compositor advertises one
     /// at startup), so it's excluded -- the registry burst loop stops as
     /// soon as the required set is complete.
-    const fn has_every_required_global(&self) -> bool {
+    fn is_complete(&self) -> bool {
         self.compositor.is_some()
             && self.shm.is_some()
             && self.layer_shell.is_some()
@@ -173,7 +173,7 @@ impl GlobalsBuilder {
     /// call instead of an inline `&&`-guard plus a 2-line body (see
     /// `platform::window::GlobalsBuilder`'s identical split for the same
     /// rationale). A no-op for any interface not in the list below.
-    fn bind_named_global(
+    fn bind_global(
         &mut self,
         sender: &mut Sender,
         registry: RegistryId,
@@ -230,10 +230,12 @@ impl GlobalsBuilder {
             _ => Ok(()),
         }
     }
+}
 
+impl GlobalsBuilder {
     /// Bind one global into `slot` if it's still empty, negotiating the
     /// version as `known_version.min(advertised_version)`. Shared body for
-    /// every arm of [`Self::bind_named_global`].
+    /// every arm of [`surface::GlobalCollector::bind_global`].
     fn bind_if_missing<T: ObjectId>(
         slot: &mut Option<T>,
         sender: &mut Sender,
@@ -650,64 +652,19 @@ impl BarWindow {
         let (dst, _stale) = self.present.slot_pixels_and_stale(slot);
         dst.copy_from_slice(&self.backbuffer);
 
-        let buffer = self.present.frame_buffer(slot);
-        self.window_tx.request(
-            MessageBuilder::new(self.surface, SurfaceRequest::Attach)
-                .object(buffer)
-                .i32(0)
-                .i32(0),
+        surface::SurfacePresenter::commit_full_frame(
+            &mut self.present,
+            &mut self.window_tx,
+            self.surface,
+            slot,
+            self.width,
+            self.height,
         );
-        self.window_tx.request(
-            MessageBuilder::new(self.surface, SurfaceRequest::Damage)
-                .i32(0)
-                .i32(0)
-                .i32(self.width)
-                .i32(self.height),
-        );
-        let cb: platform::id::CallbackId = self.window_tx.alloc_id();
-        self.window_tx
-            .request(MessageBuilder::new(self.surface, SurfaceRequest::Frame).new_id(cb));
-        self.window_tx
-            .request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
-        self.present.finish_present(cb);
     }
 
     fn discover(sender: &mut Sender, events: &mut Consumer<RawEvent>) -> Result<Globals> {
-        let registry: RegistryId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(platform::id::DisplayId(1), DisplayRequest::GetRegistry)
-                .new_id(registry),
-        )?;
-
         let mut globals = GlobalsBuilder::default();
-        while !globals.has_every_required_global() {
-            let event = events.pop_block().ok_or(Error::ReaderStopped)?;
-            let RawEvent::Bytes(bytes) = event else {
-                continue;
-            };
-            let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
-                continue;
-            };
-
-            if ev.object_id == platform::id::DisplayId(1).raw()
-                && DisplayEvent::from_opcode(ev.opcode) == Some(DisplayEvent::Error)
-            {
-                return Err(Error::Protocol {
-                    object: ev.u32(),
-                    code: ev.u32(),
-                    message: ev.string(),
-                });
-            }
-
-            if ev.object_id == registry.raw()
-                && RegistryEvent::from_opcode(ev.opcode) == Some(RegistryEvent::Global)
-            {
-                let name = ev.u32();
-                let interface = ev.string();
-                let version = ev.u32();
-                globals.bind_named_global(sender, registry, name, &interface, version)?;
-            }
-        }
+        surface::RegistryDiscovery::collect(sender, events, &mut globals)?;
         globals.finish()
     }
 

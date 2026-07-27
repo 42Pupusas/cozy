@@ -109,7 +109,9 @@ mod tests {
             // A prior test panicking while holding the lock would poison
             // it; recover the guard rather than cascading failures across
             // every other test in this module.
-            let lock = ENV_MUTEX.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let vars = pairs
                 .iter()
                 .map(|(k, v)| {
@@ -184,7 +186,10 @@ mod tests {
 
         let _guard = EnvGuard::set(&[
             ("XDG_DATA_HOME", tmp.join("data_home").to_str().unwrap()),
-            ("XDG_DATA_DIRS", tmp.join("data_dirs/share").to_str().unwrap()),
+            (
+                "XDG_DATA_DIRS",
+                tmp.join("data_dirs/share").to_str().unwrap(),
+            ),
         ]);
 
         let index = AppIndex::scan();

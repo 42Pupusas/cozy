@@ -151,6 +151,17 @@ name = "input"
 version = "0.1.0"
 
 [[package]]
+name = "ixchel"
+version = "0.1.0"
+
+[[package]]
+name = "ixiptla-core"
+version = "0.1.0"
+dependencies = [
+ "ixchel",
+]
+
+[[package]]
 name = "json-bourne"
 version = "0.2.2"
 dependencies = [
@@ -414,6 +425,24 @@ dependencies = [
 [[package]]
 name = "waker"
 version = "0.1.0"
+
+[[package]]
+name = "wallpaper"
+version = "0.1.0"
+dependencies = [
+ "ixchel",
+ "ixiptla-core",
+]
+
+[[package]]
+name = "wallpaper-bin"
+version = "0.1.0"
+dependencies = [
+ "platform",
+ "quetzalcoatl",
+ "waker",
+ "wallpaper",
+]
 
 [[package]]
 name = "windows-link"

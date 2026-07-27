@@ -192,13 +192,21 @@ impl LauncherApp {
                 // Wrap to the last row from the first (and vice versa below)
                 // instead of clamping, so repeated Up/Down cycles the list
                 // like most launcher/menu UIs rather than dead-ending.
-                let count = self.catalog.search(&self.query).len().min(MAX_VISIBLE_RESULTS);
+                let count = self
+                    .catalog
+                    .search(&self.query)
+                    .len()
+                    .min(MAX_VISIBLE_RESULTS);
                 if count > 0 {
                     self.selected = (self.selected + count - 1) % count;
                 }
             }
             LauncherKey::Down => {
-                let count = self.catalog.search(&self.query).len().min(MAX_VISIBLE_RESULTS);
+                let count = self
+                    .catalog
+                    .search(&self.query)
+                    .len()
+                    .min(MAX_VISIBLE_RESULTS);
                 if count > 0 {
                     self.selected = (self.selected + 1) % count;
                 }
@@ -275,7 +283,15 @@ impl Painter {
         }
 
         if results.is_empty() && !query.is_empty() {
-            text.draw_text_alpha(canvas, "No matching applications", pad, list_top, dim, bg, bg_alpha);
+            text.draw_text_alpha(
+                canvas,
+                "No matching applications",
+                pad,
+                list_top,
+                dim,
+                bg,
+                bg_alpha,
+            );
         }
     }
 }

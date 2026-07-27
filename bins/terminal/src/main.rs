@@ -341,7 +341,11 @@ mod cli_tests {
     use super::Cli;
 
     fn args(items: &[&str]) -> impl Iterator<Item = String> + use<> {
-        items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>().into_iter()
+        items
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 
     #[test]
@@ -361,7 +365,10 @@ mod cli_tests {
         let cli = Cli::parse(args(&["-e", "nvim", "--", "foo.txt"]));
         assert_eq!(
             cli.exec,
-            Some(("nvim".to_owned(), vec!["--".to_owned(), "foo.txt".to_owned()]))
+            Some((
+                "nvim".to_owned(),
+                vec!["--".to_owned(), "foo.txt".to_owned()]
+            ))
         );
     }
 
@@ -652,7 +659,13 @@ impl PtyWorker {
             ypixel: 0,
         };
         let shell_args_ref: Vec<&str> = shell_args.iter().map(String::as_str).collect();
-        let pty = match Pty::spawn(&shell, &shell_args_ref, win, input_wake.raw_fd(), Arc::clone(&quit)) {
+        let pty = match Pty::spawn(
+            &shell,
+            &shell_args_ref,
+            win,
+            input_wake.raw_fd(),
+            Arc::clone(&quit),
+        ) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("pty: spawn failed: {e}");

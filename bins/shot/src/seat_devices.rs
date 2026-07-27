@@ -21,6 +21,7 @@
 //! this type successfully is therefore the proof that the overlay can be
 //! dismissed -- which is why the overlay takes one instead of a bare seat id.
 
+use platform::Result;
 use platform::conn::Sender;
 use platform::event::RawEvent;
 use platform::id::{CallbackId, DisplayId, KeyboardId, ObjectId, PointerId, RegistryId, SeatId};
@@ -28,7 +29,6 @@ use platform::protocol as proto;
 use platform::protocol::{CallbackEvent, DisplayRequest, SeatCapability, SeatEvent, SeatRequest};
 use platform::surface::SurfaceBootstrap;
 use platform::wire::MessageBuilder;
-use platform::Result;
 use platform::wire::WireEvent;
 use quetzalcoatl::spsc::Consumer;
 

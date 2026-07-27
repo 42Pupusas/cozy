@@ -15,8 +15,6 @@ mod shot_options;
 mod shot_writer;
 
 use output_registry::OutputRegistry;
-use seat_devices::SeatDevices;
-use selection_overlay::SelectionOverlay;
 use platform::conn::Sender;
 use platform::event::RawEvent;
 use platform::id::{CompositorId, LayerShellId, RegistryId, ScreencopyManagerId, ShmId};
@@ -25,6 +23,8 @@ use platform::surface::{GlobalCollector, RegistryDiscovery, SurfaceBootstrap};
 use platform::{Error, Result};
 use quetzalcoatl::spsc::Consumer;
 use screencopy::{CaptureRegion, ScreencopySession};
+use seat_devices::SeatDevices;
+use selection_overlay::SelectionOverlay;
 use shot_options::{CaptureTarget, ShotOptions};
 use shot_writer::ShotWriter;
 
@@ -126,8 +126,7 @@ impl GlobalCollector for GlobalsBuilder {
                 // Record the negotiated version, not the advertised one: the
                 // handshake's shape depends on what we actually bound.
                 let bound = proto::ZWLR_SCREENCOPY_MANAGER_V1.version.min(version);
-                let manager =
-                    SurfaceBootstrap::bind(sender, registry, name, interface, bound)?;
+                let manager = SurfaceBootstrap::bind(sender, registry, name, interface, bound)?;
                 self.screencopy = Some((manager, bound));
             }
             n if n == proto::WL_COMPOSITOR.name && self.compositor.is_none() => {
@@ -199,22 +198,14 @@ impl ShotApp {
         // `collect` stops as soon as shm + screencopy arrive, which may be
         // before every output has been announced. The sync round-trip closes
         // that gap so `--output` sees them all.
-        RegistryDiscovery::collect_through_sync(
-            &mut sender,
-            &mut events,
-            registry,
-            &mut collector,
-        )
-        .map_err(|e| e.to_string())?;
+        RegistryDiscovery::collect_through_sync(&mut sender, &mut events, registry, &mut collector)
+            .map_err(|e| e.to_string())?;
         let (globals, mut outputs) = collector.finish()?;
         outputs
             .collect_names(&mut sender, &mut events)
             .map_err(|e| e.to_string())?;
-        let session = ScreencopySession::new(
-            globals.screencopy,
-            globals.screencopy_version,
-            globals.shm,
-        );
+        let session =
+            ScreencopySession::new(globals.screencopy, globals.screencopy_version, globals.shm);
         Ok(Self {
             sender,
             events,
@@ -257,8 +248,10 @@ impl ShotApp {
         &mut self,
         target: &CaptureTarget,
     ) -> std::result::Result<Option<(platform::id::OutputId, Option<CaptureRegion>)>, String> {
-        if matches!(target, CaptureTarget::Selection) {
-            let output = self.first_output()?;
+        if let CaptureTarget::Selection(name) = target {
+            let output = name
+                .as_deref()
+                .map_or_else(|| self.first_output(), |name| self.output_named(name))?;
             return Ok(self
                 .select_region(output)?
                 .map(|region| (output, Some(region))));
@@ -309,6 +302,18 @@ impl ShotApp {
 
     /// The first advertised output, which single-monitor setups make
     /// unambiguous.
+    fn output_named(&self, name: &str) -> std::result::Result<platform::id::OutputId, String> {
+        self.outputs
+            .by_name(name)
+            .map(|output| output.id)
+            .ok_or_else(|| {
+                format!(
+                    "no output named `{name}`; available: {}",
+                    self.outputs.known_names()
+                )
+            })
+    }
+
     fn first_output(&self) -> std::result::Result<platform::id::OutputId, String> {
         self.outputs
             .outputs()
@@ -330,7 +335,7 @@ impl ShotApp {
             CaptureTarget::AllOutputs => Ok((self.first_output()?, None)),
             CaptureTarget::Region(region) => Ok((self.first_output()?, Some(*region))),
             // Handled by `resolve_capture`, which can run an event loop.
-            CaptureTarget::Selection => Err(
+            CaptureTarget::Selection(_) => Err(
                 "internal: interactive selection must be resolved before this point".to_string(),
             ),
             CaptureTarget::Output(name) => self

@@ -85,13 +85,8 @@ mod tests {
             0xFF, 0x00, 0x00, 0x00, // blue
             0xFF, 0xFF, 0xFF, 0x00, // white
         ];
-        let params = FrameParams::new(
-            platform::protocol::Format::Xrgb8888.code(),
-            2,
-            2,
-            8,
-        )
-        .expect("valid params");
+        let params = FrameParams::new(platform::protocol::Format::Xrgb8888.code(), 2, 2, 8)
+            .expect("valid params");
         CapturedFrame::from_shm(&params, 0, &source).expect("converts")
     }
 

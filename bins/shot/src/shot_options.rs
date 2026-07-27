@@ -20,9 +20,9 @@ pub enum CaptureTarget {
     /// A fixed rectangle, skipping the interactive overlay entirely -- the
     /// scriptable path that makes this usable from a keybind.
     Region(CaptureRegion),
-    /// Drag a rectangle out interactively, replacing the `slurp` half of the
-    /// classic `slurp | grim -g -` pipe.
-    Selection,
+    /// Drag a rectangle out interactively, optionally on one named output.
+    /// `None` chooses the first output for single-output use.
+    Selection(Option<String>),
 }
 
 /// Everything the binary needs from its arguments.
@@ -52,16 +52,25 @@ impl ShotOptions {
             let text = argument.to_string_lossy().into_owned();
             match text.as_str() {
                 "-c" | "--cursor" => overlay_cursor = true,
-                "-s" | "--select" => target = CaptureTarget::Selection,
+                "-s" | "--select" => {
+                    target = match target {
+                        CaptureTarget::Output(name) => CaptureTarget::Selection(Some(name)),
+                        CaptureTarget::Selection(name) => CaptureTarget::Selection(name),
+                        _ => CaptureTarget::Selection(None),
+                    };
+                }
                 "-o" | "--output" => {
                     let name = Self::value_for(&mut arguments, &text)?;
-                    target = CaptureTarget::Output(name.to_string_lossy().into_owned());
+                    target = match target {
+                        CaptureTarget::Selection(_) => {
+                            CaptureTarget::Selection(Some(name.to_string_lossy().into_owned()))
+                        }
+                        _ => CaptureTarget::Output(name.to_string_lossy().into_owned()),
+                    };
                 }
                 "-g" | "--geometry" => {
                     let spec = Self::value_for(&mut arguments, &text)?;
-                    target = CaptureTarget::Region(Self::parse_geometry(
-                        &spec.to_string_lossy(),
-                    )?);
+                    target = CaptureTarget::Region(Self::parse_geometry(&spec.to_string_lossy())?);
                 }
                 // A bare `-` means stdout, so it must be checked before the
                 // generic leading-dash rejection below.
@@ -254,6 +263,24 @@ mod tests {
     }
 
     #[test]
+    fn select_can_be_pinned_to_a_named_output() {
+        let options = ShotOptions::parse(argv(&["--select", "--output", "DP-1"])).expect("valid");
+        assert_eq!(
+            options.target,
+            CaptureTarget::Selection(Some("DP-1".into()))
+        );
+    }
+
+    #[test]
+    fn output_then_select_has_the_same_explicit_selection_meaning() {
+        let options = ShotOptions::parse(argv(&["--output", "DP-1", "--select"])).expect("valid");
+        assert_eq!(
+            options.target,
+            CaptureTarget::Selection(Some("DP-1".into()))
+        );
+    }
+
+    #[test]
     fn cursor_flag_is_off_unless_asked_for() {
         for flag in ["-c", "--cursor"] {
             let options = ShotOptions::parse(argv(&[flag])).expect("valid");
@@ -282,8 +309,7 @@ mod tests {
 
     #[test]
     fn later_targets_override_earlier_ones() {
-        let options =
-            ShotOptions::parse(argv(&["-o", "DP-1", "-g", "0,0 10x10"])).expect("valid");
+        let options = ShotOptions::parse(argv(&["-o", "DP-1", "-g", "0,0 10x10"])).expect("valid");
         assert!(matches!(options.target, CaptureTarget::Region(_)));
     }
 }

@@ -11,6 +11,7 @@
 use crate::drag_selection::{DragSelection, SelectionOutcome};
 use crate::seat_devices::SeatDevices;
 use crate::selection_painter::SelectionPainter;
+use platform::Result;
 use platform::conn::Sender;
 use platform::draw::Canvas;
 use platform::event::RawEvent;
@@ -26,7 +27,6 @@ use platform::protocol::{BufferEvent, BufferRequest, CompositorRequest, ShmPoolR
 use platform::surface::Frame;
 use platform::sys::ShmBuffer;
 use platform::wire::MessageBuilder;
-use platform::Result;
 use quetzalcoatl::spsc::Consumer;
 use screencopy::CaptureRegion;
 use std::time::{Duration, Instant};

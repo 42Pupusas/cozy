@@ -9,9 +9,7 @@ use platform::Result;
 use platform::conn::Sender;
 use platform::event::RawEvent;
 use platform::id::{CallbackId, DisplayId, ObjectId, OutputId, RegistryId};
-use platform::protocol::{
-    self as proto, CallbackEvent, DisplayRequest, OutputEvent,
-};
+use platform::protocol::{self as proto, CallbackEvent, DisplayRequest, OutputEvent};
 use platform::surface::SurfaceBootstrap;
 use platform::wire::{MessageBuilder, WireEvent};
 use quetzalcoatl::spsc::Consumer;
@@ -70,8 +68,7 @@ impl OutputRegistry {
         events: &mut Consumer<RawEvent>,
     ) -> Result<()> {
         let callback: CallbackId = sender.alloc_id();
-        sender
-            .request(MessageBuilder::new(DisplayId(1), DisplayRequest::Sync).new_id(callback))?;
+        sender.request(MessageBuilder::new(DisplayId(1), DisplayRequest::Sync).new_id(callback))?;
         loop {
             let Some(event) = events.pop_block() else {
                 // The reader stopped; whatever names we have are all we get.
@@ -172,10 +169,7 @@ mod tests {
     #[test]
     fn finds_an_output_by_its_connector_name() {
         let registry = Fixture::with(&[(10, Some("eDP-1")), (11, Some("DP-1"))]);
-        assert_eq!(
-            registry.by_name("DP-1").map(|o| o.id),
-            Some(OutputId(11))
-        );
+        assert_eq!(registry.by_name("DP-1").map(|o| o.id), Some(OutputId(11)));
     }
 
     #[test]

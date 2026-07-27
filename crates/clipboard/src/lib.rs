@@ -5,6 +5,12 @@
 //! and exact request lookup. The Wayland owner can remain a thin adapter while
 //! these rules stay headlessly testable.
 
+mod history;
+mod storage;
+
+pub use history::{ClipboardHistory, HistoryEntry};
+pub use storage::{HistoryStore, HistoryStoreError};
+
 /// A byte payload advertised under one MIME type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardOffer {
@@ -76,6 +82,12 @@ impl ClipboardPayload {
         self.offers.iter().map(|offer| offer.mime.as_str())
     }
 
+    /// All representations in stable insertion order.
+    #[must_use]
+    pub(crate) fn offers(&self) -> &[ClipboardOffer] {
+        &self.offers
+    }
+
     /// Whether no data can be offered.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
@@ -117,7 +129,9 @@ pub struct ClipboardOwner<'a> {
 impl<'a> ClipboardOwner<'a> {
     /// Attach the owner decision layer to a payload held by the process.
     #[must_use]
-    pub const fn new(payload: &'a ClipboardPayload) -> Self { Self { payload } }
+    pub const fn new(payload: &'a ClipboardPayload) -> Self {
+        Self { payload }
+    }
 
     /// Handle a request without doing I/O itself.
     #[must_use]
@@ -176,9 +190,18 @@ mod tests {
     fn owner_serves_only_advertised_mimes_and_stops_on_replacement() {
         let payload = ScreenshotPayload::from_png(vec![1, 2], "file:///tmp/shot.png");
         let owner = super::ClipboardOwner::new(&payload);
-        assert_eq!(owner.handle(super::OwnerRequest::Send("image/png".into())), super::OwnerResponse::Bytes(&[1, 2]));
-        assert_eq!(owner.handle(super::OwnerRequest::Send("image/jpeg".into())), super::OwnerResponse::Unsupported);
-        assert_eq!(owner.handle(super::OwnerRequest::Cancelled), super::OwnerResponse::Stop);
+        assert_eq!(
+            owner.handle(super::OwnerRequest::Send("image/png".into())),
+            super::OwnerResponse::Bytes(&[1, 2])
+        );
+        assert_eq!(
+            owner.handle(super::OwnerRequest::Send("image/jpeg".into())),
+            super::OwnerResponse::Unsupported
+        );
+        assert_eq!(
+            owner.handle(super::OwnerRequest::Cancelled),
+            super::OwnerResponse::Stop
+        );
     }
 
     #[test]

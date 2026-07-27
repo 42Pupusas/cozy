@@ -101,6 +101,8 @@ object_ids! {
     DataControlManagerId,
     /// `zwlr_data_control_device_v1` — privileged clipboard endpoint.
     DataControlDeviceId,
+    /// `zwlr_data_control_offer_v1` — MIME offer from another clipboard owner.
+    DataControlOfferId,
     /// `zwlr_data_control_source_v1` — privileged outgoing clipboard source.
     DataControlSourceId,
 }

@@ -373,11 +373,11 @@ impl Painter {
                     &icon.rgba,
                     icon.width,
                     icon.height,
-                    bg,
+                    row_bg,
                     bg_alpha,
                 );
             }
-            let text_x = pad + ICON_SIZE + 8;
+            let text_x = pad + ICON_SIZE + 24;
             title_text.draw_text_alpha(
                 canvas,
                 &ranked.entry.name,

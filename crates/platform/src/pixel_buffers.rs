@@ -160,6 +160,31 @@ impl PixelBuffers {
             .run(alpha, &self.backbuffer, &mut custom_argb);
         self.custom_argb = custom_argb;
     }
+
+    /// Clear the scanlines below the last complete terminal cell row.
+    ///
+    /// Wayland configures are pixel-sized, while the grid deliberately uses
+    /// only complete cells. During a resize [`Self::resize`] preserves the
+    /// old image until the parser supplies a reflowed snapshot; without this
+    /// cleanup, that preservation can copy the top of an old final glyph into
+    /// the new size's fractional bottom strip. No grid row owns those pixels,
+    /// so a normal dirty-row paint can never overwrite them and the fragment
+    /// remains visible indefinitely. The strip is presentation-only space and
+    /// must always be plain terminal background.
+    pub fn clear_partial_cell_row(&mut self, width: i32, height: i32, cell_h: i32, bg: u32) {
+        let (width, height, cell_h) = (width.max(0) as usize, height.max(0) as usize, cell_h);
+        if width == 0 || cell_h <= 0 {
+            return;
+        }
+        let complete_height = (height / cell_h as usize) * cell_h as usize;
+        if complete_height == height {
+            return;
+        }
+        let start = complete_height * width;
+        if let Some(strip) = self.backbuffer.get_mut(start..) {
+            strip.fill(bg);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +243,32 @@ mod tests {
         buf.resize(3, 3, 2, 2, 0, 255);
         // Top-left 2x2 of the old 3x3: rows [1,2] and [4,5].
         assert_eq!(buf.backbuffer(), &[1, 2, 4, 5]);
+    }
+
+    #[test]
+    fn clear_partial_cell_row_removes_preserved_glyph_fragment() {
+        // Mimic an old image copied across a pixel resize: the bottom two
+        // scanlines are not a complete 4px cell and must not retain glyph ink.
+        let mut buf = PixelBuffers::new(2, 6, 0, 255);
+        buf.backbuffer_mut().fill(0x00_ff_00_ff);
+        buf.clear_partial_cell_row(2, 6, 4, 0x00_11_22_33);
+        assert_eq!(
+            buf.backbuffer(),
+            &[
+                0x00_ff_00_ff,
+                0x00_ff_00_ff,
+                0x00_ff_00_ff,
+                0x00_ff_00_ff,
+                0x00_ff_00_ff,
+                0x00_ff_00_ff,
+                0x00_ff_00_ff,
+                0x00_ff_00_ff,
+                0x00_11_22_33,
+                0x00_11_22_33,
+                0x00_11_22_33,
+                0x00_11_22_33,
+            ]
+        );
     }
 
     #[test]

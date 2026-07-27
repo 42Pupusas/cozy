@@ -2337,6 +2337,13 @@ impl TermWindow {
             self.renderer.bg_packed(),
             self.renderer.background_alpha(),
         );
+        // A configure can end between cell boundaries. The carried old image
+        // is useful for complete grid rows while the reflow snapshot is in
+        // flight, but no grid cell owns the remaining bottom scanlines. Clear
+        // them now so a cropped old glyph cannot become a permanently stuck
+        // partial line (dirty snapshots intentionally paint whole rows only).
+        self.pixels
+            .clear_partial_cell_row(w, h, self.cell_h, self.renderer.bg_packed());
 
         // `self.present`'s pool is unchanged — we reuse it across resizes now.
         self.width = w;

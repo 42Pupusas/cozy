@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 /// available rather than upscaling a tiny icon blurrily. Kept as a fixed
 /// list (not a directory scan) since `hicolor`'s standard sizes are fixed
 /// by the spec, not per-theme.
-const PREFERRED_SIZES: [u32; 6] = [32, 48, 64, 24, 16, 128];
+const PREFERRED_SIZES: [u32; 7] = [32, 48, 64, 24, 16, 128, 256];
 
 /// Resolves `Icon=` values to PNG file paths, given the search roots the
 /// XDG Base Directory spec defines (so tests can point it at a temp dir
@@ -164,6 +164,19 @@ mod tests {
             lookup.resolve("spotify"),
             Some(data_dir.join("icons/hicolor/32x32/apps/spotify.png"))
         );
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn finds_user_icon_at_256_pixels() {
+        let tmp = tmp_dir("large_icon");
+        let data_dir = tmp.join("data");
+        let icon = data_dir.join("icons/hicolor/256x256/apps/agent.png");
+        touch(&icon);
+
+        let lookup = IconLookup::with_roots(&[data_dir], Path::new("/nonexistent"));
+        assert_eq!(lookup.resolve("agent"), Some(icon));
 
         fs::remove_dir_all(&tmp).ok();
     }

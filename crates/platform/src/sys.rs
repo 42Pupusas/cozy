@@ -456,6 +456,24 @@ impl ShmBuffer {
         }
     }
 
+    /// Frame `frame`'s contents as raw bytes.
+    ///
+    /// Rendering paths want [`Self::pixels`]: they compose whole 32-bit
+    /// pixels, and a `u32` slice makes that both faster and harder to get
+    /// wrong. Capture is the opposite case -- the compositor writes the
+    /// pool and dictates a stride that need not be `width * 4`, so the
+    /// consumer walks bytes at arbitrary offsets rather than pixels.
+    pub fn bytes(&mut self, frame: usize) -> &mut [u8] {
+        assert!(frame < self.frames);
+        // SAFETY: same disjoint-window reasoning as `pixels`; `u8` has weaker
+        // alignment than `u32`, so a `u32`-aligned pointer is trivially valid
+        // here, and `&mut self` keeps this the only live borrow.
+        unsafe {
+            let base = self.ptr.add(frame * self.frame_pixels).cast::<u8>();
+            std::slice::from_raw_parts_mut(base, self.frame_bytes)
+        }
+    }
+
     /// Byte offset of frame `frame` within the pool (for `create_buffer`).
     #[must_use]
     pub const fn frame_offset(&self, frame: usize) -> usize {

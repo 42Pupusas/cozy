@@ -1,0 +1,26 @@
+[package]
+name    = "shot-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "shot"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The capture protocol itself; see `crates/screencopy` for why the pure
+# pixel/handshake logic lives there rather than in this bin.
+screencopy = { path = "../../crates/screencopy" }
+# Connection bootstrap, registry discovery, and the wire vocabulary.
+platform = { path = "../../crates/platform" }
+# The event ring the platform reader delivers into.
+quetzalcoatl.workspace = true
+# Waking the UI thread from the reader thread.
+waker = { path = "../../crates/waker" }
+# PNG encode. This bin is exactly the consumer ixiptla-core's workspace entry
+# anticipated: capture produces RGBA8 scanlines, which is precisely what
+# `Encoder::encode` takes.
+ixiptla-core.workspace = true

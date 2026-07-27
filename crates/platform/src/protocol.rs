@@ -806,6 +806,21 @@ impl Format {
     pub const fn code(self) -> u32 {
         self as u32
     }
+
+    /// Decode a wire format code, or `None` for a format we don't model.
+    ///
+    /// Needed because some protocols *tell us* which format to use rather
+    /// than letting us pick: `zwlr_screencopy_frame_v1.buffer` names the
+    /// format the compositor will copy into, so a capture client has to turn
+    /// that `uint` back into something it can allocate and interpret.
+    #[must_use]
+    pub const fn from_code(code: u32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Argb8888),
+            1 => Some(Self::Xrgb8888),
+            _ => None,
+        }
+    }
 }
 
 /// A global interface we bind by name, with the maximum version we support.
@@ -1071,6 +1086,119 @@ pub mod drm_format {
 pub const DRM_FORMAT_MOD_LINEAR_HI: u32 = 0;
 pub const DRM_FORMAT_MOD_LINEAR_LO: u32 = 0;
 
+// ── zwlr_screencopy_v1 (wlr-screencopy-unstable-v1) ──────────────────────
+//
+// How a client asks the compositor for a copy of what's on screen -- the
+// protocol `grim` uses, and the one a screenshot bin needs. There is no
+// core-Wayland equivalent: clients cannot read back other clients' pixels,
+// so capture is necessarily a privileged compositor extension.
+//
+// The exchange is a strict per-frame handshake, which is why the frame gets
+// its own object rather than being a manager request/reply:
+//
+//   capture_output(frame, overlay_cursor, output)
+//     <- buffer(format, width, height, stride)   "allocate one of these"
+//     <- linux_dmabuf(...)                       (v3, we ignore -- shm only)
+//     <- buffer_done                             (v3, end of the menu)
+//   copy(buffer)
+//     <- flags(flags)                            (y_invert, see below)
+//     <- ready(tv_sec_hi, tv_sec_lo, tv_nsec)    pixels are in our shm now
+//     or
+//     <- failed                                  give up, destroy the frame
+//
+// The compositor dictates the format/stride here (unlike our own surfaces,
+// where we choose `Xrgb8888`), so a capture client must be prepared to
+// interpret whatever `buffer` names.
+
+requests! {
+    /// `zwlr_screencopy_manager_v1` requests — the factory for capture frames.
+    ScreencopyManagerRequest {
+        /// Capture a whole output: `frame` (`new_id`), `overlay_cursor`
+        /// (int, non-zero composites the cursor into the copy), `output`.
+        CaptureOutput = 0,
+        /// Capture a sub-rectangle of an output: `frame` (`new_id`),
+        /// `overlay_cursor`, `output`, `x`, `y`, `width`, `height`, the box
+        /// given in output-logical coordinates and clipped to the output.
+        CaptureOutputRegion = 1,
+        /// Unbind the factory (frames already created stay valid).
+        Destroy = 2,
+    }
+}
+
+requests! {
+    /// `zwlr_screencopy_frame_v1` requests.
+    ScreencopyFrameRequest {
+        /// Copy this frame into `buffer`, which must match the size/stride/
+        /// format from the `buffer` event. Answered by `flags` + `ready`, or
+        /// by `failed`.
+        Copy = 0,
+        /// Delete this frame object, used or not. Required after both
+        /// `ready` and `failed`: a frame is single-use.
+        Destroy = 1,
+        /// Like `Copy`, but defers until the capture source is damaged (v2+).
+        /// For screenshots we want the current contents, not the next change,
+        /// so this stays unused -- it's here for a future screencast path.
+        CopyWithDamage = 2,
+    }
+}
+
+events! {
+    /// `zwlr_screencopy_frame_v1` events.
+    ScreencopyFrameEvent {
+        /// The shm buffer parameters to allocate: `format` (a
+        /// [`Format`] code), `width`, `height`, `stride`.
+        Buffer = 0,
+        /// Frame properties, sent once before `ready` — see
+        /// [`ScreencopyFrameFlags`].
+        Flags = 1,
+        /// The copy completed and the buffer is readable: `tv_sec_hi`,
+        /// `tv_sec_lo`, `tv_nsec` presentation timestamp.
+        Ready = 2,
+        /// The copy failed; nothing was written. Destroy the frame.
+        Failed = 3,
+        /// Damage box accompanying a `copy_with_damage` (v2+): `x`, `y`,
+        /// `width`, `height`. Unused while we only send plain `Copy`.
+        Damage = 4,
+        /// dmabuf buffer parameters (v3+): `format` (a DRM fourcc, *not* a
+        /// [`Format`] code), `width`, `height`. Ignored — we capture into
+        /// shm, which every compositor supporting this protocol offers.
+        LinuxDmabuf = 5,
+        /// End of the buffer-parameter menu (v3+); after this the client
+        /// picks a buffer type and sends `Copy`. Versions below 3 never send
+        /// it, so a client must also treat `buffer` alone as sufficient.
+        BufferDone = 6,
+    }
+}
+
+/// `zwlr_screencopy_frame_v1` frame flags (the `flags` event), `ORed` together.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ScreencopyFrameFlags {
+    /// The copied contents are bottom-up: row 0 of the buffer is the *last*
+    /// row of the image. Compositors that capture straight off a GL texture
+    /// set this, so a capture client must be ready to flip vertically before
+    /// encoding — otherwise screenshots come out upside down on some
+    /// compositors and not others.
+    YInvert = 1,
+}
+
+impl ScreencopyFrameFlags {
+    /// Whether this flag is set in a `flags` event bitmask.
+    #[must_use]
+    pub const fn in_mask(self, mask: u32) -> bool {
+        mask & (self as u32) != 0
+    }
+}
+
+pub const ZWLR_SCREENCOPY_MANAGER_V1: Interface = Interface {
+    name: "zwlr_screencopy_manager_v1",
+    // v3 adds `buffer_done`, which is what makes the parameter handshake
+    // unambiguous: without it a client has to guess that the single `buffer`
+    // event is the whole menu. Binding the max and handling both shapes keeps
+    // us working against older compositors too.
+    version: 3,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,5 +1336,61 @@ mod tests {
     fn format_code_matches_wire_value() {
         assert_eq!(Format::Argb8888.code(), 0);
         assert_eq!(Format::Xrgb8888.code(), 1);
+    }
+
+    #[test]
+    fn format_from_code_roundtrips_and_rejects_unknown() {
+        for f in [Format::Argb8888, Format::Xrgb8888] {
+            assert_eq!(Format::from_code(f.code()), Some(f));
+        }
+        // Real `wl_shm` advertises many more formats (RGB565, XBGR8888, ...).
+        // A screencopy client must reject those rather than misinterpret the
+        // bytes as one of the two layouts we can actually handle.
+        for code in [2, 3, 0x3432_5258, u32::MAX] {
+            assert_eq!(
+                Format::from_code(code),
+                None,
+                "code {code} should not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn screencopy_frame_event_opcodes_match_the_protocol_xml() {
+        // Transcribed by hand from wlr-screencopy-unstable-v1.xml, so pin the
+        // declaration-order opcodes: an off-by-one here would silently route
+        // `ready` into the `failed` branch and lose every screenshot.
+        use ScreencopyFrameEvent as E;
+        for (op, want) in [
+            (0, E::Buffer),
+            (1, E::Flags),
+            (2, E::Ready),
+            (3, E::Failed),
+            (4, E::Damage),
+            (5, E::LinuxDmabuf),
+            (6, E::BufferDone),
+        ] {
+            assert_eq!(E::from_opcode(op), Some(want));
+        }
+        assert_eq!(E::from_opcode(7), None);
+    }
+
+    #[test]
+    fn screencopy_request_opcodes_match_the_protocol_xml() {
+        assert_eq!(ScreencopyManagerRequest::CaptureOutput.opcode(), 0);
+        assert_eq!(ScreencopyManagerRequest::CaptureOutputRegion.opcode(), 1);
+        assert_eq!(ScreencopyManagerRequest::Destroy.opcode(), 2);
+        assert_eq!(ScreencopyFrameRequest::Copy.opcode(), 0);
+        assert_eq!(ScreencopyFrameRequest::Destroy.opcode(), 1);
+        assert_eq!(ScreencopyFrameRequest::CopyWithDamage.opcode(), 2);
+    }
+
+    #[test]
+    fn screencopy_y_invert_flag_reads_its_bit() {
+        assert!(ScreencopyFrameFlags::YInvert.in_mask(1));
+        assert!(!ScreencopyFrameFlags::YInvert.in_mask(0));
+        // Unknown future bits set alongside it must not mask it out.
+        assert!(ScreencopyFrameFlags::YInvert.in_mask(0b1011));
+        assert!(!ScreencopyFrameFlags::YInvert.in_mask(0b1010));
     }
 }

@@ -1540,10 +1540,14 @@ mod perf_harness {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(900);
-            let area = width as usize * height as usize;
+            let area = width * height;
             Self {
-                width: width as i32,
-                height: height as i32,
+                // The harness only ever runs with sane window dimensions; a
+                // value too large for `i32` is operator error in the env
+                // override, so fail loudly rather than silently wrapping to a
+                // negative width that would make every later clamp nonsense.
+                width: i32::try_from(width).expect("MONITOR_BENCH_W must fit in i32"),
+                height: i32::try_from(height).expect("MONITOR_BENCH_H must fit in i32"),
                 backbuffer: vec![0u32; area],
                 prev_backbuffer: vec![0u32; area],
                 custom_argb: vec![0u32; area],
@@ -1561,6 +1565,30 @@ mod perf_harness {
             }
         }
 
+        /// Window width as a buffer index, clamping a negative width to zero.
+        ///
+        /// The dimensions are stored as `i32` to match the platform rect/damage
+        /// types, but every use here indexes a `Vec`. Funnelling that conversion
+        /// through one method keeps the clamp-then-widen rule in a single place
+        /// instead of repeating a sign-losing cast at each call site.
+        fn width_px(&self) -> usize {
+            self.width.max(0).unsigned_abs() as usize
+        }
+
+        /// Window height as a buffer index; see [`Self::width_px`].
+        fn height_px(&self) -> usize {
+            self.height.max(0).unsigned_abs() as usize
+        }
+
+        /// Clamp a rect edge to `0..=height` and widen it to a row index.
+        ///
+        /// Damage rects can legitimately extend past the window (the painter
+        /// reports geometry, not clipped output), so both ends need clamping
+        /// before the value can be trusted as a slice bound.
+        fn row_index(edge: i32, height: i32) -> usize {
+            edge.clamp(0, height.max(0)).unsigned_abs() as usize
+        }
+
         /// One present: the same three phases the live trace splits into
         /// (`paint`, `premul`, `shm-copy`). Returns each phase's duration so
         /// the caller can bucket them and expose any growth trend.
@@ -1573,10 +1601,10 @@ mod perf_harness {
                 sample: synthetic_sample(tick),
                 processes: synthetic_processes(tick),
             };
-            if tick % 25 == 0 {
+            if tick.is_multiple_of(25) {
                 self.history.add(&snapshot.sample);
             }
-            let full_repaint = tick % 10 == 0;
+            let full_repaint = tick.is_multiple_of(10);
 
             // Snapshot the backbuffer so the exact number of pixels this paint
             // actually mutates can be counted by diffing afterwards. premul and
@@ -1605,7 +1633,7 @@ mod perf_harness {
             };
             let paint = t0.elapsed();
 
-            let width = self.width.max(0) as usize;
+            let width = self.width_px();
             let rows = self.backbuffer.len() / width.max(1);
             let total_area = self.backbuffer.len();
             // Three scoping models to compare in one framework:
@@ -1653,8 +1681,8 @@ mod perf_harness {
             let mut shm = Duration::ZERO;
             let mut dirty_px = 0usize;
             for rect in regions {
-                let y0 = (rect.y.max(0).min(self.height) as usize).min(rows);
-                let y1 = (rect.bottom().max(rect.y).min(self.height) as usize).min(rows);
+                let y0 = Self::row_index(rect.y, self.height).min(rows);
+                let y1 = Self::row_index(rect.bottom().max(rect.y), self.height).min(rows);
                 let start = y0 * width;
                 let end = y1 * width;
                 if start >= end {
@@ -1720,7 +1748,7 @@ mod perf_harness {
                 "headless present pipeline: {iterations} frames, {buckets} buckets of {per}\n\
                  bucket |  paint ms |  premul ms |  shm ms | worst-frame ms | dirty%"
             );
-            let total_px = (self.width.max(0) as usize) * (self.height.max(0) as usize);
+            let total_px = self.width_px() * self.height_px();
             for bucket in 0..buckets {
                 let mut paint_sum = Duration::ZERO;
                 let mut premul_sum = Duration::ZERO;

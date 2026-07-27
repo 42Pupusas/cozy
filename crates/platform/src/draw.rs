@@ -12,8 +12,12 @@
 
 use crate::font;
 
-/// An RGBA color. Alpha is carried for future use (blending, ARGB surfaces);
-/// the current XRGB8888 buffer ignores it.
+/// An RGBA color.
+///
+/// Alpha is ignored by the XRGB8888 paths (`fill_rect`, `clear`), which pack
+/// `0x00RRGGBB`, and honoured by the ARGB ones ([`Canvas::fill_rect_argb`],
+/// [`Color::to_argb8888`]) used for surfaces with genuine per-pixel
+/// transparency.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Color {
     pub r: u8,
@@ -419,6 +423,22 @@ impl<'a> Canvas<'a> {
         self.fill_rect_packed(rect, packed);
     }
 
+    /// Fill `rect` with `color` honouring **`color`'s own alpha channel**,
+    /// packed premultiplied as `wl_shm` requires.
+    ///
+    /// The distinction from [`Self::fill_rect_alpha`] matters: that one paints
+    /// solid ink *over* a translucent window (alpha is a property of the
+    /// window, and the fill is always opaque). This one treats alpha as a
+    /// property of the *paint*, which is what a surface with genuine
+    /// per-pixel transparency needs -- a selection overlay that dims part of
+    /// the screen and leaves the rest see-through, a cursor, a shaped
+    /// subsurface. Filling such a surface with [`Self::fill_rect`] silently
+    /// zeroes the alpha byte and yields a fully transparent (invisible)
+    /// rectangle.
+    pub fn fill_rect_argb(&mut self, rect: Rect, color: Color) {
+        self.fill_rect_packed(rect, color.premultiplied_argb8888(color.a));
+    }
+
     /// Shared clip + row-fill loop for [`Self::fill_rect`]/[`Self::fill_rect_alpha`].
     fn fill_rect_packed(&mut self, rect: Rect, v: u32) {
         let Some((x0, y0, x1, y1)) = self.clip(rect) else {
@@ -569,6 +589,63 @@ impl<'a> Canvas<'a> {
         for y in top..=bottom {
             self.pixels[(y.cast_unsigned() as usize) * stride + col.cast_unsigned() as usize] =
                 packed;
+        }
+    }
+
+    /// Blit a decoded RGBA8 image (`src`, `src_w`×`src_h` pixels, straight
+    /// alpha, row-major) into `dest` (clipped to the canvas), nearest-
+    /// neighbor scaled to fit, and alpha-composited exactly like
+    /// [`Self::fill_rect_alpha`]/[`text::blit_glyph`]'s "solid ink over
+    /// glass" contract: each source pixel's own alpha blends it against
+    /// `bg`, then the *result* is treated as opaque ink -- i.e. `bg_alpha`
+    /// (the window's own translucency) does not further fade the icon,
+    /// same as glyph ink never fading with the window. This is app-icon
+    /// rendering's one blit primitive (see `bins/launcher`'s icon module);
+    /// nearest-neighbor is deliberate over any smoother filter -- icons are
+    /// blitted at roughly their native size (XDG icon themes ship several
+    /// discrete sizes precisely so callers don't need to resample much),
+    /// so the softness a bilinear filter buys isn't worth the extra math
+    /// for a handful of ~24px launcher rows per frame.
+    pub fn blit_rgba_scaled(
+        &mut self,
+        dest: Rect,
+        src: &[u8],
+        src_w: i32,
+        src_h: i32,
+        bg: Color,
+        bg_alpha: u8,
+    ) {
+        if src_w <= 0 || src_h <= 0 || dest.w <= 0 || dest.h <= 0 {
+            return;
+        }
+        let Some((x0, y0, x1, y1)) = self.clip(dest) else {
+            return;
+        };
+        let stride = self.width.cast_unsigned() as usize;
+        for y in y0..y1 {
+            // Nearest-neighbor source row for this destination row.
+            let src_y = (y - dest.y) * src_h / dest.h;
+            let src_y = src_y.clamp(0, src_h - 1).cast_unsigned() as usize;
+            for x in x0..x1 {
+                let src_x = (x - dest.x) * src_w / dest.w;
+                let src_x = src_x.clamp(0, src_w - 1).cast_unsigned() as usize;
+                let idx = (src_y * src_w.cast_unsigned() as usize + src_x) * 4;
+                let Some(px) = src.get(idx..idx + 4) else {
+                    continue;
+                };
+                let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+                if a == 0 {
+                    continue;
+                }
+                let ink = Color::rgb(r, g, b).blend_opaque_color(bg, 255 - a);
+                let packed = if bg_alpha == 255 {
+                    ink.to_xrgb8888()
+                } else {
+                    ink.premultiplied_argb8888(255)
+                };
+                let out_idx = (y.cast_unsigned() as usize) * stride + x.cast_unsigned() as usize;
+                self.pixels[out_idx] = packed;
+            }
         }
     }
 
@@ -756,6 +833,48 @@ mod tests {
         let advance = c.draw_char('€', 0, 0, Color::WHITE); // non-ASCII
         assert_eq!(advance, font::GLYPH_W);
         assert_eq!(buf, before); // nothing drawn
+    }
+
+    #[test]
+    fn blit_rgba_scaled_nearest_neighbor_upscales() {
+        // A 1x1 opaque-red source, blitted into a 2x2 destination, should
+        // fill every destination pixel with red (nearest-neighbor of a
+        // single source pixel is itself, everywhere).
+        let mut buf = canvas_buf(2, 2);
+        let mut c = Canvas::new(&mut buf, 2, 2);
+        let src = [255u8, 0, 0, 255]; // opaque red
+        c.blit_rgba_scaled(Rect::new(0, 0, 2, 2), &src, 1, 1, Color::BLACK, 255);
+        let red = Color::rgb(255, 0, 0).to_xrgb8888();
+        assert_eq!(buf, vec![red, red, red, red]);
+    }
+
+    #[test]
+    fn blit_rgba_scaled_skips_fully_transparent_pixels() {
+        // A fully transparent source pixel leaves the destination untouched
+        // rather than painting black -- important for icons with rounded
+        // corners/padding, where the alpha=0 border shouldn't punch a
+        // visible hole in whatever's already drawn underneath.
+        let mut buf = canvas_buf(1, 1);
+        buf[0] = Color::WHITE.to_xrgb8888();
+        let mut c = Canvas::new(&mut buf, 1, 1);
+        let src = [0u8, 0, 0, 0]; // transparent black
+        c.blit_rgba_scaled(Rect::new(0, 0, 1, 1), &src, 1, 1, Color::BLACK, 255);
+        assert_eq!(buf[0], Color::WHITE.to_xrgb8888());
+    }
+
+    #[test]
+    fn blit_rgba_scaled_composites_partial_alpha_over_bg() {
+        // A half-alpha source pixel should blend toward `bg`, not just copy
+        // its own RGB through untouched.
+        let mut buf = canvas_buf(1, 1);
+        let mut c = Canvas::new(&mut buf, 1, 1);
+        let src = [255u8, 255, 255, 128]; // half-alpha white
+        c.blit_rgba_scaled(Rect::new(0, 0, 1, 1), &src, 1, 1, Color::BLACK, 255);
+        // Should be roughly mid-gray (white blended 50% over black), not
+        // pure white and not pure black.
+        let packed = buf[0];
+        let r = (packed >> 16) & 0xff;
+        assert!(r > 0x30 && r < 0xd0, "expected mid-gray blend, got {packed:#x}");
     }
 
     #[test]

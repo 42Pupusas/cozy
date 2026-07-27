@@ -93,6 +93,10 @@ object_ids! {
     LayerShellId,
     /// `zwlr_layer_surface_v1` — an edge-anchored surface (bars, panels).
     LayerSurfaceId,
+    /// `zwlr_screencopy_manager_v1` — the screen-capture factory global.
+    ScreencopyManagerId,
+    /// `zwlr_screencopy_frame_v1` — one single-use capture of an output.
+    ScreencopyFrameId,
 }
 
 /// An event serial — echoed back in acks/pongs. Distinct from an object id so

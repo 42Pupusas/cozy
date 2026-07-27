@@ -1,0 +1,19 @@
+[package]
+name    = "screencopy"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The Wayland wire/id/protocol vocabulary this crate drives. Unlike
+# `crates/wallpaper` (whose core is pure pixel math), screencopy *is* a
+# protocol: its whole job is the `zwlr_screencopy_frame_v1` handshake, so a
+# `platform` dependency is inherent rather than incidental. The pixel-facing
+# pieces (`FrameParams`, `CapturedFrame`) still avoid touching a connection,
+# so they stay unit-testable with no compositor -- see their module docs.
+platform = { path = "../platform" }
+# The SPSC ring the platform reader thread delivers events through; a capture
+# session drains it directly rather than owning its own event loop.
+quetzalcoatl.workspace = true

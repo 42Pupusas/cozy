@@ -343,7 +343,7 @@ mod tests {
         );
         // Poison the target: if the second paint blits, it will overwrite this.
         let sentinel = 0xDEAD_BEEF;
-        target.iter_mut().for_each(|p| *p = sentinel);
+        target.fill(sentinel);
         // Same sequence => zero new columns, and background NOT cleared.
         let damage = cache.paint(
             &mut Canvas::new(&mut target, 5, 4),
@@ -383,7 +383,7 @@ mod tests {
             true,
         );
         let sentinel = 0xDEAD_BEEF;
-        target.iter_mut().for_each(|p| *p = sentinel);
+        target.fill(sentinel);
         // Zero new columns, but background WAS cleared: must re-blit.
         cache.paint(
             &mut Canvas::new(&mut target, 5, 4),

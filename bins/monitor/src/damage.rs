@@ -232,15 +232,16 @@ mod tests {
     fn exceeding_capacity_coarsens_to_a_single_covering_rect() {
         let mut d = DamageList::new();
         // Push one more than capacity, all disjoint 1px cells on a diagonal.
-        for i in 0..=MAX_REGIONS as i32 {
+        let capacity = i32::try_from(MAX_REGIONS).expect("MAX_REGIONS fits in i32");
+        for i in 0..=capacity {
             d.push(Rect::new(i * 10, i * 10, 1, 1));
         }
         // Must have collapsed to a single region that still covers the extremes.
         assert_eq!(d.regions().len(), 1);
-        let last = MAX_REGIONS as i32 * 10;
+        let last = capacity * 10;
         let covering = d.regions()[0];
         assert!(covering.x <= 0 && covering.y <= 0);
-        assert!(covering.right() >= last + 1 && covering.bottom() >= last + 1);
+        assert!(covering.right() > last && covering.bottom() > last);
     }
 
     #[test]
@@ -274,6 +275,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "both cases hit an early `return 0.0`, so the zero is a literal \
+                  passed straight through -- an exact compare is the assertion, \
+                  and a tolerance would hide a near-zero result that shouldn't exist"
+    )]
     fn row_coverage_empty_and_degenerate_height_are_zero() {
         assert_eq!(DamageList::new().row_coverage_fraction(100), 0.0);
         let d = DamageList::single(Rect::new(0, 0, 10, 10));

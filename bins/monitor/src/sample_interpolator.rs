@@ -169,6 +169,12 @@ mod tests {
     use sysmon::MonitorSample;
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the exact 0.0 endpoint IS the property under test: clamp(0.0, 1.0) \
+                  then 1 - (1-0)^3 is exactly representable, so an approximate \
+                  compare would pass on a curve that never truly starts at rest"
+    )]
     fn glide_starts_at_zero_and_moves_immediately() {
         // t=0 must be exactly the source value (progress 0), and a small
         // elapsed must already show visible motion -- the ease-out is
@@ -185,6 +191,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "settling on EXACTLY 1.0 is the entire point (see the doc comment \
+                  on `eased_progress`): anything merely near 1.0 keeps the \
+                  quantized display creeping and pins the redraw gate at 0% skips, \
+                  which a tolerance-based assert would silently accept"
+    )]
     fn glide_settles_exactly_at_window_end_and_holds() {
         // The whole point of the shorter window: progress reaches exactly 1.0
         // at GLIDE_DURATION and never overshoots past it, so the endpoint is
@@ -203,6 +216,11 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "final-step assert checks the same exact-1.0 settle property as \
+                  `glide_settles_exactly_at_window_end_and_holds`"
+    )]
     fn glide_is_monotonic_across_the_window() {
         // Ease-out must never move backwards; a non-monotonic curve would make
         // a hero number briefly reverse direction mid-glide.

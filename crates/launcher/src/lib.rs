@@ -5,7 +5,9 @@
 pub mod app_index;
 pub mod desktop_entry;
 pub mod fuzzy;
+pub mod icon_lookup;
 pub mod launch;
+pub mod singleton;
 
 use app_index::AppIndex;
 use desktop_entry::DesktopEntry;

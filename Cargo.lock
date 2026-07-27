@@ -178,6 +178,7 @@ name = "launcher-bin"
 version = "0.1.0"
 dependencies = [
  "config",
+ "ixiptla-core",
  "launcher",
  "platform",
  "quetzalcoatl",
@@ -298,8 +299,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "screencopy"
+version = "0.1.0"
+dependencies = [
+ "platform",
+ "quetzalcoatl",
+]
+
+[[package]]
 name = "shelby"
 version = "0.1.0"
+
+[[package]]
+name = "shot-bin"
+version = "0.1.0"
+dependencies = [
+ "ixiptla-core",
+ "platform",
+ "quetzalcoatl",
+ "screencopy",
+ "waker",
+]
 
 [[package]]
 name = "statusbar"

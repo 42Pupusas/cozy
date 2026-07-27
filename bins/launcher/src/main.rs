@@ -8,9 +8,14 @@
 //! presentation layer: paint the query + result list, react to keys, spawn
 //! on Enter, exit on Esc or after a successful launch.
 
+mod icon_cache;
 mod launcher_window;
 
+use std::path::PathBuf;
+
+use icon_cache::IconCache;
 use launcher::Catalog;
+use launcher::singleton::{SingletonAcquire, SingletonGuard};
 use launcher_window::{LauncherKey, LauncherWindow};
 use platform::draw::{Canvas, Color, Rect};
 use statusbar::TextRenderer;
@@ -18,6 +23,11 @@ use statusbar::TextRenderer;
 const WINDOW_WIDTH: i32 = 640;
 const WINDOW_HEIGHT: i32 = 400;
 const MAX_VISIBLE_RESULTS: usize = 8;
+/// Icon glyph edge, in pixels -- square, drawn left of each result row's
+/// text with a small gap. Sized to roughly match a result row's text
+/// height rather than any XDG icon-theme size, since it's blitted (scaled)
+/// from whatever size actually got resolved on disk.
+const ICON_SIZE: i32 = 20;
 
 /// The launcher's resolved colors, pulled from `config::Config`'s
 /// `[launcher]` table (mirroring `[colors]`/`[font]` when unset) instead of
@@ -77,16 +87,25 @@ struct LauncherApp {
     window: LauncherWindow,
     text: TextRenderer,
     catalog: Catalog,
+    icons: IconCache,
     theme: Theme,
     query: String,
     selected: usize,
     /// Set once the user picks an app (Enter) or bails (Esc) -- the next
     /// `run` loop iteration exits instead of ticking again.
     done: bool,
+    /// Held for this process's whole lifetime: dropping it (on exit)
+    /// unlinks the singleton socket so the next launch can bind it again.
+    /// Also polled every loop iteration (`singleton_notified`) -- an
+    /// accepted connection means a second launch invocation is asking this
+    /// one to close, since a launcher hotkey is a toggle, not "stack a new
+    /// overlapping window". See `launcher::singleton` for the full
+    /// rationale.
+    singleton: SingletonGuard,
 }
 
 impl LauncherApp {
-    fn new() -> Self {
+    fn new(singleton: SingletonGuard) -> Self {
         let cfg = config::Config::load().unwrap_or_else(|e| {
             eprintln!("launcher: config error: {e} — using defaults");
             config::Config::default()
@@ -117,10 +136,12 @@ impl LauncherApp {
             window,
             text,
             catalog: Catalog::load(),
+            icons: IconCache::new(),
             theme,
             query: String::new(),
             selected: 0,
             done: false,
+            singleton,
         }
     }
 
@@ -129,17 +150,22 @@ impl LauncherApp {
             if self.done {
                 break;
             }
+            if self.singleton_notified() {
+                self.done = true;
+                break;
+            }
             let Self {
                 window,
                 text,
                 catalog,
+                icons,
                 theme,
                 query,
                 selected,
                 ..
             } = &mut self;
             match window.tick(|canvas| {
-                Painter::paint(canvas, text, catalog, theme, query, *selected);
+                Painter::paint(canvas, text, catalog, icons, theme, query, *selected);
             }) {
                 Ok(true) => {}
                 Ok(false) => break,
@@ -164,6 +190,15 @@ impl LauncherApp {
             // imperceptible instead of a visible stall.
             self.window.wait(100);
         }
+    }
+
+    /// Whether a second launch invocation has connected to our singleton
+    /// socket, asking us to close (see [`Self::singleton`]'s doc). The
+    /// listener is nonblocking (set once, at construction time in `main`),
+    /// so this is a cheap poll -- safe to call every loop iteration
+    /// alongside the Wayland tick.
+    fn singleton_notified(&self) -> bool {
+        self.singleton.listener().accept().is_ok()
     }
 
     fn handle_keys(&mut self) {
@@ -236,6 +271,7 @@ impl Painter {
         canvas: &mut Canvas,
         text: &mut TextRenderer,
         catalog: &Catalog,
+        icons: &mut IconCache,
         theme: &Theme,
         query: &str,
         selected: usize,
@@ -258,12 +294,23 @@ impl Painter {
             text.draw_text_alpha(canvas, query, pad, query_y, fg, bg, bg_alpha);
         }
 
-        let line_h = text.line_height() + 10;
+        let text_h = text.line_height();
+        let line_h = text_h + 10;
         let list_top = query_y + line_h + 10;
 
         let results = catalog.search(query);
         for (i, ranked) in results.iter().take(MAX_VISIBLE_RESULTS).enumerate() {
-            let row_y = list_top + i32::try_from(i).unwrap_or(0) * line_h;
+            let row_top = list_top + i32::try_from(i).unwrap_or(0) * line_h;
+            // Both the icon and the text glyphs are drawn from a cell-top
+            // origin, but the icon's cell height (`ICON_SIZE`) and the
+            // font's own `line_height()` are unrelated numbers -- aligning
+            // both to the same `row_top` therefore lines up their *tops*,
+            // not their visual centers, which is what actually reads as
+            // "aligned" in a row of mixed icon+text. Center each one
+            // independently within the row's full height (`line_h`,
+            // already the font's line height plus row padding) instead.
+            let icon_y = row_top + (line_h - ICON_SIZE) / 2;
+            let row_y = row_top + (line_h - text_h) / 2;
             if i == selected {
                 // `fill_rect_alpha`, not `fill_rect`: the launcher window is
                 // translucent by default (`launcher_opacity`), so its
@@ -273,13 +320,33 @@ impl Painter {
                 // selection highlight invisible instead of just slightly
                 // translucent (see fill_rect's own doc for why).
                 canvas.fill_rect_alpha(
-                    Rect::new(0, row_y - 4, canvas.width(), line_h),
+                    Rect::new(0, row_top, canvas.width(), line_h),
                     highlight_bg,
                     bg_alpha,
                 );
             }
             let color = if i == selected { fg } else { dim };
-            text.draw_text_alpha(canvas, &ranked.entry.name, pad, row_y, color, bg, bg_alpha);
+
+            // Icon, if this entry has one and it actually resolved+decoded
+            // -- entries without a usable icon just start their label at
+            // `pad` as before (`text_x` degenerates to `pad`), so a mix of
+            // icon/no-icon apps in one result list doesn't look broken.
+            let text_x = if let Some(icon_name) = &ranked.entry.icon
+                && let Some(icon) = icons.get(icon_name)
+            {
+                canvas.blit_rgba_scaled(
+                    Rect::new(pad, icon_y, ICON_SIZE, ICON_SIZE),
+                    &icon.rgba,
+                    icon.width,
+                    icon.height,
+                    bg,
+                    bg_alpha,
+                );
+                pad + ICON_SIZE + 8
+            } else {
+                pad
+            };
+            text.draw_text_alpha(canvas, &ranked.entry.name, text_x, row_y, color, bg, bg_alpha);
         }
 
         if results.is_empty() && !query.is_empty() {
@@ -296,6 +363,45 @@ impl Painter {
     }
 }
 
+/// The singleton socket's path -- `XDG_RUNTIME_DIR` (the same
+/// per-user, per-session runtime dir Wayland/D-Bus sockets live in;
+/// tmpfs-backed and cleared on logout, so a leftover socket from a
+/// previous session can never outlive its own login) falling back to
+/// `/tmp` if unset, matching how `platform::conn` resolves the Wayland
+/// socket itself.
+fn singleton_socket_path() -> PathBuf {
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    dir.join("launcher.sock")
+}
+
 fn main() {
-    LauncherApp::new().run();
+    let path = singleton_socket_path();
+    let guard = match SingletonGuard::acquire(&path) {
+        Ok(SingletonAcquire::Primary(guard)) => guard,
+        Ok(SingletonAcquire::AlreadyRunning) => {
+            // A running instance was notified to close (toggle behavior) --
+            // this invocation's job is done.
+            return;
+        }
+        Err(e) => {
+            eprintln!(
+                "launcher: failed to acquire singleton lock at {}: {e} — continuing without single-instance protection",
+                path.display()
+            );
+            // Degrade gracefully rather than refuse to launch at all: fall
+            // through with a throwaway listener bound wherever the OS picks,
+            // so `LauncherApp` still has a `SingletonGuard` to hold
+            // (`UnixListener::bind("")` isn't valid, so this uses a
+            // process-unique fallback path under /tmp instead).
+            let fallback = std::env::temp_dir().join(format!("launcher-{}.sock", std::process::id()));
+            match SingletonGuard::acquire(&fallback) {
+                Ok(SingletonAcquire::Primary(guard)) => guard,
+                _ => return,
+            }
+        }
+    };
+    if let Err(e) = guard.listener().set_nonblocking(true) {
+        eprintln!("launcher: failed to set singleton socket nonblocking: {e}");
+    }
+    LauncherApp::new(guard).run();
 }

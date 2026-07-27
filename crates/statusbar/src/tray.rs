@@ -87,6 +87,18 @@ impl TrayWatcher {
             eprintln!("statusbar: could not subscribe to tray item updates: {e}");
             return;
         }
+        // The StatusNotifierItem specification names `NewIcon`/`NewStatus`
+        // signals, but Electron clients in practice also use the generic
+        // `PropertiesChanged` path when their icon is initialized after the
+        // registration call returns. The initial property read then sees an
+        // empty pixmap and the item remains permanently invisible if this
+        // signal is ignored. Subscribe to both conventions so a late icon or
+        // attention transition always triggers a fresh, complete item read.
+        if let Err(e) = conn.add_match("type='signal',interface='org.freedesktop.DBus.Properties'")
+        {
+            eprintln!("statusbar: could not subscribe to tray property updates: {e}");
+            return;
+        }
         // Clients like Mattermost/Electron sometimes reconnect to the bus
         // (a fresh unique name) and re-register rather than reusing their
         // original connection. Without watching for the old connection's
@@ -243,19 +255,19 @@ impl TrayWatcher {
         true
     }
 
-    /// `NewIcon` and `NewStatus` carry insufficient state to paint directly,
-    /// so refresh the registered item's properties on each signal.
+    /// `NewIcon`/`NewStatus` and generic `PropertiesChanged` signals carry
+    /// insufficient pixels to paint directly, so refresh the registered
+    /// item's complete properties on either signal convention.
     fn refresh_changed_item(
         conn: &mut DbusConn,
         message: &dbus::message::Reply,
         items: &mut [TrayItem],
     ) -> bool {
-        let is_change = matches!(message.member.as_deref(), Some("NewIcon" | "NewStatus"));
         let (Some(sender), Some(path)) = (message.sender.as_deref(), message.path.as_deref())
         else {
             return false;
         };
-        if message.interface.as_deref() != Some(ITEM_IFACE) || !is_change {
+        if !Self::is_item_update_signal(message) {
             return false;
         }
         let id = format!("{sender}{path}");
@@ -268,6 +280,31 @@ impl TrayWatcher {
         };
         items[index] = replacement;
         true
+    }
+
+    /// Whether `message` announces a changed `StatusNotifier` item. Supports
+    /// both the protocol's dedicated item signals and D-Bus's generic
+    /// property-change signal, which Electron applications commonly use for
+    /// their asynchronously-created tray artwork.
+    fn is_item_update_signal(message: &dbus::message::Reply) -> bool {
+        if message.kind != dbus::message::MessageType::Signal {
+            return false;
+        }
+        match message.interface.as_deref() {
+            Some(ITEM_IFACE) => matches!(
+                message.member.as_deref(),
+                Some("NewIcon" | "NewAttentionIcon" | "NewStatus")
+            ),
+            Some(PROPERTIES_IFACE) if message.member.as_deref() == Some("PropertiesChanged") => {
+                message
+                    .values()
+                    .first()
+                    .and_then(Value::as_display_string)
+                    .as_deref()
+                    == Some(ITEM_IFACE)
+            }
+            _ => false,
+        }
     }
 
     fn read_item(conn: &mut DbusConn, sender: &str, service: &str, path: &str) -> Option<TrayItem> {
@@ -357,5 +394,39 @@ mod tests {
         // is covered by this direct contract test through an equivalent value
         // once real registration frames are exercised in integration testing.
         assert!(TrayWatcher::is_item_registration(&message));
+    }
+
+    #[test]
+    fn dedicated_item_icon_signal_refreshes_a_registered_item() {
+        let message = dbus::message::Reply {
+            kind: dbus::message::MessageType::Signal,
+            sender: Some(":1.9".into()),
+            path: Some(ITEM_PATH.into()),
+            interface: Some(ITEM_IFACE.into()),
+            member: Some("NewIcon".into()),
+            serial: 1,
+            error_name: None,
+            reply_serial: None,
+            signature: String::new(),
+            body: Vec::new(),
+        };
+        assert!(TrayWatcher::is_item_update_signal(&message));
+    }
+
+    #[test]
+    fn non_signal_item_messages_do_not_trigger_refreshes() {
+        let message = dbus::message::Reply {
+            kind: dbus::message::MessageType::MethodCall,
+            sender: Some(":1.9".into()),
+            path: Some(ITEM_PATH.into()),
+            interface: Some(ITEM_IFACE.into()),
+            member: Some("NewIcon".into()),
+            serial: 1,
+            error_name: None,
+            reply_serial: None,
+            signature: String::new(),
+            body: Vec::new(),
+        };
+        assert!(!TrayWatcher::is_item_update_signal(&message));
     }
 }

@@ -316,11 +316,15 @@ impl WaylandConn {
         recv_hdr.msg_namelen = RECV_NAMELEN;
         recv_hdr.msg_controllen = recv_controllen as usize;
 
-        // Key-repeat clock. Owned by the main thread (which arms/disarms it as keys
-        // go down/up); the reader only polls its fd, so it gets the raw integer —
-        // exactly how the socket fd is shared across the two threads.
+        // Key-repeat clock. The main thread arms/disarms it as keys go down/up;
+        // the reader polls it. Unlike the socket (whose `OwnedFd` lives in the
+        // `Sender`, i.e. as long as the connection), the `RepeatTimer` is handed
+        // back to the caller — and keyboard-less callers drop it immediately. So
+        // the reader gets its own dup rather than a borrowed raw integer,
+        // otherwise that drop closes the fd it's parked on and the number gets
+        // recycled under it. See `RepeatTimer::dup_fd`.
         let timer = RepeatTimer::new()?;
-        let timer_fd = RawFd::from_raw(timer.fd().as_raw_fd() as usize);
+        let timer_fd = timer.dup_fd()?;
 
         // The reader arms its own multishot recv as the first thing it does on its
         // own thread — crucial, because `single_issuer`/`defer_taskrun` bind a ring
@@ -522,10 +526,20 @@ impl Sender {
 /// thread via [`run`](Reader::run).
 pub struct Reader {
     sock: RawFd,
-    /// The key-repeat timerfd, polled on the rx ring. Owned (as a `RepeatTimer`)
-    /// by the main thread; here it's a raw integer we only poll and drain — the
-    /// same shared-fd arrangement as `sock`.
-    timer_fd: RawFd,
+    /// The key-repeat timerfd, polled on the rx ring.
+    ///
+    /// Owned here as a *dup* of the main thread's `RepeatTimer` fd, not a bare
+    /// integer borrowed from it. The reader polls this fd for the whole life of
+    /// the connection, but callers with no keyboard (statusbar, wallpaper,
+    /// shot, clipboard) drop their `RepeatTimer` as soon as their constructor
+    /// returns — which used to close the fd out from under this thread and let
+    /// its number be recycled by the next `open`, turning the poll into a
+    /// permanently-ready busy-loop (or an `EBADF` that killed the reader).
+    /// Owning a dup makes that impossible; see [`RepeatTimer::dup_fd`].
+    ///
+    /// Both halves still share one open file description, so `arm`/`disarm` on
+    /// the main thread drives this poll exactly as before.
+    timer_fd: OwnedFd,
     ring: IoUring,
     pool: ProvidedBufferRing,
     recv_hdr: Box<MsgHdr>,
@@ -534,12 +548,13 @@ pub struct Reader {
     pending_fds: Vec<OwnedFd>,
 }
 
-// SAFETY: the Reader owns its ring, pool, header, and buffers outright; nothing
-// is shared. The raw `sock`/`timer_fd` fds are integers both halves submit
-// against, which is sound — io_uring rings are independent of the fds they
-// operate on, recv (this thread) and send (the main thread) are separate socket
-// directions, and the timerfd is only ever armed (main) vs. polled/drained (this
-// thread), never raced.
+// SAFETY: the Reader owns its ring, pool, header, buffers, and timerfd outright;
+// nothing is shared. The raw `sock` fd is an integer both halves submit against,
+// which is sound — io_uring rings are independent of the fds they operate on,
+// and recv (this thread) and send (the main thread) are separate socket
+// directions. `timer_fd` is this thread's own dup of the key-repeat timer; the
+// main thread arms/disarms the shared open file description while this thread
+// only polls/drains it, never raced.
 //
 // clippy's `non_send_fields_in_send_ty` flags `ring: IoUring` and
 // `recv_hdr: Box<MsgHdr>` as not independently provably `Send` -- true, but
@@ -716,7 +731,8 @@ impl Reader {
     /// timerfd. `poll_add` fires once per readiness, so we re-arm after each
     /// expiry — the same arm/reap/re-arm shape as the recv, but one-shot.
     fn arm_timer_poll(&mut self) -> Result<(), ConnError> {
-        let sqe = Sqe::poll_add(self.timer_fd, PollMask::IN).user_data(UD_TIMER);
+        let timer_fd = RawFd::from_raw(self.timer_fd.as_raw_fd() as usize);
+        let sqe = Sqe::poll_add(timer_fd, PollMask::IN).user_data(UD_TIMER);
         self.ring.push(sqe).map_err(ConnError::Submit)
     }
 
@@ -734,7 +750,7 @@ impl Reader {
         if result < 0 {
             return Err(ConnError::Io(io::Error::from_raw_os_error(-result)));
         }
-        RepeatTimer::drain_fd(self.timer_fd.as_i32());
+        RepeatTimer::drain_fd(self.timer_fd.as_raw_fd());
         // Best-effort: if the consumer dropped, the main loop is ending anyway.
         let _ = producer.push_block(RawEvent::Repeat);
         self.arm_timer_poll()

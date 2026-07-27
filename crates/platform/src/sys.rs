@@ -629,6 +629,28 @@ impl RepeatTimer {
         self.fd.as_fd()
     }
 
+    /// Duplicate the timerfd for the reader thread to *own*.
+    ///
+    /// The reader parks on this fd for the whole life of the connection, but
+    /// the `RepeatTimer` itself belongs to the main thread — and several
+    /// callers (statusbar, wallpaper, shot, clipboard) have no keyboard and
+    /// bind it to a throwaway `_repeat_timer`, dropping it the moment their
+    /// constructor returns. Handing the reader a bare `RawFd` therefore left
+    /// it polling a *closed* descriptor whose number the allocator was free to
+    /// hand to the next `open`/`memfd_create`/`socketpair`. When that number
+    /// got reused by a regular file, `poll` reported it permanently readable
+    /// and the reader spun a core re-arming forever; when it stayed closed the
+    /// poll failed `EBADF` and killed the reader thread instead.
+    ///
+    /// A `dup` makes the reader's handle independent: the two halves share one
+    /// open file description (so main-thread `arm`/`disarm` still drives the
+    /// reader's poll exactly as before) while neither can invalidate the
+    /// other's fd. `try_clone` uses `F_DUPFD_CLOEXEC`, preserving the
+    /// close-on-exec hygiene `new` established.
+    pub fn dup_fd(&self) -> Result<OwnedFd, SysError> {
+        self.fd.try_clone().map_err(SysError::TimerfdCreate)
+    }
+
     /// Drain a timerfd's pending expiration count, clearing its
     /// level-triggered readiness so a re-armed poll won't immediately
     /// re-fire. The count itself is discarded -- one readiness edge should
@@ -662,6 +684,23 @@ mod tests {
         io::Error::other(msg.to_string())
     }
 
+    /// `struct pollfd` / `POLLIN`, declared here rather than in the module
+    /// proper because only the timerfd readiness tests need them -- production
+    /// code watches this fd through the reader's `io_uring` ring, not `poll(2)`.
+    #[repr(C)]
+    struct PollFd {
+        fd: RawFd,
+        events: i16,
+        revents: i16,
+    }
+
+    const POLLIN: i16 = 0x001;
+
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+        fn fcntl(fd: RawFd, cmd: i32, arg: i32) -> i32;
+    }
+
     #[test]
     fn sys_error_display_messages() {
         assert_eq!(
@@ -693,6 +732,121 @@ mod tests {
         let e = SysError::Socket(io_err("boom"));
         assert!(e.source().is_some());
         assert_eq!(e.source().unwrap().to_string(), "boom");
+    }
+
+    /// Read a timerfd's expiration count. Only safe to call when the fd is
+    /// known readable -- `RepeatTimer::new` makes a *blocking* timerfd, so
+    /// reading an unexpired one would hang the test.
+    fn read_expiry_count(fd: &OwnedFd) -> u64 {
+        let mut buf = [0u8; 8];
+        // SAFETY: reading 8 bytes into an 8-byte buffer from a valid timerfd
+        // that the caller has established is readable.
+        let n = unsafe { read(fd.as_raw_fd(), buf.as_mut_ptr().cast::<c_void>(), buf.len()) };
+        assert_eq!(n, 8, "expected a u64 expiration count");
+        u64::from_ne_bytes(buf)
+    }
+
+    /// The regression guard for the runaway-CPU bug: the reader thread's
+    /// timerfd must stay valid after the main thread drops its `RepeatTimer`.
+    ///
+    /// Keyboard-less callers (statusbar, wallpaper, shot, clipboard) drop the
+    /// timer as soon as their constructor returns. When the reader held only a
+    /// borrowed raw fd, that drop closed the descriptor it was parked on and
+    /// freed the *number* for the next `open`/`memfd_create` to claim --
+    /// whereupon `poll` reported the recycled file permanently readable and the
+    /// reader spun a core re-arming forever. Owning a dup makes the reader's
+    /// handle independent of the owner's lifetime.
+    #[test]
+    fn dup_fd_stays_valid_after_the_original_timer_is_dropped() {
+        let timer = RepeatTimer::new().expect("timerfd_create");
+        let readers_fd = timer.dup_fd().expect("dup");
+        drop(timer);
+        // `try_clone` is a pure fd-validity probe: it fails `EBADF` on a closed
+        // descriptor and succeeds on a live one, without reading (which would
+        // block on an unarmed blocking timerfd).
+        assert!(
+            readers_fd.try_clone().is_ok(),
+            "reader's timerfd was invalidated by the owner's drop"
+        );
+    }
+
+    /// Falsifiability check for the two tests around it: demonstrate that the
+    /// *old* arrangement -- reader keeps the bare `RawFd` integer, owner keeps
+    /// the `OwnedFd` -- really does go stale when the owner drops. Without this
+    /// the guards above could pass vacuously.
+    ///
+    /// After the drop the number is not merely invalid but *reusable*: the
+    /// `open` below reclaims the very same integer the reader would still be
+    /// polling, which is precisely how a dead key-repeat timer turned into a
+    /// permanently-readable regular file and pegged a core.
+    #[test]
+    fn a_borrowed_raw_timer_fd_goes_stale_and_its_number_gets_recycled() {
+        let timer = RepeatTimer::new().expect("timerfd_create");
+        // What the reader used to store: just the integer.
+        let stale = timer.fd().as_raw_fd();
+        drop(timer);
+
+        // The descriptor is gone: dup'ing it fails EBADF.
+        // SAFETY: probing an integer we expect to be closed; `F_DUPFD_CLOEXEC`
+        // (0x406) returns -1/EBADF rather than touching any live file.
+        let rc = unsafe { fcntl(stale, 0x0406, 0) };
+        assert_eq!(rc, -1, "expected the dropped timerfd to be closed");
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(9), // EBADF
+            "expected EBADF from the stale fd"
+        );
+
+        // And the number is free for the next open to claim -- Linux hands out
+        // the lowest available fd, so this reclaims exactly `stale`.
+        let recycled = std::fs::File::open("/dev/null").expect("open");
+        assert_eq!(
+            recycled.as_raw_fd(),
+            stale,
+            "the freed fd number was handed to an unrelated file"
+        );
+    }
+
+    /// The dup must share one *open file description* with the original, not
+    /// merely be some unrelated live fd: main-thread `arm`/`disarm` has to keep
+    /// driving the reader's poll. Arming before the drop and observing the
+    /// expiry through the dup afterwards proves both halves at once.
+    #[test]
+    fn dup_fd_shares_the_open_file_description_and_outlives_the_owner() {
+        let timer = RepeatTimer::new().expect("timerfd_create");
+        let readers_fd = timer.dup_fd().expect("dup");
+        // One-shot: fire once after 20ms, no repeat interval.
+        timer.arm(20, 0).expect("arm");
+        drop(timer);
+        // Comfortably past the expiry, so the read below cannot block.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert_eq!(
+            read_expiry_count(&readers_fd),
+            1,
+            "arming via the owner must be visible through the reader's dup"
+        );
+    }
+
+    /// A disarmed timer must stay quiet on the reader's dup. This is the other
+    /// half of the contract for keyboard-less callers: they never arm the
+    /// timer, so the reader's poll should simply never become ready -- rather
+    /// than firing spuriously and waking the UI loop for nothing.
+    #[test]
+    fn dup_fd_of_an_unarmed_timer_never_becomes_readable() {
+        let timer = RepeatTimer::new().expect("timerfd_create");
+        let readers_fd = timer.dup_fd().expect("dup");
+        drop(timer);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // `poll` with a zero timeout is a non-blocking readiness probe.
+        let mut pfd = [PollFd {
+            fd: readers_fd.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: one initialised pollfd, count matches, zero timeout.
+        let n = unsafe { poll(pfd.as_mut_ptr(), 1, 0) };
+        assert_eq!(n, 0, "an unarmed timerfd must not report readiness");
+        assert_eq!(pfd[0].revents, 0);
     }
 
     #[test]

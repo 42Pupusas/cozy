@@ -14,6 +14,7 @@
 //! - [`ListViewport`] -- scroll offsets, visible ranges, hit-testing.
 //! - [`ListSelection`] -- cursor, anchor, and range selection rules.
 //! - [`Scrollbar`] -- thumb geometry and drag, driven by a `ListViewport`.
+//! - [`TextInput`] -- a single-line editable field with a caret.
 //!
 //! The geometry types have no Wayland or rendering dependencies at all, which
 //! is what lets the fiddly cases (empty lists, a resize that strands the
@@ -22,8 +23,10 @@
 
 mod scrollbar;
 mod selection;
+mod text_input;
 mod viewport;
 
 pub use scrollbar::{Scrollbar, Thumb};
 pub use selection::ListSelection;
+pub use text_input::TextInput;
 pub use viewport::ListViewport;

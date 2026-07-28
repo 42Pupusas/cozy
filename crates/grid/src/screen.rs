@@ -47,6 +47,28 @@ pub struct Screen {
     /// `get_viewport_cell`/`row_is_blank`, and `resize` materializes
     /// everything up front rather than sprinkling checks through reflow.
     blank_rows: Vec<bool>,
+    /// Per physical row: how many leading cells genuinely belong to the
+    /// logical line. `cols` (the default) means "the whole row is content --
+    /// join it seamlessly".
+    ///
+    /// This exists solely to disambiguate the trailing blanks of a
+    /// soft-wrapped row during [`Self::resize`]'s stitch. A row that our
+    /// word-aware reflow produced may be RAGGED: broken before the margin and
+    /// padded out to full width. That padding must be dropped when restitching
+    /// (or it accumulates and grows the line), but it is byte-identical to
+    /// blanks the user actually printed -- a right-aligned prompt's alignment
+    /// run is nothing but blanks. Guessing from the row's contents cannot tell
+    /// the two apart, and the guess used to collapse an 80-space alignment run
+    /// down to a single space, sliding right-aligned text (e.g. fish's RPROMPT
+    /// timestamp) permanently leftward on every horizontal resize.
+    ///
+    /// So reflow records the exact piece length here instead of leaving it to
+    /// be re-derived. Rows the terminal itself autowrapped always fill the
+    /// margin, hence the `cols` default.
+    ///
+    /// INVARIANT: parallel to `wrapped`; every path that moves or blanks rows
+    /// must carry this alongside. Only read for rows with `wrapped` set.
+    row_len: Vec<u16>,
     cols: u16,
     rows: u16,
     /// Maximum scrollback lines (0 for alternate screen).
@@ -121,6 +143,8 @@ impl Screen {
             // blank -- the bits track "buf content is stale garbage", which
             // is false everywhere at construction.
             blank_rows: vec![false; total],
+            // No reflow has happened yet: every row is "all content".
+            row_len: vec![cols.max(1); total],
             cols,
             rows,
             scrollback_max,
@@ -307,6 +331,12 @@ impl Screen {
         for w in &mut self.wrapped[from..to] {
             *w = false;
         }
+        // A blank row carries no reflow-trimmed tail; reset to "all content"
+        // so a later wrap of this row joins seamlessly (see `row_len`).
+        let full = self.cols.max(1);
+        for l in &mut self.row_len[from..to] {
+            *l = full;
+        }
     }
 
     /// Mark `count` window rows starting at absolute row `abs` lazily blank,
@@ -325,6 +355,7 @@ impl Screen {
             // the ring mapping already gives us the exact physical row.
             self.blank_rows[start] = true;
             self.wrapped[start] = false;
+            self.row_len[start] = self.cols.max(1);
             return;
         }
         let first = count.min(total - start);
@@ -351,6 +382,8 @@ impl Screen {
         // Blank bits travel with their rows: the bit is what makes a
         // lazily-blank row's stale cells read as blank.
         self.blank_rows[dst] = self.blank_rows[src];
+        // Ditto the reflow content length -- it describes this row's tail.
+        self.row_len[dst] = self.row_len[src];
     }
 
     /// Write a contiguous run of narrow printable cells on one visible row.
@@ -409,6 +442,9 @@ impl Screen {
     /// Mark (or clear) the soft-wrap continuation flag for a visible row.
     pub fn set_wrapped(&mut self, row: u16, wrapped: bool) {
         let idx = self.phys_row(self.scrollback_len + usize::from(row));
+        // A row the *terminal* wraps has run into the right margin, so all of
+        // it is content. (Reflow sets its own, shorter lengths directly.)
+        self.row_len[idx] = self.cols.max(1);
         self.wrapped[idx] = wrapped;
         if wrapped {
             self.all_blank = false;
@@ -746,27 +782,27 @@ impl Screen {
                 if cont {
                     // A soft-wrapped (continuation) row that our own word-aware
                     // reflow produced may be RAGGED -- broken before the margin
-                    // and padded with blanks -- unlike a terminal-autowrapped
-                    // row, which always fills to the last column. Concatenating
-                    // that padding would reappear as phantom spaces in the
-                    // logical line; and since a word-break's separator space is
-                    // byte-identical to a padding blank (`Cell::default()`),
-                    // every narrow<->wide reflow cycle would inject an extra
-                    // space, growing lines until bottom-anchored repack pushed
-                    // visible content off into scrollback (the "resize deletes
-                    // lines" bug). So trim this row's trailing blanks: if that
-                    // leaves it short of full width the break was a WORD break,
-                    // so restore exactly one separator space; a still-full row
-                    // was a hard break (an over-long word) and joins seamlessly.
+                    // and padded out to full width -- unlike a
+                    // terminal-autowrapped row, which always runs into the last
+                    // column. That padding must not be concatenated: it would
+                    // reappear as phantom spaces, and since a word-break's
+                    // separator space is byte-identical to a padding blank
+                    // (`Cell::default()`), every narrow<->wide cycle would
+                    // inject an extra space, growing lines until the
+                    // bottom-anchored repack pushed visible content off into
+                    // scrollback (the "resize deletes lines" bug).
+                    //
+                    // We take the true content length from `row_len`, recorded
+                    // by the reflow that built this row, rather than re-deriving
+                    // it by trimming trailing blanks. Trimming cannot tell
+                    // reflow padding from blanks the user actually printed, so
+                    // it collapsed a right-aligned prompt's alignment run to a
+                    // single space and slid the text left on every resize.
+                    // `row_len` is exactly `old_cols` for any row we did not
+                    // shorten, so those still join seamlessly.
                     let row = self.buf.cells(base..base + old_cols);
-                    let mut end = row.len();
-                    while end > 0 && row[end - 1] == Cell::default() {
-                        end -= 1;
-                    }
+                    let end = usize::from(self.row_len[phys]).min(old_cols);
                     cells.extend_from_slice(&row[..end]);
-                    if end < old_cols {
-                        cells.push(Cell::default());
-                    }
                 } else {
                     cells.extend(self.buf.cells(base..base + old_cols));
                 }
@@ -792,7 +828,10 @@ impl Screen {
         lines.truncate(last_keep + 1);
 
         // 3. Re-break each logical line at the new width.
-        let mut rows_out: Vec<(Vec<Cell>, bool)> = Vec::new();
+        // Each entry: the row's cells, whether it continues onto the next row,
+        // and how many leading cells are real content (the rest is the padding
+        // this reflow added to reach full width) -- see `row_len`.
+        let mut rows_out: Vec<(Vec<Cell>, bool, u16)> = Vec::new();
         let mut new_cursor_idx = 0usize;
         let mut new_cursor_col = 0usize;
         for (li, line) in lines.iter().enumerate() {
@@ -837,7 +876,12 @@ impl Screen {
                 {
                     *first = Cell::default();
                 }
-                rows_out.push((row_cells, p + 1 < piece_count));
+                // `end - start` is the piece's true extent. A word break keeps
+                // its separator space inside the piece (the wrapper breaks
+                // *after* the whitespace), so recording the length preserves
+                // that one space without re-synthesizing it.
+                let content_len = u16::try_from(end - start).unwrap_or(u16::MAX);
+                rows_out.push((row_cells, p + 1 < piece_count, content_len));
             }
             if li == cursor_line {
                 // Find the piece whose cell range contains the cursor offset.
@@ -870,7 +914,7 @@ impl Screen {
                         // offset sits past the content end (`last_end`), matching
                         // the old fixed-stride `cursor_offset mod new_cols_u`
                         // when the line length was a multiple of the width.
-                        rows_out.push((vec![Cell::default(); new_cols_u], false));
+                        rows_out.push((vec![Cell::default(); new_cols_u], false, 0));
                         new_cursor_idx = rows_out.len() - 1;
                         new_cursor_col = (cursor_offset - last_end).min(new_cols_u - 1);
                     }
@@ -889,28 +933,33 @@ impl Screen {
         let total = Self::cap_rows(new_rows_u, self.scrollback_max);
         let mut new_buf = CellStore::new(total * new_cols_u);
         let mut new_wrapped = vec![false; total];
+        // Rows we never write below are untouched blanks: "all content".
+        let mut new_row_len = vec![new_cols; total];
         // Freshly zeroed buffer: nothing is lazily blank (see `new`).
         let new_blank_rows = vec![false; total];
 
         for i in 0..new_sb_len {
-            let (cells, w) = &rows_out[dropped + i];
+            let (cells, w, len) = &rows_out[dropped + i];
             let dst = i * new_cols_u;
             for (offset, cell) in cells.iter().copied().enumerate() {
                 new_buf.set_cell(dst + offset, cell);
             }
             new_wrapped[i] = *w;
+            new_row_len[i] = *len;
         }
         for i in 0..visible_count {
-            let (cells, w) = &rows_out[overflow + i];
+            let (cells, w, len) = &rows_out[overflow + i];
             let dst = (new_sb_len + i) * new_cols_u;
             for (offset, cell) in cells.iter().copied().enumerate() {
                 new_buf.set_cell(dst + offset, cell);
             }
             new_wrapped[new_sb_len + i] = *w;
+            new_row_len[new_sb_len + i] = *len;
         }
 
         self.buf = new_buf;
         self.wrapped = new_wrapped;
+        self.row_len = new_row_len;
         self.blank_rows = new_blank_rows;
         // The rebuilt buffer packs the window at the front: re-anchor head.
         self.head = 0;

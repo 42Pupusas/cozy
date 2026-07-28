@@ -2468,11 +2468,7 @@ mod tests {
         for w in [72u16, 64, 56, 48, 40, 32, 24] {
             g.resize(w, 24);
             let s = g.screen();
-            assert_eq!(
-                s.cols(),
-                w,
-                "screen width must track the resize at w={w}"
-            );
+            assert_eq!(s.cols(), w, "screen width must track the resize at w={w}");
             // Nothing may survive past the last legal column.
             for r in 0..s.rows() {
                 for c in 0..s.cols() {
@@ -2487,11 +2483,84 @@ mod tests {
                 .filter(|&(c, r)| s.get_cell(c, r).ch.is_ascii_digit())
                 .count();
             assert_eq!(
-                digits,
-                6,
+                digits, 6,
                 "at width {w} the timestamp lost digits -- clipped off the edge"
             );
         }
+    }
+
+    #[test]
+    fn a_run_of_interior_padding_survives_a_narrow_then_wide_drag() {
+        // User-reported: fish RPROMPT timestamps COLLAPSE leftward after a
+        // horizontal resize -- "~ > 09:49:39" jammed against the prompt
+        // instead of right-aligned. Not clipping (the earlier misdiagnosis):
+        // the run of interior padding that positions the timestamp is being
+        // squashed.
+        //
+        // Mechanism: shrinking word-wraps the line inside its padding run, so
+        // the padding becomes TRAILING blanks on a continuation row. The
+        // stitch step in `Screen::resize` trims a ragged continuation row's
+        // trailing blanks and restores exactly ONE separator space -- correct
+        // for a word break, but it cannot tell a one-space word separator from
+        // an 80-space alignment run, because both are `Cell::default()`. So a
+        // whole padding run collapses to a single space, permanently. That
+        // matches every reported symptom: horizontal-only, worse the smaller
+        // the window (more breaks inside the run), and unaffected by Enter
+        // (the damage is already in the scrollback, not in what fish prints).
+        let row_text = |g: &Grid, r: u16| -> String {
+            let s = g.screen();
+            (0..s.cols()).map(|c| s.get_cell(c, r).ch).collect()
+        };
+        let mut g = Grid::new(100, 24);
+        let stamp = "10:02:38";
+        let left = "~ > ";
+        let pad = 100 - left.len() - stamp.len();
+        apply_str(
+            &mut g,
+            format!("{left}{}{stamp}", " ".repeat(pad)).as_bytes(),
+        );
+        let before = row_text(&g, 0);
+
+        // Shrink (wrapping inside the padding run) and come back.
+        for w in [60u16, 100] {
+            g.resize(w, 24);
+        }
+
+        let after = row_text(&g, 0);
+        assert_eq!(
+            after.trim_end(),
+            before.trim_end(),
+            "padding run collapsed: the right-aligned timestamp moved left"
+        );
+
+        // A real drag is many steps, and the collapse used to compound: each
+        // narrow<->wide cycle ate more of the run. Walk down and back up.
+        for w in [90u16, 80, 70, 60, 50, 40, 50, 60, 70, 80, 90, 100] {
+            g.resize(w, 24);
+        }
+        assert_eq!(
+            row_text(&g, 0).trim_end(),
+            before.trim_end(),
+            "padding eroded across a multi-step drag"
+        );
+
+        // NOTE: at an intermediate width the stamp is deliberately NOT pinned
+        // to the right margin. A 100-column logical line reflowed to 60 wraps
+        // onto a second row, so the stamp sits at column 40 of that row -- the
+        // padding is preserved, it just no longer reaches a margin that moved.
+        // Every terminal that reflows behaves this way; only the shell can
+        // re-right-align, on its next prompt. What matters is that the run is
+        // not DESTROYED, which the round-trips above prove.
+        g.resize(60, 24);
+        let s = g.screen();
+        let stamp_cells: usize = (0..s.rows())
+            .flat_map(|r| (0..s.cols()).map(move |c| (c, r)))
+            .filter(|&(c, r)| s.get_cell(c, r).ch.is_ascii_digit())
+            .count();
+        assert_eq!(
+            stamp_cells, 6,
+            "the stamp's digits must all survive at 60 cols"
+        );
     }
 
     #[test]

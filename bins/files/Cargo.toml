@@ -17,6 +17,10 @@ fsmodel  = { path = "../../crates/fsmodel" }
 widget   = { path = "../../crates/widget" }
 # The window: xdg-shell toplevel, input, and a software canvas.
 platform = { path = "../../crates/platform" }
+# `TextRenderer`: scalable font loading with bitmap fallback, shared with the
+# bar/launcher/monitor rather than reimplemented, so the browser's type scale
+# behaves identically to theirs.
+statusbar = { path = "../../crates/statusbar" }
 # The `[files]` table, and the terminal palette its unset keys mirror.
 config   = { path = "../../crates/config" }
 waker    = { path = "../../crates/waker" }

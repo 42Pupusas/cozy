@@ -35,6 +35,7 @@ use crate::protocol::{
     ToplevelRequest, WmBaseEvent, WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
 };
 use crate::render;
+use crate::toplevel::lifecycle::Lifecycle;
 use crate::wire::MessageBuilder;
 
 const EVENT_RING_CAP: usize = 1024;
@@ -140,13 +141,6 @@ pub enum MouseEventKind {
     Press,
     Release,
     Motion,
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Lifecycle {
-    Unconfigured,
-    Mapped,
-    Closing,
 }
 
 #[cfg(feature = "trace")]
@@ -272,6 +266,11 @@ pub struct TermWindow {
     /// reports are suppressed so the app never sees the orphan half of a
     /// drag it didn't start.
     selection_bypass: bool,
+    /// The xdg-shell mapping handshake. Shared with [`crate::toplevel`]
+    /// rather than re-encoded here: the rule it protects (no buffer may be
+    /// attached before the first configure is acked) is a protocol error
+    /// that kills the client, and it is worth having exactly one tested
+    /// implementation of it in the crate.
     lifecycle: Lifecycle,
 
     /// Latest window size proposed by `xdg_toplevel.configure`, applied once per
@@ -561,7 +560,7 @@ impl TermWindow {
             mouse_pressed: None,
             app_mouse: false,
             selection_bypass: false,
-            lifecycle: Lifecycle::Unconfigured,
+            lifecycle: Lifecycle::new(),
             pending_resize: None,
             last_grid_size: (cols, rows),
             pending_dirty: Vec::new(),
@@ -761,7 +760,7 @@ impl TermWindow {
         &mut self,
         custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Damage>,
     ) -> Result<bool> {
-        if self.lifecycle == Lifecycle::Closing {
+        if self.lifecycle.is_closing() {
             return Ok(false);
         }
         self.sender
@@ -771,7 +770,7 @@ impl TermWindow {
         // Drain all queued events non-blocking.
         while let Some(ev) = self.events.pop() {
             self.handle_event(ev)?;
-            if self.lifecycle == Lifecycle::Closing {
+            if self.lifecycle.is_closing() {
                 return Ok(false);
             }
         }
@@ -784,7 +783,7 @@ impl TermWindow {
             .observe(self.events.is_closed(), self.events.is_empty())
             .is_alive()
         {
-            self.lifecycle = Lifecycle::Closing;
+            self.lifecycle.close_requested();
             return Ok(false);
         }
 
@@ -1037,7 +1036,7 @@ impl TermWindow {
     /// Block for the next Wayland event, then drain all queued events.
     /// Returns `true` while the window should stay open.
     pub fn run_once(&mut self) -> Result<bool> {
-        if self.lifecycle == Lifecycle::Closing {
+        if self.lifecycle.is_closing() {
             return Ok(false);
         }
         self.sender
@@ -1050,13 +1049,13 @@ impl TermWindow {
         self.handle_event(first)?;
         while let Some(ev) = self.events.pop() {
             self.handle_event(ev)?;
-            if self.lifecycle == Lifecycle::Closing {
+            if self.lifecycle.is_closing() {
                 break;
             }
         }
         self.advance_cursor_anim();
         self.maybe_present(None)?;
-        Ok(self.lifecycle != Lifecycle::Closing)
+        Ok(!self.lifecycle.is_closing())
     }
 
     // ── private ───────────────────────────────────────────────────────────
@@ -1323,14 +1322,14 @@ impl TermWindow {
             MessageBuilder::new(self.xdg_surface, XdgSurfaceRequest::AckConfigure)
                 .u32(ev.serial(0).raw()),
         );
-        self.lifecycle = Lifecycle::Mapped;
+        self.lifecycle.acked();
         self.maybe_present(None)
     }
 
     /// Handle `xdg_toplevel.close` -- the compositor (or user) asked us to
     /// quit; queue it for the caller rather than exiting from inside dispatch.
     fn handle_toplevel_close(&mut self) {
-        self.lifecycle = Lifecycle::Closing;
+        self.lifecycle.close_requested();
         self.input_queue.push_back(InputEvent::Close);
     }
 
@@ -2233,7 +2232,7 @@ impl TermWindow {
         &mut self,
         custom_paint: Option<&mut dyn FnMut(&mut crate::draw::Canvas<'_>) -> crate::draw::Damage>,
     ) -> Result<()> {
-        if self.lifecycle != Lifecycle::Mapped {
+        if !self.lifecycle.can_present() {
             return Ok(());
         }
         self.apply_pending_resize()?;

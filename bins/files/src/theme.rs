@@ -12,6 +12,7 @@
 
 use platform::draw::Color;
 
+use crate::density::Density;
 use crate::metric_overrides::MetricOverrides;
 use crate::spacing::Spacing;
 
@@ -19,10 +20,22 @@ use crate::spacing::Spacing;
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     pub background: Color,
-    /// Fill behind the selected rows.
+    /// Fill behind a selected row, for surfaces with no entry type to express.
+    ///
+    /// The *list* uses [`Self::selection_dir`] / [`Self::selection_file`]
+    /// instead. Retained because `[files].selection` is a documented config
+    /// key and those two derive from the palette, not from it -- so this stays
+    /// the honest home for a user's literal value, and the sidebar and toolbar
+    /// keep a type-free selection colour to reach for.
+    #[allow(dead_code)]
     pub selection: Color,
-    /// Outline on the cursor row, drawn even when the row is not selected so
-    /// keyboard focus is always locatable.
+    /// The keyboard-cursor colour.
+    ///
+    /// No longer painted as a row outline -- the cursor row now takes the
+    /// hover wash, since a border on the highlight is precisely what the
+    /// design asks against -- but still the source of [`Self::focus_ring`]
+    /// and [`Self::accent`], and still the documented `[files].cursor` key.
+    #[allow(dead_code)]
     pub cursor: Color,
     pub text: Color,
     /// Directory names, coloured distinctly so structure is scannable
@@ -57,15 +70,30 @@ pub struct Theme {
     /// Fill behind the sidebar row for the directory currently open.
     pub sidebar_active: Color,
 
-    /// Fill under a hovered row or control.
+    /// Fill under a hovered control (the filter box, a toolbar button).
     ///
-    /// The guide asks every interactive element for a distinct hover state.
-    /// Unused until the window tracks pointer position per row -- motion is
-    /// currently only forwarded for scrollbar drags -- but defined here so
-    /// the colour is chosen once, with the palette, rather than invented at
-    /// the call site later.
+    /// List *rows* use [`Self::hover_dir`] / [`Self::hover_file`] instead,
+    /// which carry the entry's type; this stays the neutral wash for chrome
+    /// that has no type to express. Not yet reached for -- the toolbar's
+    /// controls do not track the pointer -- but the colour belongs with the
+    /// palette rather than being invented at that call site later.
     #[allow(dead_code)]
     pub hover: Color,
+    /// Fill under a hovered directory row, and behind a selected one.
+    ///
+    /// Tinted toward [`Self::dir`] so the highlight itself says what kind of
+    /// thing is under the pointer. A single neutral highlight for both kinds
+    /// throws away information the row is already carrying in its text
+    /// colour -- and the text colour is the thing the highlight covers up.
+    pub hover_dir: Color,
+    /// Fill under a hovered file row, and behind a selected one.
+    pub hover_file: Color,
+    /// Selection fill for a directory row -- the same hue as
+    /// [`Self::hover_dir`], carried further from the background so selection
+    /// still outranks hover when both apply to the same row.
+    pub selection_dir: Color,
+    /// Selection fill for a file row.
+    pub selection_file: Color,
     /// Fill behind the toolbar strip.
     pub toolbar_bg: Color,
     /// Outline around toolbar controls (the filter box, the view switch).
@@ -106,6 +134,15 @@ pub struct Theme {
     /// through the painter would guarantee they drift apart.
     pub spacing: Spacing,
 
+    /// How tightly this theme packs the guide's dimensions.
+    ///
+    /// Kept so the *controls* inside a band scale with the band itself. The
+    /// guide's 31px control in a 58px toolbar is a ratio, not two independent
+    /// numbers: tightening only the band would leave a full-size control in a
+    /// smaller strip, which is precisely the vertical crowding that
+    /// `the_toolbar_always_contains_its_controls` exists to catch.
+    density: Density,
+
     /// Which measurements the user stated explicitly.
     ///
     /// Carried so the derivation stages below can tell "the user asked for
@@ -144,6 +181,14 @@ impl Default for Theme {
             sidebar_active: Color::rgb(0x31, 0x32, 0x44),
 
             hover: Color::rgb(0x28, 0x28, 0x3c),
+            // Washes of the type colours over the list background: the same
+            // hue the filename already uses, at a fraction that reads as a
+            // surface rather than as ink. Hover is the quieter pair, selection
+            // the stronger, so a selected row still wins under the pointer.
+            hover_dir: Color::rgb(0x25, 0x2c, 0x3d),
+            hover_file: Color::rgb(0x28, 0x2a, 0x3a),
+            selection_dir: Color::rgb(0x33, 0x40, 0x5c),
+            selection_file: Color::rgb(0x3a, 0x3d, 0x50),
             toolbar_bg: Color::rgb(0x18, 0x18, 0x25),
             control_border: Color::rgb(0x31, 0x32, 0x44),
             focus_ring: Color::rgb(0x89, 0xb4, 0xfa),
@@ -163,12 +208,35 @@ impl Default for Theme {
             // narrow enough to leave the list the majority of a small window.
             sidebar_width: 160,
             spacing: Spacing::new(13.0, 1.0),
+            density: Density::default(),
             overrides: MetricOverrides::default(),
         }
     }
 }
 
 impl Theme {
+    /// How far a hover highlight carries its type colour over the background.
+    ///
+    /// Low on purpose: hover is transient feedback that follows the pointer,
+    /// and a strong fill flashing under the cursor as it crosses a list is
+    /// noise. It only has to be *findable*, not loud.
+    const HOVER_WASH: f32 = 0.14;
+
+    /// The same for a selection, which is a state the user chose and expects
+    /// to stay put. Comfortably ahead of [`Self::HOVER_WASH`] so a selected
+    /// row still reads as selected while the pointer is over it.
+    const SELECTION_WASH: f32 = 0.30;
+
+    /// Mix `ink` into `surface` by `t`, as a paint colour.
+    ///
+    /// Named rather than inlined because it is applied four times with two
+    /// strengths, and the thing that must hold is that all four use the *same*
+    /// derivation -- otherwise the directory and file highlights end up on
+    /// subtly different curves and only one of them looks right.
+    fn wash(surface: config::Color, ink: config::Color, t: f32) -> Color {
+        surface.mix(ink, t).into()
+    }
+
     /// Derive every colour and measurement from `cfg`, mirroring
     /// `bins/launcher`'s and `bins/monitor`'s `Theme::from_config`.
     ///
@@ -210,6 +278,28 @@ impl Theme {
             // enough to track the pointer, quiet enough not to compete with
             // an actual selection.
             hover: cfg.files_filter_bg().into(),
+
+            // Row highlights are washes of the *type* colour over the list
+            // background, so the highlight carries the same information the
+            // filename's colour does -- which matters most exactly when the
+            // highlight is covering that filename up.
+            //
+            // Derived rather than configured: these follow `[files].dir` and
+            // `[files].text`, so re-theming those moves the highlights with
+            // them instead of stranding four hand-picked shades. The two
+            // strengths keep selection ahead of hover on the same row.
+            hover_dir: Self::wash(cfg.files_background(), cfg.files_dir(), Self::HOVER_WASH),
+            hover_file: Self::wash(cfg.files_background(), cfg.files_text(), Self::HOVER_WASH),
+            selection_dir: Self::wash(
+                cfg.files_background(),
+                cfg.files_dir(),
+                Self::SELECTION_WASH,
+            ),
+            selection_file: Self::wash(
+                cfg.files_background(),
+                cfg.files_text(),
+                Self::SELECTION_WASH,
+            ),
             toolbar_bg: cfg.files_header_bg().into(),
             control_border: cfg.files_filter_bg().into(),
             // The cursor colour already means "keyboard is here", so the
@@ -231,6 +321,7 @@ impl Theme {
             padding: px(cfg.files_padding()),
             sidebar_width: Self::default().sidebar_width,
             spacing: Spacing::new(13.0, 1.0),
+            density: Density::default(),
             overrides: MetricOverrides::from_config(cfg),
         }
     }
@@ -249,24 +340,45 @@ impl Theme {
     /// state follows the guide's proportions, which is what makes the layout
     /// hold together at any font size.
     #[must_use]
-    pub fn with_spacing(mut self, spacing: Spacing) -> Self {
+    pub fn with_spacing(self, spacing: Spacing) -> Self {
+        self.with_spacing_at(spacing, Density::default())
+    }
+
+    /// [`Self::with_spacing`] with the packing policy stated explicitly.
+    ///
+    /// `density` tightens the guide's dimensions for a list that draws no
+    /// icons -- see [`Density`]. It is applied here rather than inside
+    /// [`Spacing`] so `Spacing` keeps encoding the guide faithfully and stays
+    /// testable against its published table; this stage is where the browser's
+    /// own deviation from it is expressed.
+    ///
+    /// Note the ordering: density scales the *guide's* number, and an explicit
+    /// `[files]` override replaces it outright rather than being scaled. A
+    /// user who writes `row_height = 44` means 44 pixels, not 44 tightened to
+    /// 27.
+    #[must_use]
+    pub fn with_spacing_at(mut self, spacing: Spacing, density: Density) -> Self {
         self.spacing = spacing;
+        self.density = density;
         // Only an explicit `[files]` value outranks the guide. Anything the
         // user left unset takes the guide's number even if an earlier stage
         // already wrote something there.
         self.row_height = self
             .overrides
             .row_height()
-            .unwrap_or_else(|| spacing.list_row());
+            .unwrap_or_else(|| density.row(spacing.list_row()));
         self.header_height = self
             .overrides
             .header_height()
-            .unwrap_or_else(|| spacing.toolbar_height());
+            .unwrap_or_else(|| density.row(spacing.toolbar_height()));
         self.status_height = self
             .overrides
             .status_height()
-            .unwrap_or_else(|| spacing.status_height());
-        self.padding = self.overrides.padding().unwrap_or_else(|| spacing.m());
+            .unwrap_or_else(|| density.row(spacing.status_height()));
+        self.padding = self
+            .overrides
+            .padding()
+            .unwrap_or_else(|| density.pad(spacing.m()));
         self.sidebar_width = spacing.sidebar_width();
         self
     }
@@ -276,6 +388,29 @@ impl Theme {
     #[must_use]
     pub fn is_compact(&self, window_width: i32) -> bool {
         window_width < self.spacing.collapse_below()
+    }
+
+    /// Height of a toolbar control (the filter box, the view toggle), packed
+    /// to this theme's density.
+    ///
+    /// Exists so call sites cannot reach for the raw `spacing.control_height()`
+    /// and land a guide-sized control in a density-tightened band. Reading the
+    /// height through the theme keeps the band and its contents on one policy.
+    #[must_use]
+    pub fn control_height(&self) -> i32 {
+        self.density.row(self.spacing.control_height())
+    }
+
+    /// A sidebar navigation row, packed to this theme's density.
+    #[must_use]
+    pub fn sidebar_row(&self) -> i32 {
+        self.density.row(self.spacing.sidebar_row())
+    }
+
+    /// The column-header strip above the list, packed to this theme's density.
+    #[must_use]
+    pub fn column_header(&self) -> i32 {
+        self.density.row(self.spacing.column_header())
     }
 
     /// Adopt the metrics derived from the loaded type scale.
@@ -306,7 +441,7 @@ impl Theme {
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, Spacing, Theme};
+    use super::{Color, Density, Spacing, Theme};
 
     /// The guide's responsive rule: a narrow window collapses the sidebar to
     /// an icon rail so filenames keep their room.
@@ -317,16 +452,53 @@ mod tests {
         assert!(!theme.is_compact(1280));
     }
 
-    /// The guide's geometry must actually arrive when nothing is configured.
+    /// The guide's geometry must actually arrive when nothing is configured --
+    /// stated at [`Density::GUIDE`], since the shipped policy deliberately
+    /// tightens it (see the test below).
     #[test]
     fn the_guide_geometry_replaces_the_defaults() {
         let spacing = Spacing::new(13.0, 1.0);
-        let theme = Theme::default().with_spacing(spacing);
+        let theme = Theme::default().with_spacing_at(spacing, Density::GUIDE);
         assert_eq!(theme.row_height, spacing.list_row());
         assert_eq!(theme.header_height, spacing.toolbar_height());
         assert_eq!(theme.status_height, spacing.status_height());
         assert_eq!(theme.sidebar_width, spacing.sidebar_width());
         assert_eq!(theme.padding, spacing.m());
+    }
+
+    /// The shipped density must actually tighten the guide's list geometry --
+    /// this is the user-visible request ("smaller text, tighter spacing") that
+    /// [`Density`] exists to serve, so it is pinned rather than left implicit.
+    ///
+    /// Sidebar width is excluded on purpose: density is about vertical packing
+    /// and internal padding, and narrowing the sidebar would start truncating
+    /// place names, which is a different decision with a different tradeoff.
+    #[test]
+    fn the_shipped_density_tightens_the_guide_geometry() {
+        let spacing = Spacing::new(13.0, 1.0);
+        let guide = Theme::default().with_spacing_at(spacing, Density::GUIDE);
+        let shipped = Theme::default().with_spacing(spacing);
+
+        assert!(
+            shipped.row_height < guide.row_height,
+            "rows must be tighter than the guide's icon-sized ones"
+        );
+        assert!(shipped.padding < guide.padding, "padding must be tighter");
+        assert!(
+            shipped.header_height < guide.header_height,
+            "the toolbar must be tighter"
+        );
+        assert_eq!(
+            shipped.sidebar_width, guide.sidebar_width,
+            "density must not narrow the sidebar and truncate place names"
+        );
+        // Still positive and still ordered -- tightening must not invert the
+        // relationship the layout depends on.
+        assert!(shipped.row_height > 0 && shipped.padding > 0);
+        assert!(
+            shipped.header_height > shipped.row_height,
+            "the toolbar still carries the largest tier"
+        );
     }
 
     /// …but an explicit config value still outranks the guide's number.
@@ -485,9 +657,21 @@ background = "#181616"
             "stage order must not change the result"
         );
         for theme in [spacing_first, metrics_first] {
+            // Stated against the density-scaled toolbar rather than the guide's
+            // raw 58px: the shipped policy tightens the band deliberately, so
+            // the guide's number is no longer the floor. What must still hold
+            // is that the band is not shorter than the policy asks for *and*
+            // still contains its own controls -- which is the property the
+            // original bug actually violated.
             assert!(
-                theme.header_height >= spacing.toolbar_height(),
-                "the toolbar must never end up shorter than the guide asks"
+                theme.header_height >= theme.density.row(spacing.toolbar_height()),
+                "the toolbar must never end up shorter than its density asks"
+            );
+            assert!(
+                theme.header_height > theme.control_height(),
+                "the toolbar ({}) must still contain its controls ({})",
+                theme.header_height,
+                theme.control_height()
             );
         }
     }
@@ -511,12 +695,46 @@ background = "#181616"
                     scale.natural_header_height(),
                     scale.natural_status_height(),
                 );
+            // Both sides read through the theme, so the band and its contents
+            // are compared on the *same* density policy. Comparing a tightened
+            // band against the guide's raw control height would fail for a
+            // reason that is not a bug -- and comparing a guide band against a
+            // tightened control would hide a real one.
             assert!(
-                theme.header_height > spacing.control_height(),
+                theme.header_height > theme.control_height(),
                 "at {font}px the toolbar ({}) must exceed its controls ({})",
                 theme.header_height,
-                spacing.control_height()
+                theme.control_height()
             );
+        }
+    }
+
+    /// Density must scale a band and the controls inside it *together*.
+    ///
+    /// The ratio is the guide's actual design (a 31px control in a 58px
+    /// toolbar); tightening only the band is how a control ends up crowded
+    /// against its own edges, which is the bug the toolbar tests above exist
+    /// to catch. Checked at both policies so neither can drift.
+    #[test]
+    fn a_band_and_its_controls_scale_on_the_same_policy() {
+        for density in [Density::GUIDE, Density::COMPACT] {
+            for font in [11.0, 13.0, 16.0, 20.0, 28.0] {
+                let spacing = Spacing::new(font, 1.0);
+                let theme = Theme::default().with_spacing_at(spacing, density);
+                let slack = theme.header_height - theme.control_height();
+                assert!(
+                    slack > 0,
+                    "the control must fit at {font}px under {density:?}"
+                );
+                // Not merely fitting: the guide leaves 27 of 58px around a
+                // control, so a band that has tightened to a hairline of slack
+                // has lost the proportion even though it still "contains" it.
+                assert!(
+                    slack * 4 >= theme.header_height,
+                    "only {slack}px of slack in a {}px band at {font}px under {density:?}",
+                    theme.header_height
+                );
+            }
         }
     }
 

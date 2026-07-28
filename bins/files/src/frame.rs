@@ -58,6 +58,7 @@ impl Frame {
         spacing: Spacing,
         toolbar_height: i32,
         status_height: i32,
+        column_header_height: i32,
     ) -> Self {
         let width = width.max(0);
         let height = height.max(0);
@@ -94,7 +95,11 @@ impl Frame {
         let remaining = height - toolbar_height;
         let status_height = status_height.min(remaining);
         let remaining = remaining - status_height;
-        let header_height = spacing.column_header().min(remaining);
+        // Passed in rather than read off `spacing`, for the same reason the
+        // toolbar and status heights are: those bands are density-scaled by
+        // `Theme`, and a column-header strip that took the guide's raw height
+        // would be the one band out of step with the rows beneath it.
+        let header_height = column_header_height.min(remaining);
 
         Self {
             size: Rect::new(0, 0, width, height),
@@ -242,6 +247,7 @@ mod tests {
             s,
             s.toolbar_height(),
             s.status_height(),
+            s.column_header(),
         )
     }
 
@@ -315,7 +321,15 @@ mod tests {
     #[test]
     fn hiding_the_sidebar_gives_the_whole_window_to_the_list() {
         let s = spacing();
-        let f = Frame::new(1280, 790, false, s, s.toolbar_height(), s.status_height());
+        let f = Frame::new(
+            1280,
+            790,
+            false,
+            s,
+            s.toolbar_height(),
+            s.status_height(),
+            s.column_header(),
+        );
         assert!(!f.has_sidebar());
         assert_eq!(f.sidebar().w, 0);
         assert_eq!(f.main().x, 0);

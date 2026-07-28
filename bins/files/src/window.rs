@@ -17,6 +17,7 @@ use crate::browser::{Browser, Outcome};
 use crate::columns::{Column, Columns};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
+use crate::hover::Hover;
 use crate::kind_label::KindLabel;
 use crate::moment::Moment;
 use crate::row_format::RowFormat;
@@ -39,6 +40,53 @@ const DOUBLE_CLICK_MS: u64 = 400;
 /// user never meant to open.
 const DOUBLE_CLICK_SLOP: i32 = 4;
 
+/// Which family of highlight colours a row draws from.
+///
+/// A two-variant enum rather than the `navigable: bool` it replaced, because
+/// `bool` at a call site reads as "true means... what, exactly?" -- and because
+/// this is the axis most likely to gain a third case (a symlink family, say),
+/// which a bool cannot express without every call site changing shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowKind {
+    /// Anything Enter would descend into -- a directory, or a symlink to one.
+    /// The same test `RowFormat::name` uses for its trailing slash, so the
+    /// highlight tint and the slash cannot disagree about what a row is.
+    Navigable,
+    /// A leaf: a regular file, a device, a broken link.
+    Leaf,
+}
+
+impl RowKind {
+    /// Classify an entry.
+    const fn of(entry: &fsmodel::entry::Entry) -> Self {
+        if entry.is_navigable() {
+            Self::Navigable
+        } else {
+            Self::Leaf
+        }
+    }
+
+    /// The selection fill for this kind.
+    ///
+    /// The two lookups sit side by side deliberately: a mismatched pair (hover
+    /// reading the directory colour while selection reads the file one) is
+    /// obvious here and invisible if they live at separate call sites.
+    const fn selection_fill(self, theme: &Theme) -> Color {
+        match self {
+            Self::Navigable => theme.selection_dir,
+            Self::Leaf => theme.selection_file,
+        }
+    }
+
+    /// The hover fill for this kind.
+    const fn hover_fill(self, theme: &Theme) -> Color {
+        match self {
+            Self::Navigable => theme.hover_dir,
+            Self::Leaf => theme.hover_file,
+        }
+    }
+}
+
 /// One row's strings and states, gathered before drawing.
 ///
 /// A named struct rather than a tuple because six positional fields of which
@@ -53,6 +101,9 @@ struct PaintedRow {
     color: Color,
     selected: bool,
     is_cursor: bool,
+    hovered: bool,
+    /// Which highlight family this row draws from.
+    row_kind: RowKind,
 }
 
 /// Draws a browser and feeds it input.
@@ -67,6 +118,9 @@ pub struct FilesWindow {
     favorites: Favorites,
     size: PhysicalSize,
     focused: bool,
+    /// Which list row the pointer is over. See [`Hover`] for why this is a
+    /// type rather than an `Option<usize>`.
+    hover: Hover,
     /// Set when the user asks to quit, read by the event loop.
     quit: bool,
     /// A file the user activated, for the loop to hand to the system opener.
@@ -105,6 +159,7 @@ impl FilesWindow {
             favorites,
             size,
             focused: false,
+            hover: Hover::none(),
             quit: false,
             pending_open: None,
             last_click: None,
@@ -176,6 +231,7 @@ impl FilesWindow {
             self.theme.spacing,
             self.theme.header_height,
             self.theme.status_height,
+            self.theme.column_header(),
         )
     }
 
@@ -355,7 +411,7 @@ impl FilesWindow {
         let theme = self.theme;
         let bar = self.frame().toolbar();
         let button = theme.spacing.view_button();
-        let height = theme.spacing.control_height();
+        let height = theme.control_height();
         let width = button * 2;
         let x = bar.right() - theme.spacing.toolbar_pad() - width;
         let y = bar.y + (bar.h - height) / 2;
@@ -494,7 +550,7 @@ impl FilesWindow {
         } else {
             theme.spacing.search_width()
         };
-        let height = theme.spacing.control_height();
+        let height = theme.control_height();
         let bar = self.frame().toolbar();
         // The view toggle sits to its right, so the filter box ends before it.
         let toggle = theme.spacing.view_button() * 2 + theme.spacing.s();
@@ -650,7 +706,7 @@ impl FilesWindow {
 
         let theme = self.theme;
         let active = self.sidebar.index_of(self.browser.path());
-        let row_h = theme.spacing.sidebar_row();
+        let row_h = theme.sidebar_row();
         // Collected first because drawing needs `&mut self.type_scale` while
         // the rows live behind `&self.sidebar`.
         let rows: Vec<SidebarRow> = self.sidebar.rows().to_vec();
@@ -894,6 +950,11 @@ impl FilesWindow {
                     color: RowFormat::color(entry, &theme),
                     selected: self.browser.pane().is_selected(row),
                     is_cursor: self.browser.pane().cursor() == Some(row),
+                    hovered: self.hover.is(row),
+                    // The highlight colour follows what the row *is*, not what
+                    // its name looks like, so a directory keeps its tint even
+                    // when the name column is truncated to nothing.
+                    row_kind: RowKind::of(entry),
                 })
             })
             .collect();
@@ -901,21 +962,33 @@ impl FilesWindow {
         for row in rows {
             let y = top + row.y;
             let rect = Rect::new(left, y, content_width, theme.row_height);
-            // Selection and cursor share the row's rounded geometry so the
-            // two never disagree about where the row's edge is.
             let radius = theme.spacing.radius();
-            let bg = if row.selected {
-                canvas.fill_round_rect(rect, theme.selection, radius);
-                theme.selection
-            } else {
-                theme.background
+            // Selection outranks hover on the same row: it is a state the user
+            // chose, so it must not be overwritten by the pointer merely
+            // passing over it. Both are washes of the row's own type colour --
+            // see `Theme::hover_dir` -- so the fill says "directory" or "file"
+            // even while it covers the coloured name that would have said so.
+            // The keyboard cursor is folded in as a *fill* rather than the
+            // outline it used to be: an outline is a border, and a border on
+            // the highlight is exactly what was asked to go. It still has to
+            // be locatable, so an unselected cursor row takes the hover wash --
+            // the same treatment the pointer gives, since both mean "this row
+            // is where your attention is". Only when focused: claiming
+            // keyboard focus in an unfocused window is a lie.
+            let cursor_here = self.focused && row.is_cursor;
+            let bg = match (row.selected, row.hovered || cursor_here) {
+                (true, _) => {
+                    let fill = row.row_kind.selection_fill(&theme);
+                    canvas.fill_round_rect(rect, fill, radius);
+                    fill
+                }
+                (false, true) => {
+                    let fill = row.row_kind.hover_fill(&theme);
+                    canvas.fill_round_rect(rect, fill, radius);
+                    fill
+                }
+                (false, false) => theme.background,
             };
-            // The cursor outline is drawn even on an unselected row, and only
-            // when focused: an outline on an unfocused window claims a
-            // keyboard focus we do not have.
-            if self.focused && row.is_cursor {
-                canvas.draw_round_rect(rect, theme.cursor, radius);
-            }
             // A thin separator per row rather than a card, per the guide.
             canvas.fill_rect(
                 Rect::new(
@@ -1156,7 +1229,7 @@ impl Painter for FilesWindow {
                     }
                     if let Some(path) = self
                         .sidebar
-                        .row_at(y, self.theme.spacing.sidebar_row())
+                        .row_at(y, self.theme.sidebar_row())
                         .and_then(|r| r.path())
                         .map(std::path::Path::to_path_buf)
                     {
@@ -1196,17 +1269,37 @@ impl Painter for FilesWindow {
                 let rows_top = self.frame().rows().y;
                 let outcome = self.browser.motion(at.y - rows_top);
                 self.apply(outcome);
+                // Hover is tracked separately from the drag above, and only
+                // over the list proper: `to_pane` rejects the gutter and the
+                // chrome, so sliding along the scrollbar or across the toolbar
+                // correctly drops the row highlight instead of leaving the last
+                // row lit.
+                //
+                // The changed-flag is deliberately discarded: `Toplevel`
+                // marks the surface dirty after *every* pointer event it
+                // routes, so there is no frame here for us to save. `Hover`
+                // reports it anyway because that is the honest signal for the
+                // state it owns, and the day this window drives its own
+                // damage the call site should not have to grow the logic back.
+                let row = self
+                    .to_pane(at)
+                    .and_then(|(_, y)| self.browser.pane().viewport().row_at_y(y));
+                let _ = self.hover.move_to(row);
             }
             PointerEventKind::Scroll { lines, .. } => {
                 let outcome = self.browser.scroll(lines);
                 self.apply(outcome);
             }
-            // Enter/Leave need no action -- hover is not drawn -- and a
-            // non-left press is deliberately inert until there is a context
-            // menu to open.
-            PointerEventKind::Enter(_)
-            | PointerEventKind::Leave
-            | PointerEventKind::Press { .. } => {}
+            // The pointer left the surface, so the highlight must go with it;
+            // otherwise a row stays lit while the pointer is in another window.
+            PointerEventKind::Leave => {
+                let _ = self.hover.clear();
+            }
+            // Enter carries a position, but the Motion event that follows it
+            // does the hover work -- handling it here too would only duplicate
+            // that. A non-left press stays deliberately inert until there is a
+            // context menu to open.
+            PointerEventKind::Enter(_) | PointerEventKind::Press { .. } => {}
         }
     }
 }
@@ -1335,6 +1428,140 @@ mod tests {
             buf.iter().all(|&p| (p >> 24) == 0),
             "an opaque surface packs a zero top byte"
         );
+    }
+
+    /// Build a painter over a directory holding one subdirectory and one
+    /// regular file, so the per-type highlights below have both kinds to
+    /// distinguish. Returns the painter and the temp dir, which must stay
+    /// alive for the duration of the test.
+    ///
+    /// `tag` names the directory. It is required rather than derived from the
+    /// pid because cargo runs these tests *in parallel threads of one
+    /// process*: a shared pid-only name had them racing, one test's cleanup
+    /// deleting the tree another was still listing.
+    fn painter_over_a_mixed_directory(
+        tag: &str,
+    ) -> (FilesWindow, std::path::PathBuf, PhysicalSize) {
+        let size = PhysicalSize {
+            width: 900,
+            height: 600,
+        };
+        // Not `temp_dir()` itself: its contents are whatever the machine
+        // happens to have, so "row 0 is a directory" would not be guaranteed.
+        let root = std::env::temp_dir().join(format!("files-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a_directory")).expect("create a subdirectory");
+        std::fs::write(root.join("b_file.txt"), b"x").expect("create a file");
+
+        let cfg = config::Config::default();
+        let theme = crate::theme::Theme::from_config(&cfg);
+        let type_scale = crate::typography::Typography::load(&cfg, 1.0);
+        let favorites = crate::favorites::Favorites::default();
+        let user_dirs = crate::user_dirs::UserDirs::load();
+        let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
+        let browser = crate::browser::Browser::open(&root, 700, 400, 28).expect("listable");
+        let painter = FilesWindow::new(browser, theme, type_scale, sidebar, favorites, size);
+        (painter, root, size)
+    }
+
+    /// Paint `painter` into an opaque canvas and return the pixels.
+    fn paint_opaque(painter: &mut FilesWindow, size: PhysicalSize) -> Vec<u32> {
+        let px = (size.width * size.height).cast_unsigned() as usize;
+        let mut buf = vec![0u32; px];
+        {
+            let mut canvas = Canvas::new(&mut buf, size.width, size.height);
+            painter.paint(&mut canvas, size);
+        }
+        buf
+    }
+
+    /// Hovering a row must actually change what gets painted.
+    ///
+    /// Compares whole frames rather than probing a pixel: the highlight's exact
+    /// position depends on the frame geometry, and a test that hardcodes a
+    /// coordinate breaks every time the layout is tuned -- which is exactly
+    /// what this change did to the row height.
+    #[test]
+    fn hovering_a_row_changes_the_painted_frame() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-frame");
+        let cold = paint_opaque(&mut painter, size);
+
+        assert!(painter.hover.move_to(Some(0)), "row 0 becomes hovered");
+        let hot = paint_opaque(&mut painter, size);
+        assert_ne!(cold, hot, "a hovered row must be visibly highlighted");
+
+        // ...and clearing it must restore the original frame exactly, or the
+        // highlight leaks and rows stay lit after the pointer leaves.
+        assert!(painter.hover.clear(), "the hover is dropped");
+        let cleared = paint_opaque(&mut painter, size);
+        assert_eq!(cold, cleared, "clearing hover must restore the frame");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A directory and a file must not get the same highlight -- the whole
+    /// point of the per-type fills, and the property most at risk of quietly
+    /// collapsing if both roles are ever derived from the same colour.
+    #[test]
+    fn a_directory_and_a_file_highlight_differently() {
+        let (painter, root, _) = painter_over_a_mixed_directory("hover-theme");
+        let theme = &painter.theme;
+        assert_ne!(
+            theme.hover_dir, theme.hover_file,
+            "hover must distinguish a directory from a file"
+        );
+        assert_ne!(
+            theme.selection_dir, theme.selection_file,
+            "selection must distinguish a directory from a file"
+        );
+        // Selection has to outrank hover, or selecting a row the pointer is
+        // over would appear to do nothing.
+        assert_ne!(theme.selection_dir, theme.hover_dir);
+        assert_ne!(theme.selection_file, theme.hover_file);
+        // Every highlight must differ from the plain row background too, or it
+        // is invisible rather than subtle.
+        for fill in [
+            theme.hover_dir,
+            theme.hover_file,
+            theme.selection_dir,
+            theme.selection_file,
+        ] {
+            assert_ne!(fill, theme.background, "a highlight must be visible");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Hovering the two kinds of row must paint *differently* from each other,
+    /// not merely differ in the theme. This is the end-to-end version: it
+    /// proves the painter actually consults the row's kind rather than reaching
+    /// for one fill for everything.
+    #[test]
+    fn the_painted_highlight_follows_the_rows_kind() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-kind");
+        // Sorted with directories first, so row 0 is the directory and row 1
+        // the file. Asserted rather than assumed -- if the sort order ever
+        // changes, this test must fail loudly instead of silently comparing
+        // two files.
+        assert!(
+            painter
+                .browser
+                .entry(0)
+                .is_some_and(fsmodel::entry::Entry::is_navigable),
+            "row 0 must be the directory"
+        );
+        assert!(
+            painter.browser.entry(1).is_some_and(|e| !e.is_navigable()),
+            "row 1 must be the file"
+        );
+
+        painter.hover.move_to(Some(0));
+        let dir_hovered = paint_opaque(&mut painter, size);
+        painter.hover.move_to(Some(1));
+        let file_hovered = paint_opaque(&mut painter, size);
+        assert_ne!(
+            dir_hovered, file_hovered,
+            "the two rows must not receive the same highlight"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A width narrower than a single glyph yields no columns rather than a

@@ -17,9 +17,11 @@
 mod breadcrumb;
 mod browser;
 mod columns;
+mod density;
 mod favorites;
 mod frame;
 mod handlers;
+mod hover;
 mod keymap;
 mod kind_label;
 mod launch;
@@ -103,6 +105,7 @@ impl App {
             theme.spacing,
             theme.header_height,
             theme.status_height,
+            theme.column_header(),
         );
         // The browser is built with the *logical* size, then corrected the
         // moment the compositor tells us the real physical geometry. Guessing

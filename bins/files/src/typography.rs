@@ -22,6 +22,8 @@
 
 use statusbar::TextRenderer;
 
+use crate::density::Density;
+
 /// The four text renderers the browser draws with.
 pub struct Typography {
     pub title: TextRenderer,
@@ -42,13 +44,20 @@ impl Typography {
     const DETAIL: f32 = 0.85;
 
     /// Load every tier from the configured font, at `scale` (the output's
-    /// `HiDPI` scale factor).
+    /// `HiDPI` scale factor), under the shipped [`Density`].
     ///
     /// Falls back to the embedded bitmap font per tier if the configured face
     /// cannot be read -- a missing font must degrade to a readable window,
     /// never a blank one.
     #[must_use]
     pub fn load(cfg: &config::Config, scale: f32) -> Self {
+        Self::load_with_density(cfg, scale, Density::default())
+    }
+
+    /// [`Self::load`] with the density stated explicitly, so a test can load
+    /// the guide's own sizes and compare against them.
+    #[must_use]
+    pub fn load_with_density(cfg: &config::Config, scale: f32, density: Density) -> Self {
         let size = cfg.font.px_size() * scale;
         let path = cfg.font.path.clone();
         let emoji = cfg.font.emoji_path.clone();
@@ -57,15 +66,21 @@ impl Typography {
         // window waits to show its first frame.
         let data = path.as_deref().and_then(|p| std::fs::read(p).ok());
         let fallbacks = [emoji.as_deref()];
-        let tier = |mult: f32| match (path.as_deref(), data.as_deref()) {
-            // The happy path: one read, four faces off the same bytes.
-            (Some(p), Some(bytes)) => {
-                TextRenderer::load_with_fallbacks_from_bytes(p, bytes, &fallbacks, size * mult)
+        // Density scales every tier by one factor, so the *relative* scale
+        // the tests pin is preserved while the whole list gets smaller.
+        let tier = |mult: f32| {
+            let mult = density.text(mult);
+            match (path.as_deref(), data.as_deref()) {
+                // The happy path: one read, four faces off the same bytes.
+                (Some(p), Some(bytes)) => {
+                    TextRenderer::load_with_fallbacks_from_bytes(p, bytes, &fallbacks, size * mult)
+                }
+                // No configured font, or it could not be read.
+                // `load_with_fallbacks` owns the diagnostic and the
+                // bitmap-font fallback, so the window still comes up readable
+                // instead of blank.
+                _ => TextRenderer::load_with_fallbacks(path.as_deref(), &fallbacks, size * mult),
             }
-            // No configured font, or it could not be read. `load_with_fallbacks`
-            // owns the diagnostic and the bitmap-font fallback, so the window
-            // still comes up readable instead of blank.
-            _ => TextRenderer::load_with_fallbacks(path.as_deref(), &fallbacks, size * mult),
         };
         Self {
             title: tier(Self::TITLE),
@@ -80,9 +95,14 @@ impl Typography {
     /// Derived from the body tier plus breathing room rather than fixed in
     /// the theme, so raising the font size in config grows the rows with it
     /// instead of clipping the glyphs.
+    ///
+    /// This is a *floor* (see `Theme::with_metrics`), so the air added here
+    /// is the minimum a row needs to not clip its own descenders -- 4px,
+    /// tight on purpose. The comfortable spacing is the guide's job; this
+    /// only has to keep glyphs off the separator.
     #[must_use]
     pub fn natural_row_height(&self) -> i32 {
-        self.body.line_height() + 8
+        self.body.line_height() + 4
     }
 
     /// The natural header height: the title tier plus generous padding, since

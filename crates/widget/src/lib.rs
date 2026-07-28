@@ -13,14 +13,17 @@
 //!
 //! - [`ListViewport`] -- scroll offsets, visible ranges, hit-testing.
 //! - [`ListSelection`] -- cursor, anchor, and range selection rules.
+//! - [`Scrollbar`] -- thumb geometry and drag, driven by a `ListViewport`.
 //!
 //! The geometry types have no Wayland or rendering dependencies at all, which
 //! is what lets the fiddly cases (empty lists, a resize that strands the
 //! scroll offset, 100k-row overflow) be tested in microseconds without a
 //! compositor.
 
+mod scrollbar;
 mod selection;
 mod viewport;
 
+pub use scrollbar::{Scrollbar, Thumb};
 pub use selection::ListSelection;
 pub use viewport::ListViewport;

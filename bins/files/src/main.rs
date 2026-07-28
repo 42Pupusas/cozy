@@ -47,7 +47,13 @@ impl App {
 
     fn run() -> Result<(), Box<dyn std::error::Error>> {
         let options = Options::parse(std::env::args().skip(1))?;
-        let theme = Theme::default();
+        // A broken config should not stop the browser opening -- report it
+        // and fall back to defaults, exactly as the launcher and bar do.
+        let cfg = config::Config::load().unwrap_or_else(|e| {
+            eprintln!("files: config error: {e} — using defaults");
+            config::Config::default()
+        });
+        let theme = Theme::from_config(&cfg);
         let wake = waker::Waker::new()?;
 
         let size = LogicalSize {

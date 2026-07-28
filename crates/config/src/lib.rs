@@ -107,6 +107,34 @@
 //! highlight   = "#313244"          # selected-result row background; defaults to
 //!                                   # a built-in dark slate (no [colors] equivalent)
 //!
+//! # The file browser. Everything is optional; unset colour keys mirror the
+//! # terminal's own [colors], following `ls` convention where one applies
+//! # (directories blue, symlinks cyan, broken links red). The roles a
+//! # terminal has no equivalent for -- chrome fills, the scrollbar, the
+//! # selected row -- are *derived* from the palette rather than hardcoded,
+//! # so a re-themed terminal carries the browser with it instead of
+//! # stranding grey chrome on a light background.
+//! [files]
+//! background      = "#1e1e2e"     # defaults to [colors].background
+//! text            = "#cdd6f4"     # defaults to [colors].foreground
+//! dir             = "#89b4fa"     # defaults to [colors].blue
+//! symlink         = "#94e2d5"     # defaults to [colors].cyan
+//! broken          = "#f38ba8"     # broken symlink; defaults to [colors].red
+//! error           = "#f38ba8"     # defaults to [colors].red
+//! muted           = "#6c7086"     # sizes/counts/status; defaults to [colors].bright_black
+//! caret           = "#f9e2af"     # filter-box caret; defaults to [colors].yellow
+//! cursor          = "#89b4fa"     # cursor-row outline; defaults to [colors].blue
+//! selection       = "#45475a"     # selected-row fill; defaults to a derived shade
+//! header_bg       = "#181825"     # defaults to a derived shade
+//! status_bg       = "#181825"     # defaults to header_bg
+//! scrollbar_track = "#181825"     # defaults to header_bg
+//! scrollbar_thumb = "#585b70"     # defaults to a derived shade
+//! filter_bg       = "#313244"     # focused filter box; defaults to a derived shade
+//! row_height      = 20            # pixels, 4-512
+//! header_height   = 24            # pixels, 0-512 (0 hides the strip)
+//! status_height   = 20            # pixels, 0-512 (0 hides the strip)
+//! padding         = 8             # left/right padding inside a row, 0-512
+//!
 //! # Everything here is optional and defaults to *mirroring* the bar's own
 //! # resolved background/opacity (which itself mirrors the terminal's), or
 //! # a built-in Kanagawa-ish dark palette for the roles ([colors] has no
@@ -523,6 +551,68 @@ pub struct LauncherConfig {
     pub highlight: Option<Color>,
 }
 
+/// File-browser configuration.
+///
+/// Same mirroring rule as [`BarConfig`]/[`LauncherConfig`]: unset keys take
+/// their value from the terminal's own `[colors]`, so a user who themes the
+/// terminal gets a matching browser for free.
+///
+/// The browser needs more *roles* than the terminal has settings, though. A
+/// terminal has a foreground and a background; a file list additionally has
+/// a selected row, a focused row, a header strip, a status strip, and a
+/// scrollbar. Where a role has an honest ANSI equivalent it mirrors it --
+/// directories are `blue`, symlinks `cyan`, broken links and errors `red` --
+/// because those are the colours `ls` has used for the same things for
+/// decades and the association is worth inheriting. Where a role has no
+/// terminal equivalent at all (chrome fills, the scrollbar) it falls back to
+/// a built-in derived from the palette rather than a literal, so the browser
+/// still tracks a re-themed terminal instead of stranding grey chrome on a
+/// light background.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilesConfig {
+    /// Background color override. `None` mirrors `[colors].background`.
+    pub background: Option<Color>,
+    /// Row text color override. `None` mirrors `[colors].foreground`.
+    pub text: Option<Color>,
+    /// Directory name color. `None` mirrors `[colors].blue`.
+    pub dir: Option<Color>,
+    /// Symlink name color. `None` mirrors `[colors].cyan`.
+    pub symlink: Option<Color>,
+    /// Broken-symlink color. `None` mirrors `[colors].red`.
+    pub broken: Option<Color>,
+    /// Error text color. `None` mirrors `[colors].red`.
+    pub error: Option<Color>,
+    /// Dimmed text (sizes, counts, status line). `None` mirrors
+    /// `[colors].bright_black`.
+    pub muted: Option<Color>,
+    /// Filter-box caret color. `None` mirrors `[colors].yellow`.
+    pub caret: Option<Color>,
+    /// Selected-row fill. `None` uses a built-in derived from the palette.
+    pub selection: Option<Color>,
+    /// Cursor-row outline, drawn even when the row is not selected so
+    /// keyboard focus stays locatable. `None` mirrors `[colors].blue`.
+    pub cursor: Option<Color>,
+    /// Header strip fill. `None` uses a built-in derived from the palette.
+    pub header_bg: Option<Color>,
+    /// Status strip fill. `None` uses a built-in derived from the palette.
+    pub status_bg: Option<Color>,
+    /// Scrollbar trough. `None` uses a built-in derived from the palette.
+    pub scrollbar_track: Option<Color>,
+    /// Scrollbar thumb. `None` uses a built-in derived from the palette.
+    pub scrollbar_thumb: Option<Color>,
+    /// Focused filter-box fill. `None` uses a built-in derived from the
+    /// palette.
+    pub filter_bg: Option<Color>,
+    /// Row height in pixels. `None` uses a built-in `20`.
+    pub row_height: Option<u32>,
+    /// Header strip height in pixels. `None` uses a built-in `24`.
+    pub header_height: Option<u32>,
+    /// Status strip height in pixels. `None` uses a built-in `20`.
+    pub status_height: Option<u32>,
+    /// Left/right padding inside a row, in pixels. `None` uses a built-in `8`.
+    pub padding: Option<u32>,
+}
+
 // ── Root config ───────────────────────────────────────────────────────────────
 
 /// The validated, fully-resolved terminal configuration.
@@ -542,6 +632,7 @@ pub struct Config {
     pub bar: BarConfig,
     pub monitor: MonitorConfig,
     pub launcher: LauncherConfig,
+    pub files: FilesConfig,
 }
 
 impl Default for Config {
@@ -558,6 +649,7 @@ impl Default for Config {
             bar: BarConfig::default(),
             launcher: LauncherConfig::default(),
             monitor: MonitorConfig::default(),
+            files: FilesConfig::default(),
         }
     }
 }
@@ -625,6 +717,7 @@ impl Config {
         cfg.apply_bar(&table)?;
         cfg.apply_monitor(&table)?;
         cfg.apply_launcher(&table)?;
+        cfg.apply_files(&table)?;
         Ok(cfg)
     }
 
@@ -1029,6 +1122,93 @@ impl Config {
         Ok(())
     }
 
+    /// Apply the `[files]` table, if present.
+    ///
+    /// Flatter than its siblings because every key is either a colour or a
+    /// pixel measurement -- see [`FilesConfig`] for what each one means and
+    /// [`Config::files_theme_colors`] for how unset keys resolve.
+    fn apply_files(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(files) = table.get_table("files") else {
+            return Ok(());
+        };
+
+        // Paired with the field it fills so a mistyped error label is
+        // visible on one line rather than six lines apart.
+        let colors: [(&str, &'static str, &mut Option<Color>); 15] = [
+            ("background", "files.background", &mut self.files.background),
+            ("text", "files.text", &mut self.files.text),
+            ("dir", "files.dir", &mut self.files.dir),
+            ("symlink", "files.symlink", &mut self.files.symlink),
+            ("broken", "files.broken", &mut self.files.broken),
+            ("error", "files.error", &mut self.files.error),
+            ("muted", "files.muted", &mut self.files.muted),
+            ("caret", "files.caret", &mut self.files.caret),
+            ("selection", "files.selection", &mut self.files.selection),
+            ("cursor", "files.cursor", &mut self.files.cursor),
+            ("header_bg", "files.header_bg", &mut self.files.header_bg),
+            ("status_bg", "files.status_bg", &mut self.files.status_bg),
+            (
+                "scrollbar_track",
+                "files.scrollbar_track",
+                &mut self.files.scrollbar_track,
+            ),
+            (
+                "scrollbar_thumb",
+                "files.scrollbar_thumb",
+                &mut self.files.scrollbar_thumb,
+            ),
+            ("filter_bg", "files.filter_bg", &mut self.files.filter_bg),
+        ];
+        for (key, field, slot) in colors {
+            if let Some(c) = files.get_color(key, field)? {
+                *slot = Some(c);
+            }
+        }
+
+        // Upper bounds are deliberately loose rather than tasteful: a 400px
+        // row is silly but harmless and someone on a HiDPI panel may want
+        // something this side of silly. What they stop is the degenerate
+        // end -- a zero row height would divide by zero when computing how
+        // many rows fit, and a negative one cannot be represented at all.
+        let metrics: [(&'static str, &'static str, i64, &'static str, &mut Option<u32>); 4] = [
+            (
+                "row_height",
+                "files.row_height",
+                4,
+                "must be between 4 and 512",
+                &mut self.files.row_height,
+            ),
+            (
+                "header_height",
+                "files.header_height",
+                0,
+                "must be between 0 and 512",
+                &mut self.files.header_height,
+            ),
+            (
+                "status_height",
+                "files.status_height",
+                0,
+                "must be between 0 and 512",
+                &mut self.files.status_height,
+            ),
+            (
+                "padding",
+                "files.padding",
+                0,
+                "must be between 0 and 512",
+                &mut self.files.padding,
+            ),
+        ];
+        for (key, field, lo, reason, slot) in metrics {
+            if let Some(n) = files.get_int_range(key, field, lo, 512, reason)? {
+                *slot = Some(u32::try_from(n).unwrap_or(0));
+            }
+        }
+
+        Ok(())
+    }
+
     /// The status bar's background color: `[bar].background` if set,
     /// otherwise mirrors `[colors].background` (the terminal's own
     /// background) -- so a bare bar `[bar]` table with no keys, or no
@@ -1323,5 +1503,165 @@ impl Config {
         self.launcher
             .highlight
             .unwrap_or_else(|| Color::from_rgb(0x31, 0x32, 0x44))
+    }
+
+    /// The file browser's window background: `[files].background` if set,
+    /// otherwise mirrors `[colors].background`.
+    #[must_use]
+    pub fn files_background(&self) -> Color {
+        self.files.background.unwrap_or(self.palette.background)
+    }
+
+    /// Row text: `[files].text` if set, otherwise mirrors
+    /// `[colors].foreground`.
+    #[must_use]
+    pub fn files_text(&self) -> Color {
+        self.files.text.unwrap_or(self.palette.foreground)
+    }
+
+    /// Directory names: `[files].dir` if set, otherwise mirrors
+    /// `[colors].blue` -- the colour `ls` has used for directories long
+    /// enough that it reads as "directory" without a legend.
+    #[must_use]
+    pub fn files_dir(&self) -> Color {
+        self.files.dir.unwrap_or(self.palette.blue)
+    }
+
+    /// Symlinks: `[files].symlink` if set, otherwise mirrors
+    /// `[colors].cyan`, again following `ls`.
+    #[must_use]
+    pub fn files_symlink(&self) -> Color {
+        self.files.symlink.unwrap_or(self.palette.cyan)
+    }
+
+    /// Broken symlinks: `[files].broken` if set, otherwise mirrors
+    /// `[colors].red`. Worth shouting about -- every operation on one
+    /// behaves surprisingly.
+    #[must_use]
+    pub fn files_broken(&self) -> Color {
+        self.files.broken.unwrap_or(self.palette.red)
+    }
+
+    /// Error text: `[files].error` if set, otherwise mirrors
+    /// `[colors].red`.
+    #[must_use]
+    pub fn files_error(&self) -> Color {
+        self.files.error.unwrap_or(self.palette.red)
+    }
+
+    /// Dimmed text -- sizes, counts, the status line: `[files].muted` if
+    /// set, otherwise mirrors `[colors].bright_black`, which is what that
+    /// palette slot is for.
+    #[must_use]
+    pub fn files_muted(&self) -> Color {
+        self.files.muted.unwrap_or(self.palette.bright_black)
+    }
+
+    /// The filter-box caret: `[files].caret` if set, otherwise mirrors
+    /// `[colors].yellow` so it stays visible against a selected row.
+    #[must_use]
+    pub fn files_caret(&self) -> Color {
+        self.files.caret.unwrap_or(self.palette.yellow)
+    }
+
+    /// The cursor row's outline: `[files].cursor` if set, otherwise mirrors
+    /// `[colors].blue`.
+    #[must_use]
+    pub fn files_cursor(&self) -> Color {
+        self.files.cursor.unwrap_or(self.palette.blue)
+    }
+
+    /// Selected-row fill: `[files].selection` if set, otherwise a lightened
+    /// background.
+    ///
+    /// Derived rather than a literal because this role has no `[colors]`
+    /// equivalent -- a terminal has no "selected row" -- and a hardcoded
+    /// dark slate would sit invisibly on a light-themed palette. See
+    /// [`Color::mix`] for the derivation.
+    #[must_use]
+    pub fn files_selection(&self) -> Color {
+        self.files
+            .selection
+            .unwrap_or_else(|| self.palette.background.mix(self.palette.foreground, 0.22))
+    }
+
+    /// The header strip: `[files].header_bg` if set, otherwise a background
+    /// nudged *away* from the foreground, so the chrome recedes behind the
+    /// list on dark and light palettes alike.
+    ///
+    /// Uses [`Color::recede_from`] rather than a negative [`Color::mix`]
+    /// because a pure-white background has nothing darker to recede to and
+    /// would leave the strip invisible.
+    #[must_use]
+    pub fn files_header_bg(&self) -> Color {
+        self.files
+            .header_bg
+            .unwrap_or_else(|| self.palette.background.recede_from(self.palette.foreground, 0.35))
+    }
+
+    /// The status strip: `[files].status_bg` if set, otherwise the same
+    /// derivation as [`Config::files_header_bg`], so the two strips match
+    /// by default while staying independently overridable.
+    #[must_use]
+    pub fn files_status_bg(&self) -> Color {
+        self.files.status_bg.unwrap_or_else(|| self.files_header_bg())
+    }
+
+    /// The scrollbar trough: `[files].scrollbar_track` if set, otherwise
+    /// the chrome fill, so the bar reads as part of the frame.
+    #[must_use]
+    pub fn files_scrollbar_track(&self) -> Color {
+        self.files
+            .scrollbar_track
+            .unwrap_or_else(|| self.files_header_bg())
+    }
+
+    /// The scrollbar thumb: `[files].scrollbar_thumb` if set, otherwise a
+    /// mid-tone that stays visible against its own track.
+    #[must_use]
+    pub fn files_scrollbar_thumb(&self) -> Color {
+        self.files
+            .scrollbar_thumb
+            .unwrap_or_else(|| self.palette.background.mix(self.palette.foreground, 0.38))
+    }
+
+    /// The focused filter box: `[files].filter_bg` if set, otherwise a
+    /// slightly lifted background -- enough to show focus, not enough to
+    /// compete with the selection.
+    #[must_use]
+    pub fn files_filter_bg(&self) -> Color {
+        self.files
+            .filter_bg
+            .unwrap_or_else(|| self.palette.background.mix(self.palette.foreground, 0.13))
+    }
+
+    /// Row height in pixels: `[files].row_height` if set, otherwise `20`.
+    ///
+    /// The bitmap font is 16px tall; 20 leaves 2px above and below without
+    /// making the list feel sparse.
+    #[must_use]
+    pub fn files_row_height(&self) -> u32 {
+        self.files.row_height.unwrap_or(20)
+    }
+
+    /// Header strip height in pixels: `[files].header_height` if set,
+    /// otherwise `24`.
+    #[must_use]
+    pub fn files_header_height(&self) -> u32 {
+        self.files.header_height.unwrap_or(24)
+    }
+
+    /// Status strip height in pixels: `[files].status_height` if set,
+    /// otherwise `20`.
+    #[must_use]
+    pub fn files_status_height(&self) -> u32 {
+        self.files.status_height.unwrap_or(20)
+    }
+
+    /// Left/right padding inside a row, in pixels: `[files].padding` if
+    /// set, otherwise `8`.
+    #[must_use]
+    pub fn files_padding(&self) -> u32 {
+        self.files.padding.unwrap_or(8)
     }
 }

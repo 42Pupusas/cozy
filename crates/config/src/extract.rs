@@ -8,7 +8,7 @@
 
 use shelby::{Table, Value};
 
-use crate::ConfigError;
+use crate::{Color, ConfigError};
 
 /// Typed, validating reads off a [`Table`], as methods instead of free
 /// functions that all happened to take `&Table` as their first argument.
@@ -30,6 +30,23 @@ pub trait TableExt<'t> {
 
     /// Get a boolean value by key, or `None` if missing / not a boolean.
     fn get_bool(&self, key: &str) -> Option<bool>;
+
+    /// Read an `#rrggbb` color, returning a typed validation error if the
+    /// key is present but unparseable. `field` is the qualified name used
+    /// in error messages (e.g. `"files.dir"`). Returns `Ok(None)` when
+    /// absent.
+    ///
+    /// Exists because the alternative -- the six-line `get_str` +
+    /// `parse_hex` + `ok_or(InvalidValue)` dance -- was already written out
+    /// about twenty times across the `[bar]`, `[launcher]` and `[monitor]`
+    /// tables, and `[files]` would have added fifteen more. Each copy
+    /// restates the error field name by hand, which is exactly the sort of
+    /// thing that gets copy-pasted and left pointing at the wrong key.
+    fn get_color(
+        &'t self,
+        key: &str,
+        field: &'static str,
+    ) -> Result<Option<Color>, ConfigError>;
 
     /// Read an integer in `[lo, hi]`, returning a typed validation error
     /// otherwise. `key` is the table-relative lookup key; `field` is the
@@ -91,6 +108,31 @@ impl<'t> TableExt<'t> for Table<'t> {
         match self.get(key)? {
             Value::Boolean(b) => Some(*b),
             _ => None,
+        }
+    }
+
+    fn get_color(
+        &'t self,
+        key: &str,
+        field: &'static str,
+    ) -> Result<Option<Color>, ConfigError> {
+        // A key that is present but not a string is a mistake worth
+        // reporting, not something to silently ignore -- `dir = 0x89b4fa`
+        // (a bare integer) is a plausible typo that would otherwise leave
+        // the default in place with no explanation.
+        match self.get(key) {
+            None => Ok(None),
+            Some(Value::String(s)) => Color::parse_hex(s.as_ref()).map_or(
+                Err(ConfigError::InvalidValue {
+                    field,
+                    reason: "invalid #rrggbb hex color",
+                }),
+                |c| Ok(Some(c)),
+            ),
+            Some(_) => Err(ConfigError::InvalidValue {
+                field,
+                reason: "expected an #rrggbb hex color string",
+            }),
         }
     }
 

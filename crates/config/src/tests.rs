@@ -594,6 +594,194 @@ fn config_error_display_io() {
     assert_eq!(e.to_string(), "io error: no such file");
 }
 
+// ── Color::mix ────────────────────────────────────────────────────────────────
+
+#[test]
+fn mixing_zero_and_one_returns_the_endpoints() {
+    let a = Color::from_rgb(0x00, 0x10, 0x20);
+    let b = Color::from_rgb(0xf0, 0xe0, 0xd0);
+    assert_eq!(a.mix(b, 0.0), a);
+    assert_eq!(a.mix(b, 1.0), b);
+}
+
+#[test]
+fn mixing_halfway_lands_between() {
+    let a = Color::from_rgb(0x00, 0x00, 0x00);
+    let b = Color::from_rgb(0xff, 0xff, 0xff);
+    assert_eq!(a.mix(b, 0.5), Color::from_rgb(0x80, 0x80, 0x80));
+}
+
+/// The property the file browser's chrome derivation depends on: a negative
+/// `t` moves *away* from `other`. On a dark palette that darkens, on a light
+/// one it lightens -- which is the whole reason chrome is derived rather
+/// than hardcoded.
+#[test]
+fn a_negative_mix_moves_away_from_the_other_color() {
+    let dark_base = Color::from_rgb(0x1e, 0x1e, 0x2e);
+    let pale_text = Color::from_rgb(0xcd, 0xd6, 0xf4);
+    let receded = dark_base.mix(pale_text, -0.35);
+    assert!(
+        receded.r < dark_base.r && receded.g < dark_base.g && receded.b < dark_base.b,
+        "on a dark theme, receding from the text must darken: {receded}"
+    );
+
+    let pale_base = Color::from_rgb(0xff, 0xff, 0xff);
+    let dark_text = Color::from_rgb(0x20, 0x20, 0x20);
+    let receded = pale_base.mix(dark_text, -0.35);
+    assert_eq!(
+        receded,
+        Color::from_rgb(0xff, 0xff, 0xff),
+        "pure white cannot lighten further; it must clamp, not wrap"
+    );
+}
+
+/// An extreme `t` must saturate rather than wrapping around to a wildly
+/// wrong hue -- wraparound here would be a spectacular visual bug.
+#[test]
+fn extreme_mix_factors_clamp_rather_than_wrapping() {
+    let a = Color::from_rgb(0x80, 0x80, 0x80);
+    let b = Color::from_rgb(0xff, 0xff, 0xff);
+    assert_eq!(a.mix(b, 100.0), Color::from_rgb(0xff, 0xff, 0xff));
+    assert_eq!(a.mix(b, -100.0), Color::from_rgb(0x00, 0x00, 0x00));
+}
+
+/// The property [`Color::recede_from`] exists to guarantee: a distinct
+/// shade for *every* palette, including the two extremes where a plain
+/// negative mix has nowhere to go and silently returns the input.
+#[test]
+fn receding_always_produces_a_distinct_shade() {
+    let cases = [
+        (Color::from_rgb(0xff, 0xff, 0xff), Color::from_rgb(0x00, 0x00, 0x00)),
+        (Color::from_rgb(0x00, 0x00, 0x00), Color::from_rgb(0xff, 0xff, 0xff)),
+        (Color::from_rgb(0x1e, 0x1e, 0x2e), Color::from_rgb(0xcd, 0xd6, 0xf4)),
+        (Color::from_rgb(0xfd, 0xf6, 0xe3), Color::from_rgb(0x65, 0x7b, 0x83)),
+        (Color::from_rgb(0x80, 0x80, 0x80), Color::from_rgb(0x80, 0x80, 0x80)),
+    ];
+    for (base, contrast) in cases {
+        let receded = base.recede_from(contrast, 0.35);
+        if base == contrast {
+            // Degenerate: nothing to contrast against. Must not panic; an
+            // equal result is the only honest answer.
+            continue;
+        }
+        assert_ne!(receded, base, "recede_from({base}, {contrast}) vanished");
+    }
+}
+
+// ── [files] ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn files_colors_mirror_the_terminal_palette_by_default() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.files_background(), cfg.palette.background);
+    assert_eq!(cfg.files_text(), cfg.palette.foreground);
+    assert_eq!(cfg.files_dir(), cfg.palette.blue);
+    assert_eq!(cfg.files_symlink(), cfg.palette.cyan);
+    assert_eq!(cfg.files_broken(), cfg.palette.red);
+    assert_eq!(cfg.files_error(), cfg.palette.red);
+    assert_eq!(cfg.files_muted(), cfg.palette.bright_black);
+    assert_eq!(cfg.files_caret(), cfg.palette.yellow);
+    assert_eq!(cfg.files_cursor(), cfg.palette.blue);
+}
+
+/// Re-theming the terminal must carry into the browser without the user
+/// touching `[files]` at all -- that is the point of the mirroring rule.
+#[test]
+fn retheming_the_terminal_moves_the_browser_with_it() {
+    let cfg = Config::parse("[colors]\nbackground = \"#fdf6e3\"\nblue = \"#268bd2\"\n");
+    assert_eq!(cfg.files_background(), Color::from_rgb(0xfd, 0xf6, 0xe3));
+    assert_eq!(cfg.files_dir(), Color::from_rgb(0x26, 0x8b, 0xd2));
+}
+
+#[test]
+fn files_overrides_win_over_the_mirrored_palette() {
+    let cfg = Config::parse("[files]\ndir = \"#ff0000\"\nmuted = \"#00ff00\"\n");
+    assert_eq!(cfg.files_dir(), Color::from_rgb(0xff, 0x00, 0x00));
+    assert_eq!(cfg.files_muted(), Color::from_rgb(0x00, 0xff, 0x00));
+    // Untouched keys still mirror.
+    assert_eq!(cfg.files_symlink(), cfg.palette.cyan);
+}
+
+/// The derived roles have no `[colors]` equivalent, so the thing that must
+/// hold is *contrast against what they sit on*, not a specific value.
+#[test]
+fn derived_chrome_stays_distinguishable_on_a_light_palette() {
+    let cfg = Config::parse("[colors]\nbackground = \"#ffffff\"\nforeground = \"#000000\"\n");
+    assert_ne!(cfg.files_header_bg(), cfg.files_background());
+    assert_ne!(cfg.files_selection(), cfg.files_background());
+    assert_ne!(cfg.files_scrollbar_thumb(), cfg.files_scrollbar_track());
+    assert_ne!(cfg.files_filter_bg(), cfg.files_background());
+}
+
+#[test]
+fn derived_chrome_stays_distinguishable_on_a_dark_palette() {
+    let cfg = Config::parse("");
+    assert_ne!(cfg.files_header_bg(), cfg.files_background());
+    assert_ne!(cfg.files_selection(), cfg.files_background());
+    assert_ne!(cfg.files_scrollbar_thumb(), cfg.files_scrollbar_track());
+    assert_ne!(cfg.files_filter_bg(), cfg.files_background());
+}
+
+#[test]
+fn the_status_strip_follows_the_header_unless_overridden() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.files_status_bg(), cfg.files_header_bg());
+
+    let cfg = Config::parse("[files]\nstatus_bg = \"#123456\"\n");
+    assert_eq!(cfg.files_status_bg(), Color::from_rgb(0x12, 0x34, 0x56));
+    assert_ne!(cfg.files_status_bg(), cfg.files_header_bg());
+}
+
+#[test]
+fn files_metrics_default_and_override() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.files_row_height(), 20);
+    assert_eq!(cfg.files_header_height(), 24);
+    assert_eq!(cfg.files_status_height(), 20);
+    assert_eq!(cfg.files_padding(), 8);
+
+    let cfg = Config::parse("[files]\nrow_height = 28\npadding = 12\n");
+    assert_eq!(cfg.files_row_height(), 28);
+    assert_eq!(cfg.files_padding(), 12);
+    assert_eq!(cfg.files_header_height(), 24);
+}
+
+#[test]
+fn files_bad_color_is_a_validation_error() {
+    let err = Config::fail("[files]\ndir = \"nope\"\n");
+    assert!(err.contains("files.dir"), "{err}");
+}
+
+/// A non-string colour is a plausible typo (`dir = 0x89b4fa`) and must be
+/// reported rather than silently leaving the default in place.
+#[test]
+fn files_non_string_color_is_reported_not_ignored() {
+    let err = Config::fail("[files]\ndir = 123\n");
+    assert!(err.contains("files.dir"), "{err}");
+}
+
+/// A zero row height would divide by zero when computing how many rows fit.
+#[test]
+fn a_zero_row_height_is_rejected() {
+    let err = Config::fail("[files]\nrow_height = 0\n");
+    assert!(err.contains("files.row_height"), "{err}");
+    assert!(err.contains('4'), "the message should state the real bound: {err}");
+}
+
+/// Chrome strips, unlike rows, may legitimately be collapsed to nothing.
+#[test]
+fn chrome_strips_may_be_zero_height() {
+    let cfg = Config::parse("[files]\nheader_height = 0\nstatus_height = 0\n");
+    assert_eq!(cfg.files_header_height(), 0);
+    assert_eq!(cfg.files_status_height(), 0);
+}
+
+#[test]
+fn a_negative_metric_is_rejected() {
+    let err = Config::fail("[files]\npadding = -4\n");
+    assert!(err.contains("files.padding"), "{err}");
+}
+
 #[test]
 fn config_error_display_invalid_value() {
     let e = ConfigError::InvalidValue {

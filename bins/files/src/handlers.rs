@@ -137,8 +137,8 @@ mod tests {
 
     impl Scratch {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir()
-                .join(format!("files-handlers-{label}-{}", std::process::id()));
+            let path =
+                std::env::temp_dir().join(format!("files-handlers-{label}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("create scratch dir");
             Self(path)
@@ -267,9 +267,9 @@ mod tests {
             "[Default Applications]\napplication/pdf=chrome.desktop\n",
         );
 
-        let cmd = h.command_for(&scratch.file("paper.pdf")).expect(
-            "NoDisplay hides an app from menus, it does not stop it opening files",
-        );
+        let cmd = h
+            .command_for(&scratch.file("paper.pdf"))
+            .expect("NoDisplay hides an app from menus, it does not stop it opening files");
         assert_eq!(cmd.program, "chrome");
     }
 
@@ -293,7 +293,10 @@ mod tests {
             "nvim.desktop",
             "[Desktop Entry]\nName=Neovim\nExec=nvim %F\nTerminal=true\nType=Application\n",
         );
-        let h = handlers(&scratch, "[Default Applications]\ntext/x-rust=nvim.desktop\n");
+        let h = handlers(
+            &scratch,
+            "[Default Applications]\ntext/x-rust=nvim.desktop\n",
+        );
 
         let cmd = h.command_for(&scratch.file("main.rs")).expect("resolved");
         assert_ne!(cmd.program, "nvim", "must be wrapped in a terminal");
@@ -407,7 +410,9 @@ mod tests {
             return;
         }
 
-        let cmd = h.command_for(&page).expect("a resolvable entry must yield a command");
+        let cmd = h
+            .command_for(&page)
+            .expect("a resolvable entry must yield a command");
         assert!(
             !cmd.program.is_empty(),
             "a resolved handler must name a program to run"

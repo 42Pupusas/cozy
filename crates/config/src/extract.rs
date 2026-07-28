@@ -42,11 +42,7 @@ pub trait TableExt<'t> {
     /// tables, and `[files]` would have added fifteen more. Each copy
     /// restates the error field name by hand, which is exactly the sort of
     /// thing that gets copy-pasted and left pointing at the wrong key.
-    fn get_color(
-        &'t self,
-        key: &str,
-        field: &'static str,
-    ) -> Result<Option<Color>, ConfigError>;
+    fn get_color(&'t self, key: &str, field: &'static str) -> Result<Option<Color>, ConfigError>;
 
     /// Read an integer in `[lo, hi]`, returning a typed validation error
     /// otherwise. `key` is the table-relative lookup key; `field` is the
@@ -111,11 +107,7 @@ impl<'t> TableExt<'t> for Table<'t> {
         }
     }
 
-    fn get_color(
-        &'t self,
-        key: &str,
-        field: &'static str,
-    ) -> Result<Option<Color>, ConfigError> {
+    fn get_color(&'t self, key: &str, field: &'static str) -> Result<Option<Color>, ConfigError> {
         // A key that is present but not a string is a mistake worth
         // reporting, not something to silently ignore -- `dir = 0x89b4fa`
         // (a bare integer) is a plausible typo that would otherwise leave

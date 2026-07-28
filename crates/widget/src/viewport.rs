@@ -146,7 +146,10 @@ impl ListViewport {
     /// requesting a repaint when the list is already hard against a stop.
     pub fn scroll_by(&mut self, delta: i32) -> bool {
         let before = self.offset;
-        self.offset = self.offset.saturating_add(delta).clamp(0, self.max_scroll());
+        self.offset = self
+            .offset
+            .saturating_add(delta)
+            .clamp(0, self.max_scroll());
         self.offset != before
     }
 
@@ -205,7 +208,8 @@ impl ListViewport {
         if row >= self.len {
             return None;
         }
-        let top = i64::try_from(row).unwrap_or(0) * i64::from(self.row_height) - i64::from(self.offset);
+        let top =
+            i64::try_from(row).unwrap_or(0) * i64::from(self.row_height) - i64::from(self.offset);
         i32::try_from(top).ok()
     }
 
@@ -404,7 +408,11 @@ mod tests {
         let mut v = viewport();
         v.scroll_to(60);
         v.set_len(1000);
-        assert_eq!(v.offset(), 60, "a refresh must not fling the user to the top");
+        assert_eq!(
+            v.offset(),
+            60,
+            "a refresh must not fling the user to the top"
+        );
     }
 
     #[test]
@@ -440,7 +448,10 @@ mod tests {
         // 100px viewport - 20px row = 80px step, not a full 100px.
         assert_eq!(v.offset(), 80);
         let rows = v.visible_rows();
-        assert!(rows.contains(&4), "the row at the old bottom edge is still shown");
+        assert!(
+            rows.contains(&4),
+            "the row at the old bottom edge is still shown"
+        );
     }
 
     #[test]

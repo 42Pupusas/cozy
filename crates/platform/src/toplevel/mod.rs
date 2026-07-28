@@ -33,9 +33,9 @@
 
 pub mod geometry;
 pub mod globals;
-pub mod lifecycle;
 pub mod keyboard;
 pub mod keysym;
+pub mod lifecycle;
 pub mod modifiers;
 pub mod pointer;
 pub mod shell;
@@ -43,9 +43,9 @@ pub mod window;
 
 pub use geometry::{Geometry, LogicalSize, PhysicalSize};
 pub use globals::{ToplevelGlobals, ToplevelGlobalsBuilder};
-pub use lifecycle::{Lifecycle, Phase};
 pub use keyboard::{KeyPress, KeyboardState, RepeatInfo};
 pub use keysym::Key;
+pub use lifecycle::{Lifecycle, Phase};
 pub use modifiers::ModifierState;
 pub use pointer::{PointerEventKind, PointerState, Position};
 pub use shell::ShellSurface;

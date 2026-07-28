@@ -293,7 +293,11 @@ mod tests {
         assert_eq!(due, 10 + 600, "the schedule restarts from the new press");
 
         let rep = k.tick(due).expect("a repeat");
-        assert_eq!(rep.key, Key::Char('b'), "the newest key repeats, not the old");
+        assert_eq!(
+            rep.key,
+            Key::Char('b'),
+            "the newest key repeats, not the old"
+        );
     }
 
     #[test]

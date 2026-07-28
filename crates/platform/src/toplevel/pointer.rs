@@ -292,7 +292,10 @@ mod tests {
         p.button(1, 0x110, true, mods());
         assert!(p.is_dragging());
         p.leave();
-        assert!(!p.is_dragging(), "a drag must not survive the pointer leaving");
+        assert!(
+            !p.is_dragging(),
+            "a drag must not survive the pointer leaving"
+        );
         assert_eq!(p.held(), None);
     }
 
@@ -343,7 +346,11 @@ mod tests {
     fn an_unmodelled_button_is_ignored_rather_than_misreported() {
         let mut p = PointerState::new();
         assert_eq!(p.button(1, 0x116, true, mods()), None);
-        assert_eq!(p.held(), None, "an unknown button must not register as held");
+        assert_eq!(
+            p.held(),
+            None,
+            "an unknown button must not register as held"
+        );
     }
 
     /// Only presses carry a usable serial; overwriting it on release would
@@ -364,7 +371,10 @@ mod tests {
         let Some(PointerEventKind::Press { modifiers, .. }) = ev else {
             panic!("expected a press");
         };
-        assert!(modifiers.ctrl(), "ctrl-click must arrive as a modified press");
+        assert!(
+            modifiers.ctrl(),
+            "ctrl-click must arrive as a modified press"
+        );
     }
 
     #[test]

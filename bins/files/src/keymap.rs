@@ -326,8 +326,14 @@ mod tests {
             map.translate(with_mods(Key::Char('a'), CTRL)),
             Some(Action::List(ListCommand::SelectAll))
         );
-        assert_eq!(map.translate(with_mods(Key::Char('r'), CTRL)), Some(Action::Refresh));
-        assert_eq!(map.translate(with_mods(Key::Char('q'), CTRL)), Some(Action::Quit));
+        assert_eq!(
+            map.translate(with_mods(Key::Char('r'), CTRL)),
+            Some(Action::Refresh)
+        );
+        assert_eq!(
+            map.translate(with_mods(Key::Char('q'), CTRL)),
+            Some(Action::Quit)
+        );
     }
 
     /// Caps Lock or Shift must not silently disable every shortcut.
@@ -344,7 +350,10 @@ mod tests {
     #[test]
     fn a_bare_letter_starts_typing_into_the_filter() {
         let map = list_map();
-        assert_eq!(map.translate(press(Key::Char('r'))), Some(Action::Insert('r')));
+        assert_eq!(
+            map.translate(press(Key::Char('r'))),
+            Some(Action::Insert('r'))
+        );
     }
 
     /// Space is a selection gesture, and a filter starting with an invisible
@@ -368,7 +377,10 @@ mod tests {
     fn letters_type_while_filtering() {
         let map = filter_map();
         assert!(map.is_filtering());
-        assert_eq!(map.translate(press(Key::Char('x'))), Some(Action::Insert('x')));
+        assert_eq!(
+            map.translate(press(Key::Char('x'))),
+            Some(Action::Insert('x'))
+        );
     }
 
     /// A space is perfectly valid *inside* a query -- it is only the leading
@@ -376,7 +388,10 @@ mod tests {
     #[test]
     fn a_space_types_normally_once_filtering_has_started() {
         let map = filter_map();
-        assert_eq!(map.translate(press(Key::Char(' '))), Some(Action::Insert(' ')));
+        assert_eq!(
+            map.translate(press(Key::Char(' '))),
+            Some(Action::Insert(' '))
+        );
     }
 
     #[test]
@@ -424,7 +439,10 @@ mod tests {
             filter_map().translate(press(Key::Backspace)),
             Some(Action::Edit(EditAction::Backspace))
         );
-        assert_eq!(list_map().translate(press(Key::Backspace)), Some(Action::GoUp));
+        assert_eq!(
+            list_map().translate(press(Key::Backspace)),
+            Some(Action::GoUp)
+        );
     }
 
     /// Similarly, Left must move the caret rather than leaving the directory.
@@ -440,7 +458,10 @@ mod tests {
     #[test]
     fn escape_cancels_and_tab_commits() {
         let map = filter_map();
-        assert_eq!(map.translate(press(Key::Escape)), Some(Action::CancelFilter));
+        assert_eq!(
+            map.translate(press(Key::Escape)),
+            Some(Action::CancelFilter)
+        );
         assert_eq!(map.translate(press(Key::Tab)), Some(Action::EndFilter));
     }
 

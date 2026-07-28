@@ -463,7 +463,8 @@ impl Toplevel {
             Some(PointerEvent::Motion) => Some(self.pointer.motion(ev.fixed(1), ev.fixed(2))),
             Some(PointerEvent::Button) => {
                 let pressed = ev.arg(3) == 1;
-                self.pointer.button(ev.serial(0).raw(), ev.arg(2), pressed, mods)
+                self.pointer
+                    .button(ev.serial(0).raw(), ev.arg(2), pressed, mods)
             }
             Some(PointerEvent::Axis) => self.pointer.axis(ev.arg(1), ev.fixed(2), mods),
             None => None,
@@ -495,8 +496,7 @@ impl Toplevel {
                 self.present.mark_dirty();
             }
             Some(KeyboardEvent::Modifiers) => {
-                let mods =
-                    ModifierState::from_wire(ev.arg(1), ev.arg(2), ev.arg(3), ev.arg(4));
+                let mods = ModifierState::from_wire(ev.arg(1), ev.arg(2), ev.arg(3), ev.arg(4));
                 self.keyboard.set_modifiers(mods);
                 // XKB owns what these masks mean for the live keymap, so
                 // they are fed through verbatim rather than reinterpreted.

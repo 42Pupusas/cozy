@@ -1170,7 +1170,13 @@ impl Config {
         // something this side of silly. What they stop is the degenerate
         // end -- a zero row height would divide by zero when computing how
         // many rows fit, and a negative one cannot be represented at all.
-        let metrics: [(&'static str, &'static str, i64, &'static str, &mut Option<u32>); 4] = [
+        let metrics: [(
+            &'static str,
+            &'static str,
+            i64,
+            &'static str,
+            &mut Option<u32>,
+        ); 4] = [
             (
                 "row_height",
                 "files.row_height",
@@ -1594,9 +1600,11 @@ impl Config {
     /// would leave the strip invisible.
     #[must_use]
     pub fn files_header_bg(&self) -> Color {
-        self.files
-            .header_bg
-            .unwrap_or_else(|| self.palette.background.recede_from(self.palette.foreground, 0.35))
+        self.files.header_bg.unwrap_or_else(|| {
+            self.palette
+                .background
+                .recede_from(self.palette.foreground, 0.35)
+        })
     }
 
     /// The status strip: `[files].status_bg` if set, otherwise the same
@@ -1604,7 +1612,9 @@ impl Config {
     /// by default while staying independently overridable.
     #[must_use]
     pub fn files_status_bg(&self) -> Color {
-        self.files.status_bg.unwrap_or_else(|| self.files_header_bg())
+        self.files
+            .status_bg
+            .unwrap_or_else(|| self.files_header_bg())
     }
 
     /// The scrollbar trough: `[files].scrollbar_track` if set, otherwise

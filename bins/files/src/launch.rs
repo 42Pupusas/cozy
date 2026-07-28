@@ -110,8 +110,7 @@ mod tests {
     /// copy of those rules.
     #[test]
     fn an_opener_resolves_through_its_handlers() {
-        let dir =
-            std::env::temp_dir().join(format!("files-opener-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("files-opener-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(
@@ -143,6 +142,11 @@ mod tests {
             Associations::default(),
             Vec::<PathBuf>::new(),
         ));
-        assert!(opener.handlers.command_for(Path::new("/tmp/x.png")).is_none());
+        assert!(
+            opener
+                .handlers
+                .command_for(Path::new("/tmp/x.png"))
+                .is_none()
+        );
     }
 }

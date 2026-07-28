@@ -25,9 +25,9 @@
 //! * **View rules carry across directories.** A user who turned on hidden
 //!   files means it until they turn it off, not until they open a folder.
 
+use fsmodel::DirectoryView;
 use fsmodel::entry::Entry;
 use fsmodel::reader::ReadError;
-use fsmodel::DirectoryView;
 use std::path::{Path, PathBuf};
 use widget::{ListCommand, ListPane, Mods, PaneResponse, TextInput};
 
@@ -53,7 +53,6 @@ impl Outcome {
     const fn redraw_if(changed: bool) -> Self {
         if changed { Self::Redraw } else { Self::Ignored }
     }
-
 }
 
 /// The file browser's whole state.
@@ -73,12 +72,7 @@ pub struct Browser {
 impl Browser {
     /// Open `path` in a pane of `width` x `height` pixels with `row_height`
     /// pixel rows.
-    pub fn open(
-        path: &Path,
-        width: i32,
-        height: i32,
-        row_height: i32,
-    ) -> Result<Self, ReadError> {
+    pub fn open(path: &Path, width: i32, height: i32, row_height: i32) -> Result<Self, ReadError> {
         let view = DirectoryView::open(path)?;
         let pane = ListPane::new(width, height, row_height, view.visible_len());
         Ok(Self {
@@ -523,7 +517,11 @@ mod tests {
         browser.act(Action::ToggleHidden);
         down(&mut browser);
         activate(&mut browser);
-        assert_eq!(browser.len(), 2, "the dotfile is still shown after descending");
+        assert_eq!(
+            browser.len(),
+            2,
+            "the dotfile is still shown after descending"
+        );
     }
 
     /// A query is scoped to the directory it was typed in: carrying it along
@@ -584,7 +582,11 @@ mod tests {
 
         type_text(&mut browser, "zzzz");
         assert_eq!(browser.len(), 0);
-        assert_eq!(browser.pane().cursor(), None, "no cursor into an empty list");
+        assert_eq!(
+            browser.pane().cursor(),
+            None,
+            "no cursor into an empty list"
+        );
         assert!(browser.pane().selection().is_empty());
     }
 

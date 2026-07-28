@@ -198,8 +198,8 @@ mod tests {
     /// `[files]` table present -- the mirroring rule, end to end.
     #[test]
     fn the_browser_follows_a_retheme_of_the_terminal() {
-        let cfg = config::Config::from_bytes(b"[colors]\nbackground = \"#fdf6e3\"\n")
-            .expect("parse");
+        let cfg =
+            config::Config::from_bytes(b"[colors]\nbackground = \"#fdf6e3\"\n").expect("parse");
         let theme = Theme::from_config(&cfg);
         assert_eq!(theme.background, Color::rgb(0xfd, 0xf6, 0xe3));
     }

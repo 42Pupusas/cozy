@@ -207,12 +207,7 @@ impl FilesWindow {
 
             let text_y = y + (theme.row_height - platform::font::GLYPH_H) / 2;
             let name = RowFormat::truncate(&RowFormat::name(entry), name_columns);
-            canvas.draw_text(
-                &name,
-                theme.padding,
-                text_y,
-                RowFormat::color(entry, theme),
-            );
+            canvas.draw_text(&name, theme.padding, text_y, RowFormat::color(entry, theme));
 
             let size = RowFormat::size(entry);
             // Right-align by padding the string rather than by measuring
@@ -278,8 +273,8 @@ impl FilesWindow {
         if filtering {
             let prefix = "filter: ";
             canvas.draw_text(prefix, theme.padding, text_y, theme.muted);
-            let query_x = theme.padding
-                + i32::try_from(prefix.len()).unwrap_or(0) * platform::font::GLYPH_W;
+            let query_x =
+                theme.padding + i32::try_from(prefix.len()).unwrap_or(0) * platform::font::GLYPH_W;
             let query = self.browser.filter().text();
             canvas.draw_text(query, query_x, text_y, theme.text);
             // The caret sits at the character offset of the byte caret, which
@@ -417,11 +412,12 @@ mod tests {
 
     #[test]
     fn columns_divide_the_width_by_the_glyph_cell() {
-        assert_eq!(
-            FilesWindow::columns(platform::font::GLYPH_W * 10),
-            10
-        );
+        assert_eq!(FilesWindow::columns(platform::font::GLYPH_W * 10), 10);
         assert_eq!(FilesWindow::columns(0), 0);
-        assert_eq!(FilesWindow::columns(-100), 0, "a negative width is no columns");
+        assert_eq!(
+            FilesWindow::columns(-100),
+            0,
+            "a negative width is no columns"
+        );
     }
 }

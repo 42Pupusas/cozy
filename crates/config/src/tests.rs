@@ -651,11 +651,26 @@ fn extreme_mix_factors_clamp_rather_than_wrapping() {
 #[test]
 fn receding_always_produces_a_distinct_shade() {
     let cases = [
-        (Color::from_rgb(0xff, 0xff, 0xff), Color::from_rgb(0x00, 0x00, 0x00)),
-        (Color::from_rgb(0x00, 0x00, 0x00), Color::from_rgb(0xff, 0xff, 0xff)),
-        (Color::from_rgb(0x1e, 0x1e, 0x2e), Color::from_rgb(0xcd, 0xd6, 0xf4)),
-        (Color::from_rgb(0xfd, 0xf6, 0xe3), Color::from_rgb(0x65, 0x7b, 0x83)),
-        (Color::from_rgb(0x80, 0x80, 0x80), Color::from_rgb(0x80, 0x80, 0x80)),
+        (
+            Color::from_rgb(0xff, 0xff, 0xff),
+            Color::from_rgb(0x00, 0x00, 0x00),
+        ),
+        (
+            Color::from_rgb(0x00, 0x00, 0x00),
+            Color::from_rgb(0xff, 0xff, 0xff),
+        ),
+        (
+            Color::from_rgb(0x1e, 0x1e, 0x2e),
+            Color::from_rgb(0xcd, 0xd6, 0xf4),
+        ),
+        (
+            Color::from_rgb(0xfd, 0xf6, 0xe3),
+            Color::from_rgb(0x65, 0x7b, 0x83),
+        ),
+        (
+            Color::from_rgb(0x80, 0x80, 0x80),
+            Color::from_rgb(0x80, 0x80, 0x80),
+        ),
     ];
     for (base, contrast) in cases {
         let receded = base.recede_from(contrast, 0.35);
@@ -765,7 +780,10 @@ fn files_non_string_color_is_reported_not_ignored() {
 fn a_zero_row_height_is_rejected() {
     let err = Config::fail("[files]\nrow_height = 0\n");
     assert!(err.contains("files.row_height"), "{err}");
-    assert!(err.contains('4'), "the message should state the real bound: {err}");
+    assert!(
+        err.contains('4'),
+        "the message should state the real bound: {err}"
+    );
 }
 
 /// Chrome strips, unlike rows, may legitimately be collapsed to nothing.

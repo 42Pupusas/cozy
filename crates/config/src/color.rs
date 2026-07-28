@@ -81,7 +81,11 @@ impl Color {
     #[must_use]
     pub fn recede_from(self, contrast: Self, t: f32) -> Self {
         let away = self.mix(contrast, -t);
-        if away == self { self.mix(contrast, t) } else { away }
+        if away == self {
+            self.mix(contrast, t)
+        } else {
+            away
+        }
     }
 
     /// Pack as `0x00_rr_gg_bb`.

@@ -559,7 +559,11 @@ mod tests {
         let mut pane = pane();
         assert!(!pane.select_row(50), "one past the end");
         assert!(!pane.select_row(usize::MAX));
-        assert_eq!(pane.cursor(), None, "a refused select must not move anything");
+        assert_eq!(
+            pane.cursor(),
+            None,
+            "a refused select must not move anything"
+        );
     }
 
     #[test]
@@ -601,7 +605,11 @@ mod tests {
         let cursor = pane.cursor();
         assert_eq!(pane.command(ListCommand::Scroll(3)), PaneResponse::Redraw);
         assert_eq!(pane.viewport().offset(), 3 * pane.viewport().row_height());
-        assert_eq!(pane.cursor(), cursor, "a wheel scroll must not move the cursor");
+        assert_eq!(
+            pane.cursor(),
+            cursor,
+            "a wheel scroll must not move the cursor"
+        );
     }
 
     #[test]

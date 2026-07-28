@@ -336,7 +336,11 @@ mod tests {
         s.select_only(9);
         assert_eq!(s.move_cursor(1, 10), Some(9), "must not wrap to the top");
         s.select_only(0);
-        assert_eq!(s.move_cursor(-1, 10), Some(0), "must not wrap to the bottom");
+        assert_eq!(
+            s.move_cursor(-1, 10),
+            Some(0),
+            "must not wrap to the bottom"
+        );
     }
 
     #[test]
@@ -442,7 +446,10 @@ mod tests {
         s.toggle(7);
         s.toggle(0);
         let rows = s.selected();
-        assert!(rows.windows(2).all(|w| w[0] < w[1]), "sorted+unique: {rows:?}");
+        assert!(
+            rows.windows(2).all(|w| w[0] < w[1]),
+            "sorted+unique: {rows:?}"
+        );
         for &row in rows {
             assert!(s.contains(row));
         }

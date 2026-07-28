@@ -152,8 +152,7 @@ impl Scrollbar {
         if travel <= 0 {
             return 0;
         }
-        let scrolled =
-            i64::from(thumb_top) * i64::from(viewport.max_scroll()) / i64::from(travel);
+        let scrolled = i64::from(thumb_top) * i64::from(viewport.max_scroll()) / i64::from(travel);
         i32::try_from(scrolled).unwrap_or_else(|_| viewport.max_scroll())
     }
 
@@ -210,7 +209,13 @@ mod tests {
         let bar = Scrollbar::new(200).with_min_thumb(1);
         let v = ListViewport::new(20, 100, 200);
         // 200 visible of 2000 content = one tenth of a 200px track.
-        assert_eq!(bar.thumb(&v), Thumb { offset: 0, length: 20 });
+        assert_eq!(
+            bar.thumb(&v),
+            Thumb {
+                offset: 0,
+                length: 20
+            }
+        );
     }
 
     #[test]
@@ -255,7 +260,13 @@ mod tests {
     fn an_empty_list_yields_a_full_length_thumb() {
         let bar = Scrollbar::new(200);
         let v = ListViewport::new(20, 0, 200);
-        assert_eq!(bar.thumb(&v), Thumb { offset: 0, length: 200 });
+        assert_eq!(
+            bar.thumb(&v),
+            Thumb {
+                offset: 0,
+                length: 200
+            }
+        );
     }
 
     #[test]

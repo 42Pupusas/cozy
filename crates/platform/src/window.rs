@@ -24,18 +24,19 @@ use crate::error::{Error, Result};
 use crate::event::RawEvent;
 use crate::id::{
     CallbackId, CompositorId, DataDeviceManagerId, KeyboardId, ObjectId, OutputId, PointerId,
-    RegistryId, SeatId, ShmId, SurfaceId, ToplevelId, WmBaseId, XdgSurfaceId,
+    RegistryId, SeatId, ShmId, WmBaseId,
 };
 use crate::keymap;
 use crate::protocol::Modifiers;
 use crate::protocol::{
-    self as proto, ButtonState, CompositorRequest, DataDeviceEvent, DataOfferEvent,
-    DataSourceEvent, Format, Key, KeyState, KeyboardEvent, PointerButton, PointerEvent,
-    PointerRequest, SeatCapability, SeatEvent, SeatRequest, SurfaceRequest, ToplevelEvent,
-    ToplevelRequest, WmBaseEvent, WmBaseRequest, XdgSurfaceEvent, XdgSurfaceRequest,
+    self as proto, ButtonState, DataDeviceEvent, DataOfferEvent, DataSourceEvent, Format, Key,
+    KeyState, KeyboardEvent, PointerButton, PointerEvent, PointerRequest, SeatCapability,
+    SeatEvent, SeatRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent,
+    XdgSurfaceEvent, XdgSurfaceRequest,
 };
 use crate::render;
 use crate::toplevel::lifecycle::Lifecycle;
+use crate::toplevel::shell::ShellSurface;
 use crate::wire::MessageBuilder;
 
 const EVENT_RING_CAP: usize = 1024;
@@ -184,9 +185,12 @@ pub struct TermWindow {
     #[allow(dead_code)]
     shm: ShmId,
     wm_base: WmBaseId,
-    surface: SurfaceId,
-    xdg_surface: XdgSurfaceId,
-    toplevel: ToplevelId,
+    /// The `wl_surface` -> `xdg_surface` -> `xdg_toplevel` chain, shared with
+    /// [`crate::toplevel`] rather than rebuilt here. The destroy ordering it
+    /// encapsulates is a protocol requirement (a toplevel is a child role
+    /// object of its surface), so it is worth having one implementation of
+    /// it rather than two that can drift.
+    shell: ShellSurface,
     seat: SeatId,
     pointer: Option<PointerId>,
     keyboard: Option<KeyboardId>,
@@ -353,16 +357,23 @@ impl Drop for TermWindow {
     /// before the underlying `wl_surface` (xdg-shell requires that order), all
     /// best-effort — we're shutting down, so errors are irrelevant.
     fn drop(&mut self) {
-        let _ = self
-            .sender
-            .request(MessageBuilder::new(self.toplevel, ToplevelRequest::Destroy));
+        // Same three requests, in the same protocol-mandated order, as
+        // `ShellSurface::destroy` -- but issued through the `Sender` rather
+        // than the `WindowSender` that method takes, because at drop time we
+        // own the connection outright and want the requests flushed on the
+        // way out.
         let _ = self.sender.request(MessageBuilder::new(
-            self.xdg_surface,
+            self.shell.toplevel,
+            ToplevelRequest::Destroy,
+        ));
+        let _ = self.sender.request(MessageBuilder::new(
+            self.shell.xdg_surface,
             XdgSurfaceRequest::Destroy,
         ));
-        let _ = self
-            .sender
-            .request(MessageBuilder::new(self.surface, SurfaceRequest::Destroy));
+        let _ = self.sender.request(MessageBuilder::new(
+            self.shell.surface,
+            SurfaceRequest::Destroy,
+        ));
     }
 }
 
@@ -394,51 +405,6 @@ impl TermWindow {
     /// [`render::Renderer::with_scale`]); learning the scale, in turn,
     /// requires an open connection with `wl_output` bound, which is exactly
     /// the setup this function does.
-    /// Create the `wl_surface`/`xdg_surface`/`xdg_toplevel` object chain,
-    /// set its buffer scale/title/`app_id`, and commit the initial (empty)
-    /// state. Split out of `new` -- this whole block is one self-contained
-    /// "stand up the toplevel" step, entirely Wayland-request plumbing with
-    /// no data dependency on anything `new` builds afterwards (backbuffer,
-    /// present state, the `Self` struct literal), so it doesn't need to
-    /// share `new`'s complexity budget.
-    fn create_toplevel_surface(
-        sender: &mut Sender,
-        compositor: CompositorId,
-        wm_base: WmBaseId,
-        scale: i32,
-        title: &str,
-    ) -> Result<(SurfaceId, XdgSurfaceId, ToplevelId)> {
-        let surface: SurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
-        )?;
-        // Tell the compositor our buffer is already at `scale`x native
-        // density -- matches the physical pixels the font was rasterized at
-        // above, so it composites us 1:1 with no resampling blur.
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::SetBufferScale).i32(scale))?;
-
-        let xdg_surface: XdgSurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(wm_base, WmBaseRequest::GetXdgSurface)
-                .new_id(xdg_surface)
-                .object(surface),
-        )?;
-
-        let toplevel: ToplevelId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(xdg_surface, XdgSurfaceRequest::GetToplevel).new_id(toplevel),
-        )?;
-        sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetTitle).string(title))?;
-        // Also advertise a fixed app_id. The title is human-facing and shells
-        // rewrite it at runtime (OSC 0/2), so it's a poor match key; app_id is
-        // stable, letting tools (e.g. scripts/stress/resize_storm.sh) target
-        // *this* window without also grabbing whatever terminal launched it.
-        sender.request(MessageBuilder::new(toplevel, ToplevelRequest::SetAppId).string(APP_ID))?;
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
-
-        Ok((surface, xdg_surface, toplevel))
-    }
-
     pub fn new(
         title: &str,
         cols: u16,
@@ -492,8 +458,14 @@ impl TermWindow {
         let (frames, shm_mem, pool) =
             Frame::create_pair(&mut sender, shm, width, height, buf_format)?;
 
-        let (surface, xdg_surface, toplevel) =
-            Self::create_toplevel_surface(&mut sender, compositor, wm_base, scale, title)?;
+        // `decoration_manager: None` is deliberate, not an oversight: the
+        // terminal has never asked for server-side decorations, and this
+        // convergence is meant to be invisible on screen. Passing the real
+        // manager here would hand the window a compositor titlebar it did
+        // not have before -- a visible behaviour change that belongs in its
+        // own commit, judged on its own merits.
+        let shell =
+            ShellSurface::create(&mut sender, compositor, wm_base, None, scale, title, APP_ID)?;
 
         let cursor = cursor::PointerCursor::create(&mut sender, shm, compositor, scale).ok();
 
@@ -538,9 +510,7 @@ impl TermWindow {
             compositor,
             shm,
             wm_base,
-            surface,
-            xdg_surface,
-            toplevel,
+            shell,
             seat,
             pointer: None,
             keyboard: None,
@@ -799,9 +769,7 @@ impl TermWindow {
         {
             self.bell_until = None;
             let title = self.base_title.clone();
-            self.window_tx.request(
-                MessageBuilder::new(self.toplevel, ToplevelRequest::SetTitle).string(&title),
-            );
+            self.shell.set_title(&self.window_tx, &title);
         }
 
         self.advance_autoscroll();
@@ -1012,8 +980,7 @@ impl TermWindow {
     /// (see [`Self::bell`]) knows what to restore afterward.
     pub fn set_title(&mut self, title: &str) {
         self.base_title = title.to_string();
-        self.window_tx
-            .request(MessageBuilder::new(self.toplevel, ToplevelRequest::SetTitle).string(title));
+        self.shell.set_title(&self.window_tx, title);
     }
 
     /// BEL (C0 0x07): visual bell. xdg-shell's core protocol has no
@@ -1026,9 +993,7 @@ impl TermWindow {
     pub fn bell(&mut self) {
         if self.bell_until.is_none() {
             let flash = format!("\u{1f514} {}", self.base_title);
-            self.window_tx.request(
-                MessageBuilder::new(self.toplevel, ToplevelRequest::SetTitle).string(&flash),
-            );
+            self.shell.set_title(&self.window_tx, &flash);
         }
         self.bell_until = Some(std::time::Instant::now() + BELL_FLASH);
     }
@@ -1189,7 +1154,7 @@ impl TermWindow {
         }
 
         // xdg_surface.configure
-        if ev.is(self.xdg_surface)
+        if ev.is(self.shell.xdg_surface)
             && ev.event::<XdgSurfaceEvent>() == Some(XdgSurfaceEvent::Configure)
         {
             self.handle_xdg_surface_configure(ev)?;
@@ -1197,13 +1162,15 @@ impl TermWindow {
         }
 
         // xdg_toplevel.close
-        if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Close) {
+        if ev.is(self.shell.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Close) {
             self.handle_toplevel_close();
             return Ok(true);
         }
 
         // xdg_toplevel.configure (resize)
-        if ev.is(self.toplevel) && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Configure) {
+        if ev.is(self.shell.toplevel)
+            && ev.event::<ToplevelEvent>() == Some(ToplevelEvent::Configure)
+        {
             self.handle_toplevel_configure(ev);
             return Ok(true);
         }
@@ -1310,18 +1277,14 @@ impl TermWindow {
     /// Answer an `xdg_wm_base.ping` with the matching `pong` -- keeps the
     /// compositor from deciding we've hung.
     fn handle_wm_base_ping(&self, ev: &RawEvent) {
-        self.window_tx.request(
-            MessageBuilder::new(self.wm_base, WmBaseRequest::Pong).u32(ev.serial(0).raw()),
-        );
+        ShellSurface::pong(&self.window_tx, self.wm_base, ev.serial(0).raw());
     }
 
     /// Ack an `xdg_surface.configure` and flip to `Mapped` -- the surface is
     /// now allowed its first `wl_surface.commit`.
     fn handle_xdg_surface_configure(&mut self, ev: &RawEvent) -> Result<()> {
-        self.window_tx.request(
-            MessageBuilder::new(self.xdg_surface, XdgSurfaceRequest::AckConfigure)
-                .u32(ev.serial(0).raw()),
-        );
+        self.shell
+            .ack_configure(&self.window_tx, ev.serial(0).raw());
         self.lifecycle.acked();
         self.maybe_present(None)
     }
@@ -2205,14 +2168,14 @@ impl TermWindow {
         let buf_w = self.width;
         let buf = self.present.frame_buffer(slot);
         self.window_tx.request(
-            MessageBuilder::new(self.surface, SurfaceRequest::Attach)
+            MessageBuilder::new(self.shell.surface, SurfaceRequest::Attach)
                 .object(buf)
                 .i32(0)
                 .i32(0),
         );
         for (y_px, height_px) in damage_rects {
             self.window_tx.request(
-                MessageBuilder::new(self.surface, SurfaceRequest::Damage)
+                MessageBuilder::new(self.shell.surface, SurfaceRequest::Damage)
                     .i32(0)
                     .i32(y_px)
                     .i32(buf_w)
@@ -2221,9 +2184,11 @@ impl TermWindow {
         }
         let cb: CallbackId = self.window_tx.alloc_id();
         self.window_tx
-            .request(MessageBuilder::new(self.surface, SurfaceRequest::Frame).new_id(cb));
-        self.window_tx
-            .request(MessageBuilder::new(self.surface, SurfaceRequest::Commit));
+            .request(MessageBuilder::new(self.shell.surface, SurfaceRequest::Frame).new_id(cb));
+        self.window_tx.request(MessageBuilder::new(
+            self.shell.surface,
+            SurfaceRequest::Commit,
+        ));
 
         self.present.finish_present(cb);
     }

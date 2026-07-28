@@ -660,7 +660,12 @@ impl BarWindow {
             for p in &mut self.backbuffer {
                 *p = bg_packed;
             }
-            let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height);
+            // The canvas carries this window's packing, so the painter's
+            // drawing calls (and `TextRenderer`'s glyph-edge blending, which
+            // reads the alpha back off the canvas) are correct without each
+            // one being handed `bg_alpha` separately.
+            let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height)
+                .with_format(platform::SurfaceFormat::with_bg_alpha(self.bg_alpha));
             paint(&mut canvas);
         }
 

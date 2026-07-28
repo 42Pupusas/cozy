@@ -6,7 +6,9 @@
 //! `cancelled` — that is what "the clipboard holds it" means on Wayland: there
 //! is no server-side storage, only a live client promising to serve bytes.
 
-use clipboard::{ClipboardOwner as PayloadOwner, ClipboardPayload, OwnerRequest, OwnerResponse};
+use clipboard::{
+    ClipboardOwner as PayloadOwner, ClipboardPayload, OwnerRequest, OwnerResponse, PendingSends,
+};
 use platform::conn::Sender;
 use platform::event::RawEvent;
 use platform::id::{
@@ -27,7 +29,14 @@ use std::path::PathBuf;
 pub struct ClipboardSession<'a> {
     payload: PayloadOwner<'a>,
     source: DataControlSourceId,
-    pending_mime: Option<String>,
+    /// Requests whose pipe has not arrived yet, oldest first.
+    ///
+    /// A queue rather than a single slot because a peer routinely asks for
+    /// several representations at once -- a browser pasting a screenshot wants
+    /// `image/png` *and* `text/uri-list` -- so two `send` messages can arrive
+    /// before either pipe does. See [`PendingSends`] for why order is the only
+    /// correlation available.
+    pending: PendingSends,
     cleanup_path: Option<PathBuf>,
 }
 
@@ -70,7 +79,7 @@ impl<'a> ClipboardSession<'a> {
         Ok(Self {
             payload: PayloadOwner::new(payload),
             source,
-            pending_mime: None,
+            pending: PendingSends::new(),
             cleanup_path,
         })
     }
@@ -94,14 +103,16 @@ impl<'a> ClipboardSession<'a> {
             match event.event::<DataControlSourceEvent>() {
                 Some(DataControlSourceEvent::Send) => {
                     // The mime arrives on the message; the pipe to write it
-                    // into arrives as the *next* event, out of band.
+                    // into arrives out of band in a later `Fd` event. Queue it
+                    // rather than overwrite: a second `send` may well land
+                    // before the first pipe does.
                     let Some(bytes) = event.wire_bytes() else {
                         return true;
                     };
                     let Some((mut wire, _)) = WireEvent::parse(bytes) else {
                         return true;
                     };
-                    self.pending_mime = Some(wire.string());
+                    self.pending.push(wire.string());
                 }
                 Some(DataControlSourceEvent::Cancelled) => {
                     let _ = self.payload.handle(OwnerRequest::Cancelled);
@@ -111,16 +122,27 @@ impl<'a> ClipboardSession<'a> {
             }
             return true;
         }
-        if let RawEvent::Fd(fds) = event
-            && let Some(fd) = fds.into_iter().next()
-        {
-            self.serve(fd);
+        // The reader forwards every fd that arrived with one receive batch as
+        // a single `Fd` event, so a batch carrying two requests carries two
+        // pipes. Serving only the first wrote the wrong payload into it and
+        // dropped the other -- closing it unanswered, which the peer reads as
+        // zero bytes and renders as an empty image.
+        if let RawEvent::Fd(fds) = event {
+            for fd in fds {
+                self.serve(fd);
+            }
         }
         true
     }
 
+    /// Answer one pipe with the bytes for the request it belongs to.
+    ///
+    /// Dropping `fd` without writing is the correct response to an
+    /// unrecognised request: closing the pipe tells the peer "nothing here",
+    /// whereas leaving it open would hang a reader waiting for an EOF that
+    /// never comes.
     fn serve(&mut self, fd: OwnedFd) {
-        let Some(mime) = self.pending_mime.take() else {
+        let Some(mime) = self.pending.claim() else {
             return;
         };
         let response = self.payload.handle(OwnerRequest::Send(mime));

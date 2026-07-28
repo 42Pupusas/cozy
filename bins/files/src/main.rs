@@ -18,6 +18,7 @@ mod breadcrumb;
 mod browser;
 mod columns;
 mod favorites;
+mod frame;
 mod handlers;
 mod keymap;
 mod kind_label;
@@ -27,6 +28,7 @@ mod options;
 mod row_format;
 mod sidebar;
 mod spacing;
+mod storage;
 mod test_support;
 mod theme;
 mod typography;
@@ -87,14 +89,25 @@ impl App {
             width: options.width,
             height: options.height,
         };
+        // The same two-column decomposition the painter uses, so the browser
+        // is laid out against the geometry it will actually be drawn into
+        // rather than a second, hand-maintained approximation of it.
+        let frame = frame::Frame::new(
+            size.width,
+            size.height,
+            sidebar.visible(),
+            theme.spacing,
+            theme.header_height,
+            theme.status_height,
+        );
         // The browser is built with the *logical* size, then corrected the
         // moment the compositor tells us the real physical geometry. Guessing
         // the scale here instead would give a first frame with the wrong
         // number of rows on any HiDPI screen.
         let browser = Browser::open(
             &options.path,
-            size.width - theme.list_x(sidebar.visible(), size.width),
-            theme.list_height(size.height),
+            frame.rows().w,
+            frame.rows().h,
             theme.row_height,
         )?;
 
@@ -114,7 +127,7 @@ impl App {
             favorites,
             platform::toplevel::PhysicalSize {
                 width: size.width,
-                height: theme.list_height(size.height),
+                height: size.height,
             },
         );
         // Adopt the true physical size before the first paint.

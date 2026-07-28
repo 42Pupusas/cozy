@@ -25,6 +25,9 @@ platform = { path = "../../crates/platform" }
 quetzalcoatl.workspace = true
 # Waking the UI thread from the reader thread.
 waker = { path = "../../crates/waker" }
+# Timestamping archived captures. Shared with the status bar and the trash
+# rather than reimplemented, so every local time in the workspace agrees.
+localtime = { path = "../../crates/localtime" }
 # PNG encode. This bin is exactly the consumer ixiptla-core's workspace entry
 # anticipated: capture produces RGBA8 scanlines, which is precisely what
 # `Encoder::encode` takes.

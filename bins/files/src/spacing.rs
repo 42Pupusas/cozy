@@ -168,6 +168,28 @@ impl Spacing {
         self.at(30.0)
     }
 
+    /// Height of the sidebar's storage footer (guide: 42px).
+    ///
+    /// The guide builds this from parts -- 14px of top padding, a ~14px
+    /// caption line, a 9px gap, the 2px meter and 2px of bottom padding --
+    /// and the sum is what the layout actually needs to reserve, so it is
+    /// stated once here rather than re-added at the call site.
+    #[must_use]
+    pub fn storage_height(self) -> i32 {
+        self.at(42.0)
+    }
+
+    /// Thickness of the storage meter's bar (guide: 2px).
+    ///
+    /// Numerically the same as [`Self::rule`] today, but named separately
+    /// because they are different things: one is a selection marker, the
+    /// other a data display. Collapsing them would couple a restyle of the
+    /// active-row rule to the thickness of a progress bar.
+    #[must_use]
+    pub fn meter_height(self) -> i32 {
+        self.at(2.0)
+    }
+
     /// Sidebar width (guide: 210px).
     #[must_use]
     pub fn sidebar_width(self) -> i32 {
@@ -197,6 +219,12 @@ impl Spacing {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn icon_button(self) -> i32 {
         self.at(30.0)
+    }
+
+    /// Width of one view-toggle button (guide: 31px square).
+    #[must_use]
+    pub fn view_button(self) -> i32 {
+        self.at(31.0)
     }
 
     /// Resting width of the filter control (guide: 200px).
@@ -234,6 +262,9 @@ mod tests {
         assert_eq!(s.status_height(), 35);
         assert_eq!(s.sidebar_width(), 210);
         assert_eq!(s.rail_width(), 58);
+        assert_eq!(s.storage_height(), 42);
+        assert_eq!(s.meter_height(), 2);
+        assert_eq!(s.view_button(), 31);
     }
 
     /// The scale steps must stay in ascending order at every size, or

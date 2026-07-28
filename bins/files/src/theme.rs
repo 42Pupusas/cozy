@@ -74,6 +74,21 @@ pub struct Theme {
     /// The accent: active location, selection, and feedback. Used sparingly
     /// -- per the guide it indicates state rather than decorating.
     pub accent: Color,
+    /// A quiet wash of the accent, for the fill *behind* accented content:
+    /// the active sidebar row and the selected half of the view toggle.
+    ///
+    /// Distinct from [`Self::accent`] because the guide uses the accent for
+    /// two different jobs -- a 2px rule at full strength, and a background at
+    /// a fraction of it. Painting a fill with the full accent would drown the
+    /// text sitting on top of it.
+    pub accent_surface: Color,
+    /// Text and glyphs for a control that exists but cannot be used yet.
+    ///
+    /// A distinct role from [`Self::muted`], which means "subordinate but
+    /// live" (a file size, a timestamp). Disabled means "not available", and
+    /// conflating the two would make working metadata look broken -- or, worse,
+    /// make a dead button look clickable.
+    pub disabled: Color,
 
     pub row_height: i32,
     pub header_height: i32,
@@ -124,6 +139,10 @@ impl Default for Theme {
             control_border: Color::rgb(0x31, 0x32, 0x44),
             focus_ring: Color::rgb(0x89, 0xb4, 0xfa),
             accent: Color::rgb(0x89, 0xb4, 0xfa),
+            accent_surface: Color::rgb(0x31, 0x32, 0x44),
+            // Between the background and muted: readable as a shape, clearly
+            // not as live text.
+            disabled: Color::rgb(0x4a, 0x4d, 0x60),
 
             // The bitmap font is 16px tall; 20 leaves 2px of breathing room
             // above and below without making the list feel sparse.
@@ -188,6 +207,13 @@ impl Theme {
             // convention the user would have to learn.
             focus_ring: cfg.files_cursor().into(),
             accent: cfg.files_cursor().into(),
+            // Derived rather than configured, for the same reason as the
+            // sidebar roles: a re-themed palette should carry the accent's
+            // backing wash with it instead of stranding a stale colour.
+            accent_surface: cfg.files_filter_bg().into(),
+            // Halfway between the muted text and the background it sits on,
+            // so it recedes under a light or a dark palette alike.
+            disabled: cfg.files_muted().mix(cfg.files_background(), 0.5).into(),
 
             row_height: px(cfg.files_row_height()),
             header_height: px(cfg.files_header_height()),
@@ -227,34 +253,11 @@ impl Theme {
         self
     }
 
-    /// The sidebar's width at a given window width, collapsing to the
-    /// guide's icon rail on a narrow window.
-    #[must_use]
-    pub fn sidebar_width_at(&self, window_width: i32) -> i32 {
-        if self.is_compact(window_width) {
-            self.spacing.rail_width()
-        } else {
-            self.sidebar_width
-        }
-    }
-
     /// Whether the window is narrow enough for the guide's compact rules:
     /// a collapsed sidebar rail and a dropped `modified` column.
     #[must_use]
     pub fn is_compact(&self, window_width: i32) -> bool {
         window_width < self.spacing.collapse_below()
-    }
-
-    /// The y coordinate where the column-header row begins.
-    #[must_use]
-    pub const fn column_header_top(&self) -> i32 {
-        self.header_height
-    }
-
-    /// The y coordinate where file rows begin, below the column headers.
-    #[must_use]
-    pub fn rows_top(&self) -> i32 {
-        self.header_height + self.spacing.column_header()
     }
 
     /// Adopt the metrics derived from the loaded type scale.
@@ -276,95 +279,11 @@ impl Theme {
         }
         self
     }
-
-    /// The x coordinate where the list pane begins.
-    ///
-    /// Takes the window width so a narrow window puts the list against the
-    /// collapsed rail rather than against the full-width sidebar it is no
-    /// longer drawing.
-    #[must_use]
-    pub fn list_x(&self, sidebar_visible: bool, window_width: i32) -> i32 {
-        if sidebar_visible {
-            self.sidebar_width_at(window_width)
-        } else {
-            0
-        }
-    }
-
-    /// Vertical space the *scrolling rows* get in a window of `height`
-    /// pixels -- the window less the toolbar, column headers and status.
-    ///
-    /// Clamped at zero so a window dragged smaller than its own chrome
-    /// yields an empty list rather than a negative height that would make
-    /// every downstream calculation nonsense.
-    #[must_use]
-    pub fn list_height(&self, height: i32) -> i32 {
-        let used = self.rows_top() + self.status_height;
-        if height > used { height - used } else { 0 }
-    }
-
-    /// The y coordinate where scrolling rows start.
-    #[must_use]
-    pub fn list_top(&self) -> i32 {
-        self.rows_top()
-    }
-
-    /// Vertical space the sidebar pane occupies: everything between the
-    /// toolbar and the status strip, including alongside the column headers.
-    #[must_use]
-    pub const fn pane_height(&self, height: i32) -> i32 {
-        let used = self.header_height + self.status_height;
-        if height > used { height - used } else { 0 }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{Color, Spacing, Theme};
-
-    #[test]
-    fn the_list_gets_what_the_chrome_does_not_use() {
-        let theme = Theme::default();
-        let height = 600;
-        assert_eq!(
-            theme.list_height(height),
-            height - theme.rows_top() - theme.status_height
-        );
-    }
-
-    /// The column headers sit between the toolbar and the rows, so the rows
-    /// must start below both -- otherwise the first file paints over the
-    /// headings.
-    #[test]
-    fn rows_start_below_the_column_headers() {
-        let theme = Theme::default();
-        assert!(theme.rows_top() > theme.column_header_top());
-        assert_eq!(theme.column_header_top(), theme.header_height);
-    }
-
-    /// The sidebar spans the column-header band too: it is a pane beside the
-    /// whole list, not just beside the scrolling rows.
-    #[test]
-    fn the_sidebar_pane_is_taller_than_the_scrolling_rows() {
-        let theme = Theme::default();
-        assert!(theme.pane_height(800) > theme.list_height(800));
-    }
-
-    /// A window dragged smaller than its own chrome must not produce a
-    /// negative list height -- every scroll calculation downstream would
-    /// silently produce nonsense.
-    #[test]
-    fn a_window_smaller_than_its_chrome_yields_an_empty_list() {
-        let theme = Theme::default();
-        assert_eq!(theme.list_height(10), 0);
-        assert_eq!(theme.list_height(0), 0);
-    }
-
-    #[test]
-    fn the_list_starts_below_the_header() {
-        let theme = Theme::default();
-        assert!(theme.list_top() >= theme.header_height);
-    }
 
     /// The guide's responsive rule: a narrow window collapses the sidebar to
     /// an icon rail so filenames keep their room.
@@ -373,10 +292,6 @@ mod tests {
         let theme = Theme::default().with_spacing(Spacing::new(13.0, 1.0));
         assert!(theme.is_compact(700));
         assert!(!theme.is_compact(1280));
-        assert_eq!(theme.sidebar_width_at(1280), theme.sidebar_width);
-        assert!(theme.sidebar_width_at(700) < theme.sidebar_width);
-        // …and the list must follow the rail, not the full-width pane.
-        assert_eq!(theme.list_x(true, 700), theme.sidebar_width_at(700));
     }
 
     /// The guide's geometry must actually arrive when nothing is configured.
@@ -465,16 +380,12 @@ mod tests {
             assert_ne!(t.control_border, t.toolbar_bg, "a control outline");
             assert_ne!(t.focus_ring, t.toolbar_bg, "the focus ring");
             assert_ne!(t.accent, t.background, "the accent");
+            assert_ne!(t.accent_surface, t.background, "the accent wash");
+            // Disabled must be distinguishable from live muted text, or a
+            // working timestamp reads as a dead control.
+            assert_ne!(t.disabled, t.muted, "disabled vs muted");
+            assert_ne!(t.disabled, t.toolbar_bg, "a disabled glyph");
         }
-    }
-
-    /// The list must start after the sidebar when it is shown, and at the
-    /// window edge when it is hidden -- otherwise rows paint under the pane.
-    #[test]
-    fn the_list_begins_after_the_sidebar_only_when_it_is_shown() {
-        let theme = Theme::default();
-        assert_eq!(theme.list_x(true, 1280), theme.sidebar_width);
-        assert_eq!(theme.list_x(false, 1280), 0);
     }
 
     /// Derived metrics replace the defaults, so a larger font grows the

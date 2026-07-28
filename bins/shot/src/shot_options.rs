@@ -39,6 +39,12 @@ pub struct ShotOptions {
     pub overlay_cursor: bool,
     /// Keep a Wayland clipboard owner alive and offer the image to paste.
     pub clipboard: bool,
+    /// Also keep a timestamped copy in the screenshot archive.
+    ///
+    /// Independent of `clipboard` on purpose: the interesting combination is
+    /// *both* (a keybind that copies and archives in one press), so this is a
+    /// separate flag rather than a mode that displaces clipboard publishing.
+    pub save: bool,
 }
 
 impl ShotOptions {
@@ -56,12 +62,14 @@ impl ShotOptions {
         let mut output_path = None;
         let mut overlay_cursor = false;
         let mut clipboard = false;
+        let mut save = false;
 
         while let Some(argument) = arguments.next() {
             let text = argument.to_string_lossy().into_owned();
             match text.as_str() {
                 "-c" | "--cursor" => overlay_cursor = true,
                 "-C" | "--clipboard" => clipboard = true,
+                "-S" | "--save" => save = true,
                 "-s" | "--select" => {
                     target = match target {
                         CaptureTarget::Output(name) => CaptureTarget::Selection(Some(name)),
@@ -105,6 +113,7 @@ impl ShotOptions {
             output_path,
             overlay_cursor,
             clipboard,
+            save,
         })
     }
 
@@ -174,6 +183,8 @@ impl ShotOptions {
                -g, --geometry GEOM   capture output-local region, as `X,Y WxH`\n  \
                -c, --cursor          include the cursor in the capture\n  \
                -C, --clipboard       offer the PNG through the Wayland clipboard\n  \
+               -S, --save            also keep a timestamped copy in\n                        \
+                             $SHOT_DIR (default ~/Images/Screenshots)\n  \
                -h, --help            show this help\n  \
                -v, --version         show the version\n"
         )
@@ -201,6 +212,36 @@ mod tests {
         assert_eq!(options.target, CaptureTarget::AllOutputs);
         assert_eq!(options.output_path, None);
         assert!(!options.overlay_cursor);
+    }
+
+    #[test]
+    fn saving_and_clipboard_are_independent_so_a_keybind_can_ask_for_both() {
+        // The whole point of the flag: one keypress copies *and* archives.
+        let options =
+            ShotOptions::parse(argv(&["--select", "--clipboard", "--save"])).expect("valid");
+        assert!(options.clipboard);
+        assert!(options.save);
+        assert_eq!(options.target, CaptureTarget::Selection(None));
+        // No path given: the archive decides the name, not the user.
+        assert_eq!(options.output_path, None);
+    }
+
+    #[test]
+    fn saving_is_off_unless_asked_for() {
+        assert!(!ShotOptions::parse(argv(&[])).expect("valid").save);
+        assert!(
+            !ShotOptions::parse(argv(&["--clipboard"]))
+                .expect("valid")
+                .save,
+            "clipboard mode must not silently start writing files"
+        );
+    }
+
+    #[test]
+    fn the_short_save_flag_matches_the_long_one() {
+        let short = ShotOptions::parse(argv(&["-S"])).expect("valid");
+        let long = ShotOptions::parse(argv(&["--save"])).expect("valid");
+        assert_eq!(short, long);
     }
 
     #[test]

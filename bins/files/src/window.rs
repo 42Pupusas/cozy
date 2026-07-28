@@ -16,10 +16,12 @@ use crate::breadcrumb::Breadcrumb;
 use crate::browser::{Browser, Outcome};
 use crate::columns::{Column, Columns};
 use crate::favorites::Favorites;
+use crate::frame::Frame;
 use crate::kind_label::KindLabel;
 use crate::moment::Moment;
 use crate::row_format::RowFormat;
 use crate::sidebar::{Sidebar, SidebarRow};
+use crate::storage::Storage;
 use crate::theme::Theme;
 use crate::typography::Typography;
 
@@ -74,6 +76,15 @@ pub struct FilesWindow {
     pending_open: Option<std::path::PathBuf>,
     /// When and where the last left-click landed, for double-click detection.
     last_click: Option<(u64, Position)>,
+    /// Disk usage for the open directory's filesystem, shown in the
+    /// sidebar's footer.
+    ///
+    /// Cached rather than read per frame: `statvfs` is a syscall, and at 60fps
+    /// a per-paint read would be thousands of pointless syscalls a minute for
+    /// a figure that changes on the scale of minutes. Refreshed when the
+    /// directory changes, which is also when it can become a *different*
+    /// filesystem.
+    storage: Option<Storage>,
 }
 
 impl FilesWindow {
@@ -97,7 +108,18 @@ impl FilesWindow {
             quit: false,
             pending_open: None,
             last_click: None,
+            // Left empty so `new` can stay const; the first paint fills it.
+            storage: None,
         }
+    }
+
+    /// Re-read the filesystem figures behind the sidebar footer.
+    ///
+    /// Called on navigation rather than per paint: crossing into a different
+    /// mount is the only thing that can change which filesystem is being
+    /// reported, and the fill level moves far slower than the frame rate.
+    fn refresh_storage(&mut self) {
+        self.storage = Storage::of(self.browser.path());
     }
 
     /// Bookmark (or un-bookmark) the directory currently open, persisting the
@@ -136,11 +158,25 @@ impl FilesWindow {
     /// list's width without any window resize -- and forgetting to re-layout
     /// there would leave the list hit-testing against a stale width.
     fn relayout(&mut self) {
-        let x = self.theme.list_x(self.sidebar.visible(), self.size.width);
-        self.browser.resize(
-            (self.size.width - x).max(0),
-            self.theme.list_height(self.size.height),
-        );
+        let rows = self.frame().rows();
+        self.browser.resize(rows.w.max(0), rows.h.max(0));
+    }
+
+    /// The window's resolved geometry.
+    ///
+    /// Every band the painter draws and every hit-test it performs goes
+    /// through here, so the two cannot disagree: a click lands on whatever
+    /// was painted under it by construction rather than by two parallel
+    /// arithmetic expressions being kept in step by hand.
+    fn frame(&self) -> Frame {
+        Frame::new(
+            self.size.width,
+            self.size.height,
+            self.sidebar.visible(),
+            self.theme.spacing,
+            self.theme.header_height,
+            self.theme.status_height,
+        )
     }
 
     /// Whether the user has asked to close the window.
@@ -173,7 +209,11 @@ impl FilesWindow {
             Outcome::Open(path) => self.pending_open = Some(path),
             Outcome::ToggleFavorite => self.toggle_favorite(),
             Outcome::ToggleSidebar => self.toggle_sidebar(),
-            Outcome::Ignored | Outcome::Redraw => {}
+            // A keyboard navigation may have crossed a mount boundary, so the
+            // footer is re-read on any redraw-worthy change. Cheap enough --
+            // one `statvfs` per keystroke, not per frame.
+            Outcome::Redraw => self.refresh_storage(),
+            Outcome::Ignored => {}
         }
     }
 
@@ -184,27 +224,27 @@ impl FilesWindow {
     /// line up with it -- and `None` over the sidebar, so a click on a place
     /// does not also land on the row beside it.
     fn to_pane(&self, at: Position) -> Option<(i32, i32)> {
-        let y = at.y - self.theme.list_top();
-        if y < 0 || y >= self.theme.list_height(self.size.height) {
+        let rows = self.frame().rows();
+        let y = at.y - rows.y;
+        if y < 0 || y >= rows.h {
             return None;
         }
-        let x = at.x - self.theme.list_x(self.sidebar.visible(), self.size.width);
-        if x < 0 {
+        let x = at.x - rows.x;
+        if x < 0 || x >= rows.w {
             return None;
         }
         Some((x, y))
     }
 
-    /// Whether `at` falls inside the places pane.
+    /// Whether `at` falls inside the places pane's clickable rows.
     ///
-    /// The pane begins at the toolbar rather than below the column headers,
-    /// matching where it is painted -- a mismatch here would leave a dead
-    /// strip at the top of the sidebar where clicks did nothing.
+    /// The sidebar now runs the full height of the window, so this is the
+    /// whole column *except* the storage footer -- which is a readout, not a
+    /// control, and must not navigate anywhere when clicked.
     fn in_sidebar(&self, at: Position) -> bool {
-        self.sidebar.visible()
-            && at.x < self.theme.sidebar_width_at(self.size.width)
-            && at.y >= self.theme.header_height
-            && at.y < self.size.height - self.theme.status_height
+        let frame = self.frame();
+        let body = frame.sidebar_body();
+        frame.has_sidebar() && at.x < body.w && at.y >= body.y && at.y < body.y + body.h
     }
 
     /// Whether this click, at `now`, continues a double-click gesture.
@@ -232,31 +272,120 @@ impl FilesWindow {
         u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Draw the toolbar: the breadcrumb path and the filter control.
+    /// Draw the toolbar: navigation affordances, the breadcrumb path, the
+    /// filter control and the view toggle.
     ///
-    /// The guide's toolbar also carries back/forward, a view switch and a
-    /// new-directory action. Those are deliberately not drawn yet: a control
-    /// that is visible but inert is worse than an absent one, because the
-    /// user learns it is broken. They arrive with the actions behind them.
+    /// Confined to the right column, per the guide's shell: the sidebar runs
+    /// past it, top to bottom.
     fn paint_toolbar(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        canvas.fill_rect(
-            Rect::new(0, 0, self.size.width, theme.header_height),
-            theme.toolbar_bg,
-        );
+        let bar = self.frame().toolbar();
+        canvas.fill_rect(bar, theme.toolbar_bg);
         // A hairline under the toolbar separates it from the list without
         // spending a whole row of vertical space on a gap.
         canvas.fill_rect(
             Rect::new(
-                0,
-                theme.header_height - theme.spacing.hairline(),
-                self.size.width,
+                bar.x,
+                bar.bottom() - theme.spacing.hairline(),
+                bar.w,
                 theme.spacing.hairline(),
             ),
             theme.sidebar_border,
         );
+        self.paint_nav_buttons(canvas);
         self.paint_breadcrumb(canvas);
         self.paint_filter_control(canvas);
+        self.paint_view_toggle(canvas);
+    }
+
+    /// Draw the back and forward affordances at the toolbar's left.
+    ///
+    /// The guide puts chevrons here. Icons are still deferred, so these are
+    /// drawn as the glyphs a monospace face definitely has -- and, crucially,
+    /// they are drawn *disabled* (muted, no hover fill) because there is no
+    /// history stack behind them yet. Showing them greyed is honest about
+    /// what the toolbar will hold without implying a working control: the
+    /// alternative, an enabled-looking button that does nothing, teaches the
+    /// user the application is broken.
+    fn paint_nav_buttons(&mut self, canvas: &mut Canvas<'_>) {
+        let theme = self.theme;
+        let bar = self.frame().toolbar();
+        let size = theme.spacing.icon_button();
+        let mut x = bar.x + theme.spacing.m();
+        let y = bar.y + (bar.h - size) / 2;
+        for glyph in ["\u{2039}", "\u{203a}"] {
+            // Never let the buttons crowd out the path itself, which is the
+            // one thing in the toolbar the user actually needs.
+            if x + size > bar.right() {
+                return;
+            }
+            let tier = &mut self.type_scale.title;
+            let text_w = tier.measure(glyph);
+            let text_y = y + (size - tier.line_height()) / 2;
+            tier.draw_text(
+                canvas,
+                glyph,
+                x + (size - text_w) / 2,
+                text_y,
+                theme.disabled,
+                theme.toolbar_bg,
+            );
+            x += size;
+        }
+    }
+
+    /// Where the breadcrumb path may start: after the navigation buttons.
+    fn breadcrumb_x(&self) -> i32 {
+        let theme = self.theme;
+        let bar = self.frame().toolbar();
+        bar.x + theme.spacing.m() + theme.spacing.icon_button() * 2 + theme.spacing.s()
+    }
+
+    /// Draw the list/grid view toggle at the toolbar's right end.
+    ///
+    /// Two segments in a shared outline, the active one filled -- the guide's
+    /// anatomy. Only `list` is implemented, so `grid` is drawn muted: the
+    /// toggle communicates the current view (which is real information) while
+    /// not offering a switch that would do nothing.
+    fn paint_view_toggle(&mut self, canvas: &mut Canvas<'_>) {
+        let theme = self.theme;
+        let bar = self.frame().toolbar();
+        let button = theme.spacing.view_button();
+        let height = theme.spacing.control_height();
+        let width = button * 2;
+        let x = bar.right() - theme.spacing.m() - width;
+        let y = bar.y + (bar.h - height) / 2;
+        // Dropped entirely rather than overlapped when the toolbar is too
+        // tight: the filter box and the path outrank it.
+        if x <= self.breadcrumb_x() {
+            return;
+        }
+        // The active segment is filled, which is what makes the pair read as
+        // a state rather than as two buttons.
+        canvas.fill_rect(Rect::new(x, y, button, height), theme.accent_surface);
+        canvas.draw_rect(Rect::new(x, y, width, height), theme.control_border);
+        for (i, (glyph, color)) in [("\u{2261}", theme.accent), ("\u{22ee}", theme.disabled)]
+            .into_iter()
+            .enumerate()
+        {
+            let bg = if i == 0 {
+                theme.accent_surface
+            } else {
+                theme.toolbar_bg
+            };
+            let tier = &mut self.type_scale.label;
+            let text_w = tier.measure(glyph);
+            let text_y = y + (height - tier.line_height()) / 2;
+            let seg_x = x + button * i32::try_from(i).unwrap_or(0);
+            tier.draw_text(
+                canvas,
+                glyph,
+                seg_x + (button - text_w) / 2,
+                text_y,
+                color,
+                bg,
+            );
+        }
     }
 
     /// Draw the breadcrumb path, most-significant segment first.
@@ -267,16 +396,20 @@ impl FilesWindow {
     fn paint_breadcrumb(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
         let crumbs = self.crumbs();
-        // The filter control owns the right end of the toolbar, so the path
-        // gets what is left after it and the gaps around it.
-        let reserved = theme.spacing.search_width() + theme.spacing.l() * 2;
-        let limit = self.size.width - reserved;
-        let mut x = theme.spacing.l();
+        let bar = self.frame().toolbar();
+        let mut x = self.breadcrumb_x();
+        // The filter control and view toggle own the right end of the
+        // toolbar, so the path gets what is left after them and their gaps.
+        let reserved = theme.spacing.search_width()
+            + theme.spacing.view_button() * 2
+            + theme.spacing.m() * 2
+            + theme.spacing.s();
+        let limit = bar.right() - x - reserved;
 
         let (shown, elided) = crumbs.tail(self.crumb_budget(limit));
         if elided {
             let label = &mut self.type_scale.label;
-            let y = label.baseline_y(theme.header_height);
+            let y = label.baseline_y(bar.h) + bar.y;
             x = label.draw_text(
                 canvas,
                 Breadcrumb::ELLIPSIS,
@@ -293,7 +426,7 @@ impl FilesWindow {
             // root crumb already reads as "/".
             if i > 0 || elided {
                 let label = &mut self.type_scale.label;
-                let y = label.baseline_y(theme.header_height);
+                let y = label.baseline_y(bar.h) + bar.y;
                 x = label.draw_text(canvas, "/", x, y, theme.muted, theme.toolbar_bg);
                 x += theme.spacing.xs();
             }
@@ -302,7 +435,7 @@ impl FilesWindow {
             } else {
                 (theme.muted, &mut self.type_scale.body)
             };
-            let y = tier.baseline_y(theme.header_height);
+            let y = tier.baseline_y(bar.h) + bar.y;
             x = tier.draw_text(canvas, &crumb.label, x, y, color, theme.toolbar_bg);
             x += theme.spacing.xs();
         }
@@ -346,11 +479,14 @@ impl FilesWindow {
             theme.spacing.search_width()
         };
         let height = theme.spacing.control_height();
-        let x = self.size.width - width - theme.spacing.l();
-        let y = (theme.header_height - height) / 2;
-        // Guard against a window too narrow to hold the control at all --
+        let bar = self.frame().toolbar();
+        // The view toggle sits to its right, so the filter box ends before it.
+        let toggle = theme.spacing.view_button() * 2 + theme.spacing.s();
+        let x = bar.right() - theme.spacing.m() - toggle - width;
+        let y = bar.y + (bar.h - height) / 2;
+        // Guard against a column too narrow to hold the control at all --
         // drawing it at a negative x would wrap around the canvas.
-        if x < theme.spacing.l() {
+        if x < self.breadcrumb_x() {
             return;
         }
         let rect = Rect::new(x, y, width, height);
@@ -395,11 +531,9 @@ impl FilesWindow {
     /// over a hairline, per the guide.
     fn paint_column_headers(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let y = theme.column_header_top();
-        let height = theme.spacing.column_header();
-        let left = theme.list_x(self.sidebar.visible(), self.size.width);
-        let width = (self.size.width - left).max(0);
-        canvas.fill_rect(Rect::new(left, y, width, height), theme.background);
+        let band = self.frame().column_headers();
+        let (y, height, left, width) = (band.y, band.h, band.x, band.w);
+        canvas.fill_rect(band, theme.background);
 
         let columns = self.list_columns();
         for cell in columns.cells() {
@@ -439,46 +573,60 @@ impl FilesWindow {
     /// stale copy would put the headings out of line with the data.
     fn list_columns(&self) -> Columns {
         let theme = self.theme;
-        let left = theme.list_x(self.sidebar.visible(), self.size.width);
+        let frame = self.frame();
         // The rows reserve the scrollbar gutter, so the headers must too or
         // the "size" heading floats away from the numbers below it.
         let content = self.browser.pane().content_width();
         Columns::new(
-            left + theme.padding,
-            (content - theme.padding * 2).max(0),
+            frame.content_x(),
+            // The pane's own width, not the frame's: the rows reserve a
+            // scrollbar gutter the frame does not know about, and the table
+            // must stop short of it rather than run underneath.
+            (content - frame.inset() * 2)
+                .max(0)
+                .min(frame.content_width()),
             theme.spacing.s(),
             theme.is_compact(self.size.width),
         )
     }
 
-    /// Draw the places sidebar: section headings, places, and bookmarks.
+    /// Draw the places sidebar: section headings, places, bookmarks, and the
+    /// storage footer pinned to the bottom.
+    ///
+    /// The column runs the *full* height of the window -- past the toolbar's
+    /// top and the status strip's bottom -- because in the guide's shell
+    /// those bands belong to the right column alone.
     fn paint_sidebar(&mut self, canvas: &mut Canvas<'_>) {
-        if !self.sidebar.visible() {
+        let frame = self.frame();
+        if !frame.has_sidebar() {
             return;
         }
         let theme = self.theme;
-        // The pane starts at the toolbar, not below the column headers: the
-        // headings belong to the list, and a sidebar that skipped that band
-        // would leave an unpainted notch at its top.
-        let top = theme.header_height;
-        let height = theme.pane_height(self.size.height);
-        let width = theme.sidebar_width_at(self.size.width);
+        let column = frame.sidebar();
+        let body = frame.sidebar_body();
+        // The places list is inset from the top so the first row does not
+        // collide with the toolbar's baseline across the seam.
+        let top = body.y + theme.spacing.l();
+        let width = column.w;
         // Below the guide's threshold the pane collapses to an icon rail.
         // With icons not yet drawn, labels are simply omitted rather than
         // painted clipped -- a half-cut word is worse than none.
         let compact = theme.is_compact(self.size.width);
-        canvas.fill_rect(Rect::new(0, top, width, height), theme.sidebar_bg);
-        // The divider carries the eye down the seam between the two panes.
+        canvas.fill_rect(column, theme.sidebar_bg);
+        // The divider carries the eye down the seam between the two panes,
+        // the full height of the window.
         canvas.fill_rect(
             Rect::new(
-                width - theme.spacing.hairline(),
-                top,
+                column.right() - theme.spacing.hairline(),
+                column.y,
                 theme.spacing.hairline(),
-                height,
+                column.h,
             ),
             theme.sidebar_border,
         );
+        self.paint_storage(canvas);
 
+        let theme = self.theme;
         let active = self.sidebar.index_of(self.browser.path());
         let row_h = theme.spacing.sidebar_row();
         // Collected first because drawing needs `&mut self.type_scale` while
@@ -486,9 +634,8 @@ impl FilesWindow {
         let rows: Vec<SidebarRow> = self.sidebar.rows().to_vec();
         for (i, row) in rows.iter().enumerate() {
             let y = top + i32::try_from(i).unwrap_or(0) * row_h;
-            // Stop at the bottom of the pane rather than painting under the
-            // status strip.
-            if y + row_h > top + height {
+            // Stop at the storage footer rather than painting through it.
+            if y + row_h > body.y + body.h {
                 break;
             }
             match row {
@@ -544,14 +691,104 @@ impl FilesWindow {
                     // The open directory is drawn in the accent; the rest in
                     // ordinary text, so exactly one row draws the eye.
                     let color = if is_active { theme.accent } else { theme.text };
-                    let body = &mut self.type_scale.body;
-                    let ty = y + (row_h - body.line_height()) / 2;
+                    let tier = &mut self.type_scale.body;
+                    let ty = y + (row_h - tier.line_height()) / 2;
                     let inset = theme.spacing.m();
                     let room = width - inset - theme.spacing.s();
-                    let shown = RowFormat::truncate(label, Self::columns_for(body, room));
-                    body.draw_text(canvas, &shown, inset, ty, color, bg);
+                    let shown = RowFormat::truncate(label, Self::columns_for(tier, room));
+                    tier.draw_text(canvas, &shown, inset, ty, color, bg);
                 }
             }
+        }
+    }
+
+    /// Draw the sidebar's storage footer: the filesystem, how full it is, and
+    /// a meter.
+    ///
+    /// Ambient information, which sets its whole treatment: the smallest type
+    /// tier, muted colour, and a 2px bar rather than a chunky progress
+    /// widget. When there is nothing meaningful to report -- a pseudo-
+    /// filesystem, an unreadable path -- the footer is simply absent rather
+    /// than showing a zeroed meter, which would look like a full disk's
+    /// opposite rather than like "no data".
+    fn paint_storage(&mut self, canvas: &mut Canvas<'_>) {
+        let theme = self.theme;
+        let Some(area) = self.frame().storage() else {
+            return;
+        };
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        canvas.fill_rect(area, theme.sidebar_bg);
+        // A rule above the footer separates it from the places it sits under,
+        // mirroring the guide's `border-top`.
+        canvas.fill_rect(
+            Rect::new(area.x, area.y, area.w, theme.spacing.hairline()),
+            theme.sidebar_border,
+        );
+
+        let inset = theme.spacing.m();
+        let usage = storage.usage();
+        // "61% of 128g" when there is room for it; the bare percentage when
+        // the sidebar is too narrow. The percentage is the part that must
+        // survive, so it is what the fallback keeps.
+        let percent = usage.summary();
+        let top = area.y + theme.spacing.m();
+        let room = area.w - inset * 2;
+        if room <= 0 {
+            return;
+        }
+
+        // The percentage is placed first and the device name gets what is
+        // left: a long mount path may be truncated, but the number -- the
+        // reason to look here at all -- is never the thing that is lost.
+        let detail = &mut self.type_scale.detail;
+        // Half the footer is the most the readout may claim before the device
+        // name it shares the line with becomes unreadable.
+        let percent = if detail.measure(&percent) * 2 > room {
+            usage.percent_label()
+        } else {
+            percent
+        };
+        let percent_w = detail.measure(&percent);
+        detail.draw_text(
+            canvas,
+            &percent,
+            area.x + area.w - inset - percent_w,
+            top,
+            theme.muted,
+            theme.sidebar_bg,
+        );
+        let name_room = room - percent_w - theme.spacing.s();
+        let shown = RowFormat::truncate(storage.device(), Self::columns_for(detail, name_room));
+        detail.draw_text(
+            canvas,
+            &shown,
+            area.x + inset,
+            top,
+            theme.muted,
+            theme.sidebar_bg,
+        );
+
+        // The meter: a full-width track with the used portion in the accent,
+        // so "how full" is legible without reading the number.
+        let track_h = theme.spacing.meter_height();
+        let track_y = top + self.type_scale.detail.line_height() + theme.spacing.s();
+        // Only drawn if it actually fits inside the footer -- a bar clipped by
+        // the window's bottom edge would misreport the fill level.
+        if track_y + track_h > area.bottom() {
+            return;
+        }
+        canvas.fill_rect(
+            Rect::new(area.x + inset, track_y, room, track_h),
+            theme.scrollbar_track,
+        );
+        let filled = usage.meter_width(room);
+        if filled > 0 {
+            canvas.fill_rect(
+                Rect::new(area.x + inset, track_y, filled, track_h),
+                theme.accent,
+            );
         }
     }
 
@@ -573,8 +810,8 @@ impl FilesWindow {
     /// Draw the visible rows across the guide's four columns.
     fn paint_rows(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let left = theme.list_x(self.sidebar.visible(), self.size.width);
-        let top = theme.list_top();
+        let band = self.frame().rows();
+        let (left, top) = (band.x, band.y);
         let content_width = self.browser.pane().content_width();
         let columns = self.list_columns();
         // One clock read for the whole frame: `modified` is relative to now,
@@ -683,18 +920,15 @@ impl FilesWindow {
             return;
         }
         let theme = &self.theme;
-        let x = theme.list_x(self.sidebar.visible(), self.size.width) + pane.gutter_x();
-        let track_h = theme.list_height(self.size.height);
-        let gutter = (self.size.width - x).max(0);
-        canvas.fill_rect(
-            Rect::new(x, theme.list_top(), gutter, track_h),
-            theme.scrollbar_track,
-        );
+        let band = self.frame().rows();
+        let x = band.x + pane.gutter_x();
+        let gutter = (band.right() - x).max(0);
+        canvas.fill_rect(Rect::new(x, band.y, gutter, band.h), theme.scrollbar_track);
         let thumb = pane.scrollbar().thumb(pane.viewport());
         canvas.fill_rect(
             Rect::new(
                 x + 2,
-                theme.list_top() + thumb.offset,
+                band.y + thumb.offset,
                 (gutter - 4).max(1),
                 thumb.length,
             ),
@@ -705,20 +939,21 @@ impl FilesWindow {
     /// Draw the status line: the filter box, or a summary.
     fn paint_status(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let y = self.size.height - theme.status_height;
+        let band = self.frame().status();
+        let y = band.y;
         let filtering = self.browser.is_filtering();
         let background = if filtering {
             theme.filter_bg
         } else {
             theme.status_bg
         };
+        canvas.fill_rect(band, background);
+        // A hairline above the strip, mirroring the one under the toolbar, so
+        // the right column reads as distinct bands.
         canvas.fill_rect(
-            Rect::new(0, y, self.size.width, theme.status_height),
-            background,
+            Rect::new(band.x, y, band.w, theme.spacing.hairline()),
+            theme.sidebar_border,
         );
-        // A hairline above the strip, mirroring the one under the header, so
-        // the window reads as three distinct bands.
-        canvas.fill_rect(Rect::new(0, y, self.size.width, 1), theme.sidebar_border);
 
         // An error outranks everything else: it explains why the list is not
         // what the user expected, and hiding it behind a file count would
@@ -726,11 +961,11 @@ impl FilesWindow {
         if let Some(error) = self.browser.error() {
             let message = error.message();
             let detail = &mut self.type_scale.detail;
-            let text_y = y + (theme.status_height - detail.line_height()) / 2;
+            let text_y = y + (band.h - detail.line_height()) / 2;
             detail.draw_text(
                 canvas,
                 &message,
-                theme.padding,
+                band.x + theme.spacing.m(),
                 text_y,
                 theme.error,
                 background,
@@ -749,11 +984,11 @@ impl FilesWindow {
             format!("{shown} of {total} entries")
         };
         let label = &mut self.type_scale.label;
-        let text_y = y + (theme.status_height - label.line_height()) / 2;
+        let text_y = y + (band.h - label.line_height()) / 2;
         label.draw_text(
             canvas,
             &summary,
-            theme.spacing.l(),
+            band.x + theme.spacing.m(),
             text_y,
             theme.muted,
             background,
@@ -776,24 +1011,25 @@ impl FilesWindow {
             ("select all", "ctrl+a")
         };
 
+        let band = self.frame().status();
         let label = &mut self.type_scale.label;
         let pad = theme.spacing.xs();
         let chord_w = label.measure(chord) + pad * 2;
         let cap_h = label.line_height() + pad;
         let gap = theme.spacing.s();
         let total = label.measure(description) + gap + chord_w;
-        let start = self.size.width - theme.spacing.l() - total;
-        // A window too narrow for the hint drops it rather than overlapping
+        let start = band.right() - theme.spacing.m() - total;
+        // A column too narrow for the hint drops it rather than overlapping
         // the entry count, which is the more useful of the two.
-        let count_end = theme.spacing.l() + label.measure("9999 of 9999 entries");
+        let count_end = band.x + theme.spacing.m() + label.measure("9999 of 9999 entries");
         if start < count_end {
             return;
         }
 
-        let text_y = y + (theme.status_height - label.line_height()) / 2;
+        let text_y = y + (band.h - label.line_height()) / 2;
         let after = label.draw_text(canvas, description, start, text_y, theme.muted, background);
         let cap_x = after + gap;
-        let cap_y = y + (theme.status_height - cap_h) / 2;
+        let cap_y = y + (band.h - cap_h) / 2;
         canvas.draw_rect(
             Rect::new(cap_x, cap_y, chord_w, cap_h),
             theme.control_border,
@@ -813,7 +1049,17 @@ impl Painter for FilesWindow {
         // is resized through the window's own resize path, which the event
         // loop drives from WindowEvent::Resized.
         self.size = size;
+        // The footer's figures are read once per directory, not per frame; the
+        // first paint is where the initial read happens, since `new` is const.
+        if self.storage.is_none() {
+            self.refresh_storage();
+        }
         canvas.clear(self.theme.background);
+        // The right column is filled explicitly rather than relying on the
+        // clear: the sidebar and the list may take different backgrounds, and
+        // painting the column that owns the list makes the seam between them
+        // independent of whatever the window's clear colour happens to be.
+        canvas.fill_rect(self.frame().main(), self.theme.background);
         self.paint_toolbar(canvas);
         self.paint_sidebar(canvas);
         self.paint_column_headers(canvas);
@@ -841,7 +1087,13 @@ impl Painter for FilesWindow {
                 // A click in the places pane navigates and goes no further:
                 // it must not also be routed to the list beside it.
                 if self.in_sidebar(at) {
-                    let y = at.y - self.theme.header_height;
+                    // Rows begin at the sidebar's own inset, matching where
+                    // `paint_sidebar` starts drawing them -- a mismatch here
+                    // would offset every click by one row.
+                    let y = at.y - self.frame().sidebar_body().y - self.theme.spacing.l();
+                    if y < 0 {
+                        return;
+                    }
                     if let Some(path) = self
                         .sidebar
                         .row_at(y, self.theme.spacing.sidebar_row())
@@ -850,6 +1102,8 @@ impl Painter for FilesWindow {
                     {
                         let outcome = self.browser.go_to(&path);
                         self.apply(outcome);
+                        // A new directory may live on a different filesystem.
+                        self.refresh_storage();
                     }
                     return;
                 }
@@ -879,7 +1133,8 @@ impl Painter for FilesWindow {
                 // inside the list: a scrollbar drag that wanders over the
                 // header must keep scrolling, exactly as it does everywhere
                 // else. The pane ignores it unless a drag is live.
-                let outcome = self.browser.motion(at.y - self.theme.list_top());
+                let rows_top = self.frame().rows().y;
+                let outcome = self.browser.motion(at.y - rows_top);
                 self.apply(outcome);
             }
             PointerEventKind::Scroll { lines, .. } => {

@@ -8,11 +8,13 @@
 mod history;
 mod incoming;
 mod offer_registry;
+mod pending_sends;
 mod storage;
 
 pub use history::{ClipboardHistory, HistoryEntry};
 pub use incoming::{IncomingClipboard, IncomingState};
 pub use offer_registry::OfferRegistry;
+pub use pending_sends::PendingSends;
 pub use storage::{HistoryStore, HistoryStoreError};
 
 /// A byte payload advertised under one MIME type.

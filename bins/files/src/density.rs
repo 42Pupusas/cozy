@@ -50,16 +50,34 @@ impl Density {
     /// separators. Density is one perceptual property, so it is one number
     /// set here rather than three independently-tuned knobs.
     pub const COMPACT: Self = Self {
-        // 49px -> ~30px. The guide's row seats an icon we do not draw; a
+        // 49px -> ~25px. The guide's row seats an icon we do not draw; a
         // text-only row needs roughly its line height plus a little air.
-        row: 0.62,
+        //
+        // The target is not an abstract 'tight' but a concrete one: the
+        // *terminal's* line pitch, since the two windows sit side by side on
+        // this desktop and a file list at 1.5x the terminal's rhythm reads as
+        // a different application rather than a sibling of it. Measured from a
+        // screenshot of both at once -- the terminal runs ~25px between
+        // baselines at 14px type, and this lands the list on the same pitch.
+        //
+        // Deliberately NOT tighter than the terminal: rows here are pointer
+        // targets, not just lines of text, so matching is the floor and
+        // undercutting it would trade a real click affordance for nothing.
+        row: 0.52,
         // 12px -> 8px, landing on the rhythm's S step rather than between
         // steps, so the tightened padding is still one of the guide's values.
         pad: 0.66,
         // Filenames stop being the configured size exactly (see
         // `Typography::BODY`) -- a file list is scanned, not read, and the
         // configured size is chosen for terminal prose.
-        text: 0.88,
+        //
+        // Lower than the geometric ratio alone would suggest, because the
+        // browser draws a *proportional* face where the terminal draws a
+        // monospace one: at an identical pixel size the proportional face
+        // reads visibly larger (taller x-height, no fixed advance padding),
+        // which is why the list looked oversized next to the terminal even
+        // though its configured size was already the smaller number.
+        text: 0.82,
     };
 
     /// Scale a guide row or band height.
@@ -141,8 +159,35 @@ mod tests {
     #[test]
     fn the_compact_geometry_lands_on_its_intended_numbers() {
         let d = Density::COMPACT;
-        assert_eq!(d.row(49), 30, "the list row");
+        assert_eq!(d.row(49), 25, "the list row");
         assert_eq!(d.pad(12), 8, "padding lands on the rhythm's S step");
+    }
+
+    /// The reason [`Density::COMPACT`] has the numbers it has: the browser
+    /// must share the terminal's vertical rhythm, because the two windows are
+    /// tiled side by side and a mismatched pitch is what made the file list
+    /// read as a foreign application.
+    ///
+    /// Stated as a range rather than an equality: the terminal's pitch is a
+    /// font metric we do not control from here, so pinning one pixel would
+    /// make this test a tripwire for any font change. What must hold is that
+    /// the list row stays in the terminal's neighbourhood -- never 1.5x it,
+    /// which is the bug this encodes, and never *under* it, since these rows
+    /// are click targets.
+    #[test]
+    fn a_list_row_keeps_the_terminals_pitch() {
+        // The terminal's line pitch at the shipped 14px type, measured from a
+        // screenshot of both windows in one frame.
+        const TERMINAL_PITCH: i32 = 25;
+        let row = Density::COMPACT.row(49);
+        assert!(
+            row >= TERMINAL_PITCH,
+            "a row is a pointer target and must not undercut the terminal: {row} < {TERMINAL_PITCH}"
+        );
+        assert!(
+            row < TERMINAL_PITCH * 3 / 2,
+            "a row 1.5x the terminal's pitch is the mismatch this policy exists to fix: {row} vs {TERMINAL_PITCH}"
+        );
     }
 
     /// Nothing may collapse to zero, at any guide value, or the layout

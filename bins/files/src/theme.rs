@@ -220,7 +220,15 @@ impl Theme {
     /// Low on purpose: hover is transient feedback that follows the pointer,
     /// and a strong fill flashing under the cursor as it crosses a list is
     /// noise. It only has to be *findable*, not loud.
-    const HOVER_WASH: f32 = 0.14;
+    ///
+    /// Raised from 0.14 after measuring the result rather than trusting the
+    /// fraction: against this palette's near-black `#181616` list background,
+    /// 0.14 of the directory colour landed on `#282a2c` -- eighteen levels of
+    /// lift, which reads as "slightly less black" rather than as a highlight.
+    /// The trap is that a *fraction* of a very dark surface is a very small
+    /// absolute step, which is the same mistake 74d250f fixed for the chrome
+    /// shades. Still the quieter of the two washes, just now actually visible.
+    const HOVER_WASH: f32 = 0.22;
 
     /// The same for a selection, which is a state the user chose and expects
     /// to stay put. Comfortably ahead of [`Self::HOVER_WASH`] so a selected

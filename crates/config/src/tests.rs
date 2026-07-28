@@ -596,6 +596,80 @@ fn config_error_display_io() {
 
 // ── Color::mix ────────────────────────────────────────────────────────────────
 
+/// Luma must be weighted, not a channel average: the eye reads green as far
+/// brighter than blue, and an average would call these two equal.
+#[test]
+fn green_reads_brighter_than_blue_at_the_same_channel_value() {
+    let green = Color::from_rgb(0x00, 0xff, 0x00);
+    let blue = Color::from_rgb(0x00, 0x00, 0xff);
+    assert!(
+        green.luma() > blue.luma() * 4.0,
+        "green {} vs blue {}",
+        green.luma(),
+        blue.luma()
+    );
+}
+
+/// The endpoints, so the scale is anchored.
+#[test]
+fn luma_spans_black_to_white() {
+    assert!(Color::from_rgb(0x00, 0x00, 0x00).luma() < 0.01);
+    assert!((Color::from_rgb(0xff, 0xff, 0xff).luma() - 255.0).abs() < 0.01);
+}
+
+/// The point of `at_luma_of`: two inks end up equally bright, so any
+/// remaining visible difference between them is hue rather than lightness.
+#[test]
+fn equalising_luma_leaves_only_hue_between_two_inks() {
+    let cool = Color::from_rgb(0x8b, 0xa4, 0xb0);
+    let pale = Color::from_rgb(0xc5, 0xc9, 0xc5);
+    let matched = cool.at_luma_of(pale);
+    assert!(
+        (matched.luma() - pale.luma()).abs() < 2.0,
+        "luma must match within rounding: {} vs {}",
+        matched.luma(),
+        pale.luma()
+    );
+    assert_ne!(matched, pale, "matching brightness must not erase the hue");
+}
+
+/// Hue is the thing being preserved, so the channel *ordering* must survive:
+/// a blue-dominant ink must stay blue-dominant after rescaling.
+#[test]
+fn equalising_luma_preserves_which_channel_dominates() {
+    let cool = Color::from_rgb(0x8b, 0xa4, 0xb0);
+    assert!(cool.b > cool.r, "precondition: this ink is blue-leaning");
+    let brightened = cool.at_luma_of(Color::from_rgb(0xff, 0xff, 0xff));
+    assert!(
+        brightened.b >= brightened.r,
+        "the blue lean must survive rescaling: {brightened}"
+    );
+}
+
+/// Black has no hue to scale and no ratio to preserve; it must be returned
+/// as-is rather than dividing by zero and producing a NaN.
+#[test]
+fn black_has_no_hue_to_rescale() {
+    let black = Color::from_rgb(0x00, 0x00, 0x00);
+    assert_eq!(black.at_luma_of(Color::from_rgb(0xff, 0xff, 0xff)), black);
+}
+
+/// Rescaling to a brightness the hue cannot reach must clamp per channel
+/// rather than wrapping into a wildly wrong colour.
+#[test]
+fn an_unreachable_target_clamps_rather_than_wrapping() {
+    let dim_blue = Color::from_rgb(0x00, 0x00, 0x40);
+    let result = dim_blue.at_luma_of(Color::from_rgb(0xff, 0xff, 0xff));
+    assert_eq!(result.b, 0xff, "the dominant channel saturates");
+    // The zero channels must stay zero: 0 * anything is 0, so a non-zero red
+    // or green here would mean the scaling had wrapped rather than clamped.
+    assert_eq!(
+        (result.r, result.g),
+        (0x00, 0x00),
+        "clamping must not invent colour in empty channels: {result}"
+    );
+}
+
 #[test]
 fn mixing_zero_and_one_returns_the_endpoints() {
     let a = Color::from_rgb(0x00, 0x10, 0x20);

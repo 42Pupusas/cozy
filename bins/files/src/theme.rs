@@ -241,8 +241,17 @@ impl Theme {
     /// strengths, and the thing that must hold is that all four use the *same*
     /// derivation -- otherwise the directory and file highlights end up on
     /// subtly different curves and only one of them looks right.
-    fn wash(surface: config::Color, ink: config::Color, t: f32) -> Color {
-        surface.mix(ink, t).into()
+    ///
+    /// `ink` is first re-scaled to the brightness of `reference` so that the
+    /// directory and file highlights differ in *hue* rather than in lightness.
+    /// Without this the two washes are two greys at different brightness --
+    /// which the eye reads as one colour at two opacities, not as two colours.
+    /// This palette is the case in point: `dir` (`#8ba4b0`) is noticeably
+    /// darker than `text` (`#c5c9c5`), so at the same wash strength the file
+    /// fill simply came out lighter than the directory fill, and the type
+    /// distinction was invisible on screen even though the values differed.
+    fn wash(surface: config::Color, ink: config::Color, reference: config::Color, t: f32) -> Color {
+        surface.mix(ink.at_luma_of(reference), t).into()
     }
 
     /// Derive every colour and measurement from `cfg`, mirroring
@@ -296,15 +305,30 @@ impl Theme {
             // `[files].text`, so re-theming those moves the highlights with
             // them instead of stranding four hand-picked shades. The two
             // strengths keep selection ahead of hover on the same row.
-            hover_dir: Self::wash(cfg.files_background(), cfg.files_dir(), Self::HOVER_WASH),
-            hover_file: Self::wash(cfg.files_background(), cfg.files_text(), Self::HOVER_WASH),
+            // `files_text` is the brightness reference for both kinds, so the
+            // directory ink contributes only its hue and the two fills sit at
+            // one lightness -- see `Self::wash`.
+            hover_dir: Self::wash(
+                cfg.files_background(),
+                cfg.files_dir(),
+                cfg.files_text(),
+                Self::HOVER_WASH,
+            ),
+            hover_file: Self::wash(
+                cfg.files_background(),
+                cfg.files_text(),
+                cfg.files_text(),
+                Self::HOVER_WASH,
+            ),
             selection_dir: Self::wash(
                 cfg.files_background(),
                 cfg.files_dir(),
+                cfg.files_text(),
                 Self::SELECTION_WASH,
             ),
             selection_file: Self::wash(
                 cfg.files_background(),
+                cfg.files_text(),
                 cfg.files_text(),
                 Self::SELECTION_WASH,
             ),
@@ -629,6 +653,50 @@ background = "#181616"
             // working timestamp reads as a dead control.
             assert_ne!(t.disabled, t.muted, "disabled vs muted");
             assert_ne!(t.disabled, t.toolbar_bg, "a disabled glyph");
+        }
+    }
+
+    /// The two kinds must be told apart by *hue*, not by brightness.
+    ///
+    /// The shipped bug this pins: `[files].dir` is darker than `[files].text`
+    /// on this palette, so washing each at the same strength produced two
+    /// greys of different lightness -- which reads as one colour at two
+    /// opacities rather than as two colours, and the type distinction was
+    /// invisible on screen even though the stored values differed.
+    ///
+    /// Asserted as a blue-over-red *lean* rather than a literal pair of
+    /// colours, so the property survives a re-themed palette: whatever the
+    /// hues are, the directory fill must carry the directory ink's cast and
+    /// the file fill must not, at a brightness the two share.
+    #[test]
+    fn the_two_row_kinds_differ_in_hue_not_lightness() {
+        // A cool directory ink and a near-neutral text ink at clearly
+        // different brightness -- the shape of the real palette.
+        let cfg = config::Config::from_bytes(
+            b"[files]\nbackground = \"#181616\"\ndir = \"#8ba4b0\"\ntext = \"#c5c9c5\"\n",
+        )
+        .expect("parse");
+        let t = Theme::from_config(&cfg);
+        for (dir_fill, file_fill, what) in [
+            (t.hover_dir, t.hover_file, "hover"),
+            (t.selection_dir, t.selection_file, "selection"),
+        ] {
+            let lean = |c: Color| i32::from(c.b) - i32::from(c.r);
+            assert!(
+                lean(dir_fill) > lean(file_fill) + 4,
+                "the {what} fills must separate by hue: dir lean {} vs file lean {}",
+                lean(dir_fill),
+                lean(file_fill)
+            );
+            // Reuse the real luma rather than restating the coefficients, so
+            // this cannot drift from the implementation it is checking.
+            let luma = |c: Color| config::Color::from_rgb(c.r, c.g, c.b).luma();
+            assert!(
+                (luma(dir_fill) - luma(file_fill)).abs() < 6.0,
+                "the {what} fills must sit at one brightness: {} vs {}",
+                luma(dir_fill),
+                luma(file_fill)
+            );
         }
     }
 

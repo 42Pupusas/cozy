@@ -135,6 +135,57 @@ impl Color {
         }
     }
 
+    /// Perceived brightness, 0.0..=255.0.
+    ///
+    /// Rec. 601 coefficients rather than a plain channel average, because the
+    /// eye is far more sensitive to green than to blue: averaging would call
+    /// a saturated blue and a saturated green equally bright, which is exactly
+    /// the misjudgement this is used to avoid.
+    #[must_use]
+    pub fn luma(self) -> f32 {
+        // Written as fused multiply-adds rather than the textbook sum: clippy's
+        // `suboptimal_flops` asks for it, and each `mul_add` keeps full
+        // precision on the intermediate instead of rounding twice.
+        let red = 0.299 * f32::from(self.r);
+        let with_green = 0.587_f32.mul_add(f32::from(self.g), red);
+        0.114_f32.mul_add(f32::from(self.b), with_green)
+    }
+
+    /// `self` re-scaled to `target`'s perceived brightness, keeping its hue.
+    ///
+    /// For distinguishing two UI roles by *colour* rather than by lightness.
+    /// Two inks of different brightness, washed over one background at the
+    /// same strength, produce two fills that differ mainly in how light they
+    /// are -- which the eye reads as "the same colour at two opacities", not
+    /// as two different colours. Equalising luma first leaves hue as the only
+    /// difference, so the distinction survives at low wash strengths where a
+    /// lightness difference would just look like inconsistent alpha.
+    ///
+    /// Scales all three channels by one factor, so the ratios between them --
+    /// the hue -- are preserved. A channel that would exceed 255 clamps, which
+    /// desaturates slightly at the very top of the range; that is preferable
+    /// to wrapping, and the inks this is used on are mid-tones.
+    ///
+    /// A black `self` has no hue to preserve and no ratio to scale, so it is
+    /// returned unchanged rather than being divided by zero.
+    #[must_use]
+    pub fn at_luma_of(self, target: Self) -> Self {
+        let current = self.luma();
+        if current <= f32::EPSILON {
+            return self;
+        }
+        let factor = target.luma() / current;
+        // Clamped before the cast, so truncation and sign loss cannot occur --
+        // the same deliberate pattern as `mix` and `step_from`.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let scale = |c: u8| -> u8 { (f32::from(c) * factor).clamp(0.0, 255.0).round() as u8 };
+        Self {
+            r: scale(self.r),
+            g: scale(self.g),
+            b: scale(self.b),
+        }
+    }
+
     /// Pack as `0x00_rr_gg_bb`.
     #[must_use]
     pub const fn as_u32(self) -> u32 {

@@ -29,6 +29,11 @@ use platform::protocol::{
     Layer, LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest, SeatCapability, SeatEvent,
     SeatRequest, SurfaceRequest,
 };
+// Two different notions of "key" meet in this file, so neither is left to
+// be inferred from context: `proto::Key` is a *physical* evdev key (what
+// the wire reports, what auto-repeat tracks), while `DecodedKey` is what
+// XKB says that press *means* on the user's actual layout.
+use platform::toplevel::keysym::Key as DecodedKey;
 use platform::wire::MessageBuilder;
 use platform::{Error, Result};
 use quetzalcoatl::capacity::Capacity;
@@ -51,6 +56,28 @@ pub enum LauncherKey {
     Up,
     Down,
     CtrlDigit(u8),
+}
+
+impl LauncherKey {
+    /// Narrow a decoded [`Key`] to the subset a search box acts on.
+    ///
+    /// Deliberately total over the keys we care about and `None` for the
+    /// rest: a launcher ignores F-keys, `Insert`, `PageUp` and friends rather
+    /// than guessing at a meaning for them. `CtrlDigit` is absent here
+    /// because it is a *chord*, resolved from modifier state before the
+    /// keysym is decoded -- see `LauncherWindow::resolve_key`.
+    #[must_use]
+    pub const fn from_key(key: Option<DecodedKey>) -> Option<Self> {
+        match key {
+            Some(DecodedKey::Char(c)) => Some(Self::Char(c)),
+            Some(DecodedKey::Backspace) => Some(Self::Backspace),
+            Some(DecodedKey::Enter) => Some(Self::Enter),
+            Some(DecodedKey::Escape) => Some(Self::Esc),
+            Some(DecodedKey::Up) => Some(Self::Up),
+            Some(DecodedKey::Down) => Some(Self::Down),
+            _ => None,
+        }
+    }
 }
 
 /// A centered, keyboard-grabbing layer-shell overlay window.
@@ -84,6 +111,10 @@ pub struct LauncherWindow {
     xkb: Option<xkb::Translator>,
     awaiting_keymap_fd: Option<usize>,
     key_repeat: platform::key_repeat::KeyRepeatState,
+    /// What the currently-held key resolved to, so auto-repeat can re-emit
+    /// it verbatim instead of re-deriving it from the physical keycode.
+    /// Kept in lockstep with `key_repeat`'s held key.
+    held_resolved: Option<LauncherKey>,
 
     present: PresentState,
     backbuffer: Vec<u32>,
@@ -312,6 +343,7 @@ impl LauncherWindow {
             xkb: None,
             awaiting_keymap_fd: None,
             key_repeat: platform::key_repeat::KeyRepeatState::new(repeat_timer),
+            held_resolved: None,
             present: PresentState::new(frames, shm_mem, pool, Format::Argb8888, 1),
             backbuffer: vec![0; usize::try_from(px_w * px_h).unwrap_or(0)],
             background: platform::draw::Color::rgb(0x1e, 0x1e, 0x2e),
@@ -465,7 +497,10 @@ impl LauncherWindow {
                     let _ = xkb.update_mask(ev.arg(1), ev.arg(2), ev.arg(3), ev.arg(4));
                 }
             }
-            Some(KeyboardEvent::Leave) => self.key_repeat.on_leave(),
+            Some(KeyboardEvent::Leave) => {
+                self.held_resolved = None;
+                self.key_repeat.on_leave();
+            }
             _ => {}
         }
     }
@@ -481,6 +516,11 @@ impl LauncherWindow {
         let state = KeyState::from_raw(ev.arg(3));
         let Some(KeyState::Pressed) = state else {
             if let Some(k) = Key::from_code(evdev_code) {
+                // Clear the stashed resolution in lockstep with the timer,
+                // so a late tick cannot resurrect a released key.
+                if self.key_repeat.held_key() == Some(k) {
+                    self.held_resolved = None;
+                }
                 self.key_repeat.on_key_release(k);
             }
             return;
@@ -493,68 +533,55 @@ impl LauncherWindow {
         if let Some(k) = Key::from_code(evdev_code)
             && !k.is_modifier()
         {
+            // Stash what this press *meant*, not just which physical key it
+            // was, so auto-repeat can reproduce it without re-decoding.
+            self.held_resolved = Some(resolved);
             self.key_repeat.on_key_press(k);
         }
     }
 
+    /// Resolve one press through the shared keysym decoder.
+    ///
+    /// The keysym constants and the named-key match used to be private to
+    /// this file -- one of four copies of the same X11 table in the
+    /// workspace. They now come from [`platform::toplevel::keysym`], which
+    /// checks named keys *before* text and so cannot fall into the trap
+    /// this file was one reordering away from: Return/Tab/Backspace/Escape
+    /// each carry a legacy control codepoint, so a text-first decoder types
+    /// a carriage return into the search box when you press Enter.
     fn resolve_key(&self, evdev_code: u32) -> Option<LauncherKey> {
-        // XKB keysym constants for the handful of non-text keys a search
-        // box cares about (module-level, not local -- clippy's
-        // items_after_statements flags consts declared after a let binding
-        // above them).
-        const XKB_KEY_BACKSPACE: u32 = 0xff08;
-        const XKB_KEY_RETURN: u32 = 0xff0d;
-        const XKB_KEY_KP_ENTER: u32 = 0xff8d;
-        const XKB_KEY_ESCAPE: u32 = 0xff1b;
-        const XKB_KEY_UP: u32 = 0xff52;
-        const XKB_KEY_DOWN: u32 = 0xff54;
-
-        let Some(xkb) = &self.xkb else {
-            return None;
-        };
-
+        let xkb = self.xkb.as_ref()?;
         let sym = xkb.keysym(evdev_code);
+
+        // Ctrl+digit is checked first: it is a chord this window binds to
+        // "launch the Nth result", so it must win over the digit's text.
         if xkb.control_active()
             && let Some(digit) = Self::digit_for_keysym(sym)
         {
             return Some(LauncherKey::CtrlDigit(digit));
         }
-        match sym {
-            XKB_KEY_BACKSPACE => return Some(LauncherKey::Backspace),
-            XKB_KEY_RETURN | XKB_KEY_KP_ENTER => return Some(LauncherKey::Enter),
-            XKB_KEY_ESCAPE => return Some(LauncherKey::Esc),
-            XKB_KEY_UP => return Some(LauncherKey::Up),
-            XKB_KEY_DOWN => return Some(LauncherKey::Down),
-            _ => {}
-        }
 
-        let cp = xkb.utf32(evdev_code);
-        if cp == 0 {
-            return None;
-        }
-        char::from_u32(cp).map(LauncherKey::Char)
+        LauncherKey::from_key(DecodedKey::decode(sym, xkb.utf32(evdev_code)))
     }
 
+    /// Auto-repeat: re-emit whatever the *original* press resolved to.
+    ///
+    /// This previously re-derived a character from the physical keycode via
+    /// a hardcoded US-QWERTY table, because `KeyRepeatState` remembers only
+    /// the physical `protocol::Key` and the evdev code is long gone by the
+    /// time the timer fires. That made held-key repeat type the wrong
+    /// letter on every non-US layout -- press `a` on AZERTY and the first
+    /// character came from XKB (correct) while every repeat came from the
+    /// QWERTY table (wrong).
+    ///
+    /// Remembering the resolved key at press time sidesteps the re-decode
+    /// entirely, so repeat is correct on every layout by construction.
     fn handle_key_repeat_tick(&mut self) {
-        let Some(key) = self.key_repeat.held_key() else {
+        if self.key_repeat.held_key().is_none() {
             return;
-        };
-        // Re-resolve via the last-known evdev code is unavailable here (the
-        // repeat timer only knows the logical `Key`, not the original
-        // evdev code) -- so auto-repeat re-emits the same logical key by
-        // reusing `Key::from_code`'s inverse mapping isn't available
-        // either. Simplest correct behavior for a search box: re-derive
-        // straight from the physical `Key` via the same ASCII table
-        // `platform::keymap::PhysicalKey` uses, since letters/digits are
-        // what overwhelmingly get held-and-repeated while typing.
-        if let Some(ch) = Self::key_to_ascii(key) {
-            self.pending_keys.push(LauncherKey::Char(ch));
-        } else {
-            match key {
-                Key::Backspace => self.pending_keys.push(LauncherKey::Backspace),
-                Key::Enter => self.pending_keys.push(LauncherKey::Enter),
-                _ => {}
-            }
+        }
+        if let Some(resolved) = self.held_resolved {
+            self.pending_keys.push(resolved);
         }
     }
 
@@ -572,54 +599,6 @@ impl LauncherWindow {
             0x39 => Some(9),
             _ => None,
         }
-    }
-
-    /// Best-effort physical-keycode fallback for auto-repeat's synthesized
-    /// presses (US-QWERTY only, no XKB remap applied -- see
-    /// `handle_key_repeat_tick`'s doc for why the real per-keystroke XKB
-    /// path can't be reused here).
-    const fn key_to_ascii(key: Key) -> Option<char> {
-        Some(match key {
-            Key::A => 'a',
-            Key::B => 'b',
-            Key::C => 'c',
-            Key::D => 'd',
-            Key::E => 'e',
-            Key::F => 'f',
-            Key::G => 'g',
-            Key::H => 'h',
-            Key::I => 'i',
-            Key::J => 'j',
-            Key::K => 'k',
-            Key::L => 'l',
-            Key::M => 'm',
-            Key::N => 'n',
-            Key::O => 'o',
-            Key::P => 'p',
-            Key::Q => 'q',
-            Key::R => 'r',
-            Key::S => 's',
-            Key::T => 't',
-            Key::U => 'u',
-            Key::V => 'v',
-            Key::W => 'w',
-            Key::X => 'x',
-            Key::Y => 'y',
-            Key::Z => 'z',
-            Key::N0 => '0',
-            Key::N1 => '1',
-            Key::N2 => '2',
-            Key::N3 => '3',
-            Key::N4 => '4',
-            Key::N5 => '5',
-            Key::N6 => '6',
-            Key::N7 => '7',
-            Key::N8 => '8',
-            Key::N9 => '9',
-            Key::Space => ' ',
-            Key::Minus => '-',
-            _ => return None,
-        })
     }
 
     fn handle_layer_surface_event(&mut self, ev: &RawEvent) {
@@ -671,5 +650,90 @@ impl LauncherWindow {
         let mut globals = GlobalsBuilder::default();
         surface::RegistryDiscovery::collect(sender, events, &mut globals)?;
         globals.finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use platform::toplevel::keysym::sym;
+
+    #[test]
+    fn text_and_navigation_narrow_to_launcher_keys() {
+        assert_eq!(
+            LauncherKey::from_key(DecodedKey::decode(0x61, u32::from('a'))),
+            Some(LauncherKey::Char('a'))
+        );
+        assert_eq!(
+            LauncherKey::from_key(DecodedKey::decode(sym::UP, 0)),
+            Some(LauncherKey::Up)
+        );
+        assert_eq!(
+            LauncherKey::from_key(DecodedKey::decode(sym::DOWN, 0)),
+            Some(LauncherKey::Down)
+        );
+        assert_eq!(
+            LauncherKey::from_key(DecodedKey::decode(sym::ESCAPE, 0x1b)),
+            Some(LauncherKey::Esc)
+        );
+    }
+
+    /// The trap the shared decoder exists to close. Enter, Backspace and
+    /// Escape all report a legacy control codepoint alongside their keysym;
+    /// decoding text first would insert U+000D into the search query
+    /// instead of launching the selected entry.
+    #[test]
+    fn keys_carrying_a_control_codepoint_stay_actions_not_text() {
+        assert_eq!(
+            LauncherKey::from_key(DecodedKey::decode(sym::RETURN, 0x0d)),
+            Some(LauncherKey::Enter)
+        );
+        assert_eq!(
+            LauncherKey::from_key(DecodedKey::decode(sym::BACKSPACE, 0x08)),
+            Some(LauncherKey::Backspace)
+        );
+    }
+
+    /// The keypad's Enter is a distinct keysym; the old private table did
+    /// list it, and dropping it here would be a silent regression.
+    #[test]
+    fn the_keypad_enter_still_launches() {
+        assert_eq!(
+            LauncherKey::from_key(DecodedKey::decode(sym::KP_ENTER, 0)),
+            Some(LauncherKey::Enter)
+        );
+    }
+
+    /// Non-US layouts are the reason the repeat path was rewritten: the
+    /// decoder must carry whatever character XKB reports, not a QWERTY
+    /// guess derived from the physical keycode.
+    #[test]
+    fn a_non_ascii_character_survives_decoding() {
+        assert_eq!(
+            LauncherKey::from_key(DecodedKey::decode(0, u32::from('é'))),
+            Some(LauncherKey::Char('é'))
+        );
+    }
+
+    /// Keys a search box has no meaning for are dropped rather than
+    /// invented into something.
+    #[test]
+    fn irrelevant_keys_are_ignored() {
+        assert_eq!(LauncherKey::from_key(DecodedKey::decode(sym::F1, 0)), None);
+        assert_eq!(
+            LauncherKey::from_key(DecodedKey::decode(sym::INSERT, 0)),
+            None
+        );
+        // A bare modifier: real keysym, no symbol, no text.
+        assert_eq!(LauncherKey::from_key(DecodedKey::decode(0xffe1, 0)), None);
+        assert_eq!(LauncherKey::from_key(None), None);
+    }
+
+    #[test]
+    fn ctrl_digits_map_across_the_whole_row() {
+        assert_eq!(LauncherWindow::digit_for_keysym(0x30), Some(0));
+        assert_eq!(LauncherWindow::digit_for_keysym(0x39), Some(9));
+        assert_eq!(LauncherWindow::digit_for_keysym(0x2f), None);
+        assert_eq!(LauncherWindow::digit_for_keysym(0x3a), None);
     }
 }

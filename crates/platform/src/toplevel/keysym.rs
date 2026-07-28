@@ -3,14 +3,36 @@
 //! # Why this is its own module
 //!
 //! These constants were being redeclared at every call site that needed
-//! them: `bins/launcher/src/launcher_window.rs` has its own private block of
-//! `XKB_KEY_*` consts, and `crates/xkb`'s tests declare a third set. Each
-//! copy is a chance for a transposed hex digit that silently makes a key
-//! stop working, and nothing cross-checks them.
+//! them. This module is now the single source for the values, and the
+//! former copies read from it:
+//!
+//! * `bins/launcher/src/launcher_window.rs` had a private block of six
+//!   `XKB_KEY_*` consts plus its own named-key match -- now deleted in
+//!   favour of [`Key::decode`].
+//! * [`crate::keymap`]'s `XkbKeysym` still exists, because it decodes to a
+//!   *different* target ([`crate::protocol::Key`], which is physical and
+//!   includes modifiers, for the terminal) -- but its numbers come from
+//!   [`sym`] rather than a second set of literals.
+//!
+//! The one remaining copy is deliberate: `crates/xkb`'s tests declare two
+//! constants locally because that crate has **no path dependencies at all**
+//! by design (it speaks only libxkbcommon's C ABI), and `platform` depends
+//! on *it*. Importing this module there would invert the dependency to save
+//! two lines in a test.
 //!
 //! X11 keysyms are a frozen, published registry -- they are never going to
 //! change -- so the values are stated once here and the mapping to a
 //! semantic [`Key`] happens in one tested place.
+//!
+//! # What guards this
+//!
+//! Centralising the numbers removes the "two tables disagree" failure but
+//! creates a subtler one: a single wrong constant is now wrong *everywhere
+//! at once*, so decoders that read it stay perfectly consistent with each
+//! other while all being wrong. A cross-check between decoders cannot see
+//! that -- verified by experiment, not assumed. `every_constant_matches_
+//! the_x11_registry` below pins each value to its literal from
+//! `X11/keysymdef.h`, which is the actual oracle.
 //!
 //! # Why not put this in `crates/xkb`
 //!
@@ -47,8 +69,31 @@ pub mod sym {
     /// `RETURN` and is missed by anyone who only checks the main one.
     pub const KP_ENTER: u32 = 0xff8d;
 
+    /// The function-key block, which is contiguous.
+    ///
+    /// Callers needing an individual key say `F1 + n` rather than declaring
+    /// twelve constants -- twelve more chances to transpose a hex digit,
+    /// which is the failure this module exists to prevent.
     pub const F1: u32 = 0xffbe;
     pub const F12: u32 = 0xffc9;
+
+    /// The modifier and lock cluster.
+    ///
+    /// [`super::Key`] has no variants for these -- a widget never acts on a
+    /// bare Shift -- but the terminal's physical keymap does need to name
+    /// them, so the values live here with the rest of the registry instead
+    /// of in a second table.
+    pub const SHIFT_L: u32 = 0xffe1;
+    pub const SHIFT_R: u32 = 0xffe2;
+    pub const CONTROL_L: u32 = 0xffe3;
+    pub const CONTROL_R: u32 = 0xffe4;
+    pub const CAPS_LOCK: u32 = 0xffe5;
+    pub const NUM_LOCK: u32 = 0xff7f;
+    pub const SCROLL_LOCK: u32 = 0xff14;
+    pub const ALT_L: u32 = 0xffe9;
+    pub const ALT_R: u32 = 0xffea;
+    pub const SUPER_L: u32 = 0xffeb;
+    pub const SUPER_R: u32 = 0xffec;
 }
 
 /// A key press reduced to what a widget actually dispatches on.
@@ -157,6 +202,99 @@ impl Key {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins every constant to its literal value from the X11 keysym
+    /// registry (`X11/keysymdef.h`).
+    ///
+    /// This looks tautological and is not. Now that `keymap.rs` reads these
+    /// same constants, a typo here no longer causes a *disagreement*
+    /// between the two decoders -- it moves both in lockstep, so they stay
+    /// consistent while both being wrong, and a cross-check between them
+    /// passes happily. (Confirmed by experiment: corrupting `PAGE_UP` left
+    /// the cross-check in `keymap.rs` green.)
+    ///
+    /// Centralising the values traded "two tables disagree" for "one table
+    /// is silently wrong", and this is what covers the replacement risk.
+    /// The registry is frozen, so these literals are a permanent oracle.
+    #[test]
+    fn every_constant_matches_the_x11_registry() {
+        assert_eq!(sym::BACKSPACE, 0xff08);
+        assert_eq!(sym::TAB, 0xff09);
+        assert_eq!(sym::RETURN, 0xff0d);
+        assert_eq!(sym::ESCAPE, 0xff1b);
+        assert_eq!(sym::DELETE, 0xffff);
+
+        assert_eq!(sym::HOME, 0xff50);
+        assert_eq!(sym::LEFT, 0xff51);
+        assert_eq!(sym::UP, 0xff52);
+        assert_eq!(sym::RIGHT, 0xff53);
+        assert_eq!(sym::DOWN, 0xff54);
+        assert_eq!(sym::PAGE_UP, 0xff55);
+        assert_eq!(sym::PAGE_DOWN, 0xff56);
+        assert_eq!(sym::END, 0xff57);
+
+        assert_eq!(sym::INSERT, 0xff63);
+        assert_eq!(sym::MENU, 0xff67);
+        assert_eq!(sym::KP_ENTER, 0xff8d);
+
+        assert_eq!(sym::F1, 0xffbe);
+        assert_eq!(sym::F12, 0xffc9);
+
+        assert_eq!(sym::SHIFT_L, 0xffe1);
+        assert_eq!(sym::SHIFT_R, 0xffe2);
+        assert_eq!(sym::CONTROL_L, 0xffe3);
+        assert_eq!(sym::CONTROL_R, 0xffe4);
+        assert_eq!(sym::CAPS_LOCK, 0xffe5);
+        assert_eq!(sym::NUM_LOCK, 0xff7f);
+        assert_eq!(sym::SCROLL_LOCK, 0xff14);
+        assert_eq!(sym::ALT_L, 0xffe9);
+        assert_eq!(sym::ALT_R, 0xffea);
+        assert_eq!(sym::SUPER_L, 0xffeb);
+        assert_eq!(sym::SUPER_R, 0xffec);
+    }
+
+    /// No two keys may share a value -- a copy-paste slip that gave two
+    /// constants the same number would make one key silently shadow the
+    /// other, and every equality assertion above would still pass.
+    #[test]
+    fn no_two_constants_collide() {
+        let all = [
+            ("BACKSPACE", sym::BACKSPACE),
+            ("TAB", sym::TAB),
+            ("RETURN", sym::RETURN),
+            ("ESCAPE", sym::ESCAPE),
+            ("DELETE", sym::DELETE),
+            ("HOME", sym::HOME),
+            ("LEFT", sym::LEFT),
+            ("UP", sym::UP),
+            ("RIGHT", sym::RIGHT),
+            ("DOWN", sym::DOWN),
+            ("PAGE_UP", sym::PAGE_UP),
+            ("PAGE_DOWN", sym::PAGE_DOWN),
+            ("END", sym::END),
+            ("INSERT", sym::INSERT),
+            ("MENU", sym::MENU),
+            ("KP_ENTER", sym::KP_ENTER),
+            ("F1", sym::F1),
+            ("F12", sym::F12),
+            ("SHIFT_L", sym::SHIFT_L),
+            ("SHIFT_R", sym::SHIFT_R),
+            ("CONTROL_L", sym::CONTROL_L),
+            ("CONTROL_R", sym::CONTROL_R),
+            ("CAPS_LOCK", sym::CAPS_LOCK),
+            ("NUM_LOCK", sym::NUM_LOCK),
+            ("SCROLL_LOCK", sym::SCROLL_LOCK),
+            ("ALT_L", sym::ALT_L),
+            ("ALT_R", sym::ALT_R),
+            ("SUPER_L", sym::SUPER_L),
+            ("SUPER_R", sym::SUPER_R),
+        ];
+        for (i, (name_a, a)) in all.iter().enumerate() {
+            for (name_b, b) in &all[i + 1..] {
+                assert_ne!(a, b, "{name_a} and {name_b} share a keysym value");
+            }
+        }
+    }
 
     #[test]
     fn a_plain_letter_decodes_as_text() {

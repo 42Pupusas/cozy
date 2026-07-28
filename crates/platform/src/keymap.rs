@@ -22,6 +22,7 @@
 //! which one resolved a given press.
 
 use crate::protocol::Key;
+use crate::toplevel::keysym::sym;
 
 /// Extends [`Key`] with physical→logical keymap resolution, as a method
 /// instead of a free `physical_to_logical(key)` function.
@@ -53,45 +54,45 @@ impl PhysicalKey for Key {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub(crate) enum XkbKeysym {
-    BackSpace = 0xff08,
-    Tab = 0xff09,
-    Return = 0xff0d,
-    Escape = 0xff1b,
-    Delete = 0xffff,
-    Insert = 0xff63,
-    Home = 0xff50,
-    End = 0xff57,
-    PageUp = 0xff55,
-    PageDown = 0xff56,
-    Left = 0xff51,
-    Up = 0xff52,
-    Right = 0xff53,
-    Down = 0xff54,
-    F1 = 0xffbe,
-    F2 = 0xffbf,
-    F3 = 0xffc0,
-    F4 = 0xffc1,
-    F5 = 0xffc2,
-    F6 = 0xffc3,
-    F7 = 0xffc4,
-    F8 = 0xffc5,
-    F9 = 0xffc6,
-    F10 = 0xffc7,
-    F11 = 0xffc8,
-    F12 = 0xffc9,
-    ShiftL = 0xffe1,
-    ShiftR = 0xffe2,
-    ControlL = 0xffe3,
-    ControlR = 0xffe4,
-    CapsLock = 0xffe5,
-    NumLock = 0xff7f,
-    ScrollLock = 0xff14,
-    AltL = 0xffe9,
-    AltR = 0xffea,
-    SuperL = 0xffeb,
-    SuperR = 0xffec,
-    Menu = 0xff67,
-    KpEnter = 0xff8d,
+    BackSpace = sym::BACKSPACE,
+    Tab = sym::TAB,
+    Return = sym::RETURN,
+    Escape = sym::ESCAPE,
+    Delete = sym::DELETE,
+    Insert = sym::INSERT,
+    Home = sym::HOME,
+    End = sym::END,
+    PageUp = sym::PAGE_UP,
+    PageDown = sym::PAGE_DOWN,
+    Left = sym::LEFT,
+    Up = sym::UP,
+    Right = sym::RIGHT,
+    Down = sym::DOWN,
+    F1 = sym::F1,
+    F2 = sym::F1 + 1,
+    F3 = sym::F1 + 2,
+    F4 = sym::F1 + 3,
+    F5 = sym::F1 + 4,
+    F6 = sym::F1 + 5,
+    F7 = sym::F1 + 6,
+    F8 = sym::F1 + 7,
+    F9 = sym::F1 + 8,
+    F10 = sym::F1 + 9,
+    F11 = sym::F1 + 10,
+    F12 = sym::F12,
+    ShiftL = sym::SHIFT_L,
+    ShiftR = sym::SHIFT_R,
+    ControlL = sym::CONTROL_L,
+    ControlR = sym::CONTROL_R,
+    CapsLock = sym::CAPS_LOCK,
+    NumLock = sym::NUM_LOCK,
+    ScrollLock = sym::SCROLL_LOCK,
+    AltL = sym::ALT_L,
+    AltR = sym::ALT_R,
+    SuperL = sym::SUPER_L,
+    SuperR = sym::SUPER_R,
+    Menu = sym::MENU,
+    KpEnter = sym::KP_ENTER,
 }
 
 impl XkbKeysym {
@@ -103,45 +104,45 @@ impl XkbKeysym {
     /// own discriminants isn't expressible as a safe transmute, so the pair
     /// is spelled out explicitly instead of relying on layout.
     const RAW_TABLE: &[(u32, Self)] = &[
-        (0xff08, Self::BackSpace),
-        (0xff09, Self::Tab),
-        (0xff0d, Self::Return),
-        (0xff1b, Self::Escape),
-        (0xffff, Self::Delete),
-        (0xff63, Self::Insert),
-        (0xff50, Self::Home),
-        (0xff57, Self::End),
-        (0xff55, Self::PageUp),
-        (0xff56, Self::PageDown),
-        (0xff51, Self::Left),
-        (0xff52, Self::Up),
-        (0xff53, Self::Right),
-        (0xff54, Self::Down),
-        (0xffbe, Self::F1),
-        (0xffbf, Self::F2),
-        (0xffc0, Self::F3),
-        (0xffc1, Self::F4),
-        (0xffc2, Self::F5),
-        (0xffc3, Self::F6),
-        (0xffc4, Self::F7),
-        (0xffc5, Self::F8),
-        (0xffc6, Self::F9),
-        (0xffc7, Self::F10),
-        (0xffc8, Self::F11),
-        (0xffc9, Self::F12),
-        (0xffe1, Self::ShiftL),
-        (0xffe2, Self::ShiftR),
-        (0xffe3, Self::ControlL),
-        (0xffe4, Self::ControlR),
-        (0xffe5, Self::CapsLock),
-        (0xff7f, Self::NumLock),
-        (0xff14, Self::ScrollLock),
-        (0xffe9, Self::AltL),
-        (0xffea, Self::AltR),
-        (0xffeb, Self::SuperL),
-        (0xffec, Self::SuperR),
-        (0xff67, Self::Menu),
-        (0xff8d, Self::KpEnter),
+        (sym::BACKSPACE, Self::BackSpace),
+        (sym::TAB, Self::Tab),
+        (sym::RETURN, Self::Return),
+        (sym::ESCAPE, Self::Escape),
+        (sym::DELETE, Self::Delete),
+        (sym::INSERT, Self::Insert),
+        (sym::HOME, Self::Home),
+        (sym::END, Self::End),
+        (sym::PAGE_UP, Self::PageUp),
+        (sym::PAGE_DOWN, Self::PageDown),
+        (sym::LEFT, Self::Left),
+        (sym::UP, Self::Up),
+        (sym::RIGHT, Self::Right),
+        (sym::DOWN, Self::Down),
+        (sym::F1, Self::F1),
+        (sym::F1 + 1, Self::F2),
+        (sym::F1 + 2, Self::F3),
+        (sym::F1 + 3, Self::F4),
+        (sym::F1 + 4, Self::F5),
+        (sym::F1 + 5, Self::F6),
+        (sym::F1 + 6, Self::F7),
+        (sym::F1 + 7, Self::F8),
+        (sym::F1 + 8, Self::F9),
+        (sym::F1 + 9, Self::F10),
+        (sym::F1 + 10, Self::F11),
+        (sym::F12, Self::F12),
+        (sym::SHIFT_L, Self::ShiftL),
+        (sym::SHIFT_R, Self::ShiftR),
+        (sym::CONTROL_L, Self::ControlL),
+        (sym::CONTROL_R, Self::ControlR),
+        (sym::CAPS_LOCK, Self::CapsLock),
+        (sym::NUM_LOCK, Self::NumLock),
+        (sym::SCROLL_LOCK, Self::ScrollLock),
+        (sym::ALT_L, Self::AltL),
+        (sym::ALT_R, Self::AltR),
+        (sym::SUPER_L, Self::SuperL),
+        (sym::SUPER_R, Self::SuperR),
+        (sym::MENU, Self::Menu),
+        (sym::KP_ENTER, Self::KpEnter),
     ];
 
     pub(crate) fn from_raw(raw: u32) -> Option<Self> {
@@ -282,5 +283,90 @@ mod tests {
     fn kp_enter_and_return_both_map_to_enter() {
         assert_eq!(keysym_to_key(0xff0d), Some(Key::Enter));
         assert_eq!(keysym_to_key(0xff8d), Some(Key::Enter));
+    }
+
+    /// The two keysym decoders in this crate must not drift apart.
+    ///
+    /// They map to *different* target enums on purpose -- this one to
+    /// `protocol::Key` (physical keys, modifiers included, for the
+    /// terminal) and `toplevel::keysym::Key` to a widget-facing key with no
+    /// modifier variants -- so they cannot simply share a function. What
+    /// they must share is the *numbers*, which is why both now read
+    /// `toplevel::keysym::sym`.
+    ///
+    /// This test enforces the part a shared constant cannot: that a keysym
+    /// both tables claim to know is decoded to the same *meaning* by each.
+    /// Adding a key to one table and forgetting the other now fails here
+    /// rather than in someone's hands.
+    #[test]
+    fn both_decoders_agree_on_every_key_they_share() {
+        use crate::toplevel::keysym::Key as Decoded;
+
+        // (keysym, what each decoder should independently produce)
+        let shared: &[(u32, Key, Decoded)] = &[
+            (sym::BACKSPACE, Key::Backspace, Decoded::Backspace),
+            (sym::TAB, Key::Tab, Decoded::Tab),
+            (sym::RETURN, Key::Enter, Decoded::Enter),
+            (sym::KP_ENTER, Key::Enter, Decoded::Enter),
+            (sym::ESCAPE, Key::Esc, Decoded::Escape),
+            (sym::DELETE, Key::Delete, Decoded::Delete),
+            (sym::INSERT, Key::Insert, Decoded::Insert),
+            (sym::HOME, Key::Home, Decoded::Home),
+            (sym::END, Key::End, Decoded::End),
+            (sym::PAGE_UP, Key::PageUp, Decoded::PageUp),
+            (sym::PAGE_DOWN, Key::PageDown, Decoded::PageDown),
+            (sym::LEFT, Key::Left, Decoded::Left),
+            (sym::UP, Key::Up, Decoded::Up),
+            (sym::RIGHT, Key::Right, Decoded::Right),
+            (sym::DOWN, Key::Down, Decoded::Down),
+            (sym::MENU, Key::LMeta, Decoded::Menu),
+        ];
+
+        for &(raw, physical, decoded) in shared {
+            assert_eq!(
+                keysym_to_key(raw),
+                Some(physical),
+                "physical decoder disagrees on keysym {raw:#x}"
+            );
+            assert_eq!(
+                Decoded::named(raw),
+                Some(decoded),
+                "widget decoder disagrees on keysym {raw:#x}"
+            );
+        }
+    }
+
+    /// Function keys are a contiguous block in one decoder and twelve
+    /// enum variants in the other; walking the whole range catches an
+    /// off-by-one that spot-checking F1 and F12 would miss.
+    #[test]
+    fn the_function_key_block_lines_up_in_both_decoders() {
+        use crate::toplevel::keysym::Key as Decoded;
+
+        let physical = [
+            Key::F1,
+            Key::F2,
+            Key::F3,
+            Key::F4,
+            Key::F5,
+            Key::F6,
+            Key::F7,
+            Key::F8,
+            Key::F9,
+            Key::F10,
+            Key::F11,
+            Key::F12,
+        ];
+        for (i, expected) in physical.into_iter().enumerate() {
+            let raw = sym::F1 + u32::try_from(i).expect("12 fits");
+            assert_eq!(keysym_to_key(raw), Some(expected), "physical F{}", i + 1);
+            assert_eq!(
+                Decoded::named(raw),
+                Some(Decoded::Function(u8::try_from(i).expect("12 fits") + 1)),
+                "widget F{}",
+                i + 1
+            );
+        }
+        assert_eq!(sym::F12, sym::F1 + 11, "the block is exactly 12 keys wide");
     }
 }

@@ -63,28 +63,75 @@ impl Color {
         }
     }
 
+    /// The largest per-channel headroom [`Self::recede_from`] will scale its
+    /// step against, so a subtle surface stays subtle on every palette.
+    ///
+    /// Without a bound the step is a fraction of the distance to the
+    /// contrast colour, which is only small when the two are already close.
+    /// On a near-black theme (background `#181616`, foreground `#c5c9c5`)
+    /// that distance is ~197 of 255, so even a modest `t` overshoots past
+    /// the bottom of the range and clamps to pure black -- a ~22-point drop
+    /// presented as a nudge, and a direct violation of the design guide's
+    /// rule to keep large surfaces near-black rather than pure black. The
+    /// guide's own surfaces sit 4-7 points apart, so scaling against 64
+    /// keeps `t = 0.35` at ~8 points: clearly a different surface, still
+    /// unmistakably the same near-black family.
+    const SURFACE_HEADROOM: f32 = 64.0;
+
     /// A shade of `self` that stays visibly distinct from it, stepping away
-    /// from `contrast` by `t` where there is room and toward it where there
-    /// is not.
+    /// from `contrast` where there is room and toward it where there is not.
     ///
     /// This exists because plain [`Color::mix`] with a negative factor is
-    /// not safe for deriving UI chrome. "Recede from the text" means darken
-    /// on a dark theme -- but on a pure-white background there is nothing
-    /// darker to clamp *away* to, so the mix returns white again and the
-    /// chrome silently vanishes into the background. (Caught by test, not
-    /// by inspection: `derived_chrome_stays_distinguishable_on_a_light_
-    /// palette` failed on exactly that case.)
+    /// not safe for deriving UI chrome, for two separate reasons:
     ///
-    /// Stepping toward `contrast` instead whenever the away-step had no
-    /// effect guarantees a distinct result for every palette, including the
-    /// pure black and pure white extremes.
+    /// * On a pure-white background there is nothing darker to clamp *away*
+    ///   to, so the mix returns white again and the chrome silently
+    ///   vanishes. (Caught by test, not inspection:
+    ///   `derived_chrome_stays_distinguishable_on_a_light_palette` failed on
+    ///   exactly that case.) Stepping toward `contrast` whenever the away
+    ///   step had no effect guarantees a distinct result at both extremes.
+    ///
+    /// * A fraction of the *distance to the foreground* is the wrong
+    ///   magnitude for a surface tint -- see [`Self::SURFACE_HEADROOM`].
+    ///   `t` is therefore a fraction of the room actually available in the
+    ///   direction of travel, capped, rather than of the full span.
+    ///
+    /// The step is at least one point wherever any room exists, so subtle
+    /// never rounds down into invisible.
     #[must_use]
     pub fn recede_from(self, contrast: Self, t: f32) -> Self {
-        let away = self.mix(contrast, -t);
+        let away = self.step_from(contrast, t, false);
         if away == self {
-            self.mix(contrast, t)
+            self.step_from(contrast, t, true)
         } else {
             away
+        }
+    }
+
+    /// One bounded per-channel step, either toward `contrast` or away from
+    /// it. Shared by both arms of [`Self::recede_from`] so the fallback is
+    /// as gentle as the primary path -- a light theme should not get a grey
+    /// header just because it had no room to brighten.
+    fn step_from(self, contrast: Self, t: f32, toward: bool) -> Self {
+        // Clamped to 0..=255 before the cast, so truncation and sign loss
+        // cannot occur -- the same deliberate pattern as `mix`.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let shift = |a: u8, b: u8| -> u8 {
+            // Which way is away-from-b for this channel; ties are treated as
+            // darken, matching the dark-theme common case.
+            let darken = if toward { b < a } else { b >= a };
+            let room = f32::from(if darken { a } else { 255 - a });
+            let magnitude = t.abs() * room.min(Self::SURFACE_HEADROOM);
+            // Round up, so a small-but-real headroom still moves a point
+            // instead of rounding away to nothing.
+            let magnitude = if room > 0.0 { magnitude.max(1.0) } else { 0.0 };
+            let signed = if darken { -magnitude } else { magnitude };
+            (f32::from(a) + signed).clamp(0.0, 255.0).round() as u8
+        };
+        Self {
+            r: shift(self.r, contrast.r),
+            g: shift(self.g, contrast.g),
+            b: shift(self.b, contrast.b),
         }
     }
 

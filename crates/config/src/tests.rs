@@ -737,6 +737,36 @@ fn derived_chrome_stays_distinguishable_on_a_dark_palette() {
     assert_ne!(cfg.files_filter_bg(), cfg.files_background());
 }
 
+/// Pins the *measured* chrome derivation for the palette actually in use
+/// (Kanagawa Dragon). Asserting the value rather than just `assert_ne!`
+/// against the background is the point: the contrast tests below pass
+/// happily on a difference far larger than intended, which is how the
+/// chrome came to derive to pure `#000000` -- a ~22-point drop sold as a
+/// nudge, and visibly a *different surface* from the file list once the
+/// window went translucent.
+///
+/// The step is now scaled against bounded headroom, so the bands stay in
+/// the same near-black family as the list, per the design guide's rule to
+/// keep large surfaces near-black rather than pure black.
+#[test]
+fn dragon_chrome_stays_in_the_same_near_black_family_as_the_list() {
+    let cfg = Config::parse("[colors]\nforeground = \"#c5c9c5\"\nbackground = \"#181616\"\n");
+    let bg = cfg.files_background();
+    let chrome = cfg.files_header_bg();
+    assert_eq!(bg, Color::from_rgb(0x18, 0x16, 0x16));
+    // 0.35 of min(channel, 64) headroom: 0x18 - 8 and 0x16 - 8.
+    assert_eq!(chrome, Color::from_rgb(0x10, 0x0e, 0x0e));
+    assert_eq!(cfg.files_status_bg(), chrome);
+
+    // The property that actually matters: distinct, but by a surface-tint
+    // margin rather than a full-contrast leap, and never pure black.
+    assert_ne!(chrome, bg);
+    assert_ne!(chrome, Color::from_rgb(0x00, 0x00, 0x00));
+    for (a, b) in [(bg.r, chrome.r), (bg.g, chrome.g), (bg.b, chrome.b)] {
+        assert!(a.abs_diff(b) <= 12, "chrome step {a}->{b} is not subtle");
+    }
+}
+
 #[test]
 fn the_status_strip_follows_the_header_unless_overridden() {
     let cfg = Config::parse("");

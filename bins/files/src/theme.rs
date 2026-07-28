@@ -41,11 +41,21 @@ pub struct Theme {
     pub filter_bg: Color,
     pub caret: Color,
 
+    /// Fill behind the places sidebar. Slightly off the list background so
+    /// the two panes read as separate regions without needing a hard border.
+    pub sidebar_bg: Color,
+    /// The hairline between the sidebar and the list.
+    pub sidebar_border: Color,
+    /// Fill behind the sidebar row for the directory currently open.
+    pub sidebar_active: Color,
+
     pub row_height: i32,
     pub header_height: i32,
     pub status_height: i32,
     /// Left/right padding inside a row.
     pub padding: i32,
+    /// Width of the places sidebar.
+    pub sidebar_width: i32,
 }
 
 impl Default for Theme {
@@ -70,12 +80,21 @@ impl Default for Theme {
             filter_bg: Color::rgb(0x31, 0x32, 0x44),
             caret: Color::rgb(0xf9, 0xe2, 0xaf),
 
+            // A touch darker than the list, matching the header/status strips
+            // so the chrome reads as one family.
+            sidebar_bg: Color::rgb(0x18, 0x18, 0x25),
+            sidebar_border: Color::rgb(0x31, 0x32, 0x44),
+            sidebar_active: Color::rgb(0x31, 0x32, 0x44),
+
             // The bitmap font is 16px tall; 20 leaves 2px of breathing room
             // above and below without making the list feel sparse.
             row_height: 20,
             header_height: 24,
             status_height: 20,
             padding: 8,
+            // Wide enough for "Downloads" plus padding at the default size,
+            // narrow enough to leave the list the majority of a small window.
+            sidebar_width: 160,
         }
     }
 }
@@ -111,10 +130,48 @@ impl Theme {
             filter_bg: cfg.files_filter_bg().into(),
             caret: cfg.files_caret().into(),
 
+            // Derived from existing roles rather than given their own config
+            // keys: the sidebar is chrome, and chrome that tracks the header
+            // automatically stays coherent when the palette is re-themed.
+            sidebar_bg: cfg.files_header_bg().into(),
+            sidebar_border: cfg.files_filter_bg().into(),
+            sidebar_active: cfg.files_filter_bg().into(),
+
             row_height: px(cfg.files_row_height()),
             header_height: px(cfg.files_header_height()),
             status_height: px(cfg.files_status_height()),
             padding: px(cfg.files_padding()),
+            sidebar_width: Self::default().sidebar_width,
+        }
+    }
+
+    /// Adopt the metrics derived from the loaded type scale.
+    ///
+    /// Config still wins where the user stated a value; this only replaces
+    /// the defaults, so a bigger font grows the chrome instead of clipping
+    /// its own glyphs.
+    #[must_use]
+    pub fn with_metrics(mut self, row: i32, header: i32, status: i32) -> Self {
+        let fallback = Self::default();
+        if self.row_height == fallback.row_height {
+            self.row_height = row;
+        }
+        if self.header_height == fallback.header_height {
+            self.header_height = header;
+        }
+        if self.status_height == fallback.status_height {
+            self.status_height = status;
+        }
+        self
+    }
+
+    /// The x coordinate where the list pane begins.
+    #[must_use]
+    pub const fn list_x(&self, sidebar_visible: bool) -> i32 {
+        if sidebar_visible {
+            self.sidebar_width
+        } else {
+            0
         }
     }
 
@@ -224,6 +281,37 @@ mod tests {
                 t.scrollbar_thumb, t.scrollbar_track,
                 "scrollbar thumb on its track"
             );
+            assert_ne!(t.sidebar_active, t.sidebar_bg, "active place on sidebar");
+            assert_ne!(t.sidebar_border, t.background, "the pane divider");
         }
+    }
+
+    /// The list must start after the sidebar when it is shown, and at the
+    /// window edge when it is hidden -- otherwise rows paint under the pane.
+    #[test]
+    fn the_list_begins_after_the_sidebar_only_when_it_is_shown() {
+        let theme = Theme::default();
+        assert_eq!(theme.list_x(true), theme.sidebar_width);
+        assert_eq!(theme.list_x(false), 0);
+    }
+
+    /// Derived metrics replace the defaults, so a larger font grows the
+    /// chrome rather than clipping its glyphs.
+    #[test]
+    fn derived_metrics_replace_the_defaults() {
+        let theme = Theme::default().with_metrics(30, 40, 26);
+        assert_eq!(theme.row_height, 30);
+        assert_eq!(theme.header_height, 40);
+        assert_eq!(theme.status_height, 26);
+    }
+
+    /// …but an explicit config value outranks the derived one: the user asked
+    /// for that number and must get it.
+    #[test]
+    fn a_configured_metric_outranks_the_derived_one() {
+        let cfg = config::Config::from_bytes(b"[files]\nrow_height = 44\n").expect("parse");
+        let theme = Theme::from_config(&cfg).with_metrics(30, 40, 26);
+        assert_eq!(theme.row_height, 44, "config must win");
+        assert_eq!(theme.header_height, 40, "unset metrics still derive");
     }
 }

@@ -145,14 +145,19 @@ impl Favorites {
     }
 
     /// How many bookmarks there are.
+    ///
+    /// Only the tests read this today -- the sidebar asks the narrower
+    /// [`Self::is_empty`] -- but a collection with no way to observe its size
+    /// is a collection with untestable invariants.
     #[must_use]
-    pub fn len(&self) -> usize {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const fn len(&self) -> usize {
         self.paths.len()
     }
 
     /// Whether the list is empty.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.paths.is_empty()
     }
 
@@ -162,9 +167,10 @@ impl Favorites {
     /// an entry is never rendered as an empty row.
     #[must_use]
     pub fn label(path: &Path) -> String {
-        path.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.display().to_string())
+        path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        )
     }
 }
 

@@ -42,7 +42,7 @@ impl Typography {
     const DETAIL: f32 = 0.85;
 
     /// Load every tier from the configured font, at `scale` (the output's
-    /// HiDPI scale factor).
+    /// `HiDPI` scale factor).
     ///
     /// Falls back to the embedded bitmap font per tier if the configured face
     /// cannot be read -- a missing font must degrade to a readable window,
@@ -107,18 +107,20 @@ mod tests {
     /// collapse to the same pixel size the whole point of the scale is lost.
     #[test]
     fn the_tiers_are_ordered_and_distinct() {
-        assert!(
-            Typography::LABEL < Typography::DETAIL,
-            "headings are the smallest tier"
-        );
-        assert!(
-            Typography::DETAIL < Typography::BODY,
-            "detail must not compete with filenames"
-        );
-        assert!(
-            Typography::BODY < Typography::TITLE,
-            "the path is the most prominent string"
-        );
+        const {
+            assert!(
+                Typography::LABEL < Typography::DETAIL,
+                "headings are the smallest tier"
+            );
+            assert!(
+                Typography::DETAIL < Typography::BODY,
+                "detail must not compete with filenames"
+            );
+            assert!(
+                Typography::BODY < Typography::TITLE,
+                "the path is the most prominent string"
+            );
+        }
     }
 
     /// Body is the baseline: a configured size of N must render filenames at

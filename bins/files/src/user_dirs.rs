@@ -102,8 +102,8 @@ impl UserDirs {
     #[must_use]
     pub fn load() -> Self {
         let home = std::env::var("HOME").map_or_else(|_| PathBuf::from("."), PathBuf::from);
-        let config = std::env::var("XDG_CONFIG_HOME")
-            .map_or_else(|_| home.join(".config"), |dir| PathBuf::from(dir));
+        let config =
+            std::env::var("XDG_CONFIG_HOME").map_or_else(|_| home.join(".config"), PathBuf::from);
         let contents = std::fs::read_to_string(config.join("user-dirs.dirs")).unwrap_or_default();
         Self::parse(&contents, &home)
     }
@@ -187,7 +187,13 @@ impl UserDirs {
     }
 
     /// The resolved path for one directory, whether or not it exists.
+    ///
+    /// The sidebar builds from [`Self::existing`]; this is the accessor the
+    /// parsing tests assert through, since resolution is the whole job of
+    /// this module and needs to be observable independently of whatever
+    /// happens to exist on the machine running the tests.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn path(&self, dir: UserDir) -> Option<&Path> {
         self.resolved
             .iter()

@@ -162,26 +162,6 @@ impl Sidebar {
         let index = usize::try_from(y / row_height).ok()?;
         self.rows.get(index).filter(|r| r.selectable())
     }
-
-    /// The next selectable row at or after `from`, for keyboard navigation.
-    #[must_use]
-    pub fn next_selectable(&self, from: usize) -> Option<usize> {
-        (from..self.rows.len()).find(|&i| self.rows[i].selectable())
-    }
-
-    /// The previous selectable row at or before `from`.
-    #[must_use]
-    pub fn prev_selectable(&self, from: usize) -> Option<usize> {
-        (0..=from.min(self.rows.len().saturating_sub(1)))
-            .rev()
-            .find(|&i| self.rows[i].selectable())
-    }
-
-    /// Total pixel height at a given row height.
-    #[must_use]
-    pub fn height(&self, row_height: i32) -> i32 {
-        i32::try_from(self.rows.len()).unwrap_or(i32::MAX) * row_height
-    }
 }
 
 #[cfg(test)]
@@ -364,17 +344,5 @@ mod tests {
         assert!(!bar.toggle());
         assert!(!bar.visible());
         assert!(bar.toggle());
-    }
-
-    #[test]
-    fn keyboard_navigation_skips_headings() {
-        let tmp = TempDir::new("sidebar-nav");
-        let (dirs, fav) = fixture(&tmp);
-        let bar = Sidebar::new(&dirs, &fav);
-        // From the very top (a heading), the next selectable row is Home.
-        let first = bar.next_selectable(0).expect("a selectable row");
-        assert!(bar.rows()[first].selectable());
-        let back = bar.prev_selectable(first).expect("itself");
-        assert_eq!(back, first);
     }
 }

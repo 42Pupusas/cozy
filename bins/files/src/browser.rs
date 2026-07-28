@@ -44,6 +44,15 @@ pub enum Outcome {
     /// "open" means -- this type refuses to guess, because spawning a process
     /// is a side effect a headless state machine has no business having.
     Open(PathBuf),
+    /// Bookmark (or un-bookmark) the directory currently open.
+    ///
+    /// Bubbled up rather than handled here for the same reason as [`Self::Open`]:
+    /// the favorites list is persisted to disk, and a headless state machine
+    /// has no business writing files.
+    ToggleFavorite,
+    /// Show or hide the places pane -- a property of the window's layout,
+    /// not of the directory being browsed.
+    ToggleSidebar,
     /// The user asked to close the window.
     Quit,
 }
@@ -191,6 +200,8 @@ impl Browser {
                 self.pane.set_len(self.view.visible_len());
                 Outcome::Redraw
             }
+            Action::ToggleFavorite => Outcome::ToggleFavorite,
+            Action::ToggleSidebar => Outcome::ToggleSidebar,
             Action::Quit => Outcome::Quit,
         }
     }
@@ -261,6 +272,19 @@ impl Browser {
         };
         let leaving = self.view.path().to_path_buf();
         self.navigate(&parent, Some(&leaving))
+    }
+
+    /// Jump straight to `path`, as the sidebar's places do.
+    ///
+    /// Public counterpart to [`Self::navigate`]: a sidebar click is a
+    /// navigation with no entry to re-select, and going somewhere you already
+    /// are must not be reported as a change or the window repaints for
+    /// nothing.
+    pub fn go_to(&mut self, path: &Path) -> Outcome {
+        if path == self.view.path() {
+            return Outcome::Ignored;
+        }
+        self.navigate(path, None)
     }
 
     /// Read `path` and point the browser at it.

@@ -57,7 +57,20 @@ impl App {
             eprintln!("files: config error: {e} — using defaults");
             config::Config::default()
         });
-        let theme = Theme::from_config(&cfg);
+        // The type scale is loaded before the theme's metrics are finalized:
+        // row/header/status heights derive from the tiers' line heights, so a
+        // larger configured font grows the chrome instead of clipping it.
+        // Scale 1.0 here; the compositor's real output scale is applied when
+        // the window reports its physical size below.
+        let type_scale = typography::Typography::load(&cfg, 1.0);
+        let theme = Theme::from_config(&cfg).with_metrics(
+            type_scale.natural_row_height(),
+            type_scale.natural_header_height(),
+            type_scale.natural_status_height(),
+        );
+        let favorites = favorites::Favorites::load();
+        let user_dirs = user_dirs::UserDirs::load();
+        let sidebar = sidebar::Sidebar::new(&user_dirs, &favorites);
         let wake = waker::Waker::new()?;
 
         let size = LogicalSize {
@@ -70,7 +83,7 @@ impl App {
         // number of rows on any HiDPI screen.
         let browser = Browser::open(
             &options.path,
-            size.width,
+            size.width - theme.list_x(sidebar.visible()),
             theme.list_height(size.height),
             theme.row_height,
         )?;
@@ -86,6 +99,9 @@ impl App {
         let mut painter = FilesWindow::new(
             browser,
             theme,
+            type_scale,
+            sidebar,
+            favorites,
             platform::toplevel::PhysicalSize {
                 width: size.width,
                 height: theme.list_height(size.height),

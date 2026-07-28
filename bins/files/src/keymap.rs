@@ -58,6 +58,10 @@ pub enum Action {
     Refresh,
     /// Show or hide dotfiles.
     ToggleHidden,
+    /// Bookmark (or un-bookmark) the directory currently open.
+    ToggleFavorite,
+    /// Show or hide the places sidebar.
+    ToggleSidebar,
     /// Close the window.
     Quit,
 }
@@ -142,6 +146,10 @@ impl Keymap {
             return match press.key {
                 Key::Char('a' | 'A') => Some(Action::List(ListCommand::SelectAll)),
                 Key::Char('h' | 'H') => Some(Action::ToggleHidden),
+                // D for bookmark, B for the pane -- matching the convention
+                // every browser and file manager already trained people on.
+                Key::Char('d' | 'D') => Some(Action::ToggleFavorite),
+                Key::Char('b' | 'B') => Some(Action::ToggleSidebar),
                 Key::Char('r' | 'R') => Some(Action::Refresh),
                 Key::Char('l' | 'L') => Some(Action::BeginFilter),
                 Key::Char('q' | 'Q') => Some(Action::Quit),
@@ -311,6 +319,37 @@ mod tests {
         let map = list_map();
         assert_eq!(map.translate(press(Key::Left)), Some(Action::GoUp));
         assert_eq!(map.translate(press(Key::Backspace)), Some(Action::GoUp));
+    }
+
+    /// Ctrl-D bookmarks and Ctrl-B toggles the places pane -- the bindings
+    /// every browser and file manager already trained people on.
+    #[test]
+    fn the_sidebar_bindings_are_reachable_from_the_list() {
+        let map = list_map();
+        assert_eq!(
+            map.translate(with_mods(Key::Char('d'), CTRL)),
+            Some(Action::ToggleFavorite)
+        );
+        assert_eq!(
+            map.translate(with_mods(Key::Char('b'), CTRL)),
+            Some(Action::ToggleSidebar)
+        );
+    }
+
+    /// A bare `d` or `b` must still type into the filter -- the Ctrl variants
+    /// must not shadow ordinary letters, or searching for "docs" would
+    /// bookmark instead.
+    #[test]
+    fn the_bare_letters_still_filter_rather_than_bookmarking() {
+        let map = list_map();
+        assert_eq!(
+            map.translate(press(Key::Char('d'))),
+            Some(Action::Insert('d'))
+        );
+        assert_eq!(
+            map.translate(press(Key::Char('b'))),
+            Some(Action::Insert('b'))
+        );
     }
 
     /// The bug this ordering exists to prevent: with Ctrl held, `h` must be

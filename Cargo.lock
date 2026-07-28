@@ -154,8 +154,10 @@ dependencies = [
  "config",
  "fsmodel",
  "launcher",
+ "localtime",
  "mime",
  "platform",
+ "statusbar",
  "waker",
  "widget",
 ]
@@ -373,6 +375,7 @@ dependencies = [
  "clipboard",
  "clipboard-wayland",
  "ixiptla-core",
+ "localtime",
  "platform",
  "quetzalcoatl",
  "screencopy",

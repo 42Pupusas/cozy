@@ -12,8 +12,12 @@ use platform::protocol::PointerButton;
 use platform::toplevel::{KeyPress, Painter, PhysicalSize, PointerEventKind, Position};
 use widget::Mods;
 
+use crate::breadcrumb::Breadcrumb;
 use crate::browser::{Browser, Outcome};
+use crate::columns::{Column, Columns};
 use crate::favorites::Favorites;
+use crate::kind_label::KindLabel;
+use crate::moment::Moment;
 use crate::row_format::RowFormat;
 use crate::sidebar::{Sidebar, SidebarRow};
 use crate::theme::Theme;
@@ -32,6 +36,22 @@ const DOUBLE_CLICK_MS: u64 = 400;
 /// succession registers as a double-click on the second and opens a file the
 /// user never meant to open.
 const DOUBLE_CLICK_SLOP: i32 = 4;
+
+/// One row's strings and states, gathered before drawing.
+///
+/// A named struct rather than a tuple because six positional fields of which
+/// two are `bool` is exactly the shape that silently swaps `selected` and
+/// `is_cursor` during a refactor.
+struct PaintedRow {
+    y: i32,
+    name: String,
+    kind: String,
+    modified: String,
+    size: String,
+    color: Color,
+    selected: bool,
+    is_cursor: bool,
+}
 
 /// Draws a browser and feeds it input.
 pub struct FilesWindow {
@@ -116,7 +136,7 @@ impl FilesWindow {
     /// list's width without any window resize -- and forgetting to re-layout
     /// there would leave the list hit-testing against a stale width.
     fn relayout(&mut self) {
-        let x = self.theme.list_x(self.sidebar.visible());
+        let x = self.theme.list_x(self.sidebar.visible(), self.size.width);
         self.browser.resize(
             (self.size.width - x).max(0),
             self.theme.list_height(self.size.height),
@@ -163,12 +183,12 @@ impl FilesWindow {
     /// status bar cannot be mistaken for a click on whichever row happens to
     /// line up with it -- and `None` over the sidebar, so a click on a place
     /// does not also land on the row beside it.
-    const fn to_pane(&self, at: Position) -> Option<(i32, i32)> {
+    fn to_pane(&self, at: Position) -> Option<(i32, i32)> {
         let y = at.y - self.theme.list_top();
         if y < 0 || y >= self.theme.list_height(self.size.height) {
             return None;
         }
-        let x = at.x - self.theme.list_x(self.sidebar.visible());
+        let x = at.x - self.theme.list_x(self.sidebar.visible(), self.size.width);
         if x < 0 {
             return None;
         }
@@ -176,8 +196,15 @@ impl FilesWindow {
     }
 
     /// Whether `at` falls inside the places pane.
-    const fn in_sidebar(&self, at: Position) -> bool {
-        self.sidebar.visible() && at.x < self.theme.sidebar_width && at.y >= self.theme.list_top()
+    ///
+    /// The pane begins at the toolbar rather than below the column headers,
+    /// matching where it is painted -- a mismatch here would leave a dead
+    /// strip at the top of the sidebar where clicks did nothing.
+    fn in_sidebar(&self, at: Position) -> bool {
+        self.sidebar.visible()
+            && at.x < self.theme.sidebar_width_at(self.size.width)
+            && at.y >= self.theme.header_height
+            && at.y < self.size.height - self.theme.status_height
     }
 
     /// Whether this click, at `now`, continues a double-click gesture.
@@ -205,35 +232,223 @@ impl FilesWindow {
         u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Draw the path header.
-    fn paint_header(&mut self, canvas: &mut Canvas<'_>) {
+    /// Draw the toolbar: the breadcrumb path and the filter control.
+    ///
+    /// The guide's toolbar also carries back/forward, a view switch and a
+    /// new-directory action. Those are deliberately not drawn yet: a control
+    /// that is visible but inert is worse than an absent one, because the
+    /// user learns it is broken. They arrive with the actions behind them.
+    fn paint_toolbar(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
         canvas.fill_rect(
             Rect::new(0, 0, self.size.width, theme.header_height),
-            theme.header_bg,
+            theme.toolbar_bg,
         );
-        // A hairline under the header separates it from the list without
+        // A hairline under the toolbar separates it from the list without
         // spending a whole row of vertical space on a gap.
         canvas.fill_rect(
-            Rect::new(0, theme.header_height - 1, self.size.width, 1),
+            Rect::new(
+                0,
+                theme.header_height - theme.spacing.hairline(),
+                self.size.width,
+                theme.spacing.hairline(),
+            ),
             theme.sidebar_border,
         );
-        let title = &mut self.type_scale.title;
-        let text_y = title.baseline_y(theme.header_height);
-        let width = self.size.width - theme.padding * 2;
-        let path = self.browser.path().display().to_string();
-        // Truncated from the *left*: the tail of a path (where you are) is
-        // far more useful than the head (that you are under /home).
-        let columns = Self::columns_for(title, width);
-        let shown = Self::truncate_left(&path, columns);
-        title.draw_text(
-            canvas,
-            &shown,
-            theme.padding,
-            text_y,
-            theme.text,
-            theme.header_bg,
+        self.paint_breadcrumb(canvas);
+        self.paint_filter_control(canvas);
+    }
+
+    /// Draw the breadcrumb path, most-significant segment first.
+    ///
+    /// The current segment is drawn in full-strength text and the ancestors
+    /// muted, so the eye lands on where you *are* rather than on the path you
+    /// took to get there.
+    fn paint_breadcrumb(&mut self, canvas: &mut Canvas<'_>) {
+        let theme = self.theme;
+        let crumbs = self.crumbs();
+        // The filter control owns the right end of the toolbar, so the path
+        // gets what is left after it and the gaps around it.
+        let reserved = theme.spacing.search_width() + theme.spacing.l() * 2;
+        let limit = self.size.width - reserved;
+        let mut x = theme.spacing.l();
+
+        let (shown, elided) = crumbs.tail(self.crumb_budget(limit));
+        if elided {
+            let label = &mut self.type_scale.label;
+            let y = label.baseline_y(theme.header_height);
+            x = label.draw_text(
+                canvas,
+                Breadcrumb::ELLIPSIS,
+                x,
+                y,
+                theme.muted,
+                theme.toolbar_bg,
+            );
+            x += theme.spacing.xs();
+        }
+
+        for (i, crumb) in shown.iter().enumerate() {
+            // A separator between segments, but never before the first: the
+            // root crumb already reads as "/".
+            if i > 0 || elided {
+                let label = &mut self.type_scale.label;
+                let y = label.baseline_y(theme.header_height);
+                x = label.draw_text(canvas, "/", x, y, theme.muted, theme.toolbar_bg);
+                x += theme.spacing.xs();
+            }
+            let (color, tier) = if crumb.current {
+                (theme.text, &mut self.type_scale.title)
+            } else {
+                (theme.muted, &mut self.type_scale.body)
+            };
+            let y = tier.baseline_y(theme.header_height);
+            x = tier.draw_text(canvas, &crumb.label, x, y, color, theme.toolbar_bg);
+            x += theme.spacing.xs();
+        }
+    }
+
+    /// How many path segments fit in `width` pixels.
+    ///
+    /// Estimated from the body tier's average advance rather than measured
+    /// per crumb: an exact fit would need the widths of every segment before
+    /// choosing how many to drop, and at toolbar scale the estimate is off by
+    /// at most one segment while being far simpler to reason about.
+    fn crumb_budget(&mut self, width: i32) -> usize {
+        if width <= 0 {
+            return 1;
+        }
+        // A typical segment plus its separator, in average advances.
+        let advance = self.type_scale.body.measure("n").max(1);
+        let per_crumb = advance * 10;
+        usize::try_from(width / per_crumb.max(1))
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// The breadcrumb model for the open directory.
+    fn crumbs(&self) -> Breadcrumb {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        Breadcrumb::new(self.browser.path(), home.as_deref())
+    }
+
+    /// Draw the filter control at the toolbar's right end.
+    ///
+    /// Per the guide it is a quiet bordered box that strengthens its border
+    /// and widens when focused; here "focused" means the browser is filtering,
+    /// which is the only way the control can be active.
+    fn paint_filter_control(&mut self, canvas: &mut Canvas<'_>) {
+        let theme = self.theme;
+        let filtering = self.browser.is_filtering();
+        let width = if filtering {
+            theme.spacing.search_width_focused()
+        } else {
+            theme.spacing.search_width()
+        };
+        let height = theme.spacing.control_height();
+        let x = self.size.width - width - theme.spacing.l();
+        let y = (theme.header_height - height) / 2;
+        // Guard against a window too narrow to hold the control at all --
+        // drawing it at a negative x would wrap around the canvas.
+        if x < theme.spacing.l() {
+            return;
+        }
+        let rect = Rect::new(x, y, width, height);
+        canvas.fill_rect(rect, theme.filter_bg);
+        canvas.draw_rect(
+            rect,
+            if filtering {
+                theme.focus_ring
+            } else {
+                theme.control_border
+            },
         );
+
+        let inner_x = x + theme.spacing.s();
+        let detail = &mut self.type_scale.detail;
+        let text_y = y + (height - detail.line_height()) / 2;
+        if filtering {
+            let query = self.browser.filter().text().to_owned();
+            let before = self.browser.filter().before_caret().to_owned();
+            let detail = &mut self.type_scale.detail;
+            detail.draw_text(canvas, &query, inner_x, text_y, theme.text, theme.filter_bg);
+            // Measured, not counted: with a proportional face the caret's
+            // pixel offset is the width of the text before it.
+            let caret_x = inner_x + detail.measure(&before);
+            canvas.fill_rect(
+                Rect::new(caret_x, text_y, theme.spacing.rule(), detail.line_height()),
+                theme.caret,
+            );
+        } else {
+            detail.draw_text(
+                canvas,
+                "filter...",
+                inner_x,
+                text_y,
+                theme.muted,
+                theme.filter_bg,
+            );
+        }
+    }
+
+    /// Draw the column-header row: small, lowercase, letter-spaced labels
+    /// over a hairline, per the guide.
+    fn paint_column_headers(&mut self, canvas: &mut Canvas<'_>) {
+        let theme = self.theme;
+        let y = theme.column_header_top();
+        let height = theme.spacing.column_header();
+        let left = theme.list_x(self.sidebar.visible(), self.size.width);
+        let width = (self.size.width - left).max(0);
+        canvas.fill_rect(Rect::new(left, y, width, height), theme.background);
+
+        let columns = self.list_columns();
+        for cell in columns.cells() {
+            let heading = cell.column.heading();
+            let label = &mut self.type_scale.label;
+            let text_y = y + (height - label.line_height()) / 2;
+            // Right-aligned headings sit over right-aligned data, so the
+            // "size" label lines up with the digits beneath it.
+            let text_x = cell.text_x(label.measure(heading));
+            label.draw_text(
+                canvas,
+                heading,
+                text_x,
+                text_y,
+                theme.muted,
+                theme.background,
+            );
+        }
+
+        // The rule under the headings, which is what makes them read as a
+        // table header rather than as a first row.
+        canvas.fill_rect(
+            Rect::new(
+                left,
+                y + height - theme.spacing.hairline(),
+                width,
+                theme.spacing.hairline(),
+            ),
+            theme.sidebar_border,
+        );
+    }
+
+    /// The column layout for the current window.
+    ///
+    /// Recomputed per paint rather than cached: it depends on the window
+    /// width, the sidebar's visibility and the scrollbar's presence, and a
+    /// stale copy would put the headings out of line with the data.
+    fn list_columns(&self) -> Columns {
+        let theme = self.theme;
+        let left = theme.list_x(self.sidebar.visible(), self.size.width);
+        // The rows reserve the scrollbar gutter, so the headers must too or
+        // the "size" heading floats away from the numbers below it.
+        let content = self.browser.pane().content_width();
+        Columns::new(
+            left + theme.padding,
+            (content - theme.padding * 2).max(0),
+            theme.spacing.s(),
+            theme.is_compact(self.size.width),
+        )
     }
 
     /// Draw the places sidebar: section headings, places, and bookmarks.
@@ -242,20 +457,30 @@ impl FilesWindow {
             return;
         }
         let theme = self.theme;
-        let top = theme.list_top();
-        let height = theme.list_height(self.size.height);
-        canvas.fill_rect(
-            Rect::new(0, top, theme.sidebar_width, height),
-            theme.sidebar_bg,
-        );
+        // The pane starts at the toolbar, not below the column headers: the
+        // headings belong to the list, and a sidebar that skipped that band
+        // would leave an unpainted notch at its top.
+        let top = theme.header_height;
+        let height = theme.pane_height(self.size.height);
+        let width = theme.sidebar_width_at(self.size.width);
+        // Below the guide's threshold the pane collapses to an icon rail.
+        // With icons not yet drawn, labels are simply omitted rather than
+        // painted clipped -- a half-cut word is worse than none.
+        let compact = theme.is_compact(self.size.width);
+        canvas.fill_rect(Rect::new(0, top, width, height), theme.sidebar_bg);
         // The divider carries the eye down the seam between the two panes.
         canvas.fill_rect(
-            Rect::new(theme.sidebar_width - 1, top, 1, height),
+            Rect::new(
+                width - theme.spacing.hairline(),
+                top,
+                theme.spacing.hairline(),
+                height,
+            ),
             theme.sidebar_border,
         );
 
         let active = self.sidebar.index_of(self.browser.path());
-        let row_h = theme.row_height;
+        let row_h = theme.spacing.sidebar_row();
         // Collected first because drawing needs `&mut self.type_scale` while
         // the rows live behind `&self.sidebar`.
         let rows: Vec<SidebarRow> = self.sidebar.rows().to_vec();
@@ -267,6 +492,9 @@ impl FilesWindow {
                 break;
             }
             match row {
+                // A rail has no room for headings, and the guide hides them
+                // there rather than compressing them.
+                SidebarRow::Heading(_) | SidebarRow::Hint(_) if compact => {}
                 SidebarRow::Heading(text) => {
                     // Headings sit in the small label tier and the muted
                     // colour, so they read as structure rather than as
@@ -276,7 +504,7 @@ impl FilesWindow {
                     label.draw_text(
                         canvas,
                         text,
-                        theme.padding,
+                        theme.spacing.m(),
                         ty,
                         theme.muted,
                         theme.sidebar_bg,
@@ -288,7 +516,7 @@ impl FilesWindow {
                     detail.draw_text(
                         canvas,
                         text,
-                        theme.padding * 2,
+                        theme.spacing.m(),
                         ty,
                         theme.muted,
                         theme.sidebar_bg,
@@ -298,21 +526,30 @@ impl FilesWindow {
                     let is_active = active == Some(i);
                     let bg = if is_active {
                         canvas.fill_rect(
-                            Rect::new(0, y, theme.sidebar_width - 1, row_h),
+                            Rect::new(0, y, width - theme.spacing.hairline(), row_h),
                             theme.sidebar_active,
                         );
+                        // The guide's 2px accent rule on the left edge, which
+                        // is what makes the active place readable at a glance
+                        // even when the fill is subtle.
+                        canvas
+                            .fill_rect(Rect::new(0, y, theme.spacing.rule(), row_h), theme.accent);
                         theme.sidebar_active
                     } else {
                         theme.sidebar_bg
                     };
-                    // The open directory is drawn in full-strength text; the
-                    // rest in the directory colour, matching the list.
-                    let color = if is_active { theme.text } else { theme.dir };
+                    if compact {
+                        continue;
+                    }
+                    // The open directory is drawn in the accent; the rest in
+                    // ordinary text, so exactly one row draws the eye.
+                    let color = if is_active { theme.accent } else { theme.text };
                     let body = &mut self.type_scale.body;
                     let ty = y + (row_h - body.line_height()) / 2;
-                    let room = theme.sidebar_width - theme.padding * 3;
+                    let inset = theme.spacing.m();
+                    let room = width - inset - theme.spacing.s();
                     let shown = RowFormat::truncate(label, Self::columns_for(body, room));
-                    body.draw_text(canvas, &shown, theme.padding * 2, ty, color, bg);
+                    body.draw_text(canvas, &shown, inset, ty, color, bg);
                 }
             }
         }
@@ -333,57 +570,50 @@ impl FilesWindow {
         usize::try_from(width / advance).unwrap_or(0)
     }
 
-    /// Keep the last `columns` characters of a path, marking the cut.
-    fn truncate_left(path: &str, columns: usize) -> String {
-        let len = path.chars().count();
-        if len <= columns {
-            return path.to_owned();
-        }
-        if columns <= 1 {
-            return "…".repeat(columns);
-        }
-        let skip = len - (columns - 1);
-        let mut out = String::from("…");
-        out.extend(path.chars().skip(skip));
-        out
-    }
-
-    /// Draw the visible rows.
+    /// Draw the visible rows across the guide's four columns.
     fn paint_rows(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let left = theme.list_x(self.sidebar.visible());
+        let left = theme.list_x(self.sidebar.visible(), self.size.width);
         let top = theme.list_top();
         let content_width = self.browser.pane().content_width();
-        // The size column is right-aligned in a fixed gutter, so names in a
-        // list of mixed sizes still line up.
-        let size_width = self.type_scale.detail.measure("999.9 MB");
-        let name_width = (content_width - size_width - theme.padding * 3).max(0);
-        let name_columns = Self::columns_for(&mut self.type_scale.body, name_width);
+        let columns = self.list_columns();
+        // One clock read for the whole frame: `modified` is relative to now,
+        // and re-reading the clock per row could straddle midnight and render
+        // two rows of the same directory against different "today"s.
+        let now = localtime::LocalTime::now();
 
         // Gathered up front: drawing needs `&mut self.type_scale`, which
         // cannot coexist with an iterator borrowing `self.browser`.
-        let rows: Vec<(i32, String, String, Color, bool, bool)> = self
+        let rows: Vec<PaintedRow> = self
             .browser
             .pane()
             .visible_rows()
             .filter_map(|row| {
                 let y = self.browser.pane().row_y(row)?;
                 let entry = self.browser.entry(row)?;
-                Some((
+                Some(PaintedRow {
                     y,
-                    RowFormat::name(entry),
-                    RowFormat::size(entry),
-                    RowFormat::color(entry, &theme),
-                    self.browser.pane().is_selected(row),
-                    self.browser.pane().cursor() == Some(row),
-                ))
+                    name: RowFormat::name(entry),
+                    // Detection is skipped for directories and links, whose
+                    // label is structural -- that avoids a database lookup
+                    // for the majority of rows in a typical tree.
+                    kind: KindLabel::of(entry, None),
+                    modified: now.map_or_else(
+                        || Moment::UNKNOWN.to_owned(),
+                        |now| Moment::relative(entry.modified, now),
+                    ),
+                    size: RowFormat::size(entry),
+                    color: RowFormat::color(entry, &theme),
+                    selected: self.browser.pane().is_selected(row),
+                    is_cursor: self.browser.pane().cursor() == Some(row),
+                })
             })
             .collect();
 
-        for (y, name, size, color, selected, is_cursor) in rows {
-            let y = top + y;
+        for row in rows {
+            let y = top + row.y;
             let rect = Rect::new(left, y, content_width, theme.row_height);
-            let bg = if selected {
+            let bg = if row.selected {
                 canvas.fill_rect(rect, theme.selection);
                 theme.selection
             } else {
@@ -392,22 +622,58 @@ impl FilesWindow {
             // The cursor outline is drawn even on an unselected row, and only
             // when focused: an outline on an unfocused window claims a
             // keyboard focus we do not have.
-            if self.focused && is_cursor {
+            if self.focused && row.is_cursor {
                 canvas.draw_rect(rect, theme.cursor);
             }
+            // A thin separator per row rather than a card, per the guide.
+            canvas.fill_rect(
+                Rect::new(
+                    left,
+                    y + theme.row_height - theme.spacing.hairline(),
+                    content_width,
+                    theme.spacing.hairline(),
+                ),
+                theme.sidebar_border,
+            );
 
-            let body = &mut self.type_scale.body;
-            let text_y = y + (theme.row_height - body.line_height()) / 2;
-            let shown = RowFormat::truncate(&name, name_columns);
-            body.draw_text(canvas, &shown, left + theme.padding, text_y, color, bg);
-
-            // Right-aligned by measuring the string: with a proportional face
-            // a character count is no longer a pixel width.
-            let detail = &mut self.type_scale.detail;
-            let size_x = left + content_width - theme.padding - detail.measure(&size);
-            let detail_y = y + (theme.row_height - detail.line_height()) / 2;
-            detail.draw_text(canvas, &size, size_x, detail_y, theme.muted, bg);
+            for cell in columns.cells() {
+                // The filename keeps the body tier and the type colour; the
+                // metadata is subordinate, so it takes the smaller tier and
+                // the muted colour -- until its row is selected, where the
+                // guide asks for the whole row to brighten.
+                let (text, color, tier) = match cell.column {
+                    Column::Name => (&row.name, row.color, &mut self.type_scale.body),
+                    Column::Modified => (
+                        &row.modified,
+                        Self::meta_color(&theme, row.selected),
+                        &mut self.type_scale.detail,
+                    ),
+                    Column::Kind => (
+                        &row.kind,
+                        Self::meta_color(&theme, row.selected),
+                        &mut self.type_scale.detail,
+                    ),
+                    Column::Size => (
+                        &row.size,
+                        Self::meta_color(&theme, row.selected),
+                        &mut self.type_scale.detail,
+                    ),
+                };
+                let text_y = y + (theme.row_height - tier.line_height()) / 2;
+                let shown = RowFormat::truncate(text, Self::columns_for(tier, cell.width));
+                let text_x = cell.text_x(tier.measure(&shown));
+                tier.draw_text(canvas, &shown, text_x, text_y, color, bg);
+            }
         }
+    }
+
+    /// The colour for a metadata cell.
+    ///
+    /// The guide's rule: metadata stays subdued *until its row is selected*,
+    /// at which point holding it muted against the selection fill would make
+    /// it the least readable thing on screen.
+    const fn meta_color(theme: &Theme, selected: bool) -> Color {
+        if selected { theme.text } else { theme.muted }
     }
 
     /// Draw the scrollbar, if the list overflows.
@@ -417,7 +683,7 @@ impl FilesWindow {
             return;
         }
         let theme = &self.theme;
-        let x = theme.list_x(self.sidebar.visible()) + pane.gutter_x();
+        let x = theme.list_x(self.sidebar.visible(), self.size.width) + pane.gutter_x();
         let track_h = theme.list_height(self.size.height);
         let gutter = (self.size.width - x).max(0);
         canvas.fill_rect(
@@ -472,48 +738,68 @@ impl FilesWindow {
             return;
         }
 
-        if filtering {
-            let query = self.browser.filter().text().to_owned();
-            let before = self.browser.filter().before_caret().to_owned();
-            let detail = &mut self.type_scale.detail;
-            let text_y = y + (theme.status_height - detail.line_height()) / 2;
-            let prefix = "filter: ";
-            let query_x = detail.draw_text(
-                canvas,
-                prefix,
-                theme.padding,
-                text_y,
-                theme.muted,
-                background,
-            );
-            detail.draw_text(canvas, &query, query_x, text_y, theme.text, background);
-            // Measured, not counted: with a proportional face the caret's
-            // pixel offset is the width of the text before it.
-            let caret_x = query_x + detail.measure(&before);
-            canvas.fill_rect(
-                Rect::new(caret_x, text_y, 2, detail.line_height()),
-                theme.caret,
-            );
-            return;
-        }
-
+        // The guide's status line reports the entry count or the selection.
+        // The filter query itself now lives in the toolbar control, so the
+        // strip stays a summary rather than duplicating it.
         let shown = self.browser.len();
         let total = self.browser.total();
         let summary = if shown == total {
-            format!("{total} items")
+            format!("{total} entries")
         } else {
-            format!("{shown} of {total} items")
+            format!("{shown} of {total} entries")
         };
-        let detail = &mut self.type_scale.detail;
-        let text_y = y + (theme.status_height - detail.line_height()) / 2;
-        detail.draw_text(
+        let label = &mut self.type_scale.label;
+        let text_y = y + (theme.status_height - label.line_height()) / 2;
+        label.draw_text(
             canvas,
             &summary,
-            theme.padding,
+            theme.spacing.l(),
             text_y,
             theme.muted,
             background,
         );
+
+        self.paint_status_hint(canvas, y, background);
+    }
+
+    /// Draw the keyboard hint at the status line's right end.
+    ///
+    /// The guide gives the hint a minimal keycap: an outlined box around the
+    /// chord with its description beside it in muted text.
+    fn paint_status_hint(&mut self, canvas: &mut Canvas<'_>, y: i32, background: Color) {
+        let theme = self.theme;
+        // Which hint earns the space depends on what the user can do next:
+        // while filtering, escaping is what they will want.
+        let (description, chord) = if self.browser.is_filtering() {
+            ("clear filter", "esc")
+        } else {
+            ("select all", "ctrl+a")
+        };
+
+        let label = &mut self.type_scale.label;
+        let pad = theme.spacing.xs();
+        let chord_w = label.measure(chord) + pad * 2;
+        let cap_h = label.line_height() + pad;
+        let gap = theme.spacing.s();
+        let total = label.measure(description) + gap + chord_w;
+        let start = self.size.width - theme.spacing.l() - total;
+        // A window too narrow for the hint drops it rather than overlapping
+        // the entry count, which is the more useful of the two.
+        let count_end = theme.spacing.l() + label.measure("9999 of 9999 entries");
+        if start < count_end {
+            return;
+        }
+
+        let text_y = y + (theme.status_height - label.line_height()) / 2;
+        let after = label.draw_text(canvas, description, start, text_y, theme.muted, background);
+        let cap_x = after + gap;
+        let cap_y = y + (theme.status_height - cap_h) / 2;
+        canvas.draw_rect(
+            Rect::new(cap_x, cap_y, chord_w, cap_h),
+            theme.control_border,
+        );
+        let label = &mut self.type_scale.label;
+        label.draw_text(canvas, chord, cap_x + pad, text_y, theme.muted, background);
     }
 }
 
@@ -528,8 +814,9 @@ impl Painter for FilesWindow {
         // loop drives from WindowEvent::Resized.
         self.size = size;
         canvas.clear(self.theme.background);
-        self.paint_header(canvas);
+        self.paint_toolbar(canvas);
         self.paint_sidebar(canvas);
+        self.paint_column_headers(canvas);
         self.paint_rows(canvas);
         self.paint_scrollbar(canvas);
         self.paint_status(canvas);
@@ -554,10 +841,10 @@ impl Painter for FilesWindow {
                 // A click in the places pane navigates and goes no further:
                 // it must not also be routed to the list beside it.
                 if self.in_sidebar(at) {
-                    let y = at.y - self.theme.list_top();
+                    let y = at.y - self.theme.header_height;
                     if let Some(path) = self
                         .sidebar
-                        .row_at(y, self.theme.row_height)
+                        .row_at(y, self.theme.spacing.sidebar_row())
                         .and_then(|r| r.path())
                         .map(std::path::Path::to_path_buf)
                     {
@@ -612,36 +899,6 @@ impl Painter for FilesWindow {
 #[cfg(test)]
 mod tests {
     use super::FilesWindow;
-
-    /// A path is truncated from the left, because the tail says where you
-    /// are and the head only says you are under /home.
-    #[test]
-    fn a_long_path_keeps_its_tail() {
-        let path = "/home/user/projects/terminal/crates/widget/src";
-        let out = FilesWindow::truncate_left(path, 20);
-        assert_eq!(out.chars().count(), 20);
-        assert!(out.starts_with('…'));
-        assert!(out.ends_with("widget/src"), "got {out}");
-    }
-
-    #[test]
-    fn a_short_path_is_left_alone() {
-        assert_eq!(FilesWindow::truncate_left("/tmp", 20), "/tmp");
-    }
-
-    #[test]
-    fn degenerate_widths_do_not_panic() {
-        assert_eq!(FilesWindow::truncate_left("/some/path", 0), "");
-        assert_eq!(FilesWindow::truncate_left("/some/path", 1), "…");
-    }
-
-    /// Multi-byte path components must be counted as cells, not bytes.
-    #[test]
-    fn truncation_counts_characters_not_bytes() {
-        let path = "/home/user/日本語のディレクトリ/file";
-        let out = FilesWindow::truncate_left(path, 10);
-        assert_eq!(out.chars().count(), 10);
-    }
 
     /// A width narrower than a single glyph yields no columns rather than a
     /// huge one: a window dragged narrower than its own padding produces a

@@ -12,6 +12,8 @@
 
 use platform::draw::Color;
 
+use crate::spacing::Spacing;
+
 /// Colours and metrics for the file browser.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -32,6 +34,11 @@ pub struct Theme {
     /// Dimmed text: sizes, counts, the status line.
     pub muted: Color,
     /// The header strip showing the current path.
+    ///
+    /// Retained as a distinct role from [`Self::toolbar_bg`] because the
+    /// config exposes it and a user may have set it; the toolbar mirrors it
+    /// by default, so they only diverge if someone asks them to.
+    #[allow(dead_code)]
     pub header_bg: Color,
     pub status_bg: Color,
     pub error: Color,
@@ -49,6 +56,25 @@ pub struct Theme {
     /// Fill behind the sidebar row for the directory currently open.
     pub sidebar_active: Color,
 
+    /// Fill under a hovered row or control.
+    ///
+    /// The guide asks every interactive element for a distinct hover state.
+    /// Unused until the window tracks pointer position per row -- motion is
+    /// currently only forwarded for scrollbar drags -- but defined here so
+    /// the colour is chosen once, with the palette, rather than invented at
+    /// the call site later.
+    #[allow(dead_code)]
+    pub hover: Color,
+    /// Fill behind the toolbar strip.
+    pub toolbar_bg: Color,
+    /// Outline around toolbar controls (the filter box, the view switch).
+    pub control_border: Color,
+    /// Outline around a control while it has keyboard focus.
+    pub focus_ring: Color,
+    /// The accent: active location, selection, and feedback. Used sparingly
+    /// -- per the guide it indicates state rather than decorating.
+    pub accent: Color,
+
     pub row_height: i32,
     pub header_height: i32,
     pub status_height: i32,
@@ -56,6 +82,13 @@ pub struct Theme {
     pub padding: i32,
     /// Width of the places sidebar.
     pub sidebar_width: i32,
+
+    /// The 4px spacing rhythm and the geometry derived from it.
+    ///
+    /// Held by the theme rather than passed alongside it because every call
+    /// site that wants a colour also wants a gap, and threading two values
+    /// through the painter would guarantee they drift apart.
+    pub spacing: Spacing,
 }
 
 impl Default for Theme {
@@ -86,6 +119,12 @@ impl Default for Theme {
             sidebar_border: Color::rgb(0x31, 0x32, 0x44),
             sidebar_active: Color::rgb(0x31, 0x32, 0x44),
 
+            hover: Color::rgb(0x28, 0x28, 0x3c),
+            toolbar_bg: Color::rgb(0x18, 0x18, 0x25),
+            control_border: Color::rgb(0x31, 0x32, 0x44),
+            focus_ring: Color::rgb(0x89, 0xb4, 0xfa),
+            accent: Color::rgb(0x89, 0xb4, 0xfa),
+
             // The bitmap font is 16px tall; 20 leaves 2px of breathing room
             // above and below without making the list feel sparse.
             row_height: 20,
@@ -95,6 +134,7 @@ impl Default for Theme {
             // Wide enough for "Downloads" plus padding at the default size,
             // narrow enough to leave the list the majority of a small window.
             sidebar_width: 160,
+            spacing: Spacing::new(13.0, 1.0),
         }
     }
 }
@@ -137,12 +177,84 @@ impl Theme {
             sidebar_border: cfg.files_filter_bg().into(),
             sidebar_active: cfg.files_filter_bg().into(),
 
+            // Hover sits between the background and the selection: present
+            // enough to track the pointer, quiet enough not to compete with
+            // an actual selection.
+            hover: cfg.files_filter_bg().into(),
+            toolbar_bg: cfg.files_header_bg().into(),
+            control_border: cfg.files_filter_bg().into(),
+            // The cursor colour already means "keyboard is here", so the
+            // focus ring reuses it rather than introducing a second
+            // convention the user would have to learn.
+            focus_ring: cfg.files_cursor().into(),
+            accent: cfg.files_cursor().into(),
+
             row_height: px(cfg.files_row_height()),
             header_height: px(cfg.files_header_height()),
             status_height: px(cfg.files_status_height()),
             padding: px(cfg.files_padding()),
             sidebar_width: Self::default().sidebar_width,
+            spacing: Spacing::new(13.0, 1.0),
         }
+    }
+
+    /// Adopt the design guide's geometry for a given font size and output
+    /// scale.
+    ///
+    /// Applied after [`Self::from_config`] so an explicit `[files]` metric
+    /// still wins: the user asked for that number. Everything they did *not*
+    /// state follows the guide's proportions, which is what makes the layout
+    /// hold together at any font size.
+    #[must_use]
+    pub fn with_spacing(mut self, spacing: Spacing) -> Self {
+        let fallback = Self::default();
+        self.spacing = spacing;
+        if self.row_height == fallback.row_height {
+            self.row_height = spacing.list_row();
+        }
+        if self.header_height == fallback.header_height {
+            self.header_height = spacing.toolbar_height();
+        }
+        if self.status_height == fallback.status_height {
+            self.status_height = spacing.status_height();
+        }
+        if self.padding == fallback.padding {
+            self.padding = spacing.m();
+        }
+        if self.sidebar_width == fallback.sidebar_width {
+            self.sidebar_width = spacing.sidebar_width();
+        }
+        self
+    }
+
+    /// The sidebar's width at a given window width, collapsing to the
+    /// guide's icon rail on a narrow window.
+    #[must_use]
+    pub fn sidebar_width_at(&self, window_width: i32) -> i32 {
+        if self.is_compact(window_width) {
+            self.spacing.rail_width()
+        } else {
+            self.sidebar_width
+        }
+    }
+
+    /// Whether the window is narrow enough for the guide's compact rules:
+    /// a collapsed sidebar rail and a dropped `modified` column.
+    #[must_use]
+    pub fn is_compact(&self, window_width: i32) -> bool {
+        window_width < self.spacing.collapse_below()
+    }
+
+    /// The y coordinate where the column-header row begins.
+    #[must_use]
+    pub const fn column_header_top(&self) -> i32 {
+        self.header_height
+    }
+
+    /// The y coordinate where file rows begin, below the column headers.
+    #[must_use]
+    pub fn rows_top(&self) -> i32 {
+        self.header_height + self.spacing.column_header()
     }
 
     /// Adopt the metrics derived from the loaded type scale.
@@ -166,36 +278,49 @@ impl Theme {
     }
 
     /// The x coordinate where the list pane begins.
+    ///
+    /// Takes the window width so a narrow window puts the list against the
+    /// collapsed rail rather than against the full-width sidebar it is no
+    /// longer drawing.
     #[must_use]
-    pub const fn list_x(&self, sidebar_visible: bool) -> i32 {
+    pub fn list_x(&self, sidebar_visible: bool, window_width: i32) -> i32 {
         if sidebar_visible {
-            self.sidebar_width
+            self.sidebar_width_at(window_width)
         } else {
             0
         }
     }
 
-    /// Vertical space the list gets in a window of `height` pixels.
+    /// Vertical space the *scrolling rows* get in a window of `height`
+    /// pixels -- the window less the toolbar, column headers and status.
     ///
     /// Clamped at zero so a window dragged smaller than its own chrome
     /// yields an empty list rather than a negative height that would make
     /// every downstream calculation nonsense.
     #[must_use]
-    pub const fn list_height(&self, height: i32) -> i32 {
-        let used = self.header_height + self.status_height;
+    pub fn list_height(&self, height: i32) -> i32 {
+        let used = self.rows_top() + self.status_height;
         if height > used { height - used } else { 0 }
     }
 
-    /// The y coordinate where the list starts.
+    /// The y coordinate where scrolling rows start.
     #[must_use]
-    pub const fn list_top(&self) -> i32 {
-        self.header_height
+    pub fn list_top(&self) -> i32 {
+        self.rows_top()
+    }
+
+    /// Vertical space the sidebar pane occupies: everything between the
+    /// toolbar and the status strip, including alongside the column headers.
+    #[must_use]
+    pub const fn pane_height(&self, height: i32) -> i32 {
+        let used = self.header_height + self.status_height;
+        if height > used { height - used } else { 0 }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Color, Theme};
+    use super::{Color, Spacing, Theme};
 
     #[test]
     fn the_list_gets_what_the_chrome_does_not_use() {
@@ -203,8 +328,26 @@ mod tests {
         let height = 600;
         assert_eq!(
             theme.list_height(height),
-            height - theme.header_height - theme.status_height
+            height - theme.rows_top() - theme.status_height
         );
+    }
+
+    /// The column headers sit between the toolbar and the rows, so the rows
+    /// must start below both -- otherwise the first file paints over the
+    /// headings.
+    #[test]
+    fn rows_start_below_the_column_headers() {
+        let theme = Theme::default();
+        assert!(theme.rows_top() > theme.column_header_top());
+        assert_eq!(theme.column_header_top(), theme.header_height);
+    }
+
+    /// The sidebar spans the column-header band too: it is a pane beside the
+    /// whole list, not just beside the scrolling rows.
+    #[test]
+    fn the_sidebar_pane_is_taller_than_the_scrolling_rows() {
+        let theme = Theme::default();
+        assert!(theme.pane_height(800) > theme.list_height(800));
     }
 
     /// A window dragged smaller than its own chrome must not produce a
@@ -220,7 +363,41 @@ mod tests {
     #[test]
     fn the_list_starts_below_the_header() {
         let theme = Theme::default();
-        assert_eq!(theme.list_top(), theme.header_height);
+        assert!(theme.list_top() >= theme.header_height);
+    }
+
+    /// The guide's responsive rule: a narrow window collapses the sidebar to
+    /// an icon rail so filenames keep their room.
+    #[test]
+    fn a_narrow_window_collapses_the_sidebar_to_a_rail() {
+        let theme = Theme::default().with_spacing(Spacing::new(13.0, 1.0));
+        assert!(theme.is_compact(700));
+        assert!(!theme.is_compact(1280));
+        assert_eq!(theme.sidebar_width_at(1280), theme.sidebar_width);
+        assert!(theme.sidebar_width_at(700) < theme.sidebar_width);
+        // …and the list must follow the rail, not the full-width pane.
+        assert_eq!(theme.list_x(true, 700), theme.sidebar_width_at(700));
+    }
+
+    /// The guide's geometry must actually arrive when nothing is configured.
+    #[test]
+    fn the_guide_geometry_replaces_the_defaults() {
+        let spacing = Spacing::new(13.0, 1.0);
+        let theme = Theme::default().with_spacing(spacing);
+        assert_eq!(theme.row_height, spacing.list_row());
+        assert_eq!(theme.header_height, spacing.toolbar_height());
+        assert_eq!(theme.status_height, spacing.status_height());
+        assert_eq!(theme.sidebar_width, spacing.sidebar_width());
+        assert_eq!(theme.padding, spacing.m());
+    }
+
+    /// …but an explicit config value still outranks the guide's number.
+    #[test]
+    fn a_configured_metric_outranks_the_guide_geometry() {
+        let cfg = config::Config::from_bytes(b"[files]\nrow_height = 44\n").expect("parse");
+        let theme = Theme::from_config(&cfg).with_spacing(Spacing::new(13.0, 1.0));
+        assert_eq!(theme.row_height, 44, "config must win");
+        assert_ne!(theme.header_height, 44, "unset metrics still derive");
     }
 
     /// With no config file at all, the wired-up theme must match the
@@ -283,6 +460,11 @@ mod tests {
             );
             assert_ne!(t.sidebar_active, t.sidebar_bg, "active place on sidebar");
             assert_ne!(t.sidebar_border, t.background, "the pane divider");
+            assert_ne!(t.hover, t.background, "a hovered row");
+            assert_ne!(t.toolbar_bg, t.background, "the toolbar strip");
+            assert_ne!(t.control_border, t.toolbar_bg, "a control outline");
+            assert_ne!(t.focus_ring, t.toolbar_bg, "the focus ring");
+            assert_ne!(t.accent, t.background, "the accent");
         }
     }
 
@@ -291,8 +473,8 @@ mod tests {
     #[test]
     fn the_list_begins_after_the_sidebar_only_when_it_is_shown() {
         let theme = Theme::default();
-        assert_eq!(theme.list_x(true), theme.sidebar_width);
-        assert_eq!(theme.list_x(false), 0);
+        assert_eq!(theme.list_x(true, 1280), theme.sidebar_width);
+        assert_eq!(theme.list_x(false, 1280), 0);
     }
 
     /// Derived metrics replace the defaults, so a larger font grows the

@@ -24,6 +24,9 @@ statusbar = { path = "../../crates/statusbar" }
 # The `[files]` table, and the terminal palette its unset keys mirror.
 config   = { path = "../../crates/config" }
 waker    = { path = "../../crates/waker" }
+# Civil local time for the `modified` column, shared with the bar and the
+# trash implementation rather than reimplementing timezone handling here.
+localtime = { path = "../../crates/localtime" }
 # Type detection and type->application association, so opening a file is a
 # real desktop-entry resolution rather than a shell-out to xdg-open.
 mime     = { path = "../../crates/mime" }

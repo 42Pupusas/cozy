@@ -38,6 +38,7 @@ mod render;
 pub mod selection;
 pub mod surface;
 pub mod text;
+pub mod toplevel;
 pub mod window;
 
 pub use cursor_anim::{CursorAnimConfig, CursorAnimator};

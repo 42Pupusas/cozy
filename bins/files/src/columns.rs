@@ -27,15 +27,26 @@ pub enum Column {
 }
 
 impl Column {
-    /// The guide's column headings: small, lowercase, letter-spaced in the
-    /// painter.
+    /// The guide's column headings, in the capitalisation they are *drawn*
+    /// with.
+    ///
+    /// The guide reaches this look via `text-transform: uppercase` on 9px
+    /// letter-spaced type. We have no letter-spacing control in the text
+    /// renderer, and all-caps at our body size reads as shouting rather than
+    /// as the quiet structural label the guide intends -- so the heading is
+    /// title-cased instead, which is the same signal (these are labels, not
+    /// data) at a size we can actually draw.
+    ///
+    /// Stored pre-capitalised rather than transformed at paint time: a
+    /// transform would have to decide what to do with a word like "kind" every
+    /// frame, and the answer never changes.
     #[must_use]
     pub const fn heading(self) -> &'static str {
         match self {
-            Self::Name => "name",
-            Self::Modified => "modified",
-            Self::Kind => "kind",
-            Self::Size => "size",
+            Self::Name => "Name",
+            Self::Modified => "Modified",
+            Self::Kind => "Kind",
+            Self::Size => "Size",
         }
     }
 
@@ -322,12 +333,19 @@ mod tests {
         }
     }
 
-    /// Every column has a heading, and they are the guide's lowercase words.
+    /// Every column has a heading, and they are drawn title-cased -- the
+    /// readable stand-in for the guide's letter-spaced small caps.
     #[test]
     fn every_column_names_itself() {
-        assert_eq!(Column::Name.heading(), "name");
-        assert_eq!(Column::Modified.heading(), "modified");
-        assert_eq!(Column::Kind.heading(), "kind");
-        assert_eq!(Column::Size.heading(), "size");
+        assert_eq!(Column::Name.heading(), "Name");
+        assert_eq!(Column::Modified.heading(), "Modified");
+        assert_eq!(Column::Kind.heading(), "Kind");
+        assert_eq!(Column::Size.heading(), "Size");
+        // Every heading is capitalised and none slipped back to lowercase.
+        for column in [Column::Name, Column::Modified, Column::Kind, Column::Size] {
+            let heading = column.heading();
+            let first = heading.chars().next().expect("a heading is never empty");
+            assert!(first.is_uppercase(), "{heading} should lead with a capital");
+        }
     }
 }

@@ -11,6 +11,7 @@
 //! paints only the visible part and never panics.
 
 use crate::font;
+use crate::round_rect::RoundRect;
 
 /// An RGBA color.
 ///
@@ -488,6 +489,87 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// Fill `rect` with `color`, rounding all four corners to `radius`.
+    ///
+    /// The straight interior goes through the same packed row-fill as
+    /// [`Self::fill_rect`], so a rounded surface costs no more than a square
+    /// one except at the corners, where the two boundary pixels per row are
+    /// alpha-blended against what is already on the canvas. That blend is the
+    /// reason the caller must paint the *background* before calling this: the
+    /// corner pixels fade into whatever they find underneath, so drawing a
+    /// rounded button over stale pixels leaves a fringe of them in the arcs.
+    ///
+    /// A zero radius degenerates to exactly [`Self::fill_rect`], so callers
+    /// with a configurable corner radius need no branch of their own.
+    pub fn fill_round_rect(&mut self, rect: Rect, color: Color, radius: i32) {
+        let shape = RoundRect::new(rect, radius);
+        if shape.is_empty() {
+            return;
+        }
+        if shape.radius() == 0 {
+            self.fill_rect(rect, color);
+            return;
+        }
+        let packed = color.to_xrgb8888();
+        for y in rect.y..rect.bottom() {
+            let Some(span) = shape.span_at(y) else {
+                continue;
+            };
+            self.fill_rect_packed(Rect::new(span.x0, y, span.x1 - span.x0, 1), packed);
+            // The two fractional pixels bracketing the run. Blending rather
+            // than filling is what keeps a 4px corner from reading as a
+            // staircase.
+            if span.left_alpha > 0 {
+                self.blend_pixel(span.x0 - 1, y, color, span.left_alpha);
+            }
+            if span.right_alpha > 0 {
+                self.blend_pixel(span.x1, y, color, span.right_alpha);
+            }
+        }
+    }
+
+    /// Draw the 1px outline of `rect` with corners rounded to `radius`.
+    ///
+    /// Derived from the same [`RoundRect`] the fill uses, so an outline and a
+    /// fill of identical geometry agree on where the edge is. The stroke is
+    /// the difference between this shape and itself inset by one pixel, which
+    /// keeps the line an even weight around the arc instead of thinning at 45
+    /// degrees the way a naive per-row two-pixel stroke does.
+    pub fn draw_round_rect(&mut self, rect: Rect, color: Color, radius: i32) {
+        let shape = RoundRect::new(rect, radius);
+        if shape.is_empty() {
+            return;
+        }
+        if shape.radius() == 0 {
+            self.draw_rect(rect, color);
+            return;
+        }
+        let inner = RoundRect::new(rect.inset(1), (shape.radius() - 1).max(0));
+        let packed = color.to_xrgb8888();
+        for y in rect.y..rect.bottom() {
+            let Some(span) = shape.span_at(y) else {
+                continue;
+            };
+            match inner.span_at(y) {
+                // A row the inner shape also covers is stroked at both ends
+                // only, leaving the interior untouched.
+                Some(hole) if hole.x1 > hole.x0 => {
+                    self.fill_rect_packed(Rect::new(span.x0, y, hole.x0 - span.x0, 1), packed);
+                    self.fill_rect_packed(Rect::new(hole.x1, y, span.x1 - hole.x1, 1), packed);
+                }
+                // The top and bottom caps, where there is no interior yet:
+                // the whole span is the stroke.
+                _ => self.fill_rect_packed(Rect::new(span.x0, y, span.x1 - span.x0, 1), packed),
+            }
+            if span.left_alpha > 0 {
+                self.blend_pixel(span.x0 - 1, y, color, span.left_alpha);
+            }
+            if span.right_alpha > 0 {
+                self.blend_pixel(span.x1, y, color, span.right_alpha);
+            }
+        }
+    }
+
     /// Draw the 1px outline of `rect` (clipped) in `color`.
     pub fn draw_rect(&mut self, rect: Rect, color: Color) {
         if rect.w <= 0 || rect.h <= 0 {
@@ -702,6 +784,80 @@ mod tests {
         // ...corners untouched.
         assert_eq!(buf[0], 0);
         assert_eq!(buf[3 * 4 + 3], 0);
+    }
+
+    /// A zero radius must take the plain path byte for byte, so a caller with
+    /// a configurable radius can pass 0 without special-casing it.
+    #[test]
+    fn fill_round_rect_at_zero_radius_matches_fill_rect() {
+        let mut buf_a = canvas_buf(8, 8);
+        let mut buf_b = canvas_buf(8, 8);
+        Canvas::new(&mut buf_a, 8, 8).fill_rect(Rect::new(1, 1, 6, 6), Color::WHITE);
+        Canvas::new(&mut buf_b, 8, 8).fill_round_rect(Rect::new(1, 1, 6, 6), Color::WHITE, 0);
+        assert_eq!(buf_a, buf_b);
+    }
+
+    /// The corners must actually be lighter than the middle -- the whole point
+    /// of the primitive -- while the interior stays fully saturated.
+    #[test]
+    fn fill_round_rect_softens_only_the_corners() {
+        let mut buf = canvas_buf(20, 20);
+        let mut c = Canvas::new(&mut buf, 20, 20);
+        c.fill_round_rect(Rect::new(0, 0, 20, 20), Color::WHITE, 6);
+        let w = Color::WHITE.to_xrgb8888();
+        // Dead centre is solid.
+        assert_eq!(buf[10 * 20 + 10], w);
+        // The extreme corner pixel is not painted solid white.
+        assert_ne!(buf[0], w, "the corner was not rounded");
+        // The middle of each edge is solid, because the arc has closed by then.
+        assert_eq!(buf[10 * 20], w, "the left edge midpoint should be solid");
+        assert_eq!(buf[10], w, "the top edge midpoint should be solid");
+    }
+
+    /// A rounded fill must stay inside its rectangle: a stray pixel would
+    /// smear onto whatever widget is drawn beside it.
+    #[test]
+    fn fill_round_rect_stays_inside_its_rectangle() {
+        let mut buf = canvas_buf(16, 16);
+        let mut c = Canvas::new(&mut buf, 16, 16);
+        c.fill_round_rect(Rect::new(4, 4, 8, 8), Color::WHITE, 3);
+        for y in 0..16 {
+            for x in 0..16 {
+                let inside = (4..12).contains(&x) && (4..12).contains(&y);
+                if !inside {
+                    assert_eq!(
+                        buf[usize::try_from(y * 16 + x).unwrap()],
+                        0,
+                        "painted outside at ({x}, {y})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A rounded outline must leave its interior alone -- otherwise it is a
+    /// fill, and a bordered input box would have its text painted over.
+    #[test]
+    fn draw_round_rect_leaves_the_interior_empty() {
+        let mut buf = canvas_buf(24, 24);
+        let mut c = Canvas::new(&mut buf, 24, 24);
+        c.draw_round_rect(Rect::new(0, 0, 24, 24), Color::WHITE, 5);
+        let w = Color::WHITE.to_xrgb8888();
+        assert_eq!(buf[12 * 24 + 12], 0, "the interior was filled");
+        // The edge midpoints are stroked.
+        assert_eq!(buf[12 * 24], w, "the left edge is missing");
+        assert_eq!(buf[12], w, "the top edge is missing");
+        assert_eq!(buf[12 * 24 + 23], w, "the right edge is missing");
+    }
+
+    #[test]
+    fn round_rect_handles_a_degenerate_rectangle() {
+        let mut buf = canvas_buf(8, 8);
+        let mut c = Canvas::new(&mut buf, 8, 8);
+        // Neither call may panic, and neither may paint anything.
+        c.fill_round_rect(Rect::new(2, 2, 0, 4), Color::WHITE, 3);
+        c.draw_round_rect(Rect::new(2, 2, 4, -1), Color::WHITE, 3);
+        assert!(buf.iter().all(|&p| p == 0));
     }
 
     #[test]

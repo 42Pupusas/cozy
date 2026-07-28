@@ -311,7 +311,10 @@ impl FilesWindow {
         let theme = self.theme;
         let bar = self.frame().toolbar();
         let size = theme.spacing.icon_button();
-        let mut x = bar.x + theme.spacing.m();
+        // The guide's toolbar padding, not the generic gap step: the first
+        // button must clear the window edge by the same margin the last one
+        // clears the right edge.
+        let mut x = bar.x + theme.spacing.toolbar_pad();
         let y = bar.y + (bar.h - size) / 2;
         for glyph in ["\u{2039}", "\u{203a}"] {
             // Never let the buttons crowd out the path itself, which is the
@@ -338,7 +341,7 @@ impl FilesWindow {
     fn breadcrumb_x(&self) -> i32 {
         let theme = self.theme;
         let bar = self.frame().toolbar();
-        bar.x + theme.spacing.m() + theme.spacing.icon_button() * 2 + theme.spacing.s()
+        bar.x + theme.spacing.toolbar_pad() + theme.spacing.icon_button() * 2 + theme.spacing.s()
     }
 
     /// Draw the list/grid view toggle at the toolbar's right end.
@@ -353,7 +356,7 @@ impl FilesWindow {
         let button = theme.spacing.view_button();
         let height = theme.spacing.control_height();
         let width = button * 2;
-        let x = bar.right() - theme.spacing.m() - width;
+        let x = bar.right() - theme.spacing.toolbar_pad() - width;
         let y = bar.y + (bar.h - height) / 2;
         // Dropped entirely rather than overlapped when the toolbar is too
         // tight: the filter box and the path outrank it.
@@ -361,9 +364,21 @@ impl FilesWindow {
             return;
         }
         // The active segment is filled, which is what makes the pair read as
-        // a state rather than as two buttons.
-        canvas.fill_rect(Rect::new(x, y, button, height), theme.accent_surface);
-        canvas.draw_rect(Rect::new(x, y, width, height), theme.control_border);
+        // a state rather than as two buttons. Only its *outer* corners are
+        // rounded -- it shares a straight edge with the segment beside it, so
+        // rounding all four would leave a notch mid-pair. Drawing the fill one
+        // radius wider and squaring off that overhang gives the D-shape.
+        let radius = theme.spacing.radius();
+        canvas.fill_round_rect(
+            Rect::new(x, y, button + radius, height),
+            theme.accent_surface,
+            radius,
+        );
+        canvas.fill_rect(
+            Rect::new(x + button, y, radius, height),
+            theme.accent_surface,
+        );
+        canvas.draw_round_rect(Rect::new(x, y, width, height), theme.control_border, radius);
         for (i, (glyph, color)) in [("\u{2261}", theme.accent), ("\u{22ee}", theme.disabled)]
             .into_iter()
             .enumerate()
@@ -402,8 +417,8 @@ impl FilesWindow {
         // toolbar, so the path gets what is left after them and their gaps.
         let reserved = theme.spacing.search_width()
             + theme.spacing.view_button() * 2
-            + theme.spacing.m() * 2
-            + theme.spacing.s();
+            + theme.spacing.toolbar_pad()
+            + theme.spacing.s() * 2;
         let limit = bar.right() - x - reserved;
 
         let (shown, elided) = crumbs.tail(self.crumb_budget(limit));
@@ -482,7 +497,7 @@ impl FilesWindow {
         let bar = self.frame().toolbar();
         // The view toggle sits to its right, so the filter box ends before it.
         let toggle = theme.spacing.view_button() * 2 + theme.spacing.s();
-        let x = bar.right() - theme.spacing.m() - toggle - width;
+        let x = bar.right() - theme.spacing.toolbar_pad() - toggle - width;
         let y = bar.y + (bar.h - height) / 2;
         // Guard against a column too narrow to hold the control at all --
         // drawing it at a negative x would wrap around the canvas.
@@ -490,17 +505,22 @@ impl FilesWindow {
             return;
         }
         let rect = Rect::new(x, y, width, height);
-        canvas.fill_rect(rect, theme.filter_bg);
-        canvas.draw_rect(
+        let radius = theme.spacing.radius();
+        canvas.fill_round_rect(rect, theme.filter_bg, radius);
+        canvas.draw_round_rect(
             rect,
             if filtering {
                 theme.focus_ring
             } else {
                 theme.control_border
             },
+            radius,
         );
 
-        let inner_x = x + theme.spacing.s();
+        // Text clears the rounded corner rather than just the border: at the
+        // box's vertical centre the arc has closed, but starting text at the
+        // plain gap step still visually crowds the curve.
+        let inner_x = x + theme.spacing.m();
         let detail = &mut self.type_scale.detail;
         let text_y = y + (height - detail.line_height()) / 2;
         if filtering {
@@ -604,9 +624,10 @@ impl FilesWindow {
         let theme = self.theme;
         let column = frame.sidebar();
         let body = frame.sidebar_body();
-        // The places list is inset from the top so the first row does not
-        // collide with the toolbar's baseline across the seam.
-        let top = body.y + theme.spacing.l();
+        // The places list is inset from the top by the guide's own sidebar
+        // padding, so the first row does not collide with the toolbar's
+        // baseline across the seam.
+        let top = body.y + theme.spacing.sidebar_pad_y();
         let width = column.w;
         // Below the guide's threshold the pane collapses to an icon rail.
         // With icons not yet drawn, labels are simply omitted rather than
@@ -645,13 +666,15 @@ impl FilesWindow {
                 SidebarRow::Heading(text) => {
                     // Headings sit in the small label tier and the muted
                     // colour, so they read as structure rather than as
-                    // another place you could click.
+                    // another place you could click. Their inset matches the
+                    // row labels below them, so the section title and its
+                    // entries share a left edge.
                     let label = &mut self.type_scale.label;
                     let ty = y + (row_h - label.line_height()) / 2;
                     label.draw_text(
                         canvas,
                         text,
-                        theme.spacing.m(),
+                        Self::sidebar_text_x(&theme),
                         ty,
                         theme.muted,
                         theme.sidebar_bg,
@@ -663,7 +686,7 @@ impl FilesWindow {
                     detail.draw_text(
                         canvas,
                         text,
-                        theme.spacing.m(),
+                        Self::sidebar_text_x(&theme),
                         ty,
                         theme.muted,
                         theme.sidebar_bg,
@@ -671,16 +694,23 @@ impl FilesWindow {
                 }
                 SidebarRow::Place { label, .. } => {
                     let is_active = active == Some(i);
+                    let pad = theme.spacing.sidebar_pad();
                     let bg = if is_active {
+                        // The highlight is inset from both column edges and
+                        // rounded, so it reads as a pill behind the row rather
+                        // than as a stripe bleeding into the divider.
+                        let pill = Rect::new(pad, y, (width - pad * 2).max(0), row_h);
+                        canvas.fill_round_rect(pill, theme.sidebar_active, theme.spacing.radius());
+                        // The guide's 2px accent rule on the leading edge,
+                        // which is what makes the active place readable at a
+                        // glance even when the fill is subtle. Kept inside the
+                        // pill's straight middle section so it does not poke
+                        // out of the rounded corners.
+                        let r = theme.spacing.radius();
                         canvas.fill_rect(
-                            Rect::new(0, y, width - theme.spacing.hairline(), row_h),
-                            theme.sidebar_active,
+                            Rect::new(pad, y + r, theme.spacing.rule(), (row_h - r * 2).max(1)),
+                            theme.accent,
                         );
-                        // The guide's 2px accent rule on the left edge, which
-                        // is what makes the active place readable at a glance
-                        // even when the fill is subtle.
-                        canvas
-                            .fill_rect(Rect::new(0, y, theme.spacing.rule(), row_h), theme.accent);
                         theme.sidebar_active
                     } else {
                         theme.sidebar_bg
@@ -693,13 +723,24 @@ impl FilesWindow {
                     let color = if is_active { theme.accent } else { theme.text };
                     let tier = &mut self.type_scale.body;
                     let ty = y + (row_h - tier.line_height()) / 2;
-                    let inset = theme.spacing.m();
-                    let room = width - inset - theme.spacing.s();
+                    let inset = Self::sidebar_text_x(&theme);
+                    let room = width - inset - pad;
                     let shown = RowFormat::truncate(label, Self::columns_for(tier, room));
                     tier.draw_text(canvas, &shown, inset, ty, color, bg);
                 }
             }
         }
+    }
+
+    /// Where text in the sidebar begins: the column's own padding plus the
+    /// row's internal padding.
+    ///
+    /// Both are needed, and separately: the row highlight is inset by the
+    /// column padding, and the label sits inside *that*. Collapsing the two
+    /// into one number is what made the labels sit flush against the pane's
+    /// edge.
+    fn sidebar_text_x(theme: &Theme) -> i32 {
+        theme.spacing.sidebar_pad() + theme.spacing.sidebar_row_pad()
     }
 
     /// Draw the sidebar's storage footer: the filesystem, how full it is, and
@@ -727,7 +768,10 @@ impl FilesWindow {
             theme.sidebar_border,
         );
 
-        let inset = theme.spacing.m();
+        // The footer's own padding matches the rows above it, so the device
+        // name lines up with the place labels rather than sitting proud of
+        // them.
+        let inset = Self::sidebar_text_x(&theme);
         let usage = storage.usage();
         // "61% of 128g" when there is room for it; the bare percentage when
         // the sidebar is too narrow. The percentage is the part that must
@@ -779,15 +823,21 @@ impl FilesWindow {
         if track_y + track_h > area.bottom() {
             return;
         }
-        canvas.fill_rect(
+        // Rounded to its own half-height, so a 2px meter reads as a soft rule
+        // rather than a hard tick. `RoundRect` clamps the radius, so this stays
+        // correct if the meter ever grows.
+        let cap = track_h / 2;
+        canvas.fill_round_rect(
             Rect::new(area.x + inset, track_y, room, track_h),
             theme.scrollbar_track,
+            cap,
         );
         let filled = usage.meter_width(room);
         if filled > 0 {
-            canvas.fill_rect(
+            canvas.fill_round_rect(
                 Rect::new(area.x + inset, track_y, filled, track_h),
                 theme.accent,
+                cap,
             );
         }
     }
@@ -850,8 +900,11 @@ impl FilesWindow {
         for row in rows {
             let y = top + row.y;
             let rect = Rect::new(left, y, content_width, theme.row_height);
+            // Selection and cursor share the row's rounded geometry so the
+            // two never disagree about where the row's edge is.
+            let radius = theme.spacing.radius();
             let bg = if row.selected {
-                canvas.fill_rect(rect, theme.selection);
+                canvas.fill_round_rect(rect, theme.selection, radius);
                 theme.selection
             } else {
                 theme.background
@@ -860,7 +913,7 @@ impl FilesWindow {
             // when focused: an outline on an unfocused window claims a
             // keyboard focus we do not have.
             if self.focused && row.is_cursor {
-                canvas.draw_rect(rect, theme.cursor);
+                canvas.draw_round_rect(rect, theme.cursor, radius);
             }
             // A thin separator per row rather than a card, per the guide.
             canvas.fill_rect(
@@ -925,14 +978,13 @@ impl FilesWindow {
         let gutter = (band.right() - x).max(0);
         canvas.fill_rect(Rect::new(x, band.y, gutter, band.h), theme.scrollbar_track);
         let thumb = pane.scrollbar().thumb(pane.viewport());
-        canvas.fill_rect(
-            Rect::new(
-                x + 2,
-                band.y + thumb.offset,
-                (gutter - 4).max(1),
-                thumb.length,
-            ),
+        // The thumb is rounded to its own half-width, i.e. a capsule: it is a
+        // free-floating element with nothing to align a square edge against.
+        let thumb_w = (gutter - 4).max(1);
+        canvas.fill_round_rect(
+            Rect::new(x + 2, band.y + thumb.offset, thumb_w, thumb.length),
             theme.scrollbar_thumb,
+            thumb_w / 2,
         );
     }
 
@@ -1030,9 +1082,10 @@ impl FilesWindow {
         let after = label.draw_text(canvas, description, start, text_y, theme.muted, background);
         let cap_x = after + gap;
         let cap_y = y + (band.h - cap_h) / 2;
-        canvas.draw_rect(
+        canvas.draw_round_rect(
             Rect::new(cap_x, cap_y, chord_w, cap_h),
             theme.control_border,
+            theme.spacing.radius_small(),
         );
         let label = &mut self.type_scale.label;
         label.draw_text(canvas, chord, cap_x + pad, text_y, theme.muted, background);
@@ -1090,7 +1143,8 @@ impl Painter for FilesWindow {
                     // Rows begin at the sidebar's own inset, matching where
                     // `paint_sidebar` starts drawing them -- a mismatch here
                     // would offset every click by one row.
-                    let y = at.y - self.frame().sidebar_body().y - self.theme.spacing.l();
+                    let y =
+                        at.y - self.frame().sidebar_body().y - self.theme.spacing.sidebar_pad_y();
                     if y < 0 {
                         return;
                     }

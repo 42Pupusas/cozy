@@ -126,6 +126,68 @@ impl Spacing {
         1
     }
 
+    /// Corner radius for controls -- buttons, the filter box, row highlights
+    /// (guide: 6px).
+    ///
+    /// Scaled with everything else, because a 6px corner on a 2x output reads
+    /// as half the curve the design asks for. It never needs to be checked
+    /// against a control's own size at the call site: `RoundRect` clamps a
+    /// radius past half the shorter side to a pill.
+    #[must_use]
+    pub fn radius(self) -> i32 {
+        self.at(6.0)
+    }
+
+    /// Corner radius for the small keycap in the status strip (guide: 3px).
+    ///
+    /// Tighter than [`Self::radius`]: a keycap is a fraction of a button's
+    /// height, and the same 6px curve on it would round it into a lozenge.
+    #[must_use]
+    pub fn radius_small(self) -> i32 {
+        self.at(3.0)
+    }
+
+    /// Horizontal padding inside the toolbar, before the first control and
+    /// after the last (guide: 20px).
+    ///
+    /// The guide's toolbar has `padding: 0 20px`, which is deliberately *not*
+    /// one of the five rhythm steps -- it sits between L and XL, so the chrome
+    /// at the window's edge breathes more than the gaps between the controls
+    /// inside it. Encoded rather than approximated to M, because approximating
+    /// it is exactly what left the filter box touching the border.
+    #[must_use]
+    pub fn toolbar_pad(self) -> i32 {
+        self.at(20.0)
+    }
+
+    /// Horizontal padding inside the sidebar (guide: 12px).
+    ///
+    /// The guide's `.sidebar { padding: 18px 12px }` is asymmetric, and the
+    /// asymmetry is the point: rows are full-width hit targets that want
+    /// little horizontal inset, while the column as a whole wants a clear
+    /// margin from the window's top edge.
+    #[must_use]
+    pub fn sidebar_pad(self) -> i32 {
+        self.at(12.0)
+    }
+
+    /// Vertical padding at the top of the sidebar (guide: 18px).
+    #[must_use]
+    pub fn sidebar_pad_y(self) -> i32 {
+        self.at(18.0)
+    }
+
+    /// Inset of a sidebar row's label from the row's own left edge
+    /// (guide: 9px).
+    ///
+    /// Smaller than the column's padding because the row highlight is already
+    /// inset by that padding; the label sits 9px inside the *row*, per the
+    /// guide's `.nav { padding: 0 9px }`.
+    #[must_use]
+    pub fn sidebar_row_pad(self) -> i32 {
+        self.at(9.0)
+    }
+
     /// The accent rule marking an active sidebar row (guide: 2px).
     #[must_use]
     pub fn rule(self) -> i32 {
@@ -265,6 +327,47 @@ mod tests {
         assert_eq!(s.storage_height(), 42);
         assert_eq!(s.meter_height(), 2);
         assert_eq!(s.view_button(), 31);
+        assert_eq!(s.radius(), 6);
+        assert_eq!(s.radius_small(), 3);
+        assert_eq!(s.toolbar_pad(), 20);
+        assert_eq!(s.sidebar_pad(), 12);
+        assert_eq!(s.sidebar_pad_y(), 18);
+        assert_eq!(s.sidebar_row_pad(), 9);
+    }
+
+    /// The toolbar's edge padding must exceed the gaps between the controls
+    /// inside it, or the first control reads as falling out of the window --
+    /// the specific complaint this token was added to fix.
+    #[test]
+    fn the_toolbar_edge_padding_is_roomier_than_its_internal_gaps() {
+        for font in [8.0, 13.0, 20.0] {
+            let s = Spacing::new(font, 1.0);
+            assert!(
+                s.toolbar_pad() > s.s(),
+                "toolbar padding must beat the control gap at {font}"
+            );
+            assert!(s.toolbar_pad() >= s.l(), "and land above L at {font}");
+        }
+    }
+
+    /// A corner radius must never be so large it swallows a control whole, nor
+    /// round away to a square at a small size.
+    #[test]
+    fn the_corner_radius_suits_the_controls_it_rounds() {
+        for font in [8.0, 13.0, 20.0, 40.0] {
+            for scale in [1.0, 2.0] {
+                let s = Spacing::new(font, scale);
+                assert!(s.radius() > 0, "radius vanished at {font}/{scale}");
+                assert!(
+                    s.radius() * 2 < s.control_height(),
+                    "radius would pill the control at {font}/{scale}"
+                );
+                assert!(
+                    s.radius_small() < s.radius(),
+                    "the keycap radius must stay tighter at {font}/{scale}"
+                );
+            }
+        }
     }
 
     /// The scale steps must stay in ascending order at every size, or
@@ -343,6 +446,12 @@ mod tests {
             ("column_header", s.column_header()),
             ("icon_button", s.icon_button()),
             ("rail", s.rail_width()),
+            ("radius", s.radius()),
+            ("radius_small", s.radius_small()),
+            ("toolbar_pad", s.toolbar_pad()),
+            ("sidebar_pad", s.sidebar_pad()),
+            ("sidebar_pad_y", s.sidebar_pad_y()),
+            ("sidebar_row_pad", s.sidebar_row_pad()),
         ] {
             assert!(value > 0, "{name} must be positive");
         }

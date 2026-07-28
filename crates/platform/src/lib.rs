@@ -30,6 +30,7 @@ pub mod present;
 pub mod progress_guard;
 pub mod protocol;
 pub mod reader_health;
+pub mod round_rect;
 pub mod sys;
 pub mod wire;
 pub mod xcursor;

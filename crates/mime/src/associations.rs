@@ -284,14 +284,25 @@ impl Associations {
         self.defaults.is_empty() && self.candidates.is_empty()
     }
 
+    /// The directories `.desktop` files live in, highest priority first.
+    ///
+    /// Public because a caller that resolves *many* ids (a file browser
+    /// building an "Open With" list) wants to compute this once rather than
+    /// re-reading the environment per lookup, and because it is the honest
+    /// seam for pointing a test at fixture directories.
+    #[must_use]
+    pub fn application_dirs() -> Vec<PathBuf> {
+        Self::data_dirs()
+            .into_iter()
+            .map(|d| d.join("applications"))
+            .collect()
+    }
+
     /// Resolve a [`DesktopId`] to a file on disk, searching the standard
     /// application directories in priority order.
     #[must_use]
     pub fn resolve_path(id: &DesktopId) -> Option<PathBuf> {
-        Self::data_dirs()
-            .into_iter()
-            .map(|d| d.join("applications").join(id.as_str()))
-            .find(|p| p.is_file())
+        Self::resolve_path_in(id, &Self::application_dirs())
     }
 
     /// Resolve against explicit roots -- the seam tests use.

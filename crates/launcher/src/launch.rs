@@ -385,6 +385,7 @@ mod tests {
             exec: "firefox %u".to_owned(),
             icon: None,
             terminal: false,
+            no_display: false,
         };
         let cmd = ExecCommand::for_entry(&entry).unwrap();
         assert_eq!(cmd.program, "firefox");
@@ -399,6 +400,7 @@ mod tests {
             exec: "nvim %F".to_owned(),
             icon: None,
             terminal: true,
+            no_display: false,
         };
         let cmd = ExecCommand::for_entry(&entry).unwrap();
         assert_eq!(cmd.program, "terminal");
@@ -413,6 +415,7 @@ mod tests {
             exec: "htop".to_owned(),
             icon: None,
             terminal: true,
+            no_display: false,
         };
         let cmd = ExecCommand::for_entry(&entry).unwrap();
         assert_eq!(cmd.program, "foot");
@@ -427,6 +430,7 @@ mod tests {
             exec: "sh -c 'echo hi'".to_owned(),
             icon: None,
             terminal: true,
+            no_display: false,
         };
         let cmd = ExecCommand::for_entry(&entry).unwrap();
         assert_eq!(cmd.program, "terminal");
@@ -611,6 +615,7 @@ mod tests {
             exec: "eog %U".to_owned(),
             icon: None,
             terminal: false,
+            no_display: false,
         };
         let cmd = ExecCommand::for_file(&entry, Path::new("/tmp/a.png")).unwrap();
         assert_eq!(cmd.program, "eog");
@@ -628,6 +633,7 @@ mod tests {
             exec: "nvim %F".to_owned(),
             icon: None,
             terminal: true,
+            no_display: false,
         };
         let cmd = ExecCommand::for_file(&entry, Path::new("/tmp/main.rs")).unwrap();
         assert_eq!(cmd.program, "terminal");
@@ -644,6 +650,7 @@ mod tests {
             exec: "someapp --flag".to_owned(),
             icon: None,
             terminal: false,
+            no_display: false,
         };
         let cmd = ExecCommand::for_file(&entry, Path::new("/tmp/a.png")).unwrap();
         assert_eq!(cmd.program, "someapp");
@@ -658,6 +665,7 @@ mod tests {
             exec: "editor %F".to_owned(),
             icon: None,
             terminal: false,
+            no_display: false,
         };
         let values = FieldValues::Files(vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]);
         let cmd = ExecCommand::for_entry_with(&entry, &values).unwrap();

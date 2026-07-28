@@ -23,13 +23,31 @@ pub struct DesktopEntry {
     pub icon: Option<String>,
     /// Whether `Exec` should run inside a terminal emulator (`Terminal=true`).
     pub terminal: bool,
+    /// `NoDisplay=true` -- "this application exists, but don't display it in
+    /// the menus".
+    ///
+    /// Deliberately *not* a rejection, because the spec gives associating an
+    /// application with MIME types "so that it gets launched from a file
+    /// manager, without having a menu entry for it" as the motivating
+    /// example for this key. Google Chrome ships exactly such an entry: its
+    /// `com.google.Chrome.desktop` is `NoDisplay=true` yet is a listed
+    /// handler for `text/html` and `application/pdf`.
+    ///
+    /// So the field is carried and each caller asks its own question: a
+    /// launcher menu filters these out ([`Self::shows_in_menu`]), a file
+    /// manager resolving a handler does not.
+    pub no_display: bool,
 }
 
 impl DesktopEntry {
     /// Parse a `.desktop` file's bytes into an entry, or `None` if it's not
     /// a launchable application: missing `[Desktop Entry]`, missing
-    /// `Name`/`Exec`, `NoDisplay=true`, `Hidden=true`, or
-    /// `Type=` anything other than `Application` (when present).
+    /// `Name`/`Exec`, `Hidden=true`, or `Type=` anything other than
+    /// `Application` (when present).
+    ///
+    /// `Hidden=true` *is* a rejection -- the spec says it "should have been
+    /// called Deleted" and is "strictly equivalent to the .desktop file not
+    /// existing at all". `NoDisplay=true` is not; see [`Self::no_display`].
     #[must_use]
     pub fn parse(source: &str) -> Option<Self> {
         let group = Self::desktop_entry_group(source)?;
@@ -58,7 +76,7 @@ impl DesktopEntry {
             }
         }
 
-        if no_display || hidden {
+        if hidden {
             return None;
         }
         if let Some(t) = entry_type
@@ -72,7 +90,18 @@ impl DesktopEntry {
             exec: exec?,
             icon,
             terminal,
+            no_display,
         })
+    }
+
+    /// Whether this entry belongs in an application *menu*.
+    ///
+    /// The question a launcher asks, and the one a file manager must not:
+    /// hiding Chrome from a menu is correct, refusing to open a PDF with it
+    /// is not.
+    #[must_use]
+    pub const fn shows_in_menu(&self) -> bool {
+        !self.no_display
     }
 
     /// Read and parse a `.desktop` file from disk. `None` on any I/O error
@@ -137,12 +166,28 @@ mod tests {
         assert!(e.terminal);
     }
 
+    /// `NoDisplay` must *not* reject: the spec's own motivating example for
+    /// the key is associating an app with MIME types so a file manager can
+    /// launch it without a menu entry. Chrome ships exactly such a file.
     #[test]
-    fn rejects_no_display() {
-        let src = "[Desktop Entry]\nName=Hidden\nExec=x\nNoDisplay=true\n";
-        assert_eq!(DesktopEntry::parse(src), None);
+    fn no_display_is_parsed_but_not_a_rejection() {
+        let src = "[Desktop Entry]\nName=Chrome\nExec=chrome %U\nNoDisplay=true\n";
+        let e = DesktopEntry::parse(src).expect("still a usable handler");
+        assert!(e.no_display);
+        assert!(!e.shows_in_menu(), "but it stays out of a launcher menu");
     }
 
+    #[test]
+    fn a_normal_entry_shows_in_the_menu() {
+        let src = "[Desktop Entry]\nName=Firefox\nExec=firefox %u\n";
+        let e = DesktopEntry::parse(src).unwrap();
+        assert!(!e.no_display);
+        assert!(e.shows_in_menu());
+    }
+
+    /// `Hidden`, unlike `NoDisplay`, *is* a rejection: the spec says it
+    /// "should have been called Deleted" and is equivalent to the file not
+    /// existing at all.
     #[test]
     fn rejects_hidden() {
         let src = "[Desktop Entry]\nName=Hidden\nExec=x\nHidden=true\n";

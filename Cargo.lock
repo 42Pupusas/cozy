@@ -152,6 +152,8 @@ name = "files-bin"
 version = "0.1.0"
 dependencies = [
  "fsmodel",
+ "launcher",
+ "mime",
  "platform",
  "waker",
  "widget",

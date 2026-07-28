@@ -26,6 +26,11 @@ impl AppIndex {
     /// and de-duplicating by filename (basename) so a user override in
     /// `XDG_DATA_HOME` hides the system-wide entry of the same name rather
     /// than both appearing.
+    ///
+    /// `NoDisplay=true` entries are filtered out *here* rather than in the
+    /// parser: they are still valid MIME handlers (Chrome ships one), so
+    /// only this menu-building path wants them gone. See
+    /// [`DesktopEntry::shows_in_menu`].
     #[must_use]
     pub fn scan() -> Self {
         let mut entries = Vec::new();
@@ -50,7 +55,9 @@ impl AppIndex {
                 if !seen_basenames.insert(basename.to_owned()) {
                     continue;
                 }
-                if let Some(entry) = DesktopEntry::load(&path) {
+                if let Some(entry) = DesktopEntry::load(&path)
+                    && entry.shows_in_menu()
+                {
                     entries.push(entry);
                 }
             }
@@ -195,6 +202,36 @@ mod tests {
         let index = AppIndex::scan();
         assert_eq!(index.entries.len(), 1);
         assert_eq!(index.entries[0].name, "UserVersion");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The menu-building side of the `NoDisplay` split: the parser now
+    /// accepts these (they are valid MIME handlers), so the *index* is what
+    /// has to keep them out of the launcher's list.
+    #[test]
+    fn no_display_entries_are_kept_out_of_the_menu() {
+        let tmp = std::env::temp_dir().join(format!("launcher_test4_{}", std::process::id()));
+        let apps = tmp.join("data_home/applications");
+        write_desktop_file(
+            &apps,
+            "chrome.desktop",
+            "[Desktop Entry]\nName=Chrome\nExec=chrome %U\nType=Application\nNoDisplay=true\n",
+        );
+        write_desktop_file(
+            &apps,
+            "firefox.desktop",
+            "[Desktop Entry]\nName=Firefox\nExec=firefox %u\nType=Application\n",
+        );
+
+        let _guard = EnvGuard::set(&[
+            ("XDG_DATA_HOME", tmp.join("data_home").to_str().unwrap()),
+            ("XDG_DATA_DIRS", tmp.join("nonexistent").to_str().unwrap()),
+        ]);
+
+        let index = AppIndex::scan();
+        let names: Vec<&str> = index.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Firefox"], "Chrome is a handler, not a menu entry");
 
         fs::remove_dir_all(&tmp).ok();
     }

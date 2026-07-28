@@ -15,6 +15,7 @@
 //! needing a compositor and a pair of eyes.
 
 mod browser;
+mod handlers;
 mod keymap;
 mod launch;
 mod options;
@@ -83,6 +84,11 @@ impl App {
         // Adopt the true physical size before the first paint.
         painter.resize(window.size());
 
+        // Loaded once, before the loop: the glob and association databases
+        // are a few thousand lines between them, and re-reading disk on
+        // every Enter would put that latency directly in the user's way.
+        let opener = launch::Opener::load();
+
         let mut title = painter.title();
         loop {
             window.tick(&mut painter)?;
@@ -100,7 +106,7 @@ impl App {
             if let Some(path) = painter.take_pending_open() {
                 // Deliberately outside the paint callback: spawning a process
                 // mid-frame would run it while the framebuffer is borrowed.
-                launch::Opener::open(&path);
+                opener.open(&path);
             }
 
             // The title follows the directory, so the taskbar entry stays

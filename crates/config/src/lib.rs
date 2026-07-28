@@ -568,7 +568,10 @@ pub struct LauncherConfig {
 /// a built-in derived from the palette rather than a literal, so the browser
 /// still tracks a re-themed terminal instead of stranding grey chrome on a
 /// light background.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// `Eq` is deliberately absent: `opacity` is an `f64`, and the other config
+// structs carrying a float (`BarConfig`, `LauncherConfig`) drop it for the
+// same reason. `PartialEq` is all any caller needs.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FilesConfig {
     /// Background color override. `None` mirrors `[colors].background`.
     pub background: Option<Color>,
@@ -611,6 +614,20 @@ pub struct FilesConfig {
     pub status_height: Option<u32>,
     /// Left/right padding inside a row, in pixels. `None` uses a built-in `8`.
     pub padding: Option<u32>,
+    /// Background opacity, `0.0`-`1.0`. `None` mirrors `[window].opacity`.
+    ///
+    /// Mirrored rather than given its own default because a desktop where one
+    /// window is opaque among translucent siblings reads as a rendering fault,
+    /// not as a design choice -- the same reasoning as [`BarConfig::opacity`].
+    ///
+    /// NOTE: parsed and resolved here, but the browser cannot honour it yet --
+    /// `platform::toplevel::Toplevel` hardcodes the opaque `Xrgb8888` buffer
+    /// format, and its painter's fills are all `fill_rect` (which packs a zero
+    /// top byte, i.e. transparent, on an `Argb8888` surface). Kept in the
+    /// config layer, where it is tested and costs nothing, so the window work
+    /// is a self-contained follow-up rather than a config change plus a
+    /// window change landing together.
+    pub opacity: Option<f64>,
 }
 
 // ── Root config ───────────────────────────────────────────────────────────────
@@ -1212,6 +1229,16 @@ impl Config {
             }
         }
 
+        if let Some(n) = files.get_float_range(
+            "opacity",
+            "files.opacity",
+            0.0,
+            1.0,
+            "must be between 0.0 and 1.0",
+        )? {
+            self.files.opacity = Some(n);
+        }
+
         Ok(())
     }
 
@@ -1643,6 +1670,21 @@ impl Config {
         self.files
             .filter_bg
             .unwrap_or_else(|| self.palette.background.mix(self.palette.foreground, 0.13))
+    }
+
+    /// The browser's background opacity, `0.0`-`1.0`: `[files].opacity` if
+    /// set, otherwise mirrors `[window].opacity`.
+    ///
+    /// Mirrors rather than defaulting to opaque so the browser is as
+    /// translucent as the terminal, bar and monitor by default. Only the
+    /// background is affected; text and chrome strokes stay fully opaque, or
+    /// a translucent window would render unreadable filenames.
+    ///
+    /// Not yet consumed by `bins/files` -- see [`FilesConfig::opacity`] for
+    /// what the window layer still needs before this can take effect.
+    #[must_use]
+    pub fn files_opacity(&self) -> f64 {
+        self.files.opacity.unwrap_or(self.window.opacity)
     }
 
     /// Row height in pixels: `[files].row_height` if set, otherwise `20`.

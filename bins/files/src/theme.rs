@@ -12,6 +12,7 @@
 
 use platform::draw::Color;
 
+use crate::metric_overrides::MetricOverrides;
 use crate::spacing::Spacing;
 
 /// Colours and metrics for the file browser.
@@ -104,6 +105,14 @@ pub struct Theme {
     /// site that wants a colour also wants a gap, and threading two values
     /// through the painter would guarantee they drift apart.
     pub spacing: Spacing,
+
+    /// Which measurements the user stated explicitly.
+    ///
+    /// Carried so the derivation stages below can tell "the user asked for
+    /// this number" apart from "this is whatever the last stage left here".
+    /// See [`MetricOverrides`] for why inferring that by comparing against
+    /// the defaults was actively wrong.
+    overrides: MetricOverrides,
 }
 
 impl Default for Theme {
@@ -154,6 +163,7 @@ impl Default for Theme {
             // narrow enough to leave the list the majority of a small window.
             sidebar_width: 160,
             spacing: Spacing::new(13.0, 1.0),
+            overrides: MetricOverrides::default(),
         }
     }
 }
@@ -221,11 +231,18 @@ impl Theme {
             padding: px(cfg.files_padding()),
             sidebar_width: Self::default().sidebar_width,
             spacing: Spacing::new(13.0, 1.0),
+            overrides: MetricOverrides::from_config(cfg),
         }
     }
 
     /// Adopt the design guide's geometry for a given font size and output
     /// scale.
+    ///
+    /// NOTE: this stage owns the *chrome band* heights, because the guide
+    /// sizes the controls inside those bands (31px filter box, 31px view
+    /// toggle) against the same table. A band sized from anything else leaves
+    /// its own controls too tall for it -- which is exactly the vertical
+    /// crowding this replaced.
     ///
     /// Applied after [`Self::from_config`] so an explicit `[files]` metric
     /// still wins: the user asked for that number. Everything they did *not*
@@ -233,23 +250,24 @@ impl Theme {
     /// hold together at any font size.
     #[must_use]
     pub fn with_spacing(mut self, spacing: Spacing) -> Self {
-        let fallback = Self::default();
         self.spacing = spacing;
-        if self.row_height == fallback.row_height {
-            self.row_height = spacing.list_row();
-        }
-        if self.header_height == fallback.header_height {
-            self.header_height = spacing.toolbar_height();
-        }
-        if self.status_height == fallback.status_height {
-            self.status_height = spacing.status_height();
-        }
-        if self.padding == fallback.padding {
-            self.padding = spacing.m();
-        }
-        if self.sidebar_width == fallback.sidebar_width {
-            self.sidebar_width = spacing.sidebar_width();
-        }
+        // Only an explicit `[files]` value outranks the guide. Anything the
+        // user left unset takes the guide's number even if an earlier stage
+        // already wrote something there.
+        self.row_height = self
+            .overrides
+            .row_height()
+            .unwrap_or_else(|| spacing.list_row());
+        self.header_height = self
+            .overrides
+            .header_height()
+            .unwrap_or_else(|| spacing.toolbar_height());
+        self.status_height = self
+            .overrides
+            .status_height()
+            .unwrap_or_else(|| spacing.status_height());
+        self.padding = self.overrides.padding().unwrap_or_else(|| spacing.m());
+        self.sidebar_width = spacing.sidebar_width();
         self
     }
 
@@ -265,17 +283,22 @@ impl Theme {
     /// Config still wins where the user stated a value; this only replaces
     /// the defaults, so a bigger font grows the chrome instead of clipping
     /// its own glyphs.
+    ///
+    /// A *floor*, not an assignment: the guide's proportions already scale
+    /// with the configured font, so this only rescues the case where a tier's
+    /// glyphs are genuinely taller than the band the guide asks for. Taking
+    /// the larger of the two keeps text from clipping without letting a
+    /// font-derived number quietly replace the guide's geometry.
     #[must_use]
     pub fn with_metrics(mut self, row: i32, header: i32, status: i32) -> Self {
-        let fallback = Self::default();
-        if self.row_height == fallback.row_height {
-            self.row_height = row;
+        if self.overrides.row_height().is_none() {
+            self.row_height = self.row_height.max(row);
         }
-        if self.header_height == fallback.header_height {
-            self.header_height = header;
+        if self.overrides.header_height().is_none() {
+            self.header_height = self.header_height.max(header);
         }
-        if self.status_height == fallback.status_height {
-            self.status_height = status;
+        if self.overrides.status_height().is_none() {
+            self.status_height = self.status_height.max(status);
         }
         self
     }
@@ -343,6 +366,47 @@ mod tests {
         assert_eq!(theme.padding, 3);
     }
 
+    /// The browser must agree with the *other installed clients* on the
+    /// shared palette, not merely with `[colors]` in the abstract.
+    ///
+    /// The launcher pins `background`/`foreground` explicitly and the monitor
+    /// pins its own `background`; all three are supposed to be the same
+    /// Kanagawa Dragon surface. Since each app resolves its own accessors,
+    /// nothing structurally stops one drifting -- so this asserts the three
+    /// agree given the same document, which is the actual desktop-consistency
+    /// requirement rather than a restatement of the mirroring rule.
+    #[test]
+    fn the_browser_agrees_with_the_other_clients_on_the_shared_surface() {
+        let doc = br##"
+[colors]
+foreground = "#c5c9c5"
+background = "#181616"
+[launcher]
+foreground = "#c5c9c5"
+background = "#181616"
+highlight  = "#727169"
+[monitor]
+background = "#181616"
+"##;
+        let cfg = config::Config::from_bytes(doc).expect("parse");
+        let theme = Theme::from_config(&cfg);
+        assert_eq!(
+            theme.background,
+            Color::from(cfg.launcher_background()),
+            "the browser and launcher must share one window surface"
+        );
+        assert_eq!(
+            theme.background,
+            Color::from(cfg.monitor_background()),
+            "the browser and monitor must share one window surface"
+        );
+        assert_eq!(
+            theme.text,
+            Color::from(cfg.launcher_foreground()),
+            "and one text colour"
+        );
+    }
+
     /// Re-theming the *terminal* must carry into the browser with no
     /// `[files]` table present -- the mirroring rule, end to end.
     #[test]
@@ -398,6 +462,64 @@ mod tests {
         assert_eq!(theme.status_height, 26);
     }
 
+    /// The regression this type was introduced for.
+    ///
+    /// Both derivation stages must compose: whichever order they run in, an
+    /// unset band ends up at least the guide's height. The shipped bug was
+    /// that `with_metrics` running first left `header_height` different from
+    /// the default, so `with_spacing` read that as "user-stated" and skipped
+    /// the toolbar -- leaving a 30px band holding a 33px filter box, which is
+    /// what "the search input is vertically cramped" looked like.
+    #[test]
+    fn the_two_derivation_stages_compose_in_either_order() {
+        let spacing = Spacing::new(14.0, 1.0);
+        let (row, header, status) = (28, 30, 24);
+        let spacing_first = Theme::default()
+            .with_spacing(spacing)
+            .with_metrics(row, header, status);
+        let metrics_first = Theme::default()
+            .with_metrics(row, header, status)
+            .with_spacing(spacing);
+        assert_eq!(
+            spacing_first.header_height, metrics_first.header_height,
+            "stage order must not change the result"
+        );
+        for theme in [spacing_first, metrics_first] {
+            assert!(
+                theme.header_height >= spacing.toolbar_height(),
+                "the toolbar must never end up shorter than the guide asks"
+            );
+        }
+    }
+
+    /// The invariant that makes the toolbar look right: the band must be able
+    /// to contain the controls the guide puts inside it, at any font size.
+    ///
+    /// This is the assertion that would have caught the crowding directly --
+    /// a control is 31px in a 58px band per the guide, so a toolbar shorter
+    /// than its own control height is always wrong regardless of how it was
+    /// derived.
+    #[test]
+    fn the_toolbar_always_contains_its_controls() {
+        for font in [11.0, 13.0, 14.0, 16.0, 20.0, 28.0] {
+            let spacing = Spacing::new(font, 1.0);
+            let scale = crate::typography::Typography::load(&config::Config::default(), 1.0);
+            let theme = Theme::from_config(&config::Config::default())
+                .with_spacing(spacing)
+                .with_metrics(
+                    scale.natural_row_height(),
+                    scale.natural_header_height(),
+                    scale.natural_status_height(),
+                );
+            assert!(
+                theme.header_height > spacing.control_height(),
+                "at {font}px the toolbar ({}) must exceed its controls ({})",
+                theme.header_height,
+                spacing.control_height()
+            );
+        }
+    }
+
     /// …but an explicit config value outranks the derived one: the user asked
     /// for that number and must get it.
     #[test]
@@ -406,5 +528,22 @@ mod tests {
         let theme = Theme::from_config(&cfg).with_metrics(30, 40, 26);
         assert_eq!(theme.row_height, 44, "config must win");
         assert_eq!(theme.header_height, 40, "unset metrics still derive");
+    }
+
+    /// A configured metric equal to the built-in default is still the user's
+    /// choice, and must survive both derivation stages.
+    ///
+    /// The old default-comparison could not express this: `header_height = 24`
+    /// was indistinguishable from "unset", so the value was overwritten.
+    #[test]
+    fn configuring_the_default_value_is_still_respected() {
+        let cfg = config::Config::from_bytes(b"[files]\nheader_height = 24\n").expect("parse");
+        let theme = Theme::from_config(&cfg)
+            .with_spacing(Spacing::new(14.0, 1.0))
+            .with_metrics(30, 40, 26);
+        assert_eq!(
+            theme.header_height, 24,
+            "an explicit value must not be mistaken for an unset one"
+        );
     }
 }

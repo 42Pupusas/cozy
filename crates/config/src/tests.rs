@@ -761,6 +761,42 @@ fn files_metrics_default_and_override() {
     assert_eq!(cfg.files_header_height(), 24);
 }
 
+/// The browser must be as translucent as its siblings by default.
+///
+/// It was the one opaque window on the desktop: `[window].opacity = 0.80`
+/// moved the terminal, bar, launcher and monitor together and left the file
+/// browser a solid rectangle among them. Mirroring is the fix, so this pins
+/// the mirror rather than a literal.
+#[test]
+fn files_opacity_mirrors_the_terminal_window() {
+    let cfg = Config::parse("[window]\nopacity = 0.8\n");
+    assert!(
+        (cfg.files_opacity() - 0.8).abs() < f64::EPSILON,
+        "got {}",
+        cfg.files_opacity()
+    );
+    // And with nothing configured at all it matches the window default,
+    // whatever that is -- not a second hardcoded number that could drift.
+    let cfg = Config::parse("");
+    assert!((cfg.files_opacity() - cfg.window.opacity).abs() < f64::EPSILON);
+}
+
+/// …but an explicit `[files].opacity` still wins, for a user who wants the
+/// browser more solid than the terminal behind it.
+#[test]
+fn files_opacity_override_wins() {
+    let cfg = Config::parse("[window]\nopacity = 0.8\n[files]\nopacity = 1.0\n");
+    assert!((cfg.files_opacity() - 1.0).abs() < f64::EPSILON);
+}
+
+/// An out-of-range opacity is a typo, not a clamp request: silently accepting
+/// `opacity = 80` (meaning 80%) would render an invisible window.
+#[test]
+fn files_opacity_out_of_range_rejected() {
+    let err = Config::fail("[files]\nopacity = 80\n");
+    assert!(err.contains("files.opacity"), "{err}");
+}
+
 #[test]
 fn files_bad_color_is_a_validation_error() {
     let err = Config::fail("[files]\ndir = \"nope\"\n");

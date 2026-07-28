@@ -1,0 +1,20 @@
+[package]
+name    = "files-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "files"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The directory model: read, filter, sort. No UI knowledge at all.
+fsmodel  = { path = "../../crates/fsmodel" }
+# The list/scroll/selection/text widgets. No platform knowledge at all.
+widget   = { path = "../../crates/widget" }
+# The window: xdg-shell toplevel, input, and a software canvas.
+platform = { path = "../../crates/platform" }
+waker    = { path = "../../crates/waker" }

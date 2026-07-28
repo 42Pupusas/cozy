@@ -240,6 +240,23 @@ impl ListPane {
         }
     }
 
+    /// Put the cursor on `row`, replacing the selection, and scroll it into
+    /// view. Ignores an out-of-range index.
+    ///
+    /// The programmatic entry point -- what "go up and land on the directory
+    /// you just left" and "keep the cursor on the same file across a refresh"
+    /// both need. It goes through the pane rather than the selection directly
+    /// precisely so the scroll happens: landing on an off-screen cursor is
+    /// indistinguishable from not having landed anywhere.
+    pub fn select_row(&mut self, row: usize) -> bool {
+        if row >= self.viewport.len() {
+            return false;
+        }
+        self.selection.select_only(row);
+        self.viewport.scroll_into_view(row);
+        true
+    }
+
     /// Jump the cursor to one end of the list.
     ///
     /// # Why this names its target instead of reusing a huge delta
@@ -526,6 +543,23 @@ mod tests {
         pane.command(ListCommand::Jump(Edge::Top));
         assert_eq!(pane.cursor(), Some(0));
         assert_eq!(pane.viewport().offset(), 0);
+    }
+
+    #[test]
+    fn selecting_a_row_programmatically_scrolls_it_into_view() {
+        let mut pane = pane();
+        assert!(pane.select_row(40));
+        assert_eq!(pane.cursor(), Some(40));
+        assert_eq!(pane.selection().count(), 1);
+        assert_cursor_visible(&pane);
+    }
+
+    #[test]
+    fn selecting_an_out_of_range_row_is_refused_rather_than_panicking() {
+        let mut pane = pane();
+        assert!(!pane.select_row(50), "one past the end");
+        assert!(!pane.select_row(usize::MAX));
+        assert_eq!(pane.cursor(), None, "a refused select must not move anything");
     }
 
     #[test]

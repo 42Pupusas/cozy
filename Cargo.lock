@@ -148,6 +148,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "files-bin"
+version = "0.1.0"
+dependencies = [
+ "fsmodel",
+ "platform",
+ "waker",
+ "widget",
+]
+
+[[package]]
 name = "font"
 version = "0.1.0"
 

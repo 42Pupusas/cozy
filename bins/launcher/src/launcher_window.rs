@@ -61,6 +61,11 @@ pub struct LauncherWindow {
     events: Consumer<RawEvent>,
     #[allow(dead_code)]
     reader: Option<std::thread::JoinHandle<Result<()>>>,
+    /// Tracks whether the reader thread still exists. The launcher drains
+    /// its ring with the non-blocking `pop()`, so without this an exited
+    /// reader looks exactly like an idle one and the overlay would linger
+    /// after the compositor went away.
+    reader_health: platform::ReaderHealth,
     wake: waker::Waker,
 
     #[allow(dead_code)]
@@ -293,6 +298,7 @@ impl LauncherWindow {
             window_tx,
             events,
             reader: Some(reader_handle),
+            reader_health: platform::ReaderHealth::new(),
             wake,
             compositor,
             layer_shell,
@@ -366,6 +372,18 @@ impl LauncherWindow {
             if self.closing {
                 return Ok(false);
             }
+        }
+
+        // Drain first, *then* ask whether the reader is gone, so a final
+        // `wl_display.error` pushed on the way out is still handled above
+        // rather than discarded in favour of a silent exit.
+        if !self
+            .reader_health
+            .observe(self.events.is_closed(), self.events.is_empty())
+            .is_alive()
+        {
+            self.closing = true;
+            return Ok(false);
         }
 
         if self.configured

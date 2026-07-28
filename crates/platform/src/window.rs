@@ -173,6 +173,12 @@ pub struct TermWindow {
     window_tx: WindowSender,
     events: Consumer<RawEvent>,
     reader: Option<std::thread::JoinHandle<Result<()>>>,
+    /// Tracks whether the reader thread still exists. [`Self::run_once`]
+    /// blocks on `pop_block` and so learns of a dead reader for free, but
+    /// [`Self::tick`]/[`Self::tick_with_painter`] drain with the
+    /// non-blocking `pop()` and would otherwise spin forever against a
+    /// closed ring after the compositor went away.
+    reader_health: crate::ReaderHealth,
     /// Shared wakeup the reader signals after pushing events; also exposed to
     /// the app (via [`TermWindow::waker`]) so the parser thread can wake the UI
     /// loop after producing a dirty snapshot. The UI loop blocks in
@@ -528,6 +534,7 @@ impl TermWindow {
             window_tx,
             events,
             reader: Some(reader_handle),
+            reader_health: crate::ReaderHealth::new(),
             wake,
             compositor,
             shm,
@@ -767,6 +774,18 @@ impl TermWindow {
             if self.lifecycle == Lifecycle::Closing {
                 return Ok(false);
             }
+        }
+
+        // Drain first, *then* ask whether the reader is gone: it may have
+        // pushed the `wl_display.error` explaining its exit, and the loop
+        // above must consume that before we tear down.
+        if !self
+            .reader_health
+            .observe(self.events.is_closed(), self.events.is_empty())
+            .is_alive()
+        {
+            self.lifecycle = Lifecycle::Closing;
+            return Ok(false);
         }
 
         // Drain any paste bytes a helper thread finished reading.

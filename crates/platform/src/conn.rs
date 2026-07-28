@@ -33,6 +33,7 @@ use ququmatz::{IoUring, ProvidedBufferRing, Sqe};
 
 use crate::event::RawEvent;
 use crate::id::ObjectId;
+use crate::progress_guard::{Progress, ProgressGuard};
 use crate::sys::{self, OutgoingMessage, RepeatTimer, SysError};
 use crate::wire::{MessageBuilder, WireEvent};
 
@@ -216,6 +217,84 @@ mod error_tests {
     fn from_sys_error_wraps_as_sys_variant() {
         let e: ConnError = SysError::Mmap(io_err("x")).into();
         assert!(matches!(e, ConnError::Sys(SysError::Mmap(_))));
+    }
+}
+
+#[cfg(test)]
+mod recv_outcome_tests {
+    use super::*;
+
+    #[test]
+    fn disconnect_errnos_are_classified_as_closure() {
+        // The errnos a compositor crash/kill actually surfaces.
+        for errno in [104, 107, 32, 103, 108] {
+            assert!(
+                Reader::errno_is_disconnect(errno),
+                "errno {errno} should read as a disconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_io_errors_are_not_classified_as_closure() {
+        // EAGAIN, EINTR, EBADF, ENOMEM, EFAULT: real faults that must still
+        // propagate as errors rather than be swallowed as a clean hangup.
+        for errno in [11, 4, 9, 12, 14] {
+            assert!(
+                !Reader::errno_is_disconnect(errno),
+                "errno {errno} must not be mistaken for a disconnect"
+            );
+        }
+    }
+
+    #[test]
+    fn closed_constant_reports_closure_without_progress() {
+        // `CLOSED` is a const, so these are checkable at compile time --
+        // a const block makes that explicit and keeps the guarantee even if
+        // the test is never run.
+        const { assert!(RecvOutcome::CLOSED.closed) };
+        const { assert!(!RecvOutcome::CLOSED.absorbed) };
+    }
+
+    #[test]
+    fn default_outcomes_are_inert() {
+        let recv = RecvOutcome::default();
+        assert!(!recv.closed && !recv.absorbed);
+        let reaped = Reaped::default();
+        assert!(!reaped.closed && !reaped.pushed && !reaped.absorbed);
+    }
+
+    /// The exact regression this work exists for: a batch that reaps
+    /// completions but absorbs and pushes nothing is barren, and a run of
+    /// them must trip the watchdog rather than spin forever.
+    #[test]
+    fn barren_reaps_wedge_the_guard() {
+        let barren = Reaped::default();
+        let mut guard = ProgressGuard::with_limit(8);
+        let mut outcome = Progress::Continue;
+        for _ in 0..8 {
+            outcome = guard.record(barren.pushed || barren.absorbed);
+        }
+        assert_eq!(outcome, Progress::Wedged);
+    }
+
+    /// ...whereas a batch that absorbed bytes but hasn't yet produced a whole
+    /// message (partial message split across recvs) counts as progress and
+    /// must never trip it.
+    #[test]
+    fn partial_message_absorption_counts_as_progress() {
+        let partial = Reaped {
+            closed: false,
+            pushed: false,
+            absorbed: true,
+        };
+        let mut guard = ProgressGuard::with_limit(4);
+        for _ in 0..1_000 {
+            assert_eq!(
+                guard.record(partial.pushed || partial.absorbed),
+                Progress::Continue
+            );
+        }
     }
 }
 
@@ -598,6 +677,13 @@ impl Reader {
         self.arm_recv()?;
         self.arm_timer_poll()?;
 
+        // Backstop against the loop spinning against a peer that has gone
+        // away without producing a completion we recognise as EOF. See
+        // `progress_guard` for the full story -- in short, a recv on a dead
+        // socket completes instantly and forever, and without this the
+        // thread pins a core while the main thread sleeps for good.
+        let mut guard = ProgressGuard::new();
+
         loop {
             // Submit the (re-)arms and block for the next completion(s).
             //
@@ -611,18 +697,29 @@ impl Reader {
             // here instead of tearing down the whole connection.
             self.ring.submit_and_wait_retry(1)?;
 
-            let (closed, mut pushed) = self.reap_completions(producer)?;
+            let reaped = self.reap_completions(producer)?;
+            let (closed, mut pushed) = (reaped.closed, reaped.pushed);
+            // Absorbing bytes counts as progress even when it doesn't yet
+            // yield a whole message to push (a partial message split across
+            // recvs is real forward motion, not futility).
+            let mut progressed = reaped.pushed || reaped.absorbed;
 
             // Drain whole messages out of the inbox and forward them, then
             // forward any fds that arrived alongside them. Either can signal
             // "the consumer dropped, stop the loop" via `ControlFlow::Break`.
             match self.drain_inbox_events(producer) {
                 core::ops::ControlFlow::Break(()) => return Ok(()),
-                core::ops::ControlFlow::Continue(p) => pushed |= p,
+                core::ops::ControlFlow::Continue(p) => {
+                    pushed |= p;
+                    progressed |= p;
+                }
             }
             match self.forward_pending_fds(producer) {
                 core::ops::ControlFlow::Break(()) => return Ok(()),
-                core::ops::ControlFlow::Continue(p) => pushed |= p,
+                core::ops::ControlFlow::Continue(p) => {
+                    pushed |= p;
+                    progressed |= p;
+                }
             }
 
             // Wake the UI thread, which polls a shared eventfd rather than
@@ -632,6 +729,23 @@ impl Reader {
             }
 
             if closed {
+                if let Some(w) = waker {
+                    w.signal();
+                }
+                return Ok(());
+            }
+
+            // Nothing absorbed, nothing pushed, repeatedly: the connection is
+            // wedged. Stop rather than burn a core forever, and wake the main
+            // thread so it observes the reader's exit instead of sleeping
+            // through it -- the whole failure mode we're guarding against is
+            // "reader spins, main thread never learns".
+            if guard.record(progressed) == Progress::Wedged {
+                eprintln!(
+                    "wayland reader: no forward progress in {} consecutive completions; \
+                     treating the connection as closed",
+                    guard.limit()
+                );
                 if let Some(w) = waker {
                     w.signal();
                 }
@@ -647,24 +761,21 @@ impl Reader {
     /// share `run`'s complexity budget with the inbox-draining and
     /// fd-forwarding steps that follow it.
     ///
-    /// Returns `(closed, pushed)`: `closed` once the peer has hung up,
-    /// `pushed` if any event (so far) was pushed to `producer` this
-    /// iteration -- both feed back into `run`'s end-of-loop wake/exit logic.
-    fn reap_completions(
-        &mut self,
-        producer: &Producer<RawEvent>,
-    ) -> Result<(bool, bool), ConnError> {
-        let mut closed = false;
-        let mut pushed = false;
+    /// Returns a [`Reaped`] summarising the batch -- see its docs; all three
+    /// flags feed back into `run`'s end-of-loop wake/exit/watchdog logic.
+    fn reap_completions(&mut self, producer: &Producer<RawEvent>) -> Result<Reaped, ConnError> {
+        let mut reaped = Reaped::default();
         while let Some(cqe) = self.ring.complete() {
             if cqe.user_data == UD_TIMER {
                 self.absorb_timer_cqe(cqe.result, producer)?;
-                pushed = true;
-            } else if self.absorb_recv_cqe(cqe.result, cqe.flags)? {
-                closed = true;
+                reaped.pushed = true;
+            } else {
+                let recv = self.absorb_recv_cqe(cqe.result, cqe.flags)?;
+                reaped.closed |= recv.closed;
+                reaped.absorbed |= recv.absorbed;
             }
         }
-        Ok((closed, pushed))
+        Ok(reaped)
     }
 
     /// Drain whole Wayland messages out of `self.inbox` and forward each as
@@ -756,17 +867,35 @@ impl Reader {
         self.arm_timer_poll()
     }
 
-    /// Absorb one multishot recvmsg completion into the inbox. Returns `true` if
-    /// the peer closed the connection.
-    fn absorb_recv_cqe(&mut self, result: i32, flags: CqeFlags) -> Result<bool, ConnError> {
+    /// Absorb one multishot recvmsg completion into the inbox.
+    fn absorb_recv_cqe(&mut self, result: i32, flags: CqeFlags) -> Result<RecvOutcome, ConnError> {
         let more = flags.contains(CqeFlags::MORE);
+
         if result < 0 {
-            return Err(ConnError::Io(io::Error::from_raw_os_error(-result)));
-        }
-        if result == 0 && !more {
-            return Ok(true); // peer closed, multishot over
+            let errno = -result;
+            // A peer that vanishes rudely (compositor killed or crashed)
+            // reports the hangup as an errno on the recv rather than a clean
+            // zero-length read. That is a *closed connection*, not an I/O
+            // fault: returning `Err` here would propagate a scary error out
+            // of an ordinary shutdown, and -- worse, before the guard existed
+            // -- any errno we failed to classify left the loop re-arming
+            // against a dead socket forever.
+            if Self::errno_is_disconnect(errno) {
+                return Ok(RecvOutcome::CLOSED);
+            }
+            return Err(ConnError::Io(io::Error::from_raw_os_error(errno)));
         }
 
+        // A zero-length recv means EOF, full stop. We deliberately no longer
+        // require `!more`: if the kernel reports EOF while the multishot is
+        // still notionally armed, the connection is just as dead, and the old
+        // `result == 0 && !more` form let exactly that case fall through to
+        // the unconditional re-arm below -- the spin that pinned four cores.
+        if result == 0 {
+            return Ok(RecvOutcome::CLOSED);
+        }
+
+        let mut absorbed = false;
         if flags.contains(CqeFlags::BUFFER)
             && let Some(buf_id) = flags.buffer_id()
         {
@@ -774,12 +903,18 @@ impl Reader {
                 self.pool
                     .recvmsg_parts(buf_id, result as u32, RECV_NAMELEN, self.recv_controllen)
             {
-                self.inbox.extend_from_slice(parts.payload);
+                if !parts.payload.is_empty() {
+                    self.inbox.extend_from_slice(parts.payload);
+                    absorbed = true;
+                }
                 // Any fds the message carried (in practice just the keymap fd
                 // from wl_keyboard.keymap — the only fd-bearing event we get).
                 // We don't parse the XKB keymap, so we just take ownership; they
                 // close when the Reader drops. Retained, not used, by design.
                 let mut fds = sys::IncomingControl::fds(parts.control);
+                if !fds.is_empty() {
+                    absorbed = true;
+                }
                 self.pending_fds.append(&mut fds);
             }
             self.pool.recycle_and_commit(buf_id);
@@ -789,8 +924,73 @@ impl Reader {
         if !more {
             self.arm_recv()?;
         }
-        Ok(false)
+        Ok(RecvOutcome {
+            closed: false,
+            absorbed,
+        })
     }
+
+    /// Is this errno the socket telling us the peer is gone, rather than a
+    /// genuine I/O fault?
+    ///
+    /// An associated function rather than a method: it inspects nothing but
+    /// its argument, and lives here (rather than on `ConnError`) because
+    /// "which errnos mean the compositor went away" is knowledge the receive
+    /// loop owns.
+    const fn errno_is_disconnect(errno: i32) -> bool {
+        // ECONNRESET: peer reset the connection (compositor killed).
+        // ENOTCONN:   socket is no longer connected.
+        // EPIPE:      write end gone.
+        // ECONNABORTED / ESHUTDOWN: connection torn down under us.
+        const ECONNRESET: i32 = 104;
+        const ENOTCONN: i32 = 107;
+        const EPIPE: i32 = 32;
+        const ECONNABORTED: i32 = 103;
+        const ESHUTDOWN: i32 = 108;
+        matches!(
+            errno,
+            ECONNRESET | ENOTCONN | EPIPE | ECONNABORTED | ESHUTDOWN
+        )
+    }
+}
+
+/// Outcome of absorbing a single recv completion.
+///
+/// Replaces a bare `bool` return: the receive loop now needs to distinguish
+/// "the peer hung up" from "this completion actually carried something", and
+/// a pair of named fields beats a tuple of anonymous bools at the call site.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RecvOutcome {
+    /// The peer has hung up; the loop should tear down.
+    closed: bool,
+    /// This completion delivered payload bytes or fds — i.e. real forward
+    /// progress, as judged by [`ProgressGuard`].
+    absorbed: bool,
+}
+
+impl RecvOutcome {
+    /// The peer hung up and (necessarily) delivered nothing.
+    const CLOSED: Self = Self {
+        closed: true,
+        absorbed: false,
+    };
+}
+
+/// Summary of one full drain of the completion queue.
+///
+/// Named struct rather than the previous `(bool, bool)` tuple because it grew
+/// a third flag: with two same-typed bools a tuple was already easy to
+/// transpose silently, and `absorbed` vs `pushed` is exactly the distinction
+/// the watchdog depends on being right.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Reaped {
+    /// The peer hung up during this batch.
+    closed: bool,
+    /// Something was pushed onto the SPSC ring (so the UI thread needs a wake).
+    pushed: bool,
+    /// Payload bytes or fds landed in the inbox — forward progress even if no
+    /// whole message emerged yet.
+    absorbed: bool,
 }
 
 /// Extends `ququmatz`'s `CqeFlags` with the provided-buffer-id decode --

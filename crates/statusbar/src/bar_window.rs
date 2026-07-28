@@ -74,6 +74,11 @@ pub struct BarWindow {
     events: Consumer<RawEvent>,
     #[allow(dead_code)]
     reader: Option<std::thread::JoinHandle<Result<()>>>,
+    /// Tracks whether the reader thread still exists. A bar drains its ring
+    /// with the non-blocking `pop()`, so without this an exited reader is
+    /// indistinguishable from an idle one and the process would tick on
+    /// forever after the compositor went away.
+    reader_health: platform::ReaderHealth,
     wake: waker::Waker,
 
     #[allow(dead_code)]
@@ -377,6 +382,7 @@ impl BarWindow {
             window_tx,
             events,
             reader: Some(reader_handle),
+            reader_health: platform::ReaderHealth::new(),
             wake,
             compositor,
             layer_shell,
@@ -481,6 +487,18 @@ impl BarWindow {
             if self.closing {
                 return Ok(false);
             }
+        }
+
+        // Drain first, *then* ask whether the reader is gone: a reader that
+        // exited may have pushed the `wl_display.error` explaining why, and
+        // the loop above must get to consume it before we tear down.
+        if !self
+            .reader_health
+            .observe(self.events.is_closed(), self.events.is_empty())
+            .is_alive()
+        {
+            self.closing = true;
+            return Ok(false);
         }
 
         if self.configured

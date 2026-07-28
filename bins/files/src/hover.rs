@@ -13,6 +13,22 @@
 //! drags, and its docs note that row hover "is the caller's business, since it
 //! needs no state this type owns". This is that caller's state.
 
+use crate::toolbar::Target;
+
+/// Whatever the pointer is over: a row in one of the panes, or a control.
+///
+/// One enum rather than two `Option` fields on the window, because at most one
+/// thing can be hovered at a time. Two fields would make "a row *and* a button
+/// are both lit" representable, and the day a motion event set one without
+/// clearing the other, that is exactly what would be painted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Spot {
+    /// A row in one of the two list panes.
+    Row(Pane, usize),
+    /// A control in the toolbar.
+    Control(Target),
+}
+
 /// Which pane a hovered row belongs to.
 ///
 /// The two panes number their rows independently, so a bare index is
@@ -27,27 +43,28 @@ pub enum Pane {
     Sidebar,
 }
 
-/// The hovered row, and whether the last update changed it.
+/// What the pointer is over, and whether the last update changed it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Hover {
-    row: Option<(Pane, usize)>,
+    spot: Option<Spot>,
 }
 
 impl Hover {
     /// Nothing hovered.
     #[must_use]
     pub const fn none() -> Self {
-        Self { row: None }
+        Self { spot: None }
     }
 
-    /// The hovered pane and row, if the pointer is over one.
+    /// The hovered spot, if any.
     ///
-    /// The painter asks [`Self::is`] instead, since it walks rows; this is for
-    /// a caller that needs the index itself (a context menu's target, say).
+    /// The painter asks [`Self::is`] or [`Self::control`] instead, since it
+    /// walks rows; this is for a caller that needs the target itself (a context
+    /// menu's subject, say).
     #[must_use]
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const fn row(self) -> Option<(Pane, usize)> {
-        self.row
+    pub const fn spot(self) -> Option<Spot> {
+        self.spot
     }
 
     /// Whether `row` of `pane` is the hovered one.
@@ -57,17 +74,26 @@ impl Hover {
     /// invites -- and so the two panes cannot light each other's rows.
     #[must_use]
     pub fn is(self, pane: Pane, row: usize) -> bool {
-        self.row == Some((pane, row))
+        self.spot == Some(Spot::Row(pane, row))
     }
 
-    /// Move the hover to `row` of `pane`, reporting whether a repaint is owed.
+    /// The hovered toolbar control, if the pointer is over one.
+    #[must_use]
+    pub const fn control(self) -> Option<Target> {
+        match self.spot {
+            Some(Spot::Control(target)) => Some(target),
+            _ => None,
+        }
+    }
+
+    /// Move the hover to `spot`, reporting whether a repaint is owed.
     ///
     /// The return value is the whole point: motion events arrive per pixel of
-    /// pointer travel, but the highlight only changes when the row underneath
+    /// pointer travel, but the highlight only changes when the thing underneath
     /// does, so only that transition earns a frame.
-    pub fn move_to(&mut self, row: Option<(Pane, usize)>) -> bool {
-        let changed = self.row != row;
-        self.row = row;
+    pub fn move_to(&mut self, spot: Option<Spot>) -> bool {
+        let changed = self.spot != spot;
+        self.spot = spot;
         changed
     }
 
@@ -84,12 +110,33 @@ impl Hover {
 
 #[cfg(test)]
 mod tests {
-    use super::{Hover, Pane};
+    use super::{Hover, Pane, Spot};
+    use crate::toolbar::Target;
+
+    /// Trait rather than a free function, so the tests read as `hover.to_row(..)`
+    /// and no plain `fn` sneaks in beside the type it operates on.
+    trait HoverRow {
+        /// Move the hover to `row` of `pane`, reporting whether a repaint is owed.
+        fn to_row(&mut self, pane: Pane, row: usize) -> bool;
+        /// Move the hover off the rows entirely.
+        fn off_rows(&mut self) -> bool;
+    }
+
+    impl HoverRow for Hover {
+        fn to_row(&mut self, pane: Pane, row: usize) -> bool {
+            self.move_to(Some(Spot::Row(pane, row)))
+        }
+
+        fn off_rows(&mut self) -> bool {
+            self.move_to(None)
+        }
+    }
 
     #[test]
     fn a_fresh_hover_has_no_row() {
         let hover = Hover::none();
-        assert_eq!(hover.row(), None);
+        assert_eq!(hover.spot(), None);
+        assert_eq!(hover.control(), None);
         assert!(
             !hover.is(Pane::List, 0),
             "nothing hovered must not match row 0"
@@ -110,15 +157,9 @@ mod tests {
     #[test]
     fn moving_to_a_new_row_owes_a_repaint() {
         let mut hover = Hover::none();
-        assert!(
-            hover.move_to(Some((Pane::List, 3))),
-            "first hover is a change"
-        );
+        assert!(hover.to_row(Pane::List, 3), "first hover is a change");
         assert!(hover.is(Pane::List, 3));
-        assert!(
-            hover.move_to(Some((Pane::List, 4))),
-            "a different row is a change"
-        );
+        assert!(hover.to_row(Pane::List, 4), "a different row is a change");
         assert!(!hover.is(Pane::List, 3));
         assert!(hover.is(Pane::List, 4));
     }
@@ -128,22 +169,79 @@ mod tests {
     #[test]
     fn staying_on_the_same_row_owes_nothing() {
         let mut hover = Hover::none();
-        assert!(hover.move_to(Some((Pane::List, 2))));
+        assert!(hover.to_row(Pane::List, 2));
         for _ in 0..64 {
             assert!(
-                !hover.move_to(Some((Pane::List, 2))),
+                !hover.to_row(Pane::List, 2),
                 "re-hovering the same row must be free"
             );
         }
     }
 
+    /// The same frame-saving property for the toolbar: sliding the pointer
+    /// across one button must cost exactly one repaint, not one per pixel.
+    #[test]
+    fn staying_on_the_same_control_owes_nothing() {
+        let mut hover = Hover::none();
+        assert!(hover.move_to(Some(Spot::Control(Target::Back))));
+        for _ in 0..64 {
+            assert!(!hover.move_to(Some(Spot::Control(Target::Back))));
+        }
+        assert_eq!(hover.control(), Some(Target::Back));
+    }
+
+    #[test]
+    fn moving_between_controls_owes_a_repaint() {
+        let mut hover = Hover::none();
+        hover.move_to(Some(Spot::Control(Target::Back)));
+        assert!(
+            hover.move_to(Some(Spot::Control(Target::Forward))),
+            "the neighbouring button must light instead"
+        );
+        assert_eq!(hover.control(), Some(Target::Forward));
+    }
+
+    /// The reason `Spot` is one enum and not two fields: a row and a control
+    /// can never be lit at the same time.
+    #[test]
+    fn a_control_replaces_a_hovered_row_rather_than_joining_it() {
+        let mut hover = Hover::none();
+        hover.to_row(Pane::List, 5);
+        assert!(hover.move_to(Some(Spot::Control(Target::Filter))));
+        assert!(
+            !hover.is(Pane::List, 5),
+            "the row must go dark when a button lights up"
+        );
+        assert_eq!(hover.control(), Some(Target::Filter));
+        // And back the other way.
+        hover.to_row(Pane::List, 5);
+        assert_eq!(
+            hover.control(),
+            None,
+            "the button must go dark when a row lights up"
+        );
+    }
+
+    /// A row index and a control must not be confused for one another.
+    #[test]
+    fn a_hovered_row_is_not_reported_as_a_control() {
+        let mut hover = Hover::none();
+        hover.to_row(Pane::Sidebar, 0);
+        assert_eq!(hover.control(), None);
+    }
+
     #[test]
     fn leaving_clears_and_owes_a_repaint() {
         let mut hover = Hover::none();
-        hover.move_to(Some((Pane::List, 1)));
+        hover.to_row(Pane::List, 1);
         assert!(hover.clear(), "losing the highlight is a visible change");
-        assert_eq!(hover.row(), None);
+        assert_eq!(hover.spot(), None);
         assert!(!hover.clear(), "clearing twice owes nothing");
+        // A hovered control must be cleared by leaving, too, or a button stays
+        // lit while the pointer is in another window.
+        hover.move_to(Some(Spot::Control(Target::Back)));
+        assert!(hover.clear());
+        assert_eq!(hover.control(), None);
     }
 
     /// Moving off the rows (into the empty space below the list) is a change
@@ -151,9 +249,9 @@ mod tests {
     #[test]
     fn moving_off_the_rows_owes_a_repaint() {
         let mut hover = Hover::none();
-        hover.move_to(Some((Pane::List, 0)));
-        assert!(hover.move_to(None));
-        assert!(!hover.move_to(None), "already off owes nothing");
+        hover.to_row(Pane::List, 0);
+        assert!(hover.off_rows());
+        assert!(!hover.off_rows(), "already off owes nothing");
     }
 
     /// The reason the pane is part of the key: the two panes number their rows
@@ -162,7 +260,7 @@ mod tests {
     #[test]
     fn the_two_panes_do_not_light_each_others_rows() {
         let mut hover = Hover::none();
-        hover.move_to(Some((Pane::Sidebar, 2)));
+        hover.to_row(Pane::Sidebar, 2);
         assert!(hover.is(Pane::Sidebar, 2));
         assert!(
             !hover.is(Pane::List, 2),
@@ -175,9 +273,9 @@ mod tests {
     #[test]
     fn crossing_between_panes_owes_a_repaint() {
         let mut hover = Hover::none();
-        hover.move_to(Some((Pane::Sidebar, 1)));
+        hover.to_row(Pane::Sidebar, 1);
         assert!(
-            hover.move_to(Some((Pane::List, 1))),
+            hover.to_row(Pane::List, 1),
             "same index, different pane, is still a change"
         );
         assert!(hover.is(Pane::List, 1));

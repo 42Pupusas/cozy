@@ -17,13 +17,14 @@ use crate::browser::{Browser, Outcome};
 use crate::columns::{Column, Columns};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
-use crate::hover::{Hover, Pane};
+use crate::hover::{Hover, Pane, Spot};
 use crate::kind_label::KindLabel;
 use crate::moment::Moment;
 use crate::row_format::RowFormat;
 use crate::sidebar::{Sidebar, SidebarRow};
 use crate::storage::Storage;
 use crate::theme::Theme;
+use crate::toolbar::{Target, Toolbar};
 use crate::typography::Typography;
 
 /// Milliseconds within which a second click counts as a double-click.
@@ -310,6 +311,50 @@ impl FilesWindow {
     /// a row -- lighting one place while clicking another, which reads as a
     /// rendering bug rather than a logic one. It also has to match where
     /// `paint_sidebar` starts drawing, hence the same top inset.
+    /// Which toolbar control is under `at`, if any.
+    fn toolbar_hit(&self, at: Position) -> Option<Target> {
+        self.toolbar().hit(at.x, at.y)
+    }
+
+    /// What the pointer at `at` is over: a control, or a row in one of the panes.
+    ///
+    /// The regions are tested in the same order the press handler tests them,
+    /// and only one can win, so the highlight cannot appear in two places at
+    /// once -- and the thing that lights up is the thing a click would hit.
+    fn spot_at(&self, at: Position) -> Option<Spot> {
+        if let Some(target) = self.toolbar_hit(at) {
+            return Some(Spot::Control(target));
+        }
+        if self.in_sidebar(at) {
+            return self.sidebar_row_at(at).map(|i| Spot::Row(Pane::Sidebar, i));
+        }
+        self.to_pane(at)
+            .and_then(|(_, y)| self.browser.pane().viewport().row_at_y(y))
+            .map(|i| Spot::Row(Pane::List, i))
+    }
+
+    /// Act on a click on toolbar control `target`.
+    ///
+    /// The grid segment is deliberately inert: the view is not implemented, and
+    /// a toggle that appeared to switch to a view that never arrived would be
+    /// worse than one that visibly does nothing.
+    fn activate_control(&mut self, target: Target) {
+        let outcome = match target {
+            Target::Back => self.browser.go_back(),
+            Target::Forward => self.browser.go_forward(),
+            Target::Filter => self.browser.focus_filter(),
+            // List is already the current view, and grid does not exist yet, so
+            // neither segment changes anything.
+            Target::ViewList | Target::ViewGrid => Outcome::Ignored,
+        };
+        self.apply(outcome);
+        // Back and forward can cross a filesystem boundary, exactly as a
+        // sidebar jump can, so the storage footer must be re-read.
+        if matches!(target, Target::Back | Target::Forward) {
+            self.refresh_storage();
+        }
+    }
+
     fn sidebar_row_at(&self, at: Position) -> Option<usize> {
         let y = at.y - self.frame().sidebar_body().y - self.theme.spacing.sidebar_pad_y();
         self.sidebar.row_index_at(y, self.theme.sidebar_row())
@@ -367,50 +412,69 @@ impl FilesWindow {
         self.paint_view_toggle(canvas);
     }
 
-    /// Draw the back and forward affordances at the toolbar's left.
+    /// The toolbar's control geometry for the current window.
     ///
-    /// The guide puts chevrons here. Icons are still deferred, so these are
-    /// drawn as the glyphs a monospace face definitely has -- and, crucially,
-    /// they are drawn *disabled* (muted, no hover fill) because there is no
-    /// history stack behind them yet. Showing them greyed is honest about
-    /// what the toolbar will hold without implying a working control: the
-    /// alternative, an enabled-looking button that does nothing, teaches the
-    /// user the application is broken.
+    /// The single source of truth for where the buttons are, shared by the
+    /// painter and the pointer handler so the clickable region cannot drift
+    /// away from the drawn one.
+    fn toolbar(&self) -> Toolbar {
+        Toolbar::new(
+            self.frame().toolbar(),
+            self.theme.spacing,
+            self.theme.control_height(),
+            self.browser.is_filtering(),
+        )
+    }
+
+    /// Draw the back and forward chevrons at the toolbar's left.
+    ///
+    /// Each is live only when the history actually holds a step in that
+    /// direction, and is drawn muted when it does not -- a disabled control
+    /// that looks enabled teaches the user the application is broken, and one
+    /// that looks disabled but works is just as confusing. Hover is drawn only
+    /// on a live button, for the same reason.
     fn paint_nav_buttons(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let bar = self.frame().toolbar();
-        let size = theme.spacing.icon_button();
-        // The guide's toolbar padding, not the generic gap step: the first
-        // button must clear the window edge by the same margin the last one
-        // clears the right edge.
-        let mut x = bar.x + theme.spacing.toolbar_pad();
-        let y = bar.y + (bar.h - size) / 2;
-        for glyph in ["\u{2039}", "\u{203a}"] {
-            // Never let the buttons crowd out the path itself, which is the
-            // one thing in the toolbar the user actually needs.
-            if x + size > bar.right() {
-                return;
-            }
+        let bar = self.toolbar();
+        for (rect, glyph, enabled, target) in [
+            (
+                bar.back(),
+                "\u{2039}",
+                self.browser.can_go_back(),
+                Target::Back,
+            ),
+            (
+                bar.forward(),
+                "\u{203a}",
+                self.browser.can_go_forward(),
+                Target::Forward,
+            ),
+        ] {
+            // Dropped for want of room: nothing to draw, and `Toolbar::hit`
+            // will not report it either.
+            let Some(rect) = rect else { continue };
+            // Only a button that would do something lights up under the
+            // pointer, so the highlight is a promise rather than decoration.
+            let hovered = enabled && self.hover.control() == Some(target);
+            let bg = if hovered {
+                canvas.fill_round_rect(rect, theme.hover, theme.spacing.radius_small());
+                theme.hover
+            } else {
+                theme.toolbar_bg
+            };
+            let color = if enabled { theme.text } else { theme.disabled };
             let tier = &mut self.type_scale.title;
             let text_w = tier.measure(glyph);
-            let text_y = y + (size - tier.line_height()) / 2;
+            let text_y = rect.y + (rect.h - tier.line_height()) / 2;
             tier.draw_text(
                 canvas,
                 glyph,
-                x + (size - text_w) / 2,
+                rect.x + (rect.w - text_w) / 2,
                 text_y,
-                theme.disabled,
-                theme.toolbar_bg,
+                color,
+                bg,
             );
-            x += size;
         }
-    }
-
-    /// Where the breadcrumb path may start: after the navigation buttons.
-    fn breadcrumb_x(&self) -> i32 {
-        let theme = self.theme;
-        let bar = self.frame().toolbar();
-        bar.x + theme.spacing.toolbar_pad() + theme.spacing.icon_button() * 2 + theme.spacing.s()
     }
 
     /// Draw the list/grid view toggle at the toolbar's right end.
@@ -421,17 +485,13 @@ impl FilesWindow {
     /// not offering a switch that would do nothing.
     fn paint_view_toggle(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let bar = self.frame().toolbar();
-        let button = theme.spacing.view_button();
-        let height = theme.control_height();
-        let width = button * 2;
-        let x = bar.right() - theme.spacing.toolbar_pad() - width;
-        let y = bar.y + (bar.h - height) / 2;
         // Dropped entirely rather than overlapped when the toolbar is too
         // tight: the filter box and the path outrank it.
-        if x <= self.breadcrumb_x() {
+        let Some(outline) = self.toolbar().view_toggle() else {
             return;
-        }
+        };
+        let button = theme.spacing.view_button();
+        let (x, y, width, height) = (outline.x, outline.y, outline.w, outline.h);
         // The active segment is filled, which is what makes the pair read as
         // a state rather than as two buttons. Only its *outer* corners are
         // rounded -- it shares a straight edge with the segment beside it, so
@@ -481,14 +541,11 @@ impl FilesWindow {
         let theme = self.theme;
         let crumbs = self.crumbs();
         let bar = self.frame().toolbar();
-        let mut x = self.breadcrumb_x();
-        // The filter control and view toggle own the right end of the
-        // toolbar, so the path gets what is left after them and their gaps.
-        let reserved = theme.spacing.search_width()
-            + theme.spacing.view_button() * 2
-            + theme.spacing.toolbar_pad()
-            + theme.spacing.s() * 2;
-        let limit = bar.right() - x - reserved;
+        let toolbar = self.toolbar();
+        let mut x = toolbar.breadcrumb_x();
+        // The filter control and view toggle own the right end of the toolbar,
+        // so the path gets what is left after them and their gaps.
+        let limit = toolbar.breadcrumb_width();
 
         let (shown, elided) = crumbs.tail(self.crumb_budget(limit));
         if elided {
@@ -557,23 +614,12 @@ impl FilesWindow {
     fn paint_filter_control(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
         let filtering = self.browser.is_filtering();
-        let width = if filtering {
-            theme.spacing.search_width_focused()
-        } else {
-            theme.spacing.search_width()
-        };
-        let height = theme.control_height();
-        let bar = self.frame().toolbar();
-        // The view toggle sits to its right, so the filter box ends before it.
-        let toggle = theme.spacing.view_button() * 2 + theme.spacing.s();
-        let x = bar.right() - theme.spacing.toolbar_pad() - toggle - width;
-        let y = bar.y + (bar.h - height) / 2;
         // Guard against a column too narrow to hold the control at all --
         // drawing it at a negative x would wrap around the canvas.
-        if x < self.breadcrumb_x() {
+        let Some(rect) = self.toolbar().filter() else {
             return;
-        }
-        let rect = Rect::new(x, y, width, height);
+        };
+        let (x, y, height) = (rect.x, rect.y, rect.h);
         let radius = theme.spacing.radius();
         canvas.fill_round_rect(rect, theme.filter_bg, radius);
         canvas.draw_round_rect(
@@ -1247,6 +1293,13 @@ impl Painter for FilesWindow {
                 at,
                 modifiers,
             } => {
+                // The toolbar is checked before either pane: its controls sit
+                // above the list, and a click on one must not fall through to
+                // whatever row happens to be under it.
+                if let Some(target) = self.toolbar_hit(at) {
+                    self.activate_control(target);
+                    return;
+                }
                 // A click in the places pane navigates and goes no further:
                 // it must not also be routed to the list beside it.
                 if self.in_sidebar(at) {
@@ -1308,14 +1361,8 @@ impl Painter for FilesWindow {
                 // The panes are checked in the same order the press handler
                 // checks them, and only one can win, so the highlight cannot
                 // appear in both at once.
-                let row = if self.in_sidebar(at) {
-                    self.sidebar_row_at(at).map(|i| (Pane::Sidebar, i))
-                } else {
-                    self.to_pane(at)
-                        .and_then(|(_, y)| self.browser.pane().viewport().row_at_y(y))
-                        .map(|i| (Pane::List, i))
-                };
-                let _ = self.hover.move_to(row);
+                let spot = self.spot_at(at);
+                let _ = self.hover.move_to(spot);
             }
             PointerEventKind::Scroll { lines, .. } => {
                 let outcome = self.browser.scroll(lines);
@@ -1337,10 +1384,11 @@ impl Painter for FilesWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesWindow, Painter};
-    use crate::hover::Pane;
+    use super::{FilesWindow, Painter, PointerEventKind, Target};
+    use crate::hover::{Pane, Spot};
     use platform::SurfaceFormat;
     use platform::draw::Canvas;
+    use platform::protocol::PointerButton;
     use platform::toplevel::PhysicalSize;
 
     /// Paint a whole frame into a translucent canvas and hand back the pixels.
@@ -1507,6 +1555,154 @@ mod tests {
         buf
     }
 
+    /// The centre of a toolbar control, as a pointer position.
+    fn control_centre(painter: &FilesWindow, target: Target) -> super::Position {
+        let bar = painter.toolbar();
+        let rect = match target {
+            Target::Back => bar.back(),
+            Target::Forward => bar.forward(),
+            Target::Filter => bar.filter(),
+            Target::ViewList => bar.view_segment(0),
+            Target::ViewGrid => bar.view_segment(1),
+        }
+        .expect("the control must be drawn at this window size");
+        super::Position {
+            x: rect.x + rect.w / 2,
+            y: rect.y + rect.h / 2,
+        }
+    }
+
+    /// Click a toolbar control by its target, through the real pointer path.
+    fn click_control(painter: &mut FilesWindow, target: Target) {
+        let at = control_centre(painter, target);
+        painter.on_pointer(PointerEventKind::Press {
+            button: PointerButton::Left,
+            at,
+            modifiers: platform::toplevel::ModifierState::default(),
+        });
+    }
+
+    /// A click on the back chevron must actually navigate.
+    ///
+    /// Driven through `on_pointer` rather than by calling `go_back` directly:
+    /// the thing worth testing is the whole path -- hit-test, routing, browser
+    /// -- since a button that is wired to nothing is exactly the bug here.
+    #[test]
+    fn clicking_back_returns_to_the_previous_directory() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("toolbar-back");
+        let sub = root.join("a_directory");
+        let outcome = painter.browser.go_to(&sub);
+        painter.apply(outcome);
+        assert_eq!(painter.browser.path(), sub, "we start in the subdirectory");
+
+        click_control(&mut painter, Target::Back);
+        assert_eq!(
+            painter.browser.path(),
+            root,
+            "clicking back must return to the parent"
+        );
+
+        click_control(&mut painter, Target::Forward);
+        assert_eq!(
+            painter.browser.path(),
+            sub,
+            "and clicking forward must return to the child"
+        );
+    }
+
+    /// A click on the filter box must focus it, so typing goes into the box
+    /// rather than being treated as list shortcuts.
+    #[test]
+    fn clicking_the_filter_box_focuses_it() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("toolbar-filter");
+        assert!(!painter.browser.is_filtering(), "it starts unfocused");
+        click_control(&mut painter, Target::Filter);
+        assert!(
+            painter.browser.is_filtering(),
+            "clicking the box must give it focus"
+        );
+    }
+
+    /// A click on a toolbar control must not fall through to the row beneath.
+    #[test]
+    fn a_toolbar_click_does_not_reach_the_list() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("toolbar-no-fallthrough");
+        let before = painter.browser.pane().cursor();
+        click_control(&mut painter, Target::Filter);
+        assert_eq!(
+            painter.browser.pane().cursor(),
+            before,
+            "the click must not also move the list cursor"
+        );
+    }
+
+    /// A dead chevron must look dead, and a live one must look different --
+    /// otherwise the enabled state is a lie the user cannot see.
+    #[test]
+    fn a_live_chevron_is_painted_differently_from_a_dead_one() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("toolbar-enabled");
+        assert!(
+            !painter.browser.can_go_back(),
+            "a fresh browser has no history"
+        );
+        let dead = paint_opaque(&mut painter, size);
+
+        let outcome = painter.browser.go_to(&root.join("a_directory"));
+        painter.apply(outcome);
+        assert!(
+            painter.browser.can_go_back(),
+            "now there is a step behind us"
+        );
+        let live = paint_opaque(&mut painter, size);
+        assert_ne!(
+            dead, live,
+            "an armed back button must be visibly different from a dead one"
+        );
+    }
+
+    /// Hovering a live control must light it up; hovering a dead one must not,
+    /// so the highlight is a promise that clicking will do something.
+    #[test]
+    fn only_a_live_chevron_lights_up_under_the_pointer() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("toolbar-hover");
+
+        // Dead: hovering must change nothing at all.
+        let cold = paint_opaque(&mut painter, size);
+        assert!(painter.hover.move_to(Some(Spot::Control(Target::Back))));
+        let hovered_dead = paint_opaque(&mut painter, size);
+        assert_eq!(
+            cold, hovered_dead,
+            "a dead button must not light up and promise an action it will not take"
+        );
+
+        // Live: the same hover must now be visible.
+        assert!(painter.hover.clear());
+        let outcome = painter.browser.go_to(&root.join("a_directory"));
+        painter.apply(outcome);
+        let resting = paint_opaque(&mut painter, size);
+        assert!(painter.hover.move_to(Some(Spot::Control(Target::Back))));
+        let hovered_live = paint_opaque(&mut painter, size);
+        assert_ne!(
+            resting, hovered_live,
+            "a live button must acknowledge the pointer"
+        );
+    }
+
+    /// Moving the pointer over a control must drop a row highlight, and vice
+    /// versa -- the two must never be lit at once.
+    #[test]
+    fn the_pointer_lights_either_a_row_or_a_control_but_never_both() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("toolbar-exclusive");
+        let at = control_centre(&painter, Target::Filter);
+        painter.on_pointer(PointerEventKind::Motion(at));
+        assert_eq!(
+            painter.hover.control(),
+            Some(Target::Filter),
+            "the pointer is over the filter box"
+        );
+        assert!(!painter.hover.is(Pane::List, 0), "and so no row may be lit");
+    }
+
     /// Hovering a row must actually change what gets painted.
     ///
     /// Compares whole frames rather than probing a pixel: the highlight's exact
@@ -1519,7 +1715,7 @@ mod tests {
         let cold = paint_opaque(&mut painter, size);
 
         assert!(
-            painter.hover.move_to(Some((Pane::List, 0))),
+            painter.hover.move_to(Some(Spot::Row(Pane::List, 0))),
             "row 0 becomes hovered"
         );
         let hot = paint_opaque(&mut painter, size);
@@ -1550,7 +1746,7 @@ mod tests {
             .expect("the sidebar always offers at least Home");
         let cold = paint_opaque(&mut painter, size);
 
-        assert!(painter.hover.move_to(Some((Pane::Sidebar, place))));
+        assert!(painter.hover.move_to(Some(Spot::Row(Pane::Sidebar, place))));
         let hot = paint_opaque(&mut painter, size);
         assert_ne!(cold, hot, "a hovered place must be visibly highlighted");
 
@@ -1610,7 +1806,7 @@ mod tests {
         painter.apply(outcome);
 
         let resting = paint_opaque(&mut painter, size);
-        assert!(painter.hover.move_to(Some((Pane::Sidebar, index))));
+        assert!(painter.hover.move_to(Some(Spot::Row(Pane::Sidebar, index))));
         let hovered = paint_opaque(&mut painter, size);
         assert_eq!(
             resting, hovered,
@@ -1692,9 +1888,9 @@ mod tests {
             "row 1 must be the file"
         );
 
-        painter.hover.move_to(Some((Pane::List, 0)));
+        painter.hover.move_to(Some(Spot::Row(Pane::List, 0)));
         let dir_hovered = paint_opaque(&mut painter, size);
-        painter.hover.move_to(Some((Pane::List, 1)));
+        painter.hover.move_to(Some(Spot::Row(Pane::List, 1)));
         let file_hovered = paint_opaque(&mut painter, size);
         assert_ne!(
             dir_hovered, file_hovered,

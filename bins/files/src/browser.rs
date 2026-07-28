@@ -31,6 +31,7 @@ use fsmodel::reader::ReadError;
 use std::path::{Path, PathBuf};
 use widget::{ListCommand, ListPane, Mods, PaneResponse, TextInput};
 
+use crate::history::{History, Trail};
 use crate::keymap::{Action, EditAction, Focus, Keymap};
 
 /// What the browser did with an input, for the window to act on.
@@ -70,6 +71,8 @@ pub struct Browser {
     pane: ListPane,
     filter: TextInput,
     keymap: Keymap,
+    /// Where the user has been, for the toolbar's chevrons.
+    history: History,
     /// The most recent read error, shown in the status line.
     ///
     /// Kept rather than propagated: failing to enter one unreadable
@@ -89,6 +92,7 @@ impl Browser {
             pane,
             filter: TextInput::new(),
             keymap: Keymap::new(),
+            history: History::new(),
             error: None,
         })
     }
@@ -115,6 +119,57 @@ impl Browser {
     #[must_use]
     pub const fn is_filtering(&self) -> bool {
         self.keymap.is_filtering()
+    }
+
+    /// Give the filter box focus, as clicking it does.
+    ///
+    /// Reports whether anything changed, so a click on an already-focused box
+    /// does not cost a repaint.
+    pub const fn focus_filter(&mut self) -> Outcome {
+        let changed = !self.keymap.is_filtering();
+        self.keymap.set_focus(Focus::Filter);
+        Outcome::redraw_if(changed)
+    }
+
+    /// Whether the back chevron should be live.
+    #[must_use]
+    pub const fn can_go_back(&self) -> bool {
+        self.history.can_go_back()
+    }
+
+    /// Whether the forward chevron should be live.
+    #[must_use]
+    pub const fn can_go_forward(&self) -> bool {
+        self.history.can_go_forward()
+    }
+
+    /// Step back to the previously visited directory.
+    pub fn go_back(&mut self) -> Outcome {
+        let Some(target) = self.history.peek_back().map(Path::to_path_buf) else {
+            return Outcome::Ignored;
+        };
+        let here = self.view.path().to_path_buf();
+        let outcome = self.navigate(&target, None, Trail::Replay);
+        // Committed only on success. A directory that has been unmounted since
+        // it was visited must not silently consume a history step: the button
+        // would appear to do nothing while quietly eating the user's trail.
+        if self.error.is_none() {
+            self.history.commit_back(&here);
+        }
+        outcome
+    }
+
+    /// Step forward to a directory a previous back left behind.
+    pub fn go_forward(&mut self) -> Outcome {
+        let Some(target) = self.history.peek_forward().map(Path::to_path_buf) else {
+            return Outcome::Ignored;
+        };
+        let here = self.view.path().to_path_buf();
+        let outcome = self.navigate(&target, None, Trail::Replay);
+        if self.error.is_none() {
+            self.history.commit_forward(&here);
+        }
+        outcome
     }
 
     /// The most recent read error, if any.
@@ -257,7 +312,7 @@ impl Browser {
         };
         if entry.is_navigable() {
             let target = entry.path.clone();
-            self.navigate(&target, None)
+            self.navigate(&target, None, Trail::Record)
         } else {
             Outcome::Open(entry.path.clone())
         }
@@ -271,7 +326,7 @@ impl Browser {
             return Outcome::Ignored;
         };
         let leaving = self.view.path().to_path_buf();
-        self.navigate(&parent, Some(&leaving))
+        self.navigate(&parent, Some(&leaving), Trail::Record)
     }
 
     /// Jump straight to `path`, as the sidebar's places do.
@@ -284,7 +339,7 @@ impl Browser {
         if path == self.view.path() {
             return Outcome::Ignored;
         }
-        self.navigate(path, None)
+        self.navigate(path, None, Trail::Record)
     }
 
     /// Read `path` and point the browser at it.
@@ -294,13 +349,22 @@ impl Browser {
     ///
     /// View rules (hidden files, sort) are carried across deliberately: they
     /// are a property of how the user wants to browse, not of one directory.
-    fn navigate(&mut self, path: &Path, select: Option<&Path>) -> Outcome {
+    fn navigate(&mut self, path: &Path, select: Option<&Path>, trail: Trail) -> Outcome {
         let filter = self.view.filter().clone();
         let sort = self.view.sort_policy();
+        // Captured before the move, since `self.view` is about to be replaced.
+        let leaving = self.view.path().to_path_buf();
         match DirectoryView::open_with(path, filter, sort) {
             Ok(view) => {
                 self.view = view;
                 self.error = None;
+                // Recorded only on success, and only for a genuinely new move:
+                // a back/forward step has already accounted for itself, and
+                // recording it here would make the chevrons toggle between two
+                // directories instead of walking the trail.
+                if trail == Trail::Record {
+                    self.history.visit(&leaving);
+                }
                 // A query is scoped to the directory it was typed in: carrying
                 // "report" into a folder with no matches would show an empty
                 // window and look like a failed read.
@@ -457,6 +521,201 @@ mod tests {
     fn a_missing_directory_fails_to_open_rather_than_showing_nothing() {
         let dir = TempDir::new("open_missing");
         assert!(Browser::open(&dir.path().join("nope"), 400, 200, 20).is_err());
+    }
+
+    // -- history ----------------------------------------------------------
+
+    #[test]
+    fn a_freshly_opened_browser_has_nowhere_to_go() {
+        let dir = TempDir::new("history_fresh");
+        let browser = open(&dir);
+        assert!(
+            !browser.can_go_back(),
+            "the first directory has nothing behind it"
+        );
+        assert!(!browser.can_go_forward(), "nor anything ahead");
+    }
+
+    #[test]
+    fn pressing_back_on_a_fresh_browser_costs_no_repaint() {
+        // Reported as Ignored rather than Redraw: a dead button that repaints
+        // the window is a wasted frame on every click.
+        let dir = TempDir::new("history_dead");
+        let mut browser = open(&dir);
+        assert_eq!(browser.go_back(), Outcome::Ignored);
+        assert_eq!(browser.go_forward(), Outcome::Ignored);
+    }
+
+    #[test]
+    fn descending_then_going_back_returns_to_the_parent() {
+        let dir = TempDir::new("history_descend");
+        let sub = dir.create_dir("sub");
+
+        let mut browser = open(&dir);
+        down(&mut browser);
+        activate(&mut browser);
+        assert_eq!(browser.path(), sub);
+        assert!(browser.can_go_back(), "descending must arm the back button");
+
+        assert_eq!(browser.go_back(), Outcome::Redraw);
+        assert_eq!(browser.path(), dir.path());
+        assert!(
+            browser.can_go_forward(),
+            "going back must arm the forward button"
+        );
+    }
+
+    #[test]
+    fn forward_returns_to_the_directory_back_left() {
+        let dir = TempDir::new("history_forward");
+        let sub = dir.create_dir("sub");
+
+        let mut browser = open(&dir);
+        down(&mut browser);
+        activate(&mut browser);
+        browser.go_back();
+        assert_eq!(browser.go_forward(), Outcome::Redraw);
+        assert_eq!(browser.path(), sub);
+        assert!(
+            !browser.can_go_forward(),
+            "the forward stack is spent once replayed"
+        );
+    }
+
+    #[test]
+    fn a_sidebar_jump_is_recorded_like_any_other_navigation() {
+        let dir = TempDir::new("history_jump");
+        let sub = dir.create_dir("sub");
+
+        let mut browser = open(&dir);
+        browser.go_to(&sub);
+        assert_eq!(browser.go_back(), Outcome::Redraw);
+        assert_eq!(browser.path(), dir.path());
+    }
+
+    #[test]
+    fn going_up_is_recorded_so_back_can_undo_it() {
+        let dir = TempDir::new("history_up");
+        let sub = dir.create_dir("sub");
+
+        let mut browser = open(&dir);
+        browser.go_to(&sub);
+        browser.act(Action::GoUp);
+        assert_eq!(browser.path(), dir.path());
+        // Back from here undoes the *up*, landing in the subdirectory again.
+        assert_eq!(browser.go_back(), Outcome::Redraw);
+        assert_eq!(browser.path(), sub);
+    }
+
+    #[test]
+    fn back_and_forward_do_not_record_themselves() {
+        // The load-bearing one. If a back step recorded itself, the chevrons
+        // would toggle between two directories instead of walking the trail.
+        let dir = TempDir::new("history_no_self_record");
+        let one = dir.create_dir("one");
+        let two = dir.create_dir("one/two");
+
+        let mut browser = open(&dir);
+        browser.go_to(&one);
+        browser.go_to(&two);
+        browser.go_back();
+        browser.go_back();
+        assert_eq!(
+            browser.path(),
+            dir.path(),
+            "two backs must walk two steps, not oscillate"
+        );
+        assert!(
+            !browser.can_go_back(),
+            "the trail must now be exhausted rather than self-refilled"
+        );
+    }
+
+    #[test]
+    fn navigating_somewhere_new_abandons_the_forward_trail() {
+        let dir = TempDir::new("history_branch");
+        let sub = dir.create_dir("sub");
+        let other = dir.create_dir("other");
+
+        let mut browser = open(&dir);
+        browser.go_to(&sub);
+        browser.go_back();
+        assert!(browser.can_go_forward(), "back leaves something ahead");
+        browser.go_to(&other);
+        assert!(
+            !browser.can_go_forward(),
+            "branching off must discard the abandoned forward path"
+        );
+    }
+
+    #[test]
+    fn a_failed_navigation_is_not_recorded_at_all() {
+        // A read that failed did not move the user, so it must leave no trail:
+        // otherwise back would return to the directory they never left.
+        let dir = TempDir::new("history_failed");
+        let mut browser = open(&dir);
+        browser.go_to(&dir.path().join("nonexistent"));
+        assert!(browser.error().is_some(), "the read must have failed");
+        assert_eq!(browser.path(), dir.path(), "and left us where we were");
+        assert!(
+            !browser.can_go_back(),
+            "a navigation that never happened must not be remembered"
+        );
+    }
+
+    #[test]
+    fn a_back_step_into_a_vanished_directory_keeps_the_trail() {
+        // The peek/commit split, end to end: the directory is deleted after
+        // being visited, so back fails -- and must not eat the step, or the
+        // button would go dead while the user is still standing in the child.
+        let dir = TempDir::new("history_vanished");
+        let doomed = dir.create_dir("doomed");
+        let sub = dir.create_dir("doomed/sub");
+
+        let mut browser = open(&dir);
+        browser.go_to(&doomed);
+        browser.go_to(&sub);
+        // The whole tree, since the parent cannot be removed while the child
+        // still exists -- and a plain `remove_dir` would fail silently here,
+        // leaving the read to succeed and the test to prove nothing.
+        std::fs::remove_dir_all(&doomed).expect("remove the visited tree");
+
+        browser.go_back();
+        assert!(browser.error().is_some(), "the parent is gone");
+        assert_eq!(browser.path(), sub, "so we stay where we were");
+        assert!(browser.can_go_back(), "and the step survives to be retried");
+    }
+
+    #[test]
+    fn history_survives_a_filter_being_typed() {
+        // Filtering is not navigation: it must neither record a step nor clear
+        // the trail.
+        let dir = TempDir::new("history_filter");
+        let sub = dir.create_dir("sub");
+        dir.create_file("sub/report.txt", b"x");
+
+        let mut browser = open(&dir);
+        browser.go_to(&sub);
+        type_text(&mut browser, "rep");
+        assert!(
+            browser.can_go_back(),
+            "typing a filter must not discard the trail"
+        );
+        browser.go_back();
+        assert_eq!(browser.path(), dir.path());
+    }
+
+    #[test]
+    fn clicking_the_filter_box_focuses_it_once() {
+        let dir = TempDir::new("focus_filter");
+        let mut browser = open(&dir);
+        assert_eq!(browser.focus_filter(), Outcome::Redraw);
+        assert!(browser.is_filtering(), "the box must now have focus");
+        assert_eq!(
+            browser.focus_filter(),
+            Outcome::Ignored,
+            "clicking an already-focused box owes no repaint"
+        );
     }
 
     // -- navigation -------------------------------------------------------

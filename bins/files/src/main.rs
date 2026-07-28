@@ -15,13 +15,16 @@
 //! needing a compositor and a pair of eyes.
 
 mod browser;
+mod favorites;
 mod handlers;
 mod keymap;
 mod launch;
 mod options;
 mod row_format;
+mod sidebar;
 mod test_support;
 mod theme;
+mod user_dirs;
 mod window;
 
 use browser::Browser;

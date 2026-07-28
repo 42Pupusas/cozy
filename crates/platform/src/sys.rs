@@ -699,6 +699,37 @@ mod tests {
     unsafe extern "C" {
         fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
         fn fcntl(fd: RawFd, cmd: i32, arg: i32) -> i32;
+        fn dup3(oldfd: RawFd, newfd: RawFd, flags: i32) -> i32;
+        fn close(fd: RawFd) -> i32;
+    }
+
+    /// `O_CLOEXEC`, for `dup3`.
+    const O_CLOEXEC: i32 = 0o2_000_000;
+
+    /// A file descriptor number high enough that Linux's lowest-available-first
+    /// allocator will never hand it to a sibling test thread.
+    ///
+    /// The fd-recycling test below has to *close* a descriptor and then observe
+    /// its number being reclaimed. Doing that on a naturally-allocated (low)
+    /// number is a race against every other test running in parallel: they open
+    /// and close fds constantly, so the freed number is just as likely to land
+    /// in one of their hands as ours. Reserving an out-of-the-way slot and
+    /// reclaiming it explicitly with `dup3` makes the sequence deterministic
+    /// without serialising the suite.
+    const PRIVATE_SLOT: RawFd = 900;
+
+    /// Probe whether an fd number is currently live, without reading it.
+    /// `F_DUPFD_CLOEXEC` (0x406) returns -1/`EBADF` on a closed descriptor.
+    fn fd_is_live(fd: RawFd) -> bool {
+        // SAFETY: `F_DUPFD_CLOEXEC` only inspects the descriptor table; on
+        // success it yields a new fd we immediately close.
+        let rc = unsafe { fcntl(fd, 0x0406, 0) };
+        if rc >= 0 {
+            // SAFETY: `rc` is a fresh descriptor returned by `fcntl` above.
+            unsafe { close(rc) };
+            return true;
+        }
+        false
     }
 
     #[test]
@@ -775,21 +806,39 @@ mod tests {
     /// the `OwnedFd` -- really does go stale when the owner drops. Without this
     /// the guards above could pass vacuously.
     ///
-    /// After the drop the number is not merely invalid but *reusable*: the
-    /// `open` below reclaims the very same integer the reader would still be
-    /// polling, which is precisely how a dead key-repeat timer turned into a
-    /// permanently-readable regular file and pegged a core.
+    /// The failure was worse than "the fd is invalid". A closed number is free
+    /// for the next `open`/`memfd_create` to claim, so the reader's integer
+    /// silently starts naming an *unrelated live file*. A regular file is
+    /// always `POLLIN`-ready, so the reader's poll returned instantly forever
+    /// and pegged a core. This reproduces that end state -- stale, reclaimed,
+    /// and now spuriously readable -- rather than merely asserting the number
+    /// came back, because the readiness is what actually burned the CPU.
+    ///
+    /// The reclamation is driven explicitly through `PRIVATE_SLOT` so the test
+    /// does not race sibling threads for a naturally-allocated fd number.
     #[test]
     fn a_borrowed_raw_timer_fd_goes_stale_and_its_number_gets_recycled() {
+        assert!(
+            !fd_is_live(PRIVATE_SLOT),
+            "test slot fd {PRIVATE_SLOT} was already in use"
+        );
+
         let timer = RepeatTimer::new().expect("timerfd_create");
-        // What the reader used to store: just the integer.
-        let stale = timer.fd().as_raw_fd();
+        // Park a copy of the timerfd on our private number: this stands in for
+        // the bare integer the reader thread used to hold.
+        // SAFETY: `timer` owns a live fd; `PRIVATE_SLOT` was just shown closed.
+        let rc = unsafe { dup3(timer.fd().as_raw_fd(), PRIVATE_SLOT, O_CLOEXEC) };
+        assert_eq!(rc, PRIVATE_SLOT, "dup3 onto the private slot failed");
         drop(timer);
+
+        // Close it the way the owner's drop used to close the reader's fd.
+        // SAFETY: we own `PRIVATE_SLOT` -- the `dup3` above installed it.
+        assert_eq!(unsafe { close(PRIVATE_SLOT) }, 0, "close failed");
 
         // The descriptor is gone: dup'ing it fails EBADF.
         // SAFETY: probing an integer we expect to be closed; `F_DUPFD_CLOEXEC`
-        // (0x406) returns -1/EBADF rather than touching any live file.
-        let rc = unsafe { fcntl(stale, 0x0406, 0) };
+        // returns -1/EBADF rather than touching any live file.
+        let rc = unsafe { fcntl(PRIVATE_SLOT, 0x0406, 0) };
         assert_eq!(rc, -1, "expected the dropped timerfd to be closed");
         assert_eq!(
             io::Error::last_os_error().raw_os_error(),
@@ -797,14 +846,38 @@ mod tests {
             "expected EBADF from the stale fd"
         );
 
-        // And the number is free for the next open to claim -- Linux hands out
-        // the lowest available fd, so this reclaims exactly `stale`.
-        let recycled = std::fs::File::open("/dev/null").expect("open");
-        assert_eq!(
-            recycled.as_raw_fd(),
-            stale,
-            "the freed fd number was handed to an unrelated file"
+        // Now let an unrelated file claim that very number, exactly as the next
+        // `open` in the process would have.
+        let unrelated = std::fs::File::open("/dev/null").expect("open");
+        // SAFETY: `unrelated` is live and `PRIVATE_SLOT` is closed.
+        let rc = unsafe { dup3(unrelated.as_raw_fd(), PRIVATE_SLOT, O_CLOEXEC) };
+        assert_eq!(rc, PRIVATE_SLOT, "dup3 of the unrelated file failed");
+
+        // The reader's stale integer now names a live file it never opened...
+        assert!(
+            fd_is_live(PRIVATE_SLOT),
+            "the freed fd number was not handed to the unrelated file"
         );
+
+        // ...and that file is unconditionally readable, which is precisely the
+        // spin: poll returns ready immediately, forever, on a timer that was
+        // never armed.
+        let mut pfd = [PollFd {
+            fd: PRIVATE_SLOT,
+            events: POLLIN,
+            revents: 0,
+        }];
+        // SAFETY: one initialised pollfd, count matches, zero timeout.
+        let n = unsafe { poll(pfd.as_mut_ptr(), 1, 0) };
+        assert_eq!(n, 1, "a recycled regular file should poll ready at once");
+        assert_eq!(
+            pfd[0].revents & POLLIN,
+            POLLIN,
+            "the recycled fd reports readable -- this is the CPU spin"
+        );
+
+        // SAFETY: we installed `PRIVATE_SLOT`; leave the table as we found it.
+        unsafe { close(PRIVATE_SLOT) };
     }
 
     /// The dup must share one *open file description* with the original, not

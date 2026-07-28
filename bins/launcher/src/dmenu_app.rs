@@ -247,13 +247,9 @@ impl DmenuPainter {
             let row_top = list_top + i32::try_from(i).unwrap_or(0) * (line_h + row_gap);
             let row_y = row_top + (line_h - choice_text.line_height()) / 2;
             if i == selected {
-                // `fill_rect_alpha`, not `fill_rect` -- see `main.rs`'s
-                // Painter for why (translucent premultiplied backbuffer).
-                canvas.fill_rect_alpha(
-                    Rect::new(0, row_top, canvas.width(), line_h),
-                    highlight_bg,
-                    bg_alpha,
-                );
+                // Solid highlight; the canvas knows the window is translucent
+                // -- see `main.rs`'s Painter.
+                canvas.fill_rect(Rect::new(0, row_top, canvas.width(), line_h), highlight_bg);
             }
             let row_bg = if i == selected { highlight_bg } else { bg };
             let color = if i == selected { fg } else { helper };

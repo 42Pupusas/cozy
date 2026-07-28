@@ -232,6 +232,15 @@ impl TextRenderer {
     /// row (face font) at `(x, y)`, over an already-painted `bg` (needed for
     /// anti-aliased edge blending on the face path -- the bitmap path
     /// ignores it, being 1-bit). Returns the x just past the last glyph.
+    ///
+    /// The background alpha is taken from the canvas's own surface format, so
+    /// text drawn on a translucent window blends its anti-aliased edges
+    /// correctly without every call site having to thread the window opacity
+    /// through. This used to hardcode `255`, which on a translucent surface
+    /// packed each edge pixel with a zero alpha byte -- a transparent pinhole
+    /// around every glyph. Callers that need an alpha *other* than their
+    /// surface's (a translucent widget on an opaque window, say) still say so
+    /// explicitly via [`Self::draw_text_alpha`].
     pub fn draw_text(
         &mut self,
         canvas: &mut Canvas,
@@ -241,7 +250,8 @@ impl TextRenderer {
         fg: Color,
         bg: Color,
     ) -> i32 {
-        self.draw_text_alpha(canvas, text, x, y, fg, bg, 255)
+        let bg_alpha = canvas.format().bg_alpha();
+        self.draw_text_alpha(canvas, text, x, y, fg, bg, bg_alpha)
     }
 
     /// Same as [`Self::draw_text`], but `bg_alpha` (`0-255`) is the
@@ -295,7 +305,9 @@ impl TextRenderer {
         fg: Color,
         bg: Color,
     ) -> i32 {
-        self.draw_text_right_alpha(canvas, text, right_x, y, fg, bg, 255)
+        // Surface-derived alpha, as in `draw_text`.
+        let bg_alpha = canvas.format().bg_alpha();
+        self.draw_text_right_alpha(canvas, text, right_x, y, fg, bg, bg_alpha)
     }
 
     /// [`Self::draw_text_right`] with an explicit background alpha -- see

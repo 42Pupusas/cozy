@@ -619,14 +619,6 @@ pub struct FilesConfig {
     /// Mirrored rather than given its own default because a desktop where one
     /// window is opaque among translucent siblings reads as a rendering fault,
     /// not as a design choice -- the same reasoning as [`BarConfig::opacity`].
-    ///
-    /// NOTE: parsed and resolved here, but the browser cannot honour it yet --
-    /// `platform::toplevel::Toplevel` hardcodes the opaque `Xrgb8888` buffer
-    /// format, and its painter's fills are all `fill_rect` (which packs a zero
-    /// top byte, i.e. transparent, on an `Argb8888` surface). Kept in the
-    /// config layer, where it is tested and costs nothing, so the window work
-    /// is a self-contained follow-up rather than a config change plus a
-    /// window change landing together.
     pub opacity: Option<f64>,
 }
 
@@ -1679,9 +1671,6 @@ impl Config {
     /// translucent as the terminal, bar and monitor by default. Only the
     /// background is affected; text and chrome strokes stay fully opaque, or
     /// a translucent window would render unreadable filenames.
-    ///
-    /// Not yet consumed by `bins/files` -- see [`FilesConfig::opacity`] for
-    /// what the window layer still needs before this can take effect.
     #[must_use]
     pub fn files_opacity(&self) -> f64 {
         self.files.opacity.unwrap_or(self.window.opacity)

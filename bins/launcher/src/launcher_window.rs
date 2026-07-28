@@ -629,7 +629,12 @@ impl LauncherWindow {
             for p in &mut self.backbuffer {
                 *p = bg_packed;
             }
-            let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height);
+            // Hand the painter a canvas that knows this window is
+            // translucent, so its `fill_rect`/`fill_round_rect` calls pack
+            // for the premultiplied Argb8888 backbuffer instead of writing a
+            // zero alpha byte (an invisible fill).
+            let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height)
+                .with_format(platform::SurfaceFormat::with_bg_alpha(self.bg_alpha));
             paint(&mut canvas);
         }
 

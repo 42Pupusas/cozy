@@ -280,7 +280,8 @@ impl FilesWindow {
     fn paint_toolbar(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
         let bar = self.frame().toolbar();
-        canvas.fill_rect(bar, theme.toolbar_bg);
+        // Background band -- see `paint`'s note on glass versus paint.
+        canvas.fill_rect_glass(bar, theme.toolbar_bg);
         // A hairline under the toolbar separates it from the list without
         // spending a whole row of vertical space on a gap.
         canvas.fill_rect(
@@ -553,7 +554,7 @@ impl FilesWindow {
         let theme = self.theme;
         let band = self.frame().column_headers();
         let (y, height, left, width) = (band.y, band.h, band.x, band.w);
-        canvas.fill_rect(band, theme.background);
+        canvas.fill_rect_glass(band, theme.background);
 
         let columns = self.list_columns();
         for cell in columns.cells() {
@@ -633,7 +634,7 @@ impl FilesWindow {
         // With icons not yet drawn, labels are simply omitted rather than
         // painted clipped -- a half-cut word is worse than none.
         let compact = theme.is_compact(self.size.width);
-        canvas.fill_rect(column, theme.sidebar_bg);
+        canvas.fill_rect_glass(column, theme.sidebar_bg);
         // The divider carries the eye down the seam between the two panes,
         // the full height of the window.
         canvas.fill_rect(
@@ -760,7 +761,7 @@ impl FilesWindow {
         let Some(storage) = self.storage.clone() else {
             return;
         };
-        canvas.fill_rect(area, theme.sidebar_bg);
+        canvas.fill_rect_glass(area, theme.sidebar_bg);
         // A rule above the footer separates it from the places it sits under,
         // mirroring the guide's `border-top`.
         canvas.fill_rect(
@@ -999,7 +1000,7 @@ impl FilesWindow {
         } else {
             theme.status_bg
         };
-        canvas.fill_rect(band, background);
+        canvas.fill_rect_glass(band, background);
         // A hairline above the strip, mirroring the one under the toolbar, so
         // the right column reads as distinct bands.
         canvas.fill_rect(
@@ -1112,7 +1113,12 @@ impl Painter for FilesWindow {
         // clear: the sidebar and the list may take different backgrounds, and
         // painting the column that owns the list makes the seam between them
         // independent of whatever the window's clear colour happens to be.
-        canvas.fill_rect(self.frame().main(), self.theme.background);
+        //
+        // `fill_rect_glass`, not `fill_rect`: this is background, so on a
+        // translucent window it must stay as see-through as the clear it
+        // covers. Painting it solid would make the whole list area opaque and
+        // leave the window transparent only in the slivers no band reaches.
+        canvas.fill_rect_glass(self.frame().main(), self.theme.background);
         self.paint_toolbar(canvas);
         self.paint_sidebar(canvas);
         self.paint_column_headers(canvas);
@@ -1207,7 +1213,129 @@ impl Painter for FilesWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::FilesWindow;
+    use super::{FilesWindow, Painter};
+    use platform::SurfaceFormat;
+    use platform::draw::Canvas;
+    use platform::toplevel::PhysicalSize;
+
+    /// Paint a whole frame into a translucent canvas and hand back the pixels.
+    ///
+    /// Shared by the transparency tests below so each states only the property
+    /// it is checking.
+    fn painted_translucent(bg_alpha: u8) -> (Vec<u32>, PhysicalSize) {
+        let size = PhysicalSize {
+            width: 900,
+            height: 600,
+        };
+        let cfg = config::Config::default();
+        let theme = crate::theme::Theme::from_config(&cfg);
+        let type_scale = crate::typography::Typography::load(&cfg, 1.0);
+        let favorites = crate::favorites::Favorites::default();
+        let user_dirs = crate::user_dirs::UserDirs::load();
+        let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
+        // The temp dir always exists and is readable, so `open` succeeds
+        // without depending on anything in the developer's home.
+        let browser = crate::browser::Browser::open(&std::env::temp_dir(), 700, 400, 28)
+            .expect("the temp dir must be listable");
+        let mut painter = FilesWindow::new(browser, theme, type_scale, sidebar, favorites, size);
+        let px = (size.width * size.height).cast_unsigned() as usize;
+        let mut buf = vec![0u32; px];
+        {
+            let mut canvas = Canvas::new(&mut buf, size.width, size.height)
+                .with_format(SurfaceFormat::with_bg_alpha(bg_alpha));
+            painter.paint(&mut canvas, size);
+        }
+        (buf, size)
+    }
+
+    /// The regression this exists to prevent: a window that negotiated an
+    /// `Argb8888` buffer but whose painter fills opaque everywhere renders as
+    /// a solid rectangle, and the configured opacity silently does nothing.
+    ///
+    /// Asserted as a *proportion* of the surface rather than "some pixel is
+    /// translucent", because a single stray see-through pixel would satisfy
+    /// the weaker claim while the window still looked opaque.
+    #[test]
+    fn a_translucent_browser_actually_lets_the_desktop_through() {
+        let (buf, _) = painted_translucent(204);
+        let translucent = buf.iter().filter(|&&px| (px >> 24) != 255).count();
+        // Integer percentage rather than a float ratio: exact, and avoids a
+        // lossy usize->f64 cast for what is only ever a reported figure.
+        let percent = translucent * 100 / buf.len();
+        assert!(
+            percent > 50,
+            "most of the window should be see-through glass, got {percent}%"
+        );
+    }
+
+    /// Text and chrome must stay solid over the glass, or the wallpaper shows
+    /// through the filenames and the listing becomes unreadable. Some fully
+    /// opaque pixels must therefore survive the frame.
+    #[test]
+    fn the_browsers_text_and_chrome_stay_solid_over_the_glass() {
+        let (buf, _) = painted_translucent(204);
+        let solid = buf.iter().filter(|&&px| (px >> 24) == 255).count();
+        assert!(
+            solid > 0,
+            "the glyphs and separators must be painted as solid ink"
+        );
+    }
+
+    /// Every pixel of a translucent frame must be a valid premultiplied ARGB
+    /// word (no channel above alpha). A violation is what the compositor
+    /// renders as bright fringing or inverted colour.
+    #[test]
+    fn every_painted_pixel_is_valid_premultiplied_argb() {
+        let (buf, size) = painted_translucent(204);
+        let stride = size.width.cast_unsigned() as usize;
+        for (i, &px) in buf.iter().enumerate() {
+            let a = (px >> 24) & 0xff;
+            for shift in [16, 8, 0] {
+                assert!(
+                    (px >> shift) & 0xff <= a,
+                    "pixel ({}, {}) is not valid premultiplied: {px:#010x}",
+                    i % stride,
+                    i / stride,
+                );
+            }
+        }
+    }
+
+    /// An opaque browser must be unaffected by all of this: every pixel of the
+    /// frame ends up covered, so none may keep the zero-alpha value the buffer
+    /// started at.
+    #[test]
+    fn an_opaque_browser_paints_every_pixel_of_its_frame() {
+        let size = PhysicalSize {
+            width: 900,
+            height: 600,
+        };
+        let cfg = config::Config::default();
+        let theme = crate::theme::Theme::from_config(&cfg);
+        let type_scale = crate::typography::Typography::load(&cfg, 1.0);
+        let favorites = crate::favorites::Favorites::default();
+        let user_dirs = crate::user_dirs::UserDirs::load();
+        let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
+        let browser = crate::browser::Browser::open(&std::env::temp_dir(), 700, 400, 28)
+            .expect("the temp dir must be listable");
+        let mut painter = FilesWindow::new(browser, theme, type_scale, sidebar, favorites, size);
+        let px = (size.width * size.height).cast_unsigned() as usize;
+        // A sentinel the painter can never legitimately produce on an opaque
+        // surface, where every packed word has a zero top byte.
+        let mut buf = vec![0xdead_beef_u32; px];
+        {
+            let mut canvas = Canvas::new(&mut buf, size.width, size.height);
+            painter.paint(&mut canvas, size);
+        }
+        assert!(
+            buf.iter().all(|&p| p != 0xdead_beef),
+            "an opaque frame must cover every pixel"
+        );
+        assert!(
+            buf.iter().all(|&p| (p >> 24) == 0),
+            "an opaque surface packs a zero top byte"
+        );
+    }
 
     /// A width narrower than a single glyph yields no columns rather than a
     /// huge one: a window dragged narrower than its own padding produces a

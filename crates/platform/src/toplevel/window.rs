@@ -19,6 +19,7 @@ use crate::protocol::{
     ToplevelEvent, WmBaseEvent, XdgSurfaceEvent,
 };
 use crate::surface::{Frame, RegistryDiscovery, Routed, SurfaceBootstrap, SurfacePresenter};
+use crate::surface_format::SurfaceFormat;
 use crate::toplevel::geometry::{Geometry, LogicalSize, PhysicalSize};
 use crate::toplevel::globals::{ToplevelGlobals, ToplevelGlobalsBuilder};
 use crate::toplevel::keyboard::{KeyPress, KeyboardState, RepeatInfo};
@@ -100,6 +101,14 @@ pub struct Toplevel {
     /// never races the compositor reading a buffer it still holds.
     backbuffer: Vec<u32>,
 
+    /// How this surface's pixels are packed, decided once at construction
+    /// from the requested opacity and fixed for the window's lifetime (the
+    /// `wl_shm` buffer format is negotiated at pool creation).
+    ///
+    /// Handed to every [`Canvas`] this window builds so the painter's drawing
+    /// calls pack correctly without knowing whether the window is see-through.
+    format: SurfaceFormat,
+
     /// Events queued for the owner to drain.
     queue: std::collections::VecDeque<WindowEvent>,
 
@@ -129,16 +138,46 @@ pub struct Toplevel {
 }
 
 impl Toplevel {
-    /// Open a window of `size` physical pixels titled `title`.
+    /// Open an opaque window of `size` physical pixels titled `title`.
     ///
     /// `app_id` should be stable for the process -- compositors match window
     /// rules on it, unlike the title, which apps rewrite at runtime.
+    ///
+    /// For a translucent window use [`Self::new_with_format`]; this stays as
+    /// the name for the common case so opaque callers need not mention a
+    /// pixel format they do not care about.
     pub fn new(
         title: &str,
         app_id: &str,
         size: LogicalSize,
         wake: waker::Waker,
         background: Color,
+    ) -> Result<Self> {
+        Self::new_with_format(
+            title,
+            app_id,
+            size,
+            wake,
+            background,
+            SurfaceFormat::opaque(),
+        )
+    }
+
+    /// Open a window whose surface is packed according to `format`.
+    ///
+    /// A translucent `format` selects the `Argb8888` buffer the compositor
+    /// blends with what is behind the window; an opaque one keeps the cheaper
+    /// `Xrgb8888` it can display directly. The format is fixed for the
+    /// window's lifetime -- the buffer format is negotiated once here, at pool
+    /// creation, and changing it later would mean tearing down and rebuilding
+    /// every buffer.
+    pub fn new_with_format(
+        title: &str,
+        app_id: &str,
+        size: LogicalSize,
+        wake: waker::Waker,
+        background: Color,
+        format: SurfaceFormat,
     ) -> Result<Self> {
         let (mut sender, _repeat_timer, mut events, reader_handle) =
             SurfaceBootstrap::connect(EVENT_RING_CAP, "toplevel-wayland-reader", &wake)?;
@@ -180,13 +219,18 @@ impl Toplevel {
         let physical = geometry.physical();
 
         // Opaque windows use the cheaper XRGB format the compositor never
-        // has to blend.
+        // has to blend; a translucent one needs the per-pixel alpha channel.
+        let buf_format = if format.needs_alpha() {
+            Format::Argb8888
+        } else {
+            Format::Xrgb8888
+        };
         let (frames, shm_mem, pool) = Frame::create_pair(
             &mut sender,
             shm,
             physical.width,
             physical.height,
-            Format::Xrgb8888,
+            buf_format,
         )?;
 
         let shell = ShellSurface::create(
@@ -214,7 +258,7 @@ impl Toplevel {
             frames,
             shm_mem,
             pool,
-            Format::Xrgb8888,
+            buf_format,
             physical.height_usize().max(1),
         );
 
@@ -232,7 +276,11 @@ impl Toplevel {
             geometry,
             lifecycle: Lifecycle::new(),
             present,
-            backbuffer: vec![background.to_xrgb8888(); px],
+            // Packed as glass: this is the window's background, so on a
+            // translucent surface it carries the window opacity rather than
+            // being solid paint.
+            backbuffer: vec![format.pack_glass(background); px],
+            format,
             queue: std::collections::VecDeque::new(),
             pointer_id: None,
             keyboard_id: None,
@@ -613,7 +661,7 @@ impl Toplevel {
         let px = size.pixel_count();
         self.backbuffer.clear();
         self.backbuffer
-            .resize(px, painter.background().to_xrgb8888());
+            .resize(px, self.format.pack_glass(painter.background()));
         self.present.mark_all_stale();
         self.present.mark_dirty();
         self.queue.push_back(WindowEvent::Resized(size));
@@ -633,7 +681,8 @@ impl Toplevel {
         let size = self.geometry.physical();
 
         {
-            let mut canvas = Canvas::new(&mut self.backbuffer, size.width, size.height);
+            let mut canvas =
+                Canvas::new(&mut self.backbuffer, size.width, size.height).with_format(self.format);
             painter.paint(&mut canvas, size);
         }
 

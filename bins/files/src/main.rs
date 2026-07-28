@@ -115,12 +115,18 @@ impl App {
             theme.row_height,
         )?;
 
-        let mut window = Toplevel::new(
+        // The browser is as translucent as the terminal, bar, launcher and
+        // monitor -- `[files].opacity` mirrors `[window].opacity`, so one
+        // desktop-wide setting moves every client together and the browser
+        // does not sit among them as the one opaque window.
+        let surface = platform::SurfaceFormat::from_opacity(cfg.files_opacity());
+        let mut window = Toplevel::new_with_format(
             &browser.path().display().to_string(),
             "dev.terminal.files",
             size,
             wake,
             theme.background,
+            surface,
         )?;
 
         let mut painter = FilesWindow::new(

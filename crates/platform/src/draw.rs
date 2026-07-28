@@ -5,18 +5,24 @@
 //! turns "fill a rectangle in coral" into the right index math — no protocol, no
 //! I/O, just pixels.
 //!
-//! Pixels are `XRGB8888`: `0x00RRGGBB`, one `u32` per pixel, the high byte
-//! ignored by the compositor. Coordinates are **signed** and every primitive is
+//! Pixels are one `u32` each, packed either as `XRGB8888` (`0x00RRGGBB`, the
+//! high byte ignored by the compositor) or as premultiplied `ARGB8888` when
+//! the surface is translucent. Which one is a property of the surface, carried
+//! by the [`SurfaceFormat`] a [`Canvas`] holds -- primitives ask it to pack
+//! rather than each deciding, so the same drawing code is correct on an opaque
+//! and a see-through window. Coordinates are **signed** and every primitive is
 //! **clipped** to the buffer bounds, so drawing partly (or wholly) off-screen
 //! paints only the visible part and never panics.
 
 use crate::font;
 use crate::round_rect::RoundRect;
+use crate::surface_format::SurfaceFormat;
 
 /// An RGBA color.
 ///
-/// Alpha is ignored by the XRGB8888 paths (`fill_rect`, `clear`), which pack
-/// `0x00RRGGBB`, and honoured by the ARGB ones ([`Canvas::fill_rect_argb`],
+/// Alpha is ignored by the surface-packed paths (`fill_rect`, `clear`), which
+/// defer to the canvas's [`SurfaceFormat`], and honoured by the ARGB ones
+/// ([`Canvas::fill_rect_argb`],
 /// [`Color::to_argb8888`]) used for surfaces with genuine per-pixel
 /// transparency.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -312,10 +318,21 @@ pub struct Canvas<'a> {
     pixels: &'a mut [u32],
     width: i32,
     height: i32,
+    /// How this surface's pixels are packed.
+    ///
+    /// Defaults to opaque, so every existing caller of [`Canvas::new`] keeps
+    /// byte-identical behaviour; a translucent window opts in with
+    /// [`Canvas::with_format`]. Held here rather than passed per call because
+    /// the format is a property of the surface for its whole lifetime -- see
+    /// [`crate::surface_format`] for why that ownership matters.
+    format: SurfaceFormat,
 }
 
 impl<'a> Canvas<'a> {
     /// Wrap a buffer. `pixels.len()` must be at least `width * height`.
+    ///
+    /// The canvas is opaque (`Xrgb8888`) unless told otherwise via
+    /// [`Self::with_format`].
     pub fn new(pixels: &'a mut [u32], width: i32, height: i32) -> Self {
         debug_assert!(width >= 0 && height >= 0);
         // Checked non-negative above, so these sign-preserving casts are exact.
@@ -326,7 +343,27 @@ impl<'a> Canvas<'a> {
             pixels,
             width,
             height,
+            format: SurfaceFormat::opaque(),
         }
+    }
+
+    /// Declare this canvas's pixel packing -- use it when the surface was
+    /// created with an `Argb8888` buffer because the window is translucent.
+    ///
+    /// Builder-style so the common opaque case needs no mention of format at
+    /// all, and so a painter can thread one value in at the top of its frame
+    /// instead of at each of its drawing calls.
+    #[must_use]
+    pub const fn with_format(mut self, format: SurfaceFormat) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// This canvas's pixel packing, for primitives that need to pack a colour
+    /// themselves (e.g. glyph blitting into a cached row buffer).
+    #[must_use]
+    pub const fn format(&self) -> SurfaceFormat {
+        self.format
     }
 
     #[must_use]
@@ -351,9 +388,14 @@ impl<'a> Canvas<'a> {
         Rect::new(0, 0, self.width, self.height)
     }
 
-    /// Paint every pixel with `color`.
+    /// Paint every pixel with `color` as the surface's *background*.
+    ///
+    /// This is the one primitive that packs "glass": clearing is how a
+    /// translucent window establishes the background the desktop shows
+    /// through, so the fill carries the window's opacity. Everything drawn on
+    /// top afterwards is solid paint (see [`Self::fill_rect`]).
     pub fn clear(&mut self, color: Color) {
-        let v = color.to_xrgb8888();
+        let v = self.format.pack_glass(color);
         for p in self.pixels.iter_mut() {
             *p = v;
         }
@@ -368,66 +410,64 @@ impl<'a> Canvas<'a> {
         // sign-preserving casts are exact.
         let idx = (y.cast_unsigned() as usize) * (self.width.cast_unsigned() as usize)
             + (x.cast_unsigned() as usize);
-        self.pixels[idx] = color.to_xrgb8888();
+        self.pixels[idx] = self.format.pack_paint(color);
     }
 
-    /// Alpha-blend opaque `color` over one canvas pixel.
+    /// Composite opaque `color` at `alpha/255` coverage over one canvas pixel.
     ///
-    /// Canvas surfaces are XRGB, so the result is written back as an opaque
-    /// color. This is intended for software anti-aliasing and subtle fills.
+    /// Used for software anti-aliasing (rounded corners) and subtle fills.
+    /// The compositing algebra depends on how the destination is packed, so
+    /// this delegates to the surface's [`SurfaceFormat`] rather than assuming
+    /// straight RGB -- on a translucent surface the destination is
+    /// premultiplied, and treating it as straight would darken every blended
+    /// pixel by the window's alpha.
     pub fn blend_pixel(&mut self, x: i32, y: i32, color: Color, alpha: u8) {
         if x < 0 || y < 0 || x >= self.width || y >= self.height {
             return;
         }
         let idx = (y.cast_unsigned() as usize) * (self.width.cast_unsigned() as usize)
             + (x.cast_unsigned() as usize);
-        let packed = self.pixels[idx];
-        let background = Color::rgb(
-            ((packed >> 16) & 0xff) as u8,
-            ((packed >> 8) & 0xff) as u8,
-            (packed & 0xff) as u8,
-        );
-        self.pixels[idx] = background.blend_opaque_to(color, alpha);
+        self.pixels[idx] = self.format.blend_over(self.pixels[idx], color, alpha);
     }
 
-    /// Fill `rect` (clipped to the canvas) with `color`, fully opaque.
+    /// Fill `rect` (clipped to the canvas) with solid `color`.
     ///
-    /// Packs `color` as plain `0x00RRGGBB` (top byte zero). That is correct
-    /// only when the destination buffer is genuinely `Xrgb8888` (the
-    /// compositor ignores the top byte) -- on a translucent window's
-    /// `Argb8888` backbuffer the top byte **is** the alpha channel the
-    /// compositor reads, so this call would paint an invisible (alpha-0)
-    /// rectangle. Use [`Self::fill_rect_alpha`] for anything drawn onto a
-    /// window that might be translucent (any `bg_alpha < 255`); this
-    /// opaque-only entry point stays for buffers that are always Xrgb8888
-    /// (e.g. an always-opaque widget) and for the tests below.
+    /// Packs through this canvas's [`SurfaceFormat`], so the same call is
+    /// correct on an opaque and a translucent surface: plain `0x00RRGGBB` on
+    /// `Xrgb8888`, premultiplied at full alpha on `Argb8888`. The paint is
+    /// solid either way -- a translucent window's chrome and text stay opaque
+    /// so the desktop behind shows only through the *background*.
+    ///
+    /// This used to pack a bare `to_xrgb8888()` unconditionally, which on an
+    /// `Argb8888` buffer wrote alpha 0 and painted an invisible rectangle;
+    /// callers were expected to know to reach for `fill_rect_alpha` instead.
+    /// That put a surface-wide invariant in the hands of every call site and
+    /// failed silently when one forgot, so the decision now lives with the
+    /// surface (see [`crate::surface_format`]).
     pub fn fill_rect(&mut self, rect: Rect, color: Color) {
-        self.fill_rect_packed(rect, color.to_xrgb8888());
+        self.fill_rect_packed(rect, self.format.pack_paint(color));
     }
 
-    /// Fill `rect` (clipped to the canvas) with `color`, packed the same way
-    /// glyph ink is in [`Self::blit_glyph`]: plain `0x00RRGGBB` when
-    /// `bg_alpha == 255` (the fast, common opaque-window path, byte-
-    /// identical to [`Self::fill_rect`]), or **premultiplied** ARGB8888 at
-    /// full alpha (solid ink -- `premultiplied_argb8888(255)` is the
-    /// identity) otherwise, so the fill is fully opaque paint over a
-    /// translucent "glass" window instead of itself carrying the window's
-    /// alpha. Mirrors `platform::Color`'s "translucent glass, solid text"
-    /// contract for any solid-color UI chrome (selection highlights, etc.),
-    /// not just glyphs.
-    pub fn fill_rect_alpha(&mut self, rect: Rect, color: Color, bg_alpha: u8) {
-        let packed = if bg_alpha == 255 {
-            color.to_xrgb8888()
-        } else {
-            color.premultiplied_argb8888(255)
-        };
-        self.fill_rect_packed(rect, packed);
+    /// Fill `rect` with `color` as *background*, carrying the window's
+    /// opacity -- the banded equivalent of [`Self::clear`].
+    ///
+    /// A window whose chrome is laid out in bands (a sidebar, a toolbar, a
+    /// status strip) cannot express its background with `clear` alone, because
+    /// each band takes a different tint. Those bands are still background, so
+    /// they must show the desktop through them exactly as the cleared area
+    /// does; painting them with [`Self::fill_rect`] would make the window
+    /// opaque everywhere except the few pixels no band covers.
+    ///
+    /// Use this for surfaces, and [`Self::fill_rect`] for the things drawn
+    /// *on* them (text backplates, selection, buttons) that must stay legible.
+    pub fn fill_rect_glass(&mut self, rect: Rect, color: Color) {
+        self.fill_rect_packed(rect, self.format.pack_glass(color));
     }
 
     /// Fill `rect` with `color` honouring **`color`'s own alpha channel**,
     /// packed premultiplied as `wl_shm` requires.
     ///
-    /// The distinction from [`Self::fill_rect_alpha`] matters: that one paints
+    /// The distinction from [`Self::fill_rect`] matters: that one paints
     /// solid ink *over* a translucent window (alpha is a property of the
     /// window, and the fill is always opaque). This one treats alpha as a
     /// property of the *paint*, which is what a surface with genuine
@@ -440,7 +480,7 @@ impl<'a> Canvas<'a> {
         self.fill_rect_packed(rect, color.premultiplied_argb8888(color.a));
     }
 
-    /// Shared clip + row-fill loop for [`Self::fill_rect`]/[`Self::fill_rect_alpha`].
+    /// Shared clip + row-fill loop for the rect primitives.
     fn fill_rect_packed(&mut self, rect: Rect, v: u32) {
         let Some((x0, y0, x1, y1)) = self.clip(rect) else {
             return;
@@ -510,7 +550,7 @@ impl<'a> Canvas<'a> {
             self.fill_rect(rect, color);
             return;
         }
-        let packed = color.to_xrgb8888();
+        let packed = self.format.pack_paint(color);
         for y in rect.y..rect.bottom() {
             let Some(span) = shape.span_at(y) else {
                 continue;
@@ -545,7 +585,7 @@ impl<'a> Canvas<'a> {
             return;
         }
         let inner = RoundRect::new(rect.inset(1), (shape.radius() - 1).max(0));
-        let packed = color.to_xrgb8888();
+        let packed = self.format.pack_paint(color);
         for y in rect.y..rect.bottom() {
             let Some(span) = shape.span_at(y) else {
                 continue;
@@ -640,7 +680,7 @@ impl<'a> Canvas<'a> {
         if left > right {
             return;
         }
-        let packed = color.to_xrgb8888();
+        let packed = self.format.pack_paint(color);
         // `y` is checked in-bounds (so non-negative) above, and
         // `self.width` is always non-negative (checked in Canvas::new), so
         // these sign-preserving casts are exact.
@@ -663,7 +703,7 @@ impl<'a> Canvas<'a> {
         if top > bottom {
             return;
         }
-        let packed = color.to_xrgb8888();
+        let packed = self.format.pack_paint(color);
         // `top`/`bottom` are clamped non-negative above, `self.width` is
         // always non-negative (checked in Canvas::new), and `col` is
         // checked in-bounds above, so these sign-preserving casts are exact.
@@ -861,29 +901,69 @@ mod tests {
     }
 
     #[test]
-    fn fill_rect_alpha_opaque_matches_fill_rect() {
-        // bg_alpha == 255 must be byte-identical to the plain fill_rect
-        // path -- both should pack the same zero-top-byte XRGB8888 word.
+    fn an_explicitly_opaque_format_matches_the_default_canvas() {
+        // Declaring the opaque format must be byte-identical to not declaring
+        // one at all -- both pack the same zero-top-byte XRGB8888 word.
         let mut buf_a = canvas_buf(4, 4);
         let mut buf_b = canvas_buf(4, 4);
         Canvas::new(&mut buf_a, 4, 4).fill_rect(Rect::new(1, 1, 2, 2), Color::WHITE);
-        Canvas::new(&mut buf_b, 4, 4).fill_rect_alpha(Rect::new(1, 1, 2, 2), Color::WHITE, 255);
+        Canvas::new(&mut buf_b, 4, 4)
+            .with_format(SurfaceFormat::opaque())
+            .fill_rect(Rect::new(1, 1, 2, 2), Color::WHITE);
         assert_eq!(buf_a, buf_b);
     }
 
     #[test]
-    fn fill_rect_alpha_translucent_packs_premultiplied_argb_not_zero_alpha() {
-        // On a translucent window (bg_alpha < 255) the destination buffer is
-        // Argb8888, where the top byte is the alpha the compositor reads.
-        // fill_rect's plain to_xrgb8888() packs a zero top byte there,
-        // which would make the fill invisible; fill_rect_alpha must pack a
-        // fully-opaque (0xff) top byte instead ("solid ink" over glass),
-        // regardless of the window's own bg_alpha.
+    fn a_translucent_canvas_fills_premultiplied_argb_not_zero_alpha() {
+        // On a translucent window the destination buffer is Argb8888, where
+        // the top byte is the alpha the compositor reads. A plain
+        // to_xrgb8888() packs a zero top byte there, which would make the
+        // fill invisible; the fill must carry a fully-opaque (0xff) top byte
+        // instead ("solid ink" over glass), regardless of the window's own
+        // bg_alpha.
         let mut buf = canvas_buf(2, 1);
-        Canvas::new(&mut buf, 2, 1).fill_rect_alpha(Rect::new(0, 0, 2, 1), Color::WHITE, 128);
+        Canvas::new(&mut buf, 2, 1)
+            .with_format(SurfaceFormat::with_bg_alpha(128))
+            .fill_rect(Rect::new(0, 0, 2, 1), Color::WHITE);
         // premultiplied_argb8888(255) on white is 0xff_ff_ff_ff.
         assert_eq!(buf[0], 0xff_ff_ff_ff);
         assert_eq!(buf[1], 0xff_ff_ff_ff);
+    }
+
+    #[test]
+    fn a_translucent_canvas_clears_to_the_window_opacity() {
+        // Clearing is the one primitive that carries the window's alpha: it
+        // is the glass the desktop shows through. If this ever packed solid
+        // paint the window would render fully opaque.
+        let mut buf = canvas_buf(2, 1);
+        Canvas::new(&mut buf, 2, 1)
+            .with_format(SurfaceFormat::with_bg_alpha(204))
+            .clear(Color::WHITE);
+        assert_eq!(buf[0] >> 24, 204);
+        assert_eq!(buf[0], buf[1]);
+    }
+
+    #[test]
+    fn a_translucent_rounded_fill_keeps_its_corners_opaque_inside() {
+        // The interior of a rounded fill must be solid paint even though the
+        // window is glass, and the anti-aliased corner pixels must not be
+        // left at the background's alpha (which is what blending straight-RGB
+        // over a premultiplied destination used to produce).
+        let mut buf = canvas_buf(16, 16);
+        let mut c = Canvas::new(&mut buf, 16, 16).with_format(SurfaceFormat::with_bg_alpha(128));
+        c.clear(Color::rgb(0x1f, 0x1f, 0x28));
+        c.fill_round_rect(Rect::new(0, 0, 16, 16), Color::WHITE, 4);
+        assert_eq!(buf[8 * 16 + 8] >> 24, 255, "the interior is solid paint");
+        // Every pixel must remain a valid premultiplied word.
+        for (i, &px) in buf.iter().enumerate() {
+            let a = (px >> 24) & 0xff;
+            for shift in [16, 8, 0] {
+                assert!(
+                    (px >> shift) & 0xff <= a,
+                    "pixel {i} is not valid premultiplied: {px:#010x}"
+                );
+            }
+        }
     }
 
     #[test]

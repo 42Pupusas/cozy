@@ -378,18 +378,11 @@ impl Painter {
             let title_y = row_top + (line_h - title_h) / 2;
             let hint_y = title_y + title_text.baseline_offset() - command_text.baseline_offset();
             if i == selected {
-                // `fill_rect_alpha`, not `fill_rect`: the launcher window is
-                // translucent by default (`launcher_opacity`), so its
-                // backbuffer is a premultiplied Argb8888 surface where the
-                // top byte is the alpha the compositor reads -- `fill_rect`
-                // always packs a zero top byte, which would make the
-                // selection highlight invisible instead of just slightly
-                // translucent (see fill_rect's own doc for why).
-                canvas.fill_rect_alpha(
-                    Rect::new(0, row_top, canvas.width(), line_h),
-                    highlight_bg,
-                    bg_alpha,
-                );
+                // Solid highlight: the canvas carries the window's
+                // translucency (see `LauncherWindow::do_present`), so a plain
+                // `fill_rect` packs correctly for the premultiplied Argb8888
+                // backbuffer without this call site having to know about it.
+                canvas.fill_rect(Rect::new(0, row_top, canvas.width(), line_h), highlight_bg);
             }
             let row_bg = if i == selected { highlight_bg } else { bg };
             let color = if i == selected { fg } else { helper };

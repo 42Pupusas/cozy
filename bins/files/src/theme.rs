@@ -70,14 +70,14 @@ pub struct Theme {
     /// Fill behind the sidebar row for the directory currently open.
     pub sidebar_active: Color,
 
-    /// Fill under a hovered control (the filter box, a toolbar button).
+    /// Fill under a hovered sidebar row or control (the filter box, a toolbar
+    /// button).
     ///
     /// List *rows* use [`Self::hover_dir`] / [`Self::hover_file`] instead,
     /// which carry the entry's type; this stays the neutral wash for chrome
-    /// that has no type to express. Not yet reached for -- the toolbar's
-    /// controls do not track the pointer -- but the colour belongs with the
-    /// palette rather than being invented at that call site later.
-    #[allow(dead_code)]
+    /// that has no type to express. Every place in the sidebar is a directory,
+    /// so there is no type distinction to make there -- a two-colour scheme
+    /// would encode a difference that does not exist.
     pub hover: Color,
     /// Fill under a hovered directory row, and behind a selected one.
     ///
@@ -235,6 +235,15 @@ impl Theme {
     /// row still reads as selected while the pointer is over it.
     const SELECTION_WASH: f32 = 0.30;
 
+    /// How far from the sidebar's background toward its *active* fill a hovered
+    /// place sits.
+    ///
+    /// A fraction of the distance between two real endpoints rather than an
+    /// absolute strength, so "hover is quieter than active" holds on every
+    /// palette. Past the midpoint so the highlight is comfortably visible,
+    /// short of 1.0 so it never reads as a second active row.
+    const SIDEBAR_HOVER_MIX: f32 = 0.6;
+
     /// Mix `ink` into `surface` by `t`, as a paint colour.
     ///
     /// Named rather than inlined because it is applied four times with two
@@ -291,10 +300,23 @@ impl Theme {
             sidebar_border: cfg.files_filter_bg().into(),
             sidebar_active: cfg.files_filter_bg().into(),
 
-            // Hover sits between the background and the selection: present
-            // enough to track the pointer, quiet enough not to compete with
-            // an actual selection.
-            hover: cfg.files_filter_bg().into(),
+            // Hover sits *between* the sidebar's own background and its active
+            // fill, and is derived by mixing those two rather than by washing
+            // a third colour over the background.
+            //
+            // That is the whole point: a wash of some ink at a fixed strength
+            // has no relationship to where `sidebar_active` happens to land, so
+            // it can overshoot it. On this palette it did -- the active fill is
+            // only thirty levels above a near-black sidebar, while a 0.22 wash
+            // of the text colour reached forty, making a merely-hovered row
+            // brighter than the row marking where you actually are. Mixing
+            // between the two endpoints makes the ordering hold by
+            // construction, on any palette, instead of being a property of one
+            // tuned constant.
+            hover: cfg
+                .files_header_bg()
+                .mix(cfg.files_filter_bg(), Self::SIDEBAR_HOVER_MIX)
+                .into(),
 
             // Row highlights are washes of the *type* colour over the list
             // background, so the highlight carries the same information the
@@ -668,6 +690,42 @@ background = "#181616"
     /// colours, so the property survives a re-themed palette: whatever the
     /// hues are, the directory fill must carry the directory ink's cast and
     /// the file fill must not, at a brightness the two share.
+    /// The sidebar's three row states must read in order: plain background,
+    /// then hover, then the active place. Asserted on *brightness* rather than
+    /// on inequality, because the failure this exists to catch is not "two
+    /// colours are the same" but "the middle one overshot the top one" -- which
+    /// is exactly what a fixed-strength wash did here, making a merely-hovered
+    /// row brighter than the row marking where you actually are.
+    #[test]
+    fn the_sidebar_row_states_get_brighter_in_order() {
+        // Across a spread of palettes, not just the default: the ordering is
+        // meant to hold by construction, and a single palette cannot show that.
+        // Reuse the real luma rather than restating the coefficients, so this
+        // cannot drift from the code it checks.
+        let luma = |c: Color| config::Color::from_rgb(c.r, c.g, c.b).luma();
+        for toml in [
+            "",
+            "[colors]\nbackground = \"#181616\"\nforeground = \"#c5c9c5\"\n",
+            "[colors]\nbackground = \"#ffffff\"\nforeground = \"#000000\"\n",
+            "[files]\nheader_bg = \"#000000\"\nfilter_bg = \"#0a0a0a\"\n",
+        ] {
+            let cfg = config::Config::from_bytes(toml.as_bytes()).expect("valid config");
+            let t = Theme::from_config(&cfg);
+            let bg = luma(t.sidebar_bg);
+            let hover = luma(t.hover);
+            let active = luma(t.sidebar_active);
+            assert!(
+                (bg - hover).abs() > 0.5,
+                "hover must be visible against the sidebar (bg {bg}, hover {hover}) for {toml:?}"
+            );
+            assert!(
+                (hover - bg).abs() < (active - bg).abs(),
+                "hover must sit nearer the background than the active fill \
+                 (bg {bg}, hover {hover}, active {active}) for {toml:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_two_row_kinds_differ_in_hue_not_lightness() {
         // A cool directory ink and a near-neutral text ink at clearly

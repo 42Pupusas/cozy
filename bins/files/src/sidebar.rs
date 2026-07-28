@@ -149,18 +149,26 @@ impl Sidebar {
         found
     }
 
-    /// The row at a vertical offset, given a uniform row height.
+    /// The index of the row at a vertical offset, given a uniform row height.
     ///
     /// Returns `None` above the pane, past the last row, or on a heading --
     /// clicking a section title must do nothing rather than jump somewhere
     /// arbitrary.
+    ///
+    /// Yields the *index* rather than the row because the painter walks rows
+    /// by position and asks "is this the hovered one", so it compares indices;
+    /// a caller wanting the row itself indexes [`Self::rows`]. Both the click
+    /// and the hover path go through this one function deliberately -- two
+    /// copies of the arithmetic would be free to drift by a row, lighting one
+    /// place while clicking another.
     #[must_use]
-    pub fn row_at(&self, y: i32, row_height: i32) -> Option<&SidebarRow> {
+    pub fn row_index_at(&self, y: i32, row_height: i32) -> Option<usize> {
         if y < 0 || row_height <= 0 {
             return None;
         }
         let index = usize::try_from(y / row_height).ok()?;
-        self.rows.get(index).filter(|r| r.selectable())
+        self.rows.get(index).filter(|r| r.selectable())?;
+        Some(index)
     }
 }
 
@@ -260,7 +268,7 @@ mod tests {
         let bar = Sidebar::new(&dirs, &fav);
         assert!(!bar.rows()[0].selectable());
         assert_eq!(
-            bar.row_at(0, 20),
+            bar.row_index_at(0, 20),
             None,
             "clicking the heading resolves to nothing"
         );
@@ -272,8 +280,8 @@ mod tests {
         let (dirs, fav) = fixture(&tmp);
         let bar = Sidebar::new(&dirs, &fav);
         // Row 1 is Home (row 0 being the "Places" heading).
-        let row = bar.row_at(25, 20).expect("a place at row 1");
-        assert_eq!(row.path(), Some(tmp.path()));
+        let index = bar.row_index_at(25, 20).expect("a place at row 1");
+        assert_eq!(bar.rows()[index].path(), Some(tmp.path()));
     }
 
     #[test]
@@ -281,7 +289,7 @@ mod tests {
         let tmp = TempDir::new("sidebar-past");
         let (dirs, fav) = fixture(&tmp);
         let bar = Sidebar::new(&dirs, &fav);
-        assert_eq!(bar.row_at(10_000, 20), None);
+        assert_eq!(bar.row_index_at(10_000, 20), None);
     }
 
     /// Degenerate geometry must not panic or divide by zero.
@@ -290,8 +298,8 @@ mod tests {
         let tmp = TempDir::new("sidebar-zero");
         let (dirs, fav) = fixture(&tmp);
         let bar = Sidebar::new(&dirs, &fav);
-        assert_eq!(bar.row_at(5, 0), None);
-        assert_eq!(bar.row_at(-5, 20), None);
+        assert_eq!(bar.row_index_at(5, 0), None);
+        assert_eq!(bar.row_index_at(-5, 20), None);
     }
 
     #[test]

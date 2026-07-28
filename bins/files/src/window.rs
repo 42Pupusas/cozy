@@ -17,7 +17,7 @@ use crate::browser::{Browser, Outcome};
 use crate::columns::{Column, Columns};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
-use crate::hover::Hover;
+use crate::hover::{Hover, Pane};
 use crate::kind_label::KindLabel;
 use crate::moment::Moment;
 use crate::row_format::RowFormat;
@@ -301,6 +301,18 @@ impl FilesWindow {
         let frame = self.frame();
         let body = frame.sidebar_body();
         frame.has_sidebar() && at.x < body.w && at.y >= body.y && at.y < body.y + body.h
+    }
+
+    /// Which sidebar row a pointer position falls on, if any.
+    ///
+    /// Shared by the press handler and the hover tracker deliberately: they
+    /// must agree, and two copies of this arithmetic would be free to drift by
+    /// a row -- lighting one place while clicking another, which reads as a
+    /// rendering bug rather than a logic one. It also has to match where
+    /// `paint_sidebar` starts drawing, hence the same top inset.
+    fn sidebar_row_at(&self, at: Position) -> Option<usize> {
+        let y = at.y - self.frame().sidebar_body().y - self.theme.spacing.sidebar_pad_y();
+        self.sidebar.row_index_at(y, self.theme.sidebar_row())
     }
 
     /// Whether this click, at `now`, continues a double-click gesture.
@@ -751,27 +763,46 @@ impl FilesWindow {
                 }
                 SidebarRow::Place { label, .. } => {
                     let is_active = active == Some(i);
+                    let hovered = self.hover.is(Pane::Sidebar, i);
                     let pad = theme.spacing.sidebar_pad();
-                    let bg = if is_active {
+                    // Active outranks hover: the row marking where you *are*
+                    // must not lose its treatment just because the pointer
+                    // happens to be resting on it. Hover is a preview of a
+                    // place you could go, so it says nothing on the place you
+                    // already went.
+                    let fill = match (is_active, hovered) {
+                        (true, _) => Some(theme.sidebar_active),
+                        (false, true) => Some(theme.hover),
+                        (false, false) => None,
+                    };
+                    let bg = fill.map_or(theme.sidebar_bg, |fill| {
                         // The highlight is inset from both column edges and
                         // rounded, so it reads as a pill behind the row rather
-                        // than as a stripe bleeding into the divider.
+                        // than as a stripe bleeding into the divider. Hover
+                        // shares the geometry exactly, so the fill appears to
+                        // change colour under the pointer rather than to also
+                        // change shape.
                         let pill = Rect::new(pad, y, (width - pad * 2).max(0), row_h);
-                        canvas.fill_round_rect(pill, theme.sidebar_active, theme.spacing.radius());
-                        // The guide's 2px accent rule on the leading edge,
-                        // which is what makes the active place readable at a
-                        // glance even when the fill is subtle. Kept inside the
-                        // pill's straight middle section so it does not poke
-                        // out of the rounded corners.
-                        let r = theme.spacing.radius();
-                        canvas.fill_rect(
-                            Rect::new(pad, y + r, theme.spacing.rule(), (row_h - r * 2).max(1)),
-                            theme.accent,
-                        );
-                        theme.sidebar_active
-                    } else {
-                        theme.sidebar_bg
-                    };
+                        canvas.fill_round_rect(pill, fill, theme.spacing.radius());
+                        if is_active {
+                            // The guide's 2px accent rule on the leading edge,
+                            // which is what makes the active place readable at
+                            // a glance even when the fill is subtle. Kept
+                            // inside the pill's straight middle section so it
+                            // does not poke out of the rounded corners.
+                            //
+                            // Deliberately not drawn for hover: the rule is the
+                            // marker for "you are here", and lending it to a
+                            // transient pointer position would make the pane
+                            // appear to have two active places.
+                            let r = theme.spacing.radius();
+                            canvas.fill_rect(
+                                Rect::new(pad, y + r, theme.spacing.rule(), (row_h - r * 2).max(1)),
+                                theme.accent,
+                            );
+                        }
+                        fill
+                    });
                     if compact {
                         continue;
                     }
@@ -950,7 +981,7 @@ impl FilesWindow {
                     color: RowFormat::color(entry, &theme),
                     selected: self.browser.pane().is_selected(row),
                     is_cursor: self.browser.pane().cursor() == Some(row),
-                    hovered: self.hover.is(row),
+                    hovered: self.hover.is(Pane::List, row),
                     // The highlight colour follows what the row *is*, not what
                     // its name looks like, so a directory keeps its tint even
                     // when the name column is truncated to nothing.
@@ -1219,18 +1250,10 @@ impl Painter for FilesWindow {
                 // A click in the places pane navigates and goes no further:
                 // it must not also be routed to the list beside it.
                 if self.in_sidebar(at) {
-                    // Rows begin at the sidebar's own inset, matching where
-                    // `paint_sidebar` starts drawing them -- a mismatch here
-                    // would offset every click by one row.
-                    let y =
-                        at.y - self.frame().sidebar_body().y - self.theme.spacing.sidebar_pad_y();
-                    if y < 0 {
-                        return;
-                    }
                     if let Some(path) = self
-                        .sidebar
-                        .row_at(y, self.theme.sidebar_row())
-                        .and_then(|r| r.path())
+                        .sidebar_row_at(at)
+                        .and_then(|i| self.sidebar.rows().get(i))
+                        .and_then(SidebarRow::path)
                         .map(std::path::Path::to_path_buf)
                     {
                         let outcome = self.browser.go_to(&path);
@@ -1281,9 +1304,17 @@ impl Painter for FilesWindow {
                 // reports it anyway because that is the honest signal for the
                 // state it owns, and the day this window drives its own
                 // damage the call site should not have to grow the logic back.
-                let row = self
-                    .to_pane(at)
-                    .and_then(|(_, y)| self.browser.pane().viewport().row_at_y(y));
+                //
+                // The panes are checked in the same order the press handler
+                // checks them, and only one can win, so the highlight cannot
+                // appear in both at once.
+                let row = if self.in_sidebar(at) {
+                    self.sidebar_row_at(at).map(|i| (Pane::Sidebar, i))
+                } else {
+                    self.to_pane(at)
+                        .and_then(|(_, y)| self.browser.pane().viewport().row_at_y(y))
+                        .map(|i| (Pane::List, i))
+                };
                 let _ = self.hover.move_to(row);
             }
             PointerEventKind::Scroll { lines, .. } => {
@@ -1307,6 +1338,7 @@ impl Painter for FilesWindow {
 #[cfg(test)]
 mod tests {
     use super::{FilesWindow, Painter};
+    use crate::hover::Pane;
     use platform::SurfaceFormat;
     use platform::draw::Canvas;
     use platform::toplevel::PhysicalSize;
@@ -1486,7 +1518,10 @@ mod tests {
         let (mut painter, root, size) = painter_over_a_mixed_directory("hover-frame");
         let cold = paint_opaque(&mut painter, size);
 
-        assert!(painter.hover.move_to(Some(0)), "row 0 becomes hovered");
+        assert!(
+            painter.hover.move_to(Some((Pane::List, 0))),
+            "row 0 becomes hovered"
+        );
         let hot = paint_opaque(&mut painter, size);
         assert_ne!(cold, hot, "a hovered row must be visibly highlighted");
 
@@ -1495,6 +1530,110 @@ mod tests {
         assert!(painter.hover.clear(), "the hover is dropped");
         let cleared = paint_opaque(&mut painter, size);
         assert_eq!(cold, cleared, "clearing hover must restore the frame");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The sidebar's places must track the pointer too, not just the list.
+    ///
+    /// Whole-frame comparison for the same reason as the list version: the
+    /// pill's position falls out of the frame geometry, so a hardcoded
+    /// coordinate would break on every layout tweak.
+    #[test]
+    fn hovering_a_sidebar_place_changes_the_painted_frame() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-sidebar");
+        // Row 0 is the "Places" heading; row 1 is the first real place.
+        let place = painter
+            .sidebar
+            .rows()
+            .iter()
+            .position(crate::sidebar::SidebarRow::selectable)
+            .expect("the sidebar always offers at least Home");
+        let cold = paint_opaque(&mut painter, size);
+
+        assert!(painter.hover.move_to(Some((Pane::Sidebar, place))));
+        let hot = paint_opaque(&mut painter, size);
+        assert_ne!(cold, hot, "a hovered place must be visibly highlighted");
+
+        assert!(painter.hover.clear());
+        let cleared = paint_opaque(&mut painter, size);
+        assert_eq!(cold, cleared, "clearing hover must restore the frame");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A heading is not a destination, so it must not light up either --
+    /// otherwise the pane appears to offer somewhere to go that does nothing
+    /// when clicked.
+    #[test]
+    fn hovering_a_sidebar_heading_highlights_nothing() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-heading");
+        let heading = painter
+            .sidebar
+            .rows()
+            .iter()
+            .position(|r| !r.selectable())
+            .expect("the pane opens with a Places heading");
+        let cold = paint_opaque(&mut painter, size);
+
+        // The hover tracker refuses the row outright, so the frame cannot
+        // change: `row_index_at` filters unselectable rows for both paths.
+        let row_h = painter.theme.sidebar_row();
+        let top = painter.frame().sidebar_body().y + painter.theme.spacing.sidebar_pad_y();
+        let at = super::Position {
+            x: 20,
+            y: top + i32::try_from(heading).unwrap_or(0) * row_h + row_h / 2,
+        };
+        assert_eq!(
+            painter.sidebar_row_at(at),
+            None,
+            "a heading resolves to no row"
+        );
+        let hot = paint_opaque(&mut painter, size);
+        assert_eq!(cold, hot, "a heading must not paint a highlight");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The row marking where you *are* must keep its own treatment while the
+    /// pointer rests on it: hover is a preview of somewhere you could go, so it
+    /// has nothing to say about the place you already went.
+    #[test]
+    fn the_active_place_outranks_its_own_hover() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-active");
+        // Navigate to a place the sidebar actually lists, so one row is active.
+        let (index, path) = painter
+            .sidebar
+            .rows()
+            .iter()
+            .enumerate()
+            .find_map(|(i, r)| r.path().map(|p| (i, p.to_path_buf())))
+            .expect("a listed place");
+        let outcome = painter.browser.go_to(&path);
+        painter.apply(outcome);
+
+        let resting = paint_opaque(&mut painter, size);
+        assert!(painter.hover.move_to(Some((Pane::Sidebar, index))));
+        let hovered = paint_opaque(&mut painter, size);
+        assert_eq!(
+            resting, hovered,
+            "hovering the active place must not restyle it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The sidebar hover fill has to be visible against the sidebar's *own*
+    /// background, and distinct from the active fill -- otherwise hovering
+    /// looks like a second active place.
+    #[test]
+    fn the_sidebar_hover_is_visible_and_not_mistakable_for_active() {
+        let (painter, root, _) = painter_over_a_mixed_directory("hover-sidebar-theme");
+        let theme = &painter.theme;
+        assert_ne!(
+            theme.hover, theme.sidebar_bg,
+            "an invisible hover is not a hover"
+        );
+        assert_ne!(
+            theme.hover, theme.sidebar_active,
+            "hover must not look like the open directory"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1553,9 +1692,9 @@ mod tests {
             "row 1 must be the file"
         );
 
-        painter.hover.move_to(Some(0));
+        painter.hover.move_to(Some((Pane::List, 0)));
         let dir_hovered = paint_opaque(&mut painter, size);
-        painter.hover.move_to(Some(1));
+        painter.hover.move_to(Some((Pane::List, 1)));
         let file_hovered = paint_opaque(&mut painter, size);
         assert_ne!(
             dir_hovered, file_hovered,

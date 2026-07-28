@@ -1,0 +1,17 @@
+[package]
+name    = "widget"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Deliberately no dependencies yet. The geometry core (scroll offsets,
+# visible ranges, hit-testing) is pure integer arithmetic and must stay
+# headlessly testable -- a 100k-entry scroll bug should be reproducible in a
+# unit test in microseconds, not by launching a compositor and squinting.
+#
+# Painting is layered on top later via a thin `platform::draw::Canvas` seam,
+# so this crate stays reusable by anything that needs list logic: `bins/files`
+# first, and eventually a portal FileChooser dialog.

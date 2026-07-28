@@ -112,9 +112,16 @@ impl TrayWatcher {
     }
 
     fn run(snapshot_tx: &Sender<TraySnapshot>, wake: &waker::Waker) {
-        let Ok(mut conn) = DbusConn::session() else {
-            eprintln!("statusbar: no session D-Bus; system tray disabled");
-            return;
+        // Report *why* the bus was unreachable. This used to print a bare
+        // "no session D-Bus" line, which gave no hint that the usual cause
+        // is a missing DBUS_SESSION_BUS_ADDRESS in the compositor's
+        // inherited environment rather than an absent bus.
+        let mut conn = match DbusConn::session() {
+            Ok(conn) => conn,
+            Err(e) => {
+                eprintln!("statusbar: session D-Bus unavailable ({e}); system tray disabled");
+                return;
+            }
         };
         match conn.request_name(WATCHER_NAME) {
             Ok(true) => {}

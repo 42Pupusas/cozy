@@ -16,6 +16,8 @@
 //! * [`message`] — wire-frame (header + body) building and parsing.
 //! * [`sys`] — the unavoidable libc sliver (socket creation, `sockaddr_un`,
 //!   `geteuid`).
+//! * [`session_address`] — [`session_address::SessionAddress`], resolving
+//!   where the session bus socket actually lives.
 //! * [`conn`] — [`conn::DbusConn`], the actual connection: connect, auth, call.
 //! * [`network_manager`] / [`bluez`] / [`logind`] — thin, service-specific
 //!   convenience wrappers the statusbar calls directly.
@@ -25,8 +27,10 @@ pub mod conn;
 pub mod logind;
 pub mod message;
 pub mod network_manager;
+pub mod session_address;
 pub mod sys;
 pub mod value;
 
 pub use conn::{DbusConn, DbusError};
+pub use session_address::SessionAddress;
 pub use value::Value;

@@ -24,6 +24,7 @@ use ququmatz::types::MsgFlags;
 use ququmatz::{IoUring, Sqe};
 
 use crate::message::{BodyArg, MessageType, PRELUDE_LEN, Prelude, Reply};
+use crate::session_address::SessionAddress;
 use crate::sys;
 
 /// Ring depth — one call in flight at a time, so this only ever needs a
@@ -110,26 +111,19 @@ impl DbusConn {
         Self::connect_path(b"/var/run/dbus/system_bus_socket")
     }
 
-    /// Connect to the session bus, resolved from `DBUS_SESSION_BUS_ADDRESS`
-    /// (supports the common `unix:path=...` and `unix:abstract=...` forms;
-    /// anything else is rejected as [`DbusError::NoAddress`] rather than
-    /// guessed at).
+    /// Connect to the session bus at wherever [`SessionAddress`] resolves it
+    /// -- `DBUS_SESSION_BUS_ADDRESS` when the environment provides it, else
+    /// the well-known `$XDG_RUNTIME_DIR/bus` socket.
+    ///
+    /// The fallback matters for processes spawned by a Wayland compositor:
+    /// they inherit the compositor's environment, which frequently lacks the
+    /// variable entirely even though the user bus is running normally. See
+    /// [`SessionAddress::resolve`] for the full rationale.
     pub fn session() -> Result<Self, DbusError> {
-        let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").map_err(|_| DbusError::NoAddress)?;
-        for part in addr.split(';') {
-            let Some(rest) = part.strip_prefix("unix:") else {
-                continue;
-            };
-            for kv in rest.split(',') {
-                if let Some(path) = kv.strip_prefix("path=") {
-                    return Self::connect_path(path.as_bytes());
-                }
-                if let Some(name) = kv.strip_prefix("abstract=") {
-                    return Self::connect_abstract(name.as_bytes());
-                }
-            }
+        match SessionAddress::resolve().ok_or(DbusError::NoAddress)? {
+            SessionAddress::Path(path) => Self::connect_path(path.as_bytes()),
+            SessionAddress::Abstract(name) => Self::connect_abstract(name.as_bytes()),
         }
-        Err(DbusError::NoAddress)
     }
 
     fn connect_path(path: &[u8]) -> Result<Self, DbusError> {

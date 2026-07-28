@@ -2441,6 +2441,60 @@ mod tests {
     }
 
     #[test]
+    fn a_right_aligned_prompt_is_never_clipped_off_the_right_edge() {
+        // User-reported: with fish's RPROMPT (a timestamp padded out to the
+        // right margin) a HORIZONTAL shrink left the newest line's timestamp
+        // running off the right edge, cut mid-text -- and worse the smaller
+        // the window got. Pressing Enter did not clear it, which rules out
+        // the shell reprinting at a stale width: a freshly drawn prompt
+        // landed wrong too, so the fault is in our own reflow.
+        //
+        // The invariant this pins down is narrow but absolute: whatever
+        // resize does to a line's *content*, it may never leave a cell
+        // sitting at a column >= the new width. Every physical row must fit
+        // the grid it was reflowed into.
+        let mut g = Grid::new(80, 24);
+        // A prompt line shaped like the real one: short left prompt, a run of
+        // padding, then a right-aligned timestamp ending exactly at col 80.
+        let stamp = "09:50:12";
+        let left = "~ > ";
+        let pad = 80 - left.len() - stamp.len();
+        apply_str(
+            &mut g,
+            format!("{left}{}{stamp}", " ".repeat(pad)).as_bytes(),
+        );
+
+        // Shrink horizontally, progressively -- the reported trigger.
+        for w in [72u16, 64, 56, 48, 40, 32, 24] {
+            g.resize(w, 24);
+            let s = g.screen();
+            assert_eq!(
+                s.cols(),
+                w,
+                "screen width must track the resize at w={w}"
+            );
+            // Nothing may survive past the last legal column.
+            for r in 0..s.rows() {
+                for c in 0..s.cols() {
+                    let _ = s.get_cell(c, r);
+                }
+            }
+            // The timestamp's digits must all still be reachable inside the
+            // grid: count them across the whole visible area. Losing some to
+            // an off-grid column is exactly the reported clipping.
+            let digits: usize = (0..s.rows())
+                .flat_map(|r| (0..s.cols()).map(move |c| (c, r)))
+                .filter(|&(c, r)| s.get_cell(c, r).ch.is_ascii_digit())
+                .count();
+            assert_eq!(
+                digits,
+                6,
+                "at width {w} the timestamp lost digits -- clipped off the edge"
+            );
+        }
+    }
+
+    #[test]
     fn resize_drag_roundtrip_does_not_grow_lines_or_drop_content() {
         // Regression: word-aware reflow leaves ragged (blank-padded) soft-wrap
         // rows. The resize stitch step must trim that padding and restore only

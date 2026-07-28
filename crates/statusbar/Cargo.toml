@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 platform     = { path = "../platform" }
+localtime    = { path = "../localtime" }
 font         = { path = "../font" }
 config       = { path = "../config" }
 waker        = { path = "../waker" }

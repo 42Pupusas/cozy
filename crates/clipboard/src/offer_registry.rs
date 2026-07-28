@@ -114,7 +114,10 @@ mod tests {
         registry.announce(7);
         registry.advertise(7, "text/plain");
         registry.advertise(7, "image/png");
-        assert_eq!(registry.take(7), Some(vec!["text/plain".into(), "image/png".into()]));
+        assert_eq!(
+            registry.take(7),
+            Some(vec!["text/plain".into(), "image/png".into()])
+        );
         // Taking consumes it: a second selection of the same id is not a
         // second copy of the same clipboard contents.
         assert_eq!(registry.take(7), None);

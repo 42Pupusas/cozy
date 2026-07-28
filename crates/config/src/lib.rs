@@ -987,11 +987,10 @@ impl Config {
                 })?);
         }
         if let Some(s) = launcher.get_str("helper") {
-            self.launcher.helper =
-                Some(Color::parse_hex(s).ok_or(ConfigError::InvalidValue {
-                    field: "launcher.helper",
-                    reason: "invalid #rrggbb hex color",
-                })?);
+            self.launcher.helper = Some(Color::parse_hex(s).ok_or(ConfigError::InvalidValue {
+                field: "launcher.helper",
+                reason: "invalid #rrggbb hex color",
+            })?);
         }
         if let Some(s) = launcher.get_str("font_path") {
             self.launcher.font_path = Some(s.to_owned());

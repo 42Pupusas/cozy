@@ -21,7 +21,6 @@ pub mod click;
 pub mod clock;
 pub mod colors;
 pub mod cpu;
-pub mod localtime;
 pub mod memory;
 pub mod notifications;
 mod pointer_state;

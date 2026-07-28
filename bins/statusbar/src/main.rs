@@ -273,13 +273,7 @@ impl BarApp {
         let (scroll_tx, scroll_rx) = mpsc::channel::<(ModuleKind, i32)>();
         let (click_tx, click_rx) = mpsc::channel::<ModuleKind>();
         let notification_rules = cfg.bar_notifications().to_vec();
-        worker::Worker::spawn_thread(
-            snapshot_tx,
-            scroll_rx,
-            click_rx,
-            wake,
-            notification_rules,
-        );
+        worker::Worker::spawn_thread(snapshot_tx, scroll_rx, click_rx, wake, notification_rules);
 
         let bar_height = window.height();
         let paint_style = PaintStyle {

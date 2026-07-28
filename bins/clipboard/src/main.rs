@@ -15,12 +15,12 @@ use clipboard::{ClipboardPayload, HistoryStore};
 use clipboard_options::{ClipboardOptions, Command};
 use clipboard_wayland::{ClipboardSession, SelectionWatcher, WatcherLoop};
 use entry_preview::EntryPreview;
+use platform::Result;
 use platform::conn::Sender;
 use platform::event::RawEvent;
 use platform::id::{DataControlManagerId, RegistryId};
 use platform::protocol as proto;
 use platform::surface::{GlobalCollector, RegistryDiscovery};
-use platform::Result;
 use quetzalcoatl::spsc::Consumer;
 
 /// A clipboard daemon sees a burst per copy, not per frame; it never needs the
@@ -168,10 +168,7 @@ impl ClipboardApp {
     }
 
     /// Re-publish one stored entry and hold it until something replaces it.
-    fn restore(
-        &mut self,
-        payload: &ClipboardPayload,
-    ) -> std::result::Result<(), String> {
+    fn restore(&mut self, payload: &ClipboardPayload) -> std::result::Result<(), String> {
         let mut owner = ClipboardSession::publish(
             &mut self.sender,
             self.globals.data_control,
@@ -206,10 +203,15 @@ impl HistoryCommands {
             .get(id)
             .ok_or_else(|| format!("no history entry with id {id}"))?;
         // Richest representation first, matching what a paste would receive.
-        let bytes = ["image/png", "text/uri-list", "text/plain;charset=utf-8", "text/plain"]
-            .into_iter()
-            .find_map(|mime| entry.payload().requested(mime))
-            .ok_or_else(|| format!("entry {id} has no decodable representation"))?;
+        let bytes = [
+            "image/png",
+            "text/uri-list",
+            "text/plain;charset=utf-8",
+            "text/plain",
+        ]
+        .into_iter()
+        .find_map(|mime| entry.payload().requested(mime))
+        .ok_or_else(|| format!("entry {id} has no decodable representation"))?;
         std::io::stdout()
             .write_all(bytes)
             .map_err(|e| format!("could not write to stdout: {e}"))

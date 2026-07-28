@@ -145,7 +145,10 @@ impl DmenuApp {
     /// How many rows are currently on screen -- the bound every cursor
     /// movement wraps against.
     fn visible_count(&self) -> usize {
-        self.choices.search(&self.query).len().min(MAX_VISIBLE_RESULTS)
+        self.choices
+            .search(&self.query)
+            .len()
+            .min(MAX_VISIBLE_RESULTS)
     }
 
     fn apply_key(&mut self, key: LauncherKey) {
@@ -221,7 +224,15 @@ impl DmenuPainter {
 
         let query_y = pad;
         if query.is_empty() {
-            text.draw_text_alpha(canvas, "Type to filter…", pad, query_y, helper, bg, bg_alpha);
+            text.draw_text_alpha(
+                canvas,
+                "Type to filter…",
+                pad,
+                query_y,
+                helper,
+                bg,
+                bg_alpha,
+            );
         } else {
             text.draw_text_alpha(canvas, query, pad, query_y, fg, bg, bg_alpha);
         }

@@ -19,8 +19,7 @@ use platform::conn::Sender;
 use platform::error::Error as PlatformError;
 use platform::event::RawEvent;
 use platform::id::{
-    BufferId, DisplayId, ObjectId, OutputId, PoolId, ScreencopyFrameId, ScreencopyManagerId,
-    ShmId,
+    BufferId, DisplayId, ObjectId, OutputId, PoolId, ScreencopyFrameId, ScreencopyManagerId, ShmId,
 };
 use platform::protocol::{
     DisplayEvent, ScreencopyFrameEvent, ScreencopyFrameRequest, ScreencopyManagerRequest,

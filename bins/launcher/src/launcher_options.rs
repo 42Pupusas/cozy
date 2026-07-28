@@ -73,7 +73,10 @@ impl std::fmt::Display for OptionsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownFlag(flag) => {
-                write!(f, "unknown flag `{flag}`; usage: launcher [--dmenu] [--prompt TEXT]")
+                write!(
+                    f,
+                    "unknown flag `{flag}`; usage: launcher [--dmenu] [--prompt TEXT]"
+                )
             }
             Self::MissingPromptValue => write!(f, "`--prompt` needs a value"),
         }

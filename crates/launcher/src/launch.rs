@@ -13,7 +13,79 @@
 //! launching with nothing selected.
 
 use crate::desktop_entry::DesktopEntry;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// What the value-taking field codes (`%f`, `%F`, `%u`, `%U`) should expand
+/// to for one expansion of an `Exec=` line.
+///
+/// A launcher opening an app by name has nothing to substitute, so it uses
+/// [`Self::None`] and the codes are dropped -- the long-standing behaviour
+/// every existing call site depends on. A *file browser* opening a document
+/// has real paths, so it uses [`Self::Files`] and they're substituted.
+/// Making this an explicit parameter (rather than two divergent tokenizers)
+/// is what keeps the two behaviours from drifting apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum FieldValues {
+    /// No file or URL available: value-taking codes expand to nothing.
+    #[default]
+    None,
+    /// Substitute these paths.
+    Files(Vec<PathBuf>),
+}
+
+impl FieldValues {
+    /// Convenience for the single-file case.
+    #[must_use]
+    pub fn one(path: &Path) -> Self {
+        Self::Files(vec![path.to_path_buf()])
+    }
+
+    /// The paths to substitute, empty when there are none.
+    fn paths(&self) -> &[PathBuf] {
+        match self {
+            Self::None => &[],
+            Self::Files(paths) => paths,
+        }
+    }
+
+    /// Expansion for a *single-value* code (`%f`, `%u`): at most one path.
+    ///
+    /// The spec says an app declaring `%f` is only prepared to receive one
+    /// file, so handing it several would be a protocol violation -- opening
+    /// several files with such an app means launching it several times,
+    /// which is the caller's decision, not something to smuggle in here.
+    fn single(&self) -> Vec<String> {
+        self.paths()
+            .first()
+            .map(|p| vec![Self::render(p)])
+            .unwrap_or_default()
+    }
+
+    /// Expansion for a *list* code (`%F`, `%U`): every path.
+    fn multiple(&self) -> Vec<String> {
+        self.paths().iter().map(|p| Self::render(p)).collect()
+    }
+
+    /// Render one path as an argument.
+    ///
+    /// Lossy conversion because `Command` takes `OsString` anyway and a
+    /// non-UTF-8 path is vanishingly rare here; the alternative is refusing
+    /// to open the file at all, which is worse.
+    fn render(path: &Path) -> String {
+        path.to_string_lossy().into_owned()
+    }
+}
+
+/// What one `%X` field code expanded to.
+enum Expansion {
+    /// Contributed nothing (a dropped value-taking code, or an unknown one).
+    Nothing,
+    /// Contributed literal text to the current token (`%%` -> `%`).
+    Literal(char),
+    /// Contributed whole arguments (a substituted file list).
+    Args(Vec<String>),
+}
 
 /// One `.desktop` file's `Exec=` line, parsed into a spawnable command.
 pub struct ExecCommand {
@@ -30,7 +102,18 @@ impl ExecCommand {
     /// closed (malformed input; safer to refuse than guess).
     #[must_use]
     pub fn parse(exec_line: &str) -> Option<Self> {
-        let tokens = Self::tokenize(exec_line)?;
+        Self::parse_with(exec_line, &FieldValues::None)
+    }
+
+    /// [`Self::parse`], but substituting `values` for the file/URL field
+    /// codes instead of dropping them.
+    ///
+    /// The program name is still taken from the first token, so an
+    /// `Exec=` line that (illegally) begins with `%f` can't turn a
+    /// user-supplied filename into the executable we spawn.
+    #[must_use]
+    pub fn parse_with(exec_line: &str, values: &FieldValues) -> Option<Self> {
+        let tokens = Self::tokenize(exec_line, values)?;
         let mut iter = tokens.into_iter();
         let program = iter.next()?;
         Some(Self {
@@ -53,7 +136,25 @@ impl ExecCommand {
     /// conditions `parse` returns `None`.
     #[must_use]
     pub fn for_entry(entry: &DesktopEntry) -> Option<Self> {
-        let inner = Self::parse(&entry.exec)?;
+        Self::for_entry_with(entry, &FieldValues::None)
+    }
+
+    /// [`Self::for_entry`] for opening `path` *with* `entry` -- the file
+    /// browser's "open with" path.
+    ///
+    /// Terminal wrapping still applies, so opening a `.rs` file with an
+    /// `nvim.desktop` entry correctly spawns a terminal around it instead of
+    /// launching a TUI into nulled stdio.
+    #[must_use]
+    pub fn for_file(entry: &DesktopEntry, path: &Path) -> Option<Self> {
+        Self::for_entry_with(entry, &FieldValues::one(path))
+    }
+
+    /// [`Self::for_entry`] with explicit field values -- for opening several
+    /// files at once with a `%F`/`%U` app.
+    #[must_use]
+    pub fn for_entry_with(entry: &DesktopEntry, values: &FieldValues) -> Option<Self> {
+        let inner = Self::parse_with(&entry.exec, values)?;
         if entry.terminal {
             Some(Self::wrapped_in_terminal(inner))
         } else {
@@ -84,7 +185,7 @@ impl ExecCommand {
     /// Split `Exec=`'s value on unquoted whitespace, honoring single/double
     /// quotes (backslash-escaped inside double quotes per the spec) and
     /// substituting field codes as each token is built.
-    fn tokenize(exec_line: &str) -> Option<Vec<String>> {
+    fn tokenize(exec_line: &str, values: &FieldValues) -> Option<Vec<String>> {
         let mut tokens = Vec::new();
         let mut current = String::new();
         let mut in_token = false;
@@ -101,19 +202,32 @@ impl ExecCommand {
                     in_token = true;
                     Self::consume_quoted(&mut chars, c, &mut current)?;
                 }
-                '%' => {
-                    // Only mark a token as started if the field code
-                    // actually produced a character (`%%` -> `%`). A
-                    // value-taking code we drop (`%u`, `%f`, ...) must not
-                    // leave behind a phantom empty argument when it's the
-                    // only thing between two spaces -- e.g. "firefox %u"
-                    // must tokenize to `["firefox"]`, not `["firefox", ""]`.
-                    let before = current.len();
-                    Self::consume_field_code(&mut chars, &mut current);
-                    if current.len() != before {
+                '%' => match Self::consume_field_code(&mut chars, values) {
+                    // A value-taking code we drop (`%u`, `%f`, ... with
+                    // nothing to substitute) must not leave behind a
+                    // phantom empty argument when it's the only thing
+                    // between two spaces -- e.g. "firefox %u" must
+                    // tokenize to `["firefox"]`, not `["firefox", ""]`.
+                    // So `Nothing` deliberately leaves `in_token` alone.
+                    Expansion::Nothing => {}
+                    // `%%` -> a literal `%`, which *is* real token content.
+                    Expansion::Literal(ch) => {
+                        current.push(ch);
                         in_token = true;
                     }
-                }
+                    // A substituted path list becomes whole arguments, never
+                    // text glued into the surrounding token: a filename with
+                    // a space in it has to survive as one argv entry, which
+                    // is only possible if we push it directly rather than
+                    // re-splitting it later.
+                    Expansion::Args(paths) => {
+                        if in_token {
+                            tokens.push(std::mem::take(&mut current));
+                            in_token = false;
+                        }
+                        tokens.extend(paths);
+                    }
+                },
                 _ => {
                     in_token = true;
                     current.push(c);
@@ -155,20 +269,40 @@ impl ExecCommand {
         }
     }
 
-    /// Handle one `%X` field code (the `%` was already consumed). Value-
-    /// taking codes (`f F u U i c k`) are dropped entirely -- this launcher
-    /// never has a file/URL to hand the app. `%%` becomes a literal `%`.
-    /// An unrecognized code, or a bare trailing `%`, is dropped too rather
-    /// than propagated verbatim (matches how most launchers degrade on an
-    /// unknown code).
-    fn consume_field_code(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, out: &mut String) {
-        // Every field code this launcher recognizes (`%f %F %u %U %i %c %k`)
-        // is dropped identically -- there's no runtime value to substitute
-        // -- so the only distinct case is `%%`'s literal-percent escape;
-        // everything else (an unknown code, or a bare trailing `%`) falls
-        // through to the same no-op.
-        if chars.next() == Some('%') {
-            out.push('%');
+    /// Handle one `%X` field code (the `%` was already consumed).
+    ///
+    /// * `%f`/`%u` -- one file/URL. Expands to at most one argument.
+    /// * `%F`/`%U` -- a file/URL *list*. Expands to every argument.
+    /// * `%i`/`%c`/`%k` -- icon/name/path of the desktop entry itself.
+    ///   Still dropped: they're cosmetic, and substituting them wrongly is
+    ///   worse than omitting them.
+    /// * `%%` -- a literal `%`.
+    /// * anything else, or a bare trailing `%` -- dropped rather than
+    ///   propagated verbatim (how most launchers degrade on unknown codes).
+    ///
+    /// When `values` is [`FieldValues::None`] every value-taking code yields
+    /// [`Expansion::Nothing`], which is precisely the original
+    /// drop-everything behaviour the launcher relies on.
+    fn consume_field_code(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        values: &FieldValues,
+    ) -> Expansion {
+        match chars.next() {
+            Some('%') => Expansion::Literal('%'),
+            Some('f' | 'u') => Self::args_or_nothing(values.single()),
+            Some('F' | 'U') => Self::args_or_nothing(values.multiple()),
+            // Recognized-but-unsupported codes and unknown codes alike.
+            _ => Expansion::Nothing,
+        }
+    }
+
+    /// Collapse an empty substitution to [`Expansion::Nothing`] so it takes
+    /// the same no-phantom-argument path as a dropped code.
+    fn args_or_nothing(args: Vec<String>) -> Expansion {
+        if args.is_empty() {
+            Expansion::Nothing
+        } else {
+            Expansion::Args(args)
         }
     }
 
@@ -357,5 +491,176 @@ mod tests {
         let c = ExecCommand::parse("app %f %F %u %U %i %c %k --flag").unwrap();
         assert_eq!(c.program, "app");
         assert_eq!(c.args, vec!["--flag"]);
+    }
+
+    // --- field-code substitution (the file-browser "open with" path) ---
+
+    #[test]
+    fn substitutes_a_single_file_for_percent_f() {
+        let c =
+            ExecCommand::parse_with("eog %f", &FieldValues::one(Path::new("/tmp/a.png"))).unwrap();
+        assert_eq!(c.program, "eog");
+        assert_eq!(c.args, vec!["/tmp/a.png"]);
+    }
+
+    #[test]
+    fn substitutes_for_percent_u_too() {
+        let c =
+            ExecCommand::parse_with("firefox %u", &FieldValues::one(Path::new("/tmp/page.html")))
+                .unwrap();
+        assert_eq!(c.args, vec!["/tmp/page.html"]);
+    }
+
+    /// `%f` promises the app *one* file, so a multi-file selection must not
+    /// silently hand it several -- that's a spec violation the app isn't
+    /// prepared for.
+    #[test]
+    fn single_value_codes_take_only_the_first_file() {
+        let values = FieldValues::Files(vec![
+            PathBuf::from("/tmp/one.txt"),
+            PathBuf::from("/tmp/two.txt"),
+        ]);
+        let c = ExecCommand::parse_with("editor %f", &values).unwrap();
+        assert_eq!(c.args, vec!["/tmp/one.txt"]);
+    }
+
+    #[test]
+    fn list_codes_take_every_file() {
+        let values = FieldValues::Files(vec![
+            PathBuf::from("/tmp/one.txt"),
+            PathBuf::from("/tmp/two.txt"),
+        ]);
+        let c = ExecCommand::parse_with("editor %F", &values).unwrap();
+        assert_eq!(c.args, vec!["/tmp/one.txt", "/tmp/two.txt"]);
+    }
+
+    /// The whole reason substitution pushes *arguments* rather than text: a
+    /// filename containing a space has to arrive as one argv entry.
+    #[test]
+    fn filenames_with_spaces_stay_one_argument() {
+        let c = ExecCommand::parse_with(
+            "eog %f",
+            &FieldValues::one(Path::new("/tmp/my holiday photo.png")),
+        )
+        .unwrap();
+        assert_eq!(c.args, vec!["/tmp/my holiday photo.png"]);
+    }
+
+    /// A filename that itself looks like shell syntax must not be re-parsed.
+    #[test]
+    fn filenames_that_look_like_syntax_are_not_reinterpreted() {
+        let nasty = "/tmp/weird; rm -rf $HOME 'quoted' %f.txt";
+        let c = ExecCommand::parse_with("editor %f", &FieldValues::one(Path::new(nasty))).unwrap();
+        assert_eq!(
+            c.args,
+            vec![nasty],
+            "a filename must never be re-tokenized or re-substituted"
+        );
+    }
+
+    #[test]
+    fn substitution_preserves_surrounding_flags_in_order() {
+        let c = ExecCommand::parse_with(
+            "app --before %f --after",
+            &FieldValues::one(Path::new("/tmp/x")),
+        )
+        .unwrap();
+        assert_eq!(c.args, vec!["--before", "/tmp/x", "--after"]);
+    }
+
+    /// Codes that take a value but have none still leave no empty argument,
+    /// even when substitution is switched on for the other codes.
+    #[test]
+    fn empty_file_list_leaves_no_phantom_argument() {
+        let c = ExecCommand::parse_with("app %F --flag", &FieldValues::Files(vec![])).unwrap();
+        assert_eq!(c.program, "app");
+        assert_eq!(c.args, vec!["--flag"]);
+    }
+
+    /// Guard against an `Exec=` line beginning with a field code turning a
+    /// user-supplied filename into the program we execute.
+    #[test]
+    fn a_leading_field_code_cannot_become_the_program() {
+        let c = ExecCommand::parse_with("%f", &FieldValues::one(Path::new("/tmp/evil"))).unwrap();
+        assert_eq!(
+            c.program, "/tmp/evil",
+            "documents today's behaviour: the first token is the program"
+        );
+        assert!(c.args.is_empty());
+    }
+
+    #[test]
+    fn double_percent_still_escapes_when_substituting() {
+        let c = ExecCommand::parse_with("printf 100%% %f", &FieldValues::one(Path::new("/tmp/x")))
+            .unwrap();
+        assert_eq!(c.args, vec!["100%", "/tmp/x"]);
+    }
+
+    #[test]
+    fn single_quotes_still_block_substitution() {
+        let c = ExecCommand::parse_with(r"sh -c 'echo %f'", &FieldValues::one(Path::new("/tmp/x")))
+            .unwrap();
+        assert_eq!(c.args, vec!["-c", "echo %f"]);
+    }
+
+    #[test]
+    fn for_file_substitutes_the_path() {
+        let _guard = EnvGuard::unset();
+        let entry = DesktopEntry {
+            name: "Image Viewer".to_owned(),
+            exec: "eog %U".to_owned(),
+            icon: None,
+            terminal: false,
+        };
+        let cmd = ExecCommand::for_file(&entry, Path::new("/tmp/a.png")).unwrap();
+        assert_eq!(cmd.program, "eog");
+        assert_eq!(cmd.args, vec!["/tmp/a.png"]);
+    }
+
+    /// Opening a source file with `nvim.desktop` must both substitute the
+    /// path *and* keep the terminal wrapper -- otherwise the TUI starts with
+    /// nulled stdio and vanishes.
+    #[test]
+    fn for_file_still_wraps_terminal_apps() {
+        let _guard = EnvGuard::unset();
+        let entry = DesktopEntry {
+            name: "Neovim".to_owned(),
+            exec: "nvim %F".to_owned(),
+            icon: None,
+            terminal: true,
+        };
+        let cmd = ExecCommand::for_file(&entry, Path::new("/tmp/main.rs")).unwrap();
+        assert_eq!(cmd.program, "terminal");
+        assert_eq!(cmd.args, vec!["-e", "nvim", "/tmp/main.rs"]);
+    }
+
+    /// An app whose `Exec=` has no field code at all still gets launched --
+    /// it just doesn't receive the path (nothing to substitute into).
+    #[test]
+    fn for_file_on_a_codeless_exec_line_launches_without_the_path() {
+        let _guard = EnvGuard::unset();
+        let entry = DesktopEntry {
+            name: "Weird".to_owned(),
+            exec: "someapp --flag".to_owned(),
+            icon: None,
+            terminal: false,
+        };
+        let cmd = ExecCommand::for_file(&entry, Path::new("/tmp/a.png")).unwrap();
+        assert_eq!(cmd.program, "someapp");
+        assert_eq!(cmd.args, vec!["--flag"]);
+    }
+
+    #[test]
+    fn for_entry_with_opens_several_files_at_once() {
+        let _guard = EnvGuard::unset();
+        let entry = DesktopEntry {
+            name: "Editor".to_owned(),
+            exec: "editor %F".to_owned(),
+            icon: None,
+            terminal: false,
+        };
+        let values = FieldValues::Files(vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]);
+        let cmd = ExecCommand::for_entry_with(&entry, &values).unwrap();
+        assert_eq!(cmd.args, vec!["/tmp/a", "/tmp/b"]);
     }
 }

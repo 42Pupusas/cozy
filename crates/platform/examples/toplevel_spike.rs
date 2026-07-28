@@ -12,12 +12,23 @@
 //!   `cargo run -p platform --example toplevel_spike`
 
 use platform::draw::{Canvas, Color, Rect};
-use platform::toplevel::{LogicalSize, Painter, PhysicalSize, Toplevel, WindowEvent};
+use platform::toplevel::{
+    Key, KeyPress, LogicalSize, Painter, PhysicalSize, PointerEventKind, Toplevel, WindowEvent,
+};
 
 /// Paints a simple test pattern: a background, a border, and a moving band
 /// so successive frames are visibly different.
 struct Checkerboard {
     frames: u32,
+    /// Set when Escape is pressed, so the example proves keyboard input
+    /// round-trips all the way to a decision the app acts on.
+    quit: bool,
+    /// Last pointer position, drawn as a cursor so motion is visible.
+    cursor: Option<(i32, i32)>,
+    /// Scroll accumulator, moving the band -- proof that axis events arrive
+    /// with the right sign.
+    scroll: i32,
+    focused: bool,
 }
 
 impl Painter for Checkerboard {
@@ -25,12 +36,49 @@ impl Painter for Checkerboard {
         Color::rgb(0x1e, 0x1e, 0x2e)
     }
 
+    fn on_key(&mut self, press: KeyPress) {
+        // Repeats are labelled so a held key is visibly different from a
+        // storm of physical presses.
+        let tag = if press.repeat { " (repeat)" } else { "" };
+        println!("key: {:?} mods={:?}{tag}", press.key, press.modifiers);
+        if press.key == Key::Escape {
+            self.quit = true;
+        }
+    }
+
+    fn on_pointer(&mut self, event: PointerEventKind) {
+        match event {
+            PointerEventKind::Motion(p) | PointerEventKind::Enter(p) => {
+                self.cursor = Some((p.x, p.y));
+            }
+            PointerEventKind::Leave => self.cursor = None,
+            PointerEventKind::Press { button, at, .. } => {
+                println!("button {button:?} pressed at {},{}", at.x, at.y);
+            }
+            PointerEventKind::Release { .. } => {}
+            PointerEventKind::Scroll { lines, .. } => {
+                self.scroll += lines;
+                println!("scroll {lines:+} (total {})", self.scroll);
+            }
+        }
+    }
+
+    fn on_focus(&mut self, focused: bool) {
+        self.focused = focused;
+        println!("focus: {focused}");
+    }
+
     fn paint(&mut self, canvas: &mut Canvas<'_>, size: PhysicalSize) {
         self.frames += 1;
         canvas.fill_rect(Rect::new(0, 0, size.width, size.height), self.background());
         // A border proves we know the true window bounds -- if the geometry
         // maths were wrong this would be clipped or float away from the edge.
-        let accent = Color::rgb(0xa6, 0xe3, 0xa1);
+        // Border colour tracks focus, so keyboard focus is visible.
+        let accent = if self.focused {
+            Color::rgb(0xa6, 0xe3, 0xa1)
+        } else {
+            Color::rgb(0x58, 0x5b, 0x70)
+        };
         let t = 4;
         canvas.fill_rect(Rect::new(0, 0, size.width, t), accent);
         canvas.fill_rect(Rect::new(0, size.height - t, size.width, t), accent);
@@ -39,11 +87,19 @@ impl Painter for Checkerboard {
         // A band whose position depends on the frame count, so a frozen
         // window is visually distinguishable from a live one.
         let band_h = 40;
-        let y = i32::try_from(self.frames * 7).unwrap_or(0) % (size.height - band_h).max(1);
+        let y = (i32::try_from(self.frames * 7).unwrap_or(0) + self.scroll * 20)
+            .rem_euclid((size.height - band_h).max(1));
         canvas.fill_rect(
             Rect::new(t, y, size.width - 2 * t, band_h),
             Color::rgb(0x89, 0xb4, 0xfa),
         );
+        // A crosshair at the pointer: proves motion events arrive with
+        // coordinates in the same space we paint in.
+        if let Some((cx, cy)) = self.cursor {
+            let hot = Color::rgb(0xf3, 0x8b, 0xa8);
+            canvas.fill_rect(Rect::new(cx - 10, cy - 1, 21, 3), hot);
+            canvas.fill_rect(Rect::new(cx - 1, cy - 10, 3, 21), hot);
+        }
     }
 }
 
@@ -68,7 +124,13 @@ impl Args {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let wake = waker::Waker::new()?;
-    let mut painter = Checkerboard { frames: 0 };
+    let mut painter = Checkerboard {
+        frames: 0,
+        quit: false,
+        cursor: None,
+        scroll: 0,
+        focused: false,
+    };
 
     let mut window = Toplevel::new(
         "toplevel spike",
@@ -93,7 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 WindowEvent::Resized(s) => println!("resized to {}x{}", s.width, s.height),
             }
         }
-        if window.is_closing() {
+        if window.is_closing() || painter.quit {
             break;
         }
 

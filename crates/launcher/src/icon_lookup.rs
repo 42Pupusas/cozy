@@ -76,9 +76,8 @@ impl IconLookup {
             // extension guessing) -- only accept it if it's actually a PNG,
             // matching this launcher's PNG-only decoder.
             let path = Path::new(icon);
-            return (path.extension().and_then(|e| e.to_str()) == Some("png")
-                && path.is_file())
-            .then(|| path.to_owned());
+            return (path.extension().and_then(|e| e.to_str()) == Some("png") && path.is_file())
+                .then(|| path.to_owned());
         }
 
         for root in &self.icon_theme_roots {
@@ -110,7 +109,11 @@ mod tests {
 
     fn touch(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, b"not really a png, path existence is all that's checked").unwrap();
+        fs::write(
+            path,
+            b"not really a png, path existence is all that's checked",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -143,7 +146,8 @@ mod tests {
         let data_dir = tmp.join("data");
         touch(&data_dir.join("icons/hicolor/48x48/apps/firefox.png"));
 
-        let lookup = IconLookup::with_roots(std::slice::from_ref(&data_dir), Path::new("/nonexistent"));
+        let lookup =
+            IconLookup::with_roots(std::slice::from_ref(&data_dir), Path::new("/nonexistent"));
         assert_eq!(
             lookup.resolve("firefox"),
             Some(data_dir.join("icons/hicolor/48x48/apps/firefox.png"))
@@ -159,7 +163,8 @@ mod tests {
         touch(&data_dir.join("icons/hicolor/128x128/apps/spotify.png"));
         touch(&data_dir.join("icons/hicolor/32x32/apps/spotify.png"));
 
-        let lookup = IconLookup::with_roots(std::slice::from_ref(&data_dir), Path::new("/nonexistent"));
+        let lookup =
+            IconLookup::with_roots(std::slice::from_ref(&data_dir), Path::new("/nonexistent"));
         assert_eq!(
             lookup.resolve("spotify"),
             Some(data_dir.join("icons/hicolor/32x32/apps/spotify.png"))

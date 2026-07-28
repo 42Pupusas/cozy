@@ -756,6 +756,13 @@ impl SeatCapability {
     pub const fn in_mask(self, bitmask: u32) -> bool {
         bitmask & (self as u32) != 0
     }
+
+    /// This capability as a one-bit mask, for building a bitmask up rather
+    /// than only testing one apart.
+    #[must_use]
+    pub const fn mask(self) -> u32 {
+        self as u32
+    }
 }
 
 /// Keyboard modifier state, decoded from `wl_keyboard.modifiers`.
@@ -1461,11 +1468,20 @@ mod tests {
         assert_eq!(DataControlManagerRequest::Destroy.opcode(), 2);
         assert_eq!(DataControlDeviceRequest::SetSelection.opcode(), 0);
         assert_eq!(DataControlDeviceRequest::Destroy.opcode(), 1);
-        assert_eq!(DataControlDeviceEvent::from_opcode(0), Some(DataControlDeviceEvent::DataOffer));
-        assert_eq!(DataControlDeviceEvent::from_opcode(1), Some(DataControlDeviceEvent::Selection));
+        assert_eq!(
+            DataControlDeviceEvent::from_opcode(0),
+            Some(DataControlDeviceEvent::DataOffer)
+        );
+        assert_eq!(
+            DataControlDeviceEvent::from_opcode(1),
+            Some(DataControlDeviceEvent::Selection)
+        );
         assert_eq!(DataControlOfferRequest::Receive.opcode(), 0);
         assert_eq!(DataControlOfferRequest::Destroy.opcode(), 1);
-        assert_eq!(DataControlOfferEvent::from_opcode(0), Some(DataControlOfferEvent::Offer));
+        assert_eq!(
+            DataControlOfferEvent::from_opcode(0),
+            Some(DataControlOfferEvent::Offer)
+        );
         assert_eq!(DataControlSourceRequest::Offer.opcode(), 0);
         assert_eq!(DataControlSourceRequest::Destroy.opcode(), 1);
         assert_eq!(

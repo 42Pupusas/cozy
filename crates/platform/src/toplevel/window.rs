@@ -12,15 +12,20 @@ use crate::conn::{Sender, WindowSender};
 use crate::draw::{Canvas, Color};
 use crate::error::{Error, Result};
 use crate::event::RawEvent;
-use crate::id::SeatId;
+use crate::id::{KeyboardId, PointerId, SeatId};
 use crate::present::{PresentAttempt, PresentState};
 use crate::protocol::{
-    Format, SeatCapability, SeatEvent, SeatRequest, ToplevelEvent, WmBaseEvent, XdgSurfaceEvent,
+    Format, KeyState, KeyboardEvent, PointerEvent, SeatCapability, SeatEvent, SeatRequest,
+    ToplevelEvent, WmBaseEvent, XdgSurfaceEvent,
 };
 use crate::surface::{Frame, RegistryDiscovery, Routed, SurfaceBootstrap, SurfacePresenter};
 use crate::toplevel::geometry::{Geometry, LogicalSize, PhysicalSize};
 use crate::toplevel::globals::{ToplevelGlobals, ToplevelGlobalsBuilder};
+use crate::toplevel::keyboard::{KeyPress, KeyboardState, RepeatInfo};
+use crate::toplevel::keysym::Key;
 use crate::toplevel::lifecycle::Lifecycle;
+use crate::toplevel::modifiers::ModifierState;
+use crate::toplevel::pointer::{PointerEventKind, PointerState};
 use crate::toplevel::shell::ShellSurface;
 use crate::wire::MessageBuilder;
 
@@ -48,6 +53,19 @@ pub trait Painter {
     /// Background colour, used to clear the canvas before [`Self::paint`]
     /// and to fill newly exposed area during a resize.
     fn background(&self) -> Color;
+
+    /// A key was pressed (or auto-repeated -- see [`KeyPress::repeat`]).
+    ///
+    /// Defaulted to a no-op so existing painters that only draw are
+    /// unaffected, and so a painter opts in to exactly the input it wants.
+    fn on_key(&mut self, _press: KeyPress) {}
+
+    /// A pointer gesture occurred.
+    fn on_pointer(&mut self, _event: PointerEventKind) {}
+
+    /// Keyboard focus was gained or lost. Useful for drawing a focused
+    /// selection differently, or hiding a text cursor.
+    fn on_focus(&mut self, _focused: bool) {}
 }
 
 /// Something the window wants its owner to know about.
@@ -84,6 +102,30 @@ pub struct Toplevel {
 
     /// Events queued for the owner to drain.
     queue: std::collections::VecDeque<WindowEvent>,
+
+    /// Input device ids, once the seat advertises them. `None` until then;
+    /// a compositor may advertise capabilities late or never (a headless
+    /// session has no pointer at all).
+    pointer_id: Option<PointerId>,
+    keyboard_id: Option<KeyboardId>,
+
+    pointer: PointerState,
+    keyboard: KeyboardState,
+
+    /// The XKB translator, once the keymap fd has been received and parsed.
+    ///
+    /// `None` means no keymap yet (or `libxkbcommon` is unavailable), in
+    /// which case key events are dropped rather than guessed at: inventing a
+    /// US layout would type the wrong characters for everyone else.
+    xkb: Option<xkb::Translator>,
+
+    /// Size from the `wl_keyboard.keymap` event, held until the matching fd
+    /// arrives as the following `RawEvent::Fd`.
+    ///
+    /// The fd rides in ancillary data and is delivered as a *separate*
+    /// event correlated by arrival order, so the size has to be parked here
+    /// between the two.
+    awaiting_keymap_fd: Option<usize>,
 }
 
 impl Toplevel {
@@ -176,7 +218,7 @@ impl Toplevel {
             physical.height_usize().max(1),
         );
 
-        Ok(Self {
+        let mut window = Self {
             sender,
             request_rx,
             window_tx,
@@ -192,7 +234,15 @@ impl Toplevel {
             present,
             backbuffer: vec![background.to_xrgb8888(); px],
             queue: std::collections::VecDeque::new(),
-        })
+            pointer_id: None,
+            keyboard_id: None,
+            pointer: PointerState::new(),
+            keyboard: KeyboardState::new(),
+            xkb: None,
+            awaiting_keymap_fd: None,
+        };
+        window.bind_seat_devices_eagerly();
+        Ok(window)
     }
 
     /// The window's current size in physical pixels.
@@ -237,8 +287,9 @@ impl Toplevel {
     pub fn tick(&mut self, painter: &mut impl Painter) -> Result<()> {
         self.sender.drain_requests(&mut self.request_rx)?;
         while let Some(ev) = self.events.pop() {
-            self.handle_event(&ev)?;
+            self.handle_event(&ev, painter)?;
         }
+        self.pump_repeat(painter);
         // Drain first, *then* observe: a reader that hit a protocol error
         // pushes the explaining event before exiting, and checking liveness
         // first would discard it and turn a diagnosable fault into a silent
@@ -271,11 +322,29 @@ impl Toplevel {
     }
 
     /// Dispatch one raw event.
-    fn handle_event(&mut self, ev: &RawEvent) -> Result<()> {
+    fn handle_event(&mut self, ev: &RawEvent, painter: &mut impl Painter) -> Result<()> {
+        // The keymap fd arrives as a standalone `Fd` event immediately after
+        // the `wl_keyboard.keymap` message that carried it in ancillary
+        // data, so it is correlated by arrival order rather than by id.
+        // Borrowed, not consumed: the fd is mmap'd here and never stored.
+        if let RawEvent::Fd(fds) = ev {
+            self.take_keymap_fd(fds.first());
+            return Ok(());
+        }
+
         match self.present.route_common(ev, &mut self.window_tx) {
             Routed::Handled => return Ok(()),
             Routed::Fatal(e) => return Err(e),
             Routed::Passthrough => {}
+        }
+
+        if self.pointer_id.is_some_and(|p| ev.is(p)) {
+            self.handle_pointer_event(ev, painter);
+            return Ok(());
+        }
+        if self.keyboard_id.is_some_and(|k| ev.is(k)) {
+            self.handle_keyboard_event(ev, painter);
+            return Ok(());
         }
 
         // xdg_wm_base.ping -- answer promptly or the compositor kills us.
@@ -324,22 +393,187 @@ impl Toplevel {
         Ok(())
     }
 
-    /// Bind pointer/keyboard the first time the seat advertises them.
+    /// Request the pointer and keyboard without waiting for a capabilities
+    /// event.
     ///
-    /// The ids are created but not yet consumed: input handling is the next
-    /// increment. Binding now keeps the seat contract in one place and
-    /// means adding input later is purely additive.
+    /// # Why not wait for `wl_seat.capabilities`
+    ///
+    /// Because it has already been missed by the time this runs. The seat is
+    /// bound during registry discovery, and the compositor answers with
+    /// `capabilities` immediately -- but `RegistryDiscovery::collect_through_sync`
+    /// only forwards `wl_registry.global` events to the collector and drops
+    /// everything else, so that one event is consumed and discarded before
+    /// the window's own event loop ever starts. Waiting for it means waiting
+    /// forever, which is exactly the silent no-input bug this replaces.
+    ///
+    /// Asking unconditionally is safe: `wl_seat.get_pointer` on a seat with
+    /// no pointer yields an object that simply never sends events, which is
+    /// indistinguishable from not having asked. If a device is hot-plugged
+    /// later, [`Self::bind_seat_devices`] still handles the follow-up
+    /// capabilities event.
+    fn bind_seat_devices_eagerly(&mut self) {
+        let all = SeatCapability::Pointer.mask() | SeatCapability::Keyboard.mask();
+        self.bind_seat_devices(all);
+    }
+
+    /// Bind pointer/keyboard when the seat advertises them.
+    ///
+    /// Guarded on `is_none` because `wl_seat.capabilities` is re-sent
+    /// whenever the set changes -- plugging in a second mouse would
+    /// otherwise bind a duplicate pointer and deliver every event twice.
     fn bind_seat_devices(&mut self, caps: u32) {
-        if SeatCapability::Pointer.in_mask(caps) {
-            let pointer: crate::id::PointerId = self.window_tx.alloc_id();
+        if SeatCapability::Pointer.in_mask(caps) && self.pointer_id.is_none() {
+            let pointer: PointerId = self.window_tx.alloc_id();
             self.window_tx
                 .request(MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer));
+            self.pointer_id = Some(pointer);
         }
-        if SeatCapability::Keyboard.in_mask(caps) {
-            let keyboard: crate::id::KeyboardId = self.window_tx.alloc_id();
+        if SeatCapability::Keyboard.in_mask(caps) && self.keyboard_id.is_none() {
+            let keyboard: KeyboardId = self.window_tx.alloc_id();
             self.window_tx
                 .request(MessageBuilder::new(self.seat, SeatRequest::GetKeyboard).new_id(keyboard));
+            self.keyboard_id = Some(keyboard);
         }
+    }
+
+    /// Parse the XKB keymap from the fd that followed a `keymap` event.
+    ///
+    /// A failure here is not fatal: the window keeps working, it just cannot
+    /// resolve keysyms, so key events are dropped rather than mistranslated.
+    fn take_keymap_fd(&mut self, fd: Option<&std::os::fd::OwnedFd>) {
+        use std::os::fd::AsFd as _;
+        let Some(size) = self.awaiting_keymap_fd.take() else {
+            return;
+        };
+        let Some(fd) = fd else { return };
+        match xkb::Translator::from_keymap_fd(fd.as_fd(), size) {
+            Ok(t) => self.xkb = Some(t),
+            Err(e) => eprintln!("platform: XKB keymap unavailable: {e}"),
+        }
+    }
+
+    /// Route one `wl_pointer` event.
+    fn handle_pointer_event(&mut self, ev: &RawEvent, painter: &mut impl Painter) {
+        let mods = self.keyboard.modifiers();
+        let emitted = match ev.event::<PointerEvent>() {
+            // Enter carries `serial, surface, x, y` -- coordinates start at
+            // arg 2, unlike Motion's `time, x, y`.
+            Some(PointerEvent::Enter) => Some(self.pointer.enter(ev.fixed(2), ev.fixed(3))),
+            Some(PointerEvent::Leave) => Some(self.pointer.leave()),
+            Some(PointerEvent::Motion) => Some(self.pointer.motion(ev.fixed(1), ev.fixed(2))),
+            Some(PointerEvent::Button) => {
+                let pressed = ev.arg(3) == 1;
+                self.pointer.button(ev.serial(0).raw(), ev.arg(2), pressed, mods)
+            }
+            Some(PointerEvent::Axis) => self.pointer.axis(ev.arg(1), ev.fixed(2), mods),
+            None => None,
+        };
+        if let Some(kind) = emitted {
+            painter.on_pointer(kind);
+            self.present.mark_dirty();
+        }
+    }
+
+    /// Route one `wl_keyboard` event.
+    fn handle_keyboard_event(&mut self, ev: &RawEvent, painter: &mut impl Painter) {
+        match ev.event::<KeyboardEvent>() {
+            Some(KeyboardEvent::Keymap) => {
+                // Park the size; the fd arrives as the next event. The size
+                // is arg 1, not arg 2: the fd travels in ancillary data and
+                // occupies no slot in the argument list, so `size` follows
+                // `format` directly.
+                self.awaiting_keymap_fd = Some(ev.arg(1) as usize);
+            }
+            Some(KeyboardEvent::Enter) => {
+                self.keyboard.enter();
+                painter.on_focus(true);
+                self.present.mark_dirty();
+            }
+            Some(KeyboardEvent::Leave) => {
+                self.keyboard.leave();
+                painter.on_focus(false);
+                self.present.mark_dirty();
+            }
+            Some(KeyboardEvent::Modifiers) => {
+                let mods =
+                    ModifierState::from_wire(ev.arg(1), ev.arg(2), ev.arg(3), ev.arg(4));
+                self.keyboard.set_modifiers(mods);
+                // XKB owns what these masks mean for the live keymap, so
+                // they are fed through verbatim rather than reinterpreted.
+                if let Some(xkb) = &mut self.xkb {
+                    let (d, la, lo, g) = mods.raw();
+                    let _ = xkb.update_mask(d, la, lo, g);
+                }
+            }
+            Some(KeyboardEvent::RepeatInfo) => {
+                self.keyboard.set_repeat_info(RepeatInfo {
+                    rate: ev.arg(0),
+                    delay_ms: ev.arg(1),
+                });
+            }
+            Some(KeyboardEvent::Key) => self.handle_key(ev, painter),
+            None => {}
+        }
+    }
+
+    /// Resolve and dispatch one `wl_keyboard.key`.
+    fn handle_key(&mut self, ev: &RawEvent, painter: &mut impl Painter) {
+        let evdev = ev.arg(2);
+        let key = self.resolve_key(evdev);
+        match KeyState::from_raw(ev.arg(3)) {
+            Some(KeyState::Pressed) => {
+                // Deliberately the local monotonic clock, not the event's
+                // `time` argument: `wl_keyboard.key` timestamps come from
+                // the compositor's own clock with an unspecified epoch, so
+                // mixing them with the clock `pump_repeat` reads would make
+                // the first repeat fire immediately or never.
+                let now = Self::now_ms();
+                if let Some(press) = self.keyboard.press(key, now) {
+                    painter.on_key(press);
+                    self.present.mark_dirty();
+                }
+            }
+            Some(KeyState::Released) => self.keyboard.release(key),
+            None => {}
+        }
+    }
+
+    /// Translate an evdev code through the live keymap.
+    ///
+    /// Returns `None` without a keymap: guessing a layout would type the
+    /// wrong characters for every non-US user.
+    fn resolve_key(&self, evdev: u32) -> Option<Key> {
+        let xkb = self.xkb.as_ref()?;
+        Key::decode(xkb.keysym(evdev), xkb.utf32(evdev))
+    }
+
+    /// Emit any auto-repeat that has come due.
+    fn pump_repeat(&mut self, painter: &mut impl Painter) {
+        if let Some(press) = self.keyboard.tick(Self::now_ms()) {
+            painter.on_key(press);
+            self.present.mark_dirty();
+        }
+    }
+
+    /// Milliseconds since an arbitrary fixed point, from a *monotonic*
+    /// clock.
+    ///
+    /// Monotonic rather than wall-clock so an NTP step or a DST change
+    /// cannot stall a held key for an hour, or fire a burst of repeats.
+    fn now_ms() -> u64 {
+        use std::sync::OnceLock;
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        let start = START.get_or_init(std::time::Instant::now);
+        // Saturating rather than a cast: a u64 of milliseconds covers ~584
+        // million years, so the clamp is unreachable in practice, but it
+        // keeps the conversion total instead of silently wrapping.
+        u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// When the next repeat is due, for a caller pacing its own wait.
+    #[must_use]
+    pub const fn next_repeat_due_ms(&self) -> Option<u64> {
+        self.keyboard.next_repeat_due_ms()
     }
 
     /// Apply a coalesced resize: grow the shm pool, resize the backbuffer,
@@ -348,9 +582,31 @@ impl Toplevel {
         let Some(size) = self.geometry.apply_pending() else {
             return Ok(());
         };
-        self.present
+        // The full resize dance, in the order the protocol requires. Getting
+        // this wrong is not a crash -- it is the far worse silent failure of
+        // a window whose buffers still describe the *old* geometry, so the
+        // compositor reads each row at the previous stride and the image
+        // shears into diagonal streaks.
+        //
+        // 1. Destroy the buffers carved out of the old pool layout.
+        self.present.destroy_old_buffers(&mut self.window_tx);
+        // 2. Re-mmap. A `Some` means the pool had to grow, which the
+        //    compositor must be told about before it will honour buffers
+        //    that reach past the old end.
+        let grew = self
+            .present
             .resize_shm(size.width, size.height)
             .map_err(|e| Error::Conn(crate::conn::ConnError::Sys(e)))?;
+        if let Some(new_capacity) = grew {
+            self.present.grow_pool(&mut self.window_tx, new_capacity);
+        }
+        // 3. Carve new buffers at the new width/height/stride.
+        self.present
+            .recreate_buffers(&mut self.window_tx, size.width, size.height);
+        // 4. Reset the swap-chain bookkeeping. One row: this window repaints
+        //    its whole backbuffer every present, so per-row stale tracking
+        //    has nothing to track.
+        self.present.reset_after_resize(1);
         // Refill rather than merely resize: the newly exposed region would
         // otherwise show whatever stale pixels the Vec's spare capacity
         // happened to hold.

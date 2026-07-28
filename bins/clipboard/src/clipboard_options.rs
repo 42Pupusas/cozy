@@ -76,10 +76,7 @@ impl ClipboardOptions {
         })
     }
 
-    fn next_value(
-        args: &mut impl Iterator<Item = OsString>,
-        flag: &str,
-    ) -> Result<String, String> {
+    fn next_value(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<String, String> {
         args.next()
             .map(|v| v.to_string_lossy().into_owned())
             .ok_or_else(|| format!("`{flag}` needs a value"))
@@ -92,9 +89,11 @@ impl ClipboardOptions {
     #[must_use]
     pub fn default_store_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let data_home = std::env::var("XDG_DATA_HOME")
-            .unwrap_or_else(|_| format!("{home}/.local/share"));
-        PathBuf::from(data_home).join("clipboard").join("history.bin")
+        let data_home =
+            std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
+        PathBuf::from(data_home)
+            .join("clipboard")
+            .join("history.bin")
     }
 
     /// The resolved store path.

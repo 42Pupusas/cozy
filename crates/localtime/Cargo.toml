@@ -1,0 +1,15 @@
+[package]
+name    = "localtime"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# No deps: this crate is one audited `unsafe extern "C"` block around
+# `time(2)`/`localtime_r(3)` and the formatting on top of it. It exists as its
+# own crate rather than living inside `crates/statusbar` because a second
+# consumer appeared -- `crates/fileops` needs local time for the
+# `DeletionDate` field of a `.trashinfo` file -- and duplicating raw FFI is
+# exactly the kind of thing that must have a single owner.

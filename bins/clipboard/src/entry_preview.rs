@@ -34,10 +34,10 @@ impl EntryPreview {
                 return Self::summarise(bytes);
             }
         }
-        payload.mimes().next().map_or_else(
-            || "[empty]".to_string(),
-            |mime| format!("[{mime}]"),
-        )
+        payload
+            .mimes()
+            .next()
+            .map_or_else(|| "[empty]".to_string(), |mime| format!("[{mime}]"))
     }
 
     /// Collapse text to one printable line.

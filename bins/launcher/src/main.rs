@@ -191,7 +191,17 @@ impl LauncherApp {
                 ..
             } = &mut self;
             match window.tick(|canvas| {
-                Painter::paint(canvas, text, title_text, command_text, catalog, icons, theme, query, *selected);
+                Painter::paint(
+                    canvas,
+                    text,
+                    title_text,
+                    command_text,
+                    catalog,
+                    icons,
+                    theme,
+                    query,
+                    *selected,
+                );
             }) {
                 Ok(true) => {}
                 Ok(false) => break,
@@ -274,7 +284,11 @@ impl LauncherApp {
             }
             LauncherKey::CtrlDigit(digit) => {
                 if (1..=9).contains(&digit) {
-                    let count = self.catalog.search(&self.query).len().min(MAX_VISIBLE_RESULTS);
+                    let count = self
+                        .catalog
+                        .search(&self.query)
+                        .len()
+                        .min(MAX_VISIBLE_RESULTS);
                     let index = usize::from(digit - 1);
                     if index < count {
                         self.selected = index;
@@ -328,7 +342,15 @@ impl Painter {
         // typed text (or a placeholder) at the top.
         let query_y = pad;
         if query.is_empty() {
-            text.draw_text_alpha(canvas, "Type to search…", pad, query_y, helper, bg, bg_alpha);
+            text.draw_text_alpha(
+                canvas,
+                "Type to search…",
+                pad,
+                query_y,
+                helper,
+                bg,
+                bg_alpha,
+            );
         } else {
             text.draw_text_alpha(canvas, query, pad, query_y, fg, bg, bg_alpha);
         }
@@ -432,7 +454,8 @@ impl Painter {
 /// `/tmp` if unset, matching how `platform::conn` resolves the Wayland
 /// socket itself.
 fn singleton_socket_path() -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    let dir =
+        std::env::var_os("XDG_RUNTIME_DIR").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     dir.join("launcher.sock")
 }
 
@@ -512,7 +535,8 @@ fn main() -> std::process::ExitCode {
             // so `LauncherApp` still has a `SingletonGuard` to hold
             // (`UnixListener::bind("")` isn't valid, so this uses a
             // process-unique fallback path under /tmp instead).
-            let fallback = std::env::temp_dir().join(format!("launcher-{}.sock", std::process::id()));
+            let fallback =
+                std::env::temp_dir().join(format!("launcher-{}.sock", std::process::id()));
             match SingletonGuard::acquire(&fallback) {
                 Ok(SingletonAcquire::Primary(guard)) => guard,
                 _ => return std::process::ExitCode::FAILURE,

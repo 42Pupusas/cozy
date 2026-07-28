@@ -1,0 +1,21 @@
+[package]
+name    = "fileops"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The one dependency: the freedesktop trash spec requires a `DeletionDate` in
+# *local* time with no offset suffix, which `std` cannot produce (it offers
+# only UTC-relative `SystemTime`). `crates/localtime` owns the single audited
+# `localtime_r(3)` FFI block for the whole workspace.
+localtime = { path = "../localtime" }
+
+# Otherwise no path deps, by design -- same rule as `crates/fsmodel`. This crate is pure
+# filesystem *mutation* logic (trash, copy, move, delete) with zero Wayland,
+# rendering, or widget knowledge, so every rule in here is headlessly testable
+# against a real temp directory. It deliberately does not depend on `fsmodel`
+# either: reading a directory and mutating it are separate responsibilities,
+# and a copy engine has no business knowing about sort policies.

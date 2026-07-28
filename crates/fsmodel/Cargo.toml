@@ -1,0 +1,15 @@
+[package]
+name    = "fsmodel"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# No path deps, by design. This crate is pure directory-model logic --
+# reading a directory into typed entries, then sorting/filtering them into a
+# view -- with zero Wayland/rendering knowledge, mirroring how `crates/launcher`
+# is split from `bins/launcher`. That keeps it headlessly unit-testable (no
+# compositor required) and reusable by anything that needs to present a
+# directory: `bins/files`, and eventually a portal FileChooser dialog.

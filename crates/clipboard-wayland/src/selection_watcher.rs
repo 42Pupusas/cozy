@@ -143,10 +143,7 @@ impl SelectionWatcher {
                 payload.offer(ClipboardOffer::new(mime, bytes));
             }
         }
-        let _ = sender.request(MessageBuilder::new(
-            offer,
-            DataControlOfferRequest::Destroy,
-        ));
+        let _ = sender.request(MessageBuilder::new(offer, DataControlOfferRequest::Destroy));
         (!payload.is_empty()).then_some(payload)
     }
 }

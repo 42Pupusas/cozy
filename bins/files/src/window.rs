@@ -13,7 +13,7 @@ use platform::toplevel::{KeyPress, Painter, PhysicalSize, PointerEventKind, Posi
 use widget::Mods;
 
 use crate::breadcrumb::Breadcrumb;
-use crate::browser::{Browser, Outcome};
+use crate::browser::{Browser, Outcome, ViewMode};
 use crate::columns::{Column, Columns};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
@@ -329,23 +329,21 @@ impl FilesWindow {
             return self.sidebar_row_at(at).map(|i| Spot::Row(Pane::Sidebar, i));
         }
         self.to_pane(at)
-            .and_then(|(_, y)| self.browser.pane().viewport().row_at_y(y))
+            .and_then(|(x, y)| match self.browser.view_mode() {
+                ViewMode::List => self.browser.pane().viewport().row_at_y(y),
+                ViewMode::Grid => self.browser.grid().item_at(x, y),
+            })
             .map(|i| Spot::Row(Pane::List, i))
     }
 
     /// Act on a click on toolbar control `target`.
-    ///
-    /// The grid segment is deliberately inert: the view is not implemented, and
-    /// a toggle that appeared to switch to a view that never arrived would be
-    /// worse than one that visibly does nothing.
     fn activate_control(&mut self, target: Target) {
         let outcome = match target {
             Target::Back => self.browser.go_back(),
             Target::Forward => self.browser.go_forward(),
             Target::Filter => self.browser.focus_filter(),
-            // List is already the current view, and grid does not exist yet, so
-            // neither segment changes anything.
-            Target::ViewList | Target::ViewGrid => Outcome::Ignored,
+            Target::ViewList => self.browser.set_view_mode(ViewMode::List),
+            Target::ViewGrid => self.browser.set_view_mode(ViewMode::Grid),
         };
         self.apply(outcome);
         // Back and forward can cross a filesystem boundary, exactly as a
@@ -479,10 +477,8 @@ impl FilesWindow {
 
     /// Draw the list/grid view toggle at the toolbar's right end.
     ///
-    /// Two segments in a shared outline, the active one filled -- the guide's
-    /// anatomy. Only `list` is implemented, so `grid` is drawn muted: the
-    /// toggle communicates the current view (which is real information) while
-    /// not offering a switch that would do nothing.
+    /// Two live segments share an outline; the active presentation gets the
+    /// accent wash, so the toggle states what the content is showing.
     fn paint_view_toggle(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
         // Dropped entirely rather than overlapped when the toolbar is too
@@ -498,24 +494,45 @@ impl FilesWindow {
         // rounding all four would leave a notch mid-pair. Drawing the fill one
         // radius wider and squaring off that overhang gives the D-shape.
         let radius = theme.spacing.radius();
+        let active = match self.browser.view_mode() {
+            ViewMode::List => 0,
+            ViewMode::Grid => 1,
+        };
+        let fill_x = x + button * active;
         canvas.fill_round_rect(
-            Rect::new(x, y, button + radius, height),
+            Rect::new(
+                fill_x - if active == 1 { radius } else { 0 },
+                y,
+                button + radius,
+                height,
+            ),
             theme.accent_surface,
             radius,
         );
         canvas.fill_rect(
-            Rect::new(x + button, y, radius, height),
+            Rect::new(
+                if active == 0 {
+                    fill_x + button
+                } else {
+                    fill_x - radius
+                },
+                y,
+                radius,
+                height,
+            ),
             theme.accent_surface,
         );
         canvas.draw_round_rect(Rect::new(x, y, width, height), theme.control_border, radius);
-        for (i, (glyph, color)) in [("\u{2261}", theme.accent), ("\u{22ee}", theme.disabled)]
-            .into_iter()
-            .enumerate()
-        {
-            let bg = if i == 0 {
+        for (i, glyph) in ["\u{2261}", "\u{22ee}"].into_iter().enumerate() {
+            let bg = if i32::try_from(i).unwrap_or(-1) == active {
                 theme.accent_surface
             } else {
                 theme.toolbar_bg
+            };
+            let color = if i32::try_from(i).unwrap_or(-1) == active {
+                theme.accent
+            } else {
+                theme.text
             };
             let tier = &mut self.type_scale.label;
             let text_w = tier.measure(glyph);
@@ -1117,18 +1134,92 @@ impl FilesWindow {
         if selected { theme.text } else { theme.muted }
     }
 
-    /// Draw the scrollbar, if the list overflows.
+    /// Draw square cards for the grid presentation.
+    fn paint_grid(&mut self, canvas: &mut Canvas<'_>) {
+        let theme = self.theme;
+        let band = self.frame().rows();
+        let cells = self.browser.grid().visible_cells();
+        for cell in cells {
+            let Some(entry) = self.browser.entry(cell.index) else {
+                continue;
+            };
+            let rect = Rect::new(band.x + cell.x, band.y + cell.y, cell.width, cell.height);
+            let selected = self.browser.grid().is_selected(cell.index);
+            let hovered = self.hover.is(Pane::List, cell.index);
+            let cursor = self.focused && self.browser.grid().cursor() == Some(cell.index);
+            let kind = RowKind::of(entry);
+            let background = if selected {
+                let fill = kind.selection_fill(&theme);
+                canvas.fill_round_rect(rect, fill, theme.spacing.radius());
+                fill
+            } else {
+                if hovered || cursor {
+                    // Grid hover is deliberately an outline, preserving the
+                    // guide's quiet card geometry instead of turning cards
+                    // into list-row surfaces.
+                    canvas.draw_round_rect(rect, kind.hover_fill(&theme), theme.spacing.radius());
+                }
+                theme.background
+            };
+            let icon = if entry.is_navigable() { "□" } else { "◇" };
+            let icon_tier = &mut self.type_scale.title;
+            let icon_w = icon_tier.measure(icon);
+            icon_tier.draw_text(
+                canvas,
+                icon,
+                rect.x + (rect.w - icon_w) / 2,
+                rect.y + theme.spacing.m(),
+                RowFormat::color(entry, &theme),
+                background,
+            );
+            let label = RowFormat::truncate(
+                &RowFormat::name(entry),
+                Self::columns_for(&mut self.type_scale.detail, rect.w - theme.spacing.m() * 2),
+            );
+            let detail = &mut self.type_scale.detail;
+            let label_w = detail.measure(&label);
+            detail.draw_text(
+                canvas,
+                &label,
+                rect.x + (rect.w - label_w) / 2,
+                rect.bottom() - theme.spacing.m() - detail.line_height(),
+                theme.text,
+                background,
+            );
+        }
+    }
+
+    /// Draw the active presentation's scrollbar, if it overflows.
     fn paint_scrollbar(&self, canvas: &mut Canvas<'_>) {
-        let pane = self.browser.pane();
-        if !pane.scrollbar_visible() {
+        let (visible, gutter_x, scrollbar, viewport) = match self.browser.view_mode() {
+            ViewMode::List => {
+                let pane = self.browser.pane();
+                (
+                    pane.scrollbar_visible(),
+                    pane.gutter_x(),
+                    pane.scrollbar(),
+                    pane.viewport(),
+                )
+            }
+            ViewMode::Grid => {
+                let grid = self.browser.grid();
+                (
+                    grid.scrollbar_visible(),
+                    grid.gutter_x(),
+                    grid.scrollbar(),
+                    grid.viewport(),
+                )
+            }
+        };
+        if !visible {
             return;
         }
         let theme = &self.theme;
         let band = self.frame().rows();
-        let x = band.x + pane.gutter_x();
+        let x = band.x + gutter_x;
         let gutter = (band.right() - x).max(0);
         canvas.fill_rect(Rect::new(x, band.y, gutter, band.h), theme.scrollbar_track);
-        let thumb = pane.scrollbar().thumb(pane.viewport());
+        let thumb = scrollbar.thumb(viewport);
         // The thumb is rounded to its own half-width, i.e. a capsule: it is a
         // free-floating element with nothing to align a square edge against.
         let thumb_w = (gutter - 4).max(1);
@@ -1271,8 +1362,12 @@ impl Painter for FilesWindow {
         canvas.fill_rect_glass(self.frame().main(), self.theme.background);
         self.paint_toolbar(canvas);
         self.paint_sidebar(canvas);
-        self.paint_column_headers(canvas);
-        self.paint_rows(canvas);
+        if self.browser.view_mode() == ViewMode::List {
+            self.paint_column_headers(canvas);
+            self.paint_rows(canvas);
+        } else {
+            self.paint_grid(canvas);
+        }
         self.paint_scrollbar(canvas);
         self.paint_status(canvas);
     }

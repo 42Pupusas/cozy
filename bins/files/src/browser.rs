@@ -29,10 +29,20 @@ use fsmodel::DirectoryView;
 use fsmodel::entry::Entry;
 use fsmodel::reader::ReadError;
 use std::path::{Path, PathBuf};
-use widget::{ListCommand, ListPane, Mods, PaneResponse, TextInput};
+use widget::{GridPane, ListCommand, ListPane, Mods, PaneResponse, TextInput};
 
 use crate::history::{History, Trail};
 use crate::keymap::{Action, EditAction, Focus, Keymap};
+
+/// Which presentation is active for the current directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    /// Metadata-rich rows.
+    #[default]
+    List,
+    /// Square file cards.
+    Grid,
+}
 
 /// What the browser did with an input, for the window to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +79,10 @@ impl Outcome {
 pub struct Browser {
     view: DirectoryView,
     pane: ListPane,
+    /// The grid keeps independent scroll geometry; selection transfers when
+    /// switching views because it describes files, not their presentation.
+    grid: GridPane,
+    view_mode: ViewMode,
     filter: TextInput,
     keymap: Keymap,
     /// Where the user has been, for the toolbar's chevrons.
@@ -87,9 +101,22 @@ impl Browser {
     pub fn open(path: &Path, width: i32, height: i32, row_height: i32) -> Result<Self, ReadError> {
         let view = DirectoryView::open(path)?;
         let pane = ListPane::new(width, height, row_height, view.visible_len());
+        // The guide's 114px card follows the list scale, so a density or font
+        // adjustment cannot make the two presentations disagree in size.
+        let card = row_height.saturating_mul(114).div_euclid(49).max(1);
+        let grid = GridPane::new(
+            width,
+            height,
+            card,
+            card,
+            row_height / 6,
+            view.visible_len(),
+        );
         Ok(Self {
             view,
             pane,
+            grid,
+            view_mode: ViewMode::List,
             filter: TextInput::new(),
             keymap: Keymap::new(),
             history: History::new(),
@@ -103,10 +130,39 @@ impl Browser {
         self.view.path()
     }
 
-    /// The list pane, for painting.
+    /// The list pane, for list painting.
     #[must_use]
     pub const fn pane(&self) -> &ListPane {
         &self.pane
+    }
+
+    /// The card grid, for grid painting.
+    #[must_use]
+    pub const fn grid(&self) -> &GridPane {
+        &self.grid
+    }
+
+    /// The presentation currently active.
+    #[must_use]
+    pub const fn view_mode(&self) -> ViewMode {
+        self.view_mode
+    }
+
+    /// Switch presentation, preserving the user's selected files.
+    pub fn set_view_mode(&mut self, mode: ViewMode) -> Outcome {
+        if self.view_mode == mode {
+            return Outcome::Ignored;
+        }
+        match mode {
+            ViewMode::Grid => self
+                .grid
+                .replace_selection(self.pane.selection().selected(), self.pane.cursor()),
+            ViewMode::List => self
+                .pane
+                .replace_selection(self.grid.selection().selected(), self.grid.cursor()),
+        }
+        self.view_mode = mode;
+        Outcome::Redraw
     }
 
     /// The filter box, for painting.
@@ -199,12 +255,17 @@ impl Browser {
     /// The entry under the cursor.
     #[must_use]
     pub fn cursor_entry(&self) -> Option<&Entry> {
-        self.pane.cursor().and_then(|row| self.entry(row))
+        let cursor = match self.view_mode {
+            ViewMode::List => self.pane.cursor(),
+            ViewMode::Grid => self.grid.cursor(),
+        };
+        cursor.and_then(|row| self.entry(row))
     }
 
     /// Resize the pane.
     pub fn resize(&mut self, width: i32, height: i32) {
         self.pane.resize(width, height);
+        self.grid.resize(width, height);
     }
 
     /// Apply a translated key action.
@@ -252,7 +313,7 @@ impl Browser {
             Action::Refresh => self.refresh(),
             Action::ToggleHidden => {
                 self.view.toggle_hidden();
-                self.pane.set_len(self.view.visible_len());
+                self.set_len(self.view.visible_len());
                 Outcome::Redraw
             }
             Action::ToggleFavorite => Outcome::ToggleFavorite,
@@ -292,13 +353,13 @@ impl Browser {
     /// selection index past the end of the list.
     fn apply_query(&mut self) -> bool {
         self.view.set_query(self.filter.text());
-        self.pane.set_len(self.view.visible_len());
+        self.set_len(self.view.visible_len());
         true
     }
 
     /// Run a list command, resolving an activation against the model.
     fn list_command(&mut self, cmd: ListCommand) -> Outcome {
-        match self.pane.command(cmd) {
+        match self.active_command(cmd) {
             PaneResponse::Ignored => Outcome::Ignored,
             PaneResponse::Redraw => Outcome::Redraw,
             PaneResponse::Activate(row) => self.activate(row),
@@ -372,6 +433,7 @@ impl Browser {
                 self.view.set_query("");
                 self.keymap.set_focus(Focus::List);
                 self.pane.reset(self.view.visible_len());
+                self.grid.reset(self.view.visible_len());
                 if let Some(target) = select {
                     self.select_path(target);
                 }
@@ -393,11 +455,13 @@ impl Browser {
         else {
             return false;
         };
-        // Through the pane rather than the selection directly, so the row is
-        // also scrolled into view -- landing on an off-screen cursor would
-        // look exactly like landing at the top.
-        self.pane.select_row(row);
-        true
+        // Through the active presentation rather than a bare selection, so
+        // the target is also scrolled into view -- landing on an off-screen
+        // cursor would look exactly like landing at the top.
+        match self.view_mode {
+            ViewMode::List => self.pane.select_row(row),
+            ViewMode::Grid => self.grid.select_item(row),
+        }
     }
 
     /// Re-read the current directory, preserving the cursor where possible.
@@ -408,7 +472,7 @@ impl Browser {
         match self.view.refresh() {
             Ok(()) => {
                 self.error = None;
-                self.pane.set_len(self.view.visible_len());
+                self.set_len(self.view.visible_len());
                 if let Some(path) = cursor_path {
                     self.select_path(&path);
                 }
@@ -426,7 +490,7 @@ impl Browser {
         // A click anywhere in the list takes focus away from the filter box,
         // so the next letter typed is a shortcut again.
         self.keymap.set_focus(Focus::List);
-        match self.pane.press(x, y, mods) {
+        match self.active_press(x, y, mods) {
             PaneResponse::Ignored => Outcome::Ignored,
             PaneResponse::Redraw => Outcome::Redraw,
             PaneResponse::Activate(row) => self.activate(row),
@@ -435,20 +499,61 @@ impl Browser {
 
     /// Pointer motion, for scrollbar drags.
     pub fn motion(&mut self, y: i32) -> Outcome {
-        Outcome::redraw_if(self.pane.motion(y).needs_redraw())
+        Outcome::redraw_if(self.active_motion(y).needs_redraw())
     }
 
     /// Pointer release.
     pub const fn release(&mut self) -> Outcome {
-        Outcome::redraw_if(self.pane.release().needs_redraw())
+        Outcome::redraw_if(self.active_release().needs_redraw())
     }
 
     /// A double-click, which activates the row under the pointer.
     pub fn double_click(&mut self, x: i32, y: i32) -> Outcome {
-        match self.pane.double_click(x, y) {
+        match self.active_double_click(x, y) {
             PaneResponse::Activate(row) => self.activate(row),
             PaneResponse::Redraw => Outcome::Redraw,
             PaneResponse::Ignored => Outcome::Ignored,
+        }
+    }
+
+    /// Keep both presentations' backing lengths consistent after a filter or refresh.
+    fn set_len(&mut self, len: usize) {
+        self.pane.set_len(len);
+        self.grid.set_len(len);
+    }
+
+    fn active_command(&mut self, command: ListCommand) -> PaneResponse {
+        match self.view_mode {
+            ViewMode::List => self.pane.command(command),
+            ViewMode::Grid => self.grid.command(command),
+        }
+    }
+
+    fn active_press(&mut self, x: i32, y: i32, mods: Mods) -> PaneResponse {
+        match self.view_mode {
+            ViewMode::List => self.pane.press(x, y, mods),
+            ViewMode::Grid => self.grid.press(x, y, mods),
+        }
+    }
+
+    fn active_motion(&mut self, y: i32) -> PaneResponse {
+        match self.view_mode {
+            ViewMode::List => self.pane.motion(y),
+            ViewMode::Grid => self.grid.motion(y),
+        }
+    }
+
+    const fn active_release(&mut self) -> PaneResponse {
+        match self.view_mode {
+            ViewMode::List => self.pane.release(),
+            ViewMode::Grid => self.grid.release(),
+        }
+    }
+
+    fn active_double_click(&mut self, x: i32, y: i32) -> PaneResponse {
+        match self.view_mode {
+            ViewMode::List => self.pane.double_click(x, y),
+            ViewMode::Grid => self.grid.double_click(x, y),
         }
     }
 
@@ -495,6 +600,40 @@ mod tests {
         for c in text.chars() {
             browser.act(Action::Insert(c));
         }
+    }
+
+    #[test]
+    fn changing_views_keeps_the_selected_entry() {
+        let dir = TempDir::new("grid_selection_transfer");
+        dir.create_file("alpha.txt", b"a");
+        dir.create_file("beta.txt", b"b");
+        let mut browser = open(&dir);
+        down(&mut browser);
+        let selected = browser.cursor_entry().expect("cursor").path.clone();
+
+        assert_eq!(
+            browser.set_view_mode(super::ViewMode::Grid),
+            Outcome::Redraw
+        );
+        assert_eq!(browser.view_mode(), super::ViewMode::Grid);
+        assert_eq!(browser.cursor_entry().expect("grid cursor").path, selected);
+
+        assert_eq!(
+            browser.set_view_mode(super::ViewMode::List),
+            Outcome::Redraw
+        );
+        assert_eq!(browser.cursor_entry().expect("list cursor").path, selected);
+    }
+
+    #[test]
+    fn grid_activation_uses_the_same_directory_navigation_as_the_list() {
+        let dir = TempDir::new("grid_activation");
+        dir.create_dir("child");
+        let mut browser = open(&dir);
+        browser.set_view_mode(super::ViewMode::Grid);
+        browser.press(10, 10, Mods::none());
+        assert_eq!(activate(&mut browser), Outcome::Redraw);
+        assert!(browser.path().ends_with("child"));
     }
 
     /// The names currently visible, in order.

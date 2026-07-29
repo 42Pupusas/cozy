@@ -339,6 +339,23 @@ impl ListPane {
         PaneResponse::Redraw
     }
 
+    /// Replace the selection while retaining a valid focused row.
+    ///
+    /// This is intentionally the narrow transfer seam for a second view of
+    /// the same directory: selection is user state, not list-layout state.
+    pub fn replace_selection(&mut self, selected: &[usize], cursor: Option<usize>) {
+        self.selection.clear();
+        for &row in selected {
+            if row < self.viewport.len() {
+                self.selection.toggle(row);
+            }
+        }
+        if let Some(row) = cursor.filter(|&row| row < self.viewport.len()) {
+            self.selection.select_only(row);
+            self.viewport.scroll_into_view(row);
+        }
+    }
+
     /// Pointer motion. Only meaningful mid-scrollbar-drag; row hover is the
     /// caller's business, since it needs no state this type owns.
     pub fn motion(&mut self, y: i32) -> PaneResponse {

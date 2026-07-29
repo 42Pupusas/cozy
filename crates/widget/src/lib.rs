@@ -25,6 +25,7 @@
 //! compositor.
 
 mod command;
+mod grid_pane;
 mod pane;
 mod scrollbar;
 mod selection;
@@ -32,6 +33,7 @@ mod text_input;
 mod viewport;
 
 pub use command::{Direction, Edge, ListCommand, Mods, PaneResponse};
+pub use grid_pane::{GridCell, GridPane};
 pub use pane::ListPane;
 pub use scrollbar::{Scrollbar, Thumb};
 pub use selection::ListSelection;

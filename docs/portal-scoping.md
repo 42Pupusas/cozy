@@ -132,9 +132,11 @@ revertible before the following step begins.
    argument validation, standard D-Bus error returns, and Properties support.
    Refactor the statusbar watcher only if it reduces duplication without mixing
    its service policy into generic code.
-4. **Scratch service.** Build a small test daemon on a scratch well-known name;
-   exercise introspection, a method call, `GetAll`, malformed arguments, and a
-   signal from an external D-Bus client before registering any portal interface.
+4. **Scratch service (done).** Built as `crates/dbus-server/tests/scratch_service.rs`:
+   a small test daemon on a scratch well-known name, exercising introspection,
+   a method call, `GetAll`, malformed arguments, and a signal from an
+   external, independently-connected D-Bus client -- all over a real session
+   bus connection, not just in-memory `Dispatcher`/`ServerLoop` unit tests.
 5. **Settings backend.** Implement `impl.portal.Settings` backed by
    `crates/config`. Route only Settings via a `.portal` file and `portals.conf`.
    This validates the real frontend path without UI or FD complexity.

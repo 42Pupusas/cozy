@@ -82,7 +82,7 @@ crates/dbus-server/          Depends on crates/dbus; re-exports what downstream
   router.rs                  Signature-checked method dispatch (done)
   introspection.rs           Introspectable XML responses (done)
   properties.rs              GetAll and PropertiesChanged (done)
-  name_watcher.rs            Caller death -> request/session cleanup
+  name_watcher.rs            Caller death -> request/session cleanup (done)
 
 crates/portal-core/
   request_handle.rs          Request paths and token validation

@@ -331,7 +331,11 @@ impl SelectionTracker {
             // Clone the owned transport payload, not a materialized cell row.
             // This is the core ownership change: idle selection now carries
             // uniform terminal output without expanding it into `Cell`s.
-            self.mirror[r] = row.content.clone();
+            // `clone_from` (not `= row.content.clone()`) lets a same-shaped
+            // row (the overwhelming common case -- the same rows redraw
+            // frame after frame) reuse this slot's existing `Vec` allocation
+            // instead of dropping it and allocating fresh every snapshot.
+            self.mirror[r].clone_from(&row.content);
         }
     }
 

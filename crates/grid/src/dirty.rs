@@ -231,7 +231,7 @@ impl DirtyRegion {
 /// one narrow SGR/link style. Transporting their codepoints beside that single
 /// style avoids constructing a 20-byte [`Cell`] per column just to immediately
 /// unpack the same attributes again in the renderer.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum DirtyRowContent {
     /// Narrow characters sharing one SGR state and OSC-8 link id.
     Uniform {
@@ -244,6 +244,57 @@ pub enum DirtyRowContent {
     },
     /// General row retaining per-cell styles and wide-glyph placement.
     Cells(Vec<Cell>),
+}
+
+impl Clone for DirtyRowContent {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Uniform {
+                chars,
+                attrs,
+                link_id,
+            } => Self::Uniform {
+                chars: chars.clone(),
+                attrs: *attrs,
+                link_id: *link_id,
+            },
+            Self::Cells(cells) => Self::Cells(cells.clone()),
+        }
+    }
+
+    /// A hand-written `clone_from` reusing the target's existing allocation.
+    ///
+    /// `SelectionTracker::ingest_snapshot` re-clones every dirty row's
+    /// transport payload into its retained mirror on every frame, and a
+    /// terminal typically redraws the same rows shape-for-shape (same
+    /// variant, same column count) round after round. The derived `Clone`
+    /// only gives the default `clone_from` (`*self = source.clone()`), which
+    /// drops the mirror slot's `Vec` and allocates a fresh one every time even
+    /// though the old backing storage was already the right size. Matching on
+    /// both sides and delegating to `Vec::clone_from` lets the already-sized
+    /// allocation be reused in place instead.
+    fn clone_from(&mut self, source: &Self) {
+        match (&mut *self, source) {
+            (
+                Self::Uniform {
+                    chars,
+                    attrs,
+                    link_id,
+                },
+                Self::Uniform {
+                    chars: source_chars,
+                    attrs: source_attrs,
+                    link_id: source_link_id,
+                },
+            ) => {
+                chars.clone_from(source_chars);
+                *attrs = *source_attrs;
+                *link_id = *source_link_id;
+            }
+            (Self::Cells(cells), Self::Cells(source_cells)) => cells.clone_from(source_cells),
+            _ => *self = source.clone(),
+        }
+    }
 }
 
 impl DirtyRowContent {

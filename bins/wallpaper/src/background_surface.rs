@@ -10,12 +10,11 @@ use crate::appearance::Appearance;
 use crate::wallpaper_pixels::WallpaperPixels;
 use platform::Result;
 use platform::conn::Sender;
-use platform::id::{
-    CompositorId, LayerShellId, LayerSurfaceId, OutputId, PoolId, ShmId, SurfaceId,
-};
+use platform::id::{CompositorId, LayerShellId, OutputId, PoolId, ShmId};
+use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::protocol::{
-    Anchor, BufferRequest, CompositorRequest, Format, KeyboardInteractivity, Layer,
-    LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest, ShmPoolRequest, SurfaceRequest,
+    Anchor, BufferRequest, Format, KeyboardInteractivity, Layer, LayerSurfaceEvent,
+    ShmPoolRequest, SurfaceRequest,
 };
 use platform::surface::Frame;
 use platform::sys::ShmBuffer;
@@ -27,8 +26,7 @@ const APP_ID: &str = "wallpaper";
 pub struct BackgroundSurface {
     output: OutputId,
     shm: ShmId,
-    surface: SurfaceId,
-    layer_surface: LayerSurfaceId,
+    layer: LayerSurfaceHandle,
     frames: Option<([Frame; 2], ShmBuffer, PoolId)>,
     dimensions: Option<(i32, i32)>,
     appearance: Appearance,
@@ -45,42 +43,37 @@ impl BackgroundSurface {
         output: OutputId,
         appearance: Appearance,
     ) -> Result<Self> {
-        let surface = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
-        )?;
-        let layer_surface = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(layer_shell, LayerShellRequest::GetLayerSurface)
-                .new_id(layer_surface)
-                .object(surface)
-                .object(output)
-                .u32(Layer::Background as u32)
-                .string(APP_ID),
-        )?;
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetAnchor).u32(Anchor::bits(
-                &[Anchor::Top, Anchor::Bottom, Anchor::Left, Anchor::Right],
-            )),
-        )?;
         // `-1` is the layer-shell sentinel for a true full-output surface:
         // do not reserve usable space and do not be inset by another layer's
         // exclusive zone (such as a status bar). `0` merely reserves nothing;
         // it still permits the compositor to size this surface around a bar.
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetExclusiveZone).i32(-1),
+        // The initial buffer-less commit inside `create` asks layer-shell for
+        // the output dimensions.
+        let layer = LayerSurfaceHandle::create(
+            sender,
+            compositor,
+            layer_shell,
+            &LayerSurfaceConfig {
+                layer: Layer::Background,
+                namespace: APP_ID,
+                output,
+                buffer_scale: None,
+                anchor: Some(Anchor::bits(&[
+                    Anchor::Top,
+                    Anchor::Bottom,
+                    Anchor::Left,
+                    Anchor::Right,
+                ])),
+                size: None,
+                exclusive_zone: Some(-1),
+                margin: None,
+                keyboard_interactivity: KeyboardInteractivity::None,
+            },
         )?;
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetKeyboardInteractivity)
-                .u32(KeyboardInteractivity::None as u32),
-        )?;
-        // An empty initial commit asks layer-shell for the output dimensions.
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
         let mut background = Self {
             output,
             shm,
-            surface,
-            layer_surface,
+            layer,
             frames: None,
             dimensions: None,
             appearance: appearance.clone(),
@@ -97,11 +90,7 @@ impl BackgroundSurface {
         if let Some(frames) = self.frames.take() {
             Self::destroy_frames(sender, frames)?;
         }
-        sender.request(MessageBuilder::new(
-            self.layer_surface,
-            LayerSurfaceRequest::Destroy,
-        ))?;
-        sender.request(MessageBuilder::new(self.surface, SurfaceRequest::Destroy))?;
+        self.layer.destroy(sender)?;
         Ok(())
     }
 
@@ -141,15 +130,12 @@ impl BackgroundSurface {
         sender: &mut Sender,
         event: &platform::event::RawEvent,
     ) -> Result<()> {
-        if !event.is(self.layer_surface)
+        if !event.is(self.layer.layer_surface)
             || event.event::<LayerSurfaceEvent>() != Some(LayerSurfaceEvent::Configure)
         {
             return Ok(());
         }
-        sender.request(
-            MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
-                .u32(event.arg(0)),
-        )?;
+        self.layer.ack_configure(sender, event.arg(0))?;
         // A zero dimension means the compositor left that axis client-chosen.
         // Four-edge anchoring normally supplies both; declining a zero-sized
         // shm allocation is safer than inventing geometry on a protocol edge.
@@ -223,19 +209,19 @@ impl BackgroundSurface {
             return Ok(());
         };
         sender.request(
-            MessageBuilder::new(self.surface, SurfaceRequest::Attach)
+            MessageBuilder::new(self.layer.surface, SurfaceRequest::Attach)
                 .object(frames[0].buffer)
                 .i32(0)
                 .i32(0),
         )?;
         sender.request(
-            MessageBuilder::new(self.surface, SurfaceRequest::Damage)
+            MessageBuilder::new(self.layer.surface, SurfaceRequest::Damage)
                 .i32(0)
                 .i32(0)
                 .i32(width)
                 .i32(height),
         )?;
-        sender.request(MessageBuilder::new(self.surface, SurfaceRequest::Commit))?;
+        sender.request(MessageBuilder::new(self.layer.surface, SurfaceRequest::Commit))?;
         Ok(())
     }
 }

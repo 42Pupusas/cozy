@@ -20,14 +20,12 @@ use crate::pointer_state::PointerState;
 use platform::conn::{Sender, WindowSender};
 use platform::draw::{Canvas, Color, Point};
 use platform::event::RawEvent;
-use platform::id::{
-    CompositorId, LayerShellId, LayerSurfaceId, OutputId, RegistryId, SeatId, ShmId, SurfaceId,
-};
+use platform::id::{CompositorId, LayerShellId, OutputId, RegistryId, SeatId, ShmId};
+use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
-    self as proto, Anchor, CompositorRequest, Format, KeyboardInteractivity, Layer,
-    LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest, SeatCapability, SeatEvent,
-    SeatRequest, SurfaceRequest,
+    self as proto, Anchor, Format, KeyboardInteractivity, Layer, LayerSurfaceEvent,
+    SeatCapability, SeatEvent, SeatRequest,
 };
 use platform::wire::MessageBuilder;
 use platform::{Error, Result};
@@ -84,8 +82,7 @@ pub struct BarWindow {
     compositor: CompositorId,
     #[allow(dead_code)]
     layer_shell: LayerShellId,
-    surface: SurfaceId,
-    layer_surface: LayerSurfaceId,
+    layer: LayerSurfaceHandle,
 
     #[allow(dead_code)]
     edge: Edge,
@@ -127,13 +124,7 @@ pub struct BarWindow {
 
 impl Drop for BarWindow {
     fn drop(&mut self) {
-        let _ = self.sender.request(MessageBuilder::new(
-            self.layer_surface,
-            LayerSurfaceRequest::Destroy,
-        ));
-        let _ = self
-            .sender
-            .request(MessageBuilder::new(self.surface, SurfaceRequest::Destroy));
+        let _ = self.layer.destroy(&mut self.sender);
     }
 }
 
@@ -300,48 +291,22 @@ impl BarWindow {
         let (frames, shm_mem, pool) =
             Self::create_frame_pair(&mut sender, shm, INITIAL_WIDTH, px_height, buf_format)?;
 
-        let surface: SurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
+        let layer = LayerSurfaceHandle::create(
+            &mut sender,
+            compositor,
+            layer_shell,
+            &LayerSurfaceConfig {
+                layer: Layer::Top,
+                namespace: APP_ID,
+                output: OutputId(0), // null: let the compositor pick the output
+                buffer_scale: Some(scale),
+                anchor: Some(edge.anchor_bits()),
+                size: Some((0, height)),
+                exclusive_zone: Some(height),
+                margin: Some((0, 0, 0, 0)),
+                keyboard_interactivity: KeyboardInteractivity::None,
+            },
         )?;
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::SetBufferScale).i32(scale))?;
-
-        let layer_surface: LayerSurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(layer_shell, LayerShellRequest::GetLayerSurface)
-                .new_id(layer_surface)
-                .object(surface)
-                .object(OutputId(0)) // null: let the compositor pick the output
-                .u32(Layer::Top as u32)
-                .string(APP_ID),
-        )?;
-
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetAnchor)
-                .u32(edge.anchor_bits()),
-        )?;
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetSize)
-                .i32(0)
-                .i32(height),
-        )?;
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetExclusiveZone).i32(height),
-        )?;
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetMargin)
-                .i32(0)
-                .i32(0)
-                .i32(0)
-                .i32(0),
-        )?;
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetKeyboardInteractivity)
-                .u32(KeyboardInteractivity::None as u32),
-        )?;
-        // First commit carries no buffer -- this is what solicits the initial
-        // `configure`, which tells us the real (output-width) pixel size.
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
 
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<platform::conn::WindowRequest>::new(Capacity::exact(64)).split();
@@ -363,8 +328,7 @@ impl BarWindow {
             wake,
             compositor,
             layer_shell,
-            surface,
-            layer_surface,
+            layer,
             edge,
             height: px_height,
             scale,
@@ -513,7 +477,7 @@ impl BarWindow {
             return Ok(());
         }
 
-        if ev.is(self.layer_surface) {
+        if ev.is(self.layer.layer_surface) {
             return self.handle_layer_surface_event(ev);
         }
         Ok(())
@@ -548,10 +512,7 @@ impl BarWindow {
                 // Wayland surface dimensions never approach i32::MAX, so
                 // this is never actually a sign-changing wrap.
                 let w = ev.arg(1).cast_signed() * self.scale;
-                self.window_tx.request(
-                    MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
-                        .u32(serial),
-                );
+                self.layer.ack_configure_queued(&self.window_tx, serial);
                 if w > 0 {
                     self.resize(w)?;
                 }
@@ -655,7 +616,7 @@ impl BarWindow {
         surface::SurfacePresenter::commit_full_frame(
             &mut self.present,
             &mut self.window_tx,
-            self.surface,
+            self.layer.surface,
             slot,
             self.width,
             self.height,

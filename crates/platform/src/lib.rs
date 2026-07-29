@@ -23,6 +23,7 @@ pub mod font;
 pub mod id;
 pub mod key_repeat;
 pub mod keymap;
+pub mod layer;
 pub mod link_scan;
 pub mod pixel_buffers;
 pub mod premultiply;

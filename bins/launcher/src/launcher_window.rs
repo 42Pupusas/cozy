@@ -19,15 +19,12 @@
 use platform::conn::{Sender, WindowSender};
 use platform::draw::Canvas;
 use platform::event::RawEvent;
-use platform::id::{
-    CompositorId, KeyboardId, LayerShellId, LayerSurfaceId, OutputId, RegistryId, SeatId, ShmId,
-    SurfaceId,
-};
+use platform::id::{CompositorId, KeyboardId, LayerShellId, OutputId, RegistryId, SeatId, ShmId};
+use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
-    self as proto, CompositorRequest, Format, Key, KeyState, KeyboardEvent, KeyboardInteractivity,
-    Layer, LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest, SeatCapability, SeatEvent,
-    SeatRequest, SurfaceRequest,
+    self as proto, Format, Key, KeyState, KeyboardEvent, KeyboardInteractivity, Layer,
+    LayerSurfaceEvent, SeatCapability, SeatEvent, SeatRequest,
 };
 // Two different notions of "key" meet in this file, so neither is left to
 // be inferred from context: `proto::Key` is a *physical* evdev key (what
@@ -99,8 +96,7 @@ pub struct LauncherWindow {
     compositor: CompositorId,
     #[allow(dead_code)]
     layer_shell: LayerShellId,
-    surface: SurfaceId,
-    layer_surface: LayerSurfaceId,
+    layer: LayerSurfaceHandle,
 
     scale: i32,
     width: i32,
@@ -217,13 +213,7 @@ impl GlobalsBuilder {
 
 impl Drop for LauncherWindow {
     fn drop(&mut self) {
-        let _ = self.sender.request(MessageBuilder::new(
-            self.layer_surface,
-            LayerSurfaceRequest::Destroy,
-        ));
-        let _ = self
-            .sender
-            .request(MessageBuilder::new(self.surface, SurfaceRequest::Destroy));
+        let _ = self.layer.destroy(&mut self.sender);
     }
 }
 
@@ -264,35 +254,25 @@ impl LauncherWindow {
         let (frames, shm_mem, pool) =
             Frame::create_pair(&mut sender, shm, px_w, px_h, Format::Argb8888)?;
 
-        let surface: SurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
+        // No anchor: leaving every anchor bit unset means the compositor
+        // centers the surface on the output, exactly the "type to search"
+        // floating bar every desktop launcher uses.
+        let layer = LayerSurfaceHandle::create(
+            &mut sender,
+            compositor,
+            layer_shell,
+            &LayerSurfaceConfig {
+                layer: Layer::Overlay,
+                namespace: APP_ID,
+                output: OutputId(0),
+                buffer_scale: Some(scale),
+                anchor: None,
+                size: Some((width, height)),
+                exclusive_zone: None,
+                margin: None,
+                keyboard_interactivity: KeyboardInteractivity::Exclusive,
+            },
         )?;
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::SetBufferScale).i32(scale))?;
-
-        let layer_surface: LayerSurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(layer_shell, LayerShellRequest::GetLayerSurface)
-                .new_id(layer_surface)
-                .object(surface)
-                .object(OutputId(0))
-                .u32(Layer::Overlay as u32)
-                .string(APP_ID),
-        )?;
-
-        // No SetAnchor call: leaving every anchor bit unset means the
-        // compositor centers the surface on the output, exactly the "type
-        // to search" floating bar every desktop launcher uses.
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetSize)
-                .i32(width)
-                .i32(height),
-        )?;
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetKeyboardInteractivity)
-                .u32(KeyboardInteractivity::Exclusive as u32),
-        )?;
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
 
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<platform::conn::WindowRequest>::new(Capacity::exact(64)).split();
@@ -314,8 +294,7 @@ impl LauncherWindow {
             wake,
             compositor,
             layer_shell,
-            surface,
-            layer_surface,
+            layer,
             scale,
             width: px_w,
             height: px_h,
@@ -435,7 +414,7 @@ impl LauncherWindow {
             return Ok(());
         }
 
-        if ev.is(self.layer_surface) {
+        if ev.is(self.layer.layer_surface) {
             self.handle_layer_surface_event(ev);
         }
         Ok(())
@@ -586,10 +565,7 @@ impl LauncherWindow {
         match ev.event::<LayerSurfaceEvent>() {
             Some(LayerSurfaceEvent::Configure) => {
                 let serial = ev.arg(0);
-                self.window_tx.request(
-                    MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
-                        .u32(serial),
-                );
+                self.layer.ack_configure_queued(&self.window_tx, serial);
                 self.configured = true;
                 self.present.mark_dirty();
             }
@@ -625,7 +601,7 @@ impl LauncherWindow {
         surface::SurfacePresenter::commit_full_frame(
             &mut self.present,
             &mut self.window_tx,
-            self.surface,
+            self.layer.surface,
             slot,
             self.width,
             self.height,

@@ -15,15 +15,13 @@ use platform::Result;
 use platform::conn::Sender;
 use platform::draw::Canvas;
 use platform::event::RawEvent;
-use platform::id::{
-    CompositorId, LayerShellId, LayerSurfaceId, OutputId, PoolId, ShmId, SurfaceId,
-};
+use platform::id::{CompositorId, LayerShellId, OutputId, PoolId, ShmId};
+use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::protocol::{
     Anchor, ButtonState, Format, KeyState, KeyboardEvent, KeyboardInteractivity, Layer,
-    LayerShellRequest, LayerSurfaceEvent, LayerSurfaceRequest, PointerButton, PointerEvent,
-    SurfaceRequest,
+    LayerSurfaceEvent, PointerButton, PointerEvent, SurfaceRequest,
 };
-use platform::protocol::{BufferEvent, BufferRequest, CompositorRequest, ShmPoolRequest};
+use platform::protocol::{BufferEvent, BufferRequest, ShmPoolRequest};
 use platform::surface::Frame;
 use platform::sys::ShmBuffer;
 use platform::wire::MessageBuilder;
@@ -62,8 +60,7 @@ const IDLE_DEADLINE: Duration = Duration::from_mins(2);
 
 /// A fullscreen overlay on one output, driven until the user picks or cancels.
 pub struct SelectionOverlay {
-    surface: SurfaceId,
-    layer_surface: LayerSurfaceId,
+    layer: LayerSurfaceHandle,
     /// Devices bound *before* the surface was mapped, so Escape and clicks
     /// are guaranteed to have somewhere to arrive.
     devices: SeatDevices,
@@ -95,33 +92,6 @@ impl SelectionOverlay {
         shm: ShmId,
         output: OutputId,
     ) -> Result<Self> {
-        let surface: SurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(compositor, CompositorRequest::CreateSurface).new_id(surface),
-        )?;
-        let layer_surface: LayerSurfaceId = sender.alloc_id();
-        sender.request(
-            MessageBuilder::new(layer_shell, LayerShellRequest::GetLayerSurface)
-                .new_id(layer_surface)
-                .object(surface)
-                .object(output)
-                // Overlay, not Top: the picker must float above every other
-                // layer-shell client (bars, notifications) or the user cannot
-                // select the pixels those cover.
-                .u32(Layer::Overlay as u32)
-                .string(APP_ID),
-        )?;
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetAnchor).u32(Anchor::bits(
-                &[Anchor::Top, Anchor::Bottom, Anchor::Left, Anchor::Right],
-            )),
-        )?;
-        // `-1` means "cover the whole output, ignoring other clients'
-        // exclusive zones" -- without it a status bar would inset the picker
-        // and the strip behind the bar could never be selected.
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetExclusiveZone).i32(-1),
-        )?;
         // Exclusive keyboard focus so Escape reaches us rather than whatever
         // was focused underneath -- but *only* when a keyboard was actually
         // bound. Taking exclusive focus without one is what makes an
@@ -133,15 +103,36 @@ impl SelectionOverlay {
         } else {
             KeyboardInteractivity::None
         };
-        sender.request(
-            MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetKeyboardInteractivity)
-                .u32(interactivity as u32),
+        let layer = LayerSurfaceHandle::create(
+            sender,
+            compositor,
+            layer_shell,
+            &LayerSurfaceConfig {
+                // Overlay, not Top: the picker must float above every other
+                // layer-shell client (bars, notifications) or the user
+                // cannot select the pixels those cover.
+                layer: Layer::Overlay,
+                namespace: APP_ID,
+                output,
+                buffer_scale: None,
+                anchor: Some(Anchor::bits(&[
+                    Anchor::Top,
+                    Anchor::Bottom,
+                    Anchor::Left,
+                    Anchor::Right,
+                ])),
+                size: None,
+                // `-1` means "cover the whole output, ignoring other clients'
+                // exclusive zones" -- without it a status bar would inset the
+                // picker and the strip behind the bar could never be selected.
+                exclusive_zone: Some(-1),
+                margin: None,
+                keyboard_interactivity: interactivity,
+            },
         )?;
-        sender.request(MessageBuilder::new(surface, SurfaceRequest::Commit))?;
         let now = Instant::now();
         Ok(Self {
-            surface,
-            layer_surface,
+            layer,
             devices,
             shm,
             size: None,
@@ -234,17 +225,13 @@ impl SelectionOverlay {
             }
             sender.request(MessageBuilder::new(pool, ShmPoolRequest::Destroy))?;
         }
-        sender.request(MessageBuilder::new(
-            self.layer_surface,
-            LayerSurfaceRequest::Destroy,
-        ))?;
-        sender.request(MessageBuilder::new(self.surface, SurfaceRequest::Destroy))?;
+        self.layer.destroy(sender)?;
         Ok(())
     }
 
     /// Route one event to whichever object it belongs to.
     fn handle_event(&mut self, sender: &mut Sender, ev: &RawEvent) -> Result<()> {
-        if ev.is(self.layer_surface) {
+        if ev.is(self.layer.layer_surface) {
             return self.handle_layer_surface(sender, ev);
         }
         if self.devices.pointer().is_some_and(|p| ev.is(p)) {
@@ -283,10 +270,7 @@ impl SelectionOverlay {
         match ev.event::<LayerSurfaceEvent>() {
             Some(LayerSurfaceEvent::Configure) => {
                 let serial = ev.arg(0);
-                sender.request(
-                    MessageBuilder::new(self.layer_surface, LayerSurfaceRequest::AckConfigure)
-                        .u32(serial),
-                )?;
+                self.layer.ack_configure(sender, serial)?;
                 let width = ev.arg(1).cast_signed();
                 let height = ev.arg(2).cast_signed();
                 if width > 0 && height > 0 {
@@ -387,19 +371,19 @@ impl SelectionOverlay {
         let buffer = frames[index].buffer;
         frames[index].free = false;
         sender.request(
-            MessageBuilder::new(self.surface, SurfaceRequest::Attach)
+            MessageBuilder::new(self.layer.surface, SurfaceRequest::Attach)
                 .object(buffer)
                 .i32(0)
                 .i32(0),
         )?;
         sender.request(
-            MessageBuilder::new(self.surface, SurfaceRequest::Damage)
+            MessageBuilder::new(self.layer.surface, SurfaceRequest::Damage)
                 .i32(0)
                 .i32(0)
                 .i32(width)
                 .i32(height),
         )?;
-        sender.request(MessageBuilder::new(self.surface, SurfaceRequest::Commit))?;
+        sender.request(MessageBuilder::new(self.layer.surface, SurfaceRequest::Commit))?;
         Ok(())
     }
 }

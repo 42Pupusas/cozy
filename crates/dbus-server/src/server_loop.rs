@@ -62,24 +62,35 @@ impl ServerLoop {
     /// Block for exactly one incoming message. If it's a well-formed
     /// method call, dispatch it and send the reply; anything else
     /// (malformed method call missing a routing field, non-`MethodCall`
-    /// message) is silently skipped -- see the module doc comment for
-    /// why silence is correct here rather than an error.
+    /// message -- including bus housekeeping like `NameAcquired`, which
+    /// every connection receives unsolicited right after `Hello`/
+    /// `RequestName`) is silently skipped -- see the module doc comment
+    /// for why silence is correct here rather than an error.
     ///
-    /// Returns `Err` only for a transport-level failure (the connection
+    /// Returns `Ok(true)` if a method call was actually dispatched,
+    /// `Ok(false)` if the message was something else and got skipped --
+    /// a caller counting "messages served" (e.g. this crate's own
+    /// scratch-service integration test, which serves a known number of
+    /// real calls and must not miscount an interleaved `NameAcquired` as
+    /// one of them) needs this distinction; `run_forever` doesn't care
+    /// and ignores it.
+    ///
+    /// The `Err` case is a transport-level failure only (the connection
     /// closing, an I/O error) -- a caller's dispatch/send failure already
     /// became a wire `Error` reply to the caller that sent it, not a
     /// reason to stop serving everyone else.
-    pub fn serve_one(&mut self) -> Result<(), DbusError> {
+    pub fn serve_one(&mut self) -> Result<bool, DbusError> {
         let message = self.conn.recv_message()?;
-        if let Some(call) = IncomingCall::from_reply(&message) {
-            // A failed *send* (e.g. the caller already disconnected) is a
-            // transport-layer detail about that one caller, not a reason
-            // to tear down the whole loop -- matching
-            // `statusbar::tray`'s existing `let _ = conn.send_method_return(..)`
-            // pattern for the same situation.
-            let _ = call.serve(&self.dispatcher, &mut self.conn);
-        }
-        Ok(())
+        let Some(call) = IncomingCall::from_reply(&message) else {
+            return Ok(false);
+        };
+        // A failed *send* (e.g. the caller already disconnected) is a
+        // transport-layer detail about that one caller, not a reason to
+        // tear down the whole loop -- matching `statusbar::tray`'s
+        // existing `let _ = conn.send_method_return(..)` pattern for the
+        // same situation.
+        let _ = call.serve(&self.dispatcher, &mut self.conn);
+        Ok(true)
     }
 
     /// Serve forever, stopping only on a transport-level error (the

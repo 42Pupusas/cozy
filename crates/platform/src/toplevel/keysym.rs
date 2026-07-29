@@ -143,7 +143,30 @@ impl Key {
         if let Some(named) = Self::named(keysym) {
             return Some(named);
         }
-        Self::text(utf32)
+        // Ctrl changes XKB's UTF-32 result for a letter into a C0 control
+        // character (Ctrl-D becomes U+0004). That must not erase the letter:
+        // higher layers still need the logical `d` to match shortcuts. The
+        // keysym retains that unmodified symbol, so use it only when the text
+        // result cannot be inserted.
+        match Self::text(utf32) {
+            Some(key) => Some(key),
+            None => Self::text_from_keysym(keysym),
+        }
+    }
+
+    /// Recover printable text from an X11 keysym when modifiers made XKB's
+    /// UTF-32 result a control character.
+    #[must_use]
+    const fn text_from_keysym(keysym: u32) -> Option<Self> {
+        // Latin-1 keysyms are their Unicode code points. Other Unicode
+        // keysyms carry the scalar after the X11 `0x0100_0000` marker.
+        if keysym <= 0xff {
+            Self::text(keysym)
+        } else if keysym & 0xff00_0000 == 0x0100_0000 {
+            Self::text(keysym & 0x00ff_ffff)
+        } else {
+            None
+        }
     }
 
     /// The named-key half of [`Self::decode`].
@@ -359,6 +382,14 @@ mod tests {
     fn non_ascii_text_survives() {
         assert_eq!(Key::decode(0, u32::from('é')), Some(Key::Char('é')));
         assert_eq!(Key::decode(0, 0x1f600), Some(Key::Char('😀')));
+    }
+
+    #[test]
+    fn a_ctrl_modified_letter_keeps_its_logical_symbol() {
+        // XKB reports U+0004 as the UTF-32 value for Ctrl-D, but its keysym
+        // remains `d`. Without this fallback Ctrl-letter shortcuts never
+        // reach application keymaps.
+        assert_eq!(Key::decode(u32::from('d'), 0x04), Some(Key::Char('d')));
     }
 
     #[test]

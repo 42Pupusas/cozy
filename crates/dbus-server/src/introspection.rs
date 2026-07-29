@@ -187,6 +187,17 @@ impl InterfaceDescriptor {
         }
     }
 
+    /// This interface's name, e.g. `"org.freedesktop.impl.portal.Settings"`
+    /// -- needed by [`crate::dispatcher::Dispatcher`], which keys its
+    /// interface catalog by name so `Introspect` can look one up per
+    /// interface an object's [`crate::registry::ObjectRegistry`] entry
+    /// claims, without also requiring the caller to repeat the name as a
+    /// separate map key.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// Add a method.
     #[must_use]
     pub fn method(mut self, method: MethodDescriptor) -> Self {

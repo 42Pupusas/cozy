@@ -22,6 +22,7 @@
 //! depend on `dbus-server` alone rather than adding `dbus` as a second,
 //! separately versioned dependency just to name a `Value`.
 
+pub mod dispatcher;
 pub mod introspection;
 pub mod name_watcher;
 pub mod properties;
@@ -31,6 +32,7 @@ pub mod router;
 pub use dbus::marshal::Marshaller;
 pub use dbus::message::Reply;
 pub use dbus::value::{Unmarshaller, Value};
+pub use dispatcher::Dispatcher;
 pub use introspection::{
     Argument, InterfaceDescriptor, MethodDescriptor, NodeIntrospection, PropertyAccess,
     PropertyDescriptor, SignalDescriptor,

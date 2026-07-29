@@ -37,6 +37,12 @@ pub struct Entry {
     /// Precomputed because the filter checks it for every entry on every
     /// re-filter, and it never changes for a given entry.
     pub hidden: bool,
+    /// Unicode-lowercase name used by case-insensitive sorting.
+    ///
+    /// Names are immutable after an entry is read, while sorting compares the
+    /// same entries many times. Keeping this derived key avoids allocating two
+    /// temporary strings for every comparator invocation.
+    pub(crate) lower_name: String,
     /// For a symlink, whether its *target* resolves to a directory.
     /// `false` for non-symlinks and for broken links.
     ///
@@ -60,8 +66,10 @@ impl Entry {
         let target_is_dir = kind == EntryKind::Symlink
             && std::fs::metadata(&path).is_ok_and(|target| target.is_dir());
 
+        let lower_name = name.to_lowercase();
         Self {
             hidden: name.starts_with('.'),
+            lower_name,
             name,
             kind,
             size: metadata.len(),

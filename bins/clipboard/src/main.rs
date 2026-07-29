@@ -10,6 +10,7 @@
 
 mod clipboard_options;
 mod entry_preview;
+mod headless;
 
 use clipboard::{ClipboardPayload, HistoryStore};
 use clipboard_options::{ClipboardOptions, Command};
@@ -290,6 +291,10 @@ impl Application {
 }
 
 fn main() {
+    if let Ok(Some(options)) = headless_stress::StressOptions::parse(std::env::args()) {
+        headless::ClipboardStress::run(options);
+        return;
+    }
     if Application::handle_meta_command() {
         return;
     }

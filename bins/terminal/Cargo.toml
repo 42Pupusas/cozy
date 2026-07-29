@@ -17,6 +17,7 @@ vt_parser    = { path = "../../crates/vt_parser" }
 waker        = { path = "../../crates/waker" }
 quetzalcoatl = { workspace = true }
 ququmatz     = { workspace = true }
+headless-stress = { path = "../../crates/headless-stress" }
 
 [features]
 trace = ["tlog/trace", "platform/trace"]

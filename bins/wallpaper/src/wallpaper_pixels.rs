@@ -5,7 +5,7 @@
 //! that compositor-facing format, so alpha handling and byte packing cannot
 //! diverge between outputs.
 
-use std::path::Path;
+use std::{cell::RefCell, path::Path};
 
 use wallpaper::{LoadError, ScaleMode, WallpaperImage};
 
@@ -20,6 +20,10 @@ const MAX_DECOMPRESSED_BYTES: usize = 1 << 30;
 pub struct WallpaperPixels {
     image: WallpaperImage,
     mode: ScaleMode,
+    /// Scratch RGBA storage is kept behind interior mutability because a
+    /// wallpaper is shared immutably while rendering replacement surfaces.
+    /// Reusing it removes a frame-sized allocation from every render.
+    rgba_scratch: RefCell<Vec<u8>>,
 }
 
 impl WallpaperPixels {
@@ -28,7 +32,11 @@ impl WallpaperPixels {
         let bytes = std::fs::read(path).map_err(PixelLoadError::Read)?;
         let image =
             WallpaperImage::load(&bytes, MAX_DECOMPRESSED_BYTES).map_err(PixelLoadError::Decode)?;
-        Ok(Self { image, mode })
+        Ok(Self {
+            image,
+            mode,
+            rgba_scratch: RefCell::new(Vec::new()),
+        })
     }
 
     /// Build image pixels when `appearance` references an image. Solid-color
@@ -40,12 +48,17 @@ impl WallpaperPixels {
         }
     }
 
-    /// Scale the source image and composite it over `pad` into native-endian
-    /// `u32` XRGB8888 values required by the shared-memory surface.
-    #[must_use]
-    pub fn render_xrgb(&self, width: u32, height: u32, pad: [u8; 4]) -> Vec<u32> {
-        let rgba = self.mode.blit(&self.image, width, height, pad);
-        rgba.chunks_exact(4).map(Self::pack_xrgb).collect()
+    /// Render into caller-owned XRGB storage so repeated output redraws do not
+    /// allocate a new pixel vector every frame.
+    pub fn render_xrgb_into(&self, width: u32, height: u32, pad: [u8; 4], out: &mut [u32]) {
+        assert_eq!(out.len(), width as usize * height as usize);
+        let mut rgba = self.rgba_scratch.borrow_mut();
+        rgba.resize(out.len() * 4, 0);
+        self.mode
+            .blit_into(&self.image, width, height, pad, &mut rgba);
+        for (destination, pixel) in out.iter_mut().zip(rgba.chunks_exact(4)) {
+            *destination = Self::pack_xrgb(pixel);
+        }
     }
 
     /// Convert straight-alpha RGBA to opaque XRGB by compositing over black.

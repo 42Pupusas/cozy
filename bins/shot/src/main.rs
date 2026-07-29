@@ -9,6 +9,7 @@
 use clipboard::ScreenshotPayload;
 use clipboard_wayland::ClipboardSession;
 mod drag_selection;
+mod headless;
 mod output_registry;
 mod seat_devices;
 mod selection_overlay;
@@ -464,6 +465,10 @@ impl Application {
 }
 
 fn main() {
+    if let Ok(Some(options)) = headless_stress::StressOptions::parse(std::env::args()) {
+        headless::ShotStress::run(options);
+        return;
+    }
     if Application::handle_meta_command() {
         return;
     }

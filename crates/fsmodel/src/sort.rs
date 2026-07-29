@@ -132,9 +132,9 @@ impl SortPolicy {
     /// one so that `README` and `readme` have a stable, defined order rather
     /// than comparing equal and landing wherever the sort left them.
     fn compare_names(a: &Entry, b: &Entry) -> Ordering {
-        let a_lower = a.name.to_lowercase();
-        let b_lower = b.name.to_lowercase();
-        a_lower.cmp(&b_lower).then_with(|| a.name.cmp(&b.name))
+        a.lower_name
+            .cmp(&b.lower_name)
+            .then_with(|| a.name.cmp(&b.name))
     }
 
     /// Compare modification times, sorting unknown-mtime entries last.

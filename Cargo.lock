@@ -65,6 +65,7 @@ version = "0.1.0"
 dependencies = [
  "clipboard",
  "clipboard-wayland",
+ "headless-stress",
  "platform",
  "quetzalcoatl",
  "waker",
@@ -90,6 +91,23 @@ name = "config"
 version = "0.1.0"
 dependencies = [
  "shelby",
+]
+
+[[package]]
+name = "core-benches"
+version = "0.1.0"
+dependencies = [
+ "clipboard",
+ "config",
+ "dbus",
+ "divan",
+ "fsmodel",
+ "launcher",
+ "localtime",
+ "mime",
+ "waker",
+ "wallpaper",
+ "widget",
 ]
 
 [[package]]
@@ -153,6 +171,7 @@ version = "0.1.0"
 dependencies = [
  "config",
  "fsmodel",
+ "headless-stress",
  "launcher",
  "localtime",
  "mime",
@@ -185,6 +204,10 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
+
+[[package]]
+name = "headless-stress"
+version = "0.1.0"
 
 [[package]]
 name = "indexmap"
@@ -228,6 +251,7 @@ name = "launcher-bin"
 version = "0.1.0"
 dependencies = [
  "config",
+ "headless-stress",
  "ixiptla-core",
  "launcher",
  "platform",
@@ -262,6 +286,7 @@ name = "monitor"
 version = "0.1.0"
 dependencies = [
  "config",
+ "headless-stress",
  "platform",
  "statusbar",
  "sysmon",
@@ -374,6 +399,7 @@ version = "0.1.0"
 dependencies = [
  "clipboard",
  "clipboard-wayland",
+ "headless-stress",
  "ixiptla-core",
  "localtime",
  "platform",
@@ -412,6 +438,7 @@ name = "statusbar-bin"
 version = "0.1.0"
 dependencies = [
  "config",
+ "headless-stress",
  "platform",
  "statusbar",
  "waker",
@@ -449,6 +476,7 @@ version = "0.1.0"
 dependencies = [
  "config",
  "grid",
+ "headless-stress",
  "input",
  "platform",
  "pty",
@@ -520,6 +548,7 @@ dependencies = [
 name = "wallpaper-bin"
 version = "0.1.0"
 dependencies = [
+ "headless-stress",
  "platform",
  "quetzalcoatl",
  "waker",

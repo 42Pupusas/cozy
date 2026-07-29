@@ -1,0 +1,46 @@
+[package]
+name = "core-benches"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "Divan benchmarks for headless workspace crates outside the existing terminal, statusbar, and monitor suites"
+
+[lints]
+workspace = true
+
+[dependencies]
+clipboard = { path = "../../crates/clipboard" }
+config = { path = "../../crates/config" }
+fsmodel = { path = "../../crates/fsmodel" }
+launcher = { path = "../../crates/launcher" }
+localtime = { path = "../../crates/localtime" }
+mime = { path = "../../crates/mime" }
+wallpaper = { path = "../../crates/wallpaper" }
+widget = { path = "../../crates/widget" }
+dbus = { path = "../../crates/dbus" }
+waker = { path = "../../crates/waker" }
+divan = "0.1"
+
+[[bench]]
+name = "catalog"
+harness = false
+
+[[bench]]
+name = "filesystem"
+harness = false
+
+[[bench]]
+name = "render_data"
+harness = false
+
+[[bench]]
+name = "protocol"
+harness = false
+
+[[bench]]
+name = "time_and_config"
+harness = false
+
+[[bench]]
+name = "waker"
+harness = false

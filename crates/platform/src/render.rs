@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use grid::{Attrs, Cell, Color, DirtySnapshot, ScrollBand};
+use grid::{Attrs, Cell, Color, DirtyRow, DirtyRowContent, DirtySnapshot, ScrollBand};
 
 use crate::draw::{Canvas, Color as DrawColor};
 use crate::font::{FIRST, GLYPH_H, GLYPH_W, LAST};
@@ -833,6 +833,62 @@ impl Renderer {
         }
     }
 
+    /// Blit a transport row without forcing compact uniform content through a
+    /// temporary `Vec<Cell>`. The selection model separately materializes its
+    /// durable mirror; the renderer only needs a short-lived Cell for glyphs
+    /// that actually paint.
+    fn blit_dirty_row(&mut self, canvas: &mut Canvas<'_>, row: &DirtyRow) {
+        match &row.content {
+            DirtyRowContent::Cells(cells) => self.blit_row(canvas, row.row, cells),
+            DirtyRowContent::Uniform {
+                chars,
+                attrs,
+                link_id,
+            } => self.blit_uniform_row(canvas, row.row, chars, *attrs, *link_id),
+        }
+    }
+
+    /// Paint a narrow row with one SGR/link style. Its background is one run;
+    /// only visible glyphs pay to construct a Cell for the shared cell painter.
+    fn blit_uniform_row(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        cy: u16,
+        chars: &[u32],
+        attrs: Attrs,
+        link_id: u32,
+    ) {
+        let (fg, bg) = self.theme.effective(&attrs);
+        let bg_px = Self::pack_bg(bg, self.bg_alpha);
+        let cell_w = self.cell_w.cast_unsigned();
+        let cell_h = self.cell_h.cast_unsigned();
+        let width = canvas.width().cast_unsigned();
+        let py0 = u32::from(cy) * cell_h;
+        let span = (u32::try_from(chars.len()).unwrap_or(u32::MAX) * cell_w).min(width);
+        for scanline in 0..cell_h {
+            let base = ((py0 + scanline) * width) as usize;
+            if let Some(line) = canvas.pixels_mut().get_mut(base..base + span as usize) {
+                line.fill(bg_px);
+            }
+        }
+        for (col, &codepoint) in chars.iter().enumerate() {
+            let ch = char::from_u32(codepoint).unwrap_or('�');
+            if attrs.invisible() || (ch == ' ' && !attrs.underline() && !attrs.strikethrough()) {
+                continue;
+            }
+            let cell = Cell::new(ch, attrs, link_id);
+            self.blit_cell_with_colors(
+                canvas,
+                u16::try_from(col).unwrap_or(u16::MAX),
+                cy,
+                &cell,
+                false,
+                fg,
+                bg,
+            );
+        }
+    }
+
     /// Bitmap-font path: 1-bit glyph, no AA.
     ///
     /// Row-batched like [`Self::blit_cell_face`]: the clipped scanline width
@@ -1074,7 +1130,7 @@ impl Renderer {
             if u32::from(row.row) >= buf_rows {
                 continue;
             }
-            self.blit_row(canvas, row.row, &row.cells);
+            self.blit_dirty_row(canvas, row);
         }
         scrolled
     }
@@ -1097,7 +1153,7 @@ impl Renderer {
     ) -> (Vec<i32>, usize, usize) {
         let mut viewport_shifts: Vec<i32> = Vec::new();
         let mut painted_rows: usize = 0;
-        let mut painted_cells: usize = 0;
+        let mut painted_cells = 0usize;
         for snap in folded {
             if let Some(scroll) = self.blit_snapshot(canvas, snap) {
                 scrolls.push(scroll);
@@ -1111,7 +1167,7 @@ impl Renderer {
                 viewport_shifts.push(s);
             }
             painted_rows += snap.rows.len();
-            painted_cells += snap.rows.iter().map(|r| r.cells.len()).sum::<usize>();
+            painted_cells += snap.rows.iter().map(|r| r.content.len()).sum::<usize>();
             touched_rows.extend(snap.rows.iter().map(|r| r.row));
         }
         (viewport_shifts, painted_rows, painted_cells)
@@ -1194,7 +1250,7 @@ impl Renderer {
             for row in &snap.rows {
                 let r = usize::from(row.row);
                 if r >= edge_lo && r < edge_hi && u32::try_from(r).unwrap_or(u32::MAX) < buf_rows {
-                    self.blit_row(canvas, row.row, &row.cells);
+                    self.blit_dirty_row(canvas, row);
                     #[cfg(feature = "trace")]
                     {
                         rasterized += 1;
@@ -1218,7 +1274,7 @@ impl Renderer {
             if u32::from(row.row) >= buf_rows {
                 continue;
             }
-            self.blit_row(canvas, row.row, &row.cells);
+            self.blit_dirty_row(canvas, row);
             #[cfg(feature = "trace")]
             {
                 rasterized += 1;
@@ -1430,7 +1486,7 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grid::{DirtyRow, DirtySnapshot};
+    use grid::{DirtyRow, DirtyRowContent, DirtySnapshot};
 
     fn cell(ch: char) -> Cell {
         Cell::new(ch, Attrs::default(), 0)
@@ -1576,7 +1632,7 @@ mod tests {
             cols: 5,
             rows: vec![DirtyRow {
                 row: 0,
-                cells: (0..5).map(|_| cell('M')).collect(),
+                content: DirtyRowContent::Cells((0..5).map(|_| cell('M')).collect()),
             }],
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
@@ -1620,19 +1676,19 @@ mod tests {
             rows: vec![
                 DirtyRow {
                     row: 0,
-                    cells: vec![cell('A')],
+                    content: DirtyRowContent::Cells(vec![cell('A')]),
                 },
                 DirtyRow {
                     row: 1,
-                    cells: vec![cell('B')],
+                    content: DirtyRowContent::Cells(vec![cell('B')]),
                 },
                 DirtyRow {
                     row: 2,
-                    cells: vec![cell('C')],
+                    content: DirtyRowContent::Cells(vec![cell('C')]),
                 },
                 DirtyRow {
                     row: 3,
-                    cells: vec![cell('D')],
+                    content: DirtyRowContent::Cells(vec![cell('D')]),
                 },
             ],
             cursor: grid::CursorInfo::default(),
@@ -1658,19 +1714,19 @@ mod tests {
             rows: vec![
                 DirtyRow {
                     row: 0,
-                    cells: vec![cell('B')],
+                    content: DirtyRowContent::Cells(vec![cell('B')]),
                 },
                 DirtyRow {
                     row: 1,
-                    cells: vec![cell('C')],
+                    content: DirtyRowContent::Cells(vec![cell('C')]),
                 },
                 DirtyRow {
                     row: 2,
-                    cells: vec![cell('D')],
+                    content: DirtyRowContent::Cells(vec![cell('D')]),
                 },
                 DirtyRow {
                     row: 3,
-                    cells: vec![cell('E')],
+                    content: DirtyRowContent::Cells(vec![cell('E')]),
                 },
             ],
             cursor: grid::CursorInfo::default(),
@@ -1712,7 +1768,7 @@ mod tests {
                 let ch = char::from(b'a' + (line % 26) as u8);
                 DirtyRow {
                     row: r,
-                    cells: (0..cols).map(|_| cell(ch)).collect(),
+                    content: DirtyRowContent::Cells((0..cols).map(|_| cell(ch)).collect()),
                 }
             })
             .collect();
@@ -1819,7 +1875,7 @@ mod tests {
                 let ch = char::from(b'a' + (line % 26) as u8);
                 DirtyRow {
                     row: r,
-                    cells: (0..cols).map(|_| cell(ch)).collect(),
+                    content: DirtyRowContent::Cells((0..cols).map(|_| cell(ch)).collect()),
                 }
             })
             .collect();
@@ -1971,19 +2027,19 @@ mod tests {
             rows: vec![
                 DirtyRow {
                     row: 0,
-                    cells: vec![cell('A')],
+                    content: DirtyRowContent::Cells(vec![cell('A')]),
                 },
                 DirtyRow {
                     row: 1,
-                    cells: vec![cell('B')],
+                    content: DirtyRowContent::Cells(vec![cell('B')]),
                 },
                 DirtyRow {
                     row: 2,
-                    cells: vec![cell('C')],
+                    content: DirtyRowContent::Cells(vec![cell('C')]),
                 },
                 DirtyRow {
                     row: 3,
-                    cells: vec![cell('D')],
+                    content: DirtyRowContent::Cells(vec![cell('D')]),
                 },
             ],
             cursor: grid::CursorInfo::default(),
@@ -2002,19 +2058,19 @@ mod tests {
             rows: vec![
                 DirtyRow {
                     row: 0,
-                    cells: vec![cell('B')],
+                    content: DirtyRowContent::Cells(vec![cell('B')]),
                 },
                 DirtyRow {
                     row: 1,
-                    cells: vec![cell('C')],
+                    content: DirtyRowContent::Cells(vec![cell('C')]),
                 },
                 DirtyRow {
                     row: 2,
-                    cells: vec![cell('D')],
+                    content: DirtyRowContent::Cells(vec![cell('D')]),
                 },
                 DirtyRow {
                     row: 3,
-                    cells: vec![cell('E')],
+                    content: DirtyRowContent::Cells(vec![cell('E')]),
                 },
             ],
             cursor: grid::CursorInfo::default(),
@@ -2050,7 +2106,7 @@ mod tests {
             cols: 2,
             rows: vec![DirtyRow {
                 row: 3,
-                cells: vec![cell('M'), cell('M')],
+                content: DirtyRowContent::Cells(vec![cell('M'), cell('M')]),
             }],
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,

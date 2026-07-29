@@ -11,6 +11,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+headless-stress = { path = "../../crates/headless-stress" }
 # The capture protocol itself; see `crates/screencopy` for why the pure
 # pixel/handshake logic lives there rather than in this bin.
 screencopy = { path = "../../crates/screencopy" }

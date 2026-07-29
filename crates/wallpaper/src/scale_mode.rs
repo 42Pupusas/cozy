@@ -48,34 +48,117 @@ impl ScaleMode {
         pad: [u8; 4],
     ) -> Vec<u8> {
         let mut out = vec![0u8; target_width as usize * target_height as usize * 4];
-        for px in out.chunks_exact_mut(4) {
-            px.copy_from_slice(&pad);
-        }
+        self.blit_into(image, target_width, target_height, pad, &mut out);
+        out
+    }
+
+    /// Render into caller-owned RGBA8 storage.
+    ///
+    /// Reusing this buffer avoids a heap allocation and lets a compositor
+    /// client keep one frame-sized scratch surface across redraws. The slice
+    /// must contain exactly `target_width * target_height * 4` bytes; keeping
+    /// that contract explicit prevents silently producing a truncated frame.
+    pub fn blit_into(
+        self,
+        image: &WallpaperImage,
+        target_width: u32,
+        target_height: u32,
+        pad: [u8; 4],
+        out: &mut [u8],
+    ) {
+        self.blit_into_inner(image, target_width, target_height, pad, out);
+    }
+
+    fn blit_into_inner(
+        self,
+        image: &WallpaperImage,
+        target_width: u32,
+        target_height: u32,
+        pad: [u8; 4],
+        out: &mut [u8],
+    ) {
+        let output_len = target_width as usize * target_height as usize * 4;
+        assert_eq!(
+            out.len(),
+            output_len,
+            "wallpaper output buffer has the wrong size"
+        );
+
+        // Stretch, fill, and tile overwrite every destination pixel. Avoid
+        // first painting the padding colour in those modes: that pass was a
+        // second full-frame memory write before the real blit began. Fit and
+        // center require the padding pass because they intentionally leave
+        // uncovered pixels untouched, including when the pad is transparent
+        // black and the caller supplied a previously used buffer.
         if target_width == 0 || target_height == 0 || image.width == 0 || image.height == 0 {
-            return out;
+            for px in out.chunks_exact_mut(4) {
+                px.copy_from_slice(&pad);
+            }
+            return;
+        }
+        if self.leaves_uncovered_pixels(image, target_width, target_height) {
+            for px in out.chunks_exact_mut(4) {
+                px.copy_from_slice(&pad);
+            }
         }
 
         match self {
-            Self::Stretch => Self::blit_stretch(image, target_width, target_height, &mut out),
-            Self::Fit => Self::blit_scaled(image, target_width, target_height, &mut out, true),
-            Self::Fill => Self::blit_scaled(image, target_width, target_height, &mut out, false),
-            Self::Center => {
-                Self::blit_unscaled(image, target_width, target_height, &mut out, false);
-            }
-            Self::Tile => Self::blit_unscaled(image, target_width, target_height, &mut out, true),
+            Self::Stretch => Self::blit_stretch(image, target_width, target_height, out),
+            Self::Fit => Self::blit_scaled(image, target_width, target_height, out, true),
+            Self::Fill => Self::blit_scaled(image, target_width, target_height, out, false),
+            Self::Center => Self::blit_unscaled(image, target_width, target_height, out, false),
+            Self::Tile => Self::blit_unscaled(image, target_width, target_height, out, true),
         }
-        out
+    }
+
+    /// Whether this mode leaves any destination pixels untouched.
+    ///
+    /// Reused buffers only need a padding pass when uncovered pixels really
+    /// exist. In particular, a `Fit` render with matching aspect ratios covers
+    /// the target completely, so clearing the full frame first only doubles
+    /// its memory traffic.
+    fn leaves_uncovered_pixels(self, image: &WallpaperImage, tw: u32, th: u32) -> bool {
+        match self {
+            Self::Fit => {
+                let scale = (f64::from(tw) / f64::from(image.width))
+                    .min(f64::from(th) / f64::from(image.height));
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let scaled_width = (f64::from(image.width) * scale).round() as u32;
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let scaled_height = (f64::from(image.height) * scale).round() as u32;
+                scaled_width < tw || scaled_height < th
+            }
+            Self::Center => image.width < tw || image.height < th,
+            Self::Stretch | Self::Fill | Self::Tile => false,
+        }
     }
 
     /// Nearest-neighbor resample, independently per axis -- source and
     /// target aspect ratios needn't match; whichever differs more just
     /// looks stretched, exactly like swaybg's own `stretch` mode.
     fn blit_stretch(image: &WallpaperImage, tw: u32, th: u32, out: &mut [u8]) {
+        // Walk the nearest-neighbour mapping with integer error accumulators.
+        // The old x * source / target expression performed a division for
+        // every pixel; the equivalent Bresenham-style walk keeps the exact
+        // floor mapping while replacing those divisions with additions and a
+        // predictable threshold branch.
+        let mut y_accumulator = 0_u64;
+        let mut sy = 0_u32;
         for y in 0..th {
-            let sy = y * image.height / th;
+            let mut x_accumulator = 0_u64;
+            let mut sx = 0_u32;
             for x in 0..tw {
-                let sx = x * image.width / tw;
                 Self::copy_pixel(image, sx, sy, out, x, y, tw);
+                x_accumulator += u64::from(image.width);
+                while x_accumulator >= u64::from(tw) {
+                    x_accumulator -= u64::from(tw);
+                    sx += 1;
+                }
+            }
+            y_accumulator += u64::from(image.height);
+            while y_accumulator >= u64::from(th) {
+                y_accumulator -= u64::from(th);
+                sy += 1;
             }
         }
     }
@@ -102,32 +185,64 @@ impl ScaleMode {
         let scaled_h = (f64::from(image.height) * scale).round() as i64;
         let off_x = (i64::from(tw) - scaled_w) / 2;
         let off_y = (i64::from(th) - scaled_h) / 2;
+        if scaled_w <= 0 || scaled_h <= 0 {
+            return;
+        }
 
-        for y in 0..th {
-            let dst_y = i64::from(y) - off_y;
-            if dst_y < 0 || dst_y >= scaled_h {
-                continue;
-            }
-            // `dst_y` is bounded by `scaled_h`, itself derived from a
-            // real output/monitor pixel dimension times a scale factor --
-            // nowhere near i64's 52-bit-mantissa-losing range, so the
-            // widen-to-f64 for the division is exact in every realistic
-            // case; the two casts below are the same deliberate, reviewed
-            // pattern as `platform::draw`'s float<->int pixel conversions.
+        // The scaled image intersects the target in one contiguous rectangle.
+        // Mapping only that rectangle avoids sparse `Option` maps and keeps
+        // letterbox/crop tests out of the hot pixel loop.
+        let first_x = off_x.max(0);
+        let last_x = (off_x + scaled_w).min(i64::from(tw));
+        let first_y = off_y.max(0);
+        let last_y = (off_y + scaled_h).min(i64::from(th));
+        if first_x >= last_x || first_y >= last_y {
+            return;
+        }
+
+        let first_x = usize::try_from(first_x).expect("visible x origin fits usize");
+        let last_x = usize::try_from(last_x).expect("visible x limit fits usize");
+        let first_y = usize::try_from(first_y).expect("visible y origin fits usize");
+        let last_y = usize::try_from(last_y).expect("visible y limit fits usize");
+
+        let mut source_x_bytes = Vec::with_capacity(last_x - first_x);
+        for x in first_x..last_x {
             #[allow(clippy::cast_precision_loss)]
-            let row_pos = dst_y as f64;
+            let target_x = i64::try_from(x).expect("target x fits i64");
+            #[allow(clippy::cast_precision_loss)]
+            let col_pos = (target_x - off_x) as f64;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let sx = ((col_pos / scale) as u32).min(image.width - 1);
+            source_x_bytes.push(sx as usize * 4);
+        }
+        let mut source_row_bytes = Vec::with_capacity(last_y - first_y);
+        for y in first_y..last_y {
+            #[allow(clippy::cast_precision_loss)]
+            let target_y = i64::try_from(y).expect("target y fits i64");
+            #[allow(clippy::cast_precision_loss)]
+            let row_pos = (target_y - off_y) as f64;
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let sy = ((row_pos / scale) as u32).min(image.height - 1);
-            for x in 0..tw {
-                let dst_x = i64::from(x) - off_x;
-                if dst_x < 0 || dst_x >= scaled_w {
-                    continue;
-                }
-                #[allow(clippy::cast_precision_loss)]
-                let col_pos = dst_x as f64;
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let sx = ((col_pos / scale) as u32).min(image.width - 1);
-                Self::copy_pixel(image, sx, sy, out, x, y, tw);
+            source_row_bytes.push(sy as usize * image.width as usize * 4);
+        }
+
+        // The maps contain byte offsets so the hot loop only adds the source
+        // row and column positions. Walking destination pixels as slices also
+        // removes repeated destination row-major index calculations.
+        let row_bytes = tw as usize * 4;
+        let first_column_byte = first_x * 4;
+        let last_column_byte = last_x * 4;
+        for (source_row, destination_row) in source_row_bytes.into_iter().zip(
+            out.chunks_exact_mut(row_bytes)
+                .skip(first_y)
+                .take(last_y - first_y),
+        ) {
+            let destination_pixels =
+                destination_row[first_column_byte..last_column_byte].chunks_exact_mut(4);
+            for (source_column, destination_pixel) in source_x_bytes.iter().zip(destination_pixels)
+            {
+                let source = source_row + source_column;
+                destination_pixel.copy_from_slice(&image.rgba[source..source + 4]);
             }
         }
     }
@@ -230,6 +345,43 @@ mod tests {
         assert_eq!(pixel_at(&out, 4, 3, 0), [0, 255, 0, 255]);
         assert_eq!(pixel_at(&out, 4, 0, 3), [0, 0, 255, 255]);
         assert_eq!(pixel_at(&out, 4, 3, 3), [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn stretch_matches_floor_mapping_for_non_even_dimensions() {
+        let image = WallpaperImage {
+            width: 3,
+            height: 2,
+            rgba: vec![
+                10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 40, 0, 0, 255, 50, 0, 0, 255, 60, 0,
+                0, 255,
+            ],
+        };
+        let out = ScaleMode::Stretch.blit(&image, 5, 3, [0, 0, 0, 0]);
+        let expected = [10, 10, 20, 20, 30, 10, 10, 20, 20, 30, 40, 40, 50, 50, 60];
+        for (pixel, expected_red) in expected.into_iter().enumerate() {
+            assert_eq!(out[pixel * 4], expected_red);
+        }
+    }
+
+    #[test]
+    fn reused_buffer_clears_zero_padding_in_fit_mode() {
+        let img = tiny_image();
+        let mut out = vec![0xaa; 8 * 4 * 4];
+        ScaleMode::Fit.blit_into(&img, 8, 4, [0, 0, 0, 0], &mut out);
+
+        assert_eq!(pixel_at(&out, 8, 0, 0), [0, 0, 0, 0]);
+        assert_eq!(pixel_at(&out, 8, 2, 0), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn fit_with_matching_aspect_ratio_overwrites_reused_buffer() {
+        let img = tiny_image();
+        let mut out = vec![0xaa; 4 * 4 * 4];
+        ScaleMode::Fit.blit_into(&img, 4, 4, [17, 18, 19, 20], &mut out);
+
+        assert!(out.chunks_exact(4).all(|pixel| pixel != [0xaa; 4]));
+        assert!(out.chunks_exact(4).all(|pixel| pixel != [17, 18, 19, 20]));
     }
 
     #[test]

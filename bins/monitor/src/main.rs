@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 // Paint/data leaf modules live in the library face (`lib.rs`) so `divan`
 // benches can drive them headlessly with an allocation profiler. The binary
 // only adds the modules that need the live window/thread context.
+mod headless;
 mod profile;
 mod snapshot_cli;
 
@@ -1413,6 +1414,10 @@ impl App {
     }
 }
 fn main() {
+    if let Ok(Some(options)) = headless_stress::StressOptions::parse(std::env::args()) {
+        headless::MonitorStress::run(options);
+        return;
+    }
     let args: Vec<String> = std::env::args().collect();
     if snapshot_cli::SnapshotCli::requested(&args) {
         // Headless path: never touches Wayland/the window/the paint loop.

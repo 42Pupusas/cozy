@@ -15,6 +15,7 @@ platform = { path = "../../crates/platform" }
 wallpaper = { path = "../../crates/wallpaper" }
 waker = { path = "../../crates/waker" }
 quetzalcoatl = { workspace = true }
+headless-stress = { path = "../../crates/headless-stress" }
 
 [dev-dependencies]
 # Keep output lifecycle tests independent from a compositor and image decoder.

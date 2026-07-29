@@ -21,6 +21,7 @@ mod density;
 mod favorites;
 mod frame;
 mod handlers;
+mod headless;
 mod history;
 mod hover;
 mod keymap;
@@ -198,5 +199,9 @@ impl App {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if headless::FileStress::maybe_run(&arguments)? {
+        return Ok(());
+    }
     App::run()
 }

@@ -21,3 +21,4 @@ quetzalcoatl = { workspace = true }
 # App-icon decoding only -- see `icon_cache.rs`'s doc for why this is the
 # one place this binary touches a PNG decoder at all.
 ixiptla-core = { workspace = true }
+headless-stress = { path = "../../crates/headless-stress" }

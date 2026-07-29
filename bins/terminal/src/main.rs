@@ -47,6 +47,8 @@ use quetzalcoatl::mpsc;
 use quetzalcoatl::spsc::RingBuffer;
 use vt_parser::Parser;
 
+mod headless;
+
 /// The grid's negotiated terminal modes, packed into one `u32` for cheap
 /// lock-free cross-thread transport (parser thread writes after every grid
 /// batch, UI thread reads before encoding each key/mouse event) -- the same
@@ -287,6 +289,15 @@ impl Drop for QuitGuard {
 // ── Entry ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match headless::TerminalStress::maybe_run(&arguments) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("terminal: {error}");
+            std::process::exit(1);
+        }
+    }
     let cfg = Config::load().unwrap_or_else(|e| {
         eprintln!("terminal: config error: {e} — using defaults");
         Config::default()

@@ -8,7 +8,7 @@
 //! per cell, while attributes/link/placement are reconstructed only when a
 //! consumer needs a `Cell` value (render snapshots, selection, resize).
 
-use crate::{Attrs, Cell};
+use crate::{Attrs, Cell, DirtyRowContent};
 
 /// One interned render style. Placement remains per-cell because a wide lead
 /// and its spacer share SGR/link state but have different geometry.
@@ -248,8 +248,33 @@ impl CellStore {
         self.placement.copy_within(src, dest);
     }
 
+    pub(crate) fn row_content(&self, range: std::ops::Range<usize>) -> DirtyRowContent {
+        let chars = &self.chars[range.clone()];
+        let style_ids = &self.style_ids[range.clone()];
+        let placement = &self.placement[range.clone()];
+
+        // A shell normally emits an entire row under one SGR state. Snapshot
+        // materialization used to reconstruct that same style-table entry and
+        // test placement for every cell, even though ordinary ASCII output is
+        // uniformly narrow. Detect this common representation once and retain
+        // the fully general per-cell path for mixed SGR or wide-character rows.
+        if let Some(&style_id) = style_ids.first()
+            && placement.iter().all(|&value| value == Self::NARROW)
+            && style_ids.iter().all(|&value| value == style_id)
+        {
+            let style = self.styles[usize::from(style_id)];
+            return DirtyRowContent::Uniform {
+                chars: chars.to_vec(),
+                attrs: style.attrs,
+                link_id: style.link_id,
+            };
+        }
+
+        DirtyRowContent::Cells(range.map(|index| self.cell(index)).collect())
+    }
+
     pub(crate) fn row_cells(&self, range: std::ops::Range<usize>) -> Vec<Cell> {
-        range.map(|index| self.cell(index)).collect()
+        self.row_content(range).materialize_cells()
     }
 
     pub(crate) fn cells(&self, range: std::ops::Range<usize>) -> Vec<Cell> {
@@ -288,7 +313,7 @@ impl CellStore {
 #[cfg(test)]
 mod tests {
     use super::CellStore;
-    use crate::{Attrs, Cell, Color};
+    use crate::{Attrs, Cell, Color, DirtyRowContent};
 
     #[test]
     fn ascii_widening_preserves_each_byte_across_vector_and_scalar_tails() {
@@ -301,15 +326,32 @@ mod tests {
     }
 
     #[test]
-    fn round_trips_cells_and_plane_copies() {
+    fn row_cells_preserves_uniform_ascii_style() {
+        let mut store = CellStore::new(4);
+        let attrs = Attrs::with_colors(Color::Indexed(1), Color::Rgb(2, 3, 4));
+        store.write_ascii(0, b"test", attrs, 7);
+
+        let row = store.row_content(0..4);
+        assert!(matches!(row, DirtyRowContent::Uniform { .. }));
+        let cells = row.materialize_cells();
+        assert_eq!(cells[0], Cell::new('t', attrs, 7));
+        assert_eq!(cells[3], Cell::new('t', attrs, 7));
+    }
+
+    #[test]
+    fn row_cells_preserves_mixed_placement_and_styles() {
         let mut store = CellStore::new(4);
         let attrs = Attrs::with_colors(Color::Indexed(1), Color::Rgb(2, 3, 4));
         store.set_cell(0, Cell::wide_lead('全', attrs, 7));
         store.set_cell(1, Cell::wide_spacer(attrs, 7));
         store.set_cell(2, Cell::new('x', attrs, 7));
         store.copy_within(0..3, 1);
-        assert!(store.cell(1).wide());
-        assert!(store.cell(2).spacer());
-        assert_eq!(store.cell(3).ch, 'x');
+
+        let row = store.row_content(1..4);
+        assert!(matches!(row, DirtyRowContent::Cells(_)));
+        let cells = row.materialize_cells();
+        assert!(cells[0].wide());
+        assert!(cells[1].spacer());
+        assert_eq!(cells[2].ch, 'x');
     }
 }

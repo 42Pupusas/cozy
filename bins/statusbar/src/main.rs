@@ -27,6 +27,7 @@
 //! `waker::Waker`, means the render thread's Wayland pump is never at the
 //! mercy of a subprocess's exec/IPC latency.
 
+mod headless;
 mod worker;
 
 use std::sync::mpsc;
@@ -418,5 +419,14 @@ impl BarApp {
 }
 
 fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match headless::StatusbarStress::maybe_run(&arguments) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("statusbar: {error}");
+            std::process::exit(1);
+        }
+    }
     BarApp::new().run();
 }

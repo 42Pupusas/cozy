@@ -6,7 +6,7 @@
 )]
 //! 2-D cell buffer with scrollback.
 
-use crate::{Cell, cell_store::CellStore};
+use crate::{Cell, DirtyRowContent, cell_store::CellStore};
 
 /// A rectangular grid of cells with optional scrollback.
 ///
@@ -1012,24 +1012,22 @@ impl Screen {
 
     // ── private ───────────────────────────────────────────────────────────
 
-    /// Borrow the visible row's cells as one contiguous slice, or `None`
-    /// when the row is lazily blank (its `buf` cells are stale garbage that
-    /// must read as [`Cell::default()`]).
+    /// Build the visible row's owned snapshot payload, or `None` when the row
+    /// is lazily blank (its backing cells are stale and must read as default).
     ///
-    /// This exists for the snapshot gather path: copying a dirty row used to
-    /// go through [`Self::get_cell`] once per column, recomputing the
-    /// physical row and re-checking `blank_rows` + bounds for every single
-    /// cell. A slice lets the caller do one `extend_from_slice` (a straight
-    /// memcpy) instead. The `Option` forces the caller to handle the
-    /// blank-row case explicitly rather than ever seeing stale cells.
+    /// This is the parser-to-UI ownership boundary. Delegating to `CellStore`
+    /// preserves a uniform narrow row as codepoints plus one shared style,
+    /// while mixed styles and wide placement retain the general Cell payload.
+    /// The `Option` forces the snapshot gatherer to represent a blank row
+    /// explicitly rather than ever transporting stale ring-buffer storage.
     #[must_use]
-    pub(crate) fn visible_row_cells(&self, row: u16) -> Option<Vec<Cell>> {
+    pub(crate) fn visible_row_content(&self, row: u16) -> Option<DirtyRowContent> {
         let phys = self.phys_row(self.scrollback_len + usize::from(row));
         if self.blank_rows[phys] {
             return None;
         }
         let start = phys * usize::from(self.cols);
-        Some(self.buf.row_cells(start..start + usize::from(self.cols)))
+        Some(self.buf.row_content(start..start + usize::from(self.cols)))
     }
 
     /// Physical start index (in `buf`) of a visible row, ring-mapped.

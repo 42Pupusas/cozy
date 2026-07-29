@@ -27,22 +27,24 @@ pub struct Filter {
 }
 
 impl Filter {
-    /// Whether `entry` should be visible.
+    /// Whether `entry` is visible.
     #[must_use]
     pub fn accepts(&self, entry: &Entry) -> bool {
+        let query = self.name_contains.to_lowercase();
+        self.accepts_normalized(entry, &query)
+    }
+
+    /// Apply this filter with a query that has already been normalized.
+    ///
+    /// Directory views call this once per entry during a recompute. Keeping
+    /// normalization outside the loop avoids rebuilding the same query for
+    /// every row while preserving `accepts` as a convenient standalone API.
+    #[must_use]
+    pub(crate) fn accepts_normalized(&self, entry: &Entry, query: &str) -> bool {
         if entry.hidden && !self.show_hidden {
             return false;
         }
-        if self.name_contains.is_empty() {
-            return true;
-        }
-        // Lowercase both sides for a case-insensitive contains. This
-        // allocates per call, which is fine at directory scale but is the
-        // first thing to optimise if profiling ever says otherwise.
-        entry
-            .name
-            .to_lowercase()
-            .contains(&self.name_contains.to_lowercase())
+        query.is_empty() || entry.lower_name.contains(query)
     }
 
     /// Whether any rule is actually active.

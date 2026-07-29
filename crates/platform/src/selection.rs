@@ -34,11 +34,16 @@ pub struct SelectionTracker {
     /// is selected. The anchor is the fixed end; the head is what a drag or
     /// shift+click moves.
     range: Option<(Endpoint, Endpoint)>,
-    /// Mirror of the latest grid content the renderer has drawn, used to
-    /// extract selection text and locate the highlight — entirely on the UI
-    /// thread, no round-trip to the parser-owned grid. Indexed `[row][col]`,
-    /// only the visible viewport.
-    mirror: Vec<Vec<grid::Cell>>,
+    /// Latest grid content the renderer has drawn, retained in its compact
+    /// transport form. Keeping uniform rows compact is crucial: most terminal
+    /// frames are ordinary narrow, single-style text, and selection is idle on
+    /// nearly all of them. Expanding every such row into `Cell`s here used to
+    /// duplicate the renderer's avoided work on every frame.
+    ///
+    /// Indexed by visible row. The selection and window ask row-level accessors
+    /// for the few operations that need content; only those operations expand
+    /// general cell data when that is truly required.
+    mirror: Vec<grid::DirtyRowContent>,
     /// Rows that scrolled off the top of `mirror` while a selection was
     /// active, so `selected_text` can still recover them. Keyed by the same
     /// signed viewport row space as `range`'s endpoints (so a row that left
@@ -60,7 +65,7 @@ pub struct SelectionTracker {
     /// drawing only ever touches the clamped `visible_rows`, masking the
     /// loss until copy. Only populated while `range` is `Some`, so an idle
     /// terminal pays nothing for this.
-    history: std::collections::HashMap<i32, Vec<grid::Cell>>,
+    history: std::collections::HashMap<i32, grid::DirtyRowContent>,
     /// Current viewport offset (lines scrolled into scrollback; 0 = live
     /// bottom). Tracked so a wheel-scroll shifts the selection with the text.
     view_offset: i32,
@@ -102,10 +107,31 @@ impl SelectionTracker {
         self.left_held
     }
 
-    /// The mirrored on-screen content, indexed `[row][col]`.
+    /// The latest retained payload for visible `row`.
+    ///
+    /// Callers that merely need text or a link id should use the dedicated
+    /// accessors below, so ordinary rows remain compact. Rendering repair paths
+    /// may materialize this payload locally because they run only for touched
+    /// rows, never during every snapshot ingestion.
     #[must_use]
-    pub fn mirror(&self) -> &[Vec<grid::Cell>] {
-        &self.mirror
+    pub fn row_content(&self, row: u16) -> Option<&grid::DirtyRowContent> {
+        self.mirror.get(usize::from(row))
+    }
+
+    /// The OSC-8 link id at a visible cell, or zero when absent/out of range.
+    #[must_use]
+    pub fn link_id_at(&self, col: u16, row: u16) -> u32 {
+        let Some(content) = self.row_content(row) else {
+            return 0;
+        };
+        match content {
+            grid::DirtyRowContent::Uniform { chars, link_id, .. } => {
+                chars.get(usize::from(col)).map_or(0, |_| *link_id)
+            }
+            grid::DirtyRowContent::Cells(cells) => {
+                cells.get(usize::from(col)).map_or(0, grid::Cell::link_id)
+            }
+        }
     }
 
     /// Clear the selection if one is active. Returns `true` when something was
@@ -235,9 +261,9 @@ impl SelectionTracker {
                 // the *viewport* is only supposed to move what's visible,
                 // not shrink the selection itself.
                 if !self.mirror.is_empty() && self.range.is_some() {
-                    for (i, cells) in self.mirror.drain(..).enumerate() {
+                    for (i, content) in self.mirror.drain(..).enumerate() {
                         let row = i32::try_from(i).unwrap_or(i32::MAX) + view_delta;
-                        self.history.insert(row, cells);
+                        self.history.insert(row, content);
                     }
                 }
             }
@@ -278,11 +304,11 @@ impl SelectionTracker {
                 // differ, and keying by `d` would stash the row one-or-more
                 // rows too high, so `selected_text`'s `history.get(&row)`
                 // (row from the shifted endpoint) would miss it entirely.
-                for (i, cells) in self.mirror.drain(..d).enumerate() {
+                for (i, content) in self.mirror.drain(..d).enumerate() {
                     // `i < d <= mirror.len()`, a viewport row count, always
                     // far under `i32::MAX`.
                     let row = i32::try_from(i).unwrap_or(i32::MAX) - delta;
-                    self.history.insert(row, cells);
+                    self.history.insert(row, content);
                 }
             } else if !self.mirror.is_empty() {
                 let d = delta_usize.min(self.mirror.len());
@@ -293,18 +319,19 @@ impl SelectionTracker {
             self.history.clear();
         }
         // Keep the cell mirror in sync so selection/highlight/extraction always
-        // reflect the latest drawn content. `clone_from` (rather than
-        // `row.cells.clone()` + assign) reuses the existing row Vec's heap
-        // allocation when its capacity already fits — the overwhelmingly common
-        // case, since a row's width doesn't change between snapshots — instead
-        // of allocating a fresh Vec and dropping the old one on every single
-        // dirty row of every snapshot.
+        // reflect the latest drawn content. Compact rows become Cells exactly
+        // here because this owner retains them after the transport snapshot is
+        // dropped; renderer-only consumers keep the compact representation.
         for row in &snap.rows {
             let r = usize::from(row.row);
             if self.mirror.len() <= r {
-                self.mirror.resize(r + 1, Vec::new());
+                self.mirror
+                    .resize_with(r + 1, || grid::DirtyRowContent::Cells(Vec::new()));
             }
-            self.mirror[r].clone_from(&row.cells);
+            // Clone the owned transport payload, not a materialized cell row.
+            // This is the core ownership change: idle selection now carries
+            // uniform terminal output without expanding it into `Cell`s.
+            self.mirror[r] = row.content.clone();
         }
     }
 
@@ -371,28 +398,53 @@ impl SelectionTracker {
             } else {
                 line.len().saturating_sub(1)
             };
-            let mut s = String::new();
-            if !line.is_empty() {
-                let end = c1.min(line.len().saturating_sub(1));
-                for cell in &line[c0.min(end)..=end] {
-                    if !cell.spacer() {
-                        s.push(cell.ch);
-                    }
-                }
-            }
-            out.push_str(s.trim_end());
+            Self::append_selected_columns(&mut out, line, c0, c1);
             if row != er {
                 out.push('\n');
             }
         }
         Some(out)
     }
+
+    /// Append a selected column range without forcing compact rows through a
+    /// temporary `Vec<Cell>`. Uniform rows have no spacers by construction;
+    /// general rows preserve their existing wide-glyph spacer behavior.
+    fn append_selected_columns(
+        output: &mut String,
+        content: &grid::DirtyRowContent,
+        start: usize,
+        end: usize,
+    ) {
+        if content.is_empty() {
+            return;
+        }
+        let end = end.min(content.len().saturating_sub(1));
+        let start = start.min(end);
+        let mut text = String::new();
+        match content {
+            grid::DirtyRowContent::Uniform { chars, .. } => {
+                for &codepoint in &chars[start..=end] {
+                    text.push(char::from_u32(codepoint).unwrap_or('�'));
+                }
+            }
+            grid::DirtyRowContent::Cells(cells) => {
+                for cell in &cells[start..=end] {
+                    if !cell.spacer() {
+                        text.push(cell.ch);
+                    }
+                }
+            }
+        }
+        output.push_str(text.trim_end());
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use grid::{Cell, CursorInfo, DirtyRow, DirtySnapshot, ScrollBand, SnapshotKind};
+    use grid::{
+        Cell, CursorInfo, DirtyRow, DirtyRowContent, DirtySnapshot, ScrollBand, SnapshotKind,
+    };
 
     /// A row of plain cells from a string, row-indexed `row`.
     fn text_row(row: u16, s: &str) -> DirtyRow {
@@ -400,7 +452,22 @@ mod tests {
             .chars()
             .map(|ch| Cell::new(ch, grid::Attrs::default(), 0))
             .collect();
-        DirtyRow { row, cells }
+        DirtyRow {
+            row,
+            content: DirtyRowContent::Cells(cells),
+        }
+    }
+
+    /// A compact uniform text row, matching the common parser transport case.
+    fn uniform_text_row(row: u16, text: &str) -> DirtyRow {
+        DirtyRow {
+            row,
+            content: DirtyRowContent::Uniform {
+                chars: text.chars().map(u32::from).collect(),
+                attrs: grid::Attrs::default(),
+                link_id: 0,
+            },
+        }
     }
 
     /// An incremental snapshot carrying `rows`, with the given content-scroll
@@ -464,6 +531,19 @@ mod tests {
         sel.press_left((0, 0), false);
         assert!(sel.drag_to((5, 0)));
         assert_eq!(sel.selected_text().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn uniform_transport_stays_compact_through_selection_and_copies_text() {
+        let mut sel = SelectionTracker::new();
+        sel.ingest_snapshot(&incremental(vec![uniform_text_row(0, "compact row")], 0));
+        assert!(matches!(
+            sel.row_content(0),
+            Some(DirtyRowContent::Uniform { .. })
+        ));
+        sel.press_left((0, 0), false);
+        assert!(sel.drag_to((7, 0)));
+        assert_eq!(sel.selected_text().as_deref(), Some("compact"));
     }
 
     #[test]
@@ -651,9 +731,15 @@ mod tests {
             Cell::new('a', grid::Attrs::default(), 0),
             Cell::new('b', grid::Attrs::default(), 7),
         ];
-        sel.ingest_snapshot(&incremental(vec![DirtyRow { row: 0, cells }], 0));
-        assert_eq!(sel.mirror()[0][0].link_id(), 0);
-        assert_eq!(sel.mirror()[0][1].link_id(), 7);
+        sel.ingest_snapshot(&incremental(
+            vec![DirtyRow {
+                row: 0,
+                content: DirtyRowContent::Cells(cells),
+            }],
+            0,
+        ));
+        assert_eq!(sel.link_id_at(0, 0), 0);
+        assert_eq!(sel.link_id_at(1, 0), 7);
     }
 
     #[test]

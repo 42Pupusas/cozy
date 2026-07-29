@@ -6,6 +6,7 @@
 
 mod appearance;
 mod background_surface;
+mod headless;
 mod output_set;
 mod wallpaper_pixels;
 
@@ -337,6 +338,15 @@ impl Application {
 }
 
 fn main() {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match headless::WallpaperStress::maybe_run(&arguments) {
+        Ok(true) => return,
+        Err(error) if arguments.iter().any(|arg| arg == "--headless-stress") => {
+            eprintln!("wallpaper: {error}");
+            std::process::exit(1);
+        }
+        Ok(false) | Err(_) => {}
+    }
     if Application::handle_meta_command() {
         return;
     }

@@ -34,3 +34,4 @@ mime     = { path = "../../crates/mime" }
 # rather than reimplemented: "open this file with that app" and "launch
 # that app" are the same command-building problem.
 launcher = { path = "../../crates/launcher" }
+headless-stress = { path = "../../crates/headless-stress" }

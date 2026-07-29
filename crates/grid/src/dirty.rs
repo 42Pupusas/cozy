@@ -6,8 +6,8 @@
 
 use std::collections::BTreeMap;
 
-use crate::Cell;
 use crate::screen::Screen;
+use crate::{Attrs, Cell};
 
 /// Tracks dirty (modified) rows since the last snapshot.
 pub struct DirtyRegion {
@@ -191,11 +191,13 @@ impl DirtyRegion {
                     // `get_cell` loop recomputed the physical row index and
                     // re-checked the blank bit + bounds for every cell --
                     // pure overhead on the hottest snapshot path.
-                    let cells: Vec<Cell> = match screen.visible_row_cells(row) {
-                        Some(cells) => cells,
-                        None => vec![Cell::default(); usize::from(self.cols)],
-                    };
-                    rows.push(DirtyRow { row, cells });
+                    let content = screen.visible_row_content(row).unwrap_or_else(|| {
+                        // A lazily blank row has no backing cells to copy.
+                        // Keep it compact instead of allocating an entire row
+                        // of identical default Cells merely for transport.
+                        DirtyRowContent::uniform_spaces(usize::from(self.cols))
+                    });
+                    rows.push(DirtyRow { row, content });
                 }
                 bits &= bits - 1;
             }
@@ -222,13 +224,81 @@ impl DirtyRegion {
     }
 }
 
-/// A row of cells that needs to be redrawn.
+/// Owned payload for one dirty row.
+///
+/// A snapshot crosses from the parser-owned grid to the asynchronous UI
+/// thread, so it cannot borrow storage. Most terminal rows nevertheless have
+/// one narrow SGR/link style. Transporting their codepoints beside that single
+/// style avoids constructing a 20-byte [`Cell`] per column just to immediately
+/// unpack the same attributes again in the renderer.
+#[derive(Debug, Clone)]
+pub enum DirtyRowContent {
+    /// Narrow characters sharing one SGR state and OSC-8 link id.
+    Uniform {
+        /// Unicode scalar values, left-to-right. Invalid values render as U+FFFD.
+        chars: Vec<u32>,
+        /// Shared non-placement attributes.
+        attrs: Attrs,
+        /// Shared OSC-8 link id.
+        link_id: u32,
+    },
+    /// General row retaining per-cell styles and wide-glyph placement.
+    Cells(Vec<Cell>),
+}
+
+impl DirtyRowContent {
+    /// A compact blank row used for Screen's lazily-cleared storage.
+    #[must_use]
+    pub fn uniform_spaces(len: usize) -> Self {
+        Self::Uniform {
+            chars: vec![u32::from(' '); len],
+            attrs: Attrs::default(),
+            link_id: 0,
+        }
+    }
+
+    /// Number of columns represented by this row.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        match self {
+            Self::Uniform { chars, .. } => chars.len(),
+            Self::Cells(cells) => cells.len(),
+        }
+    }
+
+    /// Whether this row represents no columns.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Materialize cells only for consumers that intrinsically need a durable
+    /// per-cell mirror (selection, URL scanning, and clipboard extraction).
+    #[must_use]
+    pub fn materialize_cells(&self) -> Vec<Cell> {
+        match self {
+            Self::Uniform {
+                chars,
+                attrs,
+                link_id,
+            } => chars
+                .iter()
+                .map(|&codepoint| {
+                    Cell::new(char::from_u32(codepoint).unwrap_or('�'), *attrs, *link_id)
+                })
+                .collect(),
+            Self::Cells(cells) => cells.clone(),
+        }
+    }
+}
+
+/// A row that needs to be redrawn.
 #[derive(Debug, Clone)]
 pub struct DirtyRow {
     /// 0-indexed row number.
     pub row: u16,
-    /// Cells in this row, left-to-right.
-    pub cells: Vec<Cell>,
+    /// Owned compact or general row payload.
+    pub content: DirtyRowContent,
 }
 
 /// The cursor's position and visibility, carried on every [`DirtySnapshot`].
@@ -447,7 +517,7 @@ impl DirtySnapshot {
                             nr,
                             DirtyRow {
                                 row: nr,
-                                cells: row.cells,
+                                content: row.content,
                             },
                         );
                     }
@@ -482,6 +552,22 @@ mod tests {
 
     fn dirty_rows(d: &DirtyRegion) -> Vec<u16> {
         (0..d.rows).filter(|&r| d.get_bit(usize::from(r))).collect()
+    }
+
+    #[test]
+    fn compact_uniform_content_materializes_exact_cells() {
+        let attrs = crate::Attrs::default();
+        let content = DirtyRowContent::Uniform {
+            chars: vec![u32::from('a'), u32::from('b')],
+            attrs,
+            link_id: 9,
+        };
+        assert_eq!(content.len(), 2);
+        assert!(!content.is_empty());
+        assert_eq!(
+            content.materialize_cells(),
+            vec![Cell::new('a', attrs, 9), Cell::new('b', attrs, 9)]
+        );
     }
 
     #[test]
@@ -546,7 +632,7 @@ mod tests {
                 .iter()
                 .map(|&(r, ch)| DirtyRow {
                     row: r,
-                    cells: vec![cell(ch)],
+                    content: DirtyRowContent::Cells(vec![cell(ch)]),
                 })
                 .collect(),
             cols,
@@ -560,7 +646,10 @@ mod tests {
     }
 
     fn row_map(s: &DirtySnapshot) -> Vec<(u16, char)> {
-        s.rows.iter().map(|r| (r.row, r.cells[0].ch)).collect()
+        s.rows
+            .iter()
+            .map(|r| (r.row, r.content.materialize_cells()[0].ch))
+            .collect()
     }
 
     #[test]

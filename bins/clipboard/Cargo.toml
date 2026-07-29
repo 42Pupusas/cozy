@@ -11,6 +11,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+headless-stress = { path = "../../crates/headless-stress" }
 # History, retention, persistence, and MIME policy -- all headlessly testable.
 clipboard = { path = "../../crates/clipboard" }
 # The data-control transport, shared with `bins/shot`.

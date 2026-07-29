@@ -184,21 +184,25 @@ impl BackgroundSurface {
     ) -> Result<([Frame; 2], ShmBuffer, PoolId)> {
         let (frames, mut memory, pool) =
             Frame::create_pair(sender, self.shm, width, height, Format::Xrgb8888)?;
-        let pixels = self.pixels_for_size(width.cast_unsigned(), height.cast_unsigned());
+        let width = width.cast_unsigned();
+        let height = height.cast_unsigned();
+        self.render_pixels_into(&mut memory, width, height);
         // Both slots receive identical pixels. The second buffer may be used
         // after a compositor release without asking the decoder to rerun.
-        for slot in 0..2 {
-            memory.pixels(slot).copy_from_slice(&pixels);
-        }
+        let first = memory.pixels(0).to_owned();
+        memory.pixels(1).copy_from_slice(&first);
         Ok((frames, memory, pool))
     }
 
-    /// Render either the selected image or a solid-color frame.
-    fn pixels_for_size(&self, width: u32, height: u32) -> Vec<u32> {
-        self.wallpaper.as_ref().map_or_else(
-            || vec![self.appearance.color.xrgb(); width as usize * height as usize],
-            |wallpaper| wallpaper.render_xrgb(width, height, self.appearance.color.rgba()),
-        )
+    /// Render directly into the first shm slot, avoiding a temporary XRGB
+    /// vector in addition to the wallpaper decoder's reusable RGBA scratch.
+    fn render_pixels_into(&self, memory: &mut ShmBuffer, width: u32, height: u32) {
+        let pad = self.appearance.color.rgba();
+        if let Some(wallpaper) = &self.wallpaper {
+            wallpaper.render_xrgb_into(width, height, pad, memory.pixels(0));
+        } else {
+            memory.pixels(0).fill(self.appearance.color.xrgb());
+        }
     }
 
     /// Dispose the protocol resources for an obsolete configured size.

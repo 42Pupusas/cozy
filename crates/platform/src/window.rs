@@ -613,11 +613,7 @@ impl TermWindow {
     /// serve`'s banner) should go through [`Self::link_target_at`] instead.
     #[must_use]
     pub fn link_id_at(&self, col: u16, row: u16) -> u32 {
-        self.selection
-            .mirror()
-            .get(usize::from(row))
-            .and_then(|line| line.get(usize::from(col)))
-            .map_or(0, grid::Cell::link_id)
+        self.selection.link_id_at(col, row)
     }
 
     /// What's clickable at viewport `(col, row)`: a real OSC 8 link if the
@@ -632,8 +628,8 @@ impl TermWindow {
         if id != 0 {
             return Some(crate::link_scan::LinkTarget::Real(id));
         }
-        let line = self.selection.mirror().get(usize::from(row))?;
-        crate::link_scan::UrlScanner::find_at(line, col).map(crate::link_scan::LinkTarget::Url)
+        let line = self.selection.row_content(row)?.materialize_cells();
+        crate::link_scan::UrlScanner::find_at(&line, col).map(crate::link_scan::LinkTarget::Url)
     }
 
     /// Recompute which link (if any) is under the pointer, and mark the
@@ -1703,12 +1699,12 @@ impl TermWindow {
         let cols = (self.width / self.cell_w).max(1) as u16;
         let mut canvas = self.pixels.canvas(self.width, self.height);
         for &row in rows {
-            let Some(line) = self.selection.mirror().get(usize::from(row)) else {
+            let Some(content) = self.selection.row_content(row) else {
                 continue;
             };
-            // Clone the row's cells so we don't hold a borrow on `self` while
-            // the renderer needs `&mut self`.
-            let cells = line.clone();
+            // Repair painting touches only a small dirty set. Materialize here
+            // rather than retaining expanded cells for every idle frame.
+            let cells = content.materialize_cells();
             for (col, cell) in cells.iter().enumerate().take(usize::from(cols)) {
                 self.renderer.blit_cell(&mut canvas, col as u16, row, cell);
             }
@@ -1807,12 +1803,14 @@ impl TermWindow {
             return;
         };
         let (_, row) = self.pointer_cell();
-        let Some(line) = self.selection.mirror().get(usize::from(row)) else {
+        let Some(content) = self.selection.row_content(row) else {
             return;
         };
+        // Hover work is pointer-driven, not frame-driven. Expand locally so
+        // the retained selection model stays compact during ordinary output.
+        let line = content.materialize_cells();
         // Find the span to underline: a real link's contiguous same-id run,
-        // or a detected URL's own pre-computed span. (`line` came straight
-        // from `row` above, so no need to re-check it.)
+        // or a detected URL's own pre-computed span.
         let (lo, hi) = match target {
             crate::link_scan::LinkTarget::Real(id) => {
                 let mut lo = None;

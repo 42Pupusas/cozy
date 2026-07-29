@@ -204,12 +204,13 @@ impl DirectoryView {
     /// reordered -- indices into it therefore stay valid for the lifetime of
     /// the listing, which is what makes index-based visibility safe.
     fn recompute(&mut self) {
+        let query = self.filter.name_contains.to_lowercase();
         let mut kept: Vec<(usize, &Entry)> = self
             .listing
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, e)| self.filter.accepts(e))
+            .filter(|(_, e)| self.filter.accepts_normalized(e, &query))
             .collect();
 
         let policy = self.sort;

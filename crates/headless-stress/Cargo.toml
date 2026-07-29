@@ -1,0 +1,19 @@
+[package]
+name = "headless-stress"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "stress-headless"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+name = "headless_stress"
+
+[package.metadata]
+# This crate intentionally contains no Wayland connection or window creation.
+# It is a deterministic workflow harness for profiling production-owned models.

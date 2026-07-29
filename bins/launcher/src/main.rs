@@ -9,6 +9,7 @@
 //! on Enter, exit on Esc or after a successful launch.
 
 mod dmenu_app;
+mod headless;
 mod icon_cache;
 mod launcher_options;
 mod launcher_window;
@@ -495,7 +496,16 @@ impl Cli {
 }
 
 fn main() -> std::process::ExitCode {
-    let opts = match LauncherOptions::parse(std::env::args().skip(1)) {
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    match headless::LauncherStress::maybe_run(&arguments) {
+        Ok(true) => return std::process::ExitCode::SUCCESS,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("launcher: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
+    let opts = match LauncherOptions::parse(arguments) {
         Ok(opts) => opts,
         Err(e) => {
             eprintln!("launcher: {e}");

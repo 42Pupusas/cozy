@@ -32,7 +32,9 @@ mod stats;
 
 pub use cell::{Attrs, Cell, Color, UnderlineStyle};
 pub use cursor::{Cursor, CursorShape};
-pub use dirty::{CursorInfo, DirtyRegion, DirtyRow, DirtySnapshot, ScrollBand, SnapshotKind};
+pub use dirty::{
+    CursorInfo, DirtyRegion, DirtyRow, DirtyRowContent, DirtySnapshot, ScrollBand, SnapshotKind,
+};
 pub use palette::XTERM_256;
 pub use screen::Screen;
 pub use selection::{Point as SelPoint, Selection};
@@ -637,7 +639,10 @@ impl Grid {
             let cells: Vec<Cell> = (0..cols)
                 .map(|col| self.primary.get_viewport_cell(col, row, cur))
                 .collect();
-            out.push(DirtyRow { row, cells });
+            out.push(DirtyRow {
+                row,
+                content: DirtyRowContent::Cells(cells),
+            });
         }
         // Signed whole-screen pixel-shift for the common small wheel/page step.
         // Emitted only when (1) the previously-rendered frame is trusted
@@ -2201,7 +2206,10 @@ mod tests {
         );
         for (event_row, direct_row) in events_dirty.rows.iter().zip(&direct_dirty.rows) {
             assert_eq!(event_row.row, direct_row.row);
-            assert_eq!(event_row.cells, direct_row.cells);
+            assert_eq!(
+                event_row.content.materialize_cells(),
+                direct_row.content.materialize_cells()
+            );
         }
         assert_eq!(events.take_title(), direct.take_title());
         assert_eq!(events.take_replies(), direct.take_replies());
@@ -2257,7 +2265,13 @@ mod tests {
         assert_eq!(rows, vec![0, 3]);
         // The edit really is 'X' at row 0 col 0.
         assert_eq!(
-            snap.rows.iter().find(|r| r.row == 0).unwrap().cells[0].ch,
+            snap.rows
+                .iter()
+                .find(|r| r.row == 0)
+                .unwrap()
+                .content
+                .materialize_cells()[0]
+                .ch,
             'X'
         );
     }
@@ -2892,7 +2906,12 @@ mod tests {
         assert_eq!(snap.rows.len(), 4);
         // row 0 of a 3-up view = scrollback line (len-3). Verify it differs
         // from the live bottom row 0 by checking it's a real history line.
-        let row0: String = snap.rows[0].cells.iter().map(|c| c.ch).collect();
+        let row0: String = snap.rows[0]
+            .content
+            .materialize_cells()
+            .iter()
+            .map(|c| c.ch)
+            .collect();
         assert!(
             row0.starts_with("line"),
             "expected a history line, got {row0:?}"
@@ -2908,7 +2927,12 @@ mod tests {
         assert_eq!(g.viewport_offset(), 0);
         let snap = g.take_dirty();
         assert_eq!(snap.rows.len(), 4); // snap-back also repaints fully
-        let row3: String = snap.rows[3].cells.iter().map(|c| c.ch).collect();
+        let row3: String = snap.rows[3]
+            .content
+            .materialize_cells()
+            .iter()
+            .map(|c| c.ch)
+            .collect();
         assert!(
             row3.starts_with('X'),
             "cursor line back at bottom: {row3:?}"

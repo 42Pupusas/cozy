@@ -28,6 +28,18 @@ use std::collections::HashMap;
 
 use crate::registry::ObjectRegistry;
 
+/// The two interfaces every registered object answers implicitly, per
+/// [`ObjectRegistry`]'s own contract: it deliberately does not track
+/// these in a path's interface list (see its doc comment), so
+/// [`MethodCallRouter::dispatch`] must check for them here instead of
+/// via [`ObjectRegistry::implements`] -- otherwise a real `Introspect`
+/// or `Properties.Get`/`GetAll` call against any live object would
+/// wrongly fail as [`DispatchError::UnknownInterface`].
+const STANDARD_INTERFACES: [&str; 2] = [
+    "org.freedesktop.DBus.Introspectable",
+    "org.freedesktop.DBus.Properties",
+];
+
 /// The standard D-Bus error a failed dispatch corresponds to, carrying
 /// enough detail for whoever builds the wire reply to fill in a useful
 /// error message.
@@ -173,10 +185,13 @@ impl MethodCallRouter {
     /// Dispatch one incoming method call.
     ///
     /// Checks, in the order a real D-Bus service would report them: does
-    /// `path` exist at all, does it implement `interface`, is `member`
-    /// registered under `interface`, and does `signature` match what that
-    /// method expects -- before finally invoking the handler and wrapping
-    /// its own failure (if any) as [`DispatchError::Failed`].
+    /// `path` exist at all, does it implement `interface` (every path
+    /// implicitly implements [`STANDARD_INTERFACES`] whether or not
+    /// [`ObjectRegistry`] was told so -- see that constant's doc comment),
+    /// is `member` registered under `interface`, and does `signature`
+    /// match what that method expects -- before finally invoking the
+    /// handler and wrapping its own failure (if any) as
+    /// [`DispatchError::Failed`].
     pub fn dispatch(
         &self,
         registry: &ObjectRegistry,
@@ -189,7 +204,7 @@ impl MethodCallRouter {
         if !registry.contains(path) {
             return Err(DispatchError::UnknownObject { path: path.into() });
         }
-        if !registry.implements(path, interface) {
+        if !STANDARD_INTERFACES.contains(&interface) && !registry.implements(path, interface) {
             return Err(DispatchError::UnknownInterface {
                 path: path.into(),
                 interface: interface.into(),
@@ -260,6 +275,60 @@ mod tests {
         let router = MethodCallRouter::new();
         assert!(router.is_empty());
         assert_eq!(router.len(), 0);
+    }
+
+    #[test]
+    fn dispatch_reaches_the_standard_introspectable_interface_without_registration() {
+        // ObjectRegistry deliberately never tracks
+        // org.freedesktop.DBus.Introspectable/Properties (every object
+        // answers them implicitly); the router must still let a real
+        // Introspect call through rather than reporting UnknownInterface.
+        let registry = registry_with_settings_object();
+        let mut router = MethodCallRouter::new();
+        router.register(
+            "org.freedesktop.DBus.Introspectable",
+            "Introspect",
+            "",
+            "s",
+            |_path, _args| Ok(vec![Value::Str("<node/>".into())]),
+        );
+
+        let outcome = router
+            .dispatch(
+                &registry,
+                SETTINGS_PATH,
+                "org.freedesktop.DBus.Introspectable",
+                "Introspect",
+                "",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(outcome.values, vec![Value::Str("<node/>".into())]);
+    }
+
+    #[test]
+    fn dispatch_reaches_the_standard_properties_interface_without_registration() {
+        let registry = registry_with_settings_object();
+        let mut router = MethodCallRouter::new();
+        router.register(
+            "org.freedesktop.DBus.Properties",
+            "GetAll",
+            "s",
+            "a{sv}",
+            |_path, _args| Ok(vec![Value::Array(vec![])]),
+        );
+
+        let outcome = router
+            .dispatch(
+                &registry,
+                SETTINGS_PATH,
+                "org.freedesktop.DBus.Properties",
+                "GetAll",
+                "s",
+                &[Value::Str(SETTINGS_IFACE.into())],
+            )
+            .unwrap();
+        assert_eq!(outcome.values, vec![Value::Array(vec![])]);
     }
 
     #[test]

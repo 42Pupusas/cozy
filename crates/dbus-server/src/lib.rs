@@ -23,6 +23,7 @@
 //! separately versioned dependency just to name a `Value`.
 
 pub mod introspection;
+pub mod properties;
 pub mod registry;
 pub mod router;
 
@@ -33,5 +34,6 @@ pub use introspection::{
     Argument, InterfaceDescriptor, MethodDescriptor, NodeIntrospection, PropertyAccess,
     PropertyDescriptor, SignalDescriptor,
 };
+pub use properties::{PropertiesChangedSignal, PropertyTable};
 pub use registry::ObjectRegistry;
 pub use router::{DispatchError, DispatchOutcome, MethodCallRouter};

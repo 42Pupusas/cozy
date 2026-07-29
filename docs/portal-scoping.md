@@ -81,7 +81,7 @@ crates/dbus-server/          Depends on crates/dbus; re-exports what downstream
   registry.rs                Object lifetime and lookup (done)
   router.rs                  Signature-checked method dispatch (done)
   introspection.rs           Introspectable XML responses (done)
-  properties.rs              GetAll and PropertiesChanged
+  properties.rs              GetAll and PropertiesChanged (done)
   name_watcher.rs            Caller death -> request/session cleanup
 
 crates/portal-core/

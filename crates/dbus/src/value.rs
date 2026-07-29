@@ -113,6 +113,50 @@ impl Value {
             (k.as_display_string().as_deref() == Some(key)).then_some(v.as_ref())
         })
     }
+
+    /// The signature this value would encode as. Used by
+    /// [`crate::marshal::Marshaller`] to write a `Variant`'s inline type
+    /// tag: unlike every other container, a D-Bus variant carries its own
+    /// signature on the wire instead of getting it from the enclosing
+    /// signature string, so encoding one has to derive it from the value
+    /// itself.
+    ///
+    /// An empty `Array` has no element to inspect its type from, so this
+    /// falls back to `"v"` (variant) in that one case. Every caller in this
+    /// workspace that boxes an array into a variant populates it first, so
+    /// this fallback is a documented gap, not a silent correctness bug: a
+    /// genuinely empty array bound for the wire should be marshalled via
+    /// [`crate::marshal::Marshaller::marshal`] with an explicit element
+    /// signature from the caller's context instead of going through here.
+    #[must_use]
+    pub fn signature(&self) -> String {
+        match self {
+            Self::Byte(_) => "y".into(),
+            Self::Bool(_) => "b".into(),
+            Self::I16(_) => "n".into(),
+            Self::U16(_) => "q".into(),
+            Self::I32(_) => "i".into(),
+            Self::U32(_) => "u".into(),
+            Self::I64(_) => "x".into(),
+            Self::U64(_) => "t".into(),
+            Self::Double(_) => "d".into(),
+            Self::Str(_) => "s".into(),
+            Self::ObjectPath(_) => "o".into(),
+            Self::Signature(_) => "g".into(),
+            Self::Variant(_) => "v".into(),
+            Self::Array(items) => {
+                let elem = items
+                    .first()
+                    .map_or_else(|| "v".to_string(), Self::signature);
+                format!("a{elem}")
+            }
+            Self::Struct(items) => {
+                let inner: String = items.iter().map(Self::signature).collect();
+                format!("({inner})")
+            }
+            Self::DictEntry(k, v) => format!("{{{}{}}}", k.signature(), v.signature()),
+        }
+    }
 }
 
 /// The D-Bus signature grammar and wire (un)marshaller.

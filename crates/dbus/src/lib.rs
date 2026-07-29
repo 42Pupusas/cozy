@@ -14,6 +14,10 @@
 //!   unmarshaller, generic over any signature (recursive descent, not a
 //!   fixed set of hand-coded shapes).
 //! * [`message`] — wire-frame (header + body) building and parsing.
+//! * [`marshal`] — [`marshal::Marshaller`], the generic encode-side mirror
+//!   of [`value::Unmarshaller`] — needed once a caller must return an
+//!   arbitrary signature (e.g. portal replies) rather than the handful of
+//!   shapes `message::MessageBuilder` hand-writes for our own outbound calls.
 //! * [`sys`] — the unavoidable libc sliver (socket creation, `sockaddr_un`,
 //!   `geteuid`).
 //! * [`session_address`] — [`session_address::SessionAddress`], resolving
@@ -25,6 +29,7 @@
 pub mod bluez;
 pub mod conn;
 pub mod logind;
+pub mod marshal;
 pub mod message;
 pub mod network_manager;
 pub mod session_address;

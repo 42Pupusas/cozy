@@ -29,6 +29,7 @@ pub mod properties;
 pub mod registry;
 pub mod router;
 pub mod serve;
+pub mod server_loop;
 
 pub use dbus::marshal::Marshaller;
 pub use dbus::message::Reply;
@@ -43,3 +44,4 @@ pub use properties::{PropertiesChangedSignal, PropertyTable};
 pub use registry::ObjectRegistry;
 pub use router::{DispatchError, DispatchOutcome, MethodCallRouter};
 pub use serve::{IncomingCall, ReplySink};
+pub use server_loop::ServerLoop;

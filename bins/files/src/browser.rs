@@ -262,6 +262,72 @@ impl Browser {
         cursor.and_then(|row| self.entry(row))
     }
 
+    /// The paths a drag started from `row` would carry.
+    ///
+    /// If `row` is part of the active selection, every selected path is
+    /// dragged together -- the familiar "drag one of several selected
+    /// icons and they all move" behaviour. Otherwise only `row` itself is
+    /// dragged: pressing on an unselected row starts a drag of just that
+    /// row without first requiring a click to select it, matching how a
+    /// plain (non-selecting) press-drag works in other file managers.
+    ///
+    /// Empty when `row` is out of range, so a caller need not bounds-check
+    /// before calling this.
+    #[must_use]
+    pub fn drag_paths(&self, row: usize) -> Vec<PathBuf> {
+        let selected = match self.view_mode {
+            ViewMode::List => self.pane.selection().selected(),
+            ViewMode::Grid => self.grid.selection().selected(),
+        };
+        if selected.contains(&row) {
+            selected
+                .iter()
+                .filter_map(|&r| self.entry(r))
+                .map(|e| e.path.clone())
+                .collect()
+        } else {
+            self.entry(row)
+                .map(|e| vec![e.path.clone()])
+                .into_iter()
+                .flatten()
+                .collect()
+        }
+    }
+
+    /// The row (of either presentation) at pane-relative `(x, y)`, if any --
+    /// the shared hit-test a drag press resolves its source row through.
+    #[must_use]
+    pub fn row_at(&self, x: i32, y: i32) -> Option<usize> {
+        match self.view_mode {
+            ViewMode::List => self.pane.viewport().row_at_y(y),
+            ViewMode::Grid => self.grid.item_at(x, y),
+        }
+    }
+
+    /// Which row, if any, a drop at pane-relative `(x, y)` would land on --
+    /// and only if that row is a valid drop target (a directory, or a
+    /// symlink to one). Dropping onto a plain file has no defined meaning
+    /// here, so it is deliberately not reported as a target.
+    #[must_use]
+    pub fn drop_target_row(&self, x: i32, y: i32) -> Option<usize> {
+        let row = self.row_at(x, y)?;
+        self.entry(row)
+            .is_some_and(Entry::is_navigable)
+            .then_some(row)
+    }
+
+    /// The directory a drop at pane-relative `(x, y)` would land in: the
+    /// row under the point if it is navigable (see [`Self::drop_target_row`]),
+    /// otherwise the browser's own open directory -- dropping into empty
+    /// space below the list is the same as dropping into the folder
+    /// currently shown, exactly as every desktop file manager treats it.
+    #[must_use]
+    pub fn drop_target_dir(&self, x: i32, y: i32) -> PathBuf {
+        self.drop_target_row(x, y)
+            .and_then(|row| self.entry(row))
+            .map_or_else(|| self.view.path().to_path_buf(), |e| e.path.clone())
+    }
+
     /// Resize the pane.
     pub fn resize(&mut self, width: i32, height: i32) {
         self.pane.resize(width, height);
@@ -464,6 +530,43 @@ impl Browser {
         }
     }
 
+    /// Move `paths` into `target_dir` (a real filesystem mutation via
+    /// [`fileops::Transfer`]), then refresh so the change is visible at
+    /// once rather than waiting for the next inotify tick.
+    ///
+    /// A path already inside `target_dir` -- the classic "dropped it back
+    /// where it started" case -- is skipped rather than attempted: moving a
+    /// file onto its own directory is a no-op the user did not intend, and
+    /// `Transfer::move_into` would otherwise report a spurious conflict.
+    ///
+    /// Errors are collected and reported in the status line exactly like a
+    /// failed navigation, rather than silently dropping any files that could
+    /// not be moved -- a partially-failed drop (e.g. one file mid-flight to
+    /// another user's directory) must still say so.
+    pub fn accept_drop(&mut self, paths: &[PathBuf], target_dir: &Path) -> Outcome {
+        let transfer = fileops::Transfer::new(
+            fileops::ConflictResolver::default(),
+            fileops::Progress::new(),
+        );
+        let mut moved_any = false;
+        for source in paths {
+            if source.parent() == Some(target_dir) {
+                continue;
+            }
+            match transfer.move_into(source, target_dir) {
+                Ok(_) => moved_any = true,
+                Err(e) => {
+                    eprintln!("files: could not move {}: {e}", source.display());
+                }
+            }
+        }
+        if moved_any {
+            self.refresh()
+        } else {
+            Outcome::Ignored
+        }
+    }
+
     /// Re-read the current directory, preserving the cursor where possible.
     fn refresh(&mut self) -> Outcome {
         // Captured before the read, since the row index may well name a
@@ -634,6 +737,102 @@ mod tests {
         browser.press(10, 10, Mods::none());
         assert_eq!(activate(&mut browser), Outcome::Redraw);
         assert!(browser.path().ends_with("child"));
+    }
+
+    #[test]
+    fn dragging_an_unselected_row_carries_only_that_row() {
+        let dir = TempDir::new("drag_unselected");
+        dir.create_file("a.txt", b"a");
+        dir.create_file("b.txt", b"b");
+        let browser = open(&dir);
+        // Nothing is selected yet; dragging row 0 carries only row 0.
+        let paths = browser.drag_paths(0);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], browser.entry(0).unwrap().path);
+    }
+
+    #[test]
+    fn dragging_a_selected_row_carries_the_whole_selection() {
+        let dir = TempDir::new("drag_selected");
+        dir.create_file("a.txt", b"a");
+        dir.create_file("b.txt", b"b");
+        dir.create_file("c.txt", b"c");
+        let mut browser = open(&dir);
+        browser.act(Action::List(ListCommand::SelectAll));
+        let paths = browser.drag_paths(1);
+        assert_eq!(
+            paths.len(),
+            3,
+            "dragging a selected row carries every selected path"
+        );
+    }
+
+    #[test]
+    fn dragging_an_out_of_range_row_yields_nothing() {
+        let dir = TempDir::new("drag_out_of_range");
+        let browser = open(&dir);
+        assert!(browser.drag_paths(999).is_empty());
+    }
+
+    #[test]
+    fn a_directory_row_is_a_valid_drop_target() {
+        let dir = TempDir::new("drop_target_dir_row");
+        dir.create_dir("folder");
+        let browser = open(&dir);
+        // Row 0 is the (only) entry, a directory, at y in [0, 20).
+        assert_eq!(browser.drop_target_row(5, 5), Some(0));
+    }
+
+    #[test]
+    fn a_plain_file_row_is_not_a_drop_target() {
+        let dir = TempDir::new("drop_target_file_row");
+        dir.create_file("a.txt", b"a");
+        let browser = open(&dir);
+        assert_eq!(browser.drop_target_row(5, 5), None);
+    }
+
+    #[test]
+    fn empty_space_below_the_list_targets_the_open_directory() {
+        let dir = TempDir::new("drop_target_empty_space");
+        dir.create_file("a.txt", b"a");
+        let browser = open(&dir);
+        assert_eq!(browser.drop_target_dir(5, 500), browser.path());
+    }
+
+    #[test]
+    fn a_directory_row_is_the_drop_target_dir() {
+        let dir = TempDir::new("drop_target_dir_resolves");
+        let folder = dir.create_dir("folder");
+        let browser = open(&dir);
+        assert_eq!(browser.drop_target_dir(5, 5), folder);
+    }
+
+    #[test]
+    fn accepting_a_drop_moves_the_files_and_refreshes() {
+        let dir = TempDir::new("accept_drop");
+        let file = dir.create_file("a.txt", b"hello");
+        let folder = dir.create_dir("folder");
+        let mut browser = open(&dir);
+        let outcome = browser.accept_drop(&[file.clone()], &folder);
+        assert_eq!(outcome, Outcome::Redraw);
+        assert!(
+            !file.exists(),
+            "the source must be gone from the old location"
+        );
+        assert!(
+            folder.join("a.txt").exists(),
+            "the file must land in the target"
+        );
+    }
+
+    #[test]
+    fn dropping_a_file_back_into_its_own_directory_is_a_no_op() {
+        let dir = TempDir::new("accept_drop_noop");
+        let file = dir.create_file("a.txt", b"hello");
+        let mut browser = open(&dir);
+        let outcome = browser.accept_drop(&[file.clone()], dir.path());
+        assert_eq!(outcome, Outcome::Ignored);
+        assert!(file.exists(), "the file must not have moved or vanished");
     }
 
     /// The names currently visible, in order.

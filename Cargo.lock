@@ -177,6 +177,7 @@ name = "files-bin"
 version = "0.1.0"
 dependencies = [
  "config",
+ "fileops",
  "fsmodel",
  "headless-stress",
  "launcher",

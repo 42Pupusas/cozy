@@ -10,7 +10,7 @@
 use platform::draw::{Canvas, Color, Rect};
 use platform::protocol::PointerButton;
 use platform::toplevel::{KeyPress, Painter, PhysicalSize, PointerEventKind, Position};
-use widget::Mods;
+use widget::{DragArm, Mods};
 
 use crate::breadcrumb::Breadcrumb;
 use crate::browser::{Browser, Outcome, ViewMode};
@@ -93,6 +93,7 @@ impl RowKind {
 /// A named struct rather than a tuple because six positional fields of which
 /// two are `bool` is exactly the shape that silently swaps `selected` and
 /// `is_cursor` during a refactor.
+#[allow(clippy::struct_excessive_bools)] // each flag is an independent, unrelated painted state, not a state machine
 struct PaintedRow {
     y: i32,
     name: String,
@@ -103,6 +104,11 @@ struct PaintedRow {
     selected: bool,
     is_cursor: bool,
     hovered: bool,
+    /// Whether an incoming drag is currently hovering this row -- painted
+    /// as an outline so it reads distinctly from selection/hover fills
+    /// (which mean "this is what you've chosen" or "this is under the
+    /// pointer", not "dropping here will move files into this folder").
+    drop_target: bool,
     /// Which highlight family this row draws from.
     row_kind: RowKind,
 }
@@ -140,6 +146,29 @@ pub struct FilesWindow {
     /// directory changes, which is also when it can become a *different*
     /// filesystem.
     storage: Option<Storage>,
+    /// Tracks whether the left button's current press has moved far enough
+    /// to become a drag -- see [`widget::DragArm`]. A plain click must never
+    /// start a drag, so this only fires past a real pixel threshold, and
+    /// only for a press that actually landed on a row (see
+    /// [`Self::drag_row`]).
+    drag_arm: DragArm,
+    /// The row a left-button press landed on, and its pane-relative
+    /// coordinates, kept from press until either the drag threshold fires or
+    /// the button is released. `None` whenever no row is the candidate for a
+    /// drag -- a press on empty space, the scrollbar, or the toolbar.
+    drag_row: Option<usize>,
+    /// Paths queued for the event loop to hand to `Toplevel::start_drag`.
+    ///
+    /// Queued rather than started here for the same reason as
+    /// `pending_open`: `Painter::on_pointer` has no access to the `Toplevel`
+    /// that owns `start_drag` (it borrows the painter, not the other way
+    /// around), so the loop drains this once per tick.
+    pending_drag: Option<Vec<std::path::PathBuf>>,
+    /// Which row (if any) an incoming drag is currently hovering, for a
+    /// drop-target highlight. Set by the event loop each tick from
+    /// `Toplevel::is_drag_over`/`drag_position`, since that state lives on
+    /// the `Toplevel`, not a callback `Painter` receives on every motion.
+    drop_hover_row: Option<usize>,
 }
 
 impl FilesWindow {
@@ -166,7 +195,35 @@ impl FilesWindow {
             last_click: None,
             // Left empty so `new` can stay const; the first paint fills it.
             storage: None,
+            drag_arm: DragArm::new(),
+            drag_row: None,
+            pending_drag: None,
+            drop_hover_row: None,
         }
+    }
+
+    /// Take any drag the last pointer gesture started, for the event loop to
+    /// hand to `Toplevel::start_drag`.
+    pub const fn take_pending_drag(&mut self) -> Option<Vec<std::path::PathBuf>> {
+        self.pending_drag.take()
+    }
+
+    /// Tell the window where an incoming drag currently sits, so the row (if
+    /// any) under it can be highlighted as the drop target.
+    ///
+    /// `over` is [`platform::toplevel::Toplevel::is_drag_over`] and `at` is
+    /// [`platform::toplevel::Toplevel::drag_position`] -- both live on the
+    /// `Toplevel`, not delivered to `Painter` as a callback, so the event
+    /// loop reports them here once per tick instead.
+    pub fn update_drag_hover(&mut self, over: bool, at: (i32, i32)) {
+        self.drop_hover_row = if over {
+            let rows_top = self.frame().rows().y;
+            let rows_left = self.frame().rows().x;
+            self.browser
+                .drop_target_row(at.0 - rows_left, at.1 - rows_top)
+        } else {
+            None
+        };
     }
 
     /// Re-read the filesystem figures behind the sidebar footer.
@@ -1045,6 +1102,7 @@ impl FilesWindow {
                     selected: self.browser.pane().is_selected(row),
                     is_cursor: self.browser.pane().cursor() == Some(row),
                     hovered: self.hover.is(Pane::List, row),
+                    drop_target: self.drop_hover_row == Some(row),
                     // The highlight colour follows what the row *is*, not what
                     // its name looks like, so a directory keeps its tint even
                     // when the name column is truncated to nothing.
@@ -1083,6 +1141,13 @@ impl FilesWindow {
                 }
                 (false, false) => theme.background,
             };
+            // A drop-target outline is drawn over whatever fill the row
+            // already has -- selection and hover are states the row already
+            // carries; "a drag is hovering here" is a distinct, temporary
+            // fact about the pointer, not a replacement for them.
+            if row.drop_target {
+                canvas.draw_round_rect(rect, row.row_kind.selection_fill(&theme), radius);
+            }
             // A thin separator per row rather than a card, per the guide.
             canvas.fill_rect(
                 Rect::new(
@@ -1427,12 +1492,32 @@ impl Painter for FilesWindow {
                     )
                 };
                 self.apply(outcome);
+                // Arm a potential drag from this press -- but only over a
+                // real row. A press on empty list space or a scrollbar drag
+                // must never turn into a file drag.
+                self.drag_row = self.browser.row_at(x, y);
+                if self.drag_row.is_some() {
+                    self.drag_arm.press((at.x, at.y));
+                }
             }
             PointerEventKind::Release { .. } => {
                 let outcome = self.browser.release();
                 self.apply(outcome);
+                self.drag_arm.cancel();
+                self.drag_row = None;
             }
             PointerEventKind::Motion(at) => {
+                // A drag is armed only while a row press hasn't yet crossed
+                // the threshold; once it fires this is a one-shot -- the
+                // compositor takes over pointer delivery for the rest of the
+                // gesture the moment `start_drag` is queued.
+                if let Some(row) = self.drag_row
+                    && self.drag_arm.motion_exceeds_threshold((at.x, at.y))
+                {
+                    self.pending_drag = Some(self.browser.drag_paths(row));
+                    self.drag_row = None;
+                    return;
+                }
                 // Motion is forwarded unconditionally rather than only when
                 // inside the list: a scrollbar drag that wanders over the
                 // header must keep scrolling, exactly as it does everywhere
@@ -1467,6 +1552,8 @@ impl Painter for FilesWindow {
             // otherwise a row stays lit while the pointer is in another window.
             PointerEventKind::Leave => {
                 let _ = self.hover.clear();
+                self.drag_arm.cancel();
+                self.drag_row = None;
             }
             // Enter carries a position, but the Motion event that follows it
             // does the hover work -- handling it here too would only duplicate
@@ -1474,6 +1561,14 @@ impl Painter for FilesWindow {
             // context menu to open.
             PointerEventKind::Enter(_) | PointerEventKind::Press { .. } => {}
         }
+    }
+
+    fn on_files_dropped(&mut self, paths: Vec<std::path::PathBuf>, at: (i32, i32)) {
+        let rows = self.frame().rows();
+        let target = self.browser.drop_target_dir(at.0 - rows.x, at.1 - rows.y);
+        let outcome = self.browser.accept_drop(&paths, &target);
+        self.apply(outcome);
+        self.drop_hover_row = None;
     }
 }
 
@@ -2010,6 +2105,129 @@ mod tests {
         assert!(
             FilesWindow::columns_for(&mut tier, 800) > 0,
             "a real width must fit some text"
+        );
+    }
+
+    /// The pane-relative position of the centre of list row `row`, as a
+    /// window-relative pointer position -- what a real click on that row
+    /// would report.
+    fn row_centre(painter: &FilesWindow, row: usize) -> super::Position {
+        let rows = painter.frame().rows();
+        let y = painter
+            .browser
+            .pane()
+            .row_y(row)
+            .expect("row must be visible");
+        super::Position {
+            x: rows.x + 10,
+            y: rows.y + y + painter.theme.row_height / 2,
+        }
+    }
+
+    fn left_press(painter: &mut FilesWindow, at: super::Position) {
+        painter.on_pointer(PointerEventKind::Press {
+            button: PointerButton::Left,
+            at,
+            modifiers: platform::toplevel::ModifierState::default(),
+        });
+    }
+
+    /// A plain click -- press then release with no motion in between -- must
+    /// never queue a drag. This is the headline regression a `DragArm`
+    /// threshold exists to prevent.
+    #[test]
+    fn a_plain_click_does_not_start_a_drag() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("drag-plain-click");
+        let at = row_centre(&painter, 0);
+        left_press(&mut painter, at);
+        painter.on_pointer(PointerEventKind::Release {
+            button: PointerButton::Left,
+            at,
+            modifiers: platform::toplevel::ModifierState::default(),
+        });
+        assert!(painter.take_pending_drag().is_none());
+    }
+
+    /// Moving the pointer past the drag threshold after pressing on a row
+    /// must queue that row's path as a pending drag.
+    #[test]
+    fn dragging_past_the_threshold_queues_the_row_for_a_drag() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("drag-threshold");
+        let at = row_centre(&painter, 0);
+        left_press(&mut painter, at);
+        assert!(
+            painter.take_pending_drag().is_none(),
+            "a bare press must not yet be a drag"
+        );
+        let moved = super::Position {
+            x: at.x + 20,
+            y: at.y,
+        };
+        painter.on_pointer(PointerEventKind::Motion(moved));
+        let dragged = painter
+            .take_pending_drag()
+            .expect("motion past the threshold must queue a drag");
+        assert_eq!(dragged.len(), 1);
+    }
+
+    /// A press on empty space below the list (no row under the pointer) must
+    /// never arm a drag, no matter how far the pointer then moves.
+    #[test]
+    fn pressing_empty_space_never_arms_a_drag() {
+        let (mut painter, _root, size) = painter_over_a_mixed_directory("drag-empty-space");
+        let rows = painter.frame().rows();
+        let at = super::Position {
+            x: rows.x + 10,
+            y: rows.y + rows.h - 2,
+        };
+        left_press(&mut painter, at);
+        let moved = super::Position {
+            x: at.x + 50,
+            y: at.y,
+        };
+        painter.on_pointer(PointerEventKind::Motion(moved));
+        assert!(painter.take_pending_drag().is_none());
+        let _ = size;
+    }
+
+    /// Dropping files onto a directory row must move them there and refresh
+    /// the listing -- the full path from `Painter::on_files_dropped` through
+    /// to a real filesystem mutation.
+    #[test]
+    fn dropping_files_onto_a_directory_row_moves_them_there() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("drag-drop-onto-dir");
+        let file = root.join("b_file.txt");
+        let folder = root.join("a_directory");
+        assert!(
+            painter
+                .browser
+                .entry(0)
+                .is_some_and(fsmodel::entry::Entry::is_navigable),
+            "row 0 must be the directory to drop onto"
+        );
+        let at = row_centre(&painter, 0);
+        painter.on_files_dropped(vec![file.clone()], (at.x, at.y));
+        assert!(!file.exists(), "the file must have moved out of the root");
+        assert!(
+            folder.join("b_file.txt").exists(),
+            "the file must have landed inside the dropped-on directory"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Reporting drag-hover state must resolve to the row under the given
+    /// position, so the drop-target outline lands on the row a drop would
+    /// actually use.
+    #[test]
+    fn update_drag_hover_resolves_to_the_row_under_the_position() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("drag-hover-resolve");
+        let at = row_centre(&painter, 0);
+        painter.update_drag_hover(true, (at.x, at.y));
+        assert_eq!(painter.drop_hover_row, Some(0));
+        painter.update_drag_hover(false, (at.x, at.y));
+        assert_eq!(
+            painter.drop_hover_row, None,
+            "the highlight must clear once the drag leaves"
         );
     }
 }

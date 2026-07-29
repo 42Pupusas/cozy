@@ -10,7 +10,8 @@
 use crate::conn::Sender;
 use crate::error::Result;
 use crate::id::{
-    CompositorId, DecorationManagerId, OutputId, RegistryId, SeatId, ShmId, WmBaseId,
+    CompositorId, DataDeviceManagerId, DecorationManagerId, OutputId, RegistryId, SeatId, ShmId,
+    WmBaseId,
 };
 use crate::protocol as proto;
 use crate::surface::GlobalCollector;
@@ -34,6 +35,12 @@ pub struct ToplevelGlobals {
     /// rather than required: refusing to start without a titlebar would be
     /// absurd.
     pub decoration_manager: Option<DecorationManagerId>,
+    /// `wl_data_device_manager` -- clipboard and drag-and-drop factory.
+    /// Optional for the same reason as the decoration manager: refusing to
+    /// start a file browser on a compositor that (implausibly) omits this
+    /// would be absurd, it would just mean drag-and-drop and clipboard are
+    /// unavailable.
+    pub data_device_manager: Option<DataDeviceManagerId>,
 }
 
 /// Accumulates globals as `wl_registry.global` events arrive.
@@ -45,6 +52,7 @@ pub struct ToplevelGlobalsBuilder {
     seat: Option<SeatId>,
     output: Option<OutputId>,
     decoration_manager: Option<DecorationManagerId>,
+    data_device_manager: Option<DataDeviceManagerId>,
 }
 
 impl ToplevelGlobalsBuilder {
@@ -61,6 +69,7 @@ impl ToplevelGlobalsBuilder {
             seat: self.seat?,
             output: self.output,
             decoration_manager: self.decoration_manager,
+            data_device_manager: self.data_device_manager,
         })
     }
 }
@@ -143,6 +152,15 @@ impl GlobalCollector for ToplevelGlobalsBuilder {
                 version,
                 proto::ZXDG_DECORATION_MANAGER_V1.version,
             ),
+            s if s == proto::WL_DATA_DEVICE_MANAGER.name => Self::bind_if_missing(
+                &mut self.data_device_manager,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::WL_DATA_DEVICE_MANAGER.version,
+            ),
             // Compositors advertise dozens of globals we have no use for.
             _ => Ok(()),
         }
@@ -170,6 +188,7 @@ mod tests {
             seat: Some(SeatId(4)),
             output: None,
             decoration_manager: None,
+            data_device_manager: None,
         };
         assert!(b.is_complete());
     }
@@ -195,6 +214,7 @@ mod tests {
             seat: Some(SeatId(4)),
             output: None,
             decoration_manager: None,
+            data_device_manager: None,
         };
         let mut b = full();
         b.compositor = None;
@@ -225,9 +245,11 @@ mod tests {
             seat: Some(SeatId(4)),
             output: None,
             decoration_manager: None,
+            data_device_manager: None,
         };
         let g = b.finish().expect("required globals present");
         assert!(g.output.is_none());
         assert!(g.decoration_manager.is_none());
+        assert!(g.data_device_manager.is_none());
     }
 }

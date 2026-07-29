@@ -67,6 +67,14 @@ pub trait Painter {
     /// Keyboard focus was gained or lost. Useful for drawing a focused
     /// selection differently, or hiding a text cursor.
     fn on_focus(&mut self, _focused: bool) {}
+
+    /// Files were dropped onto this window from a `text/uri-list` drag --
+    /// either another application's, or this window's own (see
+    /// [`crate::toplevel::drag::DragController`] for why both arrive here
+    /// identically). `at` is the surface-local logical position the drop
+    /// landed at, for resolving which row/target it hit. Defaulted to a
+    /// no-op so painters that don't accept drops are unaffected.
+    fn on_files_dropped(&mut self, _paths: Vec<std::path::PathBuf>, _at: (i32, i32)) {}
 }
 
 /// Something the window wants its owner to know about.
@@ -135,6 +143,11 @@ pub struct Toplevel {
     /// event correlated by arrival order, so the size has to be parked here
     /// between the two.
     awaiting_keymap_fd: Option<usize>,
+
+    /// Drag-and-drop over the shared `wl_data_device` -- see
+    /// [`crate::toplevel::drag::DragController`] for why this handles both
+    /// dragging out of and dropping into this window.
+    drag: crate::toplevel::drag::DragController,
 }
 
 impl Toplevel {
@@ -198,6 +211,7 @@ impl Toplevel {
             seat,
             output,
             decoration_manager,
+            data_device_manager,
         } = builder.finish().ok_or(Error::ReaderStopped)?;
 
         // No output bound (some nested/headless compositors advertise none)
@@ -246,12 +260,17 @@ impl Toplevel {
         let (req_tx, request_rx) =
             mpsc::RingBuffer::<crate::conn::WindowRequest>::new(Capacity::exact(64)).split();
         let (id_start, id_end) = sender.alloc_id_block(ID_BLOCK);
-        let window_tx = WindowSender {
+        let mut window_tx = WindowSender {
             tx: req_tx,
             next_id: id_start,
             id_end,
             free_ids: Vec::new(),
         };
+        // Bound eagerly, alongside every other global: a file browser (the
+        // reason this type exists) needs drag-and-drop from its first
+        // frame, and there is exactly one `wl_data_device` per seat to bind.
+        let drag =
+            crate::toplevel::drag::DragController::bind(data_device_manager, seat, &mut window_tx);
 
         let px = physical.pixel_count();
         let present = PresentState::new(
@@ -288,6 +307,7 @@ impl Toplevel {
             keyboard: KeyboardState::new(),
             xkb: None,
             awaiting_keymap_fd: None,
+            drag,
         };
         window.bind_seat_devices_eagerly();
         Ok(window)
@@ -309,6 +329,45 @@ impl Toplevel {
     /// Change the window title.
     pub fn set_title(&self, title: &str) {
         self.shell.set_title(&self.window_tx, title);
+    }
+
+    /// Start dragging `paths` out of this window -- the file-browser-facing
+    /// entry point over [`crate::toplevel::drag::DragController::start_drag`].
+    ///
+    /// Must be called from a left-button press handler (or shortly after,
+    /// while the same press's serial is still live): `wl_data_device.start_drag`
+    /// requires an implicit grab matching a recent button-press serial, which
+    /// is exactly what [`crate::toplevel::pointer::PointerState::last_serial`]
+    /// tracks. No-op if nothing has been pressed yet, there's no data device,
+    /// or `paths` is empty -- see [`crate::toplevel::drag::DragController::start_drag`].
+    pub fn start_drag(&mut self, paths: &[std::path::PathBuf]) {
+        let serial = self.pointer.last_serial();
+        self.drag
+            .start_drag(&mut self.window_tx, self.shell.surface, serial, paths);
+    }
+
+    /// Whether a drag started from this window (via [`Self::start_drag`]) is
+    /// currently live.
+    #[must_use]
+    pub const fn is_dragging(&self) -> bool {
+        self.drag.is_dragging()
+    }
+
+    /// Whether an incoming drag (another window's, or our own) is currently
+    /// hovering this window's surface -- for painting a drop-target
+    /// highlight.
+    #[must_use]
+    pub const fn is_drag_over(&self) -> bool {
+        self.drag.is_drag_over()
+    }
+
+    /// The incoming drag's current surface-local logical position, if one is
+    /// hovering this window -- for a drop-target highlight that follows the
+    /// pointer. Meaningless (and unused) unless [`Self::is_drag_over`] is
+    /// true.
+    #[must_use]
+    pub const fn drag_position(&self) -> (i32, i32) {
+        self.drag.incoming_position()
     }
 
     /// Whether the window is shutting down.
@@ -335,7 +394,7 @@ impl Toplevel {
     pub fn tick(&mut self, painter: &mut impl Painter) -> Result<()> {
         self.sender.drain_requests(&mut self.request_rx)?;
         while let Some(ev) = self.events.pop() {
-            self.handle_event(&ev, painter)?;
+            self.handle_event(ev, painter)?;
         }
         self.pump_repeat(painter);
         // Drain first, *then* observe: a reader that hit a protocol error
@@ -370,28 +429,31 @@ impl Toplevel {
     }
 
     /// Dispatch one raw event.
-    fn handle_event(&mut self, ev: &RawEvent, painter: &mut impl Painter) -> Result<()> {
-        // The keymap fd arrives as a standalone `Fd` event immediately after
-        // the `wl_keyboard.keymap` message that carried it in ancillary
-        // data, so it is correlated by arrival order rather than by id.
-        // Borrowed, not consumed: the fd is mmap'd here and never stored.
+    fn handle_event(&mut self, ev: RawEvent, painter: &mut impl Painter) -> Result<()> {
+        // The keymap fd and a drag source's `send` fd both arrive as a
+        // standalone `Fd` event immediately after the message that
+        // triggered them, so both are correlated by arrival order rather
+        // than by id -- routed by which one is currently expected.
         if let RawEvent::Fd(fds) = ev {
-            self.take_keymap_fd(fds.first());
+            self.handle_fd_event(fds.into_iter().next().as_ref());
             return Ok(());
         }
 
-        match self.present.route_common(ev, &mut self.window_tx) {
+        match self.present.route_common(&ev, &mut self.window_tx) {
             Routed::Handled => return Ok(()),
             Routed::Fatal(e) => return Err(e),
             Routed::Passthrough => {}
         }
 
         if self.pointer_id.is_some_and(|p| ev.is(p)) {
-            self.handle_pointer_event(ev, painter);
+            self.handle_pointer_event(&ev, painter);
             return Ok(());
         }
         if self.keyboard_id.is_some_and(|k| ev.is(k)) {
-            self.handle_keyboard_event(ev, painter);
+            self.handle_keyboard_event(&ev, painter);
+            return Ok(());
+        }
+        if self.dispatch_drag_event(&ev, painter) {
             return Ok(());
         }
 
@@ -439,6 +501,102 @@ impl Toplevel {
         }
 
         Ok(())
+    }
+
+    /// Route the three drag-and-drop protocol objects -- `wl_data_device`
+    /// (enter/leave/motion/drop on our surface), `wl_data_source` (a peer
+    /// wants our dragged payload), and `wl_data_offer` (MIME types a peer
+    /// advertises during an incoming drag) -- to [`crate::toplevel::drag::DragController`].
+    /// Returns whether one of them matched, so `handle_event` knows to stop.
+    fn dispatch_drag_event(&mut self, ev: &RawEvent, painter: &mut impl Painter) -> bool {
+        if let Some(dev) = self.drag.device_id()
+            && ev.is(dev)
+        {
+            self.dispatch_data_device_event(ev, painter);
+            return true;
+        }
+        if let Some(src) = self.drag.source_id()
+            && ev.is(src)
+        {
+            if let Some(src_ev) = ev.event::<crate::protocol::DataSourceEvent>() {
+                self.drag.on_source_event(src_ev);
+            }
+            return true;
+        }
+        if let Some(offer) = self.drag.incoming_offer_id()
+            && ev.is(offer)
+        {
+            if let Some(offer_ev) = ev.event::<crate::protocol::DataOfferEvent>() {
+                // `Offer`'s MIME-type string arg is not one of the fixed
+                // inline words `RawEvent::Wire` carries; it must be
+                // re-parsed from the full message bytes, same as
+                // `wl_registry.global`'s interface name.
+                let mime = ev
+                    .wire_bytes()
+                    .and_then(crate::wire::WireEvent::parse)
+                    .map(|(mut wire, _)| wire.string());
+                self.drag.on_offer_event(offer_ev, mime);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// `wl_data_device.*`: track an incoming drag's lifecycle and fire the
+    /// painter's drop callback once a drop actually lands.
+    fn dispatch_data_device_event(&mut self, ev: &RawEvent, painter: &mut impl Painter) {
+        use crate::protocol::DataDeviceEvent;
+        match ev.event::<DataDeviceEvent>() {
+            Some(DataDeviceEvent::Enter) => {
+                // `enter(serial, surface, x, y, id)` -- x/y are wl_fixed
+                // surface-local coordinates, the offer id is the last arg.
+                let at = ev.point(2, 3);
+                self.drag.on_enter(ev.arg(4), (at.x, at.y));
+                self.present.mark_dirty();
+            }
+            Some(DataDeviceEvent::Leave) => {
+                self.drag.on_leave();
+                self.present.mark_dirty();
+            }
+            Some(DataDeviceEvent::Motion) => {
+                // `motion(time, x, y)`.
+                let at = ev.point(1, 2);
+                self.drag.on_motion((at.x, at.y));
+                self.present.mark_dirty();
+            }
+            Some(DataDeviceEvent::Drop) => {
+                self.drag.handle_drop(&self.window_tx, &self.wake);
+                self.present.mark_dirty();
+            }
+            _ => {}
+        }
+        let mut dropped = Vec::new();
+        self.drag.drain_drops(|d| dropped.push(d));
+        for d in dropped {
+            painter.on_files_dropped(d.paths, d.position);
+        }
+    }
+
+    /// Route one `RawEvent::Fd` to whichever wait it satisfies: the XKB
+    /// keymap (parsed and consumed here), or a drag source's `send` fd
+    /// (handed to the drag controller to write into). Borrowed for the
+    /// keymap case (mmap'd and never stored); consumed for the drag case.
+    fn handle_fd_event(&mut self, fd: Option<&std::os::fd::OwnedFd>) {
+        use std::os::fd::AsFd as _;
+        if self.awaiting_keymap_fd.is_some() {
+            self.take_keymap_fd(fd);
+            return;
+        }
+        if self.drag.is_awaiting_send_fd()
+            && let Some(fd) = fd
+        {
+            // `write_send_fd` takes ownership; `take_keymap_fd` only
+            // borrows via `AsFd`, so mint an owned duplicate here rather
+            // than restructure the caller's borrow for one branch.
+            if let Ok(owned) = fd.as_fd().try_clone_to_owned() {
+                self.drag.write_send_fd(owned);
+            }
+        }
     }
 
     /// Request the pointer and keyboard without waiting for a capabilities

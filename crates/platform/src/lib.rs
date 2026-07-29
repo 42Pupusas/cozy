@@ -19,6 +19,7 @@ mod debug_overlay;
 pub mod draw;
 pub mod error;
 pub mod event;
+pub mod file_uri;
 pub mod font;
 pub mod id;
 pub mod key_repeat;

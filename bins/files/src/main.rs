@@ -174,6 +174,21 @@ impl App {
                 opener.open(&path);
             }
 
+            // Same reasoning as `take_pending_open`: starting a drag talks
+            // to the `Toplevel`, which `Painter::on_pointer` cannot reach.
+            if let Some(paths) = painter.take_pending_drag() {
+                window.start_drag(&paths);
+            }
+
+            // The drop-target highlight depends on `Toplevel`-owned drag
+            // state (`is_drag_over`/`drag_position`), so it is reported to
+            // the painter here rather than through a callback -- exactly the
+            // seam `start_drag` above needs in the other direction.
+            painter.update_drag_hover(window.is_drag_over(), window.drag_position());
+            if window.is_drag_over() {
+                window.request_redraw();
+            }
+
             // The title follows the directory, so the taskbar entry stays
             // meaningful as the user navigates. Compared first because
             // set_title is a round-trip we should not make every frame.

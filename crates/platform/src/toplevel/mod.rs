@@ -31,6 +31,7 @@
 //! [`crate::surface`] (connection bootstrap, shm swap chain, registry
 //! discovery, the common event routing) is reused as-is.
 
+pub mod drag;
 pub mod geometry;
 pub mod globals;
 pub mod keyboard;
@@ -41,6 +42,7 @@ pub mod pointer;
 pub mod shell;
 pub mod window;
 
+pub use drag::{DragController, Dropped};
 pub use geometry::{Geometry, LogicalSize, PhysicalSize};
 pub use globals::{ToplevelGlobals, ToplevelGlobalsBuilder};
 pub use keyboard::{KeyPress, KeyboardState, RepeatInfo};

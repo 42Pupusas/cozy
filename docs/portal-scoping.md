@@ -79,7 +79,7 @@ crates/dbus-server/          Depends on crates/dbus; re-exports what downstream
                              Marshaller/Unmarshaller) so they only take one
                              dependency, not two separately versioned ones.
   registry.rs                Object lifetime and lookup (done)
-  router.rs                  Signature-checked method dispatch
+  router.rs                  Signature-checked method dispatch (done)
   introspection.rs           Introspectable XML responses
   properties.rs              GetAll and PropertiesChanged
   name_watcher.rs            Caller death -> request/session cleanup

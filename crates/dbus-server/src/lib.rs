@@ -23,8 +23,10 @@
 //! separately versioned dependency just to name a `Value`.
 
 pub mod registry;
+pub mod router;
 
 pub use dbus::marshal::Marshaller;
 pub use dbus::message::Reply;
 pub use dbus::value::{Unmarshaller, Value};
 pub use registry::ObjectRegistry;
+pub use router::{DispatchError, DispatchOutcome, MethodCallRouter};

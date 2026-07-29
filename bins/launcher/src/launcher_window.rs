@@ -20,8 +20,8 @@ use platform::conn::{Sender, WindowSender};
 use platform::draw::Canvas;
 use platform::event::RawEvent;
 use platform::id::{
-    CompositorId, KeyboardId, LayerShellId, LayerSurfaceId, ObjectId, OutputId, RegistryId, SeatId,
-    ShmId, SurfaceId,
+    CompositorId, KeyboardId, LayerShellId, LayerSurfaceId, OutputId, RegistryId, SeatId, ShmId,
+    SurfaceId,
 };
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
@@ -205,25 +205,6 @@ impl surface::GlobalCollector for GlobalsBuilder {
 }
 
 impl GlobalsBuilder {
-    fn bind_if_missing<T: ObjectId>(
-        slot: &mut Option<T>,
-        sender: &mut Sender,
-        registry: RegistryId,
-        name: u32,
-        interface: &str,
-        advertised_version: u32,
-        known_version: u32,
-    ) -> Result<()> {
-        if slot.is_some() {
-            return Ok(());
-        }
-        let v = known_version.min(advertised_version);
-        *slot = Some(surface::SurfaceBootstrap::bind(
-            sender, registry, name, interface, v,
-        )?);
-        Ok(())
-    }
-
     fn finish(self) -> Result<Globals> {
         Ok(Globals {
             compositor: self.compositor.ok_or(Error::ReaderStopped)?,

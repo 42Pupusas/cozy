@@ -49,28 +49,6 @@ struct GlobalsBuilder {
 }
 
 impl GlobalsBuilder {
-    fn bind_if_missing<T: ObjectId>(
-        slot: &mut Option<T>,
-        sender: &mut Sender,
-        registry: RegistryId,
-        name: u32,
-        interface: &str,
-        advertised_version: u32,
-        known_version: u32,
-    ) -> Result<()> {
-        if slot.is_some() {
-            return Ok(());
-        }
-        *slot = Some(SurfaceBootstrap::bind(
-            sender,
-            registry,
-            name,
-            interface,
-            known_version.min(advertised_version),
-        )?);
-        Ok(())
-    }
-
     fn finish(&self) -> Result<Globals> {
         Ok(Globals {
             compositor: self.compositor.ok_or(Error::ReaderStopped)?,

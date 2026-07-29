@@ -10,10 +10,10 @@
 use crate::conn::Sender;
 use crate::error::Result;
 use crate::id::{
-    CompositorId, DecorationManagerId, ObjectId, OutputId, RegistryId, SeatId, ShmId, WmBaseId,
+    CompositorId, DecorationManagerId, OutputId, RegistryId, SeatId, ShmId, WmBaseId,
 };
 use crate::protocol as proto;
-use crate::surface::{GlobalCollector, SurfaceBootstrap};
+use crate::surface::GlobalCollector;
 
 /// The globals a toplevel window binds, once discovery has completed.
 ///
@@ -48,31 +48,6 @@ pub struct ToplevelGlobalsBuilder {
 }
 
 impl ToplevelGlobalsBuilder {
-    /// Bind `interface` into `slot` unless something is already there.
-    ///
-    /// A compositor may in principle advertise an interface twice; the first
-    /// wins. `want` is the maximum version we support -- we bind the lower
-    /// of that and what the compositor offers, since asking for a version
-    /// above the advertised one is a protocol error.
-    fn bind_if_missing<T: ObjectId>(
-        slot: &mut Option<T>,
-        sender: &mut Sender,
-        registry: RegistryId,
-        name: u32,
-        interface: &str,
-        offered: u32,
-        want: u32,
-    ) -> Result<()> {
-        if slot.is_some() {
-            return Ok(());
-        }
-        let version = offered.min(want);
-        *slot = Some(SurfaceBootstrap::bind(
-            sender, registry, name, interface, version,
-        )?);
-        Ok(())
-    }
-
     /// Consume the builder into the discovered set.
     ///
     /// Returns `None` unless every required global was bound, so a caller

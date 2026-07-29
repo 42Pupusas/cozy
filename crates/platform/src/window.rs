@@ -23,8 +23,8 @@ use crate::draw::Point;
 use crate::error::{Error, Result};
 use crate::event::RawEvent;
 use crate::id::{
-    CallbackId, CompositorId, DataDeviceManagerId, KeyboardId, ObjectId, OutputId, PointerId,
-    RegistryId, SeatId, ShmId, WmBaseId,
+    CallbackId, CompositorId, DataDeviceManagerId, KeyboardId, OutputId, PointerId, RegistryId,
+    SeatId, ShmId, WmBaseId,
 };
 use crate::keymap;
 use crate::protocol::Modifiers;
@@ -2508,30 +2508,6 @@ impl crate::surface::GlobalCollector for GlobalsBuilder {
 }
 
 impl GlobalsBuilder {
-    /// Bind one global into `slot` if it's still empty, negotiating the
-    /// version as `known_version.min(advertised_version)`. Shared body for
-    /// every arm of [`crate::surface::GlobalCollector::bind_global`] --
-    /// factored out so the per-interface "already bound?" check doesn't
-    /// inflate that function's branch count arm-by-arm.
-    fn bind_if_missing<T: ObjectId>(
-        slot: &mut Option<T>,
-        sender: &mut Sender,
-        registry: RegistryId,
-        name: u32,
-        interface: &str,
-        advertised_version: u32,
-        known_version: u32,
-    ) -> Result<()> {
-        if slot.is_some() {
-            return Ok(());
-        }
-        let v = known_version.min(advertised_version);
-        *slot = Some(crate::surface::SurfaceBootstrap::bind(
-            sender, registry, name, interface, v,
-        )?);
-        Ok(())
-    }
-
     /// Consume the builder into the final [`Globals`], failing if any
     /// required global never arrived (`has_every_required_global` guards
     /// the caller's loop, so in practice these `ok_or`s only fire if the

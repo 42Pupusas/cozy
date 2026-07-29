@@ -132,6 +132,36 @@ pub trait GlobalCollector {
         interface: &str,
         version: u32,
     ) -> Result<()>;
+
+    /// Bind one global into `slot` if it's still empty, negotiating the
+    /// version as `known_version.min(advertised_version)`.
+    ///
+    /// Every shell role's `bind_global` match has the same per-arm shape --
+    /// "already bound? else negotiate a version and bind" -- because that
+    /// shape has nothing to do with which role or interface it's binding.
+    /// It used to be re-typed as a private associated fn in each of five
+    /// `GlobalsBuilder`s (`platform::window`, `platform::toplevel::globals`,
+    /// `statusbar::bar_window`, `launcher::launcher_window`,
+    /// `wallpaper::main`); living here once means a role only ever writes
+    /// the part that *is* role-specific -- which interface, which slot.
+    fn bind_if_missing<T: ObjectId>(
+        slot: &mut Option<T>,
+        sender: &mut Sender,
+        registry: RegistryId,
+        name: u32,
+        interface: &str,
+        advertised_version: u32,
+        known_version: u32,
+    ) -> Result<()> {
+        if slot.is_some() {
+            return Ok(());
+        }
+        let v = known_version.min(advertised_version);
+        *slot = Some(SurfaceBootstrap::bind(
+            sender, registry, name, interface, v,
+        )?);
+        Ok(())
+    }
 }
 
 /// The role-neutral registry startup transaction.

@@ -21,8 +21,7 @@ use platform::conn::{Sender, WindowSender};
 use platform::draw::{Canvas, Color, Point};
 use platform::event::RawEvent;
 use platform::id::{
-    CompositorId, LayerShellId, LayerSurfaceId, ObjectId, OutputId, RegistryId, SeatId, ShmId,
-    SurfaceId,
+    CompositorId, LayerShellId, LayerSurfaceId, OutputId, RegistryId, SeatId, ShmId, SurfaceId,
 };
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
@@ -238,28 +237,6 @@ impl surface::GlobalCollector for GlobalsBuilder {
 }
 
 impl GlobalsBuilder {
-    /// Bind one global into `slot` if it's still empty, negotiating the
-    /// version as `known_version.min(advertised_version)`. Shared body for
-    /// every arm of [`surface::GlobalCollector::bind_global`].
-    fn bind_if_missing<T: ObjectId>(
-        slot: &mut Option<T>,
-        sender: &mut Sender,
-        registry: RegistryId,
-        name: u32,
-        interface: &str,
-        advertised_version: u32,
-        known_version: u32,
-    ) -> Result<()> {
-        if slot.is_some() {
-            return Ok(());
-        }
-        let v = known_version.min(advertised_version);
-        *slot = Some(surface::SurfaceBootstrap::bind(
-            sender, registry, name, interface, v,
-        )?);
-        Ok(())
-    }
-
     /// Consume the builder into the final [`Globals`], failing if any
     /// required global never arrived.
     fn finish(self) -> Result<Globals> {

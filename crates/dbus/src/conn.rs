@@ -208,6 +208,82 @@ impl DbusConn {
         self.send_raw(&frame)
     }
 
+    /// Answer an incoming method call with an arbitrary reply body (e.g. a
+    /// portal method's `a{sv}` result, or anything else
+    /// [`crate::message::BodyArg`]'s fixed set can't express). The
+    /// generic sibling of [`Self::send_method_return`], needed once a
+    /// server side must answer with more than the handful of shapes that
+    /// method covers.
+    ///
+    /// Returns [`DbusError::Malformed`] if `values` doesn't match
+    /// `reply_signature` -- the same mismatch
+    /// [`crate::marshal::Marshaller::marshal_body`] reports, surfaced as a
+    /// connection error since sending a malformed frame isn't recoverable
+    /// by retrying at this layer.
+    pub fn send_method_return_with_values(
+        &mut self,
+        destination: &str,
+        call_serial: u32,
+        values: &[crate::value::Value],
+        reply_signature: &str,
+    ) -> Result<(), DbusError> {
+        let serial = self.take_serial();
+        let frame = crate::message::MessageBuilder::build_method_return_with_values(
+            serial,
+            destination,
+            call_serial,
+            values,
+            reply_signature,
+        )
+        .ok_or(DbusError::Malformed)?;
+        self.send_raw(&frame)
+    }
+
+    /// Answer an incoming method call with an `Error` reply -- the shape
+    /// [`Self::call`] itself expects back for a failed call, and what a
+    /// server side must send instead of a method return when dispatch
+    /// fails (a `dbus-server` `DispatchError`, or a portal method
+    /// rejecting its own arguments at the application level).
+    pub fn send_error(
+        &mut self,
+        destination: &str,
+        call_serial: u32,
+        error_name: &str,
+        message: &str,
+    ) -> Result<(), DbusError> {
+        let serial = self.take_serial();
+        let frame = crate::message::MessageBuilder::build_error(
+            serial,
+            destination,
+            call_serial,
+            error_name,
+            message,
+        );
+        self.send_raw(&frame)
+    }
+
+    /// Broadcast a signal carrying an arbitrary body -- the generic
+    /// sibling of [`Self::send_signal`], needed for e.g.
+    /// `Properties.PropertiesChanged`'s `(s, a{sv}, as)` shape.
+    ///
+    /// Returns [`DbusError::Malformed`] on the same signature/value
+    /// mismatch [`Self::send_method_return_with_values`] does.
+    pub fn send_signal_with_values(
+        &mut self,
+        path: &str,
+        interface: &str,
+        member: &str,
+        values: &[crate::value::Value],
+        signature: &str,
+    ) -> Result<(), DbusError> {
+        let serial = self.take_serial();
+        let frame = crate::message::MessageBuilder::build_signal_with_values(
+            serial, path, interface, member, values, signature,
+        )
+        .ok_or(DbusError::Malformed)?;
+        self.send_raw(&frame)
+    }
+
     /// Broadcast a signal from one of the D-Bus objects this connection
     /// serves. `StatusNotifier` clients use `StatusNotifierHostRegistered` as
     /// the authoritative transition from "a watcher name exists" to "there

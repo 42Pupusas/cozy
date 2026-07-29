@@ -13,6 +13,7 @@
 //! (body, padded to start at an 8-byte boundary from message start)
 //! ```
 
+use crate::marshal::Marshaller;
 use crate::value::{Unmarshaller, Value};
 
 /// D-Bus message types (the `mtype` header byte).
@@ -177,6 +178,147 @@ impl MessageBuilder {
         Self::pad_to(&mut out, 8);
         out.extend_from_slice(&body);
         out
+    }
+
+    /// Build a `METHOD_RETURN` frame carrying an arbitrary reply body,
+    /// e.g. a portal method's `a{sv}` or a `Properties.GetAll` result --
+    /// shapes [`Self::build_method_return`]'s fixed [`BodyArg`] set can't
+    /// express. Returns `None` if `values` doesn't match `reply_signature`
+    /// (the same failure [`crate::marshal::Marshaller::marshal_body`]
+    /// reports), leaving frame-building a caller's problem to retry rather
+    /// than silently sending a malformed reply.
+    #[must_use]
+    pub fn build_method_return_with_values(
+        serial: u32,
+        destination: &str,
+        call_serial: u32,
+        values: &[Value],
+        reply_signature: &str,
+    ) -> Option<Vec<u8>> {
+        let body = Marshaller::marshal_body(values, reply_signature)?;
+
+        let mut header_fields = Vec::new();
+        Self::write_string_field(
+            &mut header_fields,
+            field_code::DESTINATION,
+            b's',
+            destination,
+        );
+        if !reply_signature.is_empty() {
+            Self::write_string_field(
+                &mut header_fields,
+                field_code::SIGNATURE,
+                b'g',
+                reply_signature,
+            );
+        }
+        Self::pad_to(&mut header_fields, 8);
+        header_fields.push(field_code::REPLY_SERIAL);
+        header_fields.extend_from_slice(&[1, b'u', 0]);
+        Self::pad_to(&mut header_fields, 4);
+        header_fields.extend_from_slice(&call_serial.to_le_bytes());
+
+        let mut out = vec![b'l', MessageType::MethodReturn.as_byte(), 0, 1];
+        out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(header_fields.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&header_fields);
+        Self::pad_to(&mut out, 8);
+        out.extend_from_slice(&body);
+        Some(out)
+    }
+
+    /// Build an `ERROR` frame answering `call_serial`: the shape every
+    /// [`crate::conn::DbusConn::call`] caller expects back for a failed
+    /// call, and what a [`crate::message`] server side must send instead
+    /// of a method return when dispatch fails (an
+    /// `org.freedesktop.impl.portal.*` method rejecting its arguments, a
+    /// dbus-server `DispatchError`, etc). The body is always a single
+    /// human-readable string (signature `"s"`), matching every real D-Bus
+    /// service's `Error.*` replies and what [`Reply::parse_message`]
+    /// already expects only an `error_name` field plus an optional string
+    /// body from.
+    #[must_use]
+    pub fn build_error(
+        serial: u32,
+        destination: &str,
+        call_serial: u32,
+        error_name: &str,
+        message: &str,
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        Self::write_string(&mut body, message);
+
+        let mut header_fields = Vec::new();
+        Self::write_string_field(
+            &mut header_fields,
+            field_code::DESTINATION,
+            b's',
+            destination,
+        );
+        Self::write_string_field(&mut header_fields, field_code::ERROR_NAME, b's', error_name);
+        Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', "s");
+        Self::pad_to(&mut header_fields, 8);
+        header_fields.push(field_code::REPLY_SERIAL);
+        header_fields.extend_from_slice(&[1, b'u', 0]);
+        Self::pad_to(&mut header_fields, 4);
+        header_fields.extend_from_slice(&call_serial.to_le_bytes());
+
+        let mut out = vec![b'l', MessageType::Error.as_byte(), 0, 1];
+        out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(header_fields.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&header_fields);
+        Self::pad_to(&mut out, 8);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// Build a broadcast `SIGNAL` frame carrying an arbitrary body -- the
+    /// [`Value`]-based sibling of [`Self::build_signal`], needed for
+    /// e.g. `Properties.PropertiesChanged`'s `(s, a{sv}, as)` shape that
+    /// [`BodyArg`] can't express. Returns `None` on the same
+    /// signature/value mismatch [`Self::build_method_return_with_values`]
+    /// does.
+    #[must_use]
+    pub fn build_signal_with_values(
+        serial: u32,
+        path: &str,
+        interface: &str,
+        member: &str,
+        values: &[Value],
+        signature: &str,
+    ) -> Option<Vec<u8>> {
+        let body = Marshaller::marshal_body(values, signature)?;
+
+        let mut header_fields = Vec::new();
+        Self::write_string_field(&mut header_fields, field_code::PATH, b'o', path);
+        Self::write_string_field(&mut header_fields, field_code::INTERFACE, b's', interface);
+        Self::write_string_field(&mut header_fields, field_code::MEMBER, b's', member);
+        if !signature.is_empty() {
+            Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', signature);
+        }
+
+        let mut out = vec![b'l', MessageType::Signal.as_byte(), 0, 1];
+        out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(header_fields.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&header_fields);
+        Self::pad_to(&mut out, 8);
+        out.extend_from_slice(&body);
+        Some(out)
     }
 
     /// Build a broadcast `SIGNAL` frame. A `StatusNotifier` watcher uses this
@@ -595,5 +737,101 @@ mod tests {
             Some("StatusNotifierHostRegistered")
         );
         assert_eq!(reply.reply_serial, None);
+    }
+
+    #[test]
+    fn method_return_with_values_roundtrips_an_a_sv_body() {
+        // The shape every real portal GetAll reply needs, which the
+        // BodyArg-based build_method_return can't express at all.
+        let values = vec![Value::Array(vec![Value::DictEntry(
+            Box::new(Value::Str("scheme".into())),
+            Box::new(Value::Variant(Box::new(Value::U32(1)))),
+        )])];
+        let frame =
+            MessageBuilder::build_method_return_with_values(3, ":1.50", 9, &values, "a{sv}")
+                .expect("a{sv} matches the values given");
+
+        let reply = Reply::parse_message(&frame).expect("built method return parses");
+        assert_eq!(reply.kind, MessageType::MethodReturn);
+        assert_eq!(reply.reply_serial, Some(9));
+        assert_eq!(reply.signature, "a{sv}");
+        assert_eq!(reply.values(), values);
+    }
+
+    #[test]
+    fn method_return_with_values_rejects_a_signature_mismatch() {
+        let values = vec![Value::Str("only one string".into())];
+        assert!(
+            MessageBuilder::build_method_return_with_values(1, ":1.50", 5, &values, "ss").is_none()
+        );
+    }
+
+    #[test]
+    fn build_error_carries_the_error_name_and_message_and_answers_the_right_call() {
+        let frame = MessageBuilder::build_error(
+            4,
+            ":1.50",
+            11,
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            "No such method 'Foo'",
+        );
+        let reply = Reply::parse_message(&frame).expect("built error parses");
+        assert_eq!(reply.kind, MessageType::Error);
+        assert_eq!(reply.reply_serial, Some(11));
+        assert_eq!(
+            reply.error_name.as_deref(),
+            Some("org.freedesktop.DBus.Error.UnknownMethod")
+        );
+        assert_eq!(reply.signature, "s");
+        assert_eq!(
+            reply.values(),
+            vec![Value::Str("No such method 'Foo'".into())]
+        );
+    }
+
+    #[test]
+    fn signal_with_values_roundtrips_the_properties_changed_shape() {
+        let values = vec![
+            Value::Str("org.freedesktop.impl.portal.Settings".into()),
+            Value::Array(vec![Value::DictEntry(
+                Box::new(Value::Str("scheme".into())),
+                Box::new(Value::Variant(Box::new(Value::U32(1)))),
+            )]),
+            Value::Array(vec![]),
+        ];
+        let frame = MessageBuilder::build_signal_with_values(
+            2,
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &values,
+            "sa{sv}as",
+        )
+        .expect("sa{sv}as matches the values given");
+
+        let reply = Reply::parse_message(&frame).expect("built signal parses");
+        assert_eq!(reply.kind, MessageType::Signal);
+        assert_eq!(reply.reply_serial, None);
+        assert_eq!(
+            reply.path.as_deref(),
+            Some("/org/freedesktop/portal/desktop")
+        );
+        assert_eq!(reply.values(), values);
+    }
+
+    #[test]
+    fn signal_with_values_rejects_a_signature_mismatch() {
+        let values = vec![Value::Str("only one string".into())];
+        assert!(
+            MessageBuilder::build_signal_with_values(
+                1,
+                "/obj",
+                "org.example.Iface",
+                "Changed",
+                &values,
+                "ss"
+            )
+            .is_none()
+        );
     }
 }

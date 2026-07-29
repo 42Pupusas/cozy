@@ -1,273 +1,209 @@
-# Scoping: replacing `xdg-desktop-portal` (+ its tool ecosystem) with one workspace bin
+# Plan: a selective, native portal backend
 
-Status: **scoping only** — no code written. Written 2026-07-28.
+Status: **implementation plan** — refreshed 2026-07-29.
 
-## 0. What we'd actually be replacing
+## 0. Decision and boundary
 
-`xdg-desktop-portal` on this machine is not one thing, it is a stack:
+We will replace selected `xdg-desktop-portal` **backend** interfaces first by
+shipping one native `org.freedesktop.impl.portal.*` daemon. The existing
+`xdg-desktop-portal` frontend continues to own client identity, request/session
+bookkeeping, permission policy, and routing while `portals.conf` routes only the
+interfaces we have proved.
 
-| Layer | Bus name | Binary here | What it does |
-|---|---|---|---|
-| Frontend | `org.freedesktop.portal.Desktop` | `/usr/lib/xdg-desktop-portal` | Object/session lifecycle, app-id detection, permission checks, routes to a backend |
-| Backend | `org.freedesktop.impl.portal.*` | `xdg-desktop-portal-gtk`, `-gnome` | The actual UI (file dialogs, permission prompts) |
-| Documents | `org.freedesktop.portal.Documents` | same frontend binary | A FUSE fs at `/run/user/$UID/doc` |
-| Permission store | `org.freedesktop.impl.portal.PermissionStore` | separate | GVariant-backed permission DB |
+This is deliberately not an all-or-nothing replacement. Per-interface routing
+makes a regression reversible by changing configuration and restarting the user
+session; claiming `org.freedesktop.portal.Desktop` directly does not.
 
-Local config (`/usr/share/xdg-desktop-portal/niri-portals.conf`):
+**Target:** parity for this machine's actual unsandboxed applications, rather
+than a general-purpose, Flatpak-complete portal implementation.
 
-```
-[preferred]
-default=gnome;gtk;
-org.freedesktop.impl.portal.Access=gtk;
-org.freedesktop.impl.portal.Notification=gtk;
-org.freedesktop.impl.portal.Secret=gnome-keyring;
-```
+**Explicit non-goals for this project:**
 
-So today: niri session → frontend → gnome/gtk backends. That's ~3 daemons plus GTK
-pulled into the session just to draw a file dialog.
+- `ScreenCast`, `RemoteDesktop`, and `Camera`: keep the existing backend (or
+  compositor implementation) because they require PipeWire protocol support.
+- `Secret`: keep gnome-keyring; a secret store is security-sensitive work with
+  no portal payoff.
+- `Documents`: do not implement unless Flatpak is actively used. It requires a
+  FUSE document filesystem and only matters for sandboxed apps.
+- `GlobalShortcuts`, `InputCapture`, `Usb`, and other niche interfaces: defer
+  until a real local caller proves a need.
 
-"Corresponding tools" I'm reading as the `xdg-utils` script pile: `xdg-open`,
-`xdg-mime`, `xdg-settings`, `xdg-user-dir(s)`, `xdg-email`, `xdg-screensaver`.
-Those are POSIX shell scripts; they're the *easy* part and share a mime/desktop-entry
-core with the portal itself.
+The end state can remove GTK-backed dialogs and most portal-related processes
+from the session without pretending that PipeWire or a secret store are small
+follow-up tasks.
 
-## 1. The strategic insight: two possible shapes
+## 1. Current assets and remaining gates
 
-**Shape A — replace the backend only.** We own `org.freedesktop.impl.portal.*`,
-ship a `.portal` file, and point `niri-portals.conf` at us per-interface. The real
-frontend keeps doing lifecycle, app-id, permissions, and routing.
+The workspace now has the reusable product pieces that were missing when the
+original scoping note was written:
 
-**Shape B — replace the whole frontend.** We own `org.freedesktop.portal.Desktop`
-directly and skip the impl layer entirely (a single-user, non-Flatpak machine has
-no meaningful permission boundary to enforce, so the frontend's main job is moot).
-
-**Recommendation: start at A, migrate to B.** Reasons:
-
-- `portals.conf` gives us **per-interface rollback**. Break `FileChooser`? Flip one
-  line, no rebuild, session still works. Shape B is all-or-nothing from day one and
-  a bug means "no app can open a file".
-- The backend interfaces are the ones that need UI, which is the actual work. The
-  frontend is bookkeeping we can absorb later once the UI is proven.
-- We can ship value on week one (Settings, Screenshot) without touching anything else.
-
-Shape B's payoff is real though — killing the frontend drops the permission store,
-the app-id sandbox detection, and one daemon. Worth doing *after* the interfaces land.
-
-## 2. What we already have (this is the good news)
-
-| Need | Existing asset | State |
+| Need | Workspace asset | State |
 |---|---|---|
-| D-Bus client, SASL EXTERNAL, io_uring transport | `crates/dbus` | Solid, in production via statusbar |
-| D-Bus **server** side (own a name, answer calls, emit signals) | `crates/dbus` `request_name` / `send_reply` / `send_signal` / `recv_message` / `add_match` | **Already proven** by `statusbar::tray`'s `StatusNotifierWatcher` |
-| Generic D-Bus decoding of arbitrary signatures | `dbus::value::Unmarshaller` | Recursive-descent, fully generic |
-| Wayland connection, wire codec | `crates/platform` (`conn`, `wire`, `protocol`) | Mature, dual-ring io_uring |
-| SCM_RIGHTS fd passing | `platform::sys::{OutgoingMessage, IncomingControl}` | Done — but for the *Wayland* socket |
-| Layer-shell windows | `statusbar::bar_window`, `bins/launcher/launcher_window` | Two working implementations |
-| Software canvas + text + font | `platform::draw::Canvas`, `statusbar::text`, `crates/font` | Working |
-| Keyboard input / xkb | `crates/input`, `crates/xkb` | Working |
-| `.desktop` parsing, app index, fuzzy search, `Exec=` spawn | `crates/launcher` | Working — this is 80% of AppChooser and xdg-open |
-| Icon theme lookup | `launcher::icon_lookup` | hicolor + pixmaps, PNG only |
-| Screen capture | `crates/screencopy` + `bins/shot` | **Full interactive region picker already exists** |
-| Wallpaper setting | `crates/wallpaper` | Working |
-| Idle inhibit / session control | `dbus::logind` | Partial (brightness); session object path resolution done |
-| PNG encode/decode | `ixiptla-core` | Working |
-| Config | `crates/config` (shelby) | Working |
+| File selection UI and model | `bins/files`, `fsmodel`, `widget` | Working; list and grid views exist |
+| File operations | `fileops` | Working headless core |
+| MIME/default-app resolution | `mime`, `launcher` | Working core |
+| App selection and launching | `launcher` | Working |
+| Screenshot selection | `screencopy`, `bins/shot` | Working |
+| Wayland, canvas, input, text | `platform`, `font`, `xkb`, `input` | Working |
+| D-Bus client and limited watcher support | `dbus` | Working, but not a portal server foundation |
 
-That is a genuinely large head start. The portal is mostly "D-Bus object plumbing +
-a file dialog", and we have industrial-grade versions of both halves' hard parts.
+The hard gate is still `crates/dbus`. It has generic **decoding** (`Value` /
+`Unmarshaller`) and enough client/watcher support to own a name, receive
+messages, and make blocking calls. It does **not** yet provide:
 
-## 3. What's missing — the honest gap list
+1. Generic outbound encoding for arbitrary portal signatures, notably `a{sv}`,
+   arrays, structs, variants, byte arrays, and handles.
+2. A reusable object registry, method router, standard error replies, or
+   `org.freedesktop.DBus.Introspectable` support.
+3. Server-side `Properties.GetAll` / `PropertiesChanged` support.
+4. Unix FD transport (`SCM_RIGHTS`, `UNIX_FDS` header field, and `h` indexes).
+5. A non-blocking event model which can service multiple bus callers while a
+   Wayland dialog is open, plus request cleanup when the caller disconnects.
 
-### 3.1 `crates/dbus` gaps (the real long pole, and it blocks everything)
+`request_name` and `recv_message` prove a useful low-level capability, but the
+statusbar's hand-wired watcher must not be mistaken for the reusable portal
+server layer above.
 
-The current crate is a **client** that grew just enough server support for one
-specific watcher. Portal work needs it to become a proper bidirectional peer.
+## 2. Architecture
 
-1. **Outbound value encoder.** `message::BodyArg` currently has exactly six variants:
-   `Str`, `ObjectPath`, `U32`, `Bool`, `VariantBool`, `VariantU32`. Every portal
-   method returns `a{sv}` — nested arrays, dicts, variants, struct, `ay`, `h`.
-   We need a `Marshaller` that is the mirror of the existing `Unmarshaller`:
-   generic over signature, recursive. **This is the single most important missing
-   piece and everything else waits on it.** → new `crates/dbus/src/marshal.rs`.
+Keep responsibilities narrow and reuse the headless file-browser crates instead
+of cloning their policy into the portal daemon.
 
-2. **Unix fd passing on the bus socket.** `OpenFile`/`OpenPipe`/`ScreenCast` return
-   file descriptors: header field `UNIX_FDS` (code 9, not in `message::field_code`)
-   plus `SCM_RIGHTS` on `sendmsg`/`recvmsg`, and the `h` type in the body being an
-   *index* into the fd array. The cmsg assembly logic exists in `platform::sys` but
-   is Wayland-specific and not shared. → new `crates/dbus/src/fds.rs`, possibly
-   lifting a shared cmsg struct out of `platform::sys`.
+```text
+crates/dbus/
+  marshal.rs                 Generic Value -> wire encoder
+  fds.rs                     Unix-FD send/receive and header accounting
+  server/registry.rs         Object lifetime and lookup
+  server/router.rs           Signature-checked method dispatch
+  server/introspection.rs    Introspectable XML responses
+  server/properties.rs       GetAll and PropertiesChanged
+  server/name_watcher.rs     Caller death -> request/session cleanup
 
-3. **Object registry + method dispatch.** Today `tray.rs` hand-matches
-   `(path, interface, member)` in an if-chain. A portal serves dozens of methods
-   across ~15 interfaces plus dynamically-created
-   `/org/freedesktop/portal/desktop/request/<sender>/<token>` objects. Needs a real
-   router. → new `crates/dbus/src/server/` module tree: `ObjectRegistry`,
-   `MethodCallRouter`, `PropertyBag`.
+crates/portal-core/
+  request_handle.rs          Request paths and token validation
+  session_handle.rs          Session lifecycle and Closed rules
+  response_code.rs           Success/cancelled/error response semantics
+  options/                   Per-interface option-dictionary validation
 
-4. **`org.freedesktop.DBus.Introspectable`.** GTK/Qt/GLib clients introspect before
-   calling. Missing introspection = mysterious client-side failures.
-   → `crates/dbus/src/server/introspection.rs`.
+crates/portal-ui/
+  dialog_shell.rs            Wayland modal-shell lifecycle and focus
+  access_dialog.rs           Yes/no access prompt
+  file_chooser.rs            Adapter over fsmodel/widget/fileops/mime
 
-5. **`Properties.GetAll` server-side + `PropertiesChanged` emission.**
-
-6. **`NameOwnerChanged` tracking.** When a client dies mid-dialog we must close its
-   requests/sessions or we leak windows and objects forever. Requires a match rule
-   plus a per-sender registry.
-
-7. **Concurrency model.** `DbusConn` is strictly blocking-single-call. A portal must
-   serve a second client while a file dialog is open, and must pump a Wayland event
-   loop simultaneously. Both sockets are pollable fds and both already speak
-   io_uring, so this should be **one unified io_uring loop over both fds** rather
-   than threads — but that loop does not exist yet and is nontrivial design work.
-
-8. **Signature-driven arg validation.** Rejecting malformed calls with a proper
-   `org.freedesktop.DBus.Error.InvalidArgs` rather than desyncing.
-
-Realistically items 1+2+3 alone are a substantial chunk of work before a single
-portal method can return a useful value.
-
-### 3.2 Missing domain logic
-
-- **MIME resolution.** Nothing here parses `mimeapps.list`, `shared-mime-info`
-  globs/magic, or `defaults.list`. Needed by `OpenURI`, `xdg-open`, `xdg-mime`.
-  `crates/launcher`'s `DesktopEntry` gets us `MimeType=` but not the association
-  database or the glob matcher. → new `crates/mime`.
-- **A file browser model.** Directory listing, sorting, filter application
-  (portal filters are `(sas)` glob/mime pairs), navigation, hidden-file rules,
-  multi-select, save-mode name entry. Pure logic, headlessly testable.
-  → new `crates/filebrowser`.
-- **A modal dialog window abstraction.** We have two layer-shell windows, but both
-  are bespoke. A portal dialog needs: focus/keyboard grab, Esc-to-cancel, parenting
-  to the requesting window, scrolling list, text entry. → new `crates/portal-ui`,
-  factored out of `launcher_window` + `shot`'s `selection_overlay`.
-- **Notification server.** `statusbar::notifications` is *not* a notification server —
-  it polls niri IPC for `is_urgent` windows. A real `org.freedesktop.Notifications`
-  + `portal.Notification` implementation (popup surfaces, actions, timeouts, hints,
-  image-data) is from-scratch work.
-- **`parent_window` handles.** Portal clients pass `"wayland:<handle>"` from
-  `xdg_foreign`. To parent modals correctly we'd need `zxdg_importer_v2` support in
-  `crates/platform` (not currently in `protocol.rs`). Degradable: an unparented
-  layer-shell overlay works, just less pretty.
-
-### 3.3 The genuinely hard tier
-
-- **`ScreenCast` / `RemoteDesktop` / `Camera` → PipeWire.** These return a PipeWire
-  node id and require client and portal to share a PipeWire connection. There is
-  **no PipeWire client anywhere in this workspace**, and PipeWire's native protocol
-  (SPA pods, buffer/format negotiation, dmabuf handoff) is comparable in size to the
-  Wayland client we already wrote — arguably larger, and far less well specified.
-  **Recommendation: do not attempt.** Leave these three routed to the existing
-  backend in `portals.conf`. Costs us nothing architecturally, since `portals.conf`
-  is per-interface.
-  - *To verify:* recent niri implements `impl.portal.ScreenCast` itself; if so the
-    gnome backend may already be bypassed and this is even more clearly not our
-    problem.
-- **`Documents` (FUSE).** Only meaningful for Flatpak. If no Flatpak on this box →
-  **skip entirely**. Confirm before committing.
-- **`Secret`.** Delegated to gnome-keyring today. Reimplementing a secret store is a
-  separate project with real security stakes. **Skip, keep delegating.**
-- **`GlobalShortcuts`, `InputCapture`, `Usb`.** Niche; skip until something asks.
-
-### 3.4 Cross-cutting risks
-
-- **App identity is meaningless without a sandbox.** The real frontend derives app-id
-  from `/.flatpak-info` or snap cgroups. Unsandboxed callers are all "unconfined".
-  This is a *simplification* for us (no permission store needed) but means we cannot
-  claim feature parity for a Flatpak-using machine.
-- **Clients are picky about reported interface `version`.** GTK's
-  `GtkFileChooserNative` and Qt's XDG platform theme branch on version properties.
-  Report only versions we actually satisfy, and expect a debugging tail here.
-- **Bricking risk.** Owning `org.freedesktop.portal.Desktop` badly = no app can open
-  a file, screenshot, or check dark mode. Shape A + per-interface `portals.conf` is
-  the mitigation; also develop against a scratch bus name first.
-
-## 4. Proposed crate layout
-
-Respecting the workspace rules (SRP, one file one responsibility, no free functions,
-pure core / thin compositor+bus shell — the `crates/screencopy` and `crates/launcher`
-pattern):
-
-```
-crates/dbus/src/marshal.rs        Marshaller — Value -> wire bytes (mirror of Unmarshaller)
-crates/dbus/src/fds.rs            FdPassing — SCM_RIGHTS + UNIX_FDS header field
-crates/dbus/src/server/registry.rs      ObjectRegistry
-crates/dbus/src/server/router.rs        MethodCallRouter
-crates/dbus/src/server/introspection.rs Introspection (XML generation)
-crates/dbus/src/server/name_watcher.rs  NameWatcher (NameOwnerChanged -> cleanup)
-
-crates/portal-core/               Pure protocol logic, zero I/O:
-    request_handle.rs             RequestHandle — object path derivation, token rules
-    session_handle.rs             SessionHandle — lifecycle, Closed emission rules
-    response_code.rs              ResponseCode (0 success / 1 cancelled / 2 other)
-    options/*.rs                  Per-interface option-dict parse + validate
-    (this is where the bulk of the unit tests live)
-
-crates/mime/                      mimeapps.list, glob/magic matching, default resolution
-crates/filebrowser/               Directory model, sorting, filters, save-name logic
-crates/portal-ui/                 Modal dialog shell, extracted from launcher_window
-                                  + shot's selection_overlay
-crates/notify/                    Notification server logic + popup surface
-
-bins/portal/                      The daemon. Wiring only: one io_uring loop over
-                                  the bus fd + the Wayland fd, routing to the above.
-bins/xdgtools/                    Multicall: xdg-open / xdg-mime / xdg-settings /
-                                  xdg-user-dir, all on crates/mime + crates/launcher.
+bins/portal/
+  main.rs                    Thin wiring: bus + Wayland pump, routing, config
 ```
 
-`bins/portal` should stay as thin as `bins/shot` is — wiring, not logic.
+`portal-core` must be pure protocol/domain logic with exhaustive unit tests.
+`portal-ui` owns presentation only. `bins/portal` owns no policy beyond wiring
+and must remain thin.
 
-## 5. Suggested order (each step independently shippable + revertible)
+Keep the new server portion of `dbus` behind a `server` Cargo feature. Gate its
+state field and expose thin enabled/no-op wrapper methods so default client-only
+consumers do not retain unused server state or raw `#[cfg]` in their business
+logic. Decide whether `fds` should be independently gated only after inspecting
+the resulting feature graph; do not split into a new crate unless that avoids a
+real dependency cycle.
 
-| # | Step | Blocks on | Size | Payoff |
-|---|---|---|---|---|
-| 1 | `dbus::marshal::Marshaller` + tests | — | M | Unblocks literally everything |
-| 2 | `dbus::server::{ObjectRegistry, MethodCallRouter, Introspection}` | 1 | M | Ditto; also lets `tray.rs` drop its if-chain |
-| 3 | `impl.portal.Settings` (dark mode / accent from `crates/config`) | 1,2 | **S** | Immediate visible win; kills a GTK dep for theming |
-| 4 | `dbus::fds::FdPassing` (SCM_RIGHTS + `UNIX_FDS`) | 1 | M | Gate for every fd-returning method |
-| 5 | Unified io_uring loop over bus fd + Wayland fd | — | M/L | Needed before any UI-bearing interface |
-| 6 | `impl.portal.Screenshot` — wrap `bins/shot` | 4,5 | **S** | We already have the whole picker |
-| 7 | `crates/portal-ui` extracted from launcher/shot | 5 | M | Shared dialog shell |
-| 8 | `impl.portal.Access` (yes/no modal) | 7 | S | Simplest UI interface, proves the shell |
-| 9 | `crates/mime` + `bins/xdgtools` | — | M | Independent; replaces the shell scripts |
-| 10 | `impl.portal.AppChooser` | 7,9 | S | It's `bins/launcher` with a filter |
-| 11 | `impl.portal.OpenURI` | 9 | S | |
-| 12 | `crates/filebrowser` (pure) | — | M | Independent, heavily testable |
-| 13 | `impl.portal.FileChooser` | 4,7,12 | **L** | The one that matters most to real apps |
-| 14 | `Inhibit`/`Lockdown`/`Account`/`Email`/`Print` (stub or minimal) | 2 | S each | Long tail |
-| 15 | `crates/notify` + `Notification` | 7 | L | Also replaces any separate notif daemon |
-| 16 | Shape A → B: own `portal.Desktop`, drop the impl layer | 1–14 | L | Kills the last daemon |
-| — | `ScreenCast`/`RemoteDesktop`/`Camera` | PipeWire client | XL | **Out of scope — keep delegating** |
-| — | `Documents` (FUSE), `Secret` | — | — | **Out of scope** |
+## 3. Delivery sequence
 
-Steps 1, 2, 9, 12 have no Wayland dependency at all and are pure-logic +
-fully unit-testable — good places to start, and they parallelize cleanly.
+Every numbered step is independently buildable, tested, clippy-clean, and
+revertible before the following step begins.
 
-## 6. Open questions to settle before starting
+### Foundation
 
-1. Is Flatpak in use on this machine? If no → `Documents`, the permission store, and
-   app-id detection all vanish from scope, which is a large simplification.
-2. Does the installed niri already implement `impl.portal.ScreenCast` natively?
-   If yes, screencast never touches our code path and delegation is free.
-3. Do we want a notification daemon at all, or is `statusbar`'s niri-IPC urgency
-   indicator sufficient? Step 15 is large and might simply be unwanted.
-4. Should `crates/dbus`'s server half be a separate crate (`crates/dbus-server`) to
-   keep `crates/dbus` lean for the statusbar, or a feature-gated module? Workspace
-   convention favours gating the *field* + thin wrapper methods, so a `server`
-   feature on `crates/dbus` is probably right — but check `cargo graph` for cycle
-   smells either way.
-5. Target: parity with what *this* machine's apps actually call, or general
-   correctness? Parity is maybe 30% of the work. Recommend parity.
+1. **Inventory local requirements.** Record whether Flatpak is installed/in
+   use, which portal interfaces local applications call, the installed niri
+   screencast implementation, and the current `portals.conf` routing. Convert
+   that into a checked-in compatibility matrix.
+2. **Marshaller.** Add `dbus::marshal::Marshaller`, mirroring `Unmarshaller`.
+   Start with all D-Bus primitive types, recursive containers, variants, and
+   `a{sv}`. Golden-wire tests must round-trip through `Unmarshaller` and cover
+   alignment at every nesting boundary.
+3. **Server core.** Add the feature-gated registry, router, introspection,
+   argument validation, standard D-Bus error returns, and Properties support.
+   Refactor the statusbar watcher only if it reduces duplication without mixing
+   its service policy into generic code.
+4. **Scratch service.** Build a small test daemon on a scratch well-known name;
+   exercise introspection, a method call, `GetAll`, malformed arguments, and a
+   signal from an external D-Bus client before registering any portal interface.
+5. **Settings backend.** Implement `impl.portal.Settings` backed by
+   `crates/config`. Route only Settings via a `.portal` file and `portals.conf`.
+   This validates the real frontend path without UI or FD complexity.
+
+### Interactive and FD work
+
+6. **FD passing.** Add `dbus::fds::FdPassing`, `UNIX_FDS`, and `h` value
+   encoding/decoding with focused socket-pair tests. Do not expose an FD-returning
+   portal method until these tests cover multiple descriptors and error cleanup.
+7. **Unified event pump.** Introduce the daemon-owned bus/Wayland event pump.
+   It must continue accepting/responding to calls while a dialog is visible and
+   must close request/session objects when a caller loses its name.
+8. **Portal UI shell.** Extract a focused modal dialog shell from the proven
+   launcher/shot patterns. Initially accept unparented overlays; add
+   `xdg_foreign` parent-handle support only after the shell is reliable.
+9. **Access and Screenshot.** Implement `impl.portal.Access` and Screenshot
+   (adapting `bins/shot`) as the first interactive interfaces.
+
+### Application-facing interfaces
+
+10. **AppChooser and OpenURI.** Reuse `launcher` and `mime`; prove default-app,
+    cancellation, and multi-URI behavior against real GTK/Qt callers.
+11. **FileChooser.** Adapt `fsmodel`, `widget`, `mime`, and `fileops` into
+    `portal-ui`; support open/save, multiple selection, filters, choices, and
+    robust cancellation before advertising a high interface version.
+12. **Small interfaces.** Add only locally-needed minimal implementations for
+    Inhibit, Lockdown, Account, Email, and Print; otherwise leave routing to the
+    established backend.
+13. **Notifications (optional).** Scope this separately. `statusbar` urgency is
+    not a D-Bus notification server; do not silently turn it into one.
+
+### Only after daily-use proof
+
+14. **Evaluate frontend ownership.** Consider owning
+    `org.freedesktop.portal.Desktop` only after every selected backend interface
+    is exercised in daily use with a documented rollback path. It is optional,
+    not a milestone required for success.
+
+## 4. Compatibility and rollback contract
+
+- Develop every interface first on a scratch bus name.
+- Ship a `.portal` descriptor and route **one interface at a time** in
+  `portals.conf`.
+- Maintain a compatibility matrix containing interface, advertised version,
+  caller/test client, known options, and fallback backend.
+- Report only versions whose methods, properties, options, signals, and
+  cancellation semantics have tests.
+- Preserve the existing backend route for every unimplemented interface.
+- A rollback is a configuration change, not code surgery: restore that single
+  interface's prior provider and restart the portal/session components.
+
+## 5. Verification gate for each change
+
+Before declaring any increment complete:
+
+1. Run focused unit/integration tests for the changed crate.
+2. Run `cargo build` and `cargo test` for each relevant feature combination
+   (`dbus` client-only and `dbus/server`, plus FD support when applicable).
+3. Run clippy for the same combinations.
+4. Run workspace `cargo check --workspace --all-targets` and inspect the Cargo
+   dependency graph for cycles, accidental feature activation, and dead-state
+   smells.
+5. For a routed interface, validate against a real portal client and then make
+   the per-interface rollback change once to prove recovery works.
+
+## 6. First implementation task
+
+Start with step 1's compatibility matrix and then step 2: a standalone,
+well-tested `dbus::marshal::Marshaller`. No portal daemon, UI, or interface code
+should be started before the marshaller can encode and round-trip the nested
+values portal replies require.
 
 ## 7. Bottom line
 
-- **Feasible and unusually well-supported by what's already here** — the Wayland
-  client, canvas, font, input, screencopy, desktop-entry parsing, and a working
-  D-Bus server are all in place.
-- **The gating work is not the portal, it's `crates/dbus`.** A generic outbound
-  marshaller, fd passing, and object dispatch are prerequisites for everything and
-  don't exist yet. Budget for that first; don't start UI work until it's solid.
-- **Full replacement is not realistic** because of PipeWire. Aim for "replace
-  everything except ScreenCast/RemoteDesktop/Camera/Secret", which is genuinely
-  achievable and would still let us drop the GTK backend entirely.
-- **Do it as a backend first.** Per-interface `portals.conf` routing turns a
-  potentially session-bricking rewrite into a sequence of safe, reversible steps.
+The workspace is ready to begin a native portal **backend** project: the file
+chooser's actual domain/UI dependencies are no longer hypothetical. The next
+risk is concentrated in `dbus`, so we should retire that risk in small, generic,
+well-tested infrastructure slices. A selective backend replacement is feasible,
+useful, and safe to deploy; a complete PipeWire/FUSE/secret-store replacement is
+intentionally outside this plan.

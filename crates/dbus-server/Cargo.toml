@@ -1,0 +1,10 @@
+[package]
+name    = "dbus-server"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dbus = { path = "../dbus" }
+
+[lints]
+workspace = true

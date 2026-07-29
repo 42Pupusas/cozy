@@ -71,13 +71,18 @@ of cloning their policy into the portal daemon.
 
 ```text
 crates/dbus/
-  marshal.rs                 Generic Value -> wire encoder
+  marshal.rs                 Generic Value -> wire encoder (done)
   fds.rs                     Unix-FD send/receive and header accounting
-  server/registry.rs         Object lifetime and lookup
-  server/router.rs           Signature-checked method dispatch
-  server/introspection.rs    Introspectable XML responses
-  server/properties.rs       GetAll and PropertiesChanged
-  server/name_watcher.rs     Caller death -> request/session cleanup
+
+crates/dbus-server/          Depends on crates/dbus; re-exports what downstream
+                             interface crates need from it (Value, Reply,
+                             Marshaller/Unmarshaller) so they only take one
+                             dependency, not two separately versioned ones.
+  registry.rs                Object lifetime and lookup (done)
+  router.rs                  Signature-checked method dispatch
+  introspection.rs           Introspectable XML responses
+  properties.rs              GetAll and PropertiesChanged
+  name_watcher.rs            Caller death -> request/session cleanup
 
 crates/portal-core/
   request_handle.rs          Request paths and token validation
@@ -98,12 +103,15 @@ bins/portal/
 `portal-ui` owns presentation only. `bins/portal` owns no policy beyond wiring
 and must remain thin.
 
-Keep the new server portion of `dbus` behind a `server` Cargo feature. Gate its
-state field and expose thin enabled/no-op wrapper methods so default client-only
-consumers do not retain unused server state or raw `#[cfg]` in their business
-logic. Decide whether `fds` should be independently gated only after inspecting
-the resulting feature graph; do not split into a new crate unless that avoids a
-real dependency cycle.
+The server-side object registry, method router, introspection, and properties
+support live in a **separate `crates/dbus-server` crate** that depends on
+`crates/dbus`, not behind a Cargo feature on `dbus` itself. `crates/dbus` stays
+a lean client library -- exactly what `statusbar`'s `NetworkManager`/bluez/
+logind wrappers need and nothing else -- and "does this binary link the portal
+server machinery" becomes a visible `Cargo.toml` dependency edge instead of a
+feature flag someone has to remember to check. `fds.rs` stays in `crates/dbus`
+for now since fd passing is a transport-level concern any client or server
+might eventually need; revisit if that stops being true.
 
 ## 3. Delivery sequence
 
@@ -120,7 +128,7 @@ revertible before the following step begins.
    Start with all D-Bus primitive types, recursive containers, variants, and
    `a{sv}`. Golden-wire tests must round-trip through `Unmarshaller` and cover
    alignment at every nesting boundary.
-3. **Server core.** Add the feature-gated registry, router, introspection,
+3. **Server core.** Add `crates/dbus-server`'s registry, router, introspection,
    argument validation, standard D-Bus error returns, and Properties support.
    Refactor the statusbar watcher only if it reduces duplication without mixing
    its service policy into generic code.
@@ -183,12 +191,13 @@ revertible before the following step begins.
 Before declaring any increment complete:
 
 1. Run focused unit/integration tests for the changed crate.
-2. Run `cargo build` and `cargo test` for each relevant feature combination
-   (`dbus` client-only and `dbus/server`, plus FD support when applicable).
-3. Run clippy for the same combinations.
+2. Run `cargo build` and `cargo test` for every crate touched (`dbus`,
+   `dbus-server`, and any downstream crate), plus FD support once that lands.
+3. Run clippy for the same crates.
 4. Run workspace `cargo check --workspace --all-targets` and inspect the Cargo
-   dependency graph for cycles, accidental feature activation, and dead-state
-   smells.
+   dependency graph for cycles and dead-state smells -- in particular confirm
+   `dbus`'s own dependents (e.g. `statusbar`) never gain a transitive edge to
+   `dbus-server`.
 5. For a routed interface, validate against a real portal client and then make
    the per-interface rollback change once to prove recovery works.
 

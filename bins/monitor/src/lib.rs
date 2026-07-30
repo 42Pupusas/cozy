@@ -18,3 +18,4 @@ pub mod dashboard_report;
 pub mod display_snapshot;
 pub mod redraw_gate;
 pub mod sample_interpolator;
+pub mod text_layout;

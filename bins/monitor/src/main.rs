@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 // benches can drive them headlessly with an allocation profiler. The binary
 // only adds the modules that need the live window/thread context.
 mod headless;
+mod process_table;
 mod profile;
 mod snapshot_cli;
 
@@ -21,8 +22,10 @@ use monitor::dashboard_report::DashboardReport;
 use monitor::display_snapshot::DisplaySnapshot;
 use monitor::redraw_gate::RedrawGate;
 use monitor::sample_interpolator::SampleInterpolator;
+use monitor::text_layout::TextLayout;
 use platform::TermWindow;
 use platform::draw::{Canvas, Color, Rect};
+use process_table::ProcessTable;
 use profile::{FrameProfile, PaintPhases, WorkerProfile};
 use statusbar::TextRenderer;
 use sysmon::{MonitorReader, MonitorSample, ProcessInfo};
@@ -395,31 +398,10 @@ impl Painter {
     }
 
     /// Retain the beginning of a string and replace its overflowing end with
-    /// an ellipsis. CPU metadata should read naturally from the start (for
-    /// example, `Intel(R) Core(TM) … · 16 cores`) rather than exposing an
-    /// arbitrary suffix of the brand.
+    /// an ellipsis. Delegates to `TextLayout`, the shared helper this card
+    /// and the process table's long command names both need.
     fn truncate_prefix(text: &str, renderer: &mut TextRenderer, max_width: i32) -> String {
-        if max_width <= 0 {
-            return String::new();
-        }
-        if renderer.measure(text) <= max_width {
-            return text.to_owned();
-        }
-        let ellipsis_width = renderer.measure("…");
-        if ellipsis_width >= max_width {
-            return "…".to_owned();
-        }
-        let mut prefix = String::new();
-        for character in text.chars() {
-            let mut candidate = prefix.clone();
-            candidate.push(character);
-            candidate.push('…');
-            if renderer.measure(&candidate) > max_width {
-                break;
-            }
-            prefix.push(character);
-        }
-        format!("{prefix}…")
+        TextLayout::truncate_prefix(text, renderer, max_width)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -491,6 +473,10 @@ impl Painter {
         }
     }
 
+    // Down from 461 lines pre-refactor (see ProcessTable/TextLayout/card_text
+    // extractions and the chart-job loop above) to the geometry setup +
+    // damage bookkeeping + dispatch that's left; the remaining length is
+    // orchestration, not duplication.
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::too_many_arguments)]
     fn paint(
@@ -578,154 +564,61 @@ impl Painter {
         // GUI and the text report can never drift apart on rounding or units.
         let report = DashboardReport::from_sample(&snap.sample, &snap.processes);
         if full_repaint {
-            // CPU card follows the mockup's four-row rhythm: a compact
-            // identity row, a hero value row, a mixed-type detail row, and
-            // the graph consuming all remaining vertical space.
-            let cpu_card = cards[0];
-            title_text.draw_text(
-                canvas,
-                report.cpu.title,
-                cpu_card.x + 14,
-                cpu_card.y + 12,
-                self.palette.dim,
-                self.palette.surface,
-            );
-            // Keep the metadata in the right half of the title row. The
-            // report's `meta` is the untruncated brand + core count; a full
-            // CPU brand can be much wider than the card, so truncate it here
-            // at paint time, where the measured glyph widths live.
-            let metadata_width = (cpu_card.w * 3 / 4 - 14).max(1);
-            let cpu_meta = Self::truncate_prefix(&report.cpu.meta, subtitle_text, metadata_width);
-            subtitle_text.draw_text_right(
-                canvas,
-                &cpu_meta,
-                cpu_card.x + cpu_card.w - 14,
-                cpu_card.y + 13,
-                self.palette.faint,
-                self.palette.surface,
-            );
-            let hero_end = self.metric(
-                hero_text,
-                canvas,
-                &report.cpu.hero,
-                cpu_card.x + 14,
-                self.bands.hero_baseline(cpu_card.y),
-            );
-            // Use the actual Hero glyph advance instead of a fixed x offset;
-            // font metrics vary with configured typeface and scale.
-            // TextRenderer coordinates are cell-top origins. The smaller
-            // subtitle has a shorter ascent, so using the same origin would
-            // place its glyphs above the Hero baseline. Offset by the measured
-            // line-height difference to align the two baselines visually.
-            let hero_baseline = self.bands.hero_baseline(cpu_card.y);
-            let percent_baseline =
-                hero_baseline + hero_text.baseline_offset() - subtitle_text.baseline_offset();
-            subtitle_text.draw_text(
-                canvas,
-                report.cpu.unit,
-                hero_end + 6,
-                percent_baseline,
-                self.palette.dim,
-                self.palette.surface,
-            );
-            let details_y = self.bands.details_y(cpu_card.y);
-            let normal_details_y =
-                details_y + subtitle_text.baseline_offset() - text.baseline_offset();
-            // Lay out complete label/value pairs rather than anchoring each
-            // label to a fixed third. A value such as `12.4 MB/s` is wider
-            // than the DISK IO label, so equal columns can overlap the next
-            // pair. Measured pair widths let us distribute the spare space
-            // safely and keep every column readable.
-            let row_x = cpu_card.x + 14;
-            let row_width = cpu_card.w - 28;
-            let pair_widths: Vec<i32> = report
-                .cpu
-                .details
-                .iter()
-                .map(|(label, value)| subtitle_text.measure(label) + 8 + text.measure(value))
-                .collect();
-            let used_width: i32 = pair_widths.iter().sum();
-            let gap = ((row_width - used_width) / 2).max(8);
-            let mut x = row_x;
-            for ((label, value), pair_width) in report.cpu.details.iter().zip(pair_widths) {
-                subtitle_text.draw_text(
+            // All four cards now follow the identical `card_text` layout
+            // (identity row, hero row, detail row); looping over the report
+            // fields eliminates what used to be a hand-laid-out CPU card
+            // that could silently drift from this exact same geometry.
+            let sections = [
+                (
+                    cards[0],
+                    report.cpu.title,
+                    &report.cpu.meta,
+                    &report.cpu.hero,
+                    report.cpu.unit,
+                    &report.cpu.details,
+                ),
+                (
+                    cards[1],
+                    report.memory.title,
+                    &report.memory.meta,
+                    &report.memory.hero,
+                    report.memory.unit,
+                    &report.memory.details,
+                ),
+                (
+                    cards[2],
+                    report.temperature.title,
+                    &report.temperature.meta,
+                    &report.temperature.hero,
+                    report.temperature.unit,
+                    &report.temperature.details,
+                ),
+                (
+                    cards[3],
+                    report.network.title,
+                    &report.network.meta,
+                    &report.network.hero,
+                    report.network.unit,
+                    &report.network.details,
+                ),
+            ];
+            for (rect, title, meta, hero, unit, details) in sections {
+                let details: Vec<(&str, &str)> =
+                    details.iter().map(|(l, v)| (*l, v.as_str())).collect();
+                self.card_text(
                     canvas,
-                    label,
-                    x,
-                    details_y,
-                    self.palette.faint,
-                    self.palette.surface,
+                    rect,
+                    title,
+                    meta,
+                    hero,
+                    unit,
+                    &details,
+                    hero_text,
+                    title_text,
+                    subtitle_text,
+                    text,
                 );
-                let value_x = x + subtitle_text.measure(label) + 8;
-                text.draw_text(
-                    canvas,
-                    value,
-                    value_x,
-                    normal_details_y,
-                    self.palette.dim,
-                    self.palette.surface,
-                );
-                x += pair_width + gap;
             }
-        }
-        if full_repaint {
-            let memory_details: Vec<(&str, &str)> = report
-                .memory
-                .details
-                .iter()
-                .map(|(label, value)| (*label, value.as_str()))
-                .collect();
-            self.card_text(
-                canvas,
-                cards[1],
-                report.memory.title,
-                &report.memory.meta,
-                &report.memory.hero,
-                report.memory.unit,
-                &memory_details,
-                hero_text,
-                title_text,
-                subtitle_text,
-                text,
-            );
-            let temperature_details: Vec<(&str, &str)> = report
-                .temperature
-                .details
-                .iter()
-                .map(|(label, value)| (*label, value.as_str()))
-                .collect();
-            self.card_text(
-                canvas,
-                cards[2],
-                report.temperature.title,
-                &report.temperature.meta,
-                &report.temperature.hero,
-                report.temperature.unit,
-                &temperature_details,
-                hero_text,
-                title_text,
-                subtitle_text,
-                text,
-            );
-            let network_details: Vec<(&str, &str)> = report
-                .network
-                .details
-                .iter()
-                .map(|(label, value)| (*label, value.as_str()))
-                .collect();
-            self.card_text(
-                canvas,
-                cards[3],
-                report.network.title,
-                &report.network.meta,
-                &report.network.hero,
-                report.network.unit,
-                &network_details,
-                hero_text,
-                title_text,
-                subtitle_text,
-                text,
-            );
         }
         let started = Instant::now();
         let cpu_color = self.palette.cpu;
@@ -755,54 +648,53 @@ impl Painter {
         ));
         phases.cpu_chart += started.elapsed();
         let started = Instant::now();
-        let memory_damage = Self::graph(
-            &mut self.memory,
-            canvas,
-            &history.memory,
-            graph_rect(cards[1]).x,
-            graph_rect(cards[1]).y,
-            graph_rect(cards[1]).w,
-            self.palette.memory,
-            100.0,
-            graph_h,
-            history.sequence,
-            &[],
-            full_repaint,
-        );
-        phases.charts_active += u32::from(!memory_damage.is_empty());
-        damage.extend(&memory_damage);
-        let temp_damage = Self::graph(
-            &mut self.temperature,
-            canvas,
-            &history.temp,
-            graph_rect(cards[2]).x,
-            graph_rect(cards[2]).y,
-            graph_rect(cards[2]).w,
-            self.palette.temperature,
-            100.0,
-            graph_h,
-            history.sequence,
-            &[],
-            full_repaint,
-        );
-        phases.charts_active += u32::from(!temp_damage.is_empty());
-        damage.extend(&temp_damage);
-        let network_damage = Self::graph(
-            &mut self.network,
-            canvas,
-            &history.rx,
-            graph_rect(cards[3]).x,
-            graph_rect(cards[3]).y,
-            graph_rect(cards[3]).w,
-            self.palette.network,
-            10.0,
-            graph_h,
-            history.sequence,
-            &[Overlay::new(&history.tx, self.palette.temperature)],
-            full_repaint,
-        );
-        phases.charts_active += u32::from(!network_damage.is_empty());
-        damage.extend(&network_damage);
+        // Memory/temperature/network are all plain single-series charts
+        // (only network has a trailing overlay); looping over disjoint field
+        // borrows keeps that one real difference (the overlay slice) visible
+        // instead of three call sites that must be kept in lockstep by hand.
+        let network_overlay = [Overlay::new(&history.tx, self.palette.temperature)];
+        let jobs = [
+            (
+                &mut self.memory,
+                &history.memory,
+                self.palette.memory,
+                100.0,
+                [].as_slice(),
+            ),
+            (
+                &mut self.temperature,
+                &history.temp,
+                self.palette.temperature,
+                100.0,
+                [].as_slice(),
+            ),
+            (
+                &mut self.network,
+                &history.rx,
+                self.palette.network,
+                10.0,
+                network_overlay.as_slice(),
+            ),
+        ];
+        for (index, (cache, values, color, maximum, overlays)) in jobs.into_iter().enumerate() {
+            let rect = graph_rect(cards[index + 1]);
+            let chart_damage = Self::graph(
+                cache,
+                canvas,
+                values,
+                rect.x,
+                rect.y,
+                rect.w,
+                color,
+                maximum,
+                graph_h,
+                history.sequence,
+                overlays,
+                full_repaint,
+            );
+            phases.charts_active += u32::from(!chart_damage.is_empty());
+            damage.extend(&chart_damage);
+        }
         phases.other_charts += started.elapsed();
 
         let proc_rect = Rect::new(
@@ -813,134 +705,15 @@ impl Painter {
         );
         self.card(canvas, proc_rect, full_repaint);
         if full_repaint {
-            let inset = 14;
-            let left = proc_rect.x + inset;
-            let right = proc_rect.x + proc_rect.w - inset;
-            let pid_right = left + 48;
-            let name_left = pid_right + 12;
-            let cpu_right = right - 76;
-            let mem_right = right;
-            title_text.draw_text(
+            ProcessTable::paint(
                 canvas,
-                "Processes",
-                left,
-                proc_rect.y + 14,
-                self.palette.dim,
-                self.palette.surface,
+                proc_rect,
+                &snap.processes,
+                &self.palette,
+                title_text,
+                subtitle_text,
+                text,
             );
-            subtitle_text.draw_text_right(
-                canvas,
-                &format!("{} tasks", snap.processes.len()),
-                right,
-                proc_rect.y + 15,
-                self.palette.faint,
-                self.palette.surface,
-            );
-            subtitle_text.draw_text(
-                canvas,
-                "PID",
-                left,
-                proc_rect.y + 40,
-                self.palette.faint,
-                self.palette.surface,
-            );
-            subtitle_text.draw_text(
-                canvas,
-                "Name",
-                name_left,
-                proc_rect.y + 40,
-                self.palette.faint,
-                self.palette.surface,
-            );
-            subtitle_text.draw_text_right(
-                canvas,
-                "CPU",
-                cpu_right,
-                proc_rect.y + 40,
-                self.palette.faint,
-                self.palette.surface,
-            );
-            subtitle_text.draw_text_right(
-                canvas,
-                "Memory",
-                mem_right,
-                proc_rect.y + 40,
-                self.palette.faint,
-                self.palette.surface,
-            );
-            let row_height = 18;
-            let first_row = proc_rect.y + 59;
-            let available_height = (proc_rect.y + proc_rect.h - inset - first_row).max(0);
-            let row_count = usize::try_from(available_height / row_height).unwrap_or(0);
-            for (row, process) in snap.processes.iter().take(row_count).enumerate() {
-                let y = first_row + i32::try_from(row).unwrap_or(0) * row_height;
-                let name_width = (cpu_right - name_left - 12).max(1);
-                let name = Self::truncate_prefix(&process.name, text, name_width);
-                text.draw_text(
-                    canvas,
-                    &process.pid.to_string(),
-                    left,
-                    y,
-                    self.palette.dim,
-                    self.palette.surface,
-                );
-                text.draw_text(
-                    canvas,
-                    &name,
-                    name_left,
-                    y,
-                    if row == 0 {
-                        self.palette.temperature
-                    } else {
-                        self.palette.foreground
-                    },
-                    self.palette.surface,
-                );
-                // Process CPU remains measured in one-core percentage, but
-                // the table uses a visual bar instead of another numeric wall
-                // of percentages. The bar is bounded to its dedicated column
-                // and saturates at 100% for multi-threaded processes.
-                let bar_right = cpu_right;
-                let bar_left = bar_right - 58;
-                let bar_y = y + 5;
-                canvas.fill_rect(
-                    Rect::new(bar_left, bar_y, bar_right - bar_left, 6),
-                    self.palette.border,
-                );
-                let bar_width = bar_right - bar_left;
-                let fill = (process.cpu.clamp(0.0, 100.0) / 100.0
-                    * bar_width.to_string().parse::<f32>().unwrap_or(0.0))
-                .round()
-                .to_string()
-                .parse::<i32>()
-                .unwrap_or(bar_width);
-                if fill > 0 {
-                    canvas.fill_rect(
-                        Rect::new(bar_left, bar_y, fill, 6),
-                        if row == 0 {
-                            self.palette.temperature
-                        } else {
-                            self.palette.cpu
-                        },
-                    );
-                }
-                text.draw_text_right(
-                    canvas,
-                    &format!(
-                        "{:.1} MB",
-                        process
-                            .memory_kb
-                            .to_string()
-                            .parse::<f32>()
-                            .unwrap_or(f32::MAX)
-                            / 1024.0
-                    ),
-                    mem_right,
-                    y,
-                    self.palette.dim,
-                    self.palette.surface,
-                );
-            }
             phases.static_content += Instant::now().duration_since(started);
             // A full repaint rewrote text, cards, and the process table across
             // the whole surface, so the entire window is damage. Collapsing to

@@ -137,35 +137,72 @@ revertible before the following step begins.
    a method call, `GetAll`, malformed arguments, and a signal from an
    external, independently-connected D-Bus client -- all over a real session
    bus connection, not just in-memory `Dispatcher`/`ServerLoop` unit tests.
-5. **Settings backend (wired, on a scratch name).** `crates/portal-core`
-   holds the pure, D-Bus-free domain logic for `org.freedesktop.appearance`:
+5. **Settings backend -- done.** `crates/portal-core` holds the pure,
+   D-Bus-free domain logic for `org.freedesktop.appearance`:
    `AppearanceSettings` (the four documented keys, derived from a
-   `config::Config` snapshot), `ColorScheme` and `AccentColor` (the two keys
-   with a genuine local source), `NamespaceFilter` (`ReadAll`'s glob rules,
-   independent of namespace contents), and `SettingChangedSignal`.
-   `bins/portal` (new) wires that domain logic to a real
-   `dbus_server::Dispatcher`: `SettingsService` registers the
-   `org.freedesktop.impl.portal.Settings` object (`ReadAll`, `Read`, the
-   `version` property, and the `SettingChanged` signal's introspection
-   shape) at `/org/freedesktop/portal/desktop`, and `main` connects to the
-   session bus and serves forever. Proved against a real, second,
-   independently-connected client in `bins/portal/tests/real_bus_probe.rs`
-   (mirroring `dbus-server`'s own scratch-service integration test) --
-   Introspect, ReadAll, Read, and Properties.GetAll all round-trip over
-   real marshalled bytes, not just `Dispatcher::dispatch` called directly
-   in memory. `crates/dbus` grew `DbusConn::call_with_values` /
-   `MessageBuilder::build_method_call_with_values` to send this: `ReadAll`'s
-   `as` argument is a shape the existing `BodyArg` enum can't express, the
-   same gap `send_method_return_with_values`/`send_signal_with_values`
-   already closed on the reply/signal sides.
+   `config::Config` snapshot, plus `changed_from` -- diffing two
+   snapshots down to just the keys that actually changed, for
+   `SettingChanged`), `ColorScheme` and `AccentColor` (the two keys with a
+   genuine local source), `NamespaceFilter` (`ReadAll`'s glob rules,
+   independent of namespace contents), and `SettingChangedSignal` (the
+   `(namespace, key, value)` wire body).
 
-   Still on a **scratch** well-known name
-   (`org.freedesktop.impl.portal.desktop.mera.scratch`), per this doc's own
-   compatibility contract (section 4): what's left to finish this step is
-   shipping a real `.portal` file naming the true activation name and
-   routing Settings in `portals.conf`, plus wiring live config-reload (a
-   `ConfigWatcher` like `bins/terminal`'s own) so `SettingChanged` is
-   actually emitted rather than only declared in introspection XML.
+   `bins/portal` wires that domain logic to a real `dbus_server::Dispatcher`
+   and keeps it live:
+   - `SettingsService` registers the `org.freedesktop.impl.portal.Settings`
+     object (`ReadAll`, `Read`, the `version` property, the `SettingChanged`
+     signal's introspection shape) at `/org/freedesktop/portal/desktop`.
+   - `SettingsState` is the one piece of shared mutable state `ReadAll`/
+     `Read`'s `Fn` closures need to answer with *current* settings rather
+     than a value frozen at startup -- an `Arc<Mutex<AppearanceSettings>>`
+     behind a narrow `snapshot`/`reload` API.
+   - `ConfigWatcher` is a near-copy of `bins/terminal`'s own (directory-wide
+     `inotify` watch, `CLOSE_WRITE|MOVED_TO`, filtered by filename) --
+     *not* shared code, since the two consumers apply a reload to entirely
+     different things (a live `TermWindow`'s renderer vs. a
+     `SettingsState` snapshot); kept side by side rather than forcing a
+     shared abstraction that doesn't yet earn its keep.
+   - `PortalLoop` is the event pump `dbus_server::ServerLoop` alone can't
+     be: it polls both the bus socket's fd and the config watch's `inotify`
+     fd with a plain `poll(2)` (`waker::Poller::two`, the same primitive
+     `bins/terminal`'s own loop already uses to multiplex fds), reloads
+     `SettingsState` on a save, and emits a real `SettingChanged` signal
+     (via `DbusConn::send_signal_with_values`, since `(s, s, v)` needs the
+     generic `Value` path) for every key `changed_from` reports.
+
+   Ships on the **real** activation name now
+   (`org.freedesktop.impl.portal.desktop.tijaax`) with the on-disk artifacts
+   a real rollout needs: `bins/portal/data/tijaax.portal` (the
+   `DBusName`/`Interfaces`/`UseIn` file `{DATADIR}/xdg-desktop-portal/
+   portals/` needs -- confirmed against `xdg-desktop-portal`'s own
+   `xdp_portal_config.c`, which searches `$XDG_DATA_HOME/xdg-desktop-portal/
+   portals` and each `$XDG_DATA_DIRS` entry, both user-writable, no root
+   required), `bins/portal/data/org.freedesktop.impl.portal.desktop.tijaax
+   .service.in` (a D-Bus activation `.service` file for
+   `/usr/share/dbus-1/services`, matching every other portal backend
+   installed on this machine), and `bins/portal/data/tijaax-portal
+   .service.in` (a systemd user unit, matching `xdg-desktop-portal-gtk
+   .service`'s own shape). Routing Settings via a `portals.conf` entry
+   (`org.freedesktop.impl.portal.Settings=tijaax`) is the one step left
+   before this actually intercepts real calls -- deliberately not done
+   automatically by this delivery, per section 4's rollback contract:
+   flipping that one config line, and reverting it, must stay a manual,
+   reviewable act.
+
+   Proved end-to-end against a real, second, independently-connected
+   client in `bins/portal/tests/real_bus_probe.rs` (mirroring
+   `dbus-server`'s own scratch-service integration test): Introspect,
+   ReadAll, Read, and Properties.GetAll all round-trip over real marshalled
+   bytes; a **second** test
+   (`a_config_save_emits_a_real_setting_changed_signal_to_a_subscribed_client`)
+   writes a real config file to a throwaway temp directory, and confirms a
+   real second client -- subscribed via a real `AddMatch` -- receives a
+   real `SettingChanged` signal over the wire, closing the loop this doc
+   used to list as the remaining gap. `crates/dbus` grew
+   `DbusConn::call_with_values`/`MessageBuilder::build_method_call_with_values`
+   (`ReadAll`'s `as` argument needed a shape `BodyArg` can't express) and
+   `DbusConn::raw_fd` (so `PortalLoop` can poll the bus socket alongside the
+   config watch's fd).
 
 ### Interactive and FD work
 

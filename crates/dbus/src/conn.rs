@@ -596,6 +596,25 @@ impl DbusConn {
         self.recv_one_message()
     }
 
+    /// The underlying socket's raw file descriptor, for polling alongside
+    /// another fd via a plain `poll(2)` (e.g. `waker::Poller`) -- a server
+    /// that must react to *both* incoming bus messages and some other
+    /// event source (`bins/portal`'s config-file inotify watch, say)
+    /// cannot just block forever in [`Self::recv_message`]'s blocking
+    /// `io_uring` recv; polling this fd first (with the other source)
+    /// tells the caller a message is actually available before it
+    /// blocks here.
+    ///
+    /// Deliberately doesn't consult `pending` -- today's only caller
+    /// (`bins/portal`) never nests calls inside its own receive loop the
+    /// way the tray watcher does, so `pending` is always empty for it in
+    /// practice; a future caller that does nest calls would need its own
+    /// accessor for that queue's readiness.
+    #[must_use]
+    pub const fn raw_fd(&self) -> i32 {
+        self.sock_fd.as_i32()
+    }
+
     /// Pop the next message, preferring anything already queued by a prior
     /// `call_raw` over reading fresh bytes off the wire, to preserve FIFO
     /// order across both call sites sharing one socket.

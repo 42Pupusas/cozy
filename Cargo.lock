@@ -356,6 +356,8 @@ dependencies = [
  "dbus",
  "dbus-server",
  "portal-core",
+ "ququmatz",
+ "waker",
 ]
 
 [[package]]

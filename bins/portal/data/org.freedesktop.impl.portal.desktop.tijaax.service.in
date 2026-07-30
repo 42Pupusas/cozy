@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.tijaax
+Exec=@EXEC@
+SystemdService=tijaax-portal.service

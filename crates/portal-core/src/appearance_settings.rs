@@ -113,6 +113,25 @@ impl AppearanceSettings {
     /// from a single source instead of two lists silently drifting apart.
     const KEYS: [&str; 4] = ["color-scheme", "accent-color", "contrast", "reduced-motion"];
 
+    /// Compare `self` (the previous snapshot) against `new`, returning
+    /// every documented key whose value actually changed, each paired
+    /// with its new wire value -- exactly what a `SettingChanged`
+    /// emitter needs after a config reload to know which signals (if
+    /// any) to fire. `contrast`/`reduced-motion` never appear here since
+    /// both are a constant "no preference" regardless of config (see
+    /// the struct doc comment) -- they can never actually change.
+    #[must_use]
+    pub fn changed_from(&self, new: Self) -> Vec<(&'static str, Value)> {
+        let mut changed = Vec::new();
+        if self.color_scheme != new.color_scheme {
+            changed.push(("color-scheme", Value::U32(new.color_scheme.as_u32())));
+        }
+        if self.accent_color != new.accent_color {
+            changed.push(("accent-color", new.accent_color.as_value()));
+        }
+        changed
+    }
+
     /// One key's current value, or `None` if `key` isn't one of
     /// [`Self::KEYS`].
     fn key_value(&self, key: &str) -> Option<Value> {
@@ -245,5 +264,45 @@ mod tests {
         let settings = settings_with(Color::from_rgb(0x18, 0x18, 0x18), Color::from_rgb(0, 0, 0));
         let value = settings.read_all(&[]);
         assert_eq!(value.signature(), "a{sa{sv}}");
+    }
+
+    #[test]
+    fn changed_from_reports_nothing_when_the_snapshot_is_identical() {
+        let before = settings_with(Color::from_rgb(0x18, 0x18, 0x18), Color::from_rgb(0, 0, 0));
+        let after = before;
+        assert_eq!(before.changed_from(after), vec![]);
+    }
+
+    #[test]
+    fn changed_from_reports_color_scheme_when_the_background_crosses_the_threshold() {
+        let before = settings_with(Color::from_rgb(0x18, 0x18, 0x18), Color::from_rgb(0, 0, 0));
+        let after = settings_with(Color::from_rgb(0xf8, 0xf8, 0xf8), Color::from_rgb(0, 0, 0));
+        assert_eq!(
+            before.changed_from(after),
+            vec![("color-scheme", Value::U32(2))]
+        );
+    }
+
+    #[test]
+    fn changed_from_reports_accent_color_when_it_changes() {
+        let before = settings_with(Color::from_rgb(0x18, 0x18, 0x18), Color::from_rgb(0, 0, 0));
+        let after = settings_with(
+            Color::from_rgb(0x18, 0x18, 0x18),
+            Color::from_rgb(0xff, 0xff, 0xff),
+        );
+        let changed = before.changed_from(after);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].0, "accent-color");
+    }
+
+    #[test]
+    fn changed_from_reports_both_keys_when_both_change() {
+        let before = settings_with(Color::from_rgb(0x18, 0x18, 0x18), Color::from_rgb(0, 0, 0));
+        let after = settings_with(
+            Color::from_rgb(0xf8, 0xf8, 0xf8),
+            Color::from_rgb(0xff, 0xff, 0xff),
+        );
+        let changed = before.changed_from(after);
+        assert_eq!(changed.len(), 2);
     }
 }

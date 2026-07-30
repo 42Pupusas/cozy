@@ -13,7 +13,8 @@ use dbus_server::{
     Argument, Dispatcher, InterfaceDescriptor, MethodDescriptor, PropertyAccess,
     PropertyDescriptor, SignalDescriptor,
 };
-use portal_core::AppearanceSettings;
+
+use crate::settings_state::SettingsState;
 
 /// Groups this interface's `Dispatcher` wiring.
 ///
@@ -30,16 +31,16 @@ impl SettingsService {
     /// `org.freedesktop.impl.portal.Settings`'s interface name.
     pub const IFACE: &'static str = "org.freedesktop.impl.portal.Settings";
 
-    /// A **scratch** well-known name, deliberately distinct from the real
-    /// `org.freedesktop.impl.portal.desktop.mera` a future `.portal` file
-    /// would advertise. `docs/portal-scoping.md`'s compatibility/rollback
-    /// contract (section 4) requires developing every interface first on
-    /// a scratch name, exactly like `crates/dbus-server`'s own scratch
-    /// service integration test does -- only once this is validated
-    /// against a real portal client does step 5 finish by shipping a
-    /// `.portal` file naming the real activation name and routing it in
-    /// `portals.conf`.
-    pub const NAME: &'static str = "org.freedesktop.impl.portal.desktop.mera.scratch";
+    /// This backend's real D-Bus activation name, matching
+    /// `bins/portal/data/tijaax.portal`'s `DBusName` exactly -- the two
+    /// must agree, or `xdg-desktop-portal` activates this process
+    /// expecting it to claim a name it never does, and every call times
+    /// out. `docs/portal-scoping.md`'s compatibility/rollback contract
+    /// (section 4) was satisfied by developing on a scratch name first
+    /// (`crates/dbus-server`'s own scratch-service test, and
+    /// `tests/real_bus_probe.rs`'s `testprobe` name, both still do); this
+    /// is the real name now that step 5's frontend path is proven.
+    pub const NAME: &'static str = "org.freedesktop.impl.portal.desktop.tijaax";
 
     /// This interface's reported version. `2` matches the shape this
     /// backend actually answers (`ReadAll`/`Read` over all four
@@ -52,21 +53,13 @@ impl SettingsService {
     /// Build a `Dispatcher` with the Settings object fully registered:
     /// its interface descriptor (for `Introspect`), its `version`
     /// property (for `Properties.Get`/`GetAll`), and its `ReadAll`/`Read`
-    /// method handlers, each closing over one `AppearanceSettings`
-    /// snapshot taken from `cfg` at startup.
-    ///
-    /// Settings has no live-reload wiring yet -- unlike `bins/terminal`'s
-    /// `ConfigWatcher`, a config edit made after this process starts
-    /// won't be reflected (and no `SettingChanged` signal is ever
-    /// emitted) until the daemon restarts. The interface descriptor still
-    /// declares the signal for introspection's sake, since a real
-    /// `impl.portal.Settings` always does; wiring an actual
-    /// `inotify`-driven `SettingChanged` emission is a follow-up, not a
-    /// blocker for this step's "does the real frontend path work" goal.
+    /// method handlers, each closing over `state` (not a one-shot
+    /// snapshot) so a config reload -- applied by replacing `state`'s
+    /// contents via [`SettingsState::reload`] -- is reflected in every
+    /// call made after that point, not just ones made before this
+    /// process started.
     #[must_use]
-    pub fn dispatcher(cfg: &config::Config) -> Dispatcher {
-        let settings = AppearanceSettings::from_config(cfg);
-
+    pub fn dispatcher(state: SettingsState) -> Dispatcher {
         let mut dispatcher = Dispatcher::new();
         dispatcher.register_object(Self::PATH, [Self::IFACE]);
         dispatcher.register_interface(Self::interface_descriptor());
@@ -77,6 +70,7 @@ impl SettingsService {
             Value::U32(Self::VERSION),
         );
 
+        let read_all_state = state.clone();
         dispatcher.register_method(
             Self::IFACE,
             "ReadAll",
@@ -84,12 +78,13 @@ impl SettingsService {
             "a{sa{sv}}",
             move |_p, args| {
                 let namespaces = Self::decode_namespaces(args)?;
-                Ok(vec![settings.read_all(&namespaces)])
+                Ok(vec![read_all_state.snapshot().read_all(&namespaces)])
             },
         );
         dispatcher.register_method(Self::IFACE, "Read", "ss", "v", move |_p, args| {
             let (namespace, key) = Self::decode_read_args(args)?;
-            settings
+            state
+                .snapshot()
                 .read(&namespace, &key)
                 .map(|value| vec![Value::Variant(Box::new(value))])
                 .ok_or_else(|| format!("No such key '{key}' in namespace '{namespace}'"))
@@ -169,9 +164,13 @@ mod tests {
 
     const NAMESPACE: &str = "org.freedesktop.appearance";
 
+    fn state() -> SettingsState {
+        SettingsState::new(&config::Config::default())
+    }
+
     #[test]
     fn dispatcher_answers_introspect_naming_the_settings_interface() {
-        let dispatcher = SettingsService::dispatcher(&config::Config::default());
+        let dispatcher = SettingsService::dispatcher(state());
         let outcome = dispatcher
             .dispatch(
                 SettingsService::PATH,
@@ -192,7 +191,7 @@ mod tests {
 
     #[test]
     fn dispatcher_answers_properties_get_all_with_the_version_property() {
-        let dispatcher = SettingsService::dispatcher(&config::Config::default());
+        let dispatcher = SettingsService::dispatcher(state());
         let outcome = dispatcher
             .dispatch(
                 SettingsService::PATH,
@@ -213,7 +212,7 @@ mod tests {
 
     #[test]
     fn read_all_with_no_filter_reaches_the_real_appearance_settings() {
-        let dispatcher = SettingsService::dispatcher(&config::Config::default());
+        let dispatcher = SettingsService::dispatcher(state());
         let outcome = dispatcher
             .dispatch(
                 SettingsService::PATH,
@@ -232,7 +231,7 @@ mod tests {
 
     #[test]
     fn read_all_filtered_to_a_non_matching_namespace_is_empty() {
-        let dispatcher = SettingsService::dispatcher(&config::Config::default());
+        let dispatcher = SettingsService::dispatcher(state());
         let outcome = dispatcher
             .dispatch(
                 SettingsService::PATH,
@@ -247,7 +246,7 @@ mod tests {
 
     #[test]
     fn read_reports_color_scheme_wrapped_in_a_variant() {
-        let dispatcher = SettingsService::dispatcher(&config::Config::default());
+        let dispatcher = SettingsService::dispatcher(state());
         let outcome = dispatcher
             .dispatch(
                 SettingsService::PATH,
@@ -266,7 +265,7 @@ mod tests {
 
     #[test]
     fn read_on_an_unknown_key_is_a_failed_dispatch() {
-        let dispatcher = SettingsService::dispatcher(&config::Config::default());
+        let dispatcher = SettingsService::dispatcher(state());
         let err = dispatcher
             .dispatch(
                 SettingsService::PATH,
@@ -284,7 +283,7 @@ mod tests {
 
     #[test]
     fn read_on_the_wrong_namespace_is_a_failed_dispatch() {
-        let dispatcher = SettingsService::dispatcher(&config::Config::default());
+        let dispatcher = SettingsService::dispatcher(state());
         let err = dispatcher
             .dispatch(
                 SettingsService::PATH,

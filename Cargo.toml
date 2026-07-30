@@ -51,3 +51,10 @@ style    = { level = "warn", priority = -1 }
 missing_docs_in_private_items = "allow"
 missing_errors_doc            = "allow"
 missing_panics_doc            = "allow"
+
+# Every `unsafe` block in this workspace is expected to carry a `// SAFETY:`
+# comment explaining the invariant that makes it sound -- a convention
+# already followed everywhere by hand (see the 2026-07-30 unsafe audit).
+# Promoting it from convention to a real lint means a future unsafe block
+# added without one fails CI instead of relying on a reviewer noticing.
+undocumented_unsafe_blocks = "warn"

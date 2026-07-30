@@ -5,3 +5,8 @@ edition.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+# Raw filesystem capacity figures (`statvfs`), shared with `bins/files`'s
+# storage footer rather than reimplementing the same FFI struct here.
+diskstat = { path = "../diskstat" }

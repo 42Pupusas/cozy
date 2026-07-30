@@ -2,18 +2,22 @@
 //! it's time to reload.
 //!
 //! A near-copy of `bins/terminal`'s own `ConfigWatcher` (same directory
-//! watch + filename filter, same inotify ABI parsing), *not* shared code:
-//! `docs/portal-scoping.md`'s own delivery-sequence note says to refactor
-//! the statusbar watcher into `dbus-server` "only if it reduces
-//! duplication without mixing service policy into generic code" -- the
-//! terminal's copy applies a reload straight to a live `TermWindow`
-//! (rendering/cursor-animation policy), where this one only needs to
-//! report *that* a reload should happen and hand back the freshly parsed
-//! `config::Config` for [`crate::portal_loop::PortalLoop`] to apply via
+//! watch + filename filter), *not* shared code: `docs/portal-scoping.md`'s
+//! own delivery-sequence note says to refactor the statusbar watcher into
+//! `dbus-server` "only if it reduces duplication without mixing service
+//! policy into generic code" -- the terminal's copy applies a reload
+//! straight to a live `TermWindow` (rendering/cursor-animation policy),
+//! where this one only needs to report *that* a reload should happen and
+//! hand back the freshly parsed `config::Config` for
+//! [`crate::portal_loop::PortalLoop`] to apply via
 //! [`crate::settings_state::SettingsState::reload`]. Two small, distinct
 //! consumers of the same kernel mechanism don't yet justify a shared
 //! abstraction over "what changed" -- that's a judgment call to revisit
 //! if a third caller appears.
+//!
+//! The one piece that *is* shared: the raw inotify-buffer byte parsing
+//! (`inotify_events::InotifyEvents`), which has no policy in it at all --
+//! see that crate's doc comment.
 
 /// One directory-wide inotify watch, filtered down to saves of a single
 /// file.
@@ -104,43 +108,7 @@ impl ConfigWatcher {
     /// `IN_NONBLOCK`, so an empty read just means "nothing changed", not
     /// a stall.
     fn touched(ino: &ququmatz::Inotify, fname: &str) -> bool {
-        // Sized for a handful of coalesced events; `inotify_event` is 16
-        // bytes plus each event's (padded) trailing filename, so this
-        // comfortably covers a burst of saves without needing to loop
-        // reads.
-        let mut buf = [0u8; 4096];
-        let Ok(n) = ququmatz::syscall::read(ino.fd(), buf.as_mut_ptr(), buf.len()) else {
-            return false;
-        };
-        let header_size = std::mem::size_of::<ququmatz::InotifyEvent>();
-        let mut touched = false;
-        let mut off = 0usize;
-        while off + header_size <= n {
-            // SAFETY: `buf[off..]` holds at least `header_size` bytes of a
-            // kernel-written `inotify_event`, which is a plain-old-data
-            // repr(C) struct with no padding-sensitive invariants -- an
-            // unaligned read is exactly what the kernel's own byte-packed
-            // event stream requires.
-            let ev: ququmatz::InotifyEvent =
-                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) };
-            let name_len = ev.len as usize;
-            let name_start = off + header_size;
-            let name_end = name_start + name_len;
-            if name_end > n {
-                break; // Truncated trailing event -- stop rather than read garbage.
-            }
-            if name_len > 0 {
-                // The kernel pads the name with trailing NULs to the next
-                // 4-byte boundary; trim them before comparing.
-                let raw = &buf[name_start..name_end];
-                let trimmed = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
-                if trimmed == fname.as_bytes() {
-                    touched = true;
-                }
-            }
-            off = name_end;
-        }
-        touched
+        inotify_events::InotifyEvents::any_touched(ino, fname)
     }
 }
 

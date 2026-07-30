@@ -130,11 +130,16 @@ impl PtyRawIo for RawFd {
     fn set_nonblock(self) -> Result<(), PtyError> {
         use crate::sys::{FcntlCmd, OpenFlags};
 
+        // SAFETY: `self` is a fd the caller owns; `F_GETFL` takes no third
+        // argument (the `0` invoke2 omits is implied).
         let flags = unsafe { Syscall::Fcntl.invoke2(self.as_usize(), FcntlCmd::GetFl as usize) };
         if flags < 0 {
             // Linux errno values are always small (< 4096), well inside i32.
             return Err(PtyError::Exec(i32::try_from(-flags).unwrap_or(i32::MAX)));
         }
+        // SAFETY: `self` is a fd the caller owns; `flags` was just read
+        // back from `F_GETFL` above, so OR-ing in `O_NONBLOCK` and writing
+        // it back via `F_SETFL` is a well-formed read-modify-write.
         let ret = unsafe {
             Syscall::Fcntl.invoke3(
                 self.as_usize(),
@@ -150,10 +155,15 @@ impl PtyRawIo for RawFd {
     }
 
     fn raw_read(self, buf: &mut [u8]) -> isize {
+        // SAFETY: `self` is a fd the caller owns; `buf` is a live,
+        // correctly-sized slice for `read(2)` to write up to `buf.len()`
+        // bytes into.
         unsafe { Syscall::Read.invoke3(self.as_usize(), buf.as_mut_ptr() as usize, buf.len()) }
     }
 
     fn raw_write(self, buf: &[u8]) -> isize {
+        // SAFETY: `self` is a fd the caller owns; `buf` is a live slice
+        // `write(2)` only reads from, for its whole length.
         unsafe { Syscall::Write.invoke3(self.as_usize(), buf.as_ptr() as usize, buf.len()) }
     }
 }

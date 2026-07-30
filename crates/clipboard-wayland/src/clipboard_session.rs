@@ -20,9 +20,9 @@ use platform::protocol::{
 };
 use platform::surface::SurfaceBootstrap;
 use platform::wire::{MessageBuilder, WireEvent};
+use platform::sys::OwnedFdExt as _;
 use quetzalcoatl::spsc::Consumer;
-use std::io::Write;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 
 /// Owns one payload until another clipboard source replaces it.
@@ -150,10 +150,7 @@ impl<'a> ClipboardSession<'a> {
             OwnerResponse::Bytes(bytes) => bytes,
             OwnerResponse::Unsupported | OwnerResponse::Stop => return,
         };
-        let raw = fd.into_raw_fd();
-        // SAFETY: the RawEvent transferred ownership of this descriptor to us.
-        let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
-        let _ = file.write_all(bytes);
+        fd.write_all_and_close(bytes);
     }
 }
 

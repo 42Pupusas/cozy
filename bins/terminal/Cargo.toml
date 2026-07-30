@@ -17,6 +17,10 @@ vt_parser    = { path = "../../crates/vt_parser" }
 waker        = { path = "../../crates/waker" }
 quetzalcoatl = { workspace = true }
 ququmatz     = { workspace = true }
+# Shared unaligned-read loop over a raw inotify(7) buffer, shared with
+# bins/portal rather than each hand-rolling its own copy of the same
+# kernel-defined event parsing.
+inotify-events = { path = "../../crates/inotify-events" }
 headless-stress = { path = "../../crates/headless-stress" }
 
 [features]

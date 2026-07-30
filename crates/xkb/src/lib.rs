@@ -162,6 +162,7 @@ impl State {
                 XKB_MOD_NAME_CAPS.as_ptr().cast::<c_char>(),
             )
         };
+        // SAFETY: `keymap.ptr` is live; `XKB_MOD_NAME_CTRL` is NUL-terminated.
         let ctrl_mod_index = unsafe {
             (lib.keymap_mod_get_index)(
                 keymap.ptr.as_ptr(),
@@ -289,6 +290,8 @@ impl Translator {
         if self.state.ctrl_mod_index == u32::MAX {
             return false;
         }
+        // SAFETY: `self.state.ptr` is live; `ctrl_mod_index` was resolved
+        // against this exact keymap in `State::new`.
         let active = unsafe {
             (lib.state_mod_index_is_active)(
                 self.state.ptr.as_ptr(),

@@ -91,62 +91,8 @@ impl AppIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::EnvGuard;
     use std::fs;
-
-    /// Serializes every test in this module that touches process-wide env
-    /// vars: `cargo test` runs tests on multiple threads by default, and
-    /// `std::env::set_var` has no per-thread scoping -- without this,
-    /// concurrent tests would stomp each other's `XDG_DATA_HOME`/
-    /// `XDG_DATA_DIRS` mid-scan and see a random mix of both tests' fixture
-    /// directories.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Scoped `HOME`/`XDG_DATA_HOME`/`XDG_DATA_DIRS` override for a test:
-    /// restores the previous values on drop so tests don't leak env state
-    /// into each other or the rest of the process. Holds `ENV_MUTEX` for
-    /// its whole lifetime so overlapping tests can't interleave their env
-    /// var changes.
-    struct EnvGuard {
-        vars: Vec<(&'static str, Option<String>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(pairs: &[(&'static str, &str)]) -> Self {
-            // A prior test panicking while holding the lock would poison
-            // it; recover the guard rather than cascading failures across
-            // every other test in this module.
-            let lock = ENV_MUTEX
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let vars = pairs
-                .iter()
-                .map(|(k, v)| {
-                    let prev = std::env::var(k).ok();
-                    // SAFETY: tests in this module are serialized by
-                    // `#[test]`'s default single-process, and this guard's
-                    // Drop restores the prior value before the next test's
-                    // guard runs -- no other thread reads these vars
-                    // concurrently within this crate's test binary.
-                    unsafe { std::env::set_var(k, v) };
-                    (*k, prev)
-                })
-                .collect();
-            Self { vars, _lock: lock }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (k, prev) in &self.vars {
-                match prev {
-                    // SAFETY: see `set` above.
-                    Some(v) => unsafe { std::env::set_var(k, v) },
-                    None => unsafe { std::env::remove_var(k) },
-                }
-            }
-        }
-    }
 
     fn write_desktop_file(dir: &std::path::Path, name: &str, contents: &str) {
         fs::create_dir_all(dir).unwrap();

@@ -239,6 +239,9 @@ impl CellStore {
         }
         // The SSE2 kernel efficiently handles the 16-byte block plus scalar
         // tail that remains after the AVX2 bulk loop.
+        // SAFETY: SSE2 is unconditionally available on `x86_64` (this crate's
+        // only target for the vector path); the callee bounds every vector
+        // load/store to the slices it's given.
         unsafe { self.write_ascii_chars_sse2(start + offset, &bytes[offset..]) };
     }
 

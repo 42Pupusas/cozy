@@ -1790,43 +1790,7 @@ impl ConfigWatcher {
     /// directory). Non-blocking -- the fd was opened with `IN_NONBLOCK`, so
     /// an empty read just means "nothing changed", not a stall.
     fn touched(ino: &ququmatz::Inotify, fname: &str) -> bool {
-        // Sized for a handful of coalesced events; `inotify_event` is 16
-        // bytes plus each event's (padded) trailing filename, so this
-        // comfortably covers a burst of saves without needing to loop reads.
-        let mut buf = [0u8; 4096];
-        // EAGAIN (nothing pending) or a transient error either way.
-        let Ok(n) = ququmatz::syscall::read(ino.fd(), buf.as_mut_ptr(), buf.len()) else {
-            return false;
-        };
-        let header_size = std::mem::size_of::<ququmatz::InotifyEvent>();
-        let mut touched = false;
-        let mut off = 0usize;
-        while off + header_size <= n {
-            // SAFETY: `buf[off..]` holds at least `header_size` bytes of a
-            // kernel-written `inotify_event`, which is a plain-old-data
-            // repr(C) struct with no padding-sensitive invariants -- an
-            // unaligned read is exactly what the kernel's own byte-packed
-            // event stream requires.
-            let ev: ququmatz::InotifyEvent =
-                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) };
-            let name_len = ev.len as usize;
-            let name_start = off + header_size;
-            let name_end = name_start + name_len;
-            if name_end > n {
-                break; // Truncated trailing event -- stop rather than read garbage.
-            }
-            if name_len > 0 {
-                // The kernel pads the name with trailing NULs to the next
-                // 4-byte boundary; trim them before comparing.
-                let raw = &buf[name_start..name_end];
-                let trimmed = &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())];
-                if trimmed == fname.as_bytes() {
-                    touched = true;
-                }
-            }
-            off = name_end;
-        }
-        touched
+        inotify_events::InotifyEvents::any_touched(ino, fname)
     }
 
     /// Hot-apply the subset of a freshly-reloaded config that's safe to

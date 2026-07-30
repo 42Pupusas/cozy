@@ -125,6 +125,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "diskstat"
+version = "0.1.0"
+
+[[package]]
 name = "divan"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -177,6 +181,7 @@ name = "files-bin"
 version = "0.1.0"
 dependencies = [
  "config",
+ "diskstat",
  "fileops",
  "fsmodel",
  "headless-stress",
@@ -225,6 +230,13 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown",
+]
+
+[[package]]
+name = "inotify-events"
+version = "0.1.0"
+dependencies = [
+ "ququmatz",
 ]
 
 [[package]]
@@ -355,6 +367,7 @@ dependencies = [
  "config",
  "dbus",
  "dbus-server",
+ "inotify-events",
  "portal-core",
  "quetzalcoatl",
  "ququmatz",
@@ -520,6 +533,9 @@ dependencies = [
 [[package]]
 name = "sysmon"
 version = "0.1.0"
+dependencies = [
+ "diskstat",
+]
 
 [[package]]
 name = "terminal"
@@ -528,6 +544,7 @@ dependencies = [
  "config",
  "grid",
  "headless-stress",
+ "inotify-events",
  "input",
  "platform",
  "pty",

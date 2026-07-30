@@ -37,6 +37,12 @@ use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use ququmatz::types::{IoVec, MsgHdr};
 
+/// The write-bytes-then-close response shape shared by every Wayland
+/// `*_source.send` handler (clipboard, drag-and-drop, `data-control`).
+/// See the module doc for why this was pulled out of three call sites.
+pub mod fd_io;
+pub use fd_io::OwnedFdExt;
+
 /// A failure in one of the raw syscalls this module makes. Each variant names
 /// the syscall and carries the underlying OS error.
 #[derive(Debug)]

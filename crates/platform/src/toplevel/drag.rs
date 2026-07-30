@@ -238,12 +238,9 @@ impl DragController {
     /// Write our outgoing `text/uri-list` body into `fd` (a peer's pipe from
     /// a `data_source.send`), then let it close on scope exit to signal EOF.
     pub fn write_send_fd(&mut self, fd: std::os::fd::OwnedFd) {
-        use std::io::Write as _;
-        use std::os::fd::FromRawFd as _;
+        use crate::sys::OwnedFdExt as _;
         self.awaiting_send_fd = false;
-        let raw = std::os::fd::IntoRawFd::into_raw_fd(fd);
-        let mut f = unsafe { std::fs::File::from_raw_fd(raw) };
-        let _ = f.write_all(self.outgoing_body.as_bytes());
+        fd.write_all_and_close(self.outgoing_body.as_bytes());
     }
 
     /// Handle a `wl_data_device.enter` event during an incoming drag:

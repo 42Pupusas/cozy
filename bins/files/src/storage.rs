@@ -16,57 +16,7 @@
 //! draw nothing rather than to push a scary message into a UI whose job is to
 //! be ambient. So the fallible boundary returns `Option`.
 
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-
-/// The subset of `struct statvfs` this module reads.
-///
-/// Declared with the full field list because the kernel writes the whole
-/// struct: a short definition would have `statvfs` scribble past the end of
-/// our allocation. Field names mirror the C ones so they can be checked
-/// against `man 3 statvfs` directly.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Statvfs {
-    /// Filesystem block size.
-    bsize: u64,
-    /// Fragment size.
-    frsize: u64,
-    /// Size of the filesystem in `frsize` units.
-    blocks: u64,
-    /// Free blocks.
-    bfree: u64,
-    /// Free blocks available to an unprivileged process.
-    bavail: u64,
-    /// Total inodes.
-    files: u64,
-    /// Free inodes.
-    ffree: u64,
-    /// Free inodes available to an unprivileged process.
-    favail: u64,
-    /// Filesystem id.
-    fsid: u64,
-    /// Mount flags.
-    flag: u64,
-    /// Maximum filename length.
-    namemax: u64,
-    /// Padding the kernel reserves; present so our allocation is the size
-    /// the kernel expects to fill.
-    spare: [u32; 6],
-}
-
-impl Default for Statvfs {
-    fn default() -> Self {
-        // SAFETY: an all-zero `Statvfs` is a valid bit pattern -- every field
-        // is a plain unsigned integer or an array of them.
-        unsafe { std::mem::zeroed() }
-    }
-}
-
-unsafe extern "C" {
-    fn statvfs(path: *const i8, buf: *mut Statvfs) -> i32;
-}
 
 /// How full a filesystem is, in bytes.
 ///
@@ -254,29 +204,11 @@ impl Storage {
         })
     }
 
-    /// Read raw usage for `path` via `statvfs`.
+    /// Read raw usage for `path` via [`diskstat::DiskStat`].
     fn usage_of(path: &Path) -> Option<Usage> {
-        // A path containing an interior NUL cannot be passed to a C API; it
-        // also cannot exist on a Unix filesystem, so this is belt and braces.
-        let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-        let mut raw = Statvfs::default();
-        // SAFETY: `c_path` is a valid NUL-terminated string that outlives the
-        // call, and `raw` is a live, correctly sized, writable `Statvfs`.
-        let rc = unsafe { statvfs(c_path.as_ptr(), &raw mut raw) };
-        if rc != 0 {
-            return None;
-        }
-        // `frsize` is the unit `blocks` and `bavail` are counted in; it can
-        // be reported as zero by odd filesystems, in which case `bsize` is
-        // the documented fallback.
-        let unit = if raw.frsize > 0 {
-            raw.frsize
-        } else {
-            raw.bsize
-        };
-        let total = raw.blocks.checked_mul(unit)?;
-        let available = raw.bavail.saturating_mul(unit);
-        Some(Usage::new(total, available))
+        let stat = diskstat::DiskStat::for_path(path)?;
+        let total = stat.total_bytes()?;
+        Some(Usage::new(total, stat.available_bytes()))
     }
 
     /// The name to show for the filesystem holding `path`.

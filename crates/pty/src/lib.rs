@@ -426,12 +426,12 @@ impl Pty {
         self.pending_write.drain(..len);
         self.write_len = len;
         self.write_in_flight = true;
-        // SAFETY: write_buf is a stable heap allocation owned by self; it is
-        // only rewritten after the WriteDone CQE for this SQE is consumed
-        // (single-write-in-flight invariant via write_in_flight).
         // `len` is bounded by `WRITE_BUF_SIZE`, a small compile-time buffer
         // size, so this always fits in u32.
         let len_u32 = u32::try_from(len).unwrap_or(u32::MAX);
+        // SAFETY: write_buf is a stable heap allocation owned by self; it is
+        // only rewritten after the WriteDone CQE for this SQE is consumed
+        // (single-write-in-flight invariant via write_in_flight).
         let sqe =
             unsafe { Sqe::write_ptr(self.master_fd, self.write_buf.as_ptr(), len_u32, u64::MAX) }
                 .user_data(tag::WRITE);
@@ -472,11 +472,11 @@ impl Pty {
     }
 
     fn arm_read(&self) -> Result<(), PtyError> {
+        // READ_BUF_SIZE is a small compile-time buffer size, always fits in u32.
+        let read_buf_size_u32 = u32::try_from(READ_BUF_SIZE).expect("READ_BUF_SIZE fits in u32");
         // SAFETY: read_buf is a stable heap allocation owned by self, valid
         // until the next arm_read — which only happens after this SQE's CQE
         // is consumed (single-read-in-flight invariant).
-        // READ_BUF_SIZE is a small compile-time buffer size, always fits in u32.
-        let read_buf_size_u32 = u32::try_from(READ_BUF_SIZE).expect("READ_BUF_SIZE fits in u32");
         let sqe = unsafe {
             Sqe::read_ptr(
                 self.master_fd,

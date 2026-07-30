@@ -27,6 +27,10 @@ waker    = { path = "../../crates/waker" }
 # Civil local time for the `modified` column, shared with the bar and the
 # trash implementation rather than reimplementing timezone handling here.
 localtime = { path = "../../crates/localtime" }
+# Raw filesystem capacity figures (`statvfs`) for the sidebar's storage
+# footer, shared with `sysmon` rather than reimplementing the same FFI
+# struct here.
+diskstat  = { path = "../../crates/diskstat" }
 # Type detection and type->application association, so opening a file is a
 # real desktop-entry resolution rather than a shell-out to xdg-open.
 mime     = { path = "../../crates/mime" }

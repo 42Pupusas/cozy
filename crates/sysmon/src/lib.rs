@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::net::Ipv4Addr;
-use std::os::raw::{c_char, c_int, c_long, c_ulong};
+use std::os::raw::{c_int, c_long};
 use std::process::Command;
 use std::time::Instant;
 
@@ -1183,46 +1183,19 @@ impl TemperatureValue {
         }
     }
 }
-/// Linux's `statvfs(2)` layout. The monitor targets Linux, and the fields we
-/// read are ABI-stable unsigned-long values from the kernel/libc interface.
-#[repr(C)]
-struct StatVfs {
-    blocks_size: c_ulong,
-    fragment_size: c_ulong,
-    blocks: c_ulong,
-    free_blocks: c_ulong,
-    available_blocks: c_ulong,
-    files: c_ulong,
-    free_files: c_ulong,
-    available_files: c_ulong,
-    filesystem_id: c_ulong,
-    flags: c_ulong,
-    name_max: c_ulong,
-    spare: [c_int; 6],
-}
-
 unsafe extern "C" {
-    fn statvfs(path: *const c_char, buffer: *mut StatVfs) -> c_int;
     fn sysconf(name: c_int) -> c_long;
 }
 
 struct DiskValue;
 impl DiskValue {
-    /// Read root capacity directly from the kernel's VFS accounting. Unlike
-    /// `df`, this neither forks nor parses formatted text, so it is safe on the
-    /// monitor's 60 Hz sample path.
+    /// Read root capacity directly from the kernel's VFS accounting (via
+    /// [`diskstat::DiskStat`]). Unlike `df`, this neither forks nor parses
+    /// formatted text, so it is safe on the monitor's 60 Hz sample path.
     fn read() -> f32 {
-        let path = c"/";
-        // SAFETY: `path` is NUL-terminated and `stat` is valid writable storage
-        // for the duration of this libc call.
-        let mut stat = unsafe { std::mem::zeroed::<StatVfs>() };
-        if unsafe { statvfs(path.as_ptr(), &raw mut stat) } != 0 || stat.blocks == 0 {
-            return 0.0;
-        }
-        #[allow(clippy::cast_precision_loss)]
-        {
-            100.0 * (1.0 - stat.available_blocks as f32 / stat.blocks as f32)
-        }
+        diskstat::DiskStat::for_path(std::path::Path::new("/")).map_or(0.0, |stat| {
+            stat.percent_used()
+        })
     }
 }
 

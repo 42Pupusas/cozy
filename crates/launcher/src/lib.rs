@@ -9,6 +9,8 @@ pub mod fuzzy;
 pub mod icon_lookup;
 pub mod launch;
 pub mod singleton;
+#[cfg(test)]
+mod test_env;
 
 use app_index::AppIndex;
 use desktop_entry::DesktopEntry;

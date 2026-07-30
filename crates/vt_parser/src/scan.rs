@@ -100,9 +100,9 @@ impl Scanner {
         };
         let n = bytes.len();
         let mut i = 0;
-        // SAFETY (loads): `i + 16 <= n` guarantees the 16 bytes at
-        // `bytes[i..]` are in-bounds; `loadu` has no alignment requirement.
         while i + 16 <= n {
+            // SAFETY: `i + 16 <= n` guarantees the 16 bytes at
+            // `bytes[i..]` are in-bounds; `loadu` has no alignment requirement.
             unsafe {
                 let v = _mm_loadu_si128(bytes.as_ptr().add(i).cast::<__m128i>());
                 let x = _mm_sub_epi8(v, _mm_set1_epi8(0x20));
@@ -134,9 +134,9 @@ impl Scanner {
         };
         let n = bytes.len();
         let mut i = 0;
-        // SAFETY (loads): `i + 32 <= n` keeps every load in-bounds; `loadu`
-        // tolerates any alignment.
         while i + 32 <= n {
+            // SAFETY: `i + 32 <= n` keeps every load in-bounds;
+            // `loadu` tolerates any alignment.
             unsafe {
                 let v = _mm256_loadu_si256(bytes.as_ptr().add(i).cast::<__m256i>());
                 let x = _mm256_sub_epi8(v, _mm256_set1_epi8(0x20));

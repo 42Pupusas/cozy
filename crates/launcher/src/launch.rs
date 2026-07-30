@@ -332,54 +332,23 @@ impl ExecCommand {
 mod tests {
     use super::*;
     use crate::desktop_entry::DesktopEntry;
+    use crate::test_env::EnvGuard;
 
-    /// Serializes every test that touches the process-wide `TERMINAL` env
-    /// var, same rationale as `app_index`'s `ENV_MUTEX`: `cargo test`'s
-    /// default multithreading means concurrent tests would otherwise stomp
-    /// each other's override mid-check.
-    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    struct EnvGuard {
-        prev: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+    /// This module's tests only ever override `TERMINAL`; these thin
+    /// wrappers keep call sites reading `terminal_env("foot")` /
+    /// `terminal_env_unset()` rather than repeating the slice-of-pairs
+    /// shape `app_index`'s multi-var tests need.
+    fn terminal_env(value: &str) -> EnvGuard {
+        EnvGuard::set(&[("TERMINAL", value)])
     }
 
-    impl EnvGuard {
-        fn set(value: &str) -> Self {
-            let lock = ENV_MUTEX
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let prev = std::env::var("TERMINAL").ok();
-            // SAFETY: serialized by `_lock` above; no other thread reads/
-            // writes `TERMINAL` while this guard is alive.
-            unsafe { std::env::set_var("TERMINAL", value) };
-            Self { prev, _lock: lock }
-        }
-
-        fn unset() -> Self {
-            let lock = ENV_MUTEX
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let prev = std::env::var("TERMINAL").ok();
-            // SAFETY: see `set` above.
-            unsafe { std::env::remove_var("TERMINAL") };
-            Self { prev, _lock: lock }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                // SAFETY: see `set` above.
-                Some(v) => unsafe { std::env::set_var("TERMINAL", v) },
-                None => unsafe { std::env::remove_var("TERMINAL") },
-            }
-        }
+    fn terminal_env_unset() -> EnvGuard {
+        EnvGuard::unset(&["TERMINAL"])
     }
 
     #[test]
     fn for_entry_runs_gui_apps_directly() {
-        let _guard = EnvGuard::unset();
+        let _guard = terminal_env_unset();
         let entry = DesktopEntry {
             name: "Firefox".to_owned(),
             exec: "firefox %u".to_owned(),
@@ -394,7 +363,7 @@ mod tests {
 
     #[test]
     fn for_entry_wraps_terminal_apps_in_the_default_terminal() {
-        let _guard = EnvGuard::unset();
+        let _guard = terminal_env_unset();
         let entry = DesktopEntry {
             name: "Neovim".to_owned(),
             exec: "nvim %F".to_owned(),
@@ -409,7 +378,7 @@ mod tests {
 
     #[test]
     fn for_entry_respects_terminal_env_override() {
-        let _guard = EnvGuard::set("foot");
+        let _guard = terminal_env("foot");
         let entry = DesktopEntry {
             name: "Htop".to_owned(),
             exec: "htop".to_owned(),
@@ -424,7 +393,7 @@ mod tests {
 
     #[test]
     fn for_entry_keeps_terminal_apps_own_args() {
-        let _guard = EnvGuard::unset();
+        let _guard = terminal_env_unset();
         let entry = DesktopEntry {
             name: "Shell script".to_owned(),
             exec: "sh -c 'echo hi'".to_owned(),
@@ -609,7 +578,7 @@ mod tests {
 
     #[test]
     fn for_file_substitutes_the_path() {
-        let _guard = EnvGuard::unset();
+        let _guard = terminal_env_unset();
         let entry = DesktopEntry {
             name: "Image Viewer".to_owned(),
             exec: "eog %U".to_owned(),
@@ -627,7 +596,7 @@ mod tests {
     /// nulled stdio and vanishes.
     #[test]
     fn for_file_still_wraps_terminal_apps() {
-        let _guard = EnvGuard::unset();
+        let _guard = terminal_env_unset();
         let entry = DesktopEntry {
             name: "Neovim".to_owned(),
             exec: "nvim %F".to_owned(),
@@ -644,7 +613,7 @@ mod tests {
     /// it just doesn't receive the path (nothing to substitute into).
     #[test]
     fn for_file_on_a_codeless_exec_line_launches_without_the_path() {
-        let _guard = EnvGuard::unset();
+        let _guard = terminal_env_unset();
         let entry = DesktopEntry {
             name: "Weird".to_owned(),
             exec: "someapp --flag".to_owned(),
@@ -659,7 +628,7 @@ mod tests {
 
     #[test]
     fn for_entry_with_opens_several_files_at_once() {
-        let _guard = EnvGuard::unset();
+        let _guard = terminal_env_unset();
         let entry = DesktopEntry {
             name: "Editor".to_owned(),
             exec: "editor %F".to_owned(),

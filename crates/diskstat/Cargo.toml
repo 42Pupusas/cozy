@@ -1,0 +1,16 @@
+[package]
+name    = "diskstat"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# No deps: this crate is one audited `unsafe extern "C"` block around
+# `statvfs(2)` and the byte-count arithmetic on top of it. It exists as its
+# own crate rather than living inside `crates/sysmon` or `bins/files`
+# because both independently declared the exact same `#[repr(C)] struct
+# Statvfs` + `mem::zeroed` + raw extern block -- the same
+# single-owner-for-duplicated-FFI move already made for `crates/localtime`
+# (see that crate's own doc comment).

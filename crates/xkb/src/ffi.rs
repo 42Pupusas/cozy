@@ -117,6 +117,7 @@ pub struct Lib {
 // wrapper (`Keymap`/`State` are not `Sync`). `Lib` itself just holds function
 // pointers + an opaque handle, none of which point at thread-local data.
 unsafe impl Send for Lib {}
+// SAFETY: see the `Send` impl above -- the same reasoning covers `Sync`.
 unsafe impl Sync for Lib {}
 
 const RTLD_NOW: c_int = 2;

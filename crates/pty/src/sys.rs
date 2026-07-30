@@ -349,6 +349,8 @@ pub trait PtyIoctl: Copy {
 impl PtyIoctl for RawFd {
     fn pty_number(self) -> Result<u32, PtyError> {
         let mut pts_no: u32 = 0;
+        // SAFETY: `self` is a fd the caller owns; `pts_no` is a live,
+        // correctly-sized `u32` for `TIOCGPTN` to write into.
         let ret = unsafe {
             Syscall::Ioctl.invoke3(
                 self.as_usize(),
@@ -363,6 +365,8 @@ impl PtyIoctl for RawFd {
 
     fn unlock_pty(self) -> Result<(), PtyError> {
         let lock: i32 = 0;
+        // SAFETY: `self` is a fd the caller owns; `lock` is a live `i32`
+        // `TIOCSPTLCK` only reads.
         let ret = unsafe {
             Syscall::Ioctl.invoke3(
                 self.as_usize(),
@@ -376,6 +380,9 @@ impl PtyIoctl for RawFd {
     }
 
     fn set_win_size(self, win_size: WinSize) -> Result<(), PtyError> {
+        // SAFETY: `self` is a fd the caller owns; `win_size` is a live,
+        // `#[repr(C)]` `WinSize` matching `TIOCSWINSZ`'s expected layout,
+        // which `TIOCSWINSZ` only reads.
         let ret = unsafe {
             Syscall::Ioctl.invoke3(
                 self.as_usize(),
@@ -391,6 +398,8 @@ impl PtyIoctl for RawFd {
     #[allow(dead_code)] // exposed for completeness; no current caller queries winsize
     fn get_win_size(self) -> Result<WinSize, PtyError> {
         let mut ws = WinSize::default();
+        // SAFETY: `self` is a fd the caller owns; `ws` is a live,
+        // correctly-sized `WinSize` for `TIOCGWINSZ` to write into.
         let ret = unsafe {
             Syscall::Ioctl.invoke3(
                 self.as_usize(),
@@ -404,6 +413,8 @@ impl PtyIoctl for RawFd {
     }
 
     fn set_controlling_terminal(self) -> Result<(), PtyError> {
+        // SAFETY: `self` is a fd the caller owns; `TIOCSCTTY`'s third
+        // argument is unused (0 is the documented value).
         let ret = unsafe {
             Syscall::Ioctl.invoke3(self.as_usize(), IoctlRequest::SetControllingTty as usize, 0)
         };
@@ -422,6 +433,7 @@ pub trait CloseFd {
 
 impl CloseFd for RawFd {
     fn close(self) -> Result<(), i32> {
+        // SAFETY: `self` is a fd the caller owns and is relinquishing.
         let ret = unsafe { Syscall::Close.invoke1(self.as_usize()) };
         ret.into_errno_result().map(|_| ())
     }
@@ -443,6 +455,9 @@ impl ChildPid {
     pub fn hangup(self) {
         if self.0 > 0 {
             // Checked positive above, so the sign-preserving cast is exact.
+            // SAFETY: `kill(2)` takes a plain pid + signal number, no pointer
+            // arguments; a failure (e.g. the pid already reaped) is
+            // harmless to ignore here -- best-effort teardown.
             unsafe { Syscall::Kill.invoke2(self.0.cast_unsigned() as usize, Signal::Hup as usize) };
         }
     }
@@ -465,6 +480,9 @@ impl ChildPid {
             return None;
         }
         let mut status: i32 = 0;
+        // SAFETY: `self.0` is checked positive above; `status` is a live,
+        // correctly-sized `i32` for `wait4` to write into; no `rusage`
+        // pointer is requested (final `0`).
         let ret = unsafe {
             Syscall::Wait4.invoke4(
                 // Checked positive above, so the sign-preserving cast is exact.
@@ -491,6 +509,8 @@ impl ChildPid {
     /// Returns [`PtyError::WaitPid`] if `wait4` fails.
     pub fn wait_nohang(self) -> Result<WaitStatus, PtyError> {
         let mut status: i32 = 0;
+        // SAFETY: same reasoning as `reap_blocking_status` above, just with
+        // `WNOHANG` so a still-running child returns 0 instead of blocking.
         let ret = unsafe {
             Syscall::Wait4.invoke4(
                 self.0.cast_unsigned() as usize,
@@ -563,6 +583,8 @@ impl RawPty {
         // "/dev/ptmx\0"
         let path: &[u8] = b"/dev/ptmx\0";
         let flags = OpenFlags::RDWR | OpenFlags::NOCTTY | OpenFlags::CLOEXEC;
+        // SAFETY: `path` is a static NUL-terminated string; the third
+        // argument (mode) is ignored by `open(2)` without `O_CREAT`.
         let ret = unsafe { Syscall::Open.invoke3(path.as_ptr() as usize, flags.bits(), 0) };
         ret.into_errno_result()
             .map(RawFd::from_raw)
@@ -721,16 +743,28 @@ impl RawPty {
         let envp: *const *const u8 = envp_ptrs.as_ptr();
 
         // fork via clone(SIGCHLD, 0)
+        // SAFETY: `clone(2)` with a plain `SIGCHLD` flag and no stack
+        // pointer replicates `fork(2)` exactly -- the child gets a full
+        // copy of the address space, no shared-stack invariant to uphold.
         let pid = unsafe { Syscall::Clone.invoke2(Signal::Chld as usize, 0) };
         match pid.into_errno_result() {
             Err(e) => Err(PtyError::Fork(e)),
             Ok(0) => {
                 // ── child ──────────────────────────────────────────────
+                // Every syscall in this arm runs post-fork, in the child,
+                // before `execve` -- per this function's own safety
+                // contract only async-signal-safe operations are used
+                // (direct syscalls, no allocation-heavy libc paths).
+                //
                 // Start a new session so the slave PTY becomes the
                 // controlling terminal.
+                // SAFETY: `setsid(2)` takes no arguments.
                 unsafe { Syscall::SetSid.invoke0() };
 
                 // Open the slave PTY.
+                // SAFETY: `slave_path` is a NUL-terminated `CString` built
+                // above (`pts_path`) and lives for the rest of this
+                // function; the mode argument is unused without `O_CREAT`.
                 let slave_fd_ret = unsafe {
                     Syscall::Open.invoke3(slave_path.as_ptr() as usize, OpenFlags::RDWR.bits(), 0)
                 };
@@ -741,7 +775,12 @@ impl RawPty {
                 // closure.
                 let Ok(fd) = slave_fd_ret.into_errno_result() else {
                     // Can't report -- just exit.
+                    // SAFETY: `master_fd` is a live fd this child inherited
+                    // from the parent; closing it before exiting is cleanup,
+                    // not a use-after-free (the child's address space ends
+                    // with `ExitGroup` regardless).
                     unsafe { Syscall::Close.invoke1(master_fd.as_usize()) };
+                    // SAFETY: `exit_group(2)` takes a plain status code.
                     unsafe { Syscall::ExitGroup.invoke1(1) };
                     unreachable!()
                 };
@@ -752,20 +791,30 @@ impl RawPty {
                 // control, Ctrl-C/Ctrl-Z don't work -- which is bad enough
                 // to abort the child rather than limp on silently.
                 if slave_fd.set_controlling_terminal().is_err() {
+                    // SAFETY: both fds are live in this child; closing them
+                    // before exiting is cleanup on a path that never returns.
                     unsafe { Syscall::Close.invoke1(master_fd.as_usize()) };
+                    // SAFETY: see above.
                     unsafe { Syscall::Close.invoke1(slave_fd.as_usize()) };
+                    // SAFETY: `exit_group(2)` takes a plain status code.
                     unsafe { Syscall::ExitGroup.invoke1(1) };
                     unreachable!()
                 }
 
                 // Dup slave onto stdin/stdout/stderr.
                 for dest in [0usize, 1, 2] {
+                    // SAFETY: `slave_fd` is live; `dest` is one of 0/1/2,
+                    // always a valid dup2 target.
                     unsafe { Syscall::Dup2.invoke2(slave_fd.as_usize(), dest) };
                 }
 
                 // Close master and extra slave fd.
+                // SAFETY: both fds are live in this child; `master_fd` is
+                // never needed post-exec and `slave_fd` was already
+                // duplicated onto 0/1/2 above, so the original is redundant.
                 unsafe { Syscall::Close.invoke1(master_fd.as_usize()) };
                 if slave_fd.as_i32() > 2 {
+                    // SAFETY: see above.
                     unsafe { Syscall::Close.invoke1(slave_fd.as_usize()) };
                 }
 
@@ -775,6 +824,10 @@ impl RawPty {
                 // code is genuinely the best we can do here, matching the
                 // shell convention of 127 for "command not found/exec
                 // failed".
+                // SAFETY: `shell_cs` is a live, NUL-terminated `CString`;
+                // `argv_ptrs`/`envp_ptrs` are NULL-terminated pointer arrays
+                // built above and kept alive in scope for this whole call
+                // (see the comment where `envp` is constructed).
                 unsafe {
                     Syscall::Execve.invoke3(
                         shell_cs.as_ptr() as usize,
@@ -782,6 +835,8 @@ impl RawPty {
                         envp as usize,
                     )
                 };
+                // SAFETY: `exit_group(2)` takes a plain status code; reached
+                // only if `execve` returned, i.e. it failed.
                 unsafe { Syscall::ExitGroup.invoke1(127) };
                 unreachable!()
             }
@@ -810,6 +865,9 @@ impl RawPty {
     pub fn block_sigchld() -> Result<(), PtyError> {
         let mut mask = SigSet::empty();
         mask.insert(Signal::Chld);
+        // SAFETY: `mask` is a live, correctly-sized sigset; the old-mask
+        // output pointer is null (we don't need the previous mask back);
+        // `sigsetsz` (8) matches `SigSet`'s single-`u64` layout.
         let ret = unsafe {
             Syscall::SigProcMask.invoke4(
                 SigProcMaskHow::Block as usize,
@@ -835,6 +893,9 @@ impl RawPty {
 
         // Create the signalfd.
         let flags = SignalFdFlags::NONBLOCK | SignalFdFlags::CLOEXEC;
+        // SAFETY: `usize::MAX` (i.e. `-1` in the syscall's signed `int`
+        // slot) requests a fresh fd rather than replacing an existing one;
+        // `mask` is a live, correctly-sized sigset for the whole call.
         let ret = unsafe {
             Syscall::SignalFd4.invoke4(
                 usize::MAX, // -1 = new fd

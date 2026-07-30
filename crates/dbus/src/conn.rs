@@ -315,9 +315,9 @@ impl DbusConn {
     fn send_raw(&mut self, bytes: &[u8]) -> Result<(), DbusError> {
         let mut sent = 0;
         while sent < bytes.len() {
+            let remaining = u32::try_from(bytes.len() - sent).unwrap_or(u32::MAX);
             // SAFETY: `bytes[sent..]` is valid for the duration of this
             // blocking submit+wait+complete, all within this call.
-            let remaining = u32::try_from(bytes.len() - sent).unwrap_or(u32::MAX);
             let sqe = unsafe {
                 Sqe::send_ptr(
                     self.sock_fd,
@@ -345,9 +345,9 @@ impl DbusConn {
         let mut out = vec![0u8; n];
         let mut got = 0;
         while got < n {
+            let remaining = u32::try_from(n - got).unwrap_or(u32::MAX);
             // SAFETY: `out[got..]` is valid for the duration of this blocking
             // submit+wait+complete.
-            let remaining = u32::try_from(n - got).unwrap_or(u32::MAX);
             let sqe = unsafe {
                 Sqe::recv_ptr(
                     self.sock_fd,

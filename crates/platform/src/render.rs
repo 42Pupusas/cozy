@@ -18,6 +18,7 @@ use grid::{Attrs, Cell, Color, DirtyRow, DirtyRowContent, DirtySnapshot, ScrollB
 
 use crate::draw::{Canvas, Color as DrawColor};
 use crate::font::{FIRST, GLYPH_H, GLYPH_W, LAST};
+use crate::text::GlyphBlit;
 
 pub use crate::font::FONT;
 

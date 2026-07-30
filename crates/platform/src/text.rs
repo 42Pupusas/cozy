@@ -17,10 +17,18 @@ use font::{Atlas, GlyphEntry};
 
 use crate::draw::{Canvas, Color as DrawColor};
 
-/// Extends [`Canvas`] with the shared glyph-blend kernel, as a method
-/// instead of a free `blit_glyph(canvas, ...)` function -- `Canvas` is the
-/// thing actually being mutated, so it's the natural owner.
-impl Canvas<'_> {
+/// The shared glyph-blend kernel for [`Canvas`].
+///
+/// A trait, not an inherent `impl Canvas`, so that `Canvas` and this blend
+/// kernel can live in different crates: Rust's orphan rule forbids an
+/// inherent impl -- or a foreign trait's impl -- on a type from outside the
+/// crate that defines it, but it always permits implementing a *local*
+/// trait for a foreign type. `text.rs` and `draw.rs` are today both in
+/// `platform`, but the rasterizer (`draw`/`round_rect`/`surface_format`) is
+/// a candidate for its own crate along the same seam as the `sys`/`wire`
+/// splits; a trait here means that split won't have to drag glyph blitting
+/// along with it, or vice versa.
+pub trait GlyphBlit {
     /// Alpha-blend one rasterized glyph from `atlas` onto this canvas.
     ///
     /// `origin_x`/`origin_y` are the glyph's pen origin *before* bearing --
@@ -45,7 +53,21 @@ impl Canvas<'_> {
     /// per-glyph constant since the pen origin is row-independent, so the
     /// inner loop is a bounds-check-free write.
     #[allow(clippy::too_many_arguments)]
-    pub fn blit_glyph(
+    fn blit_glyph(
+        &mut self,
+        atlas: &Atlas,
+        entry: &GlyphEntry,
+        origin_x: i32,
+        origin_y: i32,
+        fg: DrawColor,
+        bg: DrawColor,
+        bg_alpha: u8,
+    );
+}
+
+impl GlyphBlit for Canvas<'_> {
+    #[allow(clippy::too_many_arguments)]
+    fn blit_glyph(
         &mut self,
         atlas: &Atlas,
         entry: &GlyphEntry,

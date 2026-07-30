@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 
 use font::{Atlas, FontFace, GlyphEntry};
+use platform::GlyphBlit;
 use platform::draw::{Canvas, Color};
 use platform::font as bitmap_font;
 

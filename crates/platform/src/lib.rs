@@ -65,5 +65,6 @@ pub use reader_health::{ReaderHealth, ReaderState};
 pub use render::{Renderer, Theme};
 pub use surface::{Frame, Routed};
 pub use surface_format::SurfaceFormat;
+pub use text::GlyphBlit;
 pub use waker::Waker;
 pub use window::{InputEvent, TermWindow};

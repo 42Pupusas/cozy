@@ -356,6 +356,7 @@ dependencies = [
  "dbus",
  "dbus-server",
  "portal-core",
+ "quetzalcoatl",
  "ququmatz",
  "waker",
 ]

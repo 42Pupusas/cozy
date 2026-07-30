@@ -23,6 +23,12 @@
 //! * [`session_address`] — [`session_address::SessionAddress`], resolving
 //!   where the session bus socket actually lives.
 //! * [`conn`] — [`conn::DbusConn`], the actual connection: connect, auth, call.
+//! * [`signals`] — typed decode-side wrappers for signal bodies shared by
+//!   more than one caller (currently [`signals::NameOwnerChanged`]), so the
+//!   positional `Value` layout of a given signal is decoded in one place
+//!   rather than re-derived by every subscriber. Callers still own their own
+//!   `add_match`/dispatch loop — this crate has no subscription machinery of
+//!   its own, matching the "no signal subscriptions" scope above.
 //! * [`network_manager`] / [`bluez`] / [`logind`] — thin, service-specific
 //!   convenience wrappers the statusbar calls directly.
 
@@ -33,9 +39,11 @@ pub mod marshal;
 pub mod message;
 pub mod network_manager;
 pub mod session_address;
+pub mod signals;
 pub mod sys;
 pub mod value;
 
 pub use conn::{DbusConn, DbusError};
 pub use session_address::SessionAddress;
+pub use signals::NameOwnerChanged;
 pub use value::Value;

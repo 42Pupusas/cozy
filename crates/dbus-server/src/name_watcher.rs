@@ -10,11 +10,11 @@
 //! clients never call `Session.Close` on their way out, they just die.
 //! `org.freedesktop.DBus`'s `NameOwnerChanged(name, old_owner, new_owner)`
 //! broadcast with an empty `new_owner` is the only reliable "this
-//! connection is gone" signal on the bus (the same fact
-//! `statusbar::tray`'s hand-rolled `is_name_owner_lost`/
-//! `drop_items_for_lost_owner` pair already relies on for tray items;
-//! this module gives the portal daemon the equivalent generic tracker
-//! instead of re-deriving that logic against a different resource type).
+//! connection is gone" signal on the bus -- decoding and interpreting the
+//! signal itself is [`dbus::NameOwnerChanged`]'s job (shared with
+//! `statusbar::tray::TrayWatcher`'s `drop_items_for_lost_owner`, which
+//! relies on the exact same rule for tray items); this module gives the
+//! portal daemon the resource-tracking side, generic over resource type.
 //!
 //! Deliberately just a name -> resource map, not a subscription to a live
 //! [`dbus::conn::DbusConn`]: this crate's other pieces
@@ -24,7 +24,6 @@
 //! `NameWatcher::forget_owner`'s result by actually unregistering those
 //! paths.
 
-use dbus::value::Value;
 use std::collections::HashMap;
 
 /// Tracks which unique connection name (e.g. `:1.55`) currently owns which
@@ -107,7 +106,8 @@ impl NameWatcher {
     /// Stop tracking every resource `owner` held and return them, oldest
     /// first -- the list a caller should unregister (from
     /// [`crate::registry::ObjectRegistry`] and anywhere else that cares)
-    /// once [`Self::owner_lost`] reports `owner` has disconnected.
+    /// once [`dbus::NameOwnerChanged::lost_owner`] reports `owner` has
+    /// disconnected.
     pub fn forget_owner(&mut self, owner: &str) -> Vec<String> {
         let Some(resources) = self.resources_by_owner.remove(owner) else {
             return Vec::new();
@@ -116,37 +116,6 @@ impl NameWatcher {
             self.owner_by_resource.remove(resource);
         }
         resources
-    }
-
-    /// Interpret a `NameOwnerChanged(name, old_owner, new_owner)` signal's
-    /// three string arguments and report the unique connection name that
-    /// just disappeared, if any.
-    ///
-    /// Only an empty `new_owner` means the owner is truly gone (a
-    /// non-empty one means the well-known name just changed hands, e.g. a
-    /// service restarting, which isn't a disconnect of the *previous*
-    /// owner in the sense this module cares about -- that previous
-    /// connection may still be alive and own other resources). An empty
-    /// `old_owner` means the name never had an owner to lose in the first
-    /// place (the acquisition half of the same signal).
-    #[must_use]
-    pub fn owner_lost(name: &str, old_owner: &str, new_owner: &str) -> Option<String> {
-        let _ = name; // Kept for signature symmetry with the real D-Bus signal; unused, see below.
-        (!old_owner.is_empty() && new_owner.is_empty()).then(|| old_owner.to_string())
-    }
-
-    /// The same interpretation as [`Self::owner_lost`], but taking the
-    /// already-decoded `NameOwnerChanged` signal body values directly
-    /// (`[name, old_owner, new_owner]`, all `Value::Str`) rather than
-    /// three loose strings -- the shape a [`crate::router::MethodCallRouter`]
-    /// signal handler or a raw [`dbus::message::Reply::values`] call
-    /// actually hands over.
-    #[must_use]
-    pub fn owner_lost_from_signal_body(values: &[Value]) -> Option<String> {
-        let old_owner = values.get(1)?.as_display_string()?;
-        let new_owner = values.get(2)?.as_display_string()?;
-        let name = values.first()?.as_display_string()?;
-        Self::owner_lost(&name, &old_owner, &new_owner)
     }
 
     /// How many owners currently have at least one tracked resource.
@@ -242,52 +211,5 @@ mod tests {
     fn forget_owner_on_an_untracked_owner_returns_empty_without_panicking() {
         let mut watcher = NameWatcher::new();
         assert_eq!(watcher.forget_owner(OWNER), Vec::<String>::new());
-    }
-
-    #[test]
-    fn owner_lost_reports_the_old_owner_when_new_owner_is_empty() {
-        assert_eq!(
-            NameWatcher::owner_lost("org.example.App", OWNER, ""),
-            Some(OWNER.to_string())
-        );
-    }
-
-    #[test]
-    fn owner_lost_is_none_when_the_name_just_changed_hands() {
-        // A well-known name's owner changing (both old and new non-empty)
-        // isn't the *previous* owner disconnecting in the sense this
-        // module cares about -- that connection may still be alive.
-        assert_eq!(
-            NameWatcher::owner_lost("org.example.App", OWNER, OTHER_OWNER),
-            None
-        );
-    }
-
-    #[test]
-    fn owner_lost_is_none_when_the_name_never_had_an_owner() {
-        // This is the acquisition half of the same signal, not a loss.
-        assert_eq!(NameWatcher::owner_lost("org.example.App", "", OWNER), None);
-    }
-
-    #[test]
-    fn owner_lost_from_signal_body_matches_the_loose_string_version() {
-        let values = vec![
-            Value::Str("org.example.App".into()),
-            Value::Str(OWNER.into()),
-            Value::Str(String::new()),
-        ];
-        assert_eq!(
-            NameWatcher::owner_lost_from_signal_body(&values),
-            Some(OWNER.to_string())
-        );
-    }
-
-    #[test]
-    fn owner_lost_from_signal_body_is_none_on_a_malformed_body() {
-        assert_eq!(NameWatcher::owner_lost_from_signal_body(&[]), None);
-        assert_eq!(
-            NameWatcher::owner_lost_from_signal_body(&[Value::U32(1)]),
-            None
-        );
     }
 }

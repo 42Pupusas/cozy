@@ -7,7 +7,7 @@
 
 use std::sync::mpsc::Sender;
 
-use dbus::{DbusConn, Value};
+use dbus::{DbusConn, NameOwnerChanged, Value};
 
 use crate::{TrayIcon, TrayPixmap};
 
@@ -185,8 +185,8 @@ impl TrayWatcher {
                 false
             } else if Self::is_item_registration(&message) {
                 Self::register(&mut conn, &message, &mut items, &mut pending)
-            } else if Self::is_name_owner_lost(&message) {
-                Self::drop_items_for_lost_owner(&message, &mut items, &mut pending)
+            } else if let Some(lost) = Self::name_owner_lost(&message) {
+                Self::drop_items_for_lost_owner(&lost, &mut items, &mut pending)
             } else {
                 Self::refresh_changed_item(&mut conn, &message, &mut items, &mut pending)
             };
@@ -205,27 +205,29 @@ impl TrayWatcher {
             && message.member.as_deref() == Some(REGISTER_ITEM)
     }
 
-    /// `NameOwnerChanged(name, old_owner, new_owner)` reports a unique or
-    /// well-known name losing its owner when `new_owner` is empty. That is
-    /// the only reliable "this client is gone" signal on the bus -- clients
-    /// never unregister their tray item explicitly, they just disconnect.
-    fn is_name_owner_lost(message: &dbus::message::Reply) -> bool {
+    /// Decode `message` as a `NameOwnerChanged` signal reporting a genuine
+    /// disconnect (not just a well-known name changing hands -- see
+    /// [`dbus::NameOwnerChanged::lost_owner`]'s doc for that distinction).
+    /// Returns `None` for any other message, including a `NameOwnerChanged`
+    /// that isn't actually a disconnect.
+    fn name_owner_lost(message: &dbus::message::Reply) -> Option<NameOwnerChanged> {
         if message.interface.as_deref() != Some("org.freedesktop.DBus")
             || message.member.as_deref() != Some("NameOwnerChanged")
         {
-            return false;
+            return None;
         }
-        let values = message.values();
-        matches!(values.get(2).and_then(Value::as_display_string), Some(new_owner) if new_owner.is_empty())
+        let changed = NameOwnerChanged::from_body(&message.values())?;
+        changed.lost_owner()?;
+        Some(changed)
     }
 
-    /// Drop every item registered by the connection that just disappeared.
-    /// `NameOwnerChanged(name, old_owner, new_owner)` reports either a
-    /// unique name itself dying (`name == old_owner`, both unique) or a
-    /// well-known name's owner changing (`old_owner` is the unique name that
-    /// used to hold it) -- either way `old_owner` is the unique connection
-    /// name to compare against `TrayItem::owner`, which was captured
-    /// verbatim from `message.sender` at registration time.
+    /// Drop every item registered by the connection `lost` reports as
+    /// disappeared. `lost.old_owner` is the unique connection name to
+    /// compare against `TrayItem::owner`, which was captured verbatim from
+    /// `message.sender` at registration time -- whether `NameOwnerChanged`
+    /// reported a unique name itself dying (`name == old_owner`, both
+    /// unique) or a well-known name's owner changing (`old_owner` is the
+    /// unique name that used to hold it).
     ///
     /// This must be an *exact* match, not a prefix match: unique names look
     /// like `:1.5` and `:1.55`, and `str::starts_with` treated the former as
@@ -235,20 +237,13 @@ impl TrayWatcher {
     /// icon flashing in once at registration and then vanishing almost
     /// immediately.
     fn drop_items_for_lost_owner(
-        message: &dbus::message::Reply,
+        lost: &NameOwnerChanged,
         items: &mut Vec<TrayItem>,
         pending: &mut Vec<PendingTrayItem>,
     ) -> bool {
-        let values = message.values();
-        let Some(old_owner) = values.get(1).and_then(Value::as_display_string) else {
-            return false;
-        };
-        if old_owner.is_empty() {
-            return false;
-        }
         let before = items.len() + pending.len();
-        items.retain(|item| item.owner != old_owner);
-        pending.retain(|item| item.owner != old_owner);
+        items.retain(|item| item.owner != lost.old_owner);
+        pending.retain(|item| item.owner != lost.old_owner);
         items.len() + pending.len() != before
     }
 
@@ -570,5 +565,96 @@ mod tests {
             body: Vec::new(),
         };
         assert!(!TrayWatcher::is_item_update_signal(&message));
+    }
+
+    /// Build a `NameOwnerChanged` signal `Reply` with the given three
+    /// positional string arguments, the shape `TrayWatcher::name_owner_lost`
+    /// decodes.
+    fn name_owner_changed_signal(
+        name: &str,
+        old_owner: &str,
+        new_owner: &str,
+    ) -> dbus::message::Reply {
+        let mut body = Vec::new();
+        for arg in [name, old_owner, new_owner] {
+            dbus::marshal::Marshaller::marshal(&mut body, &Value::Str(arg.to_string()), "s")
+                .unwrap();
+        }
+        dbus::message::Reply {
+            kind: dbus::message::MessageType::Signal,
+            sender: Some("org.freedesktop.DBus".into()),
+            path: Some("/org/freedesktop/DBus".into()),
+            interface: Some("org.freedesktop.DBus".into()),
+            member: Some("NameOwnerChanged".into()),
+            serial: 1,
+            error_name: None,
+            reply_serial: None,
+            signature: "sss".into(),
+            body,
+        }
+    }
+
+    #[test]
+    fn name_owner_lost_recognizes_a_genuine_disconnect() {
+        let message = name_owner_changed_signal("org.mattermost.Desktop", ":1.42", "");
+        let lost = TrayWatcher::name_owner_lost(&message).expect("empty new_owner is a disconnect");
+        assert_eq!(lost.old_owner, ":1.42");
+    }
+
+    #[test]
+    fn name_owner_lost_ignores_a_name_changing_hands() {
+        let message = name_owner_changed_signal("org.mattermost.Desktop", ":1.42", ":1.77");
+        assert!(TrayWatcher::name_owner_lost(&message).is_none());
+    }
+
+    #[test]
+    fn name_owner_lost_ignores_unrelated_signals() {
+        let message = dbus::message::Reply {
+            kind: dbus::message::MessageType::Signal,
+            sender: Some(":1.9".into()),
+            path: Some(ITEM_PATH.into()),
+            interface: Some(ITEM_IFACE.into()),
+            member: Some("NewIcon".into()),
+            serial: 1,
+            error_name: None,
+            reply_serial: None,
+            signature: String::new(),
+            body: Vec::new(),
+        };
+        assert!(TrayWatcher::name_owner_lost(&message).is_none());
+    }
+
+    #[test]
+    fn drop_items_for_lost_owner_evicts_only_an_exact_owner_match() {
+        let lost = NameOwnerChanged {
+            name: "org.mattermost.Desktop".into(),
+            old_owner: ":1.5".into(),
+            new_owner: String::new(),
+        };
+        let mut items = vec![
+            TrayItem {
+                id: format!(":1.5{ITEM_PATH}"),
+                service: ":1.5".into(),
+                path: ITEM_PATH.into(),
+                owner: ":1.5".into(),
+                icon: TrayIcon::default(),
+                attention: false,
+            },
+            TrayItem {
+                id: format!(":1.55{ITEM_PATH}"),
+                service: ":1.55".into(),
+                path: ITEM_PATH.into(),
+                owner: ":1.55".into(),
+                icon: TrayIcon::default(),
+                attention: false,
+            },
+        ];
+        let mut pending = Vec::new();
+
+        let changed = TrayWatcher::drop_items_for_lost_owner(&lost, &mut items, &mut pending);
+
+        assert!(changed);
+        assert_eq!(items.len(), 1, "only the exact-match owner is evicted");
+        assert_eq!(items[0].owner, ":1.55");
     }
 }

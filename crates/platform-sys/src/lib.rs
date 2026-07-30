@@ -3,7 +3,7 @@
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap
 )]
-//! The thin layer of raw syscalls and libc FFI we cannot avoid.
+//! The thin layer of raw syscalls and libc FFI `crates/platform` cannot avoid.
 //!
 //! With `io_uring` (via `ququmatz`) carrying all socket I/O, what's left here is:
 //!
@@ -18,6 +18,17 @@
 //!
 //! libc is always linked into a Rust binary, so this is "zero crates" but not
 //! "zero FFI" — graphics requires the kernel.
+//!
+//! # Why its own crate
+//!
+//! Pulled out of `crates/platform` (an audit flagged that crate as a 14k-line
+//! god-crate mixing protocol, syscalls, and rendering) as the first cut along
+//! the sys/wayland/render seam: everything in this file was already a true
+//! dependency leaf -- zero `crate::` references back into `platform`, only
+//! `std` and `ququmatz::types` -- so moving it changes nothing about what it
+//! does, only what can depend on it. `platform` re-exports this crate as
+//! `pub mod sys` (`pub use platform_sys as sys`), so every existing
+//! `crate::sys::X` / `platform::sys::X` call site keeps compiling unchanged.
 
 use std::ffi::c_void;
 use std::fmt;

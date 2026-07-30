@@ -34,9 +34,15 @@ pub mod protocol;
 pub mod reader_health;
 pub mod round_rect;
 pub mod surface_format;
-pub mod sys;
 pub mod wire;
 pub mod xcursor;
+
+/// Raw syscalls and libc FFI live in their own zero-`crate::`-dependency
+/// crate (an audit-driven split off this one, the first cut along the
+/// sys/wayland/render seam -- see `platform_sys`'s doc comment). Re-exported
+/// under the name every existing `crate::sys::X` / `platform::sys::X` call
+/// site already uses, so the split is invisible from the outside.
+pub use platform_sys as sys;
 
 mod render;
 pub mod selection;

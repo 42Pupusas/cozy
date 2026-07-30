@@ -21,6 +21,7 @@ waker        = { path = "../waker" }
 quetzalcoatl = { workspace = true }
 ququmatz     = { workspace = true }
 xkb          = { path = "../xkb" }
+platform-sys = { path = "../platform-sys" }
 
 # NOTE: quetzal-uring is intentionally absent for now.
 # The platform event loop is driven by a blocking SPSC pop + a raw Wayland

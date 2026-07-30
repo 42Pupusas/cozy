@@ -319,11 +319,27 @@ dependencies = [
  "config",
  "font",
  "grid",
+ "platform-sys",
  "quetzalcoatl",
  "ququmatz",
  "vt_parser",
  "waker",
  "xkb",
+]
+
+[[package]]
+name = "platform-sys"
+version = "0.1.0"
+dependencies = [
+ "ququmatz",
+]
+
+[[package]]
+name = "portal-core"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "dbus",
 ]
 
 [[package]]

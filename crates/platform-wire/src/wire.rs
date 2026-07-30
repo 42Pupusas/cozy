@@ -98,10 +98,12 @@ impl MessageBuilder {
 /// Named `WireEvent` (not the bare `Event` this module used to export)
 /// because it's the first of three unrelated event types the terminal's
 /// input pipeline threads through: this one (raw Wayland bytes, freshly
-/// parsed off the wire), [`crate::event::RawEvent`] (the reader→main-thread
-/// hand-off), and `vt_parser::TermEvent` (parsed VT/ANSI escape sequences,
-/// downstream of the PTY entirely — unrelated to Wayland but easy to
-/// confuse with the other two when everything is just called `Event`).
+/// parsed off the wire), `platform::event::RawEvent` (the reader→main-thread
+/// hand-off, one crate up -- this type predates the `platform-wire` split
+/// and still lives in `platform` itself), and `vt_parser::TermEvent` (parsed
+/// VT/ANSI escape sequences, downstream of the PTY entirely — unrelated to
+/// Wayland but easy to confuse with the other two when everything is just
+/// called `Event`).
 pub struct WireEvent<'a> {
     pub object_id: u32,
     pub opcode: u16,

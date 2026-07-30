@@ -320,6 +320,7 @@ dependencies = [
  "font",
  "grid",
  "platform-sys",
+ "platform-wire",
  "quetzalcoatl",
  "ququmatz",
  "vt_parser",
@@ -333,6 +334,10 @@ version = "0.1.0"
 dependencies = [
  "ququmatz",
 ]
+
+[[package]]
+name = "platform-wire"
+version = "0.1.0"
 
 [[package]]
 name = "portal-core"

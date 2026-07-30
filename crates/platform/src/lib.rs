@@ -21,7 +21,6 @@ pub mod error;
 pub mod event;
 pub mod file_uri;
 pub mod font;
-pub mod id;
 pub mod key_repeat;
 pub mod keymap;
 pub mod layer;
@@ -30,11 +29,9 @@ pub mod pixel_buffers;
 pub mod premultiply;
 pub mod present;
 pub mod progress_guard;
-pub mod protocol;
 pub mod reader_health;
 pub mod round_rect;
 pub mod surface_format;
-pub mod wire;
 pub mod xcursor;
 
 /// Raw syscalls and libc FFI live in their own zero-`crate::`-dependency
@@ -43,6 +40,15 @@ pub mod xcursor;
 /// under the name every existing `crate::sys::X` / `platform::sys::X` call
 /// site already uses, so the split is invisible from the outside.
 pub use platform_sys as sys;
+
+/// Typed Wayland object ids, the interface/opcode tables, and the wire
+/// codec -- the second cut along the sys/wayland/render seam (see
+/// `platform_wire`'s doc comment). Re-exported as three names,
+/// `platform::id` / `platform::protocol` / `platform::wire`, matching what
+/// every existing call site (inside this crate and out) already writes.
+pub use platform_wire::id;
+pub use platform_wire::protocol;
+pub use platform_wire::wire;
 
 mod render;
 pub mod selection;

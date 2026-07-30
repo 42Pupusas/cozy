@@ -15,9 +15,12 @@
 //! ```
 //!
 //! Each box above is a worker struct (`PtyWorker`, `ParserWorker`,
-//! `UiWorker`) that owns its ring endpoints as fields and is consumed by a
-//! `run` method on its own OS thread (`UiWorker` runs on the main thread) --
-//! not a free function taking half a dozen loose channel arguments.
+//! `UiWorker`) that owns its ring endpoints as fields and is run on its own
+//! OS thread (`UiWorker` runs on the main thread) -- not a free function
+//! taking half a dozen loose channel arguments. `UiWorker` itself is a
+//! plain data bag (see its doc): `UiLoop::new` consumes it by value to
+//! build the loop's mutable state, and `UiLoop::run` is the actual `run`
+//! method, so the dependency between the two runs one way only.
 //!
 //! Rings are quetzalcoatl SPSC/MPSC (MPSC where two threads fan in: pty+ui
 //! into the parser, ui+parser into the pty) — no mutexes, no async runtime.
@@ -575,7 +578,7 @@ impl<'cfg> App<'cfg> {
         // re-throwing via `resume_unwind` preserves the original panic
         // (message, exit code, backtrace) while still guaranteeing cleanup.
         let ui_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            UiWorker {
+            let worker = UiWorker {
                 cfg: self.cfg,
                 dirty_rx,
                 input_tx,
@@ -588,8 +591,8 @@ impl<'cfg> App<'cfg> {
                 ui_events_rx,
                 quit: &self.quit,
                 shell_pid: &shell_pid_ui,
-            }
-            .run()
+            };
+            UiLoop::new(worker).and_then(UiLoop::run)
         }));
 
         // Always tear down, regardless of whether the UI loop exited
@@ -1021,13 +1024,6 @@ struct UiWorker<'a> {
     /// See `App::shell_pid`. Read on Ctrl+Shift+Enter to resolve where to
     /// open the new terminal window.
     shell_pid: &'a AtomicI32,
-}
-
-impl UiWorker<'_> {
-    /// Run the UI event loop on the calling (main) thread until quit.
-    fn run(self) -> platform::Result<()> {
-        UiLoop::new(self)?.run()
-    }
 }
 
 /// Owns every piece of mutable state one iteration of the UI event loop
@@ -1715,7 +1711,7 @@ impl ResizeDebounce {
 /// Watches the config file for saves and hot-applies whatever's safe to
 /// change without a restart. Was two free functions (`inotify_touched`,
 /// `apply_live_config`) plus three loose locals (`config_path`,
-/// `config_watch`, `config_file_name`) threaded through `UiWorker::run`'s
+/// `config_watch`, `config_file_name`) threaded through `UiLoop::run`'s
 /// loop body -- bundled here since they're one cohesive unit: the watch
 /// handle, the filename it's filtering for, and the reload/apply logic
 /// that consumes them are never meaningful apart from each other.
@@ -1942,7 +1938,7 @@ mod live_reload_tests {
     use super::ConfigWatcher;
 
     /// Write to a file inside a fresh temp dir, watched the same way
-    /// `UiWorker::run` watches the real config directory (`CLOSE_WRITE |
+    /// `UiLoop::run` watches the real config directory (`CLOSE_WRITE |
     /// MOVED_TO` on the directory, filtered by filename), and confirm
     /// `ConfigWatcher::touched` reports the save. Exercises the real kernel
     /// ABI -- event header size/layout, name padding/NUL-trimming -- not a

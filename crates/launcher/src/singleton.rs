@@ -20,7 +20,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-/// What [`SingletonGuard::acquire`] found.
+/// What [`Singleton::acquire`] found.
 pub enum SingletonAcquire {
     /// No other instance was running; this process now owns the lock and
     /// should proceed to open its window. Dropping the guard releases the
@@ -37,14 +37,40 @@ pub enum SingletonAcquire {
 ///
 /// Holds the bound listener plus the path to unlink on drop. A next launch
 /// racing a not-yet-dropped guard (process killed uncleanly, leaving the
-/// socket file behind) is handled by [`SingletonGuard::acquire`] itself --
-/// see its doc.
+/// socket file behind) is handled by [`Singleton::acquire`] itself -- see
+/// its doc.
+///
+/// Deliberately holds no method that produces a [`SingletonAcquire`]: that
+/// enum's `Primary` variant holds *this* type, so if acquisition lived here
+/// too (`SingletonGuard::acquire() -> SingletonAcquire`) the two types would
+/// point at each other -- a real mutual dependency, not just a cargo-graph
+/// false positive (unlike the name-collision `Error` one elsewhere in this
+/// workspace). [`Singleton`] is the acquisition side of that relationship
+/// so this type can stay a plain held-resource with a one-way dependency.
 pub struct SingletonGuard {
     listener: UnixListener,
     path: PathBuf,
 }
 
 impl SingletonGuard {
+    /// The bound listener, for the caller to accept on (each accepted
+    /// connection is a "please close" notification from a second launch).
+    #[must_use]
+    pub const fn listener(&self) -> &UnixListener {
+        &self.listener
+    }
+}
+
+/// Namespace for the single-instance acquisition procedure.
+///
+/// Not a value in its own right (never constructed) -- just where
+/// [`Singleton::acquire`] and its stale-socket retry helper live, kept off
+/// [`SingletonGuard`] so that type doesn't depend on [`SingletonAcquire`],
+/// which in turn holds a `SingletonGuard`. See `SingletonGuard`'s doc for
+/// why that split matters.
+pub struct Singleton;
+
+impl Singleton {
     /// Try to become the sole instance bound to `path`.
     ///
     /// * `bind` succeeds → we're first; returns [`SingletonAcquire::Primary`].
@@ -61,7 +87,7 @@ impl SingletonGuard {
     /// retry, or if some other `bind` failure (not `AddrInUse`) occurs.
     pub fn acquire(path: &Path) -> io::Result<SingletonAcquire> {
         match UnixListener::bind(path) {
-            Ok(listener) => Ok(SingletonAcquire::Primary(Self {
+            Ok(listener) => Ok(SingletonAcquire::Primary(SingletonGuard {
                 listener,
                 path: path.to_owned(),
             })),
@@ -84,18 +110,11 @@ impl SingletonGuard {
             // still fails (e.g. permissions), propagate.
             let _ = fs::remove_file(path);
             let listener = UnixListener::bind(path)?;
-            Ok(SingletonAcquire::Primary(Self {
+            Ok(SingletonAcquire::Primary(SingletonGuard {
                 listener,
                 path: path.to_owned(),
             }))
         }
-    }
-
-    /// The bound listener, for the caller to accept on (each accepted
-    /// connection is a "please close" notification from a second launch).
-    #[must_use]
-    pub const fn listener(&self) -> &UnixListener {
-        &self.listener
     }
 }
 
@@ -126,7 +145,7 @@ mod tests {
     #[test]
     fn first_acquire_becomes_primary() {
         let path = temp_socket_path("first-primary");
-        let acquired = SingletonGuard::acquire(&path).unwrap();
+        let acquired = Singleton::acquire(&path).unwrap();
         assert!(matches!(acquired, SingletonAcquire::Primary(_)));
         // Guard drops at end of scope, unlinking the socket file.
         drop(acquired);
@@ -136,12 +155,12 @@ mod tests {
     #[test]
     fn second_acquire_while_primary_is_alive_is_already_running() {
         let path = temp_socket_path("second-already-running");
-        let primary = SingletonGuard::acquire(&path).unwrap();
+        let primary = Singleton::acquire(&path).unwrap();
         let SingletonAcquire::Primary(guard) = primary else {
             panic!("expected Primary");
         };
 
-        let second = SingletonGuard::acquire(&path).unwrap();
+        let second = Singleton::acquire(&path).unwrap();
         assert!(matches!(second, SingletonAcquire::AlreadyRunning));
 
         // The primary's listener should have a pending connection to
@@ -154,10 +173,10 @@ mod tests {
     #[test]
     fn acquire_after_primary_drops_reclaims_the_path() {
         let path = temp_socket_path("reclaim-after-drop");
-        let first = SingletonGuard::acquire(&path).unwrap();
+        let first = Singleton::acquire(&path).unwrap();
         drop(first);
 
-        let second = SingletonGuard::acquire(&path).unwrap();
+        let second = Singleton::acquire(&path).unwrap();
         assert!(matches!(second, SingletonAcquire::Primary(_)));
     }
 
@@ -174,7 +193,7 @@ mod tests {
         }
         assert!(path.exists(), "test setup: stale socket should remain");
 
-        let acquired = SingletonGuard::acquire(&path).unwrap();
+        let acquired = Singleton::acquire(&path).unwrap();
         assert!(matches!(acquired, SingletonAcquire::Primary(_)));
     }
 }

@@ -813,7 +813,7 @@ mod tests {
         let file = dir.create_file("a.txt", b"hello");
         let folder = dir.create_dir("folder");
         let mut browser = open(&dir);
-        let outcome = browser.accept_drop(&[file.clone()], &folder);
+        let outcome = browser.accept_drop(std::slice::from_ref(&file), &folder);
         assert_eq!(outcome, Outcome::Redraw);
         assert!(
             !file.exists(),
@@ -830,7 +830,7 @@ mod tests {
         let dir = TempDir::new("accept_drop_noop");
         let file = dir.create_file("a.txt", b"hello");
         let mut browser = open(&dir);
-        let outcome = browser.accept_drop(&[file.clone()], dir.path());
+        let outcome = browser.accept_drop(std::slice::from_ref(&file), dir.path());
         assert_eq!(outcome, Outcome::Ignored);
         assert!(file.exists(), "the file must not have moved or vanished");
     }

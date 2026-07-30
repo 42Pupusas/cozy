@@ -577,6 +577,8 @@ mod tests {
     /// `drain_drops`.
     #[test]
     fn a_real_write_on_the_pipe_is_decoded_and_delivered() {
+        use std::io::Write as _;
+
         let mut drag = DragController::new(Some((DataDeviceManagerId(1), DataDeviceId(2))));
         let window_tx = test_sender();
         let wake = waker::Waker::new().expect("waker");
@@ -604,7 +606,6 @@ mod tests {
                 }
             }
         });
-        use std::io::Write as _;
         peer_writer.write_all(b"file:///a.txt\r\n").expect("write");
         drop(peer_writer);
 

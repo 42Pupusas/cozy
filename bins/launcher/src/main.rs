@@ -23,7 +23,7 @@ use launcher_options::{LauncherMode, LauncherOptions};
 
 use icon_cache::IconCache;
 use launcher::Catalog;
-use launcher::singleton::{SingletonAcquire, SingletonGuard};
+use launcher::singleton::{Singleton, SingletonAcquire, SingletonGuard};
 use launcher_window::{LauncherKey, LauncherWindow};
 use platform::draw::{Canvas, Color, Rect};
 use statusbar::TextRenderer;
@@ -521,7 +521,7 @@ fn main() -> std::process::ExitCode {
     }
 
     let path = singleton_socket_path();
-    let guard = match SingletonGuard::acquire(&path) {
+    let guard = match Singleton::acquire(&path) {
         Ok(SingletonAcquire::Primary(guard)) => guard,
         Ok(SingletonAcquire::AlreadyRunning) => {
             // A running instance was notified to close (toggle behavior) --
@@ -540,7 +540,7 @@ fn main() -> std::process::ExitCode {
             // process-unique fallback path under /tmp instead).
             let fallback =
                 std::env::temp_dir().join(format!("launcher-{}.sock", std::process::id()));
-            match SingletonGuard::acquire(&fallback) {
+            match Singleton::acquire(&fallback) {
                 Ok(SingletonAcquire::Primary(guard)) => guard,
                 _ => return std::process::ExitCode::FAILURE,
             }

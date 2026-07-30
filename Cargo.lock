@@ -349,6 +349,16 @@ name = "platform-wire"
 version = "0.1.0"
 
 [[package]]
+name = "portal-bin"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "dbus",
+ "dbus-server",
+ "portal-core",
+]
+
+[[package]]
 name = "portal-core"
 version = "0.1.0"
 dependencies = [

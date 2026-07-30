@@ -1,0 +1,21 @@
+[package]
+name    = "portal-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "portal_bin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "portal"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+dbus        = { path = "../../crates/dbus" }
+dbus-server = { path = "../../crates/dbus-server" }
+portal-core = { path = "../../crates/portal-core" }
+config      = { path = "../../crates/config" }

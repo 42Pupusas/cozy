@@ -443,6 +443,41 @@ impl DbusConn {
         Ok(reply)
     }
 
+    /// Make a method call whose argument body needs an arbitrary
+    /// `Value` shape (e.g. a portal method's `as` or `a{sv}` argument)
+    /// rather than the handful `BodyArg` can express -- the generic
+    /// sibling of `Self::call`. Returns `DbusError::Malformed` if
+    /// `values` doesn't match `signature`, the same mismatch
+    /// `crate::marshal::Marshaller::marshal_body` reports.
+    pub fn call_with_values(
+        &mut self,
+        destination: &str,
+        path: &str,
+        interface: &str,
+        member: &str,
+        values: &[crate::value::Value],
+        signature: &str,
+    ) -> Result<Reply, DbusError> {
+        let serial = self.take_serial();
+        let msg = crate::message::MessageBuilder::build_method_call_with_values(
+            serial,
+            destination,
+            path,
+            interface,
+            member,
+            values,
+            signature,
+        )
+        .ok_or(DbusError::Malformed)?;
+        self.send_raw(&msg)?;
+        let reply = self.await_reply(serial)?;
+        if reply.kind == MessageType::Error {
+            let name = reply.error_name.unwrap_or_default();
+            return Err(DbusError::Reply { name });
+        }
+        Ok(reply)
+    }
+
     fn call_raw(
         &mut self,
         destination: &str,
@@ -461,7 +496,15 @@ impl DbusConn {
             args,
         );
         self.send_raw(&msg)?;
+        self.await_reply(serial)
+    }
 
+    /// Block until the reply matching `serial` arrives, queueing any
+    /// unsolicited signal or unrelated reply encountered along the way --
+    /// shared by `Self::call_raw` and `Self::call_with_values`, the two
+    /// frame-sending paths that both need to wait out the same
+    /// interleaved-signal noise.
+    fn await_reply(&mut self, serial: u32) -> Result<Reply, DbusError> {
         // A call made from inside the tray watcher's dispatch loop (e.g.
         // `get_property` while handling a registration) can nest inside an
         // outer `recv_message` that already left unrelated messages queued.

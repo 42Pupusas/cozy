@@ -362,6 +362,53 @@ impl MessageBuilder {
         out
     }
 
+    /// Build a `METHOD_CALL` frame carrying an arbitrary argument body
+    /// (e.g. a portal method's `as` or `a{sv}` argument) -- the
+    /// [`Value`]-based sibling of [`Self::build_method_call`], needed
+    /// once a caller must *send* more than the handful of shapes
+    /// [`BodyArg`] can express. Returns `None` on the same
+    /// signature/value mismatch [`Self::build_method_return_with_values`]
+    /// does.
+    #[must_use]
+    pub fn build_method_call_with_values(
+        serial: u32,
+        destination: &str,
+        path: &str,
+        interface: &str,
+        member: &str,
+        values: &[Value],
+        signature: &str,
+    ) -> Option<Vec<u8>> {
+        let body = Marshaller::marshal_body(values, signature)?;
+
+        let mut header_fields = Vec::new();
+        Self::write_string_field(&mut header_fields, field_code::PATH, b'o', path);
+        Self::write_string_field(
+            &mut header_fields,
+            field_code::DESTINATION,
+            b's',
+            destination,
+        );
+        Self::write_string_field(&mut header_fields, field_code::INTERFACE, b's', interface);
+        Self::write_string_field(&mut header_fields, field_code::MEMBER, b's', member);
+        if !signature.is_empty() {
+            Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', signature);
+        }
+
+        let mut out = vec![b'l', MessageType::MethodCall.as_byte(), 0, 1];
+        out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(header_fields.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(&header_fields);
+        Self::pad_to(&mut out, 8);
+        out.extend_from_slice(&body);
+        Some(out)
+    }
+
     /// Build a `METHOD_CALL` message frame: header + body, ready to write
     /// to the socket.
     ///
@@ -677,6 +724,61 @@ mod tests {
         let prelude = Prelude::parse(&msg).unwrap();
         assert_eq!(prelude.total_len(), msg.len());
         assert!(prelude.body_len > 0);
+    }
+
+    #[test]
+    fn method_call_with_values_roundtrips_an_as_argument() {
+        // ReadAll's argument shape: a plain array of strings, which
+        // BodyArg (Str/ObjectPath/U32/Bool/the two Variant* shapes) can't
+        // express at all -- there's no BodyArg::ArrayStr.
+        let values = vec![Value::Array(vec![Value::Str(
+            "org.freedesktop.appearance".into(),
+        )])];
+        let frame = MessageBuilder::build_method_call_with_values(
+            2,
+            "org.freedesktop.impl.portal.desktop.mera.scratch",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.impl.portal.Settings",
+            "ReadAll",
+            &values,
+            "as",
+        )
+        .expect("as matches the values given");
+
+        let prelude = Prelude::parse(&frame).unwrap();
+        assert_eq!(prelude.message_type, MessageType::MethodCall);
+        assert_eq!(prelude.serial, 2);
+        assert_eq!(prelude.total_len(), frame.len());
+
+        let reply = Reply::parse_message(&frame).expect("built method call parses");
+        assert_eq!(
+            reply.path.as_deref(),
+            Some("/org/freedesktop/portal/desktop")
+        );
+        assert_eq!(
+            reply.interface.as_deref(),
+            Some("org.freedesktop.impl.portal.Settings")
+        );
+        assert_eq!(reply.member.as_deref(), Some("ReadAll"));
+        assert_eq!(reply.signature, "as");
+        assert_eq!(reply.values(), values);
+    }
+
+    #[test]
+    fn method_call_with_values_rejects_a_signature_mismatch() {
+        let values = vec![Value::Str("only one string".into())];
+        assert!(
+            MessageBuilder::build_method_call_with_values(
+                1,
+                ":1.50",
+                "/obj",
+                "org.example.Iface",
+                "Method",
+                &values,
+                "as",
+            )
+            .is_none()
+        );
     }
 
     #[test]

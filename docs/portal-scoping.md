@@ -137,16 +137,35 @@ revertible before the following step begins.
    a method call, `GetAll`, malformed arguments, and a signal from an
    external, independently-connected D-Bus client -- all over a real session
    bus connection, not just in-memory `Dispatcher`/`ServerLoop` unit tests.
-5. **Settings backend (domain logic done).** `crates/portal-core` now holds
-   the pure, D-Bus-free domain logic for `org.freedesktop.appearance`:
+5. **Settings backend (wired, on a scratch name).** `crates/portal-core`
+   holds the pure, D-Bus-free domain logic for `org.freedesktop.appearance`:
    `AppearanceSettings` (the four documented keys, derived from a
    `config::Config` snapshot), `ColorScheme` and `AccentColor` (the two keys
    with a genuine local source), `NamespaceFilter` (`ReadAll`'s glob rules,
-   independent of namespace contents), and `SettingChangedSignal`. Still
-   remaining: wiring this into an actual `dbus_server::Dispatcher` inside a
-   new `bins/portal`, and routing only Settings via a `.portal` file and
-   `portals.conf` -- the step that validates the real frontend path without
-   UI or FD complexity.
+   independent of namespace contents), and `SettingChangedSignal`.
+   `bins/portal` (new) wires that domain logic to a real
+   `dbus_server::Dispatcher`: `SettingsService` registers the
+   `org.freedesktop.impl.portal.Settings` object (`ReadAll`, `Read`, the
+   `version` property, and the `SettingChanged` signal's introspection
+   shape) at `/org/freedesktop/portal/desktop`, and `main` connects to the
+   session bus and serves forever. Proved against a real, second,
+   independently-connected client in `bins/portal/tests/real_bus_probe.rs`
+   (mirroring `dbus-server`'s own scratch-service integration test) --
+   Introspect, ReadAll, Read, and Properties.GetAll all round-trip over
+   real marshalled bytes, not just `Dispatcher::dispatch` called directly
+   in memory. `crates/dbus` grew `DbusConn::call_with_values` /
+   `MessageBuilder::build_method_call_with_values` to send this: `ReadAll`'s
+   `as` argument is a shape the existing `BodyArg` enum can't express, the
+   same gap `send_method_return_with_values`/`send_signal_with_values`
+   already closed on the reply/signal sides.
+
+   Still on a **scratch** well-known name
+   (`org.freedesktop.impl.portal.desktop.mera.scratch`), per this doc's own
+   compatibility contract (section 4): what's left to finish this step is
+   shipping a real `.portal` file naming the true activation name and
+   routing Settings in `portals.conf`, plus wiring live config-reload (a
+   `ConfigWatcher` like `bins/terminal`'s own) so `SettingChanged` is
+   actually emitted rather than only declared in introspection XML.
 
 ### Interactive and FD work
 

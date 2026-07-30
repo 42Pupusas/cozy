@@ -137,9 +137,16 @@ revertible before the following step begins.
    a method call, `GetAll`, malformed arguments, and a signal from an
    external, independently-connected D-Bus client -- all over a real session
    bus connection, not just in-memory `Dispatcher`/`ServerLoop` unit tests.
-5. **Settings backend.** Implement `impl.portal.Settings` backed by
-   `crates/config`. Route only Settings via a `.portal` file and `portals.conf`.
-   This validates the real frontend path without UI or FD complexity.
+5. **Settings backend (domain logic done).** `crates/portal-core` now holds
+   the pure, D-Bus-free domain logic for `org.freedesktop.appearance`:
+   `AppearanceSettings` (the four documented keys, derived from a
+   `config::Config` snapshot), `ColorScheme` and `AccentColor` (the two keys
+   with a genuine local source), `NamespaceFilter` (`ReadAll`'s glob rules,
+   independent of namespace contents), and `SettingChangedSignal`. Still
+   remaining: wiring this into an actual `dbus_server::Dispatcher` inside a
+   new `bins/portal`, and routing only Settings via a `.portal` file and
+   `portals.conf` -- the step that validates the real frontend path without
+   UI or FD complexity.
 
 ### Interactive and FD work
 

@@ -1,0 +1,18 @@
+[package]
+name    = "portal-core"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+# The backing store every setting this crate answers is derived from.
+config = { path = "../config" }
+# `Value` is the wire-shaped answer `impl.portal.Settings` methods must
+# produce (`a{sv}`, `(ddd)`, ...) -- portal-core owns the domain logic that
+# decides *what* those values are, but the values themselves are already a
+# generic D-Bus concept, not a portal-specific one, so borrowing `dbus`'s
+# `Value` here costs nothing `dbus-server`'s own re-export doesn't already
+# cost any interface built on top of it.
+dbus = { path = "../dbus" }
+
+[lints]
+workspace = true

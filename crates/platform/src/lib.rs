@@ -58,7 +58,7 @@ pub mod toplevel;
 pub mod window;
 
 pub use cursor_anim::{CursorAnimConfig, CursorAnimator};
-pub use error::{Error, Result};
+pub use error::{PlatformError, Result};
 pub use premultiply::Premultiplier;
 pub use progress_guard::{Progress, ProgressGuard};
 pub use reader_health::{ReaderHealth, ReaderState};

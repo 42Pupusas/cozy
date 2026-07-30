@@ -32,7 +32,7 @@ use platform::protocol::{
 // XKB says that press *means* on the user's actual layout.
 use platform::toplevel::keysym::Key as DecodedKey;
 use platform::wire::MessageBuilder;
-use platform::{Error, Result};
+use platform::{PlatformError, Result};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc;
 use quetzalcoatl::spsc::Consumer;
@@ -203,10 +203,10 @@ impl surface::GlobalCollector for GlobalsBuilder {
 impl GlobalsBuilder {
     fn finish(self) -> Result<Globals> {
         Ok(Globals {
-            compositor: self.compositor.ok_or(Error::ReaderStopped)?,
-            shm: self.shm.ok_or(Error::ReaderStopped)?,
-            layer_shell: self.layer_shell.ok_or(Error::ReaderStopped)?,
-            seat: self.seat.ok_or(Error::ReaderStopped)?,
+            compositor: self.compositor.ok_or(PlatformError::ReaderStopped)?,
+            shm: self.shm.ok_or(PlatformError::ReaderStopped)?,
+            layer_shell: self.layer_shell.ok_or(PlatformError::ReaderStopped)?,
+            seat: self.seat.ok_or(PlatformError::ReaderStopped)?,
         })
     }
 }
@@ -357,7 +357,7 @@ impl LauncherWindow {
         }
         self.sender
             .drain_requests(&mut self.request_rx)
-            .map_err(Error::Conn)?;
+            .map_err(PlatformError::Conn)?;
 
         while let Some(ev) = self.events.pop() {
             self.handle_event(&ev)?;

@@ -24,11 +24,11 @@ use platform::id::{CompositorId, LayerShellId, OutputId, RegistryId, SeatId, Shm
 use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
-    self as proto, Anchor, Format, KeyboardInteractivity, Layer, LayerSurfaceEvent,
-    SeatCapability, SeatEvent, SeatRequest,
+    self as proto, Anchor, Format, KeyboardInteractivity, Layer, LayerSurfaceEvent, SeatCapability,
+    SeatEvent, SeatRequest,
 };
 use platform::wire::MessageBuilder;
-use platform::{Error, Result};
+use platform::{PlatformError, Result};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc;
 use quetzalcoatl::spsc::Consumer;
@@ -232,10 +232,10 @@ impl GlobalsBuilder {
     /// required global never arrived.
     fn finish(self) -> Result<Globals> {
         Ok(Globals {
-            compositor: self.compositor.ok_or(Error::ReaderStopped)?,
-            shm: self.shm.ok_or(Error::ReaderStopped)?,
-            layer_shell: self.layer_shell.ok_or(Error::ReaderStopped)?,
-            seat: self.seat.ok_or(Error::ReaderStopped)?,
+            compositor: self.compositor.ok_or(PlatformError::ReaderStopped)?,
+            shm: self.shm.ok_or(PlatformError::ReaderStopped)?,
+            layer_shell: self.layer_shell.ok_or(PlatformError::ReaderStopped)?,
+            seat: self.seat.ok_or(PlatformError::ReaderStopped)?,
             output: self.output,
         })
     }
@@ -421,7 +421,7 @@ impl BarWindow {
         }
         self.sender
             .drain_requests(&mut self.request_rx)
-            .map_err(Error::Conn)?;
+            .map_err(PlatformError::Conn)?;
 
         while let Some(ev) = self.events.pop() {
             self.handle_event(&ev)?;
@@ -545,7 +545,7 @@ impl BarWindow {
         let grew = self
             .present
             .resize_shm(width, self.height)
-            .map_err(|e| Error::Conn(platform::conn::ConnError::Sys(e)))?;
+            .map_err(|e| PlatformError::Conn(platform::conn::ConnError::Sys(e)))?;
         if let Some(new_capacity) = grew {
             self.present.grow_pool(&mut self.window_tx, new_capacity);
         }

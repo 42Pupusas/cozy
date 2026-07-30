@@ -11,7 +11,7 @@
 
 use crate::conn::{ConnError, Sender};
 use crate::draw::Color;
-use crate::error::{Error, Result};
+use crate::error::{PlatformError, Result};
 use crate::id::{BufferId, CompositorId, ShmId, SurfaceId};
 use crate::protocol::{CompositorRequest, Format, ShmPoolRequest, ShmRequest, SurfaceRequest};
 use crate::sys::ShmBuffer;
@@ -95,7 +95,8 @@ impl PointerCursor {
 
         let w = usize::try_from(width.max(1)).unwrap_or(1);
         let h = usize::try_from(height.max(1)).unwrap_or(1);
-        let mut cshm = ShmBuffer::new(w, h, 1).map_err(|e| Error::Conn(ConnError::Sys(e)))?;
+        let mut cshm =
+            ShmBuffer::new(w, h, 1).map_err(|e| PlatformError::Conn(ConnError::Sys(e)))?;
         match &image {
             Some(img) => Self::write_image(cshm.pixels(0), img),
             None => Self::write_left_ptr(cshm.pixels(0)),

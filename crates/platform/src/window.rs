@@ -20,7 +20,7 @@ use quetzalcoatl::spsc::Consumer;
 use crate::conn::{ConnError, Sender, WindowSender};
 use crate::cursor;
 use crate::draw::Point;
-use crate::error::{Error, Result};
+use crate::error::{PlatformError, Result};
 use crate::event::RawEvent;
 use crate::id::{
     CallbackId, CompositorId, DataDeviceManagerId, KeyboardId, OutputId, PointerId, RegistryId,
@@ -731,7 +731,7 @@ impl TermWindow {
         }
         self.sender
             .drain_requests(&mut self.request_rx)
-            .map_err(Error::Conn)?;
+            .map_err(PlatformError::Conn)?;
 
         // Drain all queued events non-blocking.
         while let Some(ev) = self.events.pop() {
@@ -1002,7 +1002,7 @@ impl TermWindow {
         }
         self.sender
             .drain_requests(&mut self.request_rx)
-            .map_err(Error::Conn)?;
+            .map_err(PlatformError::Conn)?;
 
         let Some(first) = self.events.pop_block() else {
             return Ok(false);
@@ -2316,7 +2316,7 @@ impl TermWindow {
         let grew = self
             .present
             .resize_shm(w, h)
-            .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
+            .map_err(|e| PlatformError::Conn(ConnError::Sys(e)))?;
 
         if let Some(new_cap) = grew {
             // Route the resize through the same `window_tx` MPSC ring as the
@@ -2370,7 +2370,7 @@ impl TermWindow {
         if let Some(handle) = self.reader.take() {
             match handle.join() {
                 Ok(result) => result,
-                Err(_) => Err(Error::ReaderPanicked),
+                Err(_) => Err(PlatformError::ReaderPanicked),
             }
         } else {
             Ok(())
@@ -2515,10 +2515,10 @@ impl GlobalsBuilder {
     /// than an `unwrap`, since a protocol violation here shouldn't panic).
     fn finish(self) -> Result<Globals> {
         Ok(Globals {
-            compositor: self.compositor.ok_or(Error::ReaderStopped)?,
-            shm: self.shm.ok_or(Error::ReaderStopped)?,
-            wm_base: self.wm_base.ok_or(Error::ReaderStopped)?,
-            seat: self.seat.ok_or(Error::ReaderStopped)?,
+            compositor: self.compositor.ok_or(PlatformError::ReaderStopped)?,
+            shm: self.shm.ok_or(PlatformError::ReaderStopped)?,
+            wm_base: self.wm_base.ok_or(PlatformError::ReaderStopped)?,
+            seat: self.seat.ok_or(PlatformError::ReaderStopped)?,
             output: self.output,
             data_device_manager: self.data_device_manager,
         })

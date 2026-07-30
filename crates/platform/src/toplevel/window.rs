@@ -10,7 +10,7 @@ use quetzalcoatl::spsc::Consumer;
 
 use crate::conn::{Sender, WindowSender};
 use crate::draw::{Canvas, Color};
-use crate::error::{Error, Result};
+use crate::error::{PlatformError, Result};
 use crate::event::RawEvent;
 use crate::id::{KeyboardId, PointerId, SeatId};
 use crate::present::{PresentAttempt, PresentState};
@@ -212,7 +212,7 @@ impl Toplevel {
             output,
             decoration_manager,
             data_device_manager,
-        } = builder.finish().ok_or(Error::ReaderStopped)?;
+        } = builder.finish().ok_or(PlatformError::ReaderStopped)?;
 
         // No output bound (some nested/headless compositors advertise none)
         // means we cannot ask, so assume 1 rather than fail to start.
@@ -406,7 +406,7 @@ impl Toplevel {
             .observe(self.events.is_closed(), true)
             .is_alive()
         {
-            return Err(Error::ReaderStopped);
+            return Err(PlatformError::ReaderStopped);
         }
         self.apply_resize(painter)?;
         self.maybe_present(painter);
@@ -802,7 +802,7 @@ impl Toplevel {
         let grew = self
             .present
             .resize_shm(size.width, size.height)
-            .map_err(|e| Error::Conn(crate::conn::ConnError::Sys(e)))?;
+            .map_err(|e| PlatformError::Conn(crate::conn::ConnError::Sys(e)))?;
         if let Some(new_capacity) = grew {
             self.present.grow_pool(&mut self.window_tx, new_capacity);
         }
@@ -907,10 +907,12 @@ impl Toplevel {
         // *expected* signature of a clean close.
         //
         // A reader that dies mid-session is still reported: `tick()`
-        // observes it via `ReaderHealth` and returns `Error::ReaderStopped`.
+        // observes it via `ReaderHealth` and returns `PlatformError::ReaderStopped`.
         reader.map_or(Ok(()), |handle| {
             // A panic is never expected, so it still propagates.
-            handle.join().map_or(Err(Error::ReaderPanicked), |_| Ok(()))
+            handle
+                .join()
+                .map_or(Err(PlatformError::ReaderPanicked), |_| Ok(()))
         })
     }
 }

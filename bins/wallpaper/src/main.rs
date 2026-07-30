@@ -19,7 +19,7 @@ use platform::id::{CompositorId, LayerShellId, ObjectId, RegistryId, ShmId};
 use platform::protocol::{self as proto, DisplayEvent, OutputEvent, RegistryEvent};
 use platform::surface::{GlobalCollector, RegistryDiscovery, SurfaceBootstrap};
 use platform::wire::WireEvent;
-use platform::{Error, Result};
+use platform::{PlatformError, Result};
 use quetzalcoatl::spsc::Consumer;
 
 /// The ring only carries low-rate registry/output lifecycle events in this
@@ -51,9 +51,9 @@ struct GlobalsBuilder {
 impl GlobalsBuilder {
     fn finish(&self) -> Result<Globals> {
         Ok(Globals {
-            compositor: self.compositor.ok_or(Error::ReaderStopped)?,
-            shm: self.shm.ok_or(Error::ReaderStopped)?,
-            layer_shell: self.layer_shell.ok_or(Error::ReaderStopped)?,
+            compositor: self.compositor.ok_or(PlatformError::ReaderStopped)?,
+            shm: self.shm.ok_or(PlatformError::ReaderStopped)?,
+            layer_shell: self.layer_shell.ok_or(PlatformError::ReaderStopped)?,
         })
     }
 }
@@ -186,7 +186,7 @@ impl WallpaperApp {
         if event.object_id == platform::id::DisplayId(1).raw()
             && DisplayEvent::from_opcode(event.opcode) == Some(DisplayEvent::Error)
         {
-            return Err(Error::Protocol {
+            return Err(PlatformError::Protocol {
                 object: event.u32(),
                 code: event.u32(),
                 message: event.string(),
@@ -303,7 +303,8 @@ impl Application {
 
     fn run() -> std::result::Result<(), String> {
         let appearances = AppearanceRules::parse(std::env::args_os())?;
-        let wake = waker::Waker::new().map_err(|error| Error::ReaderSpawn(error).to_string())?;
+        let wake =
+            waker::Waker::new().map_err(|error| PlatformError::ReaderSpawn(error).to_string())?;
         WallpaperApp::connect(&wake, appearances)
             .and_then(|mut app| app.run())
             .map_err(|error| error.to_string())

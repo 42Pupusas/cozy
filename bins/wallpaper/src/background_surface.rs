@@ -13,8 +13,8 @@ use platform::conn::Sender;
 use platform::id::{CompositorId, LayerShellId, OutputId, PoolId, ShmId};
 use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::protocol::{
-    Anchor, BufferRequest, Format, KeyboardInteractivity, Layer, LayerSurfaceEvent,
-    ShmPoolRequest, SurfaceRequest,
+    Anchor, BufferRequest, Format, KeyboardInteractivity, Layer, LayerSurfaceEvent, ShmPoolRequest,
+    SurfaceRequest,
 };
 use platform::surface::Frame;
 use platform::sys::ShmBuffer;
@@ -221,7 +221,10 @@ impl BackgroundSurface {
                 .i32(width)
                 .i32(height),
         )?;
-        sender.request(MessageBuilder::new(self.layer.surface, SurfaceRequest::Commit))?;
+        sender.request(MessageBuilder::new(
+            self.layer.surface,
+            SurfaceRequest::Commit,
+        ))?;
         Ok(())
     }
 }

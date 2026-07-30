@@ -18,7 +18,7 @@ use quetzalcoatl::spsc::{Consumer, RingBuffer};
 
 use crate::conn::{ConnError, Sender, WaylandConn, WindowSender};
 use crate::draw::Color as DrawColor;
-use crate::error::{Error, Result};
+use crate::error::{PlatformError, Result};
 use crate::event::RawEvent;
 use crate::id::{
     BufferId, CallbackId, DisplayId, ObjectId, OutputId, PoolId, RegistryId, ShmId, SurfaceId,
@@ -66,7 +66,7 @@ impl Frame {
             usize::try_from(height).unwrap_or(0),
             2,
         )
-        .map_err(|e| Error::Conn(ConnError::Sys(e)))?;
+        .map_err(|e| PlatformError::Conn(ConnError::Sys(e)))?;
         let stride = width * 4;
         let pool: PoolId = sender.alloc_id();
         let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
@@ -188,7 +188,7 @@ impl RegistryDiscovery {
         // event. Waiting only for the caller's required set is therefore the
         // only bounded startup condition.
         while !collector.is_complete() {
-            let event = events.pop_block().ok_or(Error::ReaderStopped)?;
+            let event = events.pop_block().ok_or(PlatformError::ReaderStopped)?;
             let RawEvent::Bytes(bytes) = event else {
                 continue;
             };
@@ -199,7 +199,7 @@ impl RegistryDiscovery {
             if ev.object_id == DisplayId(1).raw()
                 && DisplayEvent::from_opcode(ev.opcode) == Some(DisplayEvent::Error)
             {
-                return Err(Error::Protocol {
+                return Err(PlatformError::Protocol {
                     object: ev.u32(),
                     code: ev.u32(),
                     message: ev.string(),
@@ -231,7 +231,7 @@ impl RegistryDiscovery {
         let callback: CallbackId = sender.alloc_id();
         sender.request(MessageBuilder::new(DisplayId(1), DisplayRequest::Sync).new_id(callback))?;
         loop {
-            let event = events.pop_block().ok_or(Error::ReaderStopped)?;
+            let event = events.pop_block().ok_or(PlatformError::ReaderStopped)?;
             match event {
                 RawEvent::Bytes(bytes) => {
                     let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
@@ -240,7 +240,7 @@ impl RegistryDiscovery {
                     if ev.object_id == DisplayId(1).raw()
                         && DisplayEvent::from_opcode(ev.opcode) == Some(DisplayEvent::Error)
                     {
-                        return Err(Error::Protocol {
+                        return Err(PlatformError::Protocol {
                             object: ev.u32(),
                             code: ev.u32(),
                             message: ev.string(),
@@ -432,13 +432,13 @@ impl SurfaceBootstrap {
             .spawn(move || {
                 let r = reader
                     .run(&producer, Some(&reader_wake))
-                    .map_err(Error::Conn);
+                    .map_err(PlatformError::Conn);
                 if let Err(e) = &r {
                     eprintln!("{thread_name}: reader error: {e}");
                 }
                 r
             })
-            .map_err(Error::ReaderSpawn)?;
+            .map_err(PlatformError::ReaderSpawn)?;
         Ok((sender, repeat_timer, events, reader_handle))
     }
 }
@@ -450,7 +450,7 @@ pub enum Routed {
     Handled,
     /// A fatal `wl_display.error` (or an unparseable message): the caller
     /// should propagate this and tear down.
-    Fatal(Error),
+    Fatal(PlatformError),
     /// Not a shared event (pointer, configure, seat, ...); the caller
     /// handles it role-specifically.
     Passthrough,
@@ -483,12 +483,12 @@ impl SurfaceBootstrap {
         // here).
         if let RawEvent::Bytes(bytes) = ev {
             let Some((mut wire, _)) = WireEvent::parse(bytes) else {
-                return Routed::Fatal(Error::ReaderStopped);
+                return Routed::Fatal(PlatformError::ReaderStopped);
             };
             if wire.object_id == DisplayId(1).raw() {
                 match DisplayEvent::from_opcode(wire.opcode) {
                     Some(DisplayEvent::Error) => {
-                        return Routed::Fatal(Error::Protocol {
+                        return Routed::Fatal(PlatformError::Protocol {
                             object: wire.u32(),
                             code: wire.u32(),
                             message: wire.string(),

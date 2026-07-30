@@ -16,7 +16,7 @@
 //! by interface version instead. See `frame_handshake`.
 
 use platform::conn::Sender;
-use platform::error::Error as PlatformError;
+use platform::error::PlatformError;
 use platform::event::RawEvent;
 use platform::id::{
     BufferId, DisplayId, ObjectId, OutputId, PoolId, ScreencopyFrameId, ScreencopyManagerId, ShmId,

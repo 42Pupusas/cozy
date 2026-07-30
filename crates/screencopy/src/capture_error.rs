@@ -1,14 +1,14 @@
 //! This crate's error type: a capture failure, or the platform layer's.
 //!
-//! Deliberately *not* a new variant on `platform::Error`. Platform is the
-//! lower layer; teaching it about screencopy would mean every consumer of a
-//! terminal window carries a capture-shaped error case it can never hit, and
-//! would invert the dependency the workspace keeps strictly one-way (see
+//! Deliberately *not* a new variant on `platform::PlatformError`. Platform is
+//! the lower layer; teaching it about screencopy would mean every consumer of
+//! a terminal window carries a capture-shaped error case it can never hit,
+//! and would invert the dependency the workspace keeps strictly one-way (see
 //! `platform::error`'s own note about `SysError` converting up one layer at a
 //! time rather than skipping). So screencopy wraps platform, never the
 //! reverse.
 
-use platform::Error as PlatformError;
+use platform::PlatformError;
 use platform::conn::ConnError;
 
 use crate::captured_frame::CaptureError as ConversionError;
@@ -117,11 +117,11 @@ mod tests {
     #[test]
     fn socket_errors_climb_the_ladder_rather_than_skipping_a_layer() {
         // `?` on a `Sender::request` must land here without screencopy
-        // inventing a parallel path around `platform::Error`.
+        // inventing a parallel path around `platform::PlatformError`.
         let e: ScreencopyError = platform::conn::ConnError::Closed.into();
         assert!(matches!(
             e,
-            ScreencopyError::Platform(platform::Error::Conn(_))
+            ScreencopyError::Platform(platform::PlatformError::Conn(_))
         ));
     }
 
@@ -129,7 +129,7 @@ mod tests {
     fn platform_errors_convert_upward_with_the_question_mark_operator() {
         // Screencopy wraps platform, never the other way round; this is the
         // conversion that keeps the dependency one-way.
-        let e: ScreencopyError = platform::Error::ReaderStopped.into();
+        let e: ScreencopyError = platform::PlatformError::ReaderStopped.into();
         assert!(matches!(e, ScreencopyError::Platform(_)));
     }
 }

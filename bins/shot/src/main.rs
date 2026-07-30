@@ -24,7 +24,7 @@ use platform::event::RawEvent;
 use platform::id::{CompositorId, LayerShellId, RegistryId, ScreencopyManagerId, ShmId};
 use platform::protocol as proto;
 use platform::surface::{GlobalCollector, RegistryDiscovery, SurfaceBootstrap};
-use platform::{Error, Result};
+use platform::{PlatformError, Result};
 use quetzalcoatl::spsc::Consumer;
 use screencopy::{CaptureRegion, ScreencopySession};
 use seat_devices::SeatDevices;
@@ -454,7 +454,7 @@ impl Application {
 
     fn run() -> std::result::Result<(), String> {
         let options = ShotOptions::parse(std::env::args_os())?;
-        let wake = waker::Waker::new().map_err(|e| Error::ReaderSpawn(e).to_string())?;
+        let wake = waker::Waker::new().map_err(|e| PlatformError::ReaderSpawn(e).to_string())?;
         ShotApp::connect(wake)?.run(&options)
     }
 

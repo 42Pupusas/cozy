@@ -119,8 +119,9 @@ impl LayerSurfaceHandle {
                 .string(config.namespace),
         )?;
         if let Some(bits) = config.anchor {
-            sender
-                .request(MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetAnchor).u32(bits))?;
+            sender.request(
+                MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetAnchor).u32(bits),
+            )?;
         }
         if let Some((w, h)) = config.size {
             sender.request(
@@ -131,8 +132,7 @@ impl LayerSurfaceHandle {
         }
         if let Some(zone) = config.exclusive_zone {
             sender.request(
-                MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetExclusiveZone)
-                    .i32(zone),
+                MessageBuilder::new(layer_surface, LayerSurfaceRequest::SetExclusiveZone).i32(zone),
             )?;
         }
         if let Some((top, right, bottom, left)) = config.margin {

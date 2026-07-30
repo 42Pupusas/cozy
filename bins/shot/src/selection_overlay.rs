@@ -383,7 +383,10 @@ impl SelectionOverlay {
                 .i32(width)
                 .i32(height),
         )?;
-        sender.request(MessageBuilder::new(self.layer.surface, SurfaceRequest::Commit))?;
+        sender.request(MessageBuilder::new(
+            self.layer.surface,
+            SurfaceRequest::Commit,
+        ))?;
         Ok(())
     }
 }

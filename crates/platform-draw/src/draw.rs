@@ -717,8 +717,8 @@ impl<'a> Canvas<'a> {
     /// Blit a decoded RGBA8 image (`src`, `src_w`×`src_h` pixels, straight
     /// alpha, row-major) into `dest` (clipped to the canvas), nearest-
     /// neighbor scaled to fit, and alpha-composited exactly like
-    /// [`Self::fill_rect_alpha`]/[`text::blit_glyph`]'s "solid ink over
-    /// glass" contract: each source pixel's own alpha blends it against
+    /// [`Self::fill_rect_argb`]/[`crate::text::GlyphBlit::blit_glyph`]'s
+    /// "solid ink over glass" contract: each source pixel's own alpha blends it against
     /// `bg`, then the *result* is treated as opaque ink -- i.e. `bg_alpha`
     /// (the window's own translucency) does not further fade the icon,
     /// same as glyph ink never fading with the window. This is app-icon

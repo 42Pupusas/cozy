@@ -23,11 +23,13 @@ use crate::draw::{Canvas, Color as DrawColor};
 /// kernel can live in different crates: Rust's orphan rule forbids an
 /// inherent impl -- or a foreign trait's impl -- on a type from outside the
 /// crate that defines it, but it always permits implementing a *local*
-/// trait for a foreign type. `text.rs` and `draw.rs` are today both in
-/// `platform`, but the rasterizer (`draw`/`round_rect`/`surface_format`) is
-/// a candidate for its own crate along the same seam as the `sys`/`wire`
-/// splits; a trait here means that split won't have to drag glyph blitting
-/// along with it, or vice versa.
+/// trait for a foreign type. `text.rs` and `draw.rs` moved into `platform-draw`
+/// together (the third cut along the `sys`/`wire`/`draw` seam -- see this
+/// crate's `lib.rs`), so today nothing forces the split this trait
+/// anticipates; it stays a trait anyway; a future reshuffle that pulls
+/// glyph blitting toward `font` (it only touches `font::Atlas`/`GlyphEntry`
+/// and a `Canvas`, nothing else in this crate) or `Canvas` toward its own
+/// crate again costs nothing extra to support.
 pub trait GlyphBlit {
     /// Alpha-blend one rasterized glyph from `atlas` onto this canvas.
     ///

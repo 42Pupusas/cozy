@@ -319,6 +319,7 @@ dependencies = [
  "config",
  "font",
  "grid",
+ "platform-draw",
  "platform-sys",
  "platform-wire",
  "quetzalcoatl",
@@ -326,6 +327,14 @@ dependencies = [
  "vt_parser",
  "waker",
  "xkb",
+]
+
+[[package]]
+name = "platform-draw"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "font",
 ]
 
 [[package]]

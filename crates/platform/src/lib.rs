@@ -16,11 +16,9 @@ pub mod cursor;
 pub mod cursor_anim;
 pub mod cursor_gate;
 mod debug_overlay;
-pub mod draw;
 pub mod error;
 pub mod event;
 pub mod file_uri;
-pub mod font;
 pub mod key_repeat;
 pub mod keymap;
 pub mod layer;
@@ -30,8 +28,6 @@ pub mod premultiply;
 pub mod present;
 pub mod progress_guard;
 pub mod reader_health;
-pub mod round_rect;
-pub mod surface_format;
 pub mod xcursor;
 
 /// Raw syscalls and libc FFI live in their own zero-`crate::`-dependency
@@ -50,10 +46,20 @@ pub use platform_wire::id;
 pub use platform_wire::protocol;
 pub use platform_wire::wire;
 
+/// The software rasterizer -- pixels, shapes, and text -- the third cut
+/// along the sys/wayland/render seam (see `platform_draw`'s doc comment).
+/// Re-exported as `platform::draw` / `platform::round_rect` /
+/// `platform::surface_format` / `platform::font`, matching what every
+/// existing call site (inside this crate and out) already writes.
+pub use platform_draw::draw;
+pub use platform_draw::font;
+pub use platform_draw::round_rect;
+pub use platform_draw::surface_format;
+pub use platform_draw::text;
+
 mod render;
 pub mod selection;
 pub mod surface;
-pub mod text;
 pub mod toplevel;
 pub mod window;
 

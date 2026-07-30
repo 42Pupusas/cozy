@@ -23,6 +23,7 @@ ququmatz      = { workspace = true }
 xkb           = { path = "../xkb" }
 platform-sys  = { path = "../platform-sys" }
 platform-wire = { path = "../platform-wire" }
+platform-draw = { path = "../platform-draw" }
 
 # NOTE: quetzal-uring is intentionally absent for now.
 # The platform event loop is driven by a blocking SPSC pop + a raw Wayland

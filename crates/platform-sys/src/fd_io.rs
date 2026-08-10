@@ -58,12 +58,7 @@ mod tests {
         let rc = unsafe { pipe(fds.as_mut_ptr()) };
         assert_eq!(rc, 0, "pipe(2) failed");
         // SAFETY: `pipe` on success wrote two fresh, valid, owned fds.
-        unsafe {
-            (
-                OwnedFd::from_raw_fd(fds[0]),
-                OwnedFd::from_raw_fd(fds[1]),
-            )
-        }
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
     }
 
     #[test]

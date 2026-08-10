@@ -202,6 +202,36 @@ impl SelectionTracker {
         }
     }
 
+    /// Select the whole word under `cell` (double-click), replacing whatever
+    /// was selected before. Returns `true` when a word was actually found and
+    /// selected, so the caller knows to repaint.
+    ///
+    /// The word's extent comes from [`crate::word_select::WordBoundary`] over
+    /// this row's mirrored content, so it sees exactly the text the user is
+    /// looking at. `drag_moved` is set because the resulting selection must
+    /// survive the button release (a double-click involves no motion, and the
+    /// release path clears any selection that never moved) -- and leaving the
+    /// button held lets the user keep dragging from the selected word, which
+    /// extends the range as usual.
+    pub fn select_word(&mut self, cell: Endpoint) -> bool {
+        let (col, row) = cell;
+        // Only rows currently on screen have mirrored content to inspect; a
+        // negative (scrolled-off) row can't be under the pointer anyway.
+        let Ok(index) = u16::try_from(row) else {
+            return false;
+        };
+        let Some(content) = self.row_content(index) else {
+            return false;
+        };
+        let line = content.materialize_cells();
+        let Some((start, end)) = crate::word_select::WordBoundary::at(&line, col) else {
+            return false;
+        };
+        self.range = Some(((start, row), (end, row)));
+        self.drag_moved = true;
+        true
+    }
+
     /// Handle a left-button release. If the pointer never moved since the
     /// press, this was a bare click — clear whatever we tentatively anchored.
     pub fn release_left(&mut self) {
@@ -618,6 +648,67 @@ mod tests {
         sel.press_left((6, 0), false); // start at "world"
         sel.drag_to((6, 1)); // through "second"
         assert_eq!(sel.selected_text().as_deref(), Some("world\nsecond"));
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_the_pointer() {
+        let mut sel = with_two_rows();
+        // Mirror the real press path: press_left anchors, select_word widens.
+        sel.press_left((7, 0), false);
+        assert!(sel.select_word((7, 0)));
+        assert_eq!(sel.selected_text().as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn a_double_clicked_word_survives_the_button_release() {
+        // The release path clears any selection that never "moved"; a
+        // double-click involves no motion at all, so the word must be
+        // explicitly marked as a real selection or it would vanish instantly.
+        let mut sel = with_two_rows();
+        sel.press_left((2, 1), false);
+        sel.select_word((2, 1));
+        sel.release_left();
+        assert_eq!(sel.selected_text().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn dragging_on_from_a_double_click_extends_the_selection() {
+        let mut sel = with_two_rows();
+        sel.press_left((0, 0), false);
+        sel.select_word((0, 0)); // "hello"
+        assert!(sel.drag_to((6, 1)));
+        assert_eq!(sel.selected_text().as_deref(), Some("hello world\nsecond"));
+    }
+
+    #[test]
+    fn double_clicking_blank_space_selects_nothing() {
+        let mut sel = with_two_rows();
+        sel.press_left((5, 0), false); // the space in "hello world"
+        assert!(!sel.select_word((5, 0)));
+        assert_eq!(sel.selected_text(), None);
+    }
+
+    #[test]
+    fn double_click_on_a_row_with_no_mirrored_content_is_a_no_op() {
+        let mut sel = with_two_rows();
+        // Row 9 was never drawn; row -1 is scrolled off. Neither can be
+        // inspected for a word, and neither may panic.
+        assert!(!sel.select_word((0, 9)));
+        assert!(!sel.select_word((0, -1)));
+    }
+
+    #[test]
+    fn double_click_works_on_compact_uniform_rows_too() {
+        // Most terminal output arrives as the compact Uniform variant, so the
+        // word lookup must not silently only work for the general Cells path.
+        let mut sel = SelectionTracker::new();
+        sel.ingest_snapshot(&incremental(
+            vec![uniform_text_row(0, "cargo --release now")],
+            0,
+        ));
+        sel.press_left((8, 0), false);
+        assert!(sel.select_word((8, 0)));
+        assert_eq!(sel.selected_text().as_deref(), Some("--release"));
     }
 
     #[test]

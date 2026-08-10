@@ -1193,9 +1193,8 @@ impl DiskValue {
     /// [`diskstat::DiskStat`]). Unlike `df`, this neither forks nor parses
     /// formatted text, so it is safe on the monitor's 60 Hz sample path.
     fn read() -> f32 {
-        diskstat::DiskStat::for_path(std::path::Path::new("/")).map_or(0.0, |stat| {
-            stat.percent_used()
-        })
+        diskstat::DiskStat::for_path(std::path::Path::new("/"))
+            .map_or(0.0, |stat| stat.percent_used())
     }
 }
 

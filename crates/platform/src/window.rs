@@ -302,6 +302,11 @@ pub struct TermWindow {
     /// struct so the selection logic lives (and is tested) in one place; see
     /// [`crate::selection::SelectionTracker`].
     selection: crate::selection::SelectionTracker,
+    /// Classifies left-button presses as single or double clicks, so a
+    /// double-click can select the word under the pointer. Kept beside the
+    /// selection (rather than inside it) because click *timing* is a pointer
+    /// concern; see [`crate::multi_click::MultiClickTracker`].
+    multi_click: crate::multi_click::MultiClickTracker,
     /// Set when a `wl_keyboard.keymap` event just arrived; the next
     /// `RawEvent::Fd` is the keymap blob to `mmap` + compile via
     /// `crate::xkb`. Carries the event's `size` argument (the fd itself has
@@ -537,6 +542,7 @@ impl TermWindow {
             input_queue: std::collections::VecDeque::new(),
             clipboard,
             selection: crate::selection::SelectionTracker::new(),
+            multi_click: crate::multi_click::MultiClickTracker::new(),
             awaiting_keymap_fd: None,
             prev_selection_rows: Vec::new(),
             hover_link: None,
@@ -1387,7 +1393,9 @@ impl TermWindow {
         let state = ButtonState::from_raw(ev.arg(3));
         let bypass = self.left_button_bypass(button, state);
         self.report_pointer_button_to_app(button, state, bypass.suppress_report);
-        self.drive_selection_from_left_button(button, state, &bypass);
+        // arg(1) is the compositor's millisecond timestamp for this button
+        // event -- the clock the double-click threshold is measured against.
+        self.drive_selection_from_left_button(button, state, &bypass, ev.arg(1));
     }
 
     /// Left-button ownership decision (kitty/foot/xterm convention): while
@@ -1461,6 +1469,7 @@ impl TermWindow {
         button: Option<PointerButton>,
         state: Option<ButtonState>,
         bypass: &LeftButtonBypass,
+        time_ms: u32,
     ) {
         match (button, state) {
             (Some(PointerButton::Left), Some(ButtonState::Pressed)) => {
@@ -1474,6 +1483,19 @@ impl TermWindow {
                     // terminal owns the mouse anyway.
                     self.selection
                         .press_left((cc, i32::from(cr)), bypass.shift && !self.app_mouse);
+                    // A double-click promotes that press into a word
+                    // selection. Order matters: `press_left` runs first so
+                    // the drag bookkeeping (button held, anchor set) is
+                    // established exactly as for a single click, then the
+                    // word span overwrites the zero-width range -- which
+                    // also means dragging on from the second click keeps
+                    // extending the selection normally.
+                    if matches!(
+                        self.multi_click.press(time_ms, (cc, cr)),
+                        crate::multi_click::ClickKind::Double
+                    ) {
+                        self.selection.select_word((cc, i32::from(cr)));
+                    }
                     self.present.mark_dirty();
                 }
             }
@@ -1695,6 +1717,38 @@ impl TermWindow {
         }
     }
 
+    /// The pixel x-range `[x0, x1)` to underline for a hovered link spanning
+    /// grid columns `lo..=hi`, or `None` when the span lies entirely off-grid.
+    ///
+    /// `hi` originates in the *cell mirror*, whose rows are as wide as the
+    /// grid's column count -- not necessarily as wide as the window's `cols`
+    /// (`width / cell_w`, floored). A window whose pixel width isn't an exact
+    /// multiple of `cell_w` leaves a sub-cell dead strip along the right edge
+    /// that belongs to no column, and `repaint_rows` only ever repaints
+    /// `.take(cols)` cells -- so ink stamped past `cols * cell_w` is never
+    /// cleaned and survives every later frame, exactly like the bottom-strip
+    /// artifact fixed in `Renderer::draw_cursor`. Clamping to the grid-aligned
+    /// width (rather than to `buf_w`, which includes the dead strip) keeps the
+    /// underline inside pixels the repaint path can actually reclaim.
+    fn underline_span(
+        lo: usize,
+        hi: usize,
+        cols: usize,
+        cell_w: usize,
+        buf_w: usize,
+    ) -> Option<(usize, usize)> {
+        // Drop spans starting past the last visible column outright; clamping
+        // them would smear an underline across a column the user can't see.
+        if cols == 0 || lo >= cols {
+            return None;
+        }
+        let hi = hi.min(cols - 1);
+        let grid_max_x = (buf_w / cell_w.max(1)) * cell_w.max(1);
+        let x0 = lo * cell_w;
+        let x1 = ((hi + 1) * cell_w).min(grid_max_x).min(buf_w);
+        (x0 < x1).then_some((x0, x1))
+    }
+
     fn repaint_rows(&mut self, rows: &[u16]) {
         let cols = (self.width / self.cell_w).max(1) as u16;
         let mut canvas = self.pixels.canvas(self.width, self.height);
@@ -1835,8 +1889,10 @@ impl TermWindow {
         if y >= self.height as usize {
             return;
         }
-        let x0 = lo * self.cell_w as usize;
-        let x1 = ((hi + 1) * self.cell_w as usize).min(buf_w);
+        let cols = (self.width / self.cell_w).max(1) as usize;
+        let Some((x0, x1)) = Self::underline_span(lo, hi, cols, self.cell_w as usize, buf_w) else {
+            return;
+        };
         let base = y * buf_w;
         let backbuffer = self.pixels.backbuffer_mut();
         for x in x0..x1 {
@@ -2583,6 +2639,38 @@ mod tests {
         touched.dedup();
         // The full band 0..=11 must now be present, not just 9,10,11.
         assert_eq!(touched, (0u16..=11).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn underline_stops_at_the_last_full_column_not_the_buffer_edge() {
+        // 100px wide, 8px cells => 12 columns (96px) + a 4px dead strip that
+        // no column owns and `repaint_rows` never cleans. A link span running
+        // to the mirror's full width must stop at 96, not smear to 100.
+        let span = TermWindow::underline_span(0, 20, 12, 8, 100);
+        assert_eq!(span, Some((0, 96)));
+    }
+
+    #[test]
+    fn underline_of_an_ordinary_span_is_left_exactly_as_it_was() {
+        // The common case must be untouched by the clamp: columns 2..=5 of an
+        // 8px grid is precisely pixels 16..48.
+        let span = TermWindow::underline_span(2, 5, 12, 8, 100);
+        assert_eq!(span, Some((16, 48)));
+    }
+
+    #[test]
+    fn underline_span_starting_past_the_last_column_is_dropped() {
+        // A span living entirely in the off-grid remainder has nothing visible
+        // to underline; clamping it would paint a bogus mark on the last
+        // column, so it must be dropped instead.
+        assert_eq!(TermWindow::underline_span(12, 20, 12, 8, 100), None);
+    }
+
+    #[test]
+    fn underline_fits_exactly_when_the_width_is_a_whole_number_of_cells() {
+        // No dead strip at all (96 = 12 * 8): the last column still underlines
+        // to the very edge, proving the clamp costs nothing in the exact case.
+        assert_eq!(TermWindow::underline_span(11, 11, 12, 8, 96), Some((88, 96)));
     }
 
     #[test]

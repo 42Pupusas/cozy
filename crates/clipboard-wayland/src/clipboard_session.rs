@@ -19,8 +19,8 @@ use platform::protocol::{
     DataControlSourceRequest,
 };
 use platform::surface::SurfaceBootstrap;
-use platform::wire::{MessageBuilder, WireEvent};
 use platform::sys::OwnedFdExt as _;
+use platform::wire::{MessageBuilder, WireEvent};
 use quetzalcoatl::spsc::Consumer;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;

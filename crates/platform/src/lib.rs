@@ -23,6 +23,7 @@ pub mod key_repeat;
 pub mod keymap;
 pub mod layer;
 pub mod link_scan;
+pub mod multi_click;
 pub mod pixel_buffers;
 pub mod premultiply;
 pub mod present;
@@ -62,6 +63,7 @@ pub mod selection;
 pub mod surface;
 pub mod toplevel;
 pub mod window;
+pub mod word_select;
 
 pub use cursor_anim::{CursorAnimConfig, CursorAnimator};
 pub use error::{PlatformError, Result};

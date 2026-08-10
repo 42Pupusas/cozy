@@ -91,7 +91,11 @@ impl DiskStat {
     /// fallback: `frsize` (fragment size) when reported, otherwise
     /// `bsize` -- some filesystems report `frsize` as zero.
     const fn unit_bytes(self) -> u64 {
-        if self.frsize > 0 { self.frsize } else { self.bsize }
+        if self.frsize > 0 {
+            self.frsize
+        } else {
+            self.bsize
+        }
     }
 
     /// Total filesystem capacity in bytes. `None` only on a `u64`

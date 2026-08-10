@@ -51,7 +51,8 @@ impl InotifyEvents {
             // repr(C) struct with no padding-sensitive invariants -- an
             // unaligned read is exactly what the kernel's own byte-packed
             // event stream requires.
-            let ev: InotifyEvent = unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) };
+            let ev: InotifyEvent =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) };
             let name_len = ev.len as usize;
             let name_start = off + header_size;
             let name_end = name_start + name_len;
@@ -95,10 +96,8 @@ mod tests {
     /// really produces.
     #[test]
     fn a_real_write_is_reported_by_name() {
-        let dir = std::env::temp_dir().join(format!(
-            "inotify_events_test_{}_a",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("inotify_events_test_{}_a", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let ino = ququmatz::Inotify::new().expect("inotify_init1");
@@ -124,10 +123,8 @@ mod tests {
     /// names on the same watch have.
     #[test]
     fn an_untouched_name_is_not_reported() {
-        let dir = std::env::temp_dir().join(format!(
-            "inotify_events_test_{}_b",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("inotify_events_test_{}_b", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let ino = ququmatz::Inotify::new().expect("inotify_init1");

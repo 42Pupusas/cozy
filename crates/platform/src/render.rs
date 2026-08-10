@@ -1358,10 +1358,24 @@ impl Renderer {
             }
         };
 
+        // Clamp to the grid-aligned content area, not the raw buffer, for the
+        // same reason `draw_cursor_pulse` does: a window's pixel size is rarely
+        // an exact multiple of the cell size, and the leftover sub-cell strip
+        // along the bottom/right belongs to no grid row. `repaint_rows` only
+        // ever repaints whole rows from the cell mirror, so nothing can erase
+        // ink stamped there -- it survives every subsequent frame as a stuck
+        // half-line under the live prompt. The cursor reaches that strip
+        // whenever its animated position is at or past the last row: mid-slide
+        // (a fractional `visual_row` puts the block's lower half below the last
+        // row's baseline) or after a shrink-resize, whose new smaller geometry
+        // reaches the animator a snapshot later than the buffer it draws into.
+        let grid_max_x = (buf_w / self.cell_w) * self.cell_w;
+        let grid_max_y = (buf_h / self.cell_h) * self.cell_h;
+
         let x0 = rx0.floor().max(0.0) as i32;
         let y0 = ry0.floor().max(0.0) as i32;
-        let x1 = rx1.ceil().min(buf_w as f32) as i32;
-        let y1 = ry1.ceil().min(buf_h as f32) as i32;
+        let x1 = rx1.ceil().min(buf_w as f32).min(grid_max_x as f32) as i32;
+        let y1 = ry1.ceil().min(buf_h as f32).min(grid_max_y as f32) as i32;
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -2246,6 +2260,57 @@ mod tests {
                 if x >= cols * cell_w || y >= rows * cell_h {
                     let px = pixels[(y * bw + x) as usize];
                     assert_eq!(px, 0, "dead-strip pixel ({x},{y}) was painted: {px:#x}");
+                }
+            }
+        }
+    }
+
+    // cols/rows are tiny test fixture values, nowhere near f32's precision limit.
+    #[allow(clippy::cast_precision_loss)]
+    #[test]
+    fn cursor_does_not_paint_past_the_grid_aligned_area() {
+        // Same dead-strip setup as the pulse test: a buffer whose height is
+        // NOT a whole number of cells, so the bottom `extra_y` scanlines
+        // belong to no grid row and `repaint_rows` can never erase them.
+        let cell_w = GLYPH_W as u32;
+        let cell_h = GLYPH_H as u32;
+        let extra_x = 5;
+        let extra_y = 5;
+        let cols = 4u32;
+        let rows = 4u32;
+        let bw = cols * cell_w + extra_x;
+        let bh = rows * cell_h + extra_y;
+
+        // Every cursor shape, and both a mid-slide fractional row and a row
+        // past the last valid one (what a shrink-resize leaves in the
+        // animator until the next grid snapshot catches up).
+        for shape in [
+            grid::CursorShape::Block,
+            grid::CursorShape::Bar,
+            grid::CursorShape::Underline,
+        ] {
+            for visual_row in [(rows - 1) as f32 + 0.5, rows as f32, (rows + 3) as f32] {
+                let mut pixels = vec![0u32; (bw * bh) as usize];
+                let renderer = Renderer::builtin(Theme::builtin());
+                let mut canvas = Canvas::new(&mut pixels, bw.cast_signed(), bh.cast_signed());
+                renderer.draw_cursor(
+                    &mut canvas,
+                    (cols - 1) as f32,
+                    visual_row,
+                    shape,
+                    1.0,
+                );
+                for y in 0..bh {
+                    for x in 0..bw {
+                        if x >= cols * cell_w || y >= rows * cell_h {
+                            let px = pixels[(y * bw + x) as usize];
+                            assert_eq!(
+                                px, 0,
+                                "dead-strip pixel ({x},{y}) painted by {shape:?} \
+                                 at visual_row {visual_row}: {px:#x}"
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -134,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut window = Toplevel::new(
         "toplevel spike",
-        "dev.terminal.spike",
+        "cozy.spike",
         LogicalSize {
             width: 800,
             height: 600,

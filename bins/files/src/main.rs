@@ -126,7 +126,7 @@ impl App {
         let surface = platform::SurfaceFormat::from_opacity(cfg.files_opacity());
         let mut window = Toplevel::new_with_format(
             &browser.path().display().to_string(),
-            "dev.terminal.files",
+            "cozy.files",
             size,
             wake,
             theme.background,

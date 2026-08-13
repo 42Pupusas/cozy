@@ -44,7 +44,7 @@ const EVENT_RING_CAP: usize = 1024;
 /// Stable Wayland `app_id` for our toplevel. Fixed (not the caller's title) so
 /// compositor window rules and tooling can match this window reliably even
 /// after the shell rewrites the title at runtime.
-const APP_ID: &str = "forfun.terminal";
+const APP_ID: &str = "cozy.terminal";
 
 /// Minimum interval between edge-of-window autoscroll steps while a
 /// selection drag sits pinned to the top/bottom edge of the content area.

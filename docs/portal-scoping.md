@@ -175,19 +175,19 @@ revertible before the following step begins.
      generic `Value` path) for every key `changed_from` reports.
 
    Ships on the **real** activation name now
-   (`org.freedesktop.impl.portal.desktop.tijaax`) with the on-disk artifacts
-   a real rollout needs: `bins/portal/data/tijaax.portal` (the
+   (`org.freedesktop.impl.portal.desktop.cozy`) with the on-disk artifacts
+   a real rollout needs: `bins/portal/data/cozy.portal` (the
    `DBusName`/`Interfaces`/`UseIn` file `{DATADIR}/xdg-desktop-portal/
    portals/` needs -- confirmed against `xdg-desktop-portal`'s own
    `xdp_portal_config.c`, which searches `$XDG_DATA_HOME/xdg-desktop-portal/
    portals` and each `$XDG_DATA_DIRS` entry, both user-writable, no root
-   required), `bins/portal/data/org.freedesktop.impl.portal.desktop.tijaax
+   required), `bins/portal/data/org.freedesktop.impl.portal.desktop.cozy
    .service.in` (a D-Bus activation `.service` file for
    `/usr/share/dbus-1/services`, matching every other portal backend
-   installed on this machine), and `bins/portal/data/tijaax-portal
+   installed on this machine), and `bins/portal/data/cozy-portal
    .service.in` (a systemd user unit, matching `xdg-desktop-portal-gtk
    .service`'s own shape). Routing Settings via a `portals.conf` entry
-   (`org.freedesktop.impl.portal.Settings=tijaax`) is the one step left
+   (`org.freedesktop.impl.portal.Settings=cozy`) is the one step left
    before this actually intercepts real calls -- deliberately not done
    automatically by this delivery, per section 4's rollback contract:
    flipping that one config line, and reverting it, must stay a manual,

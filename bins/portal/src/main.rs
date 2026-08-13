@@ -11,8 +11,8 @@
 //! a name, run the loop.
 //!
 //! Claims [`SettingsService::NAME`], the real activation name
-//! `bins/portal/data/tijaax.portal` advertises -- see that file and
-//! `bins/portal/data/tijaax-portal.service.in` for the rest of step 5's
+//! `bins/portal/data/cozy.portal` advertises -- see that file and
+//! `bins/portal/data/cozy-portal.service.in` for the rest of step 5's
 //! "ship a real `.portal` file and route it" half.
 
 use dbus::conn::DbusConn;

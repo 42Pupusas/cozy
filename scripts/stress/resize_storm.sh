@@ -12,18 +12,18 @@
 #   * Sway/wlroots -> swaymsg (native Wayland)
 #   * X11/XWayland -> xdotool
 # The window is matched by its Wayland app_id (TermWindow sets a fixed
-# `forfun.terminal` app_id), which — unlike the title — the shell can't
+# `cozy.terminal` app_id), which — unlike the title — the shell can't
 # overwrite, so we never accidentally grab whatever terminal launched us. The
 # X11/xdotool fallback still matches by title (XWayland has no app_id).
 #
 # Usage: run from a DIFFERENT terminal than the one being stressed.
 #   ./resize_storm.sh                     # match the default app_id
-#   ./resize_storm.sh forfun.terminal 500 # explicit app_id + iterations
+#   ./resize_storm.sh cozy.terminal 500   # explicit app_id + iterations
 set -eu
-APP_ID="${1:-forfun.terminal}"
+APP_ID="${1:-cozy.terminal}"
 ITERATIONS="${2:-200}"
 # xdotool has no app_id; on X11 we match the window title instead. Strip a
-# leading `forfun.` so the default still finds a window titled "terminal".
+# leading `cozy.` so the default still finds a window titled "terminal".
 TITLE="${APP_ID##*.}"
 
 # The w/h sweep is shared by every backend: a small, cyclic set of sizes so the

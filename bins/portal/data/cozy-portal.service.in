@@ -1,0 +1,10 @@
+[Unit]
+Description=cozy native portal backend (org.freedesktop.impl.portal.Settings)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.cozy
+ExecStart=@EXEC@
+Slice=session.slice

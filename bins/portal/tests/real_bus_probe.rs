@@ -170,7 +170,7 @@ fn a_real_caller_can_introspect_readall_and_read_the_settings_backend() {
 /// bus connection).
 #[test]
 fn a_config_save_emits_a_real_setting_changed_signal_to_a_subscribed_client() {
-    const NAME: &str = "org.freedesktop.impl.portal.desktop.tijaax.testreload";
+    const NAME: &str = "org.freedesktop.impl.portal.desktop.cozy.testreload";
     if !session_bus_reachable() {
         return;
     }

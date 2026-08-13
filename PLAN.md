@@ -279,7 +279,7 @@ Owns the write half of two read-only crates.
 Owns documentation and the portal's data files. Writes no logic.
 
 17. **Route `Settings`.** Add one line to `portals.conf`:
-    `org.freedesktop.impl.portal.Settings=tijaax`. Restart the session
+    `org.freedesktop.impl.portal.Settings=cozy`. Restart the session
     components. Prove the rollback once, by reverting that line.
     The code, the tests, and the artifacts are done. Until this step happens,
     none of that work carries load.

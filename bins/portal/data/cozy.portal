@@ -1,4 +1,4 @@
 [portal]
-DBusName=org.freedesktop.impl.portal.desktop.tijaax
+DBusName=org.freedesktop.impl.portal.desktop.cozy
 Interfaces=org.freedesktop.impl.portal.Settings
 UseIn=niri

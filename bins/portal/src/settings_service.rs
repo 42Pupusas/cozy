@@ -32,7 +32,7 @@ impl SettingsService {
     pub const IFACE: &'static str = "org.freedesktop.impl.portal.Settings";
 
     /// This backend's real D-Bus activation name, matching
-    /// `bins/portal/data/tijaax.portal`'s `DBusName` exactly -- the two
+    /// `bins/portal/data/cozy.portal`'s `DBusName` exactly -- the two
     /// must agree, or `xdg-desktop-portal` activates this process
     /// expecting it to claim a name it never does, and every call times
     /// out. `docs/portal-scoping.md`'s compatibility/rollback contract
@@ -40,7 +40,7 @@ impl SettingsService {
     /// (`crates/dbus-server`'s own scratch-service test, and
     /// `tests/real_bus_probe.rs`'s `testprobe` name, both still do); this
     /// is the real name now that step 5's frontend path is proven.
-    pub const NAME: &'static str = "org.freedesktop.impl.portal.desktop.tijaax";
+    pub const NAME: &'static str = "org.freedesktop.impl.portal.desktop.cozy";
 
     /// This interface's reported version. `2` matches the shape this
     /// backend actually answers (`ReadAll`/`Read` over all four

@@ -43,7 +43,7 @@ pub mod pointer;
 pub mod shell;
 pub mod window;
 
-pub use activation::{Activation, ActivationToken, TOKEN_ENV};
+pub use activation::{Activation, ActivationToken, LaunchEvidence, TOKEN_ENV};
 pub use drag::{DragController, Dropped};
 pub use geometry::{Geometry, LogicalSize, PhysicalSize};
 pub use globals::{ToplevelGlobals, ToplevelGlobalsBuilder};

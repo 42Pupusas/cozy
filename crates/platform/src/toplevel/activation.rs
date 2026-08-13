@@ -74,6 +74,24 @@ impl ActivationToken {
     }
 }
 
+/// What a launch presents as evidence that the user asked for it.
+///
+/// One struct rather than four loose parameters because the compositor
+/// weighs them together: the serial and the surface are the trustworthy
+/// part, and separating them at the call site invites passing a serial from
+/// one event with the surface of another.
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchEvidence<'a> {
+    /// The seat the input event came from.
+    pub seat: SeatId,
+    /// The surface that had focus when the user acted.
+    pub surface: SurfaceId,
+    /// The serial of the input event that caused the launch.
+    pub serial: u32,
+    /// The app id being launched, when the launcher knows it.
+    pub app_id: Option<&'a str>,
+}
+
 /// Mints activation tokens from a bound `xdg_activation_v1`.
 ///
 /// Its own type rather than a method on the window because the *global* is
@@ -107,18 +125,12 @@ impl Activation {
 
     /// Ask the compositor for a token, and block until it answers.
     ///
-    /// `serial` is the input event that triggered the launch and `surface`
-    /// is the surface that had focus when it happened. Both are what make
-    /// the token trustworthy: they are the compositor's own evidence that a
-    /// user acted, replayed back to it.
+    /// `evidence` carries the input serial and focused surface that make the
+    /// token trustworthy -- see [`LaunchEvidence`].
     ///
-    /// `app_id` names the program being launched, which lets the compositor
-    /// apply the right window rule to a window that does not exist yet.
-    /// Pass `None` when the launcher does not know it -- a file browser
-    /// resolves a handler by MIME type and may never learn its app id. That
-    /// is not the same as passing `""`, which asks the compositor to match
-    /// rules for an application named nothing; the request is omitted
-    /// instead, exactly as the protocol allows.
+    /// Anything popped off `events` that is not our answer is moved to
+    /// `deferred` for the caller to route afterwards; see
+    /// [`Self::await_done`] for why none of it may be dropped.
     ///
     /// Returns `None` when the compositor does not answer within
     /// [`Self::TOKEN_TIMEOUT`], so the caller launches unactivated rather
@@ -127,10 +139,8 @@ impl Activation {
         &self,
         sender: &mut Sender,
         events: &mut Consumer<RawEvent>,
-        seat: SeatId,
-        surface: SurfaceId,
-        serial: u32,
-        app_id: Option<&str>,
+        deferred: &mut std::collections::VecDeque<RawEvent>,
+        evidence: LaunchEvidence<'_>,
     ) -> Result<Option<ActivationToken>> {
         let token: ActivationTokenId = sender.alloc_id();
         sender.request(
@@ -138,20 +148,20 @@ impl Activation {
         )?;
         sender.request(
             MessageBuilder::new(token, ActivationTokenRequest::SetSerial)
-                .u32(serial)
-                .object(seat),
+                .u32(evidence.serial)
+                .object(evidence.seat),
         )?;
-        if let Some(app_id) = app_id {
+        if let Some(app_id) = evidence.app_id {
             sender.request(
                 MessageBuilder::new(token, ActivationTokenRequest::SetAppId).string(app_id),
             )?;
         }
         sender.request(
-            MessageBuilder::new(token, ActivationTokenRequest::SetSurface).object(surface),
+            MessageBuilder::new(token, ActivationTokenRequest::SetSurface).object(evidence.surface),
         )?;
         sender.request(MessageBuilder::new(token, ActivationTokenRequest::Commit))?;
 
-        let done = Self::await_done(events, token)?;
+        let done = Self::await_done(events, deferred, token)?;
 
         // The token object is spent once `done` arrives, whether or not we
         // got a string out of it.
@@ -176,21 +186,31 @@ impl Activation {
 
     /// Pump events until our token object reports `done`, or time runs out.
     ///
-    /// Events for other objects are dropped rather than requeued. This runs
-    /// during a launch, between event-loop turns, so the only traffic worth
-    /// keeping is the answer we asked for; a display error still aborts,
-    /// because continuing past one is never correct.
+    /// Every event that is not our `done` is moved to `deferred` in arrival
+    /// order, for the caller to route once the exchange finishes. This
+    /// consumer is the window's only source of pointer, keyboard, configure
+    /// and frame events, and `RawEvent::Fd` deliveries correlate with the
+    /// message before them by position. Dropping anything here would lose
+    /// input, stall presentation, and break that correlation -- so nothing
+    /// is dropped. A display error still aborts, because continuing past one
+    /// is never correct.
     fn await_done(
         events: &mut Consumer<RawEvent>,
+        deferred: &mut std::collections::VecDeque<RawEvent>,
         token: ActivationTokenId,
     ) -> Result<Option<String>> {
         let deadline = std::time::Instant::now() + Self::TOKEN_TIMEOUT;
         while std::time::Instant::now() < deadline {
-            let Some(RawEvent::Bytes(bytes)) = events.pop() else {
+            let Some(event) = events.pop() else {
                 std::thread::yield_now();
                 continue;
             };
-            let Some((mut ev, _)) = WireEvent::parse(&bytes) else {
+            let RawEvent::Bytes(bytes) = &event else {
+                deferred.push_back(event);
+                continue;
+            };
+            let Some((mut ev, _)) = WireEvent::parse(bytes) else {
+                deferred.push_back(event);
                 continue;
             };
 
@@ -209,6 +229,7 @@ impl Activation {
             {
                 return Ok(Some(ev.string()));
             }
+            deferred.push_back(event);
         }
         Ok(None)
     }
@@ -256,8 +277,72 @@ mod tests {
             ))
             .split();
         let started = std::time::Instant::now();
-        let got = Activation::await_done(&mut consumer, ActivationTokenId(9)).expect("no error");
+        let mut deferred = std::collections::VecDeque::new();
+        let got = Activation::await_done(&mut consumer, &mut deferred, ActivationTokenId(9))
+            .expect("no error");
         assert!(got.is_none());
         assert!(started.elapsed() >= Activation::TOKEN_TIMEOUT);
+    }
+
+    /// The regression that wedged the file browser: this consumer is the
+    /// window's *only* source of pointer, keyboard, configure and frame
+    /// events. Dropping what we pop while waiting loses user input and
+    /// stalls presentation until the reader's progress guard gives up.
+    #[test]
+    fn events_that_are_not_ours_are_kept_for_the_caller() {
+        let (producer, mut consumer) =
+            quetzalcoatl::spsc::RingBuffer::<RawEvent>::new(quetzalcoatl::capacity::Capacity::exact(
+                8,
+            ))
+            .split();
+        // Not object 1: that is wl_display, whose opcode 0 is `error`.
+        for object in 41u32..=43 {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&object.to_ne_bytes());
+            bytes.extend_from_slice(&(8u32 << 16).to_ne_bytes());
+            producer
+                .push_block(RawEvent::Bytes(bytes.into()))
+                .expect("consumer alive");
+        }
+
+        let mut deferred = std::collections::VecDeque::new();
+        let got = Activation::await_done(&mut consumer, &mut deferred, ActivationTokenId(99))
+            .expect("no error");
+
+        assert!(got.is_none());
+        assert_eq!(deferred.len(), 3, "every foreign event must be preserved");
+    }
+
+    /// A deferred event must keep its place: a `RawEvent::Fd` is correlated
+    /// with the message before it by position alone, so reordering hands a
+    /// keymap fd to the wrong event.
+    #[test]
+    fn deferred_events_keep_their_arrival_order() {
+        let (producer, mut consumer) =
+            quetzalcoatl::spsc::RingBuffer::<RawEvent>::new(quetzalcoatl::capacity::Capacity::exact(
+                8,
+            ))
+            .split();
+        for object in [11u32, 22, 33] {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&object.to_ne_bytes());
+            bytes.extend_from_slice(&(8u32 << 16).to_ne_bytes());
+            producer
+                .push_block(RawEvent::Bytes(bytes.into()))
+                .expect("consumer alive");
+        }
+
+        let mut deferred = std::collections::VecDeque::new();
+        Activation::await_done(&mut consumer, &mut deferred, ActivationTokenId(99))
+            .expect("no error");
+
+        let seen: Vec<u32> = deferred
+            .iter()
+            .filter_map(|ev| match ev {
+                RawEvent::Bytes(b) => WireEvent::parse(b).map(|(e, _)| e.object_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(seen, vec![11, 22, 33]);
     }
 }

@@ -92,6 +92,15 @@ pub struct Toplevel {
     request_rx: mpsc::Consumer<crate::conn::WindowRequest>,
     window_tx: WindowSender,
     events: Consumer<RawEvent>,
+    /// Events popped off `events` by a synchronous exchange that was
+    /// looking for one specific reply, held in arrival order until
+    /// [`Self::tick`] routes them.
+    ///
+    /// `events` is this window's only source of input, configure and frame
+    /// events, and a `RawEvent::Fd` correlates with the message before it by
+    /// position. So a blocking round trip may not discard what it pops, and
+    /// may not reorder it either.
+    deferred: std::collections::VecDeque<RawEvent>,
     reader: Option<std::thread::JoinHandle<Result<()>>>,
     reader_health: crate::ReaderHealth,
     wake: waker::Waker,
@@ -313,6 +322,7 @@ impl Toplevel {
             keyboard: KeyboardState::new(),
             xkb: None,
             awaiting_keymap_fd: None,
+            deferred: std::collections::VecDeque::new(),
             drag,
             activation: activation.map(crate::toplevel::activation::Activation::new),
         };
@@ -358,17 +368,26 @@ impl Toplevel {
         app_id: Option<&str>,
     ) -> Option<crate::toplevel::activation::ActivationToken> {
         let activation = self.activation?;
-        activation
-            .request(
-                &mut self.sender,
-                &mut self.events,
-                self.seat,
-                self.shell.surface,
-                self.pointer.last_serial(),
+        match activation.request(
+            &mut self.sender,
+            &mut self.events,
+            &mut self.deferred,
+            crate::toplevel::activation::LaunchEvidence {
+                seat: self.seat,
+                surface: self.shell.surface,
+                serial: self.pointer.last_serial(),
                 app_id,
-            )
-            .ok()
-            .flatten()
+            },
+        ) {
+            Ok(token) => token,
+            // Reported, not swallowed: a protocol error means the compositor
+            // is about to drop the connection, and the window would
+            // otherwise die a few frames later with no stated cause.
+            Err(e) => {
+                eprintln!("platform: activation token unavailable: {e}");
+                None
+            }
+        }
     }
 
     /// Whether the compositor can issue activation tokens.
@@ -439,6 +458,12 @@ impl Toplevel {
     /// until something happens.
     pub fn tick(&mut self, painter: &mut impl Painter) -> Result<()> {
         self.sender.drain_requests(&mut self.request_rx)?;
+        // Deferred first: these arrived *before* anything still queued in
+        // `events`, and routing them out of order would apply a stale
+        // configure or mis-pair a keymap fd.
+        while let Some(ev) = self.deferred.pop_front() {
+            self.handle_event(ev, painter)?;
+        }
         while let Some(ev) = self.events.pop() {
             self.handle_event(ev, painter)?;
         }

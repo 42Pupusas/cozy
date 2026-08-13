@@ -421,6 +421,8 @@ dependencies = [
 [[package]]
 name = "quetzal-uring"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30a68ec4d2aebbf6738f5f47d804c4853be7093d2b3b100f1e325fb0227b9ee0"
 dependencies = [
  "quetzalcoatl",
  "ququmatz",
@@ -428,7 +430,9 @@ dependencies = [
 
 [[package]]
 name = "quetzalcoatl"
-version = "0.13.0"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d8cd58a47b5eee43376c57194902bae665cf6960eb841ff7cde00d2adfb04a8"
 
 [[package]]
 name = "quote"
@@ -441,7 +445,9 @@ dependencies = [
 
 [[package]]
 name = "ququmatz"
-version = "0.15.0"
+version = "0.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c73f784a5c91fc9d1dc48016bfff71f2955f2cf430fb34bf3fff98b6ecc77b56"
 
 [[package]]
 name = "regex-lite"

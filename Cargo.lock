@@ -369,6 +369,7 @@ name = "platform-sys"
 version = "0.1.0"
 dependencies = [
  "ququmatz",
+ "scm-rights",
 ]
 
 [[package]]
@@ -458,6 +459,13 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys",
+]
+
+[[package]]
+name = "scm-rights"
+version = "0.1.0"
+dependencies = [
+ "ququmatz",
 ]
 
 [[package]]

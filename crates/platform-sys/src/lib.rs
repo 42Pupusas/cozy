@@ -35,7 +35,7 @@ use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
-use ququmatz::types::{IoVec, MsgHdr};
+
 
 /// The write-bytes-then-close response shape shared by every Wayland
 /// `*_source.send` handler (clipboard, drag-and-drop, `data-control`).
@@ -167,167 +167,13 @@ impl Timespec {
 }
 
 // --- ancillary-data (SCM_RIGHTS) assembly --------------------------------
-// The cmsg layout is the same regardless of who issues the sendmsg. We build
-// the control buffer and point a `ququmatz::MsgHdr` at it; the actual transmit
-// is an io_uring SENDMSG SQE in `conn`.
-
-const SOL_SOCKET: i32 = 1;
-const SCM_RIGHTS: i32 = 1;
-
-// `struct cmsghdr` — the header of one ancillary-data item. `#[repr(C)]`
-// only pins layout (order/type/size), not names, so the fields drop the
-// shared `cmsg_` prefix the C struct uses.
-#[repr(C)]
-struct CmsgHdr {
-    len: size_t,
-    level: i32,
-    kind: i32,
-}
-
-const CMSG_HDR_LEN: usize = std::mem::size_of::<CmsgHdr>();
-
-/// Extension trait rounding a byte length up to the platform word
-/// alignment, matching the kernel's `CMSG_ALIGN`.
-///
-/// Was a free `cmsg_align(len: usize)` function -- its sole argument is a
-/// bare `usize`, so it reads as a method on that value
-/// (`len.cmsg_aligned()`), matching the `RawSyscallReturn`-on-`isize` style
-/// used in `pty::sys` for the same kind of "raw primitive, no natural
-/// receiver type" helper.
-trait CmsgAlign {
-    fn cmsg_aligned(self) -> Self;
-}
-
-impl CmsgAlign for usize {
-    fn cmsg_aligned(self) -> Self {
-        let a = std::mem::size_of::<Self>();
-        (self + a - 1) & !(a - 1)
-    }
-}
-
-/// A `sendmsg`/`recvmsg` message: a data buffer plus an optional `SCM_RIGHTS` control buffer.
-///
-/// Owns its `iovec` and control bytes so the pointers in the [`MsgHdr`] it
-/// produces stay valid as long as `self` is alive — the caller must keep it
-/// alive until the `io_uring` SENDMSG completes.
-pub struct OutgoingMessage {
-    iov: IoVec,
-    control: Vec<u8>,
-}
-
-impl OutgoingMessage {
-    /// Build a message that sends `bytes`, attaching `fds` as `SCM_RIGHTS`
-    /// ancillary data. `bytes` must outlive the message (we borrow it into the
-    /// iovec).
-    #[must_use]
-    pub fn new(bytes: &[u8], fds: &[BorrowedFd<'_>]) -> Self {
-        // SAFETY: `bytes` outlives the message per the contract above; IoVec
-        // borrows the pointer/len for the duration of the send.
-        let iov = unsafe { IoVec::new(bytes.as_ptr().cast_mut(), bytes.len()) };
-
-        let control = if fds.is_empty() {
-            Vec::new()
-        } else {
-            let fd_bytes = std::mem::size_of::<RawFd>() * fds.len();
-            let total = (CMSG_HDR_LEN + fd_bytes).cmsg_aligned();
-            let mut buf = vec![0u8; total];
-            // SAFETY: `buf` is sized for the header + fd payload computed above;
-            // we write exactly that layout.
-            unsafe {
-                // The cast itself never gets dereferenced typed -- only fed
-                // to `write_unaligned` below -- so the pointer's alignment
-                // genuinely doesn't matter here.
-                #[allow(clippy::cast_ptr_alignment)]
-                let cmsg = buf.as_mut_ptr().cast::<CmsgHdr>();
-                cmsg.write_unaligned(CmsgHdr {
-                    len: CMSG_HDR_LEN + fd_bytes,
-                    level: SOL_SOCKET,
-                    kind: SCM_RIGHTS,
-                });
-                let data = buf.as_mut_ptr().add(CMSG_HDR_LEN).cast::<RawFd>();
-                for (i, fd) in fds.iter().enumerate() {
-                    data.add(i).write(fd.as_raw_fd());
-                }
-            }
-            buf
-        };
-
-        Self { iov, control }
-    }
-
-    /// Produce a [`MsgHdr`] referencing this message's iovec and control
-    /// buffer. The returned header borrows `self`; keep `self` alive until the
-    /// send completes.
-    pub fn header(&mut self) -> MsgHdr {
-        let mut hdr = MsgHdr::default();
-        hdr.msg_iov = &raw mut self.iov;
-        hdr.msg_iovlen = 1;
-        if self.control.is_empty() {
-            hdr.msg_control = std::ptr::null_mut();
-            hdr.msg_controllen = 0;
-        } else {
-            hdr.msg_control = self.control.as_mut_ptr();
-            hdr.msg_controllen = self.control.len();
-        }
-        hdr
-    }
-}
-
-/// The received counterpart to [`OutgoingMessage`]: reading `SCM_RIGHTS`
-/// ancillary data back out of a control (cmsg) region the kernel wrote.
-///
-/// A zero-sized namespace rather than free functions at module scope -- same
-/// reasoning as `pty::sys::RawPty`: there's no fd/message value in hand yet
-/// to attach these to (they parse one), so the idiomatic home is an
-/// associated function on a type that names the concept, not a bare
-/// module-level fn.
-pub struct IncomingControl;
-
-impl IncomingControl {
-    /// The fixed control-region width to reserve on every multishot recvmsg,
-    /// sized to hold one `SCM_RIGHTS` cmsg carrying up to `max_fds`
-    /// descriptors. This is the `msg_controllen` set on the persistent recv
-    /// `MsgHdr` -- and thus the width of the control region inside each
-    /// provided buffer.
-    #[must_use]
-    pub fn reserve_len(max_fds: usize) -> usize {
-        (CMSG_HDR_LEN + std::mem::size_of::<RawFd>() * max_fds).cmsg_aligned()
-    }
-
-    /// Parse `SCM_RIGHTS` file descriptors out of a received control (cmsg)
-    /// region, taking ownership of each. `control` is the control slice the
-    /// kernel wrote -- e.g. `RecvmsgParts::control` from a multishot recvmsg
-    /// buffer.
-    #[must_use]
-    pub fn fds(control: &[u8]) -> Vec<OwnedFd> {
-        use std::os::fd::FromRawFd;
-        let mut fds = Vec::new();
-        if control.len() >= CMSG_HDR_LEN {
-            // SAFETY: a control region of at least CMSG_HDR_LEN bytes holds a
-            // valid cmsghdr; we read its fields and, if SCM_RIGHTS, the fd
-            // payload behind it (bounded by cmsg_len, which the kernel set).
-            unsafe {
-                // Same unaligned-read rationale as the write side above.
-                #[allow(clippy::cast_ptr_alignment)]
-                let cmsg = control.as_ptr().cast::<CmsgHdr>();
-                let hdr = cmsg.read_unaligned();
-                if hdr.level == SOL_SOCKET
-                    && hdr.kind == SCM_RIGHTS
-                    && hdr.len >= CMSG_HDR_LEN
-                    && hdr.len <= control.len()
-                {
-                    let payload = hdr.len - CMSG_HDR_LEN;
-                    let count = payload / std::mem::size_of::<RawFd>();
-                    let data = control.as_ptr().add(CMSG_HDR_LEN).cast::<RawFd>();
-                    for i in 0..count {
-                        fds.push(OwnedFd::from_raw_fd(data.add(i).read()));
-                    }
-                }
-            }
-        }
-        fds
-    }
-}
+// The cmsg layout is the same regardless of who issues the sendmsg, so it
+// now lives in `crates/scm-rights`, shared with `crates/dbus` (D-Bus unix FD
+// passing needs the identical bytes). Re-exported here so every existing
+// `platform::sys::OutgoingMessage` / `IncomingControl` call site keeps
+// compiling unchanged. The actual transmit stays an io_uring SENDMSG SQE in
+// `conn`.
+pub use scm_rights::{IncomingControl, OutgoingMessage};
 
 // --- AF_UNIX address ------------------------------------------------------
 
@@ -695,7 +541,6 @@ use std::os::fd::AsFd;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd;
 
     fn io_err(msg: &str) -> io::Error {
         io::Error::other(msg.to_string())
@@ -940,78 +785,6 @@ mod tests {
     }
 
     #[test]
-    fn incoming_control_fds_empty_control_region_yields_no_fds() {
-        assert!(IncomingControl::fds(&[]).is_empty());
-        assert!(IncomingControl::fds(&[0u8; 4]).is_empty());
-    }
-
-    #[test]
-    fn incoming_control_fds_roundtrips_through_outgoing_message() {
-        // Build a real SCM_RIGHTS control buffer via `OutgoingMessage` (the
-        // send side) using stdin's fd (always valid in a test process), then
-        // parse it back with `IncomingControl::fds` (the receive side) and
-        // confirm we get exactly one fd out.
-        let stdin = std::io::stdin();
-        let fd = stdin.as_fd();
-        let mut msg = OutgoingMessage::new(b"hello", &[fd]);
-        let hdr = msg.header();
-        assert!(!hdr.msg_control.is_null());
-        // Reconstruct the control region as a byte slice the way a received
-        // cmsg buffer would look.
-        let control =
-            unsafe { std::slice::from_raw_parts(hdr.msg_control.cast_const(), hdr.msg_controllen) };
-        let fds = IncomingControl::fds(control);
-        assert_eq!(fds.len(), 1);
-    }
-
-    #[test]
-    fn incoming_control_fds_reserve_len_grows_with_max_fds() {
-        let one = IncomingControl::reserve_len(1);
-        let many = IncomingControl::reserve_len(16);
-        // Alignment can make adjacent fd counts collide on the same rounded
-        // word boundary, so compare a small count against a much larger one
-        // to guarantee a real difference.
-        assert!(many > one);
-        // Always at least big enough for the cmsg header itself.
-        assert!(one >= CMSG_HDR_LEN);
-        assert_eq!(IncomingControl::reserve_len(0), CMSG_HDR_LEN.cmsg_aligned());
-    }
-
-    #[test]
-    fn incoming_control_fds_rejects_truncated_cmsg_len() {
-        // A header claiming a cmsg_len larger than the actual control slice
-        // must be treated as absent, not read out of bounds.
-        let mut buf = vec![0u8; CMSG_HDR_LEN];
-        unsafe {
-            // Never dereferenced typed, only fed to `write_unaligned` --
-            // same rationale as the non-test call site above.
-            #[allow(clippy::cast_ptr_alignment)]
-            let cmsg = buf.as_mut_ptr().cast::<CmsgHdr>();
-            cmsg.write_unaligned(CmsgHdr {
-                len: 9999, // way past buf.len()
-                level: SOL_SOCKET,
-                kind: SCM_RIGHTS,
-            });
-        }
-        assert!(IncomingControl::fds(&buf).is_empty());
-    }
-
-    #[test]
-    fn incoming_control_fds_ignores_non_scm_rights_cmsg() {
-        let mut buf = vec![0u8; CMSG_HDR_LEN + 8];
-        unsafe {
-            #[allow(clippy::cast_ptr_alignment)]
-            let cmsg = buf.as_mut_ptr().cast::<CmsgHdr>();
-            cmsg.write_unaligned(CmsgHdr {
-                len: CMSG_HDR_LEN + 8,
-                level: SOL_SOCKET,
-                kind: 99, // not SCM_RIGHTS
-            });
-        }
-        assert!(IncomingControl::fds(&buf).is_empty());
-    }
-
-    #[test]
     fn shm_resize_grows_only_when_needed_and_shrinks_lazily() {
         // Start small, then walk the size around to exercise grow + lazy shrink.
         let mut shm = ShmBuffer::new(64, 64, 2).expect("initial alloc");
@@ -1040,14 +813,5 @@ mod tests {
         // Growing again but still within the retained capacity stays lazy.
         assert!(shm.resize(150, 150).expect("regrow within cap").is_none());
         assert_eq!(shm.size_bytes(), cap1);
-    }
-
-    #[test]
-    fn cmsg_align_rounds_up_to_word_size() {
-        let word = std::mem::size_of::<size_t>();
-        assert_eq!(0usize.cmsg_aligned(), 0);
-        assert_eq!(1usize.cmsg_aligned(), word);
-        assert_eq!(word.cmsg_aligned(), word);
-        assert_eq!((word + 1).cmsg_aligned(), word * 2);
     }
 }

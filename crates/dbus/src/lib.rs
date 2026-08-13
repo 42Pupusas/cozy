@@ -18,6 +18,9 @@
 //!   of [`value::Unmarshaller`] — needed once a caller must return an
 //!   arbitrary signature (e.g. portal replies) rather than the handful of
 //!   shapes `message::MessageBuilder` hand-writes for our own outbound calls.
+//! * [`fds`] — unix descriptor passing: `SCM_RIGHTS` over the bus socket,
+//!   the arrival-ordered staging every `h` index refers into, and the
+//!   `AGREE_UNIX_FD` negotiation flag.
 //! * [`sys`] — the unavoidable libc sliver (socket creation, `sockaddr_un`,
 //!   `geteuid`).
 //! * [`session_address`] — [`session_address::SessionAddress`], resolving
@@ -34,6 +37,7 @@
 
 pub mod bluez;
 pub mod conn;
+pub mod fds;
 pub mod logind;
 pub mod marshal;
 pub mod message;

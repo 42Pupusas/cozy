@@ -100,6 +100,9 @@ pub struct DbusConn {
     /// one eaten. Queueing here and having `recv_one_message` drain it first
     /// restores FIFO order across both call sites sharing one socket.
     pending: std::collections::VecDeque<Reply>,
+    /// Descriptor passing: the `AGREE_UNIX_FD` outcome and the staging queue
+    /// every received `h` index refers into. See [`crate::fds`].
+    fds: crate::fds::FdPassing,
 }
 
 impl DbusConn {
@@ -155,6 +158,7 @@ impl DbusConn {
             ring,
             next_serial: 1,
             pending: std::collections::VecDeque::new(),
+            fds: crate::fds::FdPassing::new(),
         };
         conn.authenticate()?;
         conn.hello()?;
@@ -403,7 +407,12 @@ impl DbusConn {
             return Err(DbusError::AuthRejected(line));
         }
         self.send_raw(b"NEGOTIATE_UNIX_FD\r\n")?;
-        let _ = self.recv_line()?; // "AGREE_UNIX_FD" or "ERROR" -- either way, proceed unix-fd-less
+        // "AGREE_UNIX_FD" or "ERROR". Either way the connection proceeds --
+        // a bus without FD passing still serves every other call -- but the
+        // answer is recorded rather than discarded, so an attempt to send a
+        // descriptor later fails loudly instead of dropping it silently.
+        let answer = self.recv_line()?;
+        self.fds.set_negotiated(answer.starts_with("AGREE_UNIX_FD"));
         self.send_raw(b"BEGIN\r\n")?;
         Ok(())
     }
@@ -613,6 +622,24 @@ impl DbusConn {
     #[must_use]
     pub const fn raw_fd(&self) -> i32 {
         self.sock_fd.as_i32()
+    }
+
+    /// Did the peer agree to unix descriptor passing during SASL?
+    ///
+    /// A caller that means to use an FD-bearing interface should check this
+    /// rather than discover the refusal on the first attempt.
+    #[must_use]
+    pub const fn supports_unix_fds(&self) -> bool {
+        self.fds.is_negotiated()
+    }
+
+    /// Claim the descriptors belonging to a received message, in the order
+    /// they arrived -- which is the order its `h` indexes count in.
+    ///
+    /// `None` when fewer than `count` have arrived.
+    #[must_use]
+    pub fn claim_unix_fds(&mut self, count: usize) -> Option<Vec<std::os::fd::OwnedFd>> {
+        self.fds.claim(count)
     }
 
     /// Pop the next message, preferring anything already queued by a prior

@@ -58,6 +58,10 @@ mod field_code {
     pub const DESTINATION: u8 = 6;
     pub const SENDER: u8 = 7;
     pub const SIGNATURE: u8 = 8;
+    /// How many `SCM_RIGHTS` descriptors ride with this message. The `h`
+    /// values in the body are indexes into that array, so a receiver needs
+    /// this count to know how many descriptors the message owns.
+    pub const UNIX_FDS: u8 = 9;
 }
 
 /// Builds outgoing method-call wire frames (header + body). A zero-sized
@@ -540,6 +544,13 @@ pub struct Reply {
     pub reply_serial: Option<u32>,
     pub signature: String,
     pub body: Vec<u8>,
+    /// The `UNIX_FDS` header field: how many descriptors arrived with this
+    /// message. Zero on every message that carries none, which is all of
+    /// them until a caller uses an FD-bearing interface.
+    ///
+    /// A `Value::UnixFd` in the body is an *index*, valid only against the
+    /// descriptors claimed for this message. See [`crate::fds`].
+    pub unix_fds: u32,
 }
 
 impl Reply {
@@ -619,6 +630,7 @@ impl Reply {
         let mut path = None;
         let mut interface = None;
         let mut member = None;
+        let mut unix_fds = 0u32;
 
         // Header fields are an ARRAY of STRUCT(BYTE, VARIANT), each struct
         // 8-aligned within the fields array's own start (which is itself
@@ -658,6 +670,9 @@ impl Reply {
                 field_code::REPLY_SERIAL => {
                     reply_serial = val.as_u64().map(|n| u32::try_from(n).unwrap_or(u32::MAX));
                 }
+                field_code::UNIX_FDS => {
+                    unix_fds = val.as_u64().map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+                }
                 _ => {}
             }
             offset = next;
@@ -685,6 +700,7 @@ impl Reply {
             reply_serial,
             signature,
             body,
+            unix_fds,
         })
     }
 }
@@ -810,6 +826,55 @@ mod tests {
         assert_eq!(reply.kind, MessageType::MethodReturn);
         assert_eq!(reply.signature, "s");
         assert_eq!(reply.values(), vec![Value::Str("hello".into())]);
+    }
+
+    /// A message that carries descriptors declares how many in its
+    /// `UNIX_FDS` header field. Without reading it back a receiver cannot
+    /// tell how many of the staged descriptors belong to this message.
+    #[test]
+    fn parse_message_reads_back_the_unix_fds_header_field() {
+        let mut header_fields = Vec::new();
+        MessageBuilder::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', "h");
+        MessageBuilder::pad_to(&mut header_fields, 8);
+        header_fields.push(field_code::UNIX_FDS);
+        header_fields.extend_from_slice(&[1, b'u', 0]);
+        MessageBuilder::pad_to(&mut header_fields, 4);
+        header_fields.extend_from_slice(&3u32.to_le_bytes());
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut out = vec![b'l', MessageType::MethodReturn.as_byte(), 0, 1];
+        let body_len = u32::try_from(body.len()).expect("test body fits in u32");
+        let header_fields_len =
+            u32::try_from(header_fields.len()).expect("test header fields fit in u32");
+        out.extend_from_slice(&body_len.to_le_bytes());
+        out.extend_from_slice(&7u32.to_le_bytes());
+        out.extend_from_slice(&header_fields_len.to_le_bytes());
+        out.extend_from_slice(&header_fields);
+        MessageBuilder::pad_to(&mut out, 8);
+        out.extend_from_slice(&body);
+
+        let reply = Reply::parse_message(&out).expect("a well-formed fd-bearing reply");
+        assert_eq!(reply.unix_fds, 3);
+        assert_eq!(reply.signature, "h");
+        assert_eq!(reply.values(), vec![Value::UnixFd(0)]);
+    }
+
+    /// Every message this crate sends today carries no descriptors, so the
+    /// absent field must read as zero rather than leaving a stale count.
+    #[test]
+    fn a_message_without_the_field_reports_no_descriptors() {
+        let frame = MessageBuilder::build_method_call(
+            1,
+            "org.example.Dest",
+            "/org/example",
+            "org.example.Iface",
+            "Member",
+            &[],
+        );
+        let reply = Reply::parse_message(&frame).expect("a well-formed call");
+        assert_eq!(reply.unix_fds, 0);
     }
 
     #[test]

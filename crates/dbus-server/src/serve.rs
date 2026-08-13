@@ -215,6 +215,7 @@ mod tests {
             reply_serial: None,
             signature: signature.to_string(),
             body,
+            unix_fds: 0,
         }
     }
 

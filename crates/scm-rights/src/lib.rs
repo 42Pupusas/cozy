@@ -7,6 +7,9 @@
 //!
 //! * [`OutgoingMessage`] — build the control buffer and the [`MsgHdr`]
 //!   pointing at it.
+//! * [`IncomingMessage`] — the receive-side mirror: a payload buffer plus a
+//!   control region sized for a descriptor count, holding the [`MsgHdr`]
+//!   still so the kernel can write back into it.
 //! * [`IncomingControl`] — take ownership of the descriptors the kernel
 //!   wrote into a received control region.
 //!
@@ -29,9 +32,11 @@
 
 mod cmsg;
 mod incoming;
+mod incoming_message;
 mod outgoing;
 
 pub use incoming::IncomingControl;
+pub use incoming_message::IncomingMessage;
 pub use outgoing::OutgoingMessage;
 
 #[cfg(test)]

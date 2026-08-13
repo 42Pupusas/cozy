@@ -2,6 +2,10 @@
 
 Status: **implementation plan** — refreshed 2026-07-29.
 
+Parent document: `PLAN.md`, the workspace-level plan. That document owns the
+overall goal and the delivery order. This one stays authoritative for portal
+internals: the interface list, the architecture, and the rollback contract.
+
 ## 0. Decision and boundary
 
 We will replace selected `xdg-desktop-portal` **backend** interfaces first by

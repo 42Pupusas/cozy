@@ -1,523 +1,274 @@
-# terminal — Project Plan
+# Plan
 
-A from-scratch terminal emulator written in pure Rust with minimal external
-dependencies. Think Alacritty / Ghostty but owned end-to-end.
+Status: **rewritten 2026-07-30**, to match the workspace as it is.
+
+The first plan described one terminal emulator that did not exist yet. That
+terminal exists. Eight more binaries exist beside it. This document therefore
+changes subject.
+
+Sibling documents:
+
+- `docs/portal-scoping.md` — the portal backend's own delivery plan. It stays
+  authoritative for portal internals.
+- `docs/filebrowser-scoping.md` — the file browser's scoping note.
+- `DESIGN_GUIDE.md` — visual language.
 
 ---
 
-## Guiding principles
+## 1. Goal
 
-- **Zero external deps** where possible. Every crate we pull in must be
-  justified. Prefer rolling our own tooling crates.
-- **Rust only.** No C glue, no bindgen, no `build.rs` shelling out to system
+Replace `xdg-desktop-portal` and the `xdg-utils` command-line tools with our
+own implementations.
+
+The desktop session must run on this workspace's binaries alone. No GTK portal
+backend. No `xdg-open`. No shell-outs to other projects' tools.
+
+Two constraints bound the goal:
+
+- We replace only what a real local caller needs. We do not chase Flatpak
+  completeness.
+- We keep the rollback path. Each interface routes independently.
+
+### Non-goals
+
+| Area | Reason |
+|---|---|
+| `ScreenCast`, `RemoteDesktop`, `Camera` | These need PipeWire. |
+| `Secret` | A secret store is security-sensitive work with no portal payoff. |
+| `Documents` | This needs a FUSE filesystem. It only helps sandboxed apps. |
+| GPU rendering | The software renderer is fast enough. See section 6. |
+
+---
+
+## 2. Rules
+
+These rules did not change. They still hold.
+
+- **Zero external dependencies.** Justify every crate. Prefer our own tooling
+  crates. Only `divan` (in `benches/`) comes from crates.io today.
+- **Rust only.** No C glue. No bindgen. No `build.rs` that calls system
   libraries.
-- **No async runtimes.** No Tokio, no async-std, no `Future`s in the hot path.
-  Concurrency is expressed as threads communicating over ring buffers.
-- **Message-passing over shared state.** All cross-thread and cross-boundary
-  communication goes through ring buffers. Two flavours:
-  - *Kernel boundary* → `io_uring` via `ququmatz` / `quetzal-uring`
-  - *Intra-process* → lock-free userspace rings via `quetzalcoatl`
-- **Workspace-first.** Each concern is its own crate under `crates/`. The top-
-  level binary in `bins/terminal` wires them together.
-- **Full clippy lints.** `pedantic`, `nursery`, `perf`, `style` — doc-related
-  lints are the only exceptions allowed.
+- **No async runtimes.** Threads communicate over ring buffers. Blocking
+  happens in the kernel, or on a ring's wait path.
+- **Message passing, not shared state.** Use `io_uring` at the kernel
+  boundary, and `quetzalcoatl` rings inside a process.
+- **One responsibility per crate, one responsibility per file.**
+- **No free functions.** Every piece of logic belongs to a struct, an enum, or
+  a trait implementation.
+- **Full clippy.** `pedantic`, `nursery`, `perf`, `style`. Doc lints are the
+  only allowed exceptions. `undocumented_unsafe_blocks` is a warning, not a
+  convention.
+- **Prove each step.** Build, test, and lint every feature combination before
+  you start the next step.
 
 ---
 
-## Concurrency model
+## 3. What exists
 
-We avoid async/await entirely. Instead every component is a thread (or a small
-fixed pool of threads) that loops over its input ring, does work, and writes
-results to its output ring. All blocking happens either in the kernel (via
-`io_uring_enter`) or by parking on a ring buffer's futex-style wait path — never
-in a runtime scheduler.
+45 packages: 9 binaries, 32 libraries, 4 bench crates.
 
-### Tooling crates
+### 3.1 Binaries
 
-| Crate | Purpose | Where used |
-|-------|---------|-----------|
-| `ququmatz` | Zero-dep `io_uring` bindings (raw syscalls, no libc, `#![no_std]`). Owns the SQ/CQ ring mmap, exposes `Sqe` builders for all ops. Also owns `Inotify` and `EventFd` wrappers. | `crates/pty`, `crates/platform`, `crates/config` |
-| `quetzal-uring` | Lock-free MPSC submission + SPMC completion *directly on the kernel SQ/CQ rings* — no intermediate userspace copy. Three drive models: `drain_wait` (single consumer, blocks in kernel), `demux::Router` (N shards, each with their own completion inbox), external pumper. | `crates/platform` (event loop pumper), `crates/pty` (PTY read/write ops) |
-| `quetzalcoatl` | Lock-free userspace ring buffers — SPSC / MPSC / SPMC / MPMC / broadcast. All topologies, zero deps, blocking & non-blocking variants, zero-copy typestate API (`reserve → write → commit`), batch `drain`. | everywhere intra-process |
+| Binary | Replaces | State |
+|---|---|---|
+| `terminal` | alacritty, ghostty | Daily use |
+| `statusbar` | waybar | Daily use. Owns the `StatusNotifierWatcher` tray |
+| `launcher` | wofi, rofi | Daily use |
+| `wallpaper` | swaybg | Daily use |
+| `shot` | `slurp \| grim` | Daily use |
+| `clipboard` | `wl-paste --watch cliphist` | Daily use |
+| `files` | nautilus | Working |
+| `monitor` | htop | Working |
+| `portal` | xdg-desktop-portal-gtk | Settings interface only. Not routed |
 
-### Thread topology
+### 3.2 Library layers
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  KERNEL BOUNDARY  (io_uring / ququmatz + quetzal-uring)                 │
-│                                                                         │
-│   PTY master fd  ──read SQE──►  io_uring  ──CQE──►  pty-thread         │
-│   PTY master fd  ◄─write SQE─  io_uring  ◄─SQE──   input-thread        │
-│   inotify fd     ──read SQE──►  io_uring  ──CQE──►  config-thread       │
-│   Wayland fd     ──read SQE──►  io_uring  ──CQE──►  platform-thread     │
-│   Wayland fd     ◄─write SQE─  io_uring  ◄─SQE──   renderer-thread     │
-└─────────────────────────────────────────────────────────────────────────┘
-         │                                         ▲
-         │  INTRA-PROCESS  (quetzalcoatl rings)    │
-         ▼                                         │
-  pty-thread                               renderer-thread
-  (SPSC producer)──► raw-bytes ring ──►  vt-parser-thread
-                                         (SPSC producer)──► event ring ──► grid-thread
-                                                                            (SPSC producer)──► dirty-region ring ──► renderer-thread
+**Layer 0 — no intra-workspace dependencies.**
+`font`, `input`, `text_layout`, `xkb`, `waker`, `platform-wire`,
+`platform-sys`, `localtime`, `diskstat`, `tlog`, `widget`, `fsmodel`,
+`launcher`, `mime`, `clipboard`, `fileops`, `inotify-events`,
+`headless-stress`, `config`, `wallpaper`, `sysmon`.
 
-  input-thread ◄── input-cmd ring ◄── (SPSC producer) platform-thread
-  config-thread ──► config-event ring ──► (broadcast) all threads
-```
+**Layer 1 — platform.**
+`platform-sys` + `platform-wire` + `platform-draw` compose into `platform`.
+`platform` owns the Wayland connection, the shm swap chain, toplevel and
+layer-shell surfaces, the cursor, the clipboard, and damage-tracked present.
+Every graphical binary sits on it.
 
-### Ring buffer selection guide
+**Layer 2 — the D-Bus stack.**
 
-| Situation | Topology | Crate |
-|-----------|----------|-------|
-| PTY master fd reads/writes | fd ops → kernel via SQE | `ququmatz` SQE + `quetzal-uring` |
-| Raw bytes PTY → VT parser | one producer, one consumer | `quetzalcoatl::spsc` |
-| VT events → grid | one producer, one consumer | `quetzalcoatl::spsc` |
-| Dirty regions → renderer | one producer, one consumer | `quetzalcoatl::spsc` |
-| User input → input encoder | platform fan-in | `quetzalcoatl::mpsc` |
-| Encoded bytes → PTY write SQE | one producer, one consumer | `quetzalcoatl::spsc` |
-| Config changes → all threads | one publisher, N subscribers | `quetzalcoatl::broadcast` |
-| Wayland protocol frames | single renderer → kernel | `quetzal-uring` SPSC write path |
-
----
-
-## Why a PTY instead of `std::Command`
-
-`std::Command` gives a child process three byte pipes (`stdin`/`stdout`/
-`stderr`). That breaks interactive programs in several ways:
-
-| Problem | Cause |
-|---------|-------|
-| Shell disables prompts & color | `isatty(stdin)` returns `false` |
-| No window size | No `TIOCGWINSZ` ioctl available |
-| `Ctrl+C` doesn't send `SIGINT` | Signal dispatch goes through the TTY line discipline, not a pipe |
-| No line editing / echo / erase | Kernel TTY layer is absent |
-
-A **pseudoterminal (PTY)** is a kernel-level fiction: a master/slave fd pair
-where the kernel pretends both ends are a real serial terminal. The shell sees
-`isatty(0) == true`, we can `ioctl(master, TIOCSWINSZ, …)` to push resize
-events, and the line discipline handles `Ctrl+C` → `SIGINT` transparently.
-
-Implementation: `posix_openpt` / `forkpty` syscalls via raw `unsafe` libc FFI.
-The master fd is then handed to `io_uring` (via `ququmatz`) for all read/write
-operations — no blocking `read(2)` / `write(2)` calls on the hot path.
-
----
-
-## Crate map
-
-```
-terminal/
-├── Cargo.toml                  ← workspace root, lint config
-├── PLAN.md                     ← this file
-├── bins/
-│   └── terminal/               ← entry point; wires all crates together
-├── crates/
-│   ├── pty/                    ← pseudoterminal: forkpty, resize, io_uring I/O
-│   ├── vt_parser/              ← VT/ANSI escape sequence state machine
-│   ├── grid/                   ← 2-D cell grid, scrollback, alternate screen
-│   ├── text_layout/            ← text measurement + line-breaking (pretext port)
-│   ├── font/                   ← TTF/OTF loader, glyph rasteriser, atlas
-│   ├── renderer/               ← GPU/software draw: grid → pixels
-│   ├── platform/               ← window + event loop (built on paint scaffold)
-│   ├── input/                  ← keyboard/mouse → terminal byte sequences
-│   ├── config/                 ← TOML config (font, colors, shell, keybinds)
-│   └── tlog/                   ← compile-time-gated, runtime-selectable tracing
-└── benches/
-    └── …                       ← criterion suites per hot-path crate
+```text
+dbus              client: SASL, calls, Value, Unmarshaller, Marshaller, signals
+ ├─ dbus-server   registry, router, introspection, properties, name_watcher,
+ │  │             serve, dispatcher, server_loop
+ │  └─ bins/portal   SettingsService, PortalLoop, ConfigWatcher
+ ├─ portal-core   pure domain logic, no bus, no Wayland
+ └─ statusbar     client only. It must never gain an edge to dbus-server
 ```
 
----
+`dbus-server` is a separate crate, not a Cargo feature. The dependency edge
+must stay visible in `Cargo.toml`.
 
-## Crate responsibilities
+### 3.3 Drift from the first plan
 
-### `crates/pty`
+Record these, so nobody chases a crate that does not exist.
 
-Safe wrapper around raw POSIX pseudoterminal syscalls, with all I/O driven
-through `io_uring`.
-
-- `posix_openpt` → open a PTY master fd
-- `forkpty` → spawn a child with the slave fd as its controlling terminal
-- `TIOCSWINSZ` ioctl → push window-size changes to the running process
-- `TIOCGWINSZ` ioctl → query current window size
-- Process lifecycle: `waitpid`, `SIGCHLD` handling via `signalfd` + io_uring
-  read SQE, exit-code propagation
-- **I/O model:** master fd registered with a `quetzal-uring` `UringQueue`.
-  - Reads: `Sqe::read(master_fd, …)` submitted; CQEs land in the pty-thread's
-    `CqConsumer`; raw byte chunks pushed onto an SPSC `quetzalcoatl` ring
-    towards the VT parser thread.
-  - Writes: input-encoded bytes arrive on an SPSC ring from `crates/input`;
-    pty-thread submits `Sqe::write(master_fd, …)` SQEs.
-- No blocking `read`/`write` syscalls. No async runtime.
-
-**Tooling deps:** `ququmatz` (SQE builders, raw fd ops), `quetzal-uring`
-(lock-free SQ/CQ wrappers), `quetzalcoatl` (SPSC byte-chunk rings).
+| First plan said | Reality |
+|---|---|
+| `crates/renderer` | Never created. Drawing lives in `platform-draw` and `platform`. |
+| `crates/pty` uses `forkpty` | Correct, and it works. |
+| GPU backend behind a feature flag | No EGL exists anywhere. Section 6 explains why. |
+| `crates/text_layout` is a milestone | Done, and in use. |
+| Milestones M0 to M9 | All done, except the GPU part of M6/M7. |
 
 ---
 
-### `crates/vt_parser`
+## 4. The three gates
 
-State machine that consumes raw bytes from the PTY master fd and emits typed
-terminal events.
+Everything interactive in the portal waits behind these. Do them in order.
 
-Sequences handled:
+### Gate 1 — file descriptor passing
 
-- **C0** control characters (`BEL`, `BS`, `HT`, `LF`, `CR`, `SO`, `SI`, …)
-- **ESC** sequences (charset designation, index, reverse index, …)
-- **CSI** sequences (cursor movement, SGR attributes, erase, scroll, …)
-- **OSC** sequences (window title, color palette, hyperlinks, …)
-- **DCS** sequences (DECDLD, Sixel, TMUX passthrough, …)
-- **APC** / **PM** / **SOS** (ignored but consumed cleanly)
+Add `dbus::fds::FdPassing`.
 
-**Threading:** runs on its own thread, consuming from an SPSC
-`quetzalcoatl::spsc` ring (raw bytes from pty-thread), producing parsed
-`TermEvent` values onto a second SPSC ring towards the grid-thread.
-No allocations in the hot path — the state machine is a `u8`-indexed table.
+- `SCM_RIGHTS` send and receive over the bus socket.
+- The `UNIX_FDS` header field.
+- The `h` type: encode and decode an index into the descriptor array.
 
-**Deps:** none. Pure state machine.
+Test it with a socket pair. Cover several descriptors in one message. Cover
+cleanup after an error. Do not expose any portal method that returns a
+descriptor before these tests pass.
 
----
+This gate blocks `Screenshot` and `FileChooser`, which are the two interfaces
+that matter most. It needs no compositor. Do it first.
 
-### `crates/grid`
+### Gate 2 — the unified event pump
 
-The terminal's screen model.
+`PortalLoop` polls two descriptors today: the bus socket and an inotify watch.
+It must also drive a Wayland connection.
 
-- 2-D array of `Cell { char, fg, bg, attrs }` (bold, italic, underline,
-  blink, inverse, …)
-- Primary screen + alternate screen (switched by `smcup`/`rmcup`)
-- Scrollback buffer with configurable max lines
-- Cursor state: position, visibility, shape, saved cursor (`DECSC`/`DECRC`)
-- `DirtyRegion` tracker so the renderer only redraws changed cells
-- Selection model (range of cells → clipboard text)
+Requirements:
 
-**Threading:** grid-thread owns the `Grid` exclusively — no shared-memory
-access. It consumes `TermEvent`s from the VT parser SPSC ring, mutates the
-grid, and pushes `DirtyRegion` snapshots onto an SPSC ring towards the
-renderer-thread.
+- The daemon answers new bus calls while a dialog is on screen.
+- The daemon closes request and session objects when a caller loses its name.
+  `dbus_server::NameWatcher` already reports that event.
 
-**Deps:** none.
+### Gate 3 — the dialog shell
 
----
+Add `crates/portal-ui`, and add the missing pieces of `portal-core`.
 
-### `crates/text_layout`
+`portal-core` gains:
 
-Port of [chenglou/pretext](https://github.com/chenglou/pretext) to pure Rust.
-Used for GUI chrome (title bars, config panels, overlays) — **not** the
-terminal grid, which uses fixed-width cell metrics.
+- `request_handle.rs` — request object paths and token validation.
+- `session_handle.rs` — session lifetime and the `Closed` rules.
+- `response_code.rs` — success, cancelled, and error semantics.
+- `options/` — per-interface option-dictionary validation.
 
-#### What pretext is
+`portal-ui` gains:
 
-A text **measurement and line-breaking engine**. Given a string, a font
-descriptor, and a max width, it answers: *where do the line breaks go, and how
-tall is the resulting block?*
+- `dialog_shell.rs` — the modal Wayland surface, and its focus rules.
+- `access_dialog.rs` — a yes/no prompt.
+- `file_chooser.rs` — an adapter over `fsmodel`, `widget`, `fileops`, `mime`.
 
-#### Module map (mirroring pretext's src/)
-
-| Rust module | TS original | Notes |
-|-------------|-------------|-------|
-| `analysis` | `analysis.ts` | Whitespace normalisation, word/grapheme segmentation, break-kind classification. Swap `Intl.Segmenter` for our own UAX #29 tables. |
-| `measurement` | `measurement.ts` | Segment advance widths. Swap `Canvas.measureText()` for UAX #11 East-Asian-Width + TTF `hmtx` table reads (see `crates/font`). |
-| `line_break` | `line-break.ts` | **Direct 1:1 port.** Pure arithmetic over cached widths; no JS-isms. |
-| `layout` | `layout.ts` | Public API: `prepare`, `layout`, `layout_with_lines`, cursor types. Direct port. |
-| `bidi` | `bidi.ts` | Simplified Unicode BiDi metadata for RTL-aware rendering. Direct port of range tables + state machine. |
-
-#### Why the terminal shortcut works
-
-In the terminal grid itself every glyph is **exactly 1 or 2 cells wide**
-(UAX #11 East Asian Width). The cell size is fixed by the font's advance width
-for a reference glyph (e.g. `M`). No per-glyph font metrics or complex shaping
-needed for grid rendering.
-
-`text_layout` is only needed for GUI chrome where proportional fonts and
-variable-width text appear.
-
-**Deps:** none (UAX tables are generated and checked in as Rust arrays).
+Accept unparented overlays at first. Add `xdg_foreign` parent handles only
+after the shell is reliable.
 
 ---
 
-### `crates/font`
+## 5. Delivery sequence
 
-TTF/OTF font loading, glyph rasterisation, and atlas management.
+Each step must build, test, and lint clean before the next step starts.
 
-- Parse font files directly (no FreeType, no `font-kit`)
-  - `cmap` table → Unicode → glyph ID
-  - `hmtx` table → advance widths (feeds `crates/text_layout` measurement)
-  - `glyf` / `CFF` table → glyph outlines
-  - `head` / `hhea` / `OS/2` → metrics (ascender, descender, line gap)
-- Scan-line rasteriser for glyph outlines → 8-bit alpha mask
-- **Glyph atlas:** pack rasterised glyphs into a texture; expose dirty regions
-  for GPU upload
-- Cache: `HashMap<(GlyphId, PixelSize), AtlasSlot>`
-- Font fallback chain: primary font → emoji font → system fallback
+### Phase A — collect the finished work
 
-**Deps:** none. TTF/OTF parsing is table reads + arithmetic.
+1. **Route `Settings`.** Add one line to `portals.conf`:
+   `org.freedesktop.impl.portal.Settings=tijaax`. Restart the session
+   components. Prove the rollback once, by reverting that line.
+   The code, the tests, and the on-disk artifacts are already done. Until this
+   step happens, none of that work carries load.
+2. **Write `bins/open`.** A real `xdg-open` replacement over `mime` and
+   `launcher`. Both cores already work.
+3. **Delete the shell-outs.** Remove the `xdg-open` fallback from
+   `bins/files/src/launch.rs`. Remove the `xdg-open` call from
+   `bins/terminal`'s link handler. Point both at `bins/open`'s core.
+4. **Write the compatibility matrix.** Record, per interface: the advertised
+   version, the real caller that exercises it, the options it accepts, and the
+   backend it falls back to. `docs/portal-scoping.md` step 1 asked for this
+   and it does not exist yet.
 
----
+### Phase B — the gates
 
-### `crates/renderer`
+5. Gate 1: `dbus::fds::FdPassing`.
+6. Gate 2: the unified event pump.
+7. Gate 3: `portal-ui` and the rest of `portal-core`.
 
-Draws the terminal grid (and GUI chrome) to the screen.
+### Phase C — interfaces
 
-- Reads `Grid` + `DirtyRegion` snapshots from an SPSC `quetzalcoatl` ring
-  (grid-thread → renderer-thread)
-- Reads glyph atlas from `crates/font`
-- Two backends (feature-flagged):
-  - **GPU** — raw OpenGL via EGL (Wayland), simple glyph shader. No `wgpu`,
-    no `gl` crate; raw `unsafe` GL calls via our own thin loader. Deferred to M7.
-  - **Software** — CPU framebuffer fallback for headless/CI use
-- Render pipeline:
-  1. Background fill (per-cell colors)
-  2. Glyph batch (one draw call per atlas page)
-  3. Cursor overlay
-  4. Selection highlight
-  5. GUI chrome (title bar, scrollbar, overlays via `text_layout`)
-- Frame delivery: completed pixel buffer submitted as a Wayland `wl_buffer`
-  commit via `quetzal-uring` write SQEs (no blocking Wayland socket writes).
+Each interface routes on its own. Each one adapts a crate that already works.
 
-**Deps (intra-workspace):** `crates/font`, `crates/grid`, `crates/text_layout`.
+8. **`Access`.** The first interactive interface. It only needs the yes/no
+   dialog, so it proves the shell with the least surface.
+9. **`Screenshot`.** Adapt `bins/shot` and `crates/screencopy`. Needs Gate 1.
+10. **`AppChooser` and `OpenURI`.** Adapt `launcher` and `mime`. Prove the
+    default-application path, cancellation, and multiple URIs against real GTK
+    and Qt callers.
+11. **`FileChooser`.** Adapt `bins/files`. Support open, save, multiple
+    selection, filters, choices, and cancellation. Needs Gate 1. Advertise a
+    high interface version only after the tests cover it.
+12. **Small interfaces.** Add `Inhibit`, `Lockdown`, `Account`, `Email`, and
+    `Print` only when a local caller proves a need. Keep the old route for
+    everything else.
 
----
+### Phase D — the remaining xdg utilities
 
-### `crates/platform`
+Each one is a thin binary over a crate that already exists.
 
-Native window creation and event loop. Built on and extended from the `paint`
-project scaffold (`/home/cuarentaydos/Code/forfun/paint`).
+| Tool | Needs |
+|---|---|
+| `xdg-mime` | `crates/mime` covers queries. Add the write path that sets a default application. Then add a CLI. |
+| `xdg-user-dirs` | `bins/files/src/user_dirs.rs` reads `user-dirs.dirs`. Add the writer and the `-update` behaviour. |
+| `xdg-settings` | Get and set the default browser, and the default URL scheme handler. |
+| `xdg-desktop-menu` | Install and uninstall `.desktop` entries. |
+| `xdg-icon-resource` | Install and uninstall icon files. |
 
-`paint` already has:
-- Raw Wayland wire protocol (no `smithay-client-toolkit`)
-- `io_uring`-based I/O via `ququmatz`
-- SPSC/MPSC channels via `quetzalcoatl`
-- Software framebuffer to shared memory surface
+The end state removes the `xdg-utils` package from the machine.
 
-We extend it with:
-- XDG toplevel window management (resize, fullscreen, move)
-- EGL surface creation for GPU rendering (`crates/renderer`)
-- Clipboard: `wl_data_device`
-- DPI / scale factor detection
+### Phase E — only after daily use
 
-**I/O model:** the platform-thread owns a `quetzal-uring` `UringQueue` (using
-the `demux::Router` drive model when Wayland + PTY + inotify fds all need to be
-multiplexed). Each fd gets its own shard; completions route by `user_data` tag.
-Wayland socket reads arrive as CQEs on the platform shard; decoded input events
-are pushed onto an MPSC `quetzalcoatl` ring towards `crates/input`. Outgoing
-Wayland frames are submitted as write SQEs on the renderer shard.
-
-**Deps (tooling):** `ququmatz`, `quetzal-uring`, `quetzalcoatl`.
+13. **Notifications.** Scope this on its own. `statusbar`'s urgency segment
+    reads niri's window state. It is not a D-Bus notification server. Do not
+    quietly turn it into one.
+14. **Frontend ownership.** Consider owning `org.freedesktop.portal.Desktop`
+    itself only after every backend interface survives daily use. This is
+    optional. It is not a measure of success.
 
 ---
 
-### `crates/input`
+## 6. Terminal work that remains
 
-Translates raw platform keyboard/mouse events into terminal input byte
-sequences.
+The terminal is finished for daily use. These items stay open, and none of
+them blocks the desktop goal.
 
-- **Keyboard:**
-  - Standard VT sequences (`\x1b[A` etc.)
-  - Kitty keyboard protocol (extended key reporting)
-  - `xterm` modifyOtherKeys
-  - IME composition events
-- **Mouse:**
-  - X10 / normal / button-event / any-event tracking modes
-  - SGR mouse extension (large coordinates)
-  - Scroll → `\x1b[5~` / `\x1b[6~` or smooth pixel delta
-- Keybind layer: user-defined actions (copy, paste, new tab, font-size±)
-
-**Threading:** input-thread receives raw `InputEvent`s from the platform-thread
-via an MPSC `quetzalcoatl` ring (multiple Wayland/X11 event types fan into one
-consumer), encodes them to byte sequences, and pushes the results onto an SPSC
-ring towards the pty-thread's write path.
-
-**Deps:** `quetzalcoatl` (MPSC in, SPSC out).
+- **Sixel graphics.** `vt_parser` consumes DCS payloads and discards them.
+- **Kitty image protocol.** Nothing exists.
+- **Ligatures.** This needs `GSUB` table parsing in `crates/font`.
+- **Tabs and multiplexing.** Nothing exists.
+- **GPU rendering.** Deliberately deferred, not abandoned. The software
+  renderer meets the frame budget, and the SIMD paths are already optimised in
+  dev builds. Revisit only if a measurement shows a real problem.
 
 ---
 
-### `crates/config`
+## 7. Verification gate
 
-TOML configuration file parser and live-reload watcher.
+Run these before you call any step complete.
 
-Config covers:
-- Font: family, size, fallback chain
-- Colors: 16 ANSI palette + background/foreground/cursor
-- Shell: path, args, env overrides
-- Keybinds: action → key combo map
-- Renderer: GPU vs software, vsync, padding
-- Scrollback: max lines
-
-**Parser:** hand-written recursive-descent TOML parser (or pull from `tommy` if
-it exists in the tooling workspace — TBD).
-
-**Live reload:**
-- `ququmatz::Inotify` watches the config file with `IN_MODIFY`
-- `Sqe::read(inotify.fd(), …)` submitted to the shared `io_uring`
-- CQE triggers re-parse on the config-thread
-- New `Arc<Config>` published to all threads via a `quetzalcoatl::broadcast`
-  ring — each thread subscribes once at startup and polls the ring on every
-  iteration of its loop, no locks required
-
-**Deps (tooling):** `ququmatz` (`Inotify`), `quetzalcoatl` (broadcast ring).
-
----
-
-### `crates/tlog`
-
-Compile-time-gated, runtime-selectable tracing, replacing one bespoke
-`std::env::var("TERMINAL_DEBUG_X")` check per subsystem with a single facility
-every crate can use.
-
-- **Compile time:** the `trace` Cargo feature. Off (the default, and what
-  every release/normal build uses): every `tlog::trace!` call site compiles to
-  nothing but a type-check of its format arguments — no env read, no branch,
-  no call.
-- **Runtime:** once compiled in, `TERMINAL_LOG=pty,render` (or `=all`) picks
-  which named `Channel`s (`pty`, `parser`, `grid`, `render`, `input`,
-  `platform`, `config`, `fps`) actually emit. An unselected channel costs one
-  atomic load; its `format_args!` is never evaluated.
-- Output goes to stderr, or to a file named by `TERMINAL_LOG_FILE` — handy for
-  high-volume channels like raw PTY bytes, which would otherwise interleave
-  with the very terminal being debugged. `tlog::Escaped` renders control bytes
-  visibly (`ESC` → `\e`, etc.) for exactly that use.
-
-Deliberately separate from `TERMINAL_DEBUG_FPS` (`crates/platform/src/window.rs`):
-that's an already-zero-cost, documented on-screen overlay with its own
-established workflow (`scripts/stress/README.md`) and doesn't fit the
-"named channel, formatted line" shape here.
-
-**Deps:** none.
-
----
-
-## Data-flow overview
-
-```
-Shell process
-    │  (slave PTY fd)
-    ▼
-┌─────────┐  io_uring read CQEs   ┌────────────┐  spsc TermEvents  ┌──────┐
-│   pty   │──────────────────────►│ vt_parser  │──────────────────►│ grid │
-│ thread  │                       │   thread   │                   │thread│
-└────▲────┘                       └────────────┘                   └──┬───┘
-     │  io_uring write SQEs                                            │ spsc DirtyRegion
-     │                                                                 ▼
-┌────┴────┐  spsc encoded bytes                            ┌──────────────────┐
-│  input  │◄───────────────────────────────────────────────│ renderer thread  │
-│ thread  │                                                │  (font + grid)   │
-└────▲────┘                                                └────────┬─────────┘
-     │  mpsc InputEvents                                             │ io_uring write SQEs
-     │                                                               │ (Wayland frames)
-┌────┴─────────────┐                                                 │
-│ platform thread  │◄────────────────────────────────────────────────┘
-│ (Wayland / X11)  │
-└────▲─────────────┘
-     │
-     │  broadcast Arc<Config>
-┌────┴──────┐
-│  config   │◄── ququmatz Inotify ── config file
-│  thread   │
-└───────────┘
-```
-
----
-
-## External scaffolding to reuse
-
-| Source project | Location | What we take |
-|----------------|----------|--------------|
-| `paint` | `/home/cuarentaydos/Code/forfun/paint` | Wayland wire protocol, `io_uring` I/O, software framebuffer → `crates/platform` base |
-| `ququmatz` | `/home/cuarentaydos/Code/tooling/ququmatz` | `io_uring` SQE builders, `Inotify`, `EventFd`, raw fd types |
-| `quetzal-uring` | `/home/cuarentaydos/Code/tooling/quetzalcoatl-uring` | Lock-free SQ/CQ wrappers, `demux::Router` for fd multiplexing |
-| `quetzalcoatl` | `/home/cuarentaydos/Code/tooling/quetzalcoatl` | All intra-process ring topologies (SPSC, MPSC, broadcast) |
-| `tommy` | TBD (tooling workspace, not yet located) | TOML parser → `crates/config` internals |
-| `pretext` | https://github.com/chenglou/pretext | Text layout algorithm → `crates/text_layout` |
-
----
-
-## Build order / dependency graph
-
-```
-quetzalcoatl  ququmatz  quetzal-uring   (tooling — path deps)
-      │            │           │
-      └────────────┴───────────┘
-                   │
-      ┌────────────┼─────────────────┐
-      │            │                 │
-   config         pty           vt_parser
-                                    │
-                                   grid
-                                    │
-                              text_layout
-                                    │
-                                  font
-                                    │
-                               renderer
-                                    │
-                    ┌───────────────┤
-                    │               │
-                platform          input
-                    │               │
-                    └───────────────┘
-                            │
-                     bins/terminal
-```
-
-Crates with no intra-workspace deps (`pty`, `vt_parser`, `config`,
-`text_layout`) can be developed and tested in complete isolation first.
-
----
-
-## Milestones
-
-### M0 — Workspace scaffold ✅
-- [x] Workspace `Cargo.toml` with lint config
-- [x] `bins/terminal` stub compiles clean
-
-### M1 — PTY + shell spawning
-- [ ] `crates/pty`: `forkpty` wrapper
-- [ ] Master fd registered with `quetzal-uring` `UringQueue`
-- [ ] Read CQEs → SPSC ring (raw bytes visible on stdout for debugging)
-- [ ] Resize via `TIOCSWINSZ` ioctl
-- [ ] `SIGCHLD` via `signalfd` + io_uring read SQE
-
-### M2 — VT parser
-- [ ] `crates/vt_parser`: state machine, all major sequence classes
-- [ ] Consumes SPSC byte ring from M1, produces SPSC `TermEvent` ring
-- [ ] Fuzz corpus against known-good terminal output
-
-### M3 — Grid
-- [ ] `crates/grid`: cells, cursor, scrollback, dirty tracking
-- [ ] Consumes `TermEvent` SPSC ring from M2
-- [ ] Headless render-to-string for testing (`Display` impl)
-
-### M4 — Platform window
-- [ ] Extend `paint` into `crates/platform`
-- [ ] `quetzal-uring` `demux::Router` multiplexing Wayland + PTY fds
-- [ ] Wayland window with software framebuffer
-- [ ] Input events → MPSC `quetzalcoatl` ring → `crates/input`
-
-### M5 — Input
-- [ ] `crates/input`: MPSC consumer, encode to VT byte sequences
-- [ ] Push encoded bytes onto SPSC ring → pty-thread write SQEs
-- [ ] Keyboard, mouse, keybinds
-
-### M6 — Font + renderer (software)
-- [ ] `crates/font`: TTF parse, rasterise, atlas
-- [ ] `crates/renderer`: software backend, consume dirty-region SPSC ring
-- [ ] Visible text in window 🎉
-
-### M7 — GPU renderer
-- [ ] EGL setup, GL context
-- [ ] Glyph shader, batch draw calls
-- [ ] `crates/renderer`: GPU backend behind feature flag
-- [ ] Frame delivery via `quetzal-uring` write SQEs
-
-### M8 — Text layout + GUI chrome
-- [ ] `crates/text_layout`: pretext port (analysis → measurement → line_break → layout → bidi)
-- [ ] Title bar, scrollbar, overlays
-
-### M9 — Config
-- [ ] `crates/config`: TOML parse (hand-written or `tommy`)
-- [ ] `ququmatz::Inotify` + io_uring read SQE for live reload
-- [ ] `quetzalcoatl::broadcast` ring publishing `Arc<Config>` to all threads
-
-### M10 — Polish
-- [ ] Sixel graphics
-- [ ] Kitty image protocol
-- [ ] Ligatures (via `crates/font` GSUB table parsing)
-- [ ] Tabs / multiplexing
+1. Run the changed crate's own tests.
+2. Run `cargo build` and `cargo test` for every crate you touched, and for
+   every crate downstream of them.
+3. Run clippy on the same set.
+4. Run `cargo check --workspace --all-targets`.
+5. Inspect `cargo graph --report`. Confirm `dbus`'s client-only dependents
+   never gain an edge to `dbus-server`.
+6. For a routed portal interface, test it against a real client. Then perform
+   the rollback once, to prove recovery works.

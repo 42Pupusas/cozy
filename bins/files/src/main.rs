@@ -175,10 +175,18 @@ impl App {
                 // click that asked for this file, so the compositor lets the
                 // handler's window come to the user rather than treating it
                 // as focus stealing.
+                let token = window.activation_token(None);
+                if std::env::var_os("COZY_DEBUG_ACTIVATION").is_some() {
+                    match &token {
+                        Some(t) => eprintln!("files: minted activation token {}", t.as_str()),
+                        None => eprintln!(
+                            "files: no activation token (supported={})",
+                            window.supports_activation()
+                        ),
+                    }
+                }
                 opener.set_activation(
-                    window
-                        .activation_token(None)
-                        .map(|token| opener::ActivationToken::new(token.into_string())),
+                    token.map(|token| opener::ActivationToken::new(token.into_string())),
                 );
                 opener.open(&path);
             }

@@ -56,7 +56,7 @@ impl Marshaller {
     pub fn marshal(buf: &mut Vec<u8>, value: &Value, sig: &str) -> Option<()> {
         let type_byte = *sig.as_bytes().first()?;
         match type_byte {
-            b'y' | b'b' | b'n' | b'q' | b'i' | b'u' | b'x' | b't' | b'd' => {
+            b'y' | b'b' | b'n' | b'q' | b'i' | b'u' | b'h' | b'x' | b't' | b'd' => {
                 Self::marshal_fixed_width(type_byte, buf, value)
             }
             b's' | b'o' | b'g' | b'v' => Self::marshal_string_like(type_byte, buf, value),
@@ -67,8 +67,8 @@ impl Marshaller {
         }
     }
 
-    /// Encode one of the fixed-width scalars (`y`/`b`/`n`/`q`/`i`/`u`/`x`/
-    /// `t`/`d`). Split out for the same reason
+    /// Encode one of the fixed-width scalars (`y`/`b`/`n`/`q`/`i`/`u`/`h`/
+    /// `x`/`t`/`d`). Split out for the same reason
     /// [`Unmarshaller::unmarshal_fixed_width`] is: these nine arms share
     /// nothing with the string-like or container arms beyond the grammar
     /// they're part of.
@@ -103,6 +103,13 @@ impl Marshaller {
                 let &Value::U32(v) = value else { return None };
                 buf.extend_from_slice(&v.to_le_bytes());
             }
+            b'h' => {
+                Self::pad_to(buf, 4);
+                let &Value::UnixFd(index) = value else {
+                    return None;
+                };
+                buf.extend_from_slice(&index.to_le_bytes());
+            }
             b'x' => {
                 Self::pad_to(buf, 8);
                 let &Value::I64(v) = value else { return None };
@@ -120,7 +127,7 @@ impl Marshaller {
                 };
                 buf.extend_from_slice(&v.to_le_bytes());
             }
-            // Unreachable: marshal only calls this for one of the 9 bytes
+            // Unreachable: marshal only calls this for one of the 10 bytes
             // matched above.
             _ => return None,
         }
@@ -293,6 +300,31 @@ mod tests {
         roundtrip(&Value::I64(-9_000_000_000_000), "x");
         roundtrip(&Value::U64(18_000_000_000_000_000_000), "t");
         roundtrip(&Value::Double(std::f64::consts::PI), "d");
+    }
+
+    #[test]
+    fn roundtrip_unix_fd_index() {
+        roundtrip(&Value::UnixFd(0), "h");
+        roundtrip(&Value::UnixFd(4_000_000_000), "h");
+    }
+
+    /// The shape `OpenFile` and `OpenPipeWriter` reply with: a descriptor
+    /// index boxed in a variant, so the variant's inline signature has to
+    /// come out as `h` rather than `u`.
+    #[test]
+    fn roundtrip_variant_wrapping_a_unix_fd() {
+        roundtrip(&Value::Variant(Box::new(Value::UnixFd(2))), "v");
+    }
+
+    /// `h` and `u` are the same four bytes on the wire, so nothing but the
+    /// tag stops a caller sending a number where a descriptor belongs.
+    #[test]
+    fn a_u32_is_refused_where_a_unix_fd_is_declared() {
+        let mut buf = Vec::new();
+        assert!(Marshaller::marshal(&mut buf, &Value::U32(2), "h").is_none());
+
+        let mut buf = Vec::new();
+        assert!(Marshaller::marshal(&mut buf, &Value::UnixFd(2), "u").is_none());
     }
 
     #[test]

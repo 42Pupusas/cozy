@@ -27,6 +27,15 @@ pub enum Value {
     Struct(Vec<Self>),
     Variant(Box<Self>),
     DictEntry(Box<Self>, Box<Self>),
+    /// A file descriptor (`h`), held as its **index** into the message's
+    /// out-of-band descriptor array -- not as a descriptor number.
+    ///
+    /// The wire carries only this index. The descriptors themselves travel
+    /// beside the message in an `SCM_RIGHTS` control block, and the kernel
+    /// renumbers each one on arrival. So a value decoded here says "the
+    /// n-th descriptor of this message", and the transport layer resolves
+    /// it against the descriptors it received.
+    UnixFd(u32),
 }
 
 impl Value {
@@ -68,12 +77,28 @@ impl Value {
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Self::Byte(v) => Some(u64::from(*v)),
+            // `UnixFd` is deliberately absent: its payload is an index
+            // into a descriptor array, not a quantity. Widening it here
+            // would let a caller that meant "read me a number" silently
+            // succeed on a descriptor slot.
             Self::U16(v) => Some(u64::from(*v)),
             Self::U32(v) => Some(u64::from(*v)),
             Self::U64(v) => Some(*v),
             Self::I16(v) if *v >= 0 => Some(v.cast_unsigned().into()),
             Self::I32(v) if *v >= 0 => Some(v.cast_unsigned().into()),
             Self::I64(v) if *v >= 0 => Some(v.cast_unsigned()),
+            _ => None,
+        }
+    }
+
+    /// The descriptor index this value carries, if it is a `UnixFd`.
+    ///
+    /// The index is meaningful only together with the descriptors that
+    /// arrived with the same message.
+    #[must_use]
+    pub const fn as_unix_fd_index(&self) -> Option<u32> {
+        match self {
+            Self::UnixFd(index) => Some(*index),
             _ => None,
         }
     }
@@ -143,6 +168,7 @@ impl Value {
             Self::Str(_) => "s".into(),
             Self::ObjectPath(_) => "o".into(),
             Self::Signature(_) => "g".into(),
+            Self::UnixFd(_) => "h".into(),
             Self::Variant(_) => "v".into(),
             Self::Array(items) => {
                 let elem = items
@@ -222,7 +248,7 @@ impl Unmarshaller {
     #[must_use]
     pub const fn alignment_of(sig: &str) -> usize {
         match sig.as_bytes().first() {
-            Some(b'b' | b'i' | b'u' | b's' | b'o' | b'a') => 4,
+            Some(b'b' | b'i' | b'u' | b'h' | b's' | b'o' | b'a') => 4,
             Some(b'n' | b'q') => 2,
             Some(b'x' | b't' | b'd' | b'(' | b'{') => 8,
             // b'y' (byte), b'g'/b'v' (signature/variant), and everything
@@ -302,7 +328,7 @@ impl Unmarshaller {
     pub fn unmarshal(buf: &[u8], offset: usize, sig: &str) -> Option<(Value, usize)> {
         let type_byte = *sig.as_bytes().first()?;
         match type_byte {
-            b'y' | b'b' | b'n' | b'q' | b'i' | b'u' | b'x' | b't' | b'd' => {
+            b'y' | b'b' | b'n' | b'q' | b'i' | b'u' | b'h' | b'x' | b't' | b'd' => {
                 Self::unmarshal_fixed_width(type_byte, buf, offset)
             }
             b's' | b'o' | b'g' | b'v' => Self::unmarshal_string_like(type_byte, buf, offset),
@@ -324,10 +350,10 @@ impl Unmarshaller {
         match type_byte {
             b'y' => Some((Value::Byte(*buf.get(offset)?), offset + 1)),
             b'n' | b'q' => Self::unmarshal_2byte(type_byte, buf, offset),
-            b'b' | b'i' | b'u' => Self::unmarshal_4byte(type_byte, buf, offset),
+            b'b' | b'i' | b'u' | b'h' => Self::unmarshal_4byte(type_byte, buf, offset),
             b'x' | b't' | b'd' => Self::unmarshal_8byte(type_byte, buf, offset),
-            // Unreachable: unmarshal only calls this for one of the 9 bytes
-            // matched above.
+            // Unreachable: unmarshal only calls this for one of the 10
+            // bytes matched above.
             _ => None,
         }
     }
@@ -344,7 +370,7 @@ impl Unmarshaller {
     }
 
     /// The 4-byte-aligned fixed-width types: `b` (bool, as a u32 0/nonzero),
-    /// `i` (i32), `u` (u32).
+    /// `i` (i32), `u` (u32), `h` (descriptor index, also a u32).
     fn unmarshal_4byte(type_byte: u8, buf: &[u8], offset: usize) -> Option<(Value, usize)> {
         let aligned = Self::align_up(offset, 4);
         Some(match type_byte {
@@ -354,8 +380,9 @@ impl Unmarshaller {
             }
             b'i' => (Value::I32(read_le!(buf, aligned, i32)?), aligned + 4),
             b'u' => (Value::U32(read_le!(buf, aligned, u32)?), aligned + 4),
+            b'h' => (Value::UnixFd(read_le!(buf, aligned, u32)?), aligned + 4),
             // Unreachable: unmarshal_fixed_width only calls this for
-            // 'b'/'i'/'u'.
+            // 'b'/'i'/'u'/'h'.
             _ => return None,
         })
     }
@@ -501,6 +528,52 @@ mod tests {
         assert_eq!(v, Value::Variant(Box::new(Value::U32(42))));
         assert_eq!(end, buf.len());
         assert_eq!(v.into_inner(), Value::U32(42));
+    }
+
+    /// A descriptor index is a plain 4-byte word on the wire, exactly like
+    /// a `u32`. Only the tag distinguishes them, which is the whole point:
+    /// the transport must know which words to resolve against the
+    /// descriptors that arrived with the message.
+    #[test]
+    fn unmarshal_unix_fd_reads_a_four_byte_index() {
+        let buf = 3u32.to_le_bytes();
+        let (v, end) = Unmarshaller::unmarshal(&buf, 0, "h").unwrap();
+        assert_eq!(v, Value::UnixFd(3));
+        assert_eq!(end, 4);
+    }
+
+    #[test]
+    fn a_unix_fd_aligns_to_four_bytes_like_a_u32() {
+        assert_eq!(
+            Unmarshaller::alignment_of("h"),
+            Unmarshaller::alignment_of("u")
+        );
+
+        let mut buf = vec![0xAA];
+        buf.extend_from_slice(&[0, 0, 0]);
+        buf.extend_from_slice(&7u32.to_le_bytes());
+        let (v, end) = Unmarshaller::unmarshal(&buf, 1, "h").unwrap();
+        assert_eq!(v, Value::UnixFd(7));
+        assert_eq!(end, 8);
+    }
+
+    /// A descriptor index must not read as a number. A caller asking for a
+    /// quantity that silently accepted a descriptor slot would produce a
+    /// plausible, wrong answer.
+    #[test]
+    fn a_unix_fd_is_not_a_number() {
+        assert_eq!(Value::UnixFd(3).as_u64(), None);
+        assert_eq!(Value::UnixFd(3).as_unix_fd_index(), Some(3));
+        assert_eq!(Value::U32(3).as_unix_fd_index(), None);
+    }
+
+    #[test]
+    fn a_unix_fd_reports_the_h_signature() {
+        assert_eq!(Value::UnixFd(0).signature(), "h");
+        assert_eq!(
+            Value::Variant(Box::new(Value::UnixFd(0))).signature(),
+            "v"
+        );
     }
 
     #[test]

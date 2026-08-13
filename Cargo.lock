@@ -185,9 +185,9 @@ dependencies = [
  "fileops",
  "fsmodel",
  "headless-stress",
- "launcher",
  "localtime",
  "mime",
+ "opener",
  "platform",
  "statusbar",
  "waker",
@@ -322,6 +322,14 @@ dependencies = [
  "platform",
  "statusbar",
  "sysmon",
+]
+
+[[package]]
+name = "opener"
+version = "0.1.0"
+dependencies = [
+ "launcher",
+ "mime",
 ]
 
 [[package]]

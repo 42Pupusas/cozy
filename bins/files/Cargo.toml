@@ -34,12 +34,11 @@ diskstat  = { path = "../../crates/diskstat" }
 # Type detection and type->application association, so opening a file is a
 # real desktop-entry resolution rather than a shell-out to xdg-open.
 mime     = { path = "../../crates/mime" }
+# "Which application opens this file, and with what argv?" -- the same
+# resolution policy `bins/open` and the portal's OpenURI use.
+opener   = { path = "../../crates/opener" }
 # Copy/move for drag-and-drop drops: moving files onto a folder row is a
 # real filesystem mutation (cross-filesystem fallback, conflict policy),
 # not a bare `std::fs::rename` call.
 fileops  = { path = "../../crates/fileops" }
-# `.desktop` parsing and `Exec=` expansion, shared with `bins/launcher`
-# rather than reimplemented: "open this file with that app" and "launch
-# that app" are the same command-building problem.
-launcher = { path = "../../crates/launcher" }
 headless-stress = { path = "../../crates/headless-stress" }

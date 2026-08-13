@@ -20,13 +20,11 @@ mod columns;
 mod density;
 mod favorites;
 mod frame;
-mod handlers;
 mod headless;
 mod history;
 mod hover;
 mod keymap;
 mod kind_label;
-mod launch;
 mod metric_overrides;
 mod moment;
 mod options;
@@ -152,7 +150,7 @@ impl App {
         // Loaded once, before the loop: the glob and association databases
         // are a few thousand lines between them, and re-reading disk on
         // every Enter would put that latency directly in the user's way.
-        let opener = launch::Opener::load();
+        let opener = opener::Opener::load();
 
         let mut title = painter.title();
         loop {

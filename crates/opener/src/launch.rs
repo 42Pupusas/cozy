@@ -18,7 +18,7 @@
 //! The ordering is deliberate and not reversible: consulting `xdg-open`
 //! first would make every association we resolve irrelevant.
 
-use crate::handlers::Handlers;
+use crate::Handlers;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -40,11 +40,11 @@ impl Opener {
         }
     }
 
-    /// Build around an explicit resolver -- the seam tests use.
+    /// Build around an explicit resolver.
     ///
-    /// Test-only for the same reason as [`Handlers::from_parts`]: the
-    /// running program always loads the real databases.
-    #[cfg(test)]
+    /// The seam a caller that already holds a [`Handlers`] uses, so a
+    /// program that resolves handlers for other reasons -- an "Open With…"
+    /// menu, the portal's `OpenURI` -- loads the databases once.
     #[must_use]
     pub const fn new(handlers: Handlers) -> Self {
         Self { handlers }
@@ -64,7 +64,7 @@ impl Opener {
                 // is broken or missing from PATH, which is exactly the kind
                 // of thing a silent fallback would hide for months.
                 Err(e) => eprintln!(
-                    "files: {} failed to start ({e}); falling back",
+                    "opener: {} failed to start ({e}); falling back",
                     command.program
                 ),
             }
@@ -91,7 +91,7 @@ impl Opener {
         // frozen file browser. The cost is a zombie until we exit, which
         // is bounded and harmless for a desktop app's lifetime.
         if let Err(e) = spawned {
-            eprintln!("files: could not open {}: {e}", path.display());
+            eprintln!("opener: could not open {}: {e}", path.display());
         }
     }
 }
@@ -99,7 +99,6 @@ impl Opener {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handlers::Handlers;
     use mime::{Associations, MimeDb};
     use std::path::PathBuf;
 

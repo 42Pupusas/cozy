@@ -31,6 +31,7 @@
 //! [`crate::surface`] (connection bootstrap, shm swap chain, registry
 //! discovery, the common event routing) is reused as-is.
 
+pub mod activation;
 pub mod drag;
 pub mod geometry;
 pub mod globals;
@@ -42,6 +43,7 @@ pub mod pointer;
 pub mod shell;
 pub mod window;
 
+pub use activation::{Activation, ActivationToken, TOKEN_ENV};
 pub use drag::{DragController, Dropped};
 pub use geometry::{Geometry, LogicalSize, PhysicalSize};
 pub use globals::{ToplevelGlobals, ToplevelGlobalsBuilder};

@@ -22,7 +22,7 @@
 mod open_options;
 
 use open_options::{Command, OpenOptions};
-use opener::{Handlers, OpenError, Opener, Target};
+use opener::{ActivationToken, Handlers, OpenError, Opener, Target};
 
 /// Exit statuses, named rather than scattered as integer literals.
 struct ExitStatus;
@@ -88,9 +88,17 @@ impl Application {
             Command::Open(targets) => targets,
         };
 
+        // Taken before anything is spawned, and taken rather than read: a
+        // token authorises one activation, so it must leave our environment
+        // as we pick it up. Whatever ran us -- a terminal, a launcher --
+        // minted it while it had focus, which is why a browser already
+        // running elsewhere comes to the front instead of opening a tab on
+        // a workspace nobody is looking at.
+        let token = ActivationToken::take_from_env();
+
         // Loaded once, not per target: the glob and association databases
         // are a fair slice of the filesystem, and `open *.png` is ordinary.
-        let opener = Opener::new(Handlers::load());
+        let opener = Opener::new(Handlers::load()).with_activation(token);
         let mut failed = false;
 
         for raw in &targets {

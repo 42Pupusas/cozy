@@ -148,6 +148,11 @@ pub struct Toplevel {
     /// [`crate::toplevel::drag::DragController`] for why this handles both
     /// dragging out of and dropping into this window.
     drag: crate::toplevel::drag::DragController,
+
+    /// `xdg_activation_v1`, when the compositor offers it. `None` means a
+    /// launched window cannot ask to be raised, which is the pre-protocol
+    /// behaviour rather than a failure.
+    activation: Option<crate::toplevel::activation::Activation>,
 }
 
 impl Toplevel {
@@ -212,6 +217,7 @@ impl Toplevel {
             output,
             decoration_manager,
             data_device_manager,
+            activation,
         } = builder.finish().ok_or(PlatformError::ReaderStopped)?;
 
         // No output bound (some nested/headless compositors advertise none)
@@ -308,6 +314,7 @@ impl Toplevel {
             xkb: None,
             awaiting_keymap_fd: None,
             drag,
+            activation: activation.map(crate::toplevel::activation::Activation::new),
         };
         window.bind_seat_devices_eagerly();
         Ok(window)
@@ -329,6 +336,44 @@ impl Toplevel {
     /// Change the window title.
     pub fn set_title(&self, title: &str) {
         self.shell.set_title(&self.window_tx, title);
+    }
+
+    /// Mint an activation token for a program this window is about to
+    /// launch, so the launched window may raise itself.
+    ///
+    /// Call this from the handler for the input event that caused the
+    /// launch. The token carries that event's serial and this window's
+    /// surface, which together are the compositor's own evidence that a
+    /// user acted -- see [`crate::toplevel::activation`].
+    ///
+    /// Returns `None` when the compositor offers no `xdg_activation_v1`, or
+    /// does not answer in time. Both mean "launch without a token": the
+    /// child still starts, it simply appears where it already lived instead
+    /// of on the current workspace.
+    ///
+    /// `app_id` names the program being launched, not this one.
+    pub fn activation_token(
+        &mut self,
+        app_id: &str,
+    ) -> Option<crate::toplevel::activation::ActivationToken> {
+        let activation = self.activation?;
+        activation
+            .request(
+                &mut self.sender,
+                &mut self.events,
+                self.seat,
+                self.shell.surface,
+                self.pointer.last_serial(),
+                app_id,
+            )
+            .ok()
+            .flatten()
+    }
+
+    /// Whether the compositor can issue activation tokens.
+    #[must_use]
+    pub const fn supports_activation(&self) -> bool {
+        self.activation.is_some()
     }
 
     /// Start dragging `paths` out of this window -- the file-browser-facing

@@ -877,6 +877,68 @@ pub const WL_DATA_DEVICE_MANAGER: Interface = Interface {
     // v1 has create_data_source/get_data_device — all plain clipboard needs.
     version: 1,
 };
+pub const XDG_ACTIVATION_V1: Interface = Interface {
+    name: "xdg_activation_v1",
+    version: 1,
+};
+
+// ── xdg_activation_v1 ────────────────────────────────────────────
+//
+// The protocol that carries "the user asked for this" across a process
+// boundary. A compositor refuses to raise a window on an unsolicited
+// request, because that is focus stealing; a token is the proof that
+// distinguishes a launch the user performed from one a background process
+// invented.
+//
+// The exchange has two halves in two different processes:
+//
+//   1. The launcher (us) asks for a token, presenting the serial of the
+//      input event that triggered the launch and the surface that had
+//      focus. The compositor replies with an opaque string.
+//   2. The launcher passes that string to the child in the environment
+//      variable `XDG_ACTIVATION_TOKEN`. The child presents it with
+//      `activate`, and the compositor honours the raise.
+//
+// A token is single-use and short-lived; the compositor decides how short.
+// Replaced `_NET_ACTIVE_WINDOW`/`DESKTOP_STARTUP_ID` from X11.
+
+requests! {
+    /// `xdg_activation_v1` requests — the token factory.
+    ActivationRequest {
+        Destroy = 0,
+        /// Create a token object to configure and then commit.
+        GetActivationToken = 1,
+        /// Raise the surface associated with a token string.
+        Activate = 2,
+    }
+}
+
+requests! {
+    /// `xdg_activation_token_v1` requests — one token under construction.
+    ///
+    /// `SetSerial` and `SetSurface` are what make the token trustworthy:
+    /// they tell the compositor which input event and which focused surface
+    /// the launch came from. A token committed without them is still issued,
+    /// but a compositor is free to treat it as weak evidence.
+    ActivationTokenRequest {
+        /// The input event serial and the seat it came from.
+        SetSerial = 0,
+        /// The app id being launched.
+        SetAppId = 1,
+        /// The surface that was focused when the user acted.
+        SetSurface = 2,
+        /// Ask for the token string; answered by `ActivationTokenEvent::Done`.
+        Commit = 3,
+        Destroy = 4,
+    }
+}
+events! {
+    /// `xdg_activation_token_v1` events.
+    ActivationTokenEvent {
+        /// The token string. Single-use, and the object is spent after it.
+        Done = 0,
+    }
+}
 
 // ── zwlr_layer_shell_v1 (wlr-layer-shell-unstable-v1) ────────────────────
 //
@@ -1459,6 +1521,29 @@ mod tests {
         assert_eq!(ScreencopyFrameRequest::Copy.opcode(), 0);
         assert_eq!(ScreencopyFrameRequest::Destroy.opcode(), 1);
         assert_eq!(ScreencopyFrameRequest::CopyWithDamage.opcode(), 2);
+    }
+
+    /// An opcode is the wire contract. A wrong one does not fail to
+    /// compile and does not error at runtime -- it silently invokes a
+    /// different request on the compositor, so these are transcribed from
+    /// `xdg-activation-v1.xml` declaration order and pinned here.
+    #[test]
+    fn activation_opcodes_match_the_protocol_xml() {
+        assert_eq!(ActivationRequest::Destroy.opcode(), 0);
+        assert_eq!(ActivationRequest::GetActivationToken.opcode(), 1);
+        assert_eq!(ActivationRequest::Activate.opcode(), 2);
+
+        assert_eq!(ActivationTokenRequest::SetSerial.opcode(), 0);
+        assert_eq!(ActivationTokenRequest::SetAppId.opcode(), 1);
+        assert_eq!(ActivationTokenRequest::SetSurface.opcode(), 2);
+        assert_eq!(ActivationTokenRequest::Commit.opcode(), 3);
+        assert_eq!(ActivationTokenRequest::Destroy.opcode(), 4);
+
+        assert_eq!(
+            ActivationTokenEvent::from_opcode(0),
+            Some(ActivationTokenEvent::Done)
+        );
+        assert_eq!(ActivationTokenEvent::from_opcode(1), None);
     }
 
     #[test]

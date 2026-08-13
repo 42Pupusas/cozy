@@ -105,6 +105,10 @@ object_ids! {
     DataControlOfferId,
     /// `zwlr_data_control_source_v1` — privileged outgoing clipboard source.
     DataControlSourceId,
+    /// `xdg_activation_v1` — the activation-token factory global.
+    ActivationId,
+    /// `xdg_activation_token_v1` — one in-flight token request.
+    ActivationTokenId,
 }
 
 /// An event serial — echoed back in acks/pongs. Distinct from an object id so

@@ -19,13 +19,16 @@
 //! mime::MimeDb + mime::Associations   type -> desktop id
 //! launcher::DesktopEntry              desktop id -> Exec=
 //! Handlers                            the candidate-walking policy
+//! ActivationToken                     proof the user asked for this
 //! Opener                              spawn, with an xdg-open fallback
 //! ```
 
+mod activation_token;
 mod handlers;
 mod launch;
 mod target;
 
+pub use activation_token::ActivationToken;
 pub use handlers::Handlers;
 pub use launch::{OpenError, Opener};
 pub use target::Target;

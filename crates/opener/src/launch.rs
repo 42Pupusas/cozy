@@ -18,7 +18,7 @@
 //! The ordering is deliberate and not reversible: consulting `xdg-open`
 //! first would make every association we resolve irrelevant.
 
-use crate::{Handlers, Target};
+use crate::{ActivationToken, Handlers, Target};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -55,6 +55,13 @@ impl std::error::Error for OpenError {}
 /// Opens files with their associated application.
 pub struct Opener {
     handlers: Handlers,
+    /// Proof that the user asked for this, handed to the child so its
+    /// window may raise itself onto the current workspace.
+    ///
+    /// `None` is the ordinary case for a process nobody activated, and it
+    /// costs only the pre-protocol behaviour: the window still opens, on
+    /// whichever workspace it already lived.
+    activation: Option<ActivationToken>,
 }
 
 impl Opener {
@@ -67,6 +74,7 @@ impl Opener {
     pub fn load() -> Self {
         Self {
             handlers: Handlers::load(),
+            activation: None,
         }
     }
 
@@ -77,7 +85,22 @@ impl Opener {
     /// menu, the portal's `OpenURI` -- loads the databases once.
     #[must_use]
     pub const fn new(handlers: Handlers) -> Self {
-        Self { handlers }
+        Self {
+            handlers,
+            activation: None,
+        }
+    }
+
+    /// Carry `token` to every process this opener launches.
+    ///
+    /// The builder half of [`ActivationToken::take_from_env`]: a launcher
+    /// that was itself activated forwards its token, so the window it opens
+    /// arrives where the user is looking rather than on the workspace the
+    /// application already occupied.
+    #[must_use]
+    pub fn with_activation(mut self, token: Option<ActivationToken>) -> Self {
+        self.activation = token;
+        self
     }
 
     /// The resolver behind this opener.
@@ -97,7 +120,7 @@ impl Opener {
     /// not take the browser down with it.
     pub fn open(&self, path: &Path) {
         if let Some(command) = self.handlers.command_for(path) {
-            match command.spawn_detached() {
+            match self.spawn(&command) {
                 Ok(()) => return,
                 // A resolved handler that won't start is worth saying out
                 // loud -- it means the association is real but the program
@@ -110,7 +133,7 @@ impl Opener {
             }
         }
 
-        Self::spawn_xdg_open(path.as_os_str());
+        self.spawn_xdg_open(path.as_os_str());
     }
 
     /// Open `target`, reporting why if it did not happen.
@@ -126,12 +149,48 @@ impl Opener {
             .handlers
             .command_for_target(target)
             .ok_or(OpenError::NoHandler)?;
-        command
-            .spawn_detached()
-            .map_err(|e| OpenError::SpawnFailed {
-                program: command.program.clone(),
-                reason: e.to_string(),
-            })
+        self.spawn(&command).map_err(|e| OpenError::SpawnFailed {
+            program: command.program.clone(),
+            reason: e.to_string(),
+        })
+    }
+
+    /// Start `command` detached, carrying the activation token when we have
+    /// one.
+    ///
+    /// `launcher::ExecCommand::spawn_detached` does everything here except
+    /// the token, and it belongs to another crate. Rather than ask that
+    /// crate for an environment-aware twin, the few lines of `Command`
+    /// setup live here, where the token does.
+    fn spawn(&self, command: &launcher::launch::ExecCommand) -> std::io::Result<()> {
+        let mut child = Command::new(&command.program);
+        child
+            .args(&command.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        self.apply_activation(&mut child);
+        // Deliberately not waited on -- see `spawn_xdg_open`.
+        child.spawn()?;
+        Ok(())
+    }
+
+    /// Set the activation token on `child`, or make sure it has none.
+    ///
+    /// The `remove_env` half is not redundant. A token is single-use, and
+    /// this process may have inherited one from whatever launched it. If we
+    /// hold no token of our own, letting a stale inherited one reach the
+    /// child hands it proof that belongs to a different, already-completed
+    /// activation -- so the variable is cleared rather than left to leak.
+    fn apply_activation(&self, child: &mut Command) {
+        match &self.activation {
+            Some(token) => {
+                child.env(ActivationToken::ENV, token.as_str());
+            }
+            None => {
+                child.env_remove(ActivationToken::ENV);
+            }
+        }
     }
 
     /// [`Self::try_open`], then `xdg-open` if nothing was associated.
@@ -142,7 +201,7 @@ impl Opener {
     pub fn try_open_with_fallback(&self, target: &Target) -> Result<(), OpenError> {
         match self.try_open(target) {
             Err(OpenError::NoHandler) => {
-                Self::spawn_xdg_open(target.as_argument());
+                self.spawn_xdg_open(target.as_argument());
                 Ok(())
             }
             other => other,
@@ -150,16 +209,18 @@ impl Opener {
     }
 
     /// Last resort: let the desktop environment try.
-    fn spawn_xdg_open(argument: &OsStr) {
+    fn spawn_xdg_open(&self, argument: &OsStr) {
         // stdin/stdout/stderr go to null so a handler that decides to print
         // cannot interleave with our own diagnostics or, worse, block on a
         // pipe nobody is draining.
-        let spawned = Command::new("xdg-open")
+        let mut child = Command::new("xdg-open");
+        child
             .arg(argument)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+            .stderr(Stdio::null());
+        self.apply_activation(&mut child);
+        let spawned = child.spawn();
 
         // The child is deliberately not waited on. Reaping it would block
         // the event loop for as long as the opened application runs --
@@ -264,6 +325,103 @@ mod tests {
             opener.try_open(&Target::parse("ircs://irc.example.com/rust")),
             Err(OpenError::NoHandler)
         );
+    }
+
+    /// A `.desktop` handler that writes one environment variable to a file,
+    /// and the wait for it to do so.
+    ///
+    /// The child is spawned detached, so the value it reports arrives on
+    /// its own schedule. Polling to a deadline is what makes these tests
+    /// deterministic without waiting on a process we deliberately never
+    /// reap.
+    struct EnvProbe {
+        dir: std::path::PathBuf,
+        out: std::path::PathBuf,
+    }
+
+    impl EnvProbe {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+        fn new(tag: &str, shell_word: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("opener-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let out = dir.join("env.txt");
+            std::fs::write(
+                dir.join("env.desktop"),
+                format!(
+                    "[Desktop Entry]\nName=Env\nExec=sh -c 'printf %s \"{shell_word}\" > {}'\n\
+                     Type=Application\n",
+                    out.display()
+                ),
+            )
+            .expect("write");
+            std::fs::write(dir.join("photo.png"), b"x").expect("write");
+            Self { dir, out }
+        }
+
+        fn target(&self) -> Target {
+            Target::File(self.dir.join("photo.png"))
+        }
+
+        fn handlers(&self) -> Handlers {
+            Handlers::from_parts(
+                MimeDb::from_globs_data("50:image/png:*.png\n"),
+                Associations::from_str_data("[Default Applications]\nimage/png=env.desktop\n"),
+                vec![self.dir.clone()],
+            )
+        }
+
+        fn reported_value(&self) -> String {
+            let deadline = std::time::Instant::now() + Self::TIMEOUT;
+            while std::time::Instant::now() < deadline {
+                if let Ok(s) = std::fs::read_to_string(&self.out)
+                    && !s.is_empty()
+                {
+                    return s;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            String::new()
+        }
+    }
+
+    impl Drop for EnvProbe {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// The token has to reach the child's environment, not merely be held.
+    /// A handler that writes its own environment out proves the whole path:
+    /// builder, spawn, and variable name together.
+    #[test]
+    fn a_carried_token_reaches_the_launched_process() {
+        let probe = EnvProbe::new("token", "$XDG_ACTIVATION_TOKEN");
+        let opener = Opener::new(probe.handlers())
+            .with_activation(Some(ActivationToken::new("tok-abc")));
+
+        opener.try_open(&probe.target()).expect("spawned");
+
+        assert_eq!(probe.reported_value(), "tok-abc");
+    }
+
+    /// Without a token the variable must be *absent* from the child.
+    ///
+    /// This test caught a real leak: the process running it had a live
+    /// `XDG_ACTIVATION_TOKEN` in its own environment, which the child
+    /// inherited. A token authorises exactly one activation, so an
+    /// inherited one is proof of somebody else's completed launch. The
+    /// no-token path therefore clears the variable rather than merely
+    /// declining to set it.
+    #[test]
+    fn no_token_means_no_variable_in_the_child() {
+        let probe = EnvProbe::new("notoken", "${XDG_ACTIVATION_TOKEN-unset}");
+        let opener = Opener::new(probe.handlers());
+
+        opener.try_open(&probe.target()).expect("spawned");
+
+        assert_eq!(probe.reported_value(), "unset");
     }
 
     #[test]

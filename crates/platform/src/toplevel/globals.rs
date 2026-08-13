@@ -10,8 +10,8 @@
 use crate::conn::Sender;
 use crate::error::Result;
 use crate::id::{
-    CompositorId, DataDeviceManagerId, DecorationManagerId, OutputId, RegistryId, SeatId, ShmId,
-    WmBaseId,
+    ActivationId, CompositorId, DataDeviceManagerId, DecorationManagerId, OutputId, RegistryId,
+    SeatId, ShmId, WmBaseId,
 };
 use crate::protocol as proto;
 use crate::surface::GlobalCollector;
@@ -41,6 +41,12 @@ pub struct ToplevelGlobals {
     /// would be absurd, it would just mean drag-and-drop and clipboard are
     /// unavailable.
     pub data_device_manager: Option<DataDeviceManagerId>,
+    /// `xdg_activation_v1` -- the factory for the tokens that let a launched
+    /// window raise itself. Optional for the same reason as the others: a
+    /// compositor without it simply means a launched window appears on the
+    /// workspace it was already on, which is the behaviour every client had
+    /// before the protocol existed.
+    pub activation: Option<ActivationId>,
 }
 
 /// Accumulates globals as `wl_registry.global` events arrive.
@@ -53,6 +59,7 @@ pub struct ToplevelGlobalsBuilder {
     output: Option<OutputId>,
     decoration_manager: Option<DecorationManagerId>,
     data_device_manager: Option<DataDeviceManagerId>,
+    activation: Option<ActivationId>,
 }
 
 impl ToplevelGlobalsBuilder {
@@ -70,6 +77,7 @@ impl ToplevelGlobalsBuilder {
             output: self.output,
             decoration_manager: self.decoration_manager,
             data_device_manager: self.data_device_manager,
+            activation: self.activation,
         })
     }
 }
@@ -161,6 +169,15 @@ impl GlobalCollector for ToplevelGlobalsBuilder {
                 version,
                 proto::WL_DATA_DEVICE_MANAGER.version,
             ),
+            s if s == proto::XDG_ACTIVATION_V1.name => Self::bind_if_missing(
+                &mut self.activation,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::XDG_ACTIVATION_V1.version,
+            ),
             // Compositors advertise dozens of globals we have no use for.
             _ => Ok(()),
         }
@@ -189,6 +206,7 @@ mod tests {
             output: None,
             decoration_manager: None,
             data_device_manager: None,
+            activation: None,
         };
         assert!(b.is_complete());
     }
@@ -199,6 +217,7 @@ mod tests {
         let b = ToplevelGlobalsBuilder {
             output: Some(OutputId(9)),
             decoration_manager: Some(DecorationManagerId(10)),
+            activation: Some(ActivationId(11)),
             ..Default::default()
         };
         assert!(!b.is_complete());
@@ -215,6 +234,7 @@ mod tests {
             output: None,
             decoration_manager: None,
             data_device_manager: None,
+            activation: None,
         };
         let mut b = full();
         b.compositor = None;
@@ -246,10 +266,12 @@ mod tests {
             output: None,
             decoration_manager: None,
             data_device_manager: None,
+            activation: None,
         };
         let g = b.finish().expect("required globals present");
         assert!(g.output.is_none());
         assert!(g.decoration_manager.is_none());
         assert!(g.data_device_manager.is_none());
+        assert!(g.activation.is_none());
     }
 }

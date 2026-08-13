@@ -33,7 +33,7 @@ opt-level = 3
 ququmatz      = "0.15.1"
 # Must come from the registry, not a path: quetzal-uring's own ququmatz
 # dependency would otherwise resolve to a second, distinct copy of the crate.
-quetzal-uring = "0.2"
+quetzal-uring = "0.2.1"
 # Must come from the registry, not a path: quetzal-uring depends on
 # quetzalcoatl too, and a path copy resolves as a second, distinct crate.
 quetzalcoatl  = "0.13.1"

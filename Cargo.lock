@@ -420,9 +420,9 @@ dependencies = [
 
 [[package]]
 name = "quetzal-uring"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30a68ec4d2aebbf6738f5f47d804c4853be7093d2b3b100f1e325fb0227b9ee0"
+checksum = "511ba63cbd3d14932ef822122e61400a9936c902c1bb31282278c404e97e6ef0"
 dependencies = [
  "quetzalcoatl",
  "ququmatz",

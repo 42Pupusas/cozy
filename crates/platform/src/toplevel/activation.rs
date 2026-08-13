@@ -125,6 +125,10 @@ impl Activation {
 
     /// Ask the compositor for a token, and block until it answers.
     ///
+    /// `token` is the id for the token object, supplied by the caller rather
+    /// than allocated here: a window owns a reserved block of object ids, and
+    /// an id drawn from anywhere else collides with one already in use.
+    ///
     /// `evidence` carries the input serial and focused surface that make the
     /// token trustworthy -- see [`LaunchEvidence`].
     ///
@@ -137,12 +141,12 @@ impl Activation {
     /// than not at all.
     pub fn request(
         &self,
+        token: ActivationTokenId,
         sender: &mut Sender,
         events: &mut Consumer<RawEvent>,
         deferred: &mut std::collections::VecDeque<RawEvent>,
         evidence: LaunchEvidence<'_>,
     ) -> Result<Option<ActivationToken>> {
-        let token: ActivationTokenId = sender.alloc_id();
         sender.request(
             MessageBuilder::new(self.global, ActivationRequest::GetActivationToken).new_id(token),
         )?;

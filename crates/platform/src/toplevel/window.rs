@@ -368,7 +368,14 @@ impl Toplevel {
         app_id: Option<&str>,
     ) -> Option<crate::toplevel::activation::ActivationToken> {
         let activation = self.activation?;
+        // The id must come from this window's reserved block, like every
+        // other object created after startup. `Sender::alloc_id` hands out
+        // ids from the range that block was carved out of, so using it here
+        // names an object the window already owns -- and the compositor
+        // rejects the request as invalid arguments.
+        let token: crate::id::ActivationTokenId = self.window_tx.alloc_id();
         match activation.request(
+            token,
             &mut self.sender,
             &mut self.events,
             &mut self.deferred,

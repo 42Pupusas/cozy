@@ -136,6 +136,52 @@ impl IoUringExt for IoUring {
 }
 
 #[cfg(test)]
+mod id_allocation_tests {
+    use super::*;
+
+    /// A window reserves a block and hands ids out of it. The connection must
+    /// resume past that block, or a later `Sender::alloc_id` re-issues an id
+    /// the window is already using, and the compositor kills the connection
+    /// with an invalid-arguments protocol error.
+    #[test]
+    fn a_reserved_block_is_never_reissued_by_the_connection() {
+        let mut sender = Sender::stub();
+        let first: crate::id::SurfaceId = sender.alloc_id();
+        let (start, end) = sender.alloc_id_block(64);
+
+        assert!(start > first.raw());
+
+        let next: crate::id::SurfaceId = sender.alloc_id();
+        assert!(
+            next.raw() >= end,
+            "connection re-issued an id from the window's reserved block"
+        );
+    }
+
+    /// The window's own allocator stays inside its block, so the two sources
+    /// partition the id space rather than sharing it.
+    #[test]
+    fn a_window_allocates_only_from_its_own_block() {
+        let mut sender = Sender::stub();
+        let (start, end) = sender.alloc_id_block(8);
+        let (tx, _rx) =
+            mpsc::RingBuffer::<WindowRequest>::new(quetzalcoatl::capacity::Capacity::exact(4))
+                .split();
+        let mut window_tx = WindowSender {
+            tx,
+            next_id: start,
+            id_end: end,
+            free_ids: Vec::new(),
+        };
+
+        for _ in 0..8 {
+            let id: crate::id::SurfaceId = window_tx.alloc_id();
+            assert!((start..end).contains(&id.raw()));
+        }
+    }
+}
+
+#[cfg(test)]
 mod error_tests {
     use super::*;
     use std::error::Error as _;
@@ -537,6 +583,13 @@ impl Sender {
     /// Reserve a block of `count` consecutive object ids for a window's
     /// exclusive use. Returns `(start, end_exclusive)`. The window hands these
     /// out via [`WindowSender::alloc_id`] without touching the connection.
+    ///
+    /// Every object a window creates after startup must be allocated from its
+    /// block. [`Self::alloc_id`] resumes past the block, so the two never
+    /// collide -- but only if post-startup callers use the block. One that
+    /// reaches for `alloc_id` instead names an id the window already holds,
+    /// and the compositor answers with a protocol error that closes the
+    /// connection.
     pub const fn alloc_id_block(&mut self, count: u32) -> (u32, u32) {
         let start = self.next_id;
         self.next_id += count;

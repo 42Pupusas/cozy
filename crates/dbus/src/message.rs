@@ -36,7 +36,7 @@ impl MessageType {
         }
     }
 
-    const fn as_byte(self) -> u8 {
+    pub(crate) const fn as_byte(self) -> u8 {
         match self {
             Self::MethodCall => 1,
             Self::MethodReturn => 2,
@@ -551,6 +551,14 @@ pub struct Reply {
     /// A `Value::UnixFd` in the body is an *index*, valid only against the
     /// descriptors claimed for this message. See [`crate::fds`].
     pub unix_fds: u32,
+    /// The descriptors that arrived with this message, in the order a
+    /// `Value::UnixFd` index counts in.
+    ///
+    /// Populated by the connection as it parses the frame, so the
+    /// descriptors travel with the message that owns them instead of
+    /// staying in a shared queue a later message could drain first. Empty
+    /// on every message built locally rather than read off a socket.
+    pub fds: Vec<std::os::fd::OwnedFd>,
 }
 
 impl Reply {
@@ -559,6 +567,21 @@ impl Reply {
     #[must_use]
     pub fn values(&self) -> Vec<Value> {
         Unmarshaller::unmarshal_body(&self.body, &self.signature).unwrap_or_default()
+    }
+
+    /// Resolve a body `Value::UnixFd(index)` to the descriptor it names.
+    ///
+    /// The `h` value in a body is an index, not a descriptor number.
+    /// Reading it as one yields an unrelated file that happens to be open
+    /// in this process, so callers must resolve through here.
+    #[must_use]
+    pub fn fd_at(&self, index: u32) -> Option<&std::os::fd::OwnedFd> {
+        self.fds.get(index as usize)
+    }
+
+    /// Take ownership of every descriptor this message carried.
+    pub fn take_fds(&mut self) -> Vec<std::os::fd::OwnedFd> {
+        std::mem::take(&mut self.fds)
     }
 }
 
@@ -701,6 +724,7 @@ impl Reply {
             signature,
             body,
             unix_fds,
+            fds: Vec::new(),
         })
     }
 }

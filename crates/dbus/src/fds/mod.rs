@@ -19,6 +19,10 @@ mod queue;
 mod socket_pair;
 
 #[cfg(test)]
+mod conn_tests;
+#[cfg(test)]
+mod fd_frame;
+#[cfg(test)]
 mod test_fds;
 #[cfg(test)]
 mod tests;

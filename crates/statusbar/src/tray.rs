@@ -527,6 +527,7 @@ mod tests {
             signature: "s".into(),
             body: vec![0; 0],
             unix_fds: 0,
+            fds: Vec::new(),
         };
         // Body decoding belongs to dbus; target parsing's service/path branch
         // is covered by this direct contract test through an equivalent value
@@ -548,6 +549,7 @@ mod tests {
             signature: String::new(),
             body: Vec::new(),
             unix_fds: 0,
+            fds: Vec::new(),
         };
         assert!(TrayWatcher::is_item_update_signal(&message));
     }
@@ -566,6 +568,7 @@ mod tests {
             signature: String::new(),
             body: Vec::new(),
             unix_fds: 0,
+            fds: Vec::new(),
         };
         assert!(!TrayWatcher::is_item_update_signal(&message));
     }
@@ -595,6 +598,7 @@ mod tests {
             signature: "sss".into(),
             body,
             unix_fds: 0,
+            fds: Vec::new(),
         }
     }
 
@@ -625,6 +629,7 @@ mod tests {
             signature: String::new(),
             body: Vec::new(),
             unix_fds: 0,
+            fds: Vec::new(),
         };
         assert!(TrayWatcher::name_owner_lost(&message).is_none());
     }

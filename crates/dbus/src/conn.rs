@@ -20,7 +20,6 @@ use std::fmt;
 use std::io;
 use std::os::fd::OwnedFd;
 
-use ququmatz::types::MsgFlags;
 use ququmatz::{IoUring, Sqe};
 
 use crate::message::{BodyArg, MessageType, PRELUDE_LEN, Prelude, Reply};
@@ -49,10 +48,30 @@ pub enum DbusError {
     AuthRejected(String),
     /// A reply didn't parse as a well-formed D-Bus message.
     Malformed,
+    /// The kernel discarded ancillary data: descriptors arrived that the
+    /// control region was too small to hold. Reported rather than ignored,
+    /// because the alternative is a message whose `h` indexes point at
+    /// descriptors this process never received.
+    FdsTruncated,
+    /// Descriptors were offered on a connection whose peer refused
+    /// `NEGOTIATE_UNIX_FD` during SASL.
+    FdsNotNegotiated,
     /// The call returned `MessageType::Error`.
     Reply {
         name: String,
     },
+}
+
+impl From<crate::fds::FdError> for DbusError {
+    fn from(err: crate::fds::FdError) -> Self {
+        use crate::fds::FdError;
+        match err {
+            FdError::Io(e) => Self::Io(e),
+            FdError::Closed => Self::Closed,
+            FdError::ControlTruncated => Self::FdsTruncated,
+            FdError::NotNegotiated => Self::FdsNotNegotiated,
+        }
+    }
 }
 
 impl fmt::Display for DbusError {
@@ -65,6 +84,12 @@ impl fmt::Display for DbusError {
             Self::Closed => write!(f, "the bus closed the connection"),
             Self::AuthRejected(line) => write!(f, "SASL auth rejected: {line}"),
             Self::Malformed => write!(f, "malformed D-Bus message"),
+            Self::FdsTruncated => {
+                write!(f, "the kernel truncated ancillary data; descriptors lost")
+            }
+            Self::FdsNotNegotiated => {
+                write!(f, "the peer did not agree to unix FD passing")
+            }
             Self::Reply { name } => write!(f, "D-Bus error reply: {name}"),
         }
     }
@@ -163,6 +188,48 @@ impl DbusConn {
         conn.authenticate()?;
         conn.hello()?;
         Ok(conn)
+    }
+
+    /// Build a connection over an already-connected socket, skipping SASL
+    /// and `Hello`.
+    ///
+    /// Exists so the framing and descriptor-passing paths can be tested
+    /// against a real kernel socket pair rather than a live bus daemon.
+    #[cfg(test)]
+    pub(crate) fn over_socket(sock: OwnedFd, negotiated: bool) -> Result<Self, DbusError> {
+        let sock_fd = sys::DbusSys::as_uring_fd(&sock);
+        let ring = IoUring::builder(RING_ENTRIES)
+            .clamp()
+            .cq_entries(RING_CQ_ENTRIES)
+            .build()
+            .map_err(DbusError::Setup)?;
+        let mut fds = crate::fds::FdPassing::new();
+        fds.set_negotiated(negotiated);
+        Ok(Self {
+            _sock: sock,
+            sock_fd,
+            ring,
+            next_serial: 1,
+            pending: std::collections::VecDeque::new(),
+            fds,
+        })
+    }
+
+    /// Write a pre-built frame with `fds` attached, for tests that must act
+    /// as the peer of a connection under test.
+    #[cfg(test)]
+    pub(crate) fn write_frame(
+        &mut self,
+        frame: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<(), DbusError> {
+        self.send_raw_with_fds(frame, fds)
+    }
+
+    /// Read one frame straight off the wire, bypassing the pending queue.
+    #[cfg(test)]
+    pub(crate) fn read_frame(&mut self) -> Result<Reply, DbusError> {
+        self.recv_wire_message()
     }
 
     /// Submit one SQE, block for its completion, return the raw CQE result.
@@ -317,58 +384,48 @@ impl DbusConn {
     }
 
     fn send_raw(&mut self, bytes: &[u8]) -> Result<(), DbusError> {
+        self.send_raw_with_fds(bytes, &[])
+    }
+
+    /// Send `bytes`, attaching `fds` as `SCM_RIGHTS` on the first write.
+    ///
+    /// The descriptors ride the first `sendmsg` only. A partial write
+    /// resends the remaining bytes with no ancillary data, because the
+    /// kernel already took ownership of the descriptors from that first
+    /// call; re-attaching them would duplicate every one into the peer.
+    fn send_raw_with_fds(
+        &mut self,
+        bytes: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<(), DbusError> {
         let mut sent = 0;
         while sent < bytes.len() {
-            let remaining = u32::try_from(bytes.len() - sent).unwrap_or(u32::MAX);
-            // SAFETY: `bytes[sent..]` is valid for the duration of this
-            // blocking submit+wait+complete, all within this call.
-            let sqe = unsafe {
-                Sqe::send_ptr(
-                    self.sock_fd,
-                    bytes[sent..].as_ptr(),
-                    remaining,
-                    MsgFlags::NOSIGNAL,
-                )
-            };
-            let n = Self::run_one(&mut self.ring, sqe)?;
-            if n < 0 {
-                return Err(DbusError::Io(io::Error::from_raw_os_error(-n)));
-            }
-            if n == 0 {
-                return Err(DbusError::Closed);
-            }
-            // `n` is a byte count `run_one` just confirmed is >= 0.
-            sent += usize::try_from(n).unwrap_or(0);
+            let attach: &[std::os::fd::BorrowedFd<'_>] = if sent == 0 { fds } else { &[] };
+            let n = self
+                .fds
+                .send_with_fds(&mut self.ring, self.sock_fd, &bytes[sent..], attach)?;
+            sent += n;
         }
         Ok(())
     }
 
-    /// Read exactly `buf.len()` bytes, growing `into` -- used both for the
-    /// line-based SASL handshake and for full message frames.
+    /// Read exactly `n` bytes, staging any descriptors that arrive with them.
+    ///
+    /// Every receive goes through `recvmsg`, including the SASL handshake and
+    /// frames expected to carry nothing. A plain `recv(2)` discards
+    /// `SCM_RIGHTS` ancillary data silently, and a reader only learns a frame
+    /// carried descriptors after parsing the `UNIX_FDS` header out of bytes it
+    /// has already read -- by which point a plain read has destroyed them.
+    /// Descriptors are therefore always staged, and claimed later by the
+    /// message that owns them.
     fn recv_exact(&mut self, n: usize) -> Result<Vec<u8>, DbusError> {
         let mut out = vec![0u8; n];
         let mut got = 0;
         while got < n {
-            let remaining = u32::try_from(n - got).unwrap_or(u32::MAX);
-            // SAFETY: `out[got..]` is valid for the duration of this blocking
-            // submit+wait+complete.
-            let sqe = unsafe {
-                Sqe::recv_ptr(
-                    self.sock_fd,
-                    out[got..].as_mut_ptr(),
-                    remaining,
-                    MsgFlags::default(),
-                )
-            };
-            let r = Self::run_one(&mut self.ring, sqe)?;
-            if r < 0 {
-                return Err(DbusError::Io(io::Error::from_raw_os_error(-r)));
-            }
-            if r == 0 {
-                return Err(DbusError::Closed);
-            }
-            // `r` is a byte count `run_one` just confirmed is >= 0.
-            got += usize::try_from(r).unwrap_or(0);
+            let r = self
+                .fds
+                .recv_with_fds(&mut self.ring, self.sock_fd, &mut out[got..])?;
+            got += r;
         }
         Ok(out)
     }
@@ -564,7 +621,19 @@ impl DbusConn {
 
         let mut full = prelude_bytes;
         full.extend_from_slice(&rest);
-        Reply::parse_message(&full).ok_or(DbusError::Malformed)
+        let mut reply = Reply::parse_message(&full).ok_or(DbusError::Malformed)?;
+
+        // Claim here, while this frame is the oldest unclaimed one, rather
+        // than leaving descriptors staged for the caller to claim later.
+        // `pending` can reorder delivery -- a reply is handed back before
+        // signals read ahead of it -- but the staging queue is strictly
+        // arrival-ordered. A later message claiming first would silently
+        // receive an earlier message's descriptors.
+        let wanted = reply.unix_fds as usize;
+        if wanted > 0 {
+            reply.fds = self.fds.claim(wanted).ok_or(DbusError::FdsTruncated)?;
+        }
+        Ok(reply)
     }
 
     /// Claim a well-known session-bus name.
@@ -633,13 +702,20 @@ impl DbusConn {
         self.fds.is_negotiated()
     }
 
-    /// Claim the descriptors belonging to a received message, in the order
-    /// they arrived -- which is the order its `h` indexes count in.
+    /// Descriptors received but not yet attached to a parsed message.
     ///
-    /// `None` when fewer than `count` have arrived.
+    /// Normally zero: [`Self::recv_message`] binds descriptors to the frame
+    /// that declared them as it parses. A non-zero count here means a peer
+    /// sent more descriptors than its `UNIX_FDS` header declared.
     #[must_use]
-    pub fn claim_unix_fds(&mut self, count: usize) -> Option<Vec<std::os::fd::OwnedFd>> {
-        self.fds.claim(count)
+    pub fn staged_unix_fds(&self) -> usize {
+        self.fds.staged_len()
+    }
+
+    /// Close any descriptors still staged, for a caller abandoning a
+    /// connection mid-message.
+    pub fn discard_staged_unix_fds(&mut self) {
+        self.fds.discard_staged();
     }
 
     /// Pop the next message, preferring anything already queued by a prior

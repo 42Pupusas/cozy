@@ -216,6 +216,7 @@ mod tests {
             signature: signature.to_string(),
             body,
             unix_fds: 0,
+            fds: Vec::new(),
         }
     }
 

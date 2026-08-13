@@ -132,6 +132,7 @@ mod tests {
     /// itself, so this pins the probe against a descriptor of known state.
     #[test]
     fn the_cloexec_probe_reads_a_real_descriptor_flag() {
+        let _guard = FdTestGuard::acquire();
         let loaned = LoanedFds::open(1);
         let raw = loaned.raw_numbers()[0];
         assert!(LoanedFds::is_cloexec(raw));

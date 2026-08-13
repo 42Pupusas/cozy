@@ -150,7 +150,7 @@ impl App {
         // Loaded once, before the loop: the glob and association databases
         // are a few thousand lines between them, and re-reading disk on
         // every Enter would put that latency directly in the user's way.
-        let opener = opener::Opener::load();
+        let mut opener = opener::Opener::load();
 
         let mut title = painter.title();
         loop {
@@ -169,6 +169,17 @@ impl App {
             if let Some(path) = painter.take_pending_open() {
                 // Deliberately outside the paint callback: spawning a process
                 // mid-frame would run it while the framebuffer is borrowed.
+                //
+                // The token is minted here, per open, because it is spent by
+                // the launch it authorises: it carries the serial of the
+                // click that asked for this file, so the compositor lets the
+                // handler's window come to the user rather than treating it
+                // as focus stealing.
+                opener.set_activation(
+                    window
+                        .activation_token(None)
+                        .map(|token| opener::ActivationToken::new(token.into_string())),
+                );
                 opener.open(&path);
             }
 

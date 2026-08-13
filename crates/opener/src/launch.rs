@@ -103,6 +103,16 @@ impl Opener {
         self
     }
 
+    /// Replace the token carried to launched processes.
+    ///
+    /// The per-launch twin of [`Self::with_activation`]. A token is minted
+    /// from the input event that caused one particular launch and is spent
+    /// by it, so a long-lived opener sets a fresh one before each open
+    /// rather than holding one for its lifetime.
+    pub fn set_activation(&mut self, token: Option<ActivationToken>) {
+        self.activation = token;
+    }
+
     /// The resolver behind this opener.
     ///
     /// So a caller that both opens and *reports* -- `bins/open`'s `--list`

@@ -110,9 +110,15 @@ impl Activation {
     /// `serial` is the input event that triggered the launch and `surface`
     /// is the surface that had focus when it happened. Both are what make
     /// the token trustworthy: they are the compositor's own evidence that a
-    /// user acted, replayed back to it. `app_id` names the program being
-    /// launched, which lets the compositor apply the right window rule to a
-    /// window that does not exist yet.
+    /// user acted, replayed back to it.
+    ///
+    /// `app_id` names the program being launched, which lets the compositor
+    /// apply the right window rule to a window that does not exist yet.
+    /// Pass `None` when the launcher does not know it -- a file browser
+    /// resolves a handler by MIME type and may never learn its app id. That
+    /// is not the same as passing `""`, which asks the compositor to match
+    /// rules for an application named nothing; the request is omitted
+    /// instead, exactly as the protocol allows.
     ///
     /// Returns `None` when the compositor does not answer within
     /// [`Self::TOKEN_TIMEOUT`], so the caller launches unactivated rather
@@ -124,7 +130,7 @@ impl Activation {
         seat: SeatId,
         surface: SurfaceId,
         serial: u32,
-        app_id: &str,
+        app_id: Option<&str>,
     ) -> Result<Option<ActivationToken>> {
         let token: ActivationTokenId = sender.alloc_id();
         sender.request(
@@ -135,9 +141,11 @@ impl Activation {
                 .u32(serial)
                 .object(seat),
         )?;
-        sender.request(
-            MessageBuilder::new(token, ActivationTokenRequest::SetAppId).string(app_id),
-        )?;
+        if let Some(app_id) = app_id {
+            sender.request(
+                MessageBuilder::new(token, ActivationTokenRequest::SetAppId).string(app_id),
+            )?;
+        }
         sender.request(
             MessageBuilder::new(token, ActivationTokenRequest::SetSurface).object(surface),
         )?;

@@ -351,10 +351,11 @@ impl Toplevel {
     /// child still starts, it simply appears where it already lived instead
     /// of on the current workspace.
     ///
-    /// `app_id` names the program being launched, not this one.
+    /// `app_id` names the program being launched, not this one; pass `None`
+    /// when it is not known.
     pub fn activation_token(
         &mut self,
-        app_id: &str,
+        app_id: Option<&str>,
     ) -> Option<crate::toplevel::activation::ActivationToken> {
         let activation = self.activation?;
         activation

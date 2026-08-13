@@ -6,6 +6,10 @@ The first plan described one terminal emulator that did not exist yet. That
 terminal exists. Eight more binaries exist beside it. This document therefore
 changes subject.
 
+The work runs across several agents at once. Section 4 partitions the
+workspace by file ownership, section 5 details each track, and section 8 is
+the contract every agent follows. Read section 8 first.
+
 Sibling documents:
 
 - `docs/portal-scoping.md` — the portal backend's own delivery plan. It stays
@@ -123,124 +127,204 @@ Record these, so nobody chases a crate that does not exist.
 
 ---
 
-## 4. The three gates
+## 4. How we parallelize
 
-Everything interactive in the portal waits behind these. Do them in order.
+The work splits across agents. Agents do not coordinate. Therefore the plan
+assigns **files**, not tasks.
 
-### Gate 1 — file descriptor passing
+### 4.1 The ownership rule
 
-Add `dbus::fds::FdPassing`.
+Each track below lists the paths it owns. An agent writes only inside its own
+paths.
 
-- `SCM_RIGHTS` send and receive over the bus socket.
-- The `UNIX_FDS` header field.
-- The `h` type: encode and decode an index into the descriptor array.
+If an agent needs a change outside its paths, it must stop and report the
+need. It must not make the change. Two agents editing one file produces a
+conflict that neither can see.
 
-Test it with a socket pair. Cover several descriptors in one message. Cover
-cleanup after an error. Do not expose any portal method that returns a
-descriptor before these tests pass.
+### 4.2 Sole-owner files
 
-This gate blocks `Screenshot` and `FileChooser`, which are the two interfaces
-that matter most. It needs no compositor. Do it first.
+These files carry cross-cutting change. Exactly one track owns each.
 
-### Gate 2 — the unified event pump
+| Path | Owner | Reason |
+|---|---|---|
+| `crates/dbus/**` | Track 1 | Gate 1 adds a `Value::UnixFd` variant. That breaks every exhaustive match in the crate. |
+| `crates/dbus-server/**` | Track 1 | It re-exports `dbus` types, so it moves with them. |
+| `bins/portal/**` | Track 2 | The daemon wires every interface together. |
+| `crates/platform/**` | nobody | Frozen for this plan. See 4.5. |
 
-`PortalLoop` polls two descriptors today: the bus socket and an inotify watch.
-It must also drive a Wayland connection.
+### 4.3 The prerequisites
 
-Requirements:
+Two extractions unblock several tracks at once. Do them first, alone, and land
+them before the tracks that depend on them start.
 
-- The daemon answers new bus calls while a dialog is on screen.
-- The daemon closes request and session objects when a caller loses its name.
-  `dbus_server::NameWatcher` already reports that event.
+**P1 — extract `crates/opener`.**
+`bins/files/src/handlers.rs` holds `Handlers`, the association-resolution
+policy. `bins/files/src/launch.rs` holds `Opener`. Both are pure logic over
+`mime` and `launcher`, and both are trapped inside a binary.
 
-### Gate 3 — the dialog shell
+`bins/open` needs them. The portal's `OpenURI` needs them. Move both files to
+a new `crates/opener`, and leave the `xdg-open` fallback exactly where it is
+for now. `Opener` has one call site (`bins/files/src/main.rs:155`), so this is
+a small, mechanical change.
 
-Add `crates/portal-ui`, and add the missing pieces of `portal-core`.
+**P2 — add `Value::UnixFd`.**
+The first half of Gate 1. Add the variant, the `h` signature character, and
+the marshal and unmarshal arms. Do not add socket transport yet. This lands
+the breaking change to `crates/dbus` early, so Track 1 stops blocking anybody.
 
-`portal-core` gains:
+### 4.4 The tracks
 
-- `request_handle.rs` — request object paths and token validation.
-- `session_handle.rs` — session lifetime and the `Closed` rules.
-- `response_code.rs` — success, cancelled, and error semantics.
-- `options/` — per-interface option-dictionary validation.
+After P1 and P2 land, these run **concurrently**.
 
-`portal-ui` gains:
+| Track | Owns | Depends on | Blocked by |
+|---|---|---|---|
+| 1. Bus transport | `crates/dbus/**`, `crates/dbus-server/**` | P2 | — |
+| 2. Portal daemon | `bins/portal/**`, `crates/portal-core/**` | — | Track 1, for FD methods only |
+| 3. Dialog shell | `crates/portal-ui/**` (new) | — | — |
+| 4. xdg CLIs | `bins/open/**`, `bins/xdg-*/**` (new) | P1 | — |
+| 5. Write paths | `crates/mime/**`, `crates/fsmodel/user_dirs` | — | — |
+| 6. Rollout | `docs/**`, `bins/portal/data/**` | — | — |
+| 7. Terminal | `crates/vt_parser/**`, `crates/font/**`, `bins/terminal/**` | — | — |
 
-- `dialog_shell.rs` — the modal Wayland surface, and its focus rules.
-- `access_dialog.rs` — a yes/no prompt.
-- `file_chooser.rs` — an adapter over `fsmodel`, `widget`, `fileops`, `mime`.
+Track 7 shares nothing with tracks 1 to 6. It runs at any time.
 
-Accept unparented overlays at first. Add `xdg_foreign` parent handles only
-after the shell is reliable.
+### 4.5 Frozen paths
+
+Do not restructure `crates/platform` during this plan. Six binaries depend on
+it. A refactor there stalls every track at once.
+
+The `TermWindow` and `Toplevel` convergence stays deferred. `docs/` records
+why: `TermWindow` tracks damage per cell row, and the generic painter repaints
+the whole window. The naive port is a performance regression.
 
 ---
 
-## 5. Delivery sequence
+## 5. Track detail
 
-Each step must build, test, and lint clean before the next step starts.
+Each numbered item is one agent's assignment. Each must build, test, and lint
+clean on its own.
 
-### Phase A — collect the finished work
+### Track 1 — bus transport
 
-1. **Route `Settings`.** Add one line to `portals.conf`:
-   `org.freedesktop.impl.portal.Settings=tijaax`. Restart the session
-   components. Prove the rollback once, by reverting that line.
-   The code, the tests, and the on-disk artifacts are already done. Until this
-   step happens, none of that work carries load.
-2. **Write `bins/open`.** A real `xdg-open` replacement over `mime` and
-   `launcher`. Both cores already work.
-3. **Delete the shell-outs.** Remove the `xdg-open` fallback from
-   `bins/files/src/launch.rs`. Remove the `xdg-open` call from
-   `bins/terminal`'s link handler. Point both at `bins/open`'s core.
-4. **Write the compatibility matrix.** Record, per interface: the advertised
-   version, the real caller that exercises it, the options it accepts, and the
-   backend it falls back to. `docs/portal-scoping.md` step 1 asked for this
-   and it does not exist yet.
+Owns `crates/dbus` and `crates/dbus-server`.
 
-### Phase B — the gates
+1. **`dbus::fds::FdPassing`.** Send and receive `SCM_RIGHTS` over the bus
+   socket. Add the `UNIX_FDS` header field. Encode and decode the `h` index
+   into the descriptor array.
+   Test with a socket pair. Cover several descriptors in one message. Cover
+   cleanup after an error.
+   Needs no compositor and no bus daemon.
+2. **Descriptor lifetime.** Close received descriptors when a message drops.
+   Prove it: open many, drop them, and count the process's open descriptors.
 
-5. Gate 1: `dbus::fds::FdPassing`.
-6. Gate 2: the unified event pump.
-7. Gate 3: `portal-ui` and the rest of `portal-core`.
+### Track 2 — portal daemon
 
-### Phase C — interfaces
+Owns `bins/portal` and `crates/portal-core`.
 
-Each interface routes on its own. Each one adapts a crate that already works.
+3. **`portal-core` handles.** Add `request_handle.rs`, `session_handle.rs`,
+   and `response_code.rs`. These are pure domain types: object paths, token
+   validation, the `Closed` rules, and the response codes.
+   This needs no bus and no UI. It starts immediately.
+4. **`options/`.** Per-interface option-dictionary validation, one module per
+   interface.
+5. **The unified pump.** `PortalLoop` polls the bus socket and an inotify
+   watch today. Add the Wayland connection. The daemon must answer new calls
+   while a dialog is open, and must close requests when a caller loses its
+   name. `dbus_server::NameWatcher` already reports that event.
 
-8. **`Access`.** The first interactive interface. It only needs the yes/no
-   dialog, so it proves the shell with the least surface.
-9. **`Screenshot`.** Adapt `bins/shot` and `crates/screencopy`. Needs Gate 1.
-10. **`AppChooser` and `OpenURI`.** Adapt `launcher` and `mime`. Prove the
-    default-application path, cancellation, and multiple URIs against real GTK
-    and Qt callers.
-11. **`FileChooser`.** Adapt `bins/files`. Support open, save, multiple
-    selection, filters, choices, and cancellation. Needs Gate 1. Advertise a
-    high interface version only after the tests cover it.
-12. **Small interfaces.** Add `Inhibit`, `Lockdown`, `Account`, `Email`, and
-    `Print` only when a local caller proves a need. Keep the old route for
-    everything else.
+### Track 3 — dialog shell
 
-### Phase D — the remaining xdg utilities
+Owns a new `crates/portal-ui`. Depends on `platform` and `widget`, and changes
+neither.
 
-Each one is a thin binary over a crate that already exists.
+6. **`dialog_shell.rs`.** The modal Wayland surface and its focus rules.
+   Accept unparented overlays. Add `xdg_foreign` parent handles only after the
+   shell is reliable.
+7. **`access_dialog.rs`.** A yes/no prompt. The smallest real dialog, so it
+   proves the shell.
+8. **`file_chooser.rs`.** An adapter over `fsmodel`, `widget`, `fileops`, and
+   `mime`. Open, save, multiple selection, filters, and cancellation.
 
-| Tool | Needs |
-|---|---|
-| `xdg-mime` | `crates/mime` covers queries. Add the write path that sets a default application. Then add a CLI. |
-| `xdg-user-dirs` | `bins/files/src/user_dirs.rs` reads `user-dirs.dirs`. Add the writer and the `-update` behaviour. |
-| `xdg-settings` | Get and set the default browser, and the default URL scheme handler. |
-| `xdg-desktop-menu` | Install and uninstall `.desktop` entries. |
-| `xdg-icon-resource` | Install and uninstall icon files. |
+This track builds against a test harness, not against the daemon. Track 2
+wires it in later.
+
+### Track 4 — xdg command-line tools
+
+Owns new binaries. Each is a thin shell over a crate that already works.
+
+9. **`bins/open`.** The `xdg-open` replacement, over `crates/opener`.
+10. **Delete the shell-outs.** Remove the fallback from `crates/opener`.
+    Remove the `xdg-open` call in `bins/terminal`'s link handler.
+    Do this only after step 9 proves itself in daily use.
+11. **`bins/xdg-mime`.** Query and set the default application.
+    Needs Track 5's write path.
+12. **`bins/xdg-user-dirs`.** Read, write, and the `-update` behaviour.
+13. **`bins/xdg-settings`.** The default browser and URL scheme handlers.
+14. **`bins/xdg-desktop-menu` and `bins/xdg-icon-resource`.** Install and
+    uninstall `.desktop` entries and icon files.
 
 The end state removes the `xdg-utils` package from the machine.
 
-### Phase E — only after daily use
+### Track 5 — write paths
 
-13. **Notifications.** Scope this on its own. `statusbar`'s urgency segment
-    reads niri's window state. It is not a D-Bus notification server. Do not
-    quietly turn it into one.
-14. **Frontend ownership.** Consider owning `org.freedesktop.portal.Desktop`
-    itself only after every backend interface survives daily use. This is
-    optional. It is not a measure of success.
+Owns the write half of two read-only crates.
+
+15. **`mime` write path.** `crates/mime` answers queries today. Add setting a
+    default application, which means writing `mimeapps.list`.
+16. **`user_dirs` write path.** `bins/files/src/user_dirs.rs` reads
+    `user-dirs.dirs`. Move it to a crate and add the writer.
+
+### Track 6 — rollout
+
+Owns documentation and the portal's data files. Writes no logic.
+
+17. **Route `Settings`.** Add one line to `portals.conf`:
+    `org.freedesktop.impl.portal.Settings=tijaax`. Restart the session
+    components. Prove the rollback once, by reverting that line.
+    The code, the tests, and the artifacts are done. Until this step happens,
+    none of that work carries load.
+18. **The compatibility matrix.** Record, per interface: the advertised
+    version, the real caller that exercises it, the options it accepts, and
+    the fallback backend. `docs/portal-scoping.md` step 1 asked for this, and
+    it does not exist.
+19. **Route each new interface**, one at a time, as its track finishes.
+
+### Track 7 — terminal
+
+Owns the terminal's own crates. Independent of everything above.
+
+20. **Sixel graphics.** `vt_parser` consumes DCS payloads and discards them.
+21. **Kitty image protocol.**
+22. **Ligatures.** This needs `GSUB` parsing in `crates/font`.
+23. **Tabs and multiplexing.**
+
+---
+
+## 5b. Interface assembly
+
+An interface needs pieces from several tracks. These are integration steps,
+and Track 2 owns them. Each waits for its parts.
+
+| Interface | Needs | Adapts |
+|---|---|---|
+| `Access` | Track 3 step 7 | — |
+| `Screenshot` | Track 1, Track 3 step 6 | `bins/shot`, `screencopy` |
+| `OpenURI`, `AppChooser` | P1, Track 3 step 6 | `opener`, `launcher` |
+| `FileChooser` | Track 1, Track 3 step 8 | `bins/files` |
+
+Add `Inhibit`, `Lockdown`, `Account`, `Email`, and `Print` only when a real
+local caller proves a need. Keep the old route for everything else.
+
+---
+
+## 5c. Deferred
+
+- **Notifications.** Scope this on its own. `statusbar`'s urgency segment
+  reads niri's window state. It is not a D-Bus notification server. Do not
+  quietly turn it into one.
+- **Frontend ownership.** Consider owning `org.freedesktop.portal.Desktop`
+  itself only after every backend interface survives daily use. This is
+  optional. It is not a measure of success.
 
 ---
 
@@ -272,3 +356,46 @@ Run these before you call any step complete.
    never gain an edge to `dbus-server`.
 6. For a routed portal interface, test it against a real client. Then perform
    the rollback once, to prove recovery works.
+
+Step 4 is the shared check. It is the one that catches another agent's
+breakage. Run it, but do not repair what you find outside your own paths.
+Report it instead.
+
+---
+
+## 8. The agent contract
+
+One agent takes one track. Read this before you start.
+
+### 8.1 Boundaries
+
+- Write only inside your track's paths, as listed in section 4.4.
+- Do not edit `crates/platform`. Section 4.5 explains why.
+- Do not edit another track's crate, even to fix an obvious bug. Report it.
+- Add a dependency edge only within your own crates. A new edge into a crate
+  you do not own is a request, not a change.
+
+### 8.2 When you are blocked
+
+Stop. Report the block. Name the file, the reason, and the track that owns it.
+
+Do not work around a block by copying the code you needed. A second copy of
+someone else's logic is worse than waiting.
+
+### 8.3 Landing work
+
+- One commit per numbered step. Do not batch steps.
+- Run section 7 before every commit.
+- A step that adds a public type also adds its tests, in the same commit.
+
+### 8.4 The house rules still apply
+
+Section 2 is not advisory. In particular:
+
+- No free functions. Every piece of logic belongs to a struct, an enum, or a
+  trait implementation.
+- One responsibility per file. A new responsibility means a new module file,
+  not a new struct in an existing one.
+- No prose comments. Comment only what the code cannot say.
+- Feature-gated code gates the field, and gives call sites thin wrapper
+  methods. Never scatter `#[cfg]` through logic.

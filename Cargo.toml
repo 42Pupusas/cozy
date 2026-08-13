@@ -29,7 +29,9 @@ opt-level = 3
 opt-level = 3
 
 [workspace.dependencies]
-ququmatz      = { path = "/home/cuarentaydos/Code/tooling/ququmatz" }
+# 0.15.1 adds MsgFlags::CMSG_CLOEXEC, required by `crates/scm-rights`.
+# Tagged v0.15.1 in the ququmatz repo; run `cargo publish` there to resolve.
+ququmatz      = "0.15.1"
 quetzal-uring = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl-uring" }
 quetzalcoatl  = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl" }
 shelby        = { path = "/home/cuarentaydos/Code/tooling/shelby/crates/shelby", features = ["std"] }

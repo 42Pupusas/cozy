@@ -30,10 +30,13 @@ opt-level = 3
 
 [workspace.dependencies]
 # 0.15.1 adds MsgFlags::CMSG_CLOEXEC, required by `crates/scm-rights`.
-# Tagged v0.15.1 in the ququmatz repo; run `cargo publish` there to resolve.
 ququmatz      = "0.15.1"
-quetzal-uring = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl-uring" }
-quetzalcoatl  = { path = "/home/cuarentaydos/Code/tooling/quetzalcoatl" }
+# Must come from the registry, not a path: quetzal-uring's own ququmatz
+# dependency would otherwise resolve to a second, distinct copy of the crate.
+quetzal-uring = "0.2"
+# Must come from the registry, not a path: quetzal-uring depends on
+# quetzalcoatl too, and a path copy resolves as a second, distinct crate.
+quetzalcoatl  = "0.13.1"
 shelby        = { path = "/home/cuarentaydos/Code/tooling/shelby/crates/shelby", features = ["std"] }
 json-bourne   = { path = "/home/cuarentaydos/Code/tooling/bourne/crates/bourne", features = ["derive"] }
 # Zero-dependency PNG encode/decode, shared by `bins/wallpaper` (decode, for

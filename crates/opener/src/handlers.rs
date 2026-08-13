@@ -29,9 +29,10 @@
 //! launchable entry, and its `Exec=` yields a command. Each of those three
 //! can independently fail on a real machine.
 
+use crate::Target;
 use launcher::desktop_entry::DesktopEntry;
-use launcher::launch::ExecCommand;
-use mime::{Associations, DesktopId, MimeDb};
+use launcher::launch::{ExecCommand, FieldValues};
+use mime::{Associations, DesktopId, MimeDb, MimeType};
 use std::path::{Path, PathBuf};
 
 /// The type-detection and application-association databases, loaded once.
@@ -107,11 +108,56 @@ impl Handlers {
     #[must_use]
     pub fn entries_for(&self, path: &Path) -> Vec<DesktopEntry> {
         let detected = self.mime.detect(path);
+        self.entries_for_type(&detected.mime)
+    }
+
+    /// The command that opens `target`, whether it is a file or a URL.
+    ///
+    /// The two differ only in how the association key is found: a file is
+    /// sniffed, a URL is keyed on its scheme. Everything after that -- the
+    /// candidate walk, the `Exec=` expansion -- is identical, which is why
+    /// they meet here rather than in two parallel methods.
+    ///
+    /// The URL reaches `Exec=` expansion through [`FieldValues::one`], whose
+    /// parameter is a `Path`. That is exact rather than merely convenient: a
+    /// `Path` is a thin wrapper over `OsStr` that neither normalises nor
+    /// reinterprets its bytes, so the URL substituted into `%u` is the one
+    /// the user typed. `FieldValues` taking a raw `OsStr` would say so in the
+    /// type, but `crates/launcher` belongs to no track in this plan.
+    #[must_use]
+    pub fn command_for_target(&self, target: &Target) -> Option<ExecCommand> {
+        let entry = self.entries_for_target(target).into_iter().next()?;
+        let argument = Path::new(target.as_argument());
+        ExecCommand::for_entry_with(&entry, &FieldValues::one(argument))
+    }
+
+    /// Every application that can open `target`, best first.
+    #[must_use]
+    pub fn entries_for_target(&self, target: &Target) -> Vec<DesktopEntry> {
+        match target {
+            Target::File(path) => self.entries_for(path),
+            Target::Url { scheme, .. } => Self::scheme_type(scheme)
+                .map(|mime| self.entries_for_type(&mime))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The candidate walk itself, over an already-determined type.
+    fn entries_for_type(&self, mime: &MimeType) -> Vec<DesktopEntry> {
         self.associations
-            .candidates_for(&detected.mime)
+            .candidates_for(mime)
             .iter()
             .filter_map(|id| self.load_entry(id))
             .collect()
+    }
+
+    /// The pseudo-type a URL scheme is associated under.
+    ///
+    /// `x-scheme-handler/https` is not a real media type, but it is the key
+    /// every `mimeapps.list` on every desktop uses for "which browser opens
+    /// a link", so it is the key we must look up.
+    fn scheme_type(scheme: &str) -> Option<MimeType> {
+        MimeType::parse(&format!("x-scheme-handler/{scheme}"))
     }
 
     /// Resolve one id to a parsed entry, or `None` if it is stale.
@@ -423,6 +469,121 @@ mod tests {
             cmd.program,
             cmd.args
         );
+    }
+
+    #[test]
+    fn a_url_resolves_through_its_scheme_handler() {
+        let scratch = Scratch::new("scheme");
+        scratch.app(
+            "firefox.desktop",
+            "[Desktop Entry]\nName=Firefox\nExec=firefox %u\nType=Application\n",
+        );
+        let h = handlers(
+            &scratch,
+            "[Default Applications]\nx-scheme-handler/https=firefox.desktop\n",
+        );
+
+        let cmd = h
+            .command_for_target(&Target::parse("https://example.com/page"))
+            .expect("resolved");
+        assert_eq!(cmd.program, "firefox");
+        assert_eq!(cmd.args, ["https://example.com/page"]);
+    }
+
+    /// The URL must reach the handler byte-for-byte. A query string is where
+    /// a well-meaning normalisation would show up first.
+    #[test]
+    fn a_url_reaches_the_handler_unmodified() {
+        let scratch = Scratch::new("rawurl");
+        scratch.app(
+            "firefox.desktop",
+            "[Desktop Entry]\nName=Firefox\nExec=firefox %u\nType=Application\n",
+        );
+        let h = handlers(
+            &scratch,
+            "[Default Applications]\nx-scheme-handler/https=firefox.desktop\n",
+        );
+
+        let raw = "https://example.com/s?q=a+b&n=1#frag";
+        let cmd = h.command_for_target(&Target::parse(raw)).expect("resolved");
+        assert_eq!(cmd.args, [raw]);
+    }
+
+    /// `mailto:` is the everyday non-http scheme, and the one most likely to
+    /// be handled by an application that is not a browser.
+    #[test]
+    fn a_mailto_url_resolves_to_its_own_handler() {
+        let scratch = Scratch::new("mailto");
+        scratch.app(
+            "thunderbird.desktop",
+            "[Desktop Entry]\nName=Thunderbird\nExec=thunderbird %u\nType=Application\n",
+        );
+        let h = handlers(
+            &scratch,
+            "[Default Applications]\nx-scheme-handler/mailto=thunderbird.desktop\n",
+        );
+
+        let cmd = h
+            .command_for_target(&Target::parse("mailto:someone@example.com"))
+            .expect("resolved");
+        assert_eq!(cmd.program, "thunderbird");
+        assert_eq!(cmd.args, ["mailto:someone@example.com"]);
+    }
+
+    /// A scheme nothing claims is the URL half of "no handler", and must be
+    /// the same non-answer a file with no handler gives.
+    #[test]
+    fn a_scheme_with_no_handler_resolves_to_nothing() {
+        let scratch = Scratch::new("noscheme");
+        let h = handlers(
+            &scratch,
+            "[Default Applications]\nx-scheme-handler/https=firefox.desktop\n",
+        );
+
+        assert!(
+            h.command_for_target(&Target::parse("ircs://irc.example.com/rust"))
+                .is_none()
+        );
+    }
+
+    /// A `file:` URL must resolve exactly as the bare path does -- the point
+    /// of collapsing it in `Target` rather than teaching every layer about
+    /// the scheme.
+    #[test]
+    fn a_file_url_resolves_as_the_file_it_names() {
+        let scratch = Scratch::new("fileurl");
+        scratch.app(
+            "eog.desktop",
+            "[Desktop Entry]\nName=Image Viewer\nExec=eog %f\nType=Application\n",
+        );
+        let h = handlers(&scratch, "[Default Applications]\nimage/png=eog.desktop\n");
+        let file = scratch.file("photo.png");
+
+        let cmd = h
+            .command_for_target(&Target::parse(&format!("file://{}", file.display())))
+            .expect("resolved");
+        assert_eq!(cmd.program, "eog");
+        assert!(cmd.args[0].ends_with("photo.png"));
+    }
+
+    /// A stale scheme handler must be skipped for the same reason a stale
+    /// file handler is: `mimeapps.list` is never pruned.
+    #[test]
+    fn a_stale_scheme_handler_is_skipped() {
+        let scratch = Scratch::new("stalescheme");
+        scratch.app(
+            "firefox.desktop",
+            "[Desktop Entry]\nName=Firefox\nExec=firefox %u\nType=Application\n",
+        );
+        let h = handlers(
+            &scratch,
+            "[Default Applications]\nx-scheme-handler/https=ghost.desktop;firefox.desktop;\n",
+        );
+
+        let cmd = h
+            .command_for_target(&Target::parse("https://example.com"))
+            .expect("resolved");
+        assert_eq!(cmd.program, "firefox");
     }
 
     /// A directory is a real MIME type (`inode/directory`) and must not be

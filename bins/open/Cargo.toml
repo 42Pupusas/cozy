@@ -1,0 +1,16 @@
+[package]
+name    = "open-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "open"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The whole of this binary's behaviour: classify the argument, resolve the
+# handler, spawn it. This crate is a shell over that policy.
+opener = { path = "../../crates/opener" }

@@ -15,6 +15,7 @@
 //! # Layering
 //!
 //! ```text
+//! Target                              a file, or a URL
 //! mime::MimeDb + mime::Associations   type -> desktop id
 //! launcher::DesktopEntry              desktop id -> Exec=
 //! Handlers                            the candidate-walking policy
@@ -23,6 +24,8 @@
 
 mod handlers;
 mod launch;
+mod target;
 
 pub use handlers::Handlers;
-pub use launch::Opener;
+pub use launch::{OpenError, Opener};
+pub use target::Target;

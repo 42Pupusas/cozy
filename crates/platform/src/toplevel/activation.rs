@@ -203,6 +203,7 @@ impl Activation {
         deferred: &mut std::collections::VecDeque<RawEvent>,
         token: ActivationTokenId,
     ) -> Result<Option<String>> {
+        let trace = Trace::from_env(token);
         let deadline = std::time::Instant::now() + Self::TOKEN_TIMEOUT;
         while std::time::Instant::now() < deadline {
             let Some(event) = events.pop() else {
@@ -214,9 +215,11 @@ impl Activation {
                 continue;
             };
             let Some((mut ev, _)) = WireEvent::parse(bytes) else {
+                trace.unparsed();
                 deferred.push_back(event);
                 continue;
             };
+            trace.saw(ev.object_id, ev.opcode);
 
             if ev.object_id == DisplayId(1).raw()
                 && DisplayEvent::from_opcode(ev.opcode) == Some(DisplayEvent::Error)
@@ -235,7 +238,56 @@ impl Activation {
             }
             deferred.push_back(event);
         }
+        trace.timed_out();
         Ok(None)
+    }
+}
+
+/// Prints what arrives during a token exchange, when `COZY_DEBUG_ACTIVATION`
+/// is set.
+///
+/// The exchange fails silently by design -- a timeout is indistinguishable
+/// from a compositor that never answers -- so this reports the object ids and
+/// opcodes actually seen, which is the difference between "nothing arrived"
+/// and "the answer arrived and we did not recognise it".
+struct Trace {
+    enabled: bool,
+    token: ActivationTokenId,
+}
+
+impl Trace {
+    const ENV: &'static str = "COZY_DEBUG_ACTIVATION";
+
+    fn from_env(token: ActivationTokenId) -> Self {
+        Self {
+            enabled: std::env::var_os(Self::ENV).is_some(),
+            token,
+        }
+    }
+
+    fn saw(&self, object: u32, opcode: u16) {
+        if self.enabled {
+            eprintln!(
+                "activation: event object={object} opcode={opcode} (awaiting object={} opcode=0)",
+                self.token.raw()
+            );
+        }
+    }
+
+    fn unparsed(&self) {
+        if self.enabled {
+            eprintln!("activation: unparsable event");
+        }
+    }
+
+    fn timed_out(&self) {
+        if self.enabled {
+            eprintln!(
+                "activation: no done for object={} within {:?}",
+                self.token.raw(),
+                Activation::TOKEN_TIMEOUT
+            );
+        }
     }
 }
 

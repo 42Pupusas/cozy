@@ -252,14 +252,18 @@ wires it in later.
 
 Owns new binaries. Each is a thin shell over a crate that already works.
 
-9. **`bins/open`.** The `xdg-open` replacement, over `crates/opener`.
-10. **Delete the shell-outs.** Remove the fallback from `crates/opener`.
-    Remove the `xdg-open` call in `bins/terminal`'s link handler.
-    Do this only after step 9 proves itself in daily use.
+9. ~~**`bins/open`.** The `xdg-open` replacement, over `crates/opener`.~~ Done.
+10. ~~**Delete the shell-outs.**~~ Done. `crates/opener` no longer falls back,
+    and `bins/terminal`'s Ctrl+click resolves through `opener` instead of
+    spawning `xdg-open`. The terminal still mints no activation token --
+    `TermWindow` tracks no input serial. That is Track 7, and it matches the
+    behaviour the shell-out already had.
 11. **`bins/xdg-mime`.** Query and set the default application.
     Needs Track 5's write path.
-12. **`bins/xdg-user-dirs`.** Read, write, and the `-update` behaviour.
+12. ~~**`bins/xdg-user-dirs`.** Read, write, and the `-update` behaviour.~~
+    Done. Two binaries, matching the package it replaces.
 13. **`bins/xdg-settings`.** The default browser and URL scheme handlers.
+    Needs Track 5 step 15: it sets the browser through `mimeapps.list`.
 14. **`bins/xdg-desktop-menu` and `bins/xdg-icon-resource`.** Install and
     uninstall `.desktop` entries and icon files.
 
@@ -271,8 +275,8 @@ Owns the write half of two read-only crates.
 
 15. **`mime` write path.** `crates/mime` answers queries today. Add setting a
     default application, which means writing `mimeapps.list`.
-16. **`user_dirs` write path.** `bins/files/src/user_dirs.rs` reads
-    `user-dirs.dirs`. Move it to a crate and add the writer.
+16. ~~**`user_dirs` write path.**~~ Done. `crates/user-dirs` owns the parser,
+    the writer, and `xdg-user-dir`'s separate lookup policy.
 
 ### Track 6 — rollout
 

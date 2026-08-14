@@ -108,7 +108,7 @@ impl Application {
             } else if options.dry_run {
                 Report::dry_run(opener.handlers(), &target)
             } else {
-                opener.try_open_with_fallback(&target)
+                opener.try_open(&target)
             };
             if let Err(error) = outcome {
                 eprintln!("open: {raw}: {error}");

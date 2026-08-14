@@ -21,6 +21,9 @@ ququmatz     = { workspace = true }
 # bins/portal rather than each hand-rolling its own copy of the same
 # kernel-defined event parsing.
 inotify-events = { path = "../../crates/inotify-events" }
+# Ctrl+click on a link resolves through the same association policy the file
+# browser and `bins/open` use, rather than shelling out to xdg-open.
+opener   = { path = "../../crates/opener" }
 headless-stress = { path = "../../crates/headless-stress" }
 
 [features]

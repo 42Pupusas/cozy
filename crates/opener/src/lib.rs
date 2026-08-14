@@ -2,9 +2,10 @@
 //!
 //! # Why this is a crate and not part of the file browser
 //!
-//! Three programs ask the same question:
+//! Four programs ask the same question:
 //!
 //! * `bins/files`, when the user activates a row.
+//! * `bins/terminal`, when the user Ctrl+clicks a link.
 //! * `bins/open`, the `xdg-open` replacement.
 //! * the portal's `OpenURI`, on behalf of a sandboxed application.
 //!
@@ -20,7 +21,7 @@
 //! launcher::DesktopEntry              desktop id -> Exec=
 //! Handlers                            the candidate-walking policy
 //! ActivationToken                     proof the user asked for this
-//! Opener                              spawn, with an xdg-open fallback
+//! Opener                              spawn
 //! ```
 
 mod activation_token;

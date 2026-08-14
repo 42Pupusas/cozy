@@ -1569,16 +1569,25 @@ impl<'a> UiLoop<'a> {
             Some(platform::link_scan::LinkTarget::Url(span)) => span.uri,
             None => return false,
         };
-        // `spawn()` alone leaves a zombie once xdg-open exits -- dropping a
-        // `Child` does not reap it, and nothing here ever calls `wait()` on
-        // repeated Ctrl+clicks. Reap it on a throwaway thread instead of
-        // blocking the UI loop on `wait()` ourselves.
-        if let Ok(mut child) = std::process::Command::new("xdg-open").arg(&uri).spawn() {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-        }
+        Self::open_link(&uri);
         true
+    }
+
+    /// Hand a clicked link to the application associated with it.
+    ///
+    /// The databases are loaded per click rather than held: opening a link
+    /// is a rare, human-paced action, and a terminal that cached them at
+    /// startup would keep answering with the associations that existed then.
+    ///
+    /// No activation token is minted. `TermWindow` tracks no input serial,
+    /// so there is nothing to prove a user acted with -- the launched window
+    /// appears wherever it already lived rather than on the current
+    /// workspace. That matches what this handler did when it shelled out to
+    /// `xdg-open`, and wiring the token is Track 7 work.
+    fn open_link(uri: &str) {
+        if let Err(error) = opener::Opener::load().try_open(&opener::Target::parse(uri)) {
+            eprintln!("terminal: {uri}: {error}");
+        }
     }
 
     /// `InputEvent::Focus`: DECSET 1004 focus in/out reporting (`CSI I` /

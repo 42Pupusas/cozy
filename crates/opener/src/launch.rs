@@ -8,18 +8,19 @@
 //! to do, and doing it in-process means the failure modes are visible and
 //! testable rather than swallowed by another program.
 //!
-//! `xdg-open` remains as a fallback for exactly one situation: nothing on
-//! this machine claims the file's type. That is a real state -- an obscure
-//! extension, a machine with no `mimeinfo.cache`, a stripped container --
-//! and `xdg-open` occasionally knows a desktop-environment-specific trick
-//! we do not (GNOME's `gio open`, KDE's `kde-open`). Trying it costs one
-//! spawn and turns "nothing happened" into "something reasonable happened".
+//! # No `xdg-open` fallback
 //!
-//! The ordering is deliberate and not reversible: consulting `xdg-open`
-//! first would make every association we resolve irrelevant.
+//! There used to be one, for the case where nothing on the machine claims a
+//! file's type. It is gone. `bins/open` *is* this crate, so falling back to
+//! `xdg-open` on a session built from this workspace either finds our own
+//! binary -- resolving through this same code a second time -- or finds the
+//! shell script we are replacing. Neither knows anything we do not.
+//!
+//! An unhandled type is now reported as [`OpenError::NoHandler`] rather than
+//! handed to another program whose success says nothing about whether
+//! anything opened.
 
 use crate::{ActivationToken, Handlers, Target};
-use std::ffi::OsStr;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -129,31 +130,16 @@ impl Opener {
     /// application that refuses to start, or a type nothing handles, must
     /// not take the browser down with it.
     pub fn open(&self, path: &Path) {
-        if let Some(command) = self.handlers.command_for(path) {
-            match self.spawn(&command) {
-                Ok(()) => return,
-                // A resolved handler that won't start is worth saying out
-                // loud -- it means the association is real but the program
-                // is broken or missing from PATH, which is exactly the kind
-                // of thing a silent fallback would hide for months.
-                Err(e) => eprintln!(
-                    "opener: {} failed to start ({e}); falling back",
-                    command.program
-                ),
-            }
+        if let Err(error) = self.try_open(&Target::File(path.to_path_buf())) {
+            eprintln!("opener: {}: {error}", path.display());
         }
-
-        self.spawn_xdg_open(path.as_os_str());
     }
 
     /// Open `target`, reporting why if it did not happen.
     ///
     /// The `Result`-returning twin of [`Self::open`], for a caller that has
     /// somewhere to put a failure -- a command-line tool's exit status, a
-    /// portal reply. It covers URLs as well as files, and it does **not**
-    /// fall back to `xdg-open`: a caller that wants to know the outcome is
-    /// poorly served by a spawn whose success says nothing about whether
-    /// anything opened.
+    /// portal reply. It covers URLs as well as files.
     pub fn try_open(&self, target: &Target) -> Result<(), OpenError> {
         let command = self
             .handlers
@@ -174,13 +160,20 @@ impl Opener {
     /// setup live here, where the token does.
     fn spawn(&self, command: &launcher::launch::ExecCommand) -> std::io::Result<()> {
         let mut child = Command::new(&command.program);
+        // stdin/stdout/stderr go to null so a handler that decides to print
+        // cannot interleave with our own diagnostics or, worse, block on a
+        // pipe nobody is draining.
         child
             .args(&command.args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         self.apply_activation(&mut child);
-        // Deliberately not waited on -- see `spawn_xdg_open`.
+        // The child is deliberately not waited on. Reaping it would block
+        // the event loop for as long as the opened application runs --
+        // which for a text editor is "until the user closes it", i.e. a
+        // frozen file browser. The cost is a zombie until we exit, which
+        // is bounded and harmless for a desktop app's lifetime.
         child.spawn()?;
         Ok(())
     }
@@ -203,47 +196,6 @@ impl Opener {
         }
     }
 
-    /// [`Self::try_open`], then `xdg-open` if nothing was associated.
-    ///
-    /// The fallback is worth taking only for [`OpenError::NoHandler`]. A
-    /// handler that resolved and then failed to start is a real, specific
-    /// fault, and retrying it through another program hides it.
-    pub fn try_open_with_fallback(&self, target: &Target) -> Result<(), OpenError> {
-        match self.try_open(target) {
-            Err(OpenError::NoHandler) => {
-                self.spawn_xdg_open(target.as_argument());
-                Ok(())
-            }
-            other => other,
-        }
-    }
-
-    /// Last resort: let the desktop environment try.
-    fn spawn_xdg_open(&self, argument: &OsStr) {
-        // stdin/stdout/stderr go to null so a handler that decides to print
-        // cannot interleave with our own diagnostics or, worse, block on a
-        // pipe nobody is draining.
-        let mut child = Command::new("xdg-open");
-        child
-            .arg(argument)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        self.apply_activation(&mut child);
-        let spawned = child.spawn();
-
-        // The child is deliberately not waited on. Reaping it would block
-        // the event loop for as long as the opened application runs --
-        // which for a text editor is "until the user closes it", i.e. a
-        // frozen file browser. The cost is a zombie until we exit, which
-        // is bounded and harmless for a desktop app's lifetime.
-        if let Err(e) = spawned {
-            eprintln!(
-                "opener: could not open {}: {e}",
-                Path::new(argument).display()
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -447,10 +399,12 @@ mod tests {
         );
     }
 
-    /// An unhandled type must not resolve to a command -- that is what
-    /// sends `open` down the `xdg-open` path.
+    /// An unhandled type resolves to nothing and is reported as such.
+    ///
+    /// There is no longer anywhere else for it to go: the `xdg-open`
+    /// fallback would find this same crate through `bins/open`.
     #[test]
-    fn an_unhandled_type_falls_through_to_the_desktop_environment() {
+    fn an_unhandled_type_resolves_to_nothing_and_is_reported() {
         let opener = Opener::new(Handlers::from_parts(
             MimeDb::from_globs_data("50:image/png:*.png\n"),
             Associations::default(),
@@ -461,6 +415,10 @@ mod tests {
                 .handlers
                 .command_for(Path::new("/tmp/x.png"))
                 .is_none()
+        );
+        assert_eq!(
+            opener.try_open(&Target::File(PathBuf::from("/tmp/x.png"))),
+            Err(OpenError::NoHandler)
         );
     }
 }

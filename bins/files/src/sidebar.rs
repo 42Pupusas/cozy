@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::favorites::Favorites;
-use crate::user_dirs::UserDirs;
+use user_dirs::{UserDir, UserDirs};
 
 /// One row in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +67,21 @@ impl Sidebar {
     /// Shown when nothing is bookmarked yet.
     const EMPTY_HINT: &'static str = "Ctrl+D to bookmark";
 
+    /// The directories this sidebar offers, in display order.
+    ///
+    /// A subset of the spec's eight, in the order people reach for them
+    /// rather than the order the file lists them. `Templates` and
+    /// `PublicShare` are omitted: both are session plumbing that a file
+    /// browser's "places" list would only clutter.
+    const PLACES_ORDER: [UserDir; 6] = [
+        UserDir::Desktop,
+        UserDir::Documents,
+        UserDir::Download,
+        UserDir::Music,
+        UserDir::Pictures,
+        UserDir::Videos,
+    ];
+
     /// Build the sidebar from the user's directories and bookmarks.
     #[must_use]
     pub fn new(dirs: &UserDirs, favorites: &Favorites) -> Self {
@@ -78,7 +93,11 @@ impl Sidebar {
             path: dirs.home().to_path_buf(),
             favorite: false,
         });
-        for (dir, path) in dirs.existing() {
+        let existing = dirs.existing();
+        for dir in Self::PLACES_ORDER {
+            let Some((_, path)) = existing.iter().find(|(d, _)| *d == dir) else {
+                continue;
+            };
             // `$HOME` itself is a legal value for a user directory (it means
             // "I have no separate Desktop"); listing it again under another
             // name would be a confusing duplicate of the Home row.
@@ -87,7 +106,7 @@ impl Sidebar {
             }
             rows.push(SidebarRow::Place {
                 label: dir.label().to_owned(),
-                path,
+                path: path.clone(),
                 favorite: false,
             });
         }
@@ -177,8 +196,8 @@ mod tests {
     use super::{Sidebar, SidebarRow};
     use crate::favorites::Favorites;
     use crate::test_support::TempDir;
-    use crate::user_dirs::UserDirs;
     use std::path::Path;
+    use user_dirs::UserDirs;
 
     /// Build a sidebar over a real temp directory with a couple of XDG dirs.
     fn fixture(tmp: &TempDir) -> (UserDirs, Favorites) {

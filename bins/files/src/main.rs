@@ -37,7 +37,6 @@ mod test_support;
 mod theme;
 mod toolbar;
 mod typography;
-mod user_dirs;
 mod window;
 
 use activation_report::ActivationReport;

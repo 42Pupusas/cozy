@@ -257,7 +257,7 @@ impl FilesWindow {
 
     /// Rebuild the sidebar rows after the favorites list changed.
     fn rebuild_sidebar(&mut self) {
-        let dirs = crate::user_dirs::UserDirs::load();
+        let dirs = user_dirs::UserDirs::load();
         let visible = self.sidebar.visible();
         self.sidebar = Sidebar::new(&dirs, &self.favorites);
         if !visible {
@@ -1594,7 +1594,7 @@ mod tests {
         let theme = crate::theme::Theme::from_config(&cfg);
         let type_scale = crate::typography::Typography::load(&cfg, 1.0);
         let favorites = crate::favorites::Favorites::default();
-        let user_dirs = crate::user_dirs::UserDirs::load();
+        let user_dirs = user_dirs::UserDirs::load();
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
         // The temp dir always exists and is readable, so `open` succeeds
         // without depending on anything in the developer's home.
@@ -1677,7 +1677,7 @@ mod tests {
         let theme = crate::theme::Theme::from_config(&cfg);
         let type_scale = crate::typography::Typography::load(&cfg, 1.0);
         let favorites = crate::favorites::Favorites::default();
-        let user_dirs = crate::user_dirs::UserDirs::load();
+        let user_dirs = user_dirs::UserDirs::load();
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
         let browser = crate::browser::Browser::open(&std::env::temp_dir(), 700, 400, 28)
             .expect("the temp dir must be listable");
@@ -1727,7 +1727,7 @@ mod tests {
         let theme = crate::theme::Theme::from_config(&cfg);
         let type_scale = crate::typography::Typography::load(&cfg, 1.0);
         let favorites = crate::favorites::Favorites::default();
-        let user_dirs = crate::user_dirs::UserDirs::load();
+        let user_dirs = user_dirs::UserDirs::load();
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
         let browser = crate::browser::Browser::open(&root, 700, 400, 28).expect("listable");
         let painter = FilesWindow::new(browser, theme, type_scale, sidebar, favorites, size);

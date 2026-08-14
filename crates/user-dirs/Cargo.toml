@@ -1,0 +1,11 @@
+[package]
+name = "user-dirs"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "user_dirs"
+path = "src/lib.rs"
+
+[lints]
+workspace = true

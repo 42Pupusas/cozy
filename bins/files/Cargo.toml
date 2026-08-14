@@ -41,4 +41,8 @@ opener   = { path = "../../crates/opener" }
 # real filesystem mutation (cross-filesystem fallback, conflict policy),
 # not a bare `std::fs::rename` call.
 fileops  = { path = "../../crates/fileops" }
+# The XDG user directories the sidebar's "places" section lists, shared with
+# `bins/xdg-user-dirs` so the reader and the writer cannot disagree about the
+# `user-dirs.dirs` format.
+user-dirs = { path = "../../crates/user-dirs" }
 headless-stress = { path = "../../crates/headless-stress" }

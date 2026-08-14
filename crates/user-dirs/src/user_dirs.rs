@@ -14,6 +14,12 @@ pub struct UserDirs {
     /// The keys the file stated, which the update tool must distinguish from
     /// the ones it supplied itself.
     stated: Vec<UserDir>,
+    /// `XDG_*_DIR` keys outside the eight, kept verbatim.
+    ///
+    /// The format does not reserve the namespace, and real configurations
+    /// carry extra keys. The update tool rewrites this file at every login,
+    /// so a key it did not understand must survive rather than be deleted.
+    extra: Vec<(String, String)>,
 }
 
 impl UserDirs {
@@ -58,7 +64,40 @@ impl UserDirs {
             home: home.to_path_buf(),
             resolved,
             stated,
+            extra: Self::find_extra_keys(contents),
         }
+    }
+
+    /// Collect the `XDG_*_DIR` keys that are not one of the eight.
+    ///
+    /// The raw value is kept exactly as written: this crate does not model
+    /// the key, so re-quoting it could only lose information.
+    fn find_extra_keys(contents: &str) -> Vec<(String, String)> {
+        let mut extra = Vec::new();
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let key = key.trim_end();
+            if !key.starts_with("XDG_") || !key.ends_with("_DIR") {
+                continue;
+            }
+            if UserDir::from_key(key).is_some() {
+                continue;
+            }
+            extra.push((key.to_owned(), value.trim().to_owned()));
+        }
+        extra
+    }
+
+    /// The `XDG_*_DIR` keys this crate does not model, with raw values.
+    #[must_use]
+    pub fn extra_keys(&self) -> &[(String, String)] {
+        &self.extra
     }
 
     /// The value for one key, if the file names it.

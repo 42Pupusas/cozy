@@ -1,0 +1,24 @@
+[package]
+name = "xdg-user-dirs-bin"
+version = "0.1.0"
+edition.workspace = true
+
+# Two binaries, because the package they replace ships two: a lookup tool
+# every desktop script calls, and an update tool the session runs at login.
+[[bin]]
+name = "xdg-user-dir"
+path = "src/lookup_main.rs"
+
+[[bin]]
+name = "xdg-user-dirs-update"
+path = "src/update_main.rs"
+
+[[test]]
+name = "real_config_probe"
+path = "tests/real_config_probe.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+user-dirs = { path = "../../crates/user-dirs" }

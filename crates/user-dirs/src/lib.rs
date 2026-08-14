@@ -7,7 +7,11 @@
 //! ConfigPaths  where user-dirs.dirs and its siblings live
 //! UserDirs     the parsed file
 //! DirsWriter   the parsed file, written back atomically
+//! DirLookup    one directory, with `xdg-user-dir`'s fallback rule
 //! ```
+//!
+//! [`UserDirs`] and [`DirLookup`] answer deliberately different questions.
+//! See [`DirLookup`] for why a caller must not substitute one for the other.
 //!
 //! # Why a crate
 //!
@@ -25,11 +29,13 @@
 //! directory.
 
 mod config_paths;
+mod lookup;
 mod user_dir;
 mod user_dirs;
 mod writer;
 
 pub use config_paths::ConfigPaths;
+pub use lookup::DirLookup;
 pub use user_dir::UserDir;
 pub use user_dirs::UserDirs;
 pub use writer::{DirsWriter, WriteError};

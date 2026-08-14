@@ -71,6 +71,15 @@ impl DirsWriter {
             out.push_str(&value);
             out.push_str("\"\n");
         }
+        // Keys this crate does not model go back verbatim, after the eight.
+        // The session rewrites this file at every login, so dropping them
+        // would quietly delete part of the user's configuration.
+        for (key, value) in dirs.extra_keys() {
+            out.push_str(key);
+            out.push('=');
+            out.push_str(value);
+            out.push('\n');
+        }
         out
     }
 
@@ -194,6 +203,19 @@ mod tests {
         assert!(text.contains(r#"XDG_DESKTOP_DIR="$HOME/""#));
         let reparsed = UserDirs::parse(&text, &home());
         assert_eq!(reparsed.path(UserDir::Desktop), home());
+    }
+
+    /// A key outside the eight must be written back untouched.
+    #[test]
+    fn an_unmodelled_key_is_preserved() {
+        let dirs = UserDirs::parse(r#"XDG_PROJECTS_DIR="$HOME/Projects""#, &home());
+        let text = DirsWriter::render(&dirs);
+        assert!(
+            text.contains(r#"XDG_PROJECTS_DIR="$HOME/Projects""#),
+            "got: {text}"
+        );
+        let reparsed = UserDirs::parse(&text, &home());
+        assert_eq!(reparsed.extra_keys().len(), 1);
     }
 
     /// The whole file must survive a round trip, or the update tool would

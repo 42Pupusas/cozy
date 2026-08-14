@@ -14,6 +14,7 @@
 //! where you came from -- has unit tests that run in microseconds instead of
 //! needing a compositor and a pair of eyes.
 
+mod activation_report;
 mod breadcrumb;
 mod browser;
 mod columns;
@@ -39,6 +40,7 @@ mod typography;
 mod user_dirs;
 mod window;
 
+use activation_report::ActivationReport;
 use browser::Browser;
 use options::Options;
 use platform::toplevel::{LogicalSize, Toplevel, WindowEvent};
@@ -151,6 +153,7 @@ impl App {
         // are a few thousand lines between them, and re-reading disk on
         // every Enter would put that latency directly in the user's way.
         let mut opener = opener::Opener::load();
+        let activation_report = ActivationReport::from_env();
 
         let mut title = painter.title();
         loop {
@@ -176,15 +179,7 @@ impl App {
                 // handler's window come to the user rather than treating it
                 // as focus stealing.
                 let token = window.activation_token(None);
-                if std::env::var_os("COZY_DEBUG_ACTIVATION").is_some() {
-                    match &token {
-                        Some(t) => eprintln!("files: minted activation token {}", t.as_str()),
-                        None => eprintln!(
-                            "files: no activation token (supported={})",
-                            window.supports_activation()
-                        ),
-                    }
-                }
+                activation_report.record(token.as_ref(), window.supports_activation());
                 opener.set_activation(
                     token.map(|token| opener::ActivationToken::new(token.into_string())),
                 );

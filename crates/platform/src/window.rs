@@ -195,6 +195,21 @@ pub struct TermWindow {
     pointer: Option<PointerId>,
     keyboard: Option<KeyboardId>,
 
+    /// `xdg_activation_v1`, when the compositor offers it. `None` means a
+    /// program this window launches opens on whichever workspace it already
+    /// occupied -- the behaviour every client had before the protocol.
+    activation: Option<crate::toplevel::activation::Activation>,
+    /// The serial of the last press or key-down, which is what makes a token
+    /// request trustworthy. See [`crate::input_serial::InputSerial`].
+    input_serial: crate::input_serial::InputSerial,
+    /// Events pulled off the ring during a token exchange that were not the
+    /// exchange's own answer.
+    ///
+    /// They must be routed afterwards rather than dropped: this consumer is
+    /// the window's only source of pointer, keyboard, configure and frame
+    /// events, and discarding them loses input and stalls presentation.
+    deferred: std::collections::VecDeque<RawEvent>,
+
     /// Keyboard auto-repeat: the held key, negotiated rate/delay, and the
     /// `timerfd` that paces synthesized repeats. Extracted from this struct
     /// so the three fields' lockstep invariants live (and are tested) in
@@ -432,6 +447,7 @@ impl TermWindow {
             seat,
             output,
             data_device_manager,
+            activation,
         } = Registry::discover(&mut sender, &mut events)?;
         // Ask the compositor what buffer scale this output actually wants
         // (1 = normal DPI, 2 = HiDPI @2x, ...) *before* building the renderer,
@@ -519,6 +535,9 @@ impl TermWindow {
             seat,
             pointer: None,
             keyboard: None,
+            activation: activation.map(crate::toplevel::activation::Activation::new),
+            input_serial: crate::input_serial::InputSerial::new(),
+            deferred: std::collections::VecDeque::new(),
             key_repeat: crate::key_repeat::KeyRepeatState::new(repeat_timer),
             modifiers: Modifiers::default(),
             xkb: None,
@@ -738,6 +757,14 @@ impl TermWindow {
         self.sender
             .drain_requests(&mut self.request_rx)
             .map_err(PlatformError::Conn)?;
+
+        // Deferred events first, in arrival order: they came off the ring
+        // before anything still queued, and routing them late would reorder
+        // input against the events that followed them.
+        self.handle_deferred()?;
+        if self.lifecycle.is_closing() {
+            return Ok(false);
+        }
 
         // Drain all queued events non-blocking.
         while let Some(ev) = self.events.pop() {
@@ -985,6 +1012,56 @@ impl TermWindow {
         self.shell.set_title(&self.window_tx, title);
     }
 
+    /// Mint an activation token for a program this window is about to
+    /// launch, so the launched window may raise itself.
+    ///
+    /// Call this from the handler for the input event that caused the launch
+    /// -- a Ctrl+click on a link. The token carries that event's serial and
+    /// this window's surface, which together are the compositor's own
+    /// evidence that a user acted.
+    ///
+    /// Returns `None` when the compositor offers no `xdg_activation_v1`,
+    /// when no input has been seen yet, or when the compositor does not
+    /// answer in time. All three mean "launch without a token": the child
+    /// still starts, it simply appears where it already lived.
+    ///
+    /// `app_id` names the program being launched, not this one.
+    pub fn activation_token(
+        &mut self,
+        app_id: Option<&str>,
+    ) -> Option<crate::toplevel::activation::ActivationToken> {
+        let activation = self.activation?;
+        let serial = self.input_serial.get()?;
+        // The id must come from this window's own reserved block: an id from
+        // anywhere else names an object the connection already handed out,
+        // and the compositor kills the connection over it.
+        let token: crate::id::ActivationTokenId = self.window_tx.alloc_id();
+        let result = activation.request(
+            token,
+            &mut self.sender,
+            &mut self.events,
+            &mut self.deferred,
+            crate::toplevel::activation::LaunchEvidence {
+                seat: self.seat,
+                surface: self.shell.surface,
+                serial,
+                app_id,
+            },
+        );
+        // A failed exchange must not take the terminal down: the launch
+        // proceeds unactivated, which is the pre-protocol behaviour.
+        result.unwrap_or_default()
+    }
+
+    /// Whether the compositor offers `xdg_activation_v1` at all.
+    ///
+    /// Separates the two silent reasons a token can be absent, so a caller
+    /// reporting the outcome can say which one happened.
+    #[must_use]
+    pub const fn supports_activation(&self) -> bool {
+        self.activation.is_some()
+    }
+
     /// BEL (C0 0x07): visual bell. xdg-shell's core protocol has no
     /// urgency-hint/attention-demand request, so this is implemented as a
     /// brief title-bar flash (prefixing a bell glyph), which the compositor
@@ -1010,6 +1087,15 @@ impl TermWindow {
             .drain_requests(&mut self.request_rx)
             .map_err(PlatformError::Conn)?;
 
+        // A token exchange may have left events here. Route them before
+        // blocking: they are already older than anything the ring will
+        // deliver, and blocking on a ring that may stay quiet would strand
+        // input the user already produced.
+        self.handle_deferred()?;
+        if self.lifecycle.is_closing() {
+            return Ok(false);
+        }
+
         let Some(first) = self.events.pop_block() else {
             return Ok(false);
         };
@@ -1026,6 +1112,22 @@ impl TermWindow {
     }
 
     // ── private ───────────────────────────────────────────────────────────
+
+    /// Route everything a token exchange set aside, oldest first.
+    ///
+    /// `pop_front` per iteration rather than draining into a local: the queue
+    /// is only ever appended to by [`Self::activation_token`], which the
+    /// window's own event handlers never call, so nothing can grow it while
+    /// this walks it.
+    fn handle_deferred(&mut self) -> Result<()> {
+        while let Some(ev) = self.deferred.pop_front() {
+            self.handle_event(ev)?;
+            if self.lifecycle.is_closing() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
 
     /// Consume the fd batch that followed a clipboard `send`/`receive`, or a
     /// `wl_keyboard.keymap` event. `send` → we write our `clipboard_text` to
@@ -1391,6 +1493,13 @@ impl TermWindow {
     fn handle_pointer_button(&mut self, ev: &RawEvent) {
         let button = PointerButton::from_code(ev.arg(2));
         let state = ButtonState::from_raw(ev.arg(3));
+        // arg(0) is the press serial. Recorded before any of the ownership
+        // logic below, which may consume the event entirely: a Ctrl+click
+        // that opens a link is exactly the case that needs this serial, and
+        // it is also a case the app never sees.
+        if matches!(state, Some(ButtonState::Pressed)) {
+            self.input_serial.record_press(ev.arg(0));
+        }
         let bypass = self.left_button_bypass(button, state);
         self.report_pointer_button_to_app(button, state, bypass.suppress_report);
         // arg(1) is the compositor's millisecond timestamp for this button
@@ -1563,6 +1672,9 @@ impl TermWindow {
         let physical = Key::from_code(ev.arg(2));
         let logical = self.resolve_logical_key(physical, ev.arg(2));
         let state = KeyState::from_raw(ev.arg(3));
+        if matches!(state, Some(KeyState::Pressed)) {
+            self.input_serial.record_key_down(ev.arg(0));
+        }
         // Start/stop repeat timer. Modifier keys never repeat.
         match (logical, state) {
             (Some(k), Some(KeyState::Pressed)) if !physical.is_some_and(Key::is_modifier) => {
@@ -2454,6 +2566,11 @@ struct Globals {
     seat: SeatId,
     output: Option<OutputId>,
     data_device_manager: Option<DataDeviceManagerId>,
+    /// `xdg_activation_v1` -- the factory for the tokens that let a program
+    /// this window launches raise itself onto the current workspace.
+    /// Optional like the others: a compositor without it means a Ctrl+clicked
+    /// link opens where that application already lived.
+    activation: Option<crate::id::ActivationId>,
 }
 
 /// Accumulates globals as `wl_registry.global` events arrive, one field per
@@ -2471,6 +2588,7 @@ struct GlobalsBuilder {
     seat: Option<SeatId>,
     output: Option<OutputId>,
     data_device_manager: Option<DataDeviceManagerId>,
+    activation: Option<crate::id::ActivationId>,
 }
 
 impl crate::surface::GlobalCollector for GlobalsBuilder {
@@ -2558,6 +2676,15 @@ impl crate::surface::GlobalCollector for GlobalsBuilder {
                 version,
                 proto::WL_DATA_DEVICE_MANAGER.version,
             ),
+            s if s == proto::XDG_ACTIVATION_V1.name => Self::bind_if_missing(
+                &mut self.activation,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::XDG_ACTIVATION_V1.version,
+            ),
             _ => Ok(()),
         }
     }
@@ -2577,6 +2704,7 @@ impl GlobalsBuilder {
             seat: self.seat.ok_or(PlatformError::ReaderStopped)?,
             output: self.output,
             data_device_manager: self.data_device_manager,
+            activation: self.activation,
         })
     }
 }

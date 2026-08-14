@@ -1071,6 +1071,9 @@ struct UiLoop<'a> {
     /// from `UiEvent::Link`. Lets a Ctrl+click resolve the cell under the
     /// pointer's `link_id` without reaching across to the parser thread.
     links: std::collections::HashMap<u32, String>,
+    /// Says which way a Ctrl+click's token request degraded, when
+    /// `COZY_DEBUG_ACTIVATION` is set. Read once here rather than per click.
+    activation_report: platform::toplevel::activation_report::ActivationReport,
     /// See `ConfigWatcher`'s doc for the save-detection strategy and why
     /// it's best-effort.
     config_watcher: ConfigWatcher,
@@ -1137,6 +1140,8 @@ impl<'a> UiLoop<'a> {
             grid_rows: ROWS,
             resize_debounce: ResizeDebounce::new(),
             links: std::collections::HashMap::new(),
+            activation_report:
+                platform::toplevel::activation_report::ActivationReport::from_env("terminal"),
             config_watcher: ConfigWatcher::new(),
         })
     }
@@ -1487,7 +1492,7 @@ impl<'a> UiLoop<'a> {
     /// usual and can handle OSC 8 itself. Otherwise encodes + queues a VT
     /// mouse report. Returns whether any bytes were queued.
     fn handle_mouse_event(
-        &self,
+        &mut self,
         button: platform::window::MouseButton,
         kind: platform::window::MouseEventKind,
         col: u16,
@@ -1539,7 +1544,7 @@ impl<'a> UiLoop<'a> {
     /// building + encoding a VT mouse report. Returns whether a link was
     /// opened (and the click should NOT also be forwarded to the shell).
     fn try_open_hyperlink(
-        &self,
+        &mut self,
         button: platform::window::MouseButton,
         kind: platform::window::MouseEventKind,
         col: u16,
@@ -1569,7 +1574,7 @@ impl<'a> UiLoop<'a> {
             Some(platform::link_scan::LinkTarget::Url(span)) => span.uri,
             None => return false,
         };
-        Self::open_link(&uri);
+        self.open_link(&uri);
         true
     }
 
@@ -1579,13 +1584,16 @@ impl<'a> UiLoop<'a> {
     /// is a rare, human-paced action, and a terminal that cached them at
     /// startup would keep answering with the associations that existed then.
     ///
-    /// No activation token is minted. `TermWindow` tracks no input serial,
-    /// so there is nothing to prove a user acted with -- the launched window
-    /// appears wherever it already lived rather than on the current
-    /// workspace. That matches what this handler did when it shelled out to
-    /// `xdg-open`, and wiring the token is Track 7 work.
-    fn open_link(uri: &str) {
-        if let Err(error) = opener::Opener::load().try_open(&opener::Target::parse(uri)) {
+    /// The token is minted here, inside the click handler, because it must
+    /// carry *this* click's serial. Minting it earlier or later would present
+    /// the compositor evidence of a different moment.
+    fn open_link(&mut self, uri: &str) {
+        let token = self.win.activation_token(None);
+        self.activation_report
+            .record(token.as_ref(), self.win.supports_activation());
+        let opener = opener::Opener::load()
+            .with_activation(token.map(|t| opener::ActivationToken::new(t.into_string())));
+        if let Err(error) = opener.try_open(&opener::Target::parse(uri)) {
             eprintln!("terminal: {uri}: {error}");
         }
     }

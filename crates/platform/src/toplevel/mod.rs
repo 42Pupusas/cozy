@@ -32,6 +32,7 @@
 //! discovery, the common event routing) is reused as-is.
 
 pub mod activation;
+pub mod activation_report;
 pub mod drag;
 pub mod geometry;
 pub mod globals;

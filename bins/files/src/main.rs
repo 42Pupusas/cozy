@@ -14,7 +14,6 @@
 //! where you came from -- has unit tests that run in microseconds instead of
 //! needing a compositor and a pair of eyes.
 
-mod activation_report;
 mod breadcrumb;
 mod browser;
 mod columns;
@@ -39,8 +38,8 @@ mod toolbar;
 mod typography;
 mod window;
 
-use activation_report::ActivationReport;
 use browser::Browser;
+use platform::toplevel::activation_report::ActivationReport;
 use options::Options;
 use platform::toplevel::{LogicalSize, Toplevel, WindowEvent};
 use theme::Theme;
@@ -152,7 +151,7 @@ impl App {
         // are a few thousand lines between them, and re-reading disk on
         // every Enter would put that latency directly in the user's way.
         let mut opener = opener::Opener::load();
-        let activation_report = ActivationReport::from_env();
+        let activation_report = ActivationReport::from_env("files");
 
         let mut title = painter.title();
         loop {

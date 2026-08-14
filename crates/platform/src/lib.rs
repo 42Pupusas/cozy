@@ -19,6 +19,7 @@ mod debug_overlay;
 pub mod error;
 pub mod event;
 pub mod file_uri;
+pub mod input_serial;
 pub mod key_repeat;
 pub mod keymap;
 pub mod layer;

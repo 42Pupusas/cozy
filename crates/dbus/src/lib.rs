@@ -36,6 +36,7 @@
 //!   convenience wrappers the statusbar calls directly.
 
 pub mod bluez;
+pub mod call_target;
 pub mod conn;
 pub mod fds;
 pub mod logind;

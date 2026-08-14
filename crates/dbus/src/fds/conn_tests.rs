@@ -8,10 +8,10 @@
 //! Two `DbusConn`s over a socket pair stand in for client and bus. Neither
 //! ran SASL, so negotiation is set directly.
 
-use std::io::{Read as _, Seek as _, Write as _};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
 use super::fd_frame::FdFrame;
+use super::marked_file::MarkedFile;
 use super::test_fds::{FdTestGuard, LoanedFds};
 use super::SocketPair;
 use crate::conn::{DbusConn, DbusError};
@@ -36,40 +36,8 @@ impl Linked {
     }
 }
 
-/// A temp file whose contents identify it, so a received descriptor can be
-/// proved to be the *same* open file rather than merely a valid number.
-struct MarkedFile {
-    path: std::path::PathBuf,
-}
-
-impl MarkedFile {
-    fn new(marker: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "cozy-conn-fd-{}-{marker}",
-            std::process::id()
-        ));
-        let mut file = std::fs::File::create(&path).expect("create");
-        file.write_all(marker.as_bytes()).expect("write");
-        Self { path }
-    }
-
-    fn open(&self) -> std::fs::File {
-        std::fs::File::open(&self.path).expect("reopen")
-    }
-}
-
-impl Drop for MarkedFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 fn read_through(fd: &OwnedFd) -> String {
-    let mut file = std::fs::File::from(fd.try_clone().expect("dup"));
-    file.rewind().expect("rewind");
-    let mut text = String::new();
-    file.read_to_string(&mut text).expect("read");
-    text
+    MarkedFile::read_through(fd)
 }
 
 /// The regression this work exists for. The connection read frames with a

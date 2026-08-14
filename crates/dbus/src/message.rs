@@ -131,6 +131,20 @@ impl MessageBuilder {
         buf.push(0);
     }
 
+    /// Append the `UNIX_FDS` header field, declaring how many descriptors
+    /// ride with this message. Omitted entirely when the count is zero,
+    /// which the spec treats as identical to absent.
+    fn write_unix_fds_field(buf: &mut Vec<u8>, count: u32) {
+        if count == 0 {
+            return;
+        }
+        Self::pad_to(buf, 8);
+        buf.push(field_code::UNIX_FDS);
+        buf.extend_from_slice(&[1, b'u', 0]);
+        Self::pad_to(buf, 4);
+        buf.extend_from_slice(&count.to_le_bytes());
+    }
+
     fn write_variant_signature(buf: &mut Vec<u8>, signature: &str) {
         buf.push(u8::try_from(signature.len()).unwrap_or(u8::MAX));
         buf.extend_from_slice(signature.as_bytes());
@@ -363,6 +377,151 @@ impl MessageBuilder {
         out.extend_from_slice(&header_fields);
         Self::pad_to(&mut out, 8);
         out.extend_from_slice(&body);
+        out
+    }
+
+    /// Build a `METHOD_RETURN` frame that declares `fd_count` descriptors
+    /// travelling beside it as `SCM_RIGHTS`.
+    ///
+    /// The frame is only half the message: the caller must hand the
+    /// matching descriptors to the transport in the same send, because a
+    /// `Value::UnixFd` in `values` is an index into that array and means
+    /// nothing without it. [`crate::conn::DbusConn::send_method_return_with_fds`]
+    /// pairs the two.
+    ///
+    /// Returns `None` on the same signature/value mismatch
+    /// [`Self::build_method_return_with_values`] reports.
+    #[must_use]
+    pub fn build_method_return_with_fds(
+        serial: u32,
+        destination: &str,
+        call_serial: u32,
+        values: &[Value],
+        reply_signature: &str,
+        fd_count: u32,
+    ) -> Option<Vec<u8>> {
+        let body = Marshaller::marshal_body(values, reply_signature)?;
+
+        let mut header_fields = Vec::new();
+        Self::write_string_field(
+            &mut header_fields,
+            field_code::DESTINATION,
+            b's',
+            destination,
+        );
+        if !reply_signature.is_empty() {
+            Self::write_string_field(
+                &mut header_fields,
+                field_code::SIGNATURE,
+                b'g',
+                reply_signature,
+            );
+        }
+        Self::write_unix_fds_field(&mut header_fields, fd_count);
+        Self::pad_to(&mut header_fields, 8);
+        header_fields.push(field_code::REPLY_SERIAL);
+        header_fields.extend_from_slice(&[1, b'u', 0]);
+        Self::pad_to(&mut header_fields, 4);
+        header_fields.extend_from_slice(&call_serial.to_le_bytes());
+
+        Some(Self::frame(
+            MessageType::MethodReturn,
+            serial,
+            &header_fields,
+            &body,
+        ))
+    }
+
+    /// Build a `METHOD_CALL` frame declaring `fd_count` descriptors, for a
+    /// client passing a file *to* a service (the `FileChooser` and
+    /// `Screenshot` direction). The descriptor-carrying sibling of
+    /// [`Self::build_method_call_with_values`].
+    #[must_use]
+    pub fn build_method_call_with_fds(
+        serial: u32,
+        target: crate::call_target::CallTarget<'_>,
+        values: &[Value],
+        signature: &str,
+        fd_count: u32,
+    ) -> Option<Vec<u8>> {
+        let body = Marshaller::marshal_body(values, signature)?;
+
+        let mut header_fields = Vec::new();
+        Self::write_string_field(&mut header_fields, field_code::PATH, b'o', target.path());
+        Self::write_string_field(
+            &mut header_fields,
+            field_code::DESTINATION,
+            b's',
+            target.destination(),
+        );
+        Self::write_string_field(
+            &mut header_fields,
+            field_code::INTERFACE,
+            b's',
+            target.interface(),
+        );
+        Self::write_string_field(&mut header_fields, field_code::MEMBER, b's', target.member());
+        if !signature.is_empty() {
+            Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', signature);
+        }
+        Self::write_unix_fds_field(&mut header_fields, fd_count);
+
+        Some(Self::frame(
+            MessageType::MethodCall,
+            serial,
+            &header_fields,
+            &body,
+        ))
+    }
+
+    /// Build a `SIGNAL` frame declaring `fd_count` descriptors.
+    #[must_use]
+    pub fn build_signal_with_fds(
+        serial: u32,
+        path: &str,
+        interface: &str,
+        member: &str,
+        values: &[Value],
+        signature: &str,
+        fd_count: u32,
+    ) -> Option<Vec<u8>> {
+        let body = Marshaller::marshal_body(values, signature)?;
+
+        let mut header_fields = Vec::new();
+        Self::write_string_field(&mut header_fields, field_code::PATH, b'o', path);
+        Self::write_string_field(&mut header_fields, field_code::INTERFACE, b's', interface);
+        Self::write_string_field(&mut header_fields, field_code::MEMBER, b's', member);
+        if !signature.is_empty() {
+            Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', signature);
+        }
+        Self::write_unix_fds_field(&mut header_fields, fd_count);
+
+        Some(Self::frame(
+            MessageType::Signal,
+            serial,
+            &header_fields,
+            &body,
+        ))
+    }
+
+    /// Assemble a complete frame from finished header fields and body.
+    ///
+    /// The fixed prelude, the two length words, and the 8-byte pad before
+    /// the body are identical for every message type, so the
+    /// descriptor-carrying builders share this rather than repeating the
+    /// layout each time and risking a divergent one.
+    fn frame(kind: MessageType, serial: u32, header_fields: &[u8], body: &[u8]) -> Vec<u8> {
+        let mut out = vec![b'l', kind.as_byte(), 0, 1];
+        out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(header_fields.len())
+                .unwrap_or(u32::MAX)
+                .to_le_bytes(),
+        );
+        out.extend_from_slice(header_fields);
+        Self::pad_to(&mut out, 8);
+        out.extend_from_slice(body);
         out
     }
 

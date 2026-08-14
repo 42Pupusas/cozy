@@ -14,6 +14,7 @@
 //! The byte-stream path in [`crate::conn`] stays on plain `send`/`recv`.
 //! Only connections that negotiated FD passing pay for the message path.
 
+mod fd_index_scan;
 mod passing;
 mod queue;
 mod socket_pair;
@@ -23,10 +24,15 @@ mod conn_tests;
 #[cfg(test)]
 mod fd_frame;
 #[cfg(test)]
+mod marked_file;
+#[cfg(test)]
+mod send_tests;
+#[cfg(test)]
 mod test_fds;
 #[cfg(test)]
 mod tests;
 
+pub use fd_index_scan::FdIndexScan;
 pub use passing::{FdError, FdPassing};
 pub use queue::FdQueue;
 pub use socket_pair::SocketPair;

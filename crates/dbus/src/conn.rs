@@ -56,6 +56,18 @@ pub enum DbusError {
     /// Descriptors were offered on a connection whose peer refused
     /// `NEGOTIATE_UNIX_FD` during SASL.
     FdsNotNegotiated,
+    /// An outgoing body named descriptor `index` while only `attached`
+    /// descriptors rode with the message. Caught before sending, because a
+    /// peer cannot tell a dangling index from a valid one.
+    FdIndexOutOfRange {
+        index: u32,
+        attached: usize,
+    },
+    /// More descriptors were offered than one message may carry.
+    TooManyFds {
+        offered: usize,
+        limit: usize,
+    },
     /// The call returned `MessageType::Error`.
     Reply {
         name: String,
@@ -90,6 +102,14 @@ impl fmt::Display for DbusError {
             Self::FdsNotNegotiated => {
                 write!(f, "the peer did not agree to unix FD passing")
             }
+            Self::FdIndexOutOfRange { index, attached } => write!(
+                f,
+                "message body names descriptor {index} but only {attached} travel with it"
+            ),
+            Self::TooManyFds { offered, limit } => write!(
+                f,
+                "{offered} descriptors offered for one message; the limit is {limit}"
+            ),
             Self::Reply { name } => write!(f, "D-Bus error reply: {name}"),
         }
     }
@@ -308,6 +328,134 @@ impl DbusConn {
         )
         .ok_or(DbusError::Malformed)?;
         self.send_raw(&frame)
+    }
+
+    /// Answer an incoming method call with a reply that carries open file
+    /// descriptors as `SCM_RIGHTS`.
+    ///
+    /// This is how a portal hands a caller a file: `Screenshot` returns the
+    /// image, `FileChooser` returns the chosen document. Each
+    /// [`crate::value::Value::UnixFd`] in `values` is an **index** into
+    /// `fds`, not a descriptor number, so the two arguments must agree.
+    ///
+    /// The descriptors are borrowed, not consumed. The kernel duplicates
+    /// each into the peer, leaving this process's copies open for the
+    /// caller to close on its own schedule.
+    ///
+    /// Fails without sending anything when:
+    ///
+    /// * the peer never agreed to `NEGOTIATE_UNIX_FD`
+    ///   ([`DbusError::FdsNotNegotiated`]),
+    /// * `fds` holds more than [`FdPassing::MAX_FDS_PER_MESSAGE`]
+    ///   ([`DbusError::TooManyFds`]),
+    /// * a body index names a descriptor beyond `fds`
+    ///   ([`DbusError::FdIndexOutOfRange`]),
+    /// * `values` does not match `reply_signature` ([`DbusError::Malformed`]).
+    pub fn send_method_return_with_fds(
+        &mut self,
+        destination: &str,
+        call_serial: u32,
+        values: &[crate::value::Value],
+        reply_signature: &str,
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<(), DbusError> {
+        self.check_sendable_fds(values, fds)?;
+        let serial = self.take_serial();
+        let frame = crate::message::MessageBuilder::build_method_return_with_fds(
+            serial,
+            destination,
+            call_serial,
+            values,
+            reply_signature,
+            u32::try_from(fds.len()).unwrap_or(u32::MAX),
+        )
+        .ok_or(DbusError::Malformed)?;
+        self.send_raw_with_fds(&frame, fds)
+    }
+
+    /// Make a method call that carries open file descriptors, for passing a
+    /// file *to* a service. The outbound sibling of
+    /// [`Self::send_method_return_with_fds`], with the same failure rules.
+    pub fn call_with_fds(
+        &mut self,
+        target: crate::call_target::CallTarget<'_>,
+        values: &[crate::value::Value],
+        signature: &str,
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<Reply, DbusError> {
+        self.check_sendable_fds(values, fds)?;
+        let serial = self.take_serial();
+        let frame = crate::message::MessageBuilder::build_method_call_with_fds(
+            serial,
+            target,
+            values,
+            signature,
+            u32::try_from(fds.len()).unwrap_or(u32::MAX),
+        )
+        .ok_or(DbusError::Malformed)?;
+        self.send_raw_with_fds(&frame, fds)?;
+        let reply = self.await_reply(serial)?;
+        if reply.kind == MessageType::Error {
+            let name = reply.error_name.unwrap_or_default();
+            return Err(DbusError::Reply { name });
+        }
+        Ok(reply)
+    }
+
+    /// Broadcast a signal carrying open file descriptors.
+    pub fn send_signal_with_fds(
+        &mut self,
+        path: &str,
+        interface: &str,
+        member: &str,
+        values: &[crate::value::Value],
+        signature: &str,
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<(), DbusError> {
+        self.check_sendable_fds(values, fds)?;
+        let serial = self.take_serial();
+        let frame = crate::message::MessageBuilder::build_signal_with_fds(
+            serial,
+            path,
+            interface,
+            member,
+            values,
+            signature,
+            u32::try_from(fds.len()).unwrap_or(u32::MAX),
+        )
+        .ok_or(DbusError::Malformed)?;
+        self.send_raw_with_fds(&frame, fds)
+    }
+
+    /// Reject a descriptor-carrying message before any byte reaches the
+    /// socket.
+    ///
+    /// A frame whose body names a descriptor that does not ride with it is
+    /// undetectable by the peer: it reads a plausible index and resolves it
+    /// to nothing, or worse to an unrelated descriptor of the same message.
+    /// Catching it here keeps the failure on the side that has the bug.
+    fn check_sendable_fds(
+        &self,
+        values: &[crate::value::Value],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<(), DbusError> {
+        if !fds.is_empty() && !self.fds.is_negotiated() {
+            return Err(DbusError::FdsNotNegotiated);
+        }
+        if fds.len() > crate::fds::FdPassing::MAX_FDS_PER_MESSAGE {
+            return Err(DbusError::TooManyFds {
+                offered: fds.len(),
+                limit: crate::fds::FdPassing::MAX_FDS_PER_MESSAGE,
+            });
+        }
+        let scan = crate::fds::FdIndexScan::of(values);
+        if !scan.fits(fds.len()) {
+            return Err(DbusError::FdIndexOutOfRange {
+                index: scan.highest().unwrap_or(0),
+                attached: fds.len(),
+            });
+        }
+        Ok(())
     }
 
     /// Answer an incoming method call with an `Error` reply -- the shape

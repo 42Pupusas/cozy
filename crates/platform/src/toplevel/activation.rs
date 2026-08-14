@@ -210,9 +210,17 @@ impl Activation {
                 std::thread::yield_now();
                 continue;
             };
-            let RawEvent::Bytes(bytes) = &event else {
-                deferred.push_back(event);
-                continue;
+            // Both variants, because the reader splits them by object: only
+            // `wl_display` and `wl_registry` become `Bytes`, and everything
+            // else -- our token object included -- becomes `Wire`. Reading
+            // only `Bytes` would watch the two objects that never carry a
+            // `done` and defer the one that does.
+            let bytes = match &event {
+                RawEvent::Bytes(bytes) | RawEvent::Wire { bytes, .. } => &**bytes,
+                _ => {
+                    deferred.push_back(event);
+                    continue;
+                }
             };
             let Some((mut ev, _)) = WireEvent::parse(bytes) else {
                 trace.unparsed();
@@ -367,6 +375,47 @@ mod tests {
 
         assert!(got.is_none());
         assert_eq!(deferred.len(), 3, "every foreign event must be preserved");
+    }
+
+    /// Builds the compositor's side of the exchange, so a test can feed the
+    /// wait exactly what niri sends.
+    struct Compositor;
+
+    impl Compositor {
+        /// Encode `xdg_activation_token_v1.done` carrying `token_string`.
+        ///
+        /// `done` is opcode 0, which is `SetSerial`'s number on the request
+        /// side -- the builder writes whichever opcode it is handed, and the
+        /// two enums are separate namespaces on the wire.
+        fn done(token: ActivationTokenId, token_string: &str) -> Vec<u8> {
+            MessageBuilder::new(token, ActivationTokenRequest::SetSerial)
+                .string(token_string)
+                .finish()
+        }
+    }
+
+    /// The regression that made every launch tokenless: the reader turns a
+    /// message into `Bytes` only for `wl_display` and `wl_registry`, and into
+    /// `Wire` for every other object. A token object is one of those others,
+    /// so its `done` arrives as `Wire`, and a wait that reads only `Bytes`
+    /// never sees the answer it asked for.
+    #[test]
+    fn a_done_arriving_as_a_wire_event_is_recognised() {
+        let (producer, mut consumer) =
+            quetzalcoatl::spsc::RingBuffer::<RawEvent>::new(quetzalcoatl::capacity::Capacity::exact(
+                4,
+            ))
+            .split();
+        let token = ActivationTokenId(15);
+        producer
+            .push_block(RawEvent::from_wire_msg(&Compositor::done(token, "tok-xyz")))
+            .expect("consumer alive");
+
+        let mut deferred = std::collections::VecDeque::new();
+        let got = Activation::await_done(&mut consumer, &mut deferred, token).expect("no error");
+
+        assert_eq!(got.as_deref(), Some("tok-xyz"));
+        assert!(deferred.is_empty(), "the answer must not be deferred");
     }
 
     /// A deferred event must keep its place: a `RawEvent::Fd` is correlated

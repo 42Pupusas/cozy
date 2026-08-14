@@ -33,6 +33,7 @@
 //! a reference implementation.
 
 mod error;
+mod inflight;
 mod simple;
 mod sys;
 
@@ -55,13 +56,16 @@ pub const READ_BUF_SIZE: usize = 4096;
 /// Size of the (single) in-flight write buffer.
 const WRITE_BUF_SIZE: usize = 4096;
 
-/// `user_data` tags for CQE dispatch.
-mod tag {
-    pub const READ: u64 = 1;
-    pub const WRITE: u64 = 2;
-    pub const SIGNAL: u64 = 3;
-    pub const WAKE: u64 = 4;
-}
+use inflight::{InFlight, OpTag};
+
+/// `user_data` for the cancel SQEs submitted during teardown. Outside the
+/// range [`OpTag`] decodes, so a cancel's own completion is never mistaken
+/// for an operation completing.
+const CANCEL_USER_DATA: u64 = 0xffff_0001;
+
+/// How long teardown waits for the kernel to give the buffers back before
+/// leaking them instead.
+const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// One message from the application into the PTY event loop.
 ///
@@ -83,10 +87,14 @@ pub enum PtyInput {
 pub struct Pty {
     /// `io_uring` queue driving all master-fd I/O.
     ///
-    /// Declared before the I/O buffers below so the ring (and any still
-    /// in-flight kernel ops) is torn down first on drop — the kernel
-    /// quiesces pending SQEs when the ring fd closes, before the buffers
-    /// they point into are freed.
+    /// Declared before the I/O buffers below so the ring is torn down
+    /// first on drop.
+    ///
+    /// Field order alone is **not** sufficient for soundness. Closing the
+    /// ring fd starts the kernel's teardown but does not wait for it, so a
+    /// read armed against `read_buf` can complete after that buffer is
+    /// freed. [`Pty::quiesce`] cancels the outstanding operations and waits
+    /// for their completions before anything is dropped.
     queue: UringQueue,
     /// SQ producer — for submitting read/write SQEs.
     sq: SqProducer,
@@ -130,6 +138,10 @@ pub struct Pty {
     /// the kernel's pty output buffer full, which back-pressures the child's
     /// `write(2)` for free instead of us silently dropping bytes.
     read_pending: Option<usize>,
+    /// Which submitted operations the kernel has not completed yet, and so
+    /// whose buffers it may still write into. Teardown must not free a
+    /// buffer while its operation is in this set.
+    in_flight: InFlight,
 }
 
 impl Pty {
@@ -181,6 +193,7 @@ impl Pty {
             wake_buf: Box::new([0u8; 8]),
             shutdown,
             read_pending: None,
+            in_flight: InFlight::new(),
         })
     }
 
@@ -284,10 +297,19 @@ impl Pty {
             // inside the drain closure. Unbounded Vec: a burst of
             // completions must never be truncated and lose a re-arm.
             let mut actions: Vec<CqeAction> = Vec::new();
+            let mut completed: Vec<OpTag> = Vec::new();
             let cq = &self.cq;
             cq.drain(|cqe| {
+                if let Some(tag) = OpTag::from_user_data(cqe.user_data) {
+                    completed.push(tag);
+                }
                 actions.push(CqeAction::from_cqe(cqe.user_data, cqe.result));
             });
+            // Clear before dispatch: an action may re-arm the very tag whose
+            // completion this batch carried.
+            for tag in completed {
+                self.in_flight.complete(tag);
+            }
 
             let mut got_exit = false;
             for action in &actions {
@@ -384,7 +406,19 @@ impl Pty {
             reaped = true;
         }
 
+        // Before anything is freed: take the buffers back from the kernel.
+        // This runs while the fds are still open, since cancelling an
+        // operation needs the ring fd it was submitted to.
+        let quiet = self.quiesce();
+
         self.cleanup(reaped);
+
+        if !quiet {
+            // The kernel never returned some completion, so it may still
+            // write into these buffers. Leak them rather than hand the
+            // allocator memory the kernel is using.
+            std::mem::forget(self);
+        }
         Ok(exit_code)
     }
 
@@ -434,8 +468,9 @@ impl Pty {
         // (single-write-in-flight invariant via write_in_flight).
         let sqe =
             unsafe { Sqe::write_ptr(self.master_fd, self.write_buf.as_ptr(), len_u32, u64::MAX) }
-                .user_data(tag::WRITE);
+                .user_data(OpTag::Write.as_user_data());
         self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
+        self.in_flight.arm(OpTag::Write);
         self.queue.submit().map_err(PtyError::UringEnter)
     }
 
@@ -471,7 +506,7 @@ impl Pty {
         self.write_in_flight = false;
     }
 
-    fn arm_read(&self) -> Result<(), PtyError> {
+    fn arm_read(&mut self) -> Result<(), PtyError> {
         // READ_BUF_SIZE is a small compile-time buffer size, always fits in u32.
         let read_buf_size_u32 = u32::try_from(READ_BUF_SIZE).expect("READ_BUF_SIZE fits in u32");
         // SAFETY: read_buf is a stable heap allocation owned by self, valid
@@ -485,12 +520,13 @@ impl Pty {
                 u64::MAX,
             )
         }
-        .user_data(tag::READ);
+        .user_data(OpTag::Read.as_user_data());
         self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
+        self.in_flight.arm(OpTag::Read);
         self.queue.submit().map_err(PtyError::UringEnter)
     }
 
-    fn arm_signal(&self) -> Result<(), PtyError> {
+    fn arm_signal(&mut self) -> Result<(), PtyError> {
         // SAFETY: signal_buf's heap allocation outlives this call (owned by
         // Pty, which outlives the loop in `run`); only one signal read is
         // ever in flight against it.
@@ -502,12 +538,13 @@ impl Pty {
                 u64::MAX,
             )
         }
-        .user_data(tag::SIGNAL);
+        .user_data(OpTag::Signal.as_user_data());
         self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
+        self.in_flight.arm(OpTag::Signal);
         self.queue.submit().map_err(PtyError::UringEnter)
     }
 
-    fn arm_wake(&self) -> Result<(), PtyError> {
+    fn arm_wake(&mut self) -> Result<(), PtyError> {
         // Reading an eventfd returns the counter AND resets it to zero, so
         // this armed read both wakes the loop and drains the count — several
         // coalesced signals cost one CQE.
@@ -515,9 +552,66 @@ impl Pty {
         // one wake read is ever in flight (re-armed after its CQE).
         let sqe =
             unsafe { Sqe::read_ptr(self.wake_fd, self.wake_buf.as_ptr().cast_mut(), 8, u64::MAX) }
-                .user_data(tag::WAKE);
+                .user_data(OpTag::Wake.as_user_data());
         self.sq.push(sqe).map_err(|_| PtyError::SqFull)?;
+        self.in_flight.arm(OpTag::Wake);
         self.queue.submit().map_err(PtyError::UringEnter)
+    }
+
+    /// Cancel every outstanding operation and wait for its completion, so
+    /// the kernel owns none of our buffers when they are freed.
+    ///
+    /// Closing the ring fd is **not** enough on its own. The kernel's ring
+    /// teardown is asynchronous, so a read armed against `read_buf` can
+    /// still complete after `Drop` has returned that allocation to the
+    /// heap. The kernel then writes into a free chunk, and the corruption
+    /// surfaces much later as an allocator abort in an unrelated thread
+    /// (`malloc(): unaligned tcache chunk`). The completion of an operation
+    /// is the only proof that the kernel has let its buffer go.
+    ///
+    /// If the kernel does not return every completion within
+    /// [`QUIESCE_TIMEOUT`], this reports failure and the caller leaks the
+    /// buffers instead. A bounded leak on a teardown path is recoverable;
+    /// freeing memory the kernel still writes into is not.
+    fn quiesce(&mut self) -> bool {
+        if self.in_flight.is_quiet() {
+            return true;
+        }
+
+        for tag in self.in_flight.armed() {
+            let sqe = Sqe::cancel(tag.as_user_data()).user_data(CANCEL_USER_DATA);
+            if self.sq.push(sqe).is_err() {
+                break;
+            }
+        }
+        let _ = self.queue.submit();
+
+        // Poll rather than block in the kernel. `submit_and_wait(1)` sleeps
+        // until a completion arrives, which makes the deadline below
+        // unenforceable: an operation the kernel declines to cancel would
+        // hang teardown forever instead of falling back to the leak. A
+        // cancelled operation completes almost immediately, so this loop
+        // normally runs a single pass.
+        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
+        while !self.in_flight.is_quiet() {
+            let _ = self.queue.submit();
+            let in_flight = &mut self.in_flight;
+            // A cancelled operation still posts a CQE (with `-ECANCELED`),
+            // so its arrival is what confirms the buffer is idle.
+            self.cq.drain(|cqe| {
+                if let Some(tag) = OpTag::from_user_data(cqe.user_data) {
+                    in_flight.complete(tag);
+                }
+            });
+            if self.in_flight.is_quiet() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+        true
     }
 
     fn cleanup(&self, reaped: bool) {
@@ -554,8 +648,8 @@ enum CqeAction {
 
 impl CqeAction {
     const fn from_cqe(user_data: u64, result: i32) -> Self {
-        match user_data {
-            tag::READ => {
+        match OpTag::from_user_data(user_data) {
+            Some(OpTag::Read) => {
                 const EAGAIN: i32 = 11;
                 const EINTR: i32 = 4;
                 if result > 0 {
@@ -569,10 +663,10 @@ impl CqeAction {
                     Self::ReadEof
                 }
             }
-            tag::WRITE => Self::WriteDone(result),
-            tag::SIGNAL => Self::Signal,
-            tag::WAKE => Self::Wake,
-            _ => Self::None,
+            Some(OpTag::Write) => Self::WriteDone(result),
+            Some(OpTag::Signal) => Self::Signal,
+            Some(OpTag::Wake) => Self::Wake,
+            None => Self::None,
         }
     }
 }

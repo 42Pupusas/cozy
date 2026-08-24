@@ -23,6 +23,7 @@ use crate::kind_label::KindLabel;
 use crate::moment::Moment;
 use crate::row_format::RowFormat;
 use crate::sidebar::{Sidebar, SidebarRow};
+use volumes::{VolumeFlush, VolumeWatch};
 use crate::storage::Storage;
 use crate::theme::Theme;
 use crate::toolbar::{Target, Toolbar};
@@ -118,6 +119,21 @@ struct PaintedRow {
     row_kind: RowKind,
 }
 
+/// Where one sidebar entry sits, and in what state.
+///
+/// A struct rather than six positional arguments: `y`, `width` and `row_h`
+/// are all `i32`, and `active`, `hovered` and `compact` are all `bool`, so a
+/// transposed pair would compile and paint the wrong thing.
+#[derive(Clone, Copy)]
+struct SidebarEntry {
+    y: i32,
+    width: i32,
+    row_h: i32,
+    active: bool,
+    hovered: bool,
+    compact: bool,
+}
+
 /// The inline rename box's contents for one frame.
 ///
 /// Gathered before painting for the same reason as [`PaintedRow`]: drawing
@@ -188,11 +204,18 @@ pub struct FilesWindow {
     drop_hover_row: Option<usize>,
     /// The floating "N items" label shown while a drag is in flight.
     drag_badge: DragBadge,
+    /// Watches the mount table so attached devices appear and disappear.
+    ///
+    /// Held here rather than in the event loop because the sidebar it feeds
+    /// lives here, and a poll that found a change would otherwise have to
+    /// hand the new set across the same seam the loop already crosses for
+    /// drags and opens.
+    volumes: VolumeWatch,
 }
 
 impl FilesWindow {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         browser: Browser,
         theme: Theme,
         type_scale: Typography,
@@ -201,6 +224,7 @@ impl FilesWindow {
         size: PhysicalSize,
     ) -> Self {
         Self {
+            volumes: VolumeWatch::new(),
             browser,
             theme,
             type_scale,
@@ -267,7 +291,56 @@ impl FilesWindow {
     /// mount is the only thing that can change which filesystem is being
     /// reported, and the fill level moves far slower than the frame rate.
     fn refresh_storage(&mut self) {
-        self.storage = Storage::of(self.browser.path());
+        let path = self.browser.path().to_path_buf();
+        // A device the user has navigated into is named by its label rather
+        // than by its mount point: "KINGSTON" is what is written on the
+        // stick, while `/run/media/user/KINGSTON` is where this machine
+        // happened to attach it.
+        let named = self
+            .volumes
+            .volumes()
+            .containing(&path)
+            .map(|volume| volume.label().to_owned());
+        self.storage = Storage::of(&path).map(|storage| match named {
+            Some(label) => storage.named(label),
+            None => storage,
+        });
+    }
+
+    /// Poll for attached or removed devices, rebuilding the sidebar on a
+    /// change. Returns whether anything changed, so the loop can repaint.
+    ///
+    /// Driven from the event loop rather than from `paint`: painting is the
+    /// consequence of a change, and a poll inside it would read the mount
+    /// table on every frame of a scroll.
+    pub fn poll_volumes(&mut self) -> bool {
+        if !self.volumes.poll_if_due().needs_redraw() {
+            return false;
+        }
+        self.rebuild_sidebar();
+        // The open directory may have just been unmounted, and the footer
+        // still names it.
+        self.refresh_storage();
+        true
+    }
+
+    /// Flush pending writes on the device the sidebar row `index` names.
+    ///
+    /// Refuses anything that is not a device row: the action's promise is
+    /// "it is now safe to unplug", which is meaningless for `/home` and
+    /// alarming for `/`. Returns whether a flush was attempted, so a click
+    /// on an ordinary place can fall through to navigation.
+    fn flush_device(&self, index: usize) -> bool {
+        let Some(row) = self.sidebar.rows().get(index) else {
+            return false;
+        };
+        let Some(path) = row.path().filter(|_| row.is_device()) else {
+            return false;
+        };
+        if let Err(error) = VolumeFlush::flush(path) {
+            eprintln!("files: {error}");
+        }
+        true
     }
 
     /// Bookmark (or un-bookmark) the directory currently open, persisting the
@@ -290,11 +363,12 @@ impl FilesWindow {
         self.relayout();
     }
 
-    /// Rebuild the sidebar rows after the favorites list changed.
+    /// Rebuild the sidebar rows after the favorites list or the attached
+    /// devices changed.
     fn rebuild_sidebar(&mut self) {
         let dirs = user_dirs::UserDirs::load();
         let visible = self.sidebar.visible();
-        self.sidebar = Sidebar::new(&dirs, &self.favorites);
+        self.sidebar = Sidebar::with_volumes(&dirs, &self.favorites, self.volumes.volumes());
         if !visible {
             self.sidebar.toggle();
         }
@@ -959,63 +1033,108 @@ impl FilesWindow {
                         theme.sidebar_bg,
                     );
                 }
-                SidebarRow::Place { label, .. } => {
-                    let is_active = active == Some(i);
-                    let hovered = self.hover.is(Pane::Sidebar, i);
-                    let pad = theme.spacing.sidebar_pad();
-                    // Active outranks hover: the row marking where you *are*
-                    // must not lose its treatment just because the pointer
-                    // happens to be resting on it. Hover is a preview of a
-                    // place you could go, so it says nothing on the place you
-                    // already went.
-                    let fill = match (is_active, hovered) {
-                        (true, _) => Some(theme.sidebar_active),
-                        (false, true) => Some(theme.hover),
-                        (false, false) => None,
-                    };
-                    let bg = fill.map_or(theme.sidebar_bg, |fill| {
-                        // The highlight is inset from both column edges and
-                        // rounded, so it reads as a pill behind the row rather
-                        // than as a stripe bleeding into the divider. Hover
-                        // shares the geometry exactly, so the fill appears to
-                        // change colour under the pointer rather than to also
-                        // change shape.
-                        let pill = Rect::new(pad, y, (width - pad * 2).max(0), row_h);
-                        canvas.fill_round_rect(pill, fill, theme.spacing.radius());
-                        if is_active {
-                            // The guide's 2px accent rule on the leading edge,
-                            // which is what makes the active place readable at
-                            // a glance even when the fill is subtle. Kept
-                            // inside the pill's straight middle section so it
-                            // does not poke out of the rounded corners.
-                            //
-                            // Deliberately not drawn for hover: the rule is the
-                            // marker for "you are here", and lending it to a
-                            // transient pointer position would make the pane
-                            // appear to have two active places.
-                            let r = theme.spacing.radius();
-                            canvas.fill_rect(
-                                Rect::new(pad, y + r, theme.spacing.rule(), (row_h - r * 2).max(1)),
-                                theme.accent,
-                            );
-                        }
-                        fill
-                    });
-                    if compact {
-                        continue;
-                    }
-                    // The open directory is drawn in the accent; the rest in
-                    // ordinary text, so exactly one row draws the eye.
-                    let color = if is_active { theme.accent } else { theme.text };
-                    let tier = &mut self.type_scale.body;
-                    let ty = y + (row_h - tier.line_height()) / 2;
-                    let inset = Self::sidebar_text_x(&theme);
-                    let room = width - inset - pad;
-                    let shown = RowFormat::truncate(label, Self::columns_for(tier, room));
-                    tier.draw_text(canvas, &shown, inset, ty, color, bg);
+                SidebarRow::Place { label, .. } | SidebarRow::Device { label, .. } => {
+                    self.paint_sidebar_entry(
+                        canvas,
+                        row,
+                        label,
+                        SidebarEntry {
+                            y,
+                            width,
+                            row_h,
+                            active: active == Some(i),
+                            hovered: self.hover.is(Pane::Sidebar, i),
+                            compact,
+                        },
+                    );
                 }
             }
         }
+    }
+
+    /// Draw one navigable sidebar row: its highlight, its name, and -- for a
+    /// device -- the filesystem caption at the right edge.
+    ///
+    /// Split from [`Self::paint_sidebar`] when the device caption pushed that
+    /// function past readable length. Headings and hints stay there because
+    /// they are two lines each; this is the part with real branching.
+    fn paint_sidebar_entry(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        row: &SidebarRow,
+        label: &str,
+        at: SidebarEntry,
+    ) {
+        let theme = self.theme;
+        let pad = theme.spacing.sidebar_pad();
+        // Active outranks hover: the row marking where you *are* must not
+        // lose its treatment just because the pointer happens to be resting
+        // on it. Hover is a preview of a place you could go, so it says
+        // nothing on the place you already went.
+        let fill = match (at.active, at.hovered) {
+            (true, _) => Some(theme.sidebar_active),
+            (false, true) => Some(theme.hover),
+            (false, false) => None,
+        };
+        let bg = fill.map_or(theme.sidebar_bg, |fill| {
+            // The highlight is inset from both column edges and rounded, so
+            // it reads as a pill behind the row rather than as a stripe
+            // bleeding into the divider. Hover shares the geometry exactly,
+            // so the fill appears to change colour under the pointer rather
+            // than to also change shape.
+            let pill = Rect::new(pad, at.y, (at.width - pad * 2).max(0), at.row_h);
+            canvas.fill_round_rect(pill, fill, theme.spacing.radius());
+            if at.active {
+                // The guide's 2px accent rule on the leading edge, which is
+                // what makes the active place readable at a glance even when
+                // the fill is subtle. Kept inside the pill's straight middle
+                // section so it does not poke out of the rounded corners.
+                //
+                // Deliberately not drawn for hover: the rule is the marker
+                // for "you are here", and lending it to a transient pointer
+                // position would make the pane appear to have two active
+                // places.
+                let r = theme.spacing.radius();
+                canvas.fill_rect(
+                    Rect::new(
+                        pad,
+                        at.y + r,
+                        theme.spacing.rule(),
+                        (at.row_h - r * 2).max(1),
+                    ),
+                    theme.accent,
+                );
+            }
+            fill
+        });
+        if at.compact {
+            return;
+        }
+        // The open directory is drawn in the accent; the rest in ordinary
+        // text, so exactly one row draws the eye.
+        let color = if at.active { theme.accent } else { theme.text };
+        let inset = Self::sidebar_text_x(&theme);
+        let mut room = at.width - inset - pad;
+        // A device's filesystem sits at the row's right edge in the muted
+        // caption tier, so "vfat" or "read-only" is available without
+        // competing with the name. The name is measured against what is left,
+        // so the detail truncates the label rather than overprinting it.
+        if let Some(detail) = row.detail() {
+            let tier = &mut self.type_scale.detail;
+            let detail_w = tier.measure(detail);
+            // Only shown when the name keeps the larger share: below that the
+            // row reads as two competing labels, and the name is the part
+            // that identifies the disk.
+            if detail_w * 2 < room {
+                let ty = at.y + (at.row_h - tier.line_height()) / 2;
+                tier.draw_text(canvas, detail, inset + room - detail_w, ty, theme.muted, bg);
+                room -= detail_w + theme.spacing.s();
+            }
+        }
+        let tier = &mut self.type_scale.body;
+        let ty = at.y + (at.row_h - tier.line_height()) / 2;
+        let shown = RowFormat::truncate(label, Self::columns_for(tier, room));
+        tier.draw_text(canvas, &shown, inset, ty, color, bg);
     }
 
     /// Where text in the sidebar begins: the column's own padding plus the
@@ -1690,6 +1809,22 @@ impl Painter for FilesWindow {
                     self.drag_arm.press((at.x, at.y));
                 }
             }
+            // A secondary click on a device flushes it. The one honest
+            // removal step available without privileges: `umount(2)` needs
+            // CAP_SYS_ADMIN, so "eject" is not ours to offer, but pushing
+            // pending writes to the hardware is, and it is the part that
+            // actually protects the user's data.
+            PointerEventKind::Press {
+                button: PointerButton::Right,
+                at,
+                ..
+            } => {
+                if self.in_sidebar(at)
+                    && let Some(index) = self.sidebar_row_at(at)
+                {
+                    self.flush_device(index);
+                }
+            }
             PointerEventKind::Release { .. } => {
                 let outcome = self.browser.release();
                 self.apply(outcome);
@@ -1995,6 +2130,138 @@ mod tests {
             at,
             modifiers: platform::toplevel::ModifierState::default(),
         });
+    }
+
+    /// Give `painter` a sidebar with `volumes` attached, as the poller does
+    /// when a device appears.
+    fn attach_devices(painter: &mut FilesWindow, volumes: &volumes::VolumeSet) {
+        let dirs = user_dirs::UserDirs::load();
+        painter.sidebar =
+            crate::sidebar::Sidebar::with_volumes(&dirs, &painter.favorites, volumes);
+    }
+
+    /// A USB stick attached at `/run/media/user/<label>`.
+    fn attached_stick(label: &str) -> volumes::VolumeSet {
+        volumes::VolumeSet::of(vec![volumes::Volume::new(
+            label,
+            format!("/run/media/user/{label}"),
+            "/dev/sdb1",
+            "vfat",
+            volumes::DeviceClass::Removable,
+            false,
+        )])
+    }
+
+    /// The centre of sidebar row `index`, as a pointer position.
+    fn sidebar_row_centre(painter: &FilesWindow, index: usize) -> super::Position {
+        let frame = painter.frame();
+        let row_h = painter.theme.sidebar_row();
+        let top = frame.sidebar_body().y + painter.theme.spacing.sidebar_pad_y();
+        super::Position {
+            x: frame.sidebar().w / 2,
+            y: top + i32::try_from(index).expect("a small index") * row_h + row_h / 2,
+        }
+    }
+
+    /// A device row must actually reach the canvas, not merely exist in the
+    /// model. The section is drawn below the existing rows, so a painter that
+    /// stopped at the old row count would leave it invisible.
+    #[test]
+    fn an_attached_device_changes_the_painted_sidebar() {
+        let (mut painter, _root, size) = painter_over_a_mixed_directory("dev-paint");
+        let before = paint_opaque(&mut painter, size);
+        attach_devices(&mut painter, &attached_stick("KINGSTON"));
+        let after = paint_opaque(&mut painter, size);
+        assert_ne!(
+            before, after,
+            "the Devices section must be visible once a stick is attached"
+        );
+    }
+
+    /// Clicking a device row navigates to its mount point like any place.
+    #[test]
+    fn clicking_a_device_row_navigates_to_its_mount_point() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("dev-click");
+        // A real directory standing in for a mount point, so the navigation
+        // can succeed -- this machine has no removable media to point at.
+        let mount = root.join("a_directory");
+        attach_devices(
+            &mut painter,
+            &volumes::VolumeSet::of(vec![volumes::Volume::new(
+                "KINGSTON",
+                mount.clone(),
+                "/dev/sdb1",
+                "vfat",
+                volumes::DeviceClass::Removable,
+                false,
+            )]),
+        );
+        let index = painter
+            .sidebar
+            .rows()
+            .iter()
+            .position(crate::sidebar::SidebarRow::is_device)
+            .expect("the stick");
+        let at = sidebar_row_centre(&painter, index);
+        painter.on_pointer(PointerEventKind::Press {
+            button: PointerButton::Left,
+            at,
+            modifiers: platform::toplevel::ModifierState::default(),
+        });
+        assert_eq!(painter.browser.path(), mount.as_path());
+    }
+
+    /// The guard that matters: a secondary click on an ordinary place must
+    /// not be treated as a device, or the flush would act on the user's home
+    /// directory or the root filesystem.
+    #[test]
+    fn a_secondary_click_on_a_plain_place_flushes_nothing() {
+        let (painter, _root, _size) = painter_over_a_mixed_directory("dev-guard");
+        for (index, row) in painter.sidebar.rows().iter().enumerate() {
+            if !row.is_device() {
+                assert!(
+                    !painter.flush_device(index),
+                    "{:?} is not a device and must not be flushed",
+                    row.path()
+                );
+            }
+        }
+    }
+
+    /// And the positive case: a device row does flush. The mount point is a
+    /// real directory, so `syncfs` succeeds and the call reports it acted.
+    #[test]
+    fn a_secondary_click_on_a_device_flushes_it() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("dev-flush");
+        attach_devices(
+            &mut painter,
+            &volumes::VolumeSet::of(vec![volumes::Volume::new(
+                "KINGSTON",
+                root.join("a_directory"),
+                "/dev/sdb1",
+                "vfat",
+                volumes::DeviceClass::Removable,
+                false,
+            )]),
+        );
+        let index = painter
+            .sidebar
+            .rows()
+            .iter()
+            .position(crate::sidebar::SidebarRow::is_device)
+            .expect("the stick");
+        assert!(painter.flush_device(index), "a device row flushes");
+    }
+
+    /// Polling on a machine with no removable media must report no change,
+    /// so the window does not repaint on a timer.
+    #[test]
+    fn polling_an_unchanged_system_asks_for_no_repaint() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("dev-poll");
+        assert!(
+            !painter.poll_volumes(),
+            "nothing was plugged in, so nothing must repaint"
+        );
     }
 
     /// The toggle must reveal dotfiles *and* dot-directories, through the

@@ -35,7 +35,24 @@ impl MountTable {
     /// Read a mount table from an arbitrary path.
     #[must_use]
     pub fn read_from(path: &Path) -> Self {
-        std::fs::read_to_string(path).map_or_else(|_| Self::default(), |text| Self::parse(&text))
+        Self::parse(&Self::read_text_from(path))
+    }
+
+    /// The live mount table as raw text, before parsing.
+    ///
+    /// Exposed because a poller compares successive reads to decide whether
+    /// to do any work at all. The kernel rewrites this file on every read,
+    /// so its mtime never changes and byte comparison is the only cheap
+    /// change test available.
+    #[must_use]
+    pub fn read_text() -> String {
+        Self::read_text_from(Path::new(Self::PATH))
+    }
+
+    /// Read mount-table text from an arbitrary path, empty when unreadable.
+    #[must_use]
+    pub fn read_text_from(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
     }
 
     /// Parse mount-table text.

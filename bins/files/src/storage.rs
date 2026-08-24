@@ -249,6 +249,18 @@ impl Storage {
         Some(best.to_string_lossy().into_owned())
     }
 
+    /// Rename the filesystem, for when a better name is known.
+    ///
+    /// A removable volume has one: `KINGSTON` is written on the stick, while
+    /// `/run/media/user/KINGSTON` is only where this machine happened to
+    /// attach it. The capacity figures are unaffected -- this changes what
+    /// the filesystem is *called*, not which one was measured.
+    #[must_use]
+    pub fn named(mut self, name: impl Into<String>) -> Self {
+        self.device = name.into();
+        self
+    }
+
     /// The device or mount label for the footer's left side.
     #[must_use]
     pub fn device(&self) -> &str {
@@ -395,6 +407,17 @@ mod tests {
             "device {} is not a path",
             storage.device()
         );
+    }
+
+    /// A named volume shows its label, not the mount point nobody chose.
+    #[test]
+    fn naming_a_filesystem_replaces_its_label_and_keeps_its_figures() {
+        let dir = std::env::temp_dir();
+        let storage = Storage::of(&dir).expect("temp dir is on a real filesystem");
+        let usage = storage.usage();
+        let named = storage.named("KINGSTON");
+        assert_eq!(named.device(), "KINGSTON");
+        assert_eq!(named.usage(), usage, "renaming must not change the figures");
     }
 
     /// A path that does not exist has no figures to report, and that is a

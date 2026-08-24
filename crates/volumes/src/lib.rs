@@ -32,9 +32,11 @@
 pub mod device_class;
 pub mod mount_entry;
 pub mod mount_table;
+pub mod system_tables;
 pub mod volume;
 pub mod volume_flush;
 pub mod volume_set;
+pub mod volume_watch;
 
 #[cfg(test)]
 mod test_support;
@@ -43,5 +45,7 @@ pub use device_class::DeviceClass;
 pub use mount_entry::MountEntry;
 pub use mount_table::MountTable;
 pub use volume::Volume;
+pub use system_tables::SystemTables;
 pub use volume_flush::{FlushError, VolumeFlush};
 pub use volume_set::VolumeSet;
+pub use volume_watch::{VolumeChange, VolumeWatch};

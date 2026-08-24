@@ -1,9 +1,13 @@
 //! [`Sidebar`] -- the places pane down the left edge.
 //!
-//! Two sections: the XDG user directories ("Places") and the user's own
-//! bookmarks ("Favorites"). This module owns the *model* -- what rows exist,
-//! which is highlighted, what a click resolves to -- and knows nothing about
-//! pixels. `window.rs` paints it.
+//! Three sections: the XDG user directories ("Places"), the user's own
+//! bookmarks ("Favorites"), and attached removable storage ("Devices"). This
+//! module owns the *model* -- what rows exist, which is highlighted, what a
+//! click resolves to -- and knows nothing about pixels. `window.rs` paints it.
+//!
+//! Devices come last deliberately: it is the only section that appears and
+//! disappears on its own, and a section that can grow by two rows without
+//! the user doing anything must not push the rows they were aiming at.
 //!
 //! The flattened-row representation is the point: a sidebar is visually two
 //! lists with headings, but for hit-testing and keyboard navigation it is one
@@ -15,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::favorites::Favorites;
 use user_dirs::{UserDir, UserDirs};
+use volumes::VolumeSet;
 
 /// One row in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +38,21 @@ pub enum SidebarRow {
     /// Shown in place of an empty favorites list, so the section explains
     /// itself instead of appearing broken.
     Hint(&'static str),
+    /// An attached removable volume.
+    ///
+    /// Distinct from [`Self::Place`] rather than reusing it with a flag: a
+    /// device carries a detail line the painter shows, it can be flushed,
+    /// and it can vanish while the pointer is over it. Those are different
+    /// enough behaviours that folding them into `Place` would mean three
+    /// booleans and a `match` at every use.
+    Device {
+        label: String,
+        path: PathBuf,
+        /// The filesystem and read-only state, e.g. `vfat, read-only`.
+        detail: String,
+        /// Whether the volume refuses writes, so the painter can mark it.
+        read_only: bool,
+    },
 }
 
 impl SidebarRow {
@@ -40,7 +60,7 @@ impl SidebarRow {
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match self {
-            Self::Place { path, .. } => Some(path.as_path()),
+            Self::Place { path, .. } | Self::Device { path, .. } => Some(path.as_path()),
             Self::Heading(_) | Self::Hint(_) => None,
         }
     }
@@ -48,7 +68,22 @@ impl SidebarRow {
     /// Whether the row can be clicked or moved onto.
     #[must_use]
     pub const fn selectable(&self) -> bool {
-        matches!(self, Self::Place { .. })
+        matches!(self, Self::Place { .. } | Self::Device { .. })
+    }
+
+    /// Whether this row is a removable device.
+    #[must_use]
+    pub const fn is_device(&self) -> bool {
+        matches!(self, Self::Device { .. })
+    }
+
+    /// The device's detail line, if this is a device row.
+    #[must_use]
+    pub const fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Device { detail, .. } => Some(detail.as_str()),
+            _ => None,
+        }
     }
 }
 
@@ -64,6 +99,8 @@ impl Sidebar {
     const PLACES: &'static str = "Places";
     /// Heading for the bookmarks section.
     const FAVORITES: &'static str = "Favorites";
+    /// Heading for the removable storage section.
+    const DEVICES: &'static str = "Devices";
     /// Shown when nothing is bookmarked yet.
     const EMPTY_HINT: &'static str = "Ctrl+D to bookmark";
 
@@ -82,9 +119,15 @@ impl Sidebar {
         UserDir::Videos,
     ];
 
-    /// Build the sidebar from the user's directories and bookmarks.
+    /// Build the sidebar with no devices attached.
     #[must_use]
     pub fn new(dirs: &UserDirs, favorites: &Favorites) -> Self {
+        Self::with_volumes(dirs, favorites, &VolumeSet::default())
+    }
+
+    /// Build the sidebar from the user's directories, bookmarks and devices.
+    #[must_use]
+    pub fn with_volumes(dirs: &UserDirs, favorites: &Favorites, volumes: &VolumeSet) -> Self {
         let mut rows = vec![SidebarRow::Heading(Self::PLACES)];
         // Home leads the list: it is where the browser opens and where people
         // navigate back to most.
@@ -124,10 +167,39 @@ impl Sidebar {
             }
         }
 
+        // The whole section is omitted when nothing is attached, rather than
+        // showing an empty heading. Unlike Favorites -- where a hint teaches
+        // a keybinding -- there is nothing to teach here: the answer to "no
+        // devices" is to plug one in, which the user already knows.
+        if !volumes.is_empty() {
+            rows.push(SidebarRow::Heading(Self::DEVICES));
+            for volume in volumes.volumes() {
+                rows.push(SidebarRow::Device {
+                    label: volume.label().to_owned(),
+                    path: volume.mount_point().to_path_buf(),
+                    detail: volume.detail(),
+                    read_only: volume.read_only(),
+                });
+            }
+        }
+
         Self {
             rows,
             visible: true,
         }
+    }
+
+    /// The device row mounted at `path`, if any.
+    ///
+    /// The flush action reaches devices by row index, since that is what a
+    /// click resolves to; this is the by-path lookup the tests use to assert
+    /// that a plain place is never mistaken for a device.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn device_at(&self, path: &Path) -> Option<&SidebarRow> {
+        self.rows
+            .iter()
+            .find(|row| row.is_device() && row.path() == Some(path))
     }
 
     /// Every row, headings included, top to bottom.
@@ -198,6 +270,19 @@ mod tests {
     use crate::test_support::TempDir;
     use std::path::Path;
     use user_dirs::UserDirs;
+    use volumes::{DeviceClass, Volume, VolumeSet};
+
+    /// A USB stick attached at `/run/media/user/<label>`.
+    fn stick(label: &str, read_only: bool) -> Volume {
+        Volume::new(
+            label,
+            format!("/run/media/user/{label}"),
+            "/dev/sdb1",
+            "vfat",
+            DeviceClass::Removable,
+            read_only,
+        )
+    }
 
     /// Build a sidebar over a real temp directory with a couple of XDG dirs.
     fn fixture(tmp: &TempDir) -> (UserDirs, Favorites) {
@@ -210,20 +295,137 @@ mod tests {
         (UserDirs::parse(&doc, tmp.path()), Favorites::new())
     }
 
-    #[test]
-    fn both_sections_are_present() {
-        let tmp = TempDir::new("sidebar-sections");
-        let (dirs, fav) = fixture(&tmp);
-        let bar = Sidebar::new(&dirs, &fav);
-        let headings: Vec<_> = bar
-            .rows()
+    /// Every heading in the bar, in order.
+    fn headings(bar: &Sidebar) -> Vec<&'static str> {
+        bar.rows()
             .iter()
             .filter_map(|r| match r {
                 SidebarRow::Heading(h) => Some(*h),
                 _ => None,
             })
+            .collect()
+    }
+
+    #[test]
+    fn both_sections_are_present() {
+        let tmp = TempDir::new("sidebar-sections");
+        let (dirs, fav) = fixture(&tmp);
+        let bar = Sidebar::new(&dirs, &fav);
+        assert_eq!(headings(&bar), ["Places", "Favorites"]);
+    }
+
+    /// With nothing plugged in there is no section at all -- not an empty
+    /// heading, which would be chrome describing nothing.
+    #[test]
+    fn the_devices_section_is_absent_when_nothing_is_attached() {
+        let tmp = TempDir::new("sidebar-nodev");
+        let (dirs, fav) = fixture(&tmp);
+        let bar = Sidebar::with_volumes(&dirs, &fav, &VolumeSet::default());
+        assert!(!headings(&bar).contains(&"Devices"));
+        assert!(!bar.rows().iter().any(SidebarRow::is_device));
+    }
+
+    #[test]
+    fn an_attached_device_appears_under_a_devices_heading() {
+        let tmp = TempDir::new("sidebar-dev");
+        let (dirs, fav) = fixture(&tmp);
+        let volumes = VolumeSet::of(vec![stick("KINGSTON", false)]);
+        let bar = Sidebar::with_volumes(&dirs, &fav, &volumes);
+        assert_eq!(headings(&bar), ["Places", "Favorites", "Devices"]);
+        let rows = bar.rows();
+        let heading = rows
+            .iter()
+            .position(|r| matches!(r, SidebarRow::Heading("Devices")))
+            .expect("the devices heading");
+        let device = rows.iter().position(SidebarRow::is_device).expect("the stick");
+        assert!(device > heading, "a device must sit under its heading");
+    }
+
+    /// Devices come last so that a stick appearing on its own cannot push
+    /// the row the user was reaching for.
+    #[test]
+    fn attaching_a_device_does_not_move_the_rows_above_it() {
+        let tmp = TempDir::new("sidebar-stable");
+        let (dirs, fav) = fixture(&tmp);
+        let before = Sidebar::new(&dirs, &fav);
+        let paths: Vec<_> = before.rows().iter().map(SidebarRow::path).collect();
+        let volumes = VolumeSet::of(vec![stick("KINGSTON", false)]);
+        let after = Sidebar::with_volumes(&dirs, &fav, &volumes);
+        let grown: Vec<_> = after
+            .rows()
+            .iter()
+            .take(paths.len())
+            .map(SidebarRow::path)
             .collect();
-        assert_eq!(headings, ["Places", "Favorites"]);
+        assert_eq!(paths, grown, "existing rows must keep their positions");
+    }
+
+    /// A device row navigates like any other place.
+    #[test]
+    fn a_device_row_is_selectable_and_carries_its_mount_point() {
+        let tmp = TempDir::new("sidebar-devnav");
+        let (dirs, fav) = fixture(&tmp);
+        let volumes = VolumeSet::of(vec![stick("KINGSTON", false)]);
+        let bar = Sidebar::with_volumes(&dirs, &fav, &volumes);
+        let row = bar
+            .rows()
+            .iter()
+            .find(|r| r.is_device())
+            .expect("the stick");
+        assert!(row.selectable());
+        assert_eq!(row.path(), Some(Path::new("/run/media/user/KINGSTON")));
+    }
+
+    #[test]
+    fn a_device_carries_a_detail_line_and_a_place_does_not() {
+        let tmp = TempDir::new("sidebar-detail");
+        let (dirs, fav) = fixture(&tmp);
+        let volumes = VolumeSet::of(vec![stick("DISC", true)]);
+        let bar = Sidebar::with_volumes(&dirs, &fav, &volumes);
+        let device = bar.device_at(Path::new("/run/media/user/DISC")).expect("found");
+        assert_eq!(device.detail(), Some("vfat, read-only"));
+        let home = bar
+            .rows()
+            .iter()
+            .find(|r| r.path() == Some(tmp.path()))
+            .expect("home");
+        assert_eq!(home.detail(), None);
+    }
+
+    /// The browsing directory must never be mistaken for a device, or the
+    /// flush action would offer to act on the root filesystem.
+    #[test]
+    fn a_plain_place_is_not_reported_as_a_device() {
+        let tmp = TempDir::new("sidebar-notdev");
+        let (dirs, fav) = fixture(&tmp);
+        let volumes = VolumeSet::of(vec![stick("KINGSTON", false)]);
+        let bar = Sidebar::with_volumes(&dirs, &fav, &volumes);
+        assert!(bar.device_at(tmp.path()).is_none());
+        assert!(bar.device_at(Path::new("/")).is_none());
+    }
+
+    /// The open directory highlights whether it is a place or a device.
+    #[test]
+    fn an_open_device_is_locatable_for_highlighting() {
+        let tmp = TempDir::new("sidebar-devhl");
+        let (dirs, fav) = fixture(&tmp);
+        let volumes = VolumeSet::of(vec![stick("KINGSTON", false)]);
+        let bar = Sidebar::with_volumes(&dirs, &fav, &volumes);
+        let index = bar
+            .index_of(Path::new("/run/media/user/KINGSTON"))
+            .expect("the open device highlights");
+        assert!(bar.rows()[index].is_device());
+    }
+
+    /// Two sticks must both appear; the count is what tells a user whether
+    /// the machine saw the one they just plugged in.
+    #[test]
+    fn every_attached_device_is_listed() {
+        let tmp = TempDir::new("sidebar-many");
+        let (dirs, fav) = fixture(&tmp);
+        let volumes = VolumeSet::of(vec![stick("ALPHA", false), stick("BETA", true)]);
+        let bar = Sidebar::with_volumes(&dirs, &fav, &volumes);
+        assert_eq!(bar.rows().iter().filter(|r| r.is_device()).count(), 2);
     }
 
     #[test]

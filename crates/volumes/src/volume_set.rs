@@ -34,6 +34,16 @@ impl VolumeSet {
         Self::collect(table, Volume::from_mount)
     }
 
+    /// Build a set from volumes that are already known.
+    ///
+    /// For callers describing a system rather than reading one: a downstream
+    /// test that needs two attached sticks should not have to build a sysfs
+    /// tree to get them.
+    #[must_use]
+    pub const fn of(volumes: Vec<Volume>) -> Self {
+        Self { volumes }
+    }
+
     /// Build the set against arbitrary system tables, for testing.
     #[must_use]
     pub fn from_table_in(table: &MountTable, sys_block: &Path, by_label: &Path) -> Self {

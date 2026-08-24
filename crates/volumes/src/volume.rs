@@ -45,6 +45,32 @@ impl Volume {
     /// Where the kernel publishes filesystem labels.
     const BY_LABEL: &'static str = "/dev/disk/by-label";
 
+    /// Build a volume from its parts.
+    ///
+    /// The mount tables are the only production source, but a volume is a
+    /// plain description, and callers that already know what they are
+    /// describing -- a downstream test, a future `UDisks2` backend reading
+    /// the same facts over D-Bus -- should not have to fabricate a
+    /// `mountinfo` line to say so.
+    #[must_use]
+    pub fn new(
+        label: impl Into<String>,
+        mount_point: impl Into<PathBuf>,
+        source: impl Into<String>,
+        fs_type: impl Into<String>,
+        class: DeviceClass,
+        read_only: bool,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            mount_point: mount_point.into(),
+            source: source.into(),
+            fs_type: fs_type.into(),
+            class,
+            read_only,
+        }
+    }
+
     /// Build a volume from a mount entry, reading the real system tables.
     #[must_use]
     pub fn from_mount(entry: &MountEntry) -> Self {

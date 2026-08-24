@@ -192,6 +192,7 @@ dependencies = [
  "platform",
  "statusbar",
  "user-dirs",
+ "volumes",
  "waker",
  "widget",
 ]

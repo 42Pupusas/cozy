@@ -41,6 +41,10 @@ opener   = { path = "../../crates/opener" }
 # real filesystem mutation (cross-filesystem fallback, conflict policy),
 # not a bare `std::fs::rename` call.
 fileops  = { path = "../../crates/fileops" }
+# Removable storage for the sidebar's "Devices" section: which USB sticks and
+# cards are attached, read from the kernel's own tables rather than from a
+# UDisks2 daemon that is not installed on every machine.
+volumes  = { path = "../../crates/volumes" }
 # The XDG user directories the sidebar's "places" section lists, shared with
 # `bins/xdg-user-dirs` so the reader and the writer cannot disagree about the
 # `user-dirs.dirs` format.

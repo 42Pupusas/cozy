@@ -206,6 +206,14 @@ impl App {
                 window.request_redraw();
             }
 
+            // Devices attach and detach without any input from the user, so
+            // this is the one thing in the loop that is not a response to an
+            // event. It is gated on an interval inside, so the common pass --
+            // a keystroke, a pointer motion -- costs a clock read.
+            if painter.poll_volumes() {
+                window.request_redraw();
+            }
+
             // The title follows the directory, so the taskbar entry stays
             // meaningful as the user navigates. Compared first because
             // set_title is a round-trip we should not make every frame.

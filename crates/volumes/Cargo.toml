@@ -1,0 +1,17 @@
+[package]
+name    = "volumes"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# No path deps, by design -- same rule as `crates/fsmodel`. This crate turns
+# the kernel's own mount and block-device tables into a list of storage
+# volumes, with zero Wayland/rendering knowledge and zero daemon dependency.
+#
+# Notably it does NOT depend on `crates/dbus`: UDisks2 is not required to
+# *detect* storage, and building on the kernel's tables means detection works
+# on machines where that daemon is absent. `MountSource` is the seam through
+# which a UDisks2-backed implementation can be added later.

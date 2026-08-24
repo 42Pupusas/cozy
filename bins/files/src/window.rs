@@ -15,6 +15,7 @@ use widget::{DragArm, Mods};
 use crate::breadcrumb::Breadcrumb;
 use crate::browser::{Browser, Outcome, ViewMode};
 use crate::columns::{Column, Columns};
+use crate::drag_badge::{BadgeStyle, DragBadge};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
 use crate::hover::{Hover, Pane, Spot};
@@ -109,8 +110,24 @@ struct PaintedRow {
     /// (which mean "this is what you've chosen" or "this is under the
     /// pointer", not "dropping here will move files into this folder").
     drop_target: bool,
+    /// Whether a Ctrl-X marked this entry to be moved by the next paste.
+    /// Painted dimmed, the way every file manager shows a pending cut, so
+    /// the user can see what their Ctrl-X actually took.
+    cut: bool,
     /// Which highlight family this row draws from.
     row_kind: RowKind,
+}
+
+/// The inline rename box's contents for one frame.
+///
+/// Gathered before painting for the same reason as [`PaintedRow`]: drawing
+/// borrows `self.type_scale` mutably, which cannot coexist with a borrow of
+/// `self.browser`.
+struct PaintedRename {
+    row: usize,
+    text: String,
+    before_caret: String,
+    valid: bool,
 }
 
 /// Draws a browser and feeds it input.
@@ -169,6 +186,8 @@ pub struct FilesWindow {
     /// `Toplevel::is_drag_over`/`drag_position`, since that state lives on
     /// the `Toplevel`, not a callback `Painter` receives on every motion.
     drop_hover_row: Option<usize>,
+    /// The floating "N items" label shown while a drag is in flight.
+    drag_badge: DragBadge,
 }
 
 impl FilesWindow {
@@ -199,6 +218,7 @@ impl FilesWindow {
             drag_row: None,
             pending_drag: None,
             drop_hover_row: None,
+            drag_badge: DragBadge::new(),
         }
     }
 
@@ -224,6 +244,21 @@ impl FilesWindow {
         } else {
             None
         };
+        if over {
+            self.drag_badge.follow(at);
+        }
+    }
+
+    /// Report whether a drag this window started is still in flight.
+    ///
+    /// Driven from the event loop rather than inferred here: once the
+    /// compositor takes the pointer grab this window stops receiving the
+    /// release, so the painter has no way of its own to learn that the
+    /// gesture ended. Without this the badge would stay on screen forever.
+    pub const fn update_drag_active(&mut self, dragging: bool) {
+        if !dragging {
+            self.drag_badge.end();
+        }
     }
 
     /// Re-read the filesystem figures behind the sidebar footer.
@@ -398,6 +433,7 @@ impl FilesWindow {
         let outcome = match target {
             Target::Back => self.browser.go_back(),
             Target::Forward => self.browser.go_forward(),
+            Target::ToggleHidden => self.browser.act(crate::keymap::Action::ToggleHidden),
             Target::Filter => self.browser.focus_filter(),
             Target::ViewList => self.browser.set_view_mode(ViewMode::List),
             Target::ViewGrid => self.browser.set_view_mode(ViewMode::Grid),
@@ -462,6 +498,7 @@ impl FilesWindow {
             theme.sidebar_border,
         );
         self.paint_nav_buttons(canvas);
+        self.paint_hidden_toggle(canvas);
         self.paint_breadcrumb(canvas);
         self.paint_filter_control(canvas);
         self.paint_view_toggle(canvas);
@@ -530,6 +567,47 @@ impl FilesWindow {
                 bg,
             );
         }
+    }
+
+    /// Draw the dotfile visibility toggle, beside the navigation chevrons.
+    ///
+    /// Drawn in the accent wash while hidden files are shown, exactly as the
+    /// active segment of the view toggle is. That is the whole job of this
+    /// control: dotfiles being listed is a mode the user can forget they are
+    /// in, and an unlit button gives them nothing to notice.
+    ///
+    /// The glyph changes with the state as well as the fill, because a colour
+    /// alone is not an answer for anyone who cannot distinguish it.
+    fn paint_hidden_toggle(&mut self, canvas: &mut Canvas<'_>) {
+        let theme = self.theme;
+        let Some(rect) = self.toolbar().hidden_toggle() else {
+            return;
+        };
+        let on = self.browser.shows_hidden();
+        let hovered = self.hover.control() == Some(Target::ToggleHidden);
+        let radius = theme.spacing.radius_small();
+        let bg = if on {
+            canvas.fill_round_rect(rect, theme.accent_surface, radius);
+            theme.accent_surface
+        } else if hovered {
+            canvas.fill_round_rect(rect, theme.hover, radius);
+            theme.hover
+        } else {
+            theme.toolbar_bg
+        };
+        let color = if on { theme.accent } else { theme.text };
+        let glyph = if on { "\u{25c9}" } else { "\u{25cb}" };
+        let tier = &mut self.type_scale.label;
+        let text_w = tier.measure(glyph);
+        let text_y = rect.y + (rect.h - tier.line_height()) / 2;
+        tier.draw_text(
+            canvas,
+            glyph,
+            rect.x + (rect.w - text_w) / 2,
+            text_y,
+            color,
+            bg,
+        );
     }
 
     /// Draw the list/grid view toggle at the toolbar's right end.
@@ -1103,6 +1181,7 @@ impl FilesWindow {
                     is_cursor: self.browser.pane().cursor() == Some(row),
                     hovered: self.hover.is(Pane::List, row),
                     drop_target: self.drop_hover_row == Some(row),
+                    cut: self.browser.clipboard().is_cut(&entry.path),
                     // The highlight colour follows what the row *is*, not what
                     // its name looks like, so a directory keeps its tint even
                     // when the name column is truncated to nothing.
@@ -1128,6 +1207,14 @@ impl FilesWindow {
             // is where your attention is". Only when focused: claiming
             // keyboard focus in an unfocused window is a lie.
             let cursor_here = self.focused && row.is_cursor;
+            // A pending cut is shown by fading the name toward the
+            // background, which is the one signal that survives every
+            // combination of selection, hover and cursor fill beneath it.
+            let name_color = if row.cut {
+                theme.muted
+            } else {
+                row.color
+            };
             let bg = match (row.selected, row.hovered || cursor_here) {
                 (true, _) => {
                     let fill = row.row_kind.selection_fill(&theme);
@@ -1165,7 +1252,7 @@ impl FilesWindow {
                 // the muted colour -- until its row is selected, where the
                 // guide asks for the whole row to brighten.
                 let (text, color, tier) = match cell.column {
-                    Column::Name => (&row.name, row.color, &mut self.type_scale.body),
+                    Column::Name => (&row.name, name_color, &mut self.type_scale.body),
                     Column::Modified => (
                         &row.modified,
                         Self::meta_color(&theme, row.selected),
@@ -1188,6 +1275,97 @@ impl FilesWindow {
                 tier.draw_text(canvas, &shown, text_x, text_y, color, bg);
             }
         }
+
+        self.paint_rename_box(canvas, &columns);
+    }
+
+    /// Draw the inline rename box over the row being renamed.
+    ///
+    /// Painted after every row, not in place of one: the box covers only the
+    /// name column, so the row's metadata stays visible beside it and the
+    /// user keeps the context of what they are renaming.
+    fn paint_rename_box(&mut self, canvas: &mut Canvas<'_>, columns: &Columns) {
+        let Some(editing) = self.painted_rename() else {
+            return;
+        };
+        let Some(cell) = columns.cells().iter().find(|c| c.column == Column::Name) else {
+            return;
+        };
+        let Some(row_y) = self.browser.pane().row_y(editing.row) else {
+            return;
+        };
+        let theme = self.theme;
+        let band = self.frame().rows();
+        let radius = theme.spacing.radius();
+        let rect = Rect::new(
+            band.x + cell.x,
+            band.y + row_y,
+            cell.width,
+            theme.row_height,
+        );
+        canvas.fill_round_rect(rect, theme.filter_bg, radius);
+        // An illegal name is outlined in the error colour rather than
+        // refused silently: the box stays open on Enter, and without this the
+        // user gets no explanation for why nothing happened.
+        let border = if editing.valid {
+            theme.focus_ring
+        } else {
+            theme.error
+        };
+        canvas.draw_round_rect(rect, border, radius);
+
+        let inner_x = rect.x + theme.spacing.m();
+        let body = &mut self.type_scale.body;
+        let text_y = rect.y + (theme.row_height - body.line_height()) / 2;
+        body.draw_text(
+            canvas,
+            &editing.text,
+            inner_x,
+            text_y,
+            theme.text,
+            theme.filter_bg,
+        );
+        let caret_x = inner_x + body.measure(&editing.before_caret);
+        canvas.fill_rect(
+            Rect::new(caret_x, text_y, theme.spacing.rule(), body.line_height()),
+            theme.caret,
+        );
+    }
+
+    /// The open rename box's contents, or `None` when no rename is active.
+    fn painted_rename(&self) -> Option<PaintedRename> {
+        let rename = self.browser.rename();
+        let input = rename.input()?;
+        Some(PaintedRename {
+            row: rename.row()?,
+            text: input.text().to_owned(),
+            before_caret: input.before_caret().to_owned(),
+            valid: rename.is_valid(),
+        })
+    }
+
+    /// Draw the floating "N items" badge while a drag is in flight.
+    ///
+    /// Uses the accent surface rather than a row fill: the badge belongs to
+    /// the gesture, not to the listing, and reusing a row colour would make
+    /// it read as another row.
+    fn paint_drag_badge(&mut self, canvas: &mut Canvas<'_>) {
+        if !self.drag_badge.is_active() {
+            return;
+        }
+        let theme = self.theme;
+        let bounds = self.frame().main();
+        self.drag_badge.paint(
+            canvas,
+            &mut self.type_scale.detail,
+            bounds,
+            BadgeStyle {
+                spacing: theme.spacing,
+                fill: theme.accent_surface,
+                border: theme.accent,
+                fg: theme.text,
+            },
+        );
     }
 
     /// The colour for a metadata cell.
@@ -1335,13 +1513,22 @@ impl FilesWindow {
         // The guide's status line reports the entry count or the selection.
         // The filter query itself now lives in the toolbar control, so the
         // strip stays a summary rather than duplicating it.
+        //
+        // A file operation's result outranks the count while it is current:
+        // "3 items copied" is what the user just did, and the entry count is
+        // still there beneath it on the next action.
         let shown = self.browser.len();
         let total = self.browser.total();
-        let summary = if shown == total {
-            format!("{total} entries")
-        } else {
-            format!("{shown} of {total} entries")
-        };
+        let summary = self.browser.notice().map_or_else(
+            || {
+                if shown == total {
+                    format!("{total} entries")
+                } else {
+                    format!("{shown} of {total} entries")
+                }
+            },
+            ToOwned::to_owned,
+        );
         let label = &mut self.type_scale.label;
         let text_y = y + (band.h - label.line_height()) / 2;
         label.draw_text(
@@ -1435,6 +1622,9 @@ impl Painter for FilesWindow {
         }
         self.paint_scrollbar(canvas);
         self.paint_status(canvas);
+        // Last, and over everything: the badge is cargo the user is holding
+        // above the window, so anything it covers is by definition behind it.
+        self.paint_drag_badge(canvas);
     }
 
     fn on_key(&mut self, press: KeyPress) {
@@ -1514,7 +1704,9 @@ impl Painter for FilesWindow {
                 if let Some(row) = self.drag_row
                     && self.drag_arm.motion_exceeds_threshold((at.x, at.y))
                 {
-                    self.pending_drag = Some(self.browser.drag_paths(row));
+                    let paths = self.browser.drag_paths(row);
+                    self.drag_badge.begin(paths.len(), (at.x, at.y));
+                    self.pending_drag = Some(paths);
                     self.drag_row = None;
                     return;
                 }
@@ -1569,6 +1761,36 @@ impl Painter for FilesWindow {
         let outcome = self.browser.accept_drop(&paths, &target);
         self.apply(outcome);
         self.drop_hover_row = None;
+        self.drag_badge.end();
+    }
+}
+
+#[cfg(test)]
+impl FilesWindow {
+    /// Paint one frame and digest the pixels of the file-row band.
+    ///
+    /// The crop is what makes a row test mean anything: the status line
+    /// reports "1 item cut" against "1 item copied", so a whole-frame
+    /// comparison passes on that text alone and proves nothing about the
+    /// listing.
+    ///
+    /// A digest rather than the pixels themselves, because a failed
+    /// `assert_ne!` prints its operands: half a million integers is not a
+    /// diagnostic, it is a flooded terminal.
+    fn painted_rows(&mut self, size: platform::toplevel::PhysicalSize) -> u64 {
+        let px = (size.width * size.height).cast_unsigned() as usize;
+        let mut buf = vec![0u32; px];
+        {
+            let mut canvas = platform::draw::Canvas::new(&mut buf, size.width, size.height);
+            self.paint(&mut canvas, size);
+        }
+        let band = self.frame().rows();
+        let stride = size.width.cast_unsigned() as usize;
+        let top = (band.y.max(0).cast_unsigned() as usize * stride).min(px);
+        let bottom = ((band.y + band.h).max(0).cast_unsigned() as usize * stride).min(px);
+        buf[top..bottom].iter().fold(0xcbf2_9ce4_8422_2325, |h, &p| {
+            (h ^ u64::from(p)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
     }
 }
 
@@ -1722,6 +1944,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("a_directory")).expect("create a subdirectory");
         std::fs::write(root.join("b_file.txt"), b"x").expect("create a file");
+        std::fs::create_dir_all(root.join(".a_hidden_dir")).expect("create a dot directory");
+        std::fs::write(root.join(".a_dotfile"), b"x").expect("create a dotfile");
 
         let cfg = config::Config::default();
         let theme = crate::theme::Theme::from_config(&cfg);
@@ -1751,6 +1975,7 @@ mod tests {
         let rect = match target {
             Target::Back => bar.back(),
             Target::Forward => bar.forward(),
+            Target::ToggleHidden => bar.hidden_toggle(),
             Target::Filter => bar.filter(),
             Target::ViewList => bar.view_segment(0),
             Target::ViewGrid => bar.view_segment(1),
@@ -1770,6 +1995,47 @@ mod tests {
             at,
             modifiers: platform::toplevel::ModifierState::default(),
         });
+    }
+
+    /// The toggle must reveal dotfiles *and* dot-directories, through the
+    /// real pointer path -- a button wired to nothing is the bug this guards.
+    #[test]
+    fn clicking_the_hidden_toggle_reveals_and_rehides_dotfiles() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("toolbar-hidden");
+        assert_eq!(
+            painter.browser.len(),
+            2,
+            "dotfiles start hidden, so only the two plain entries list"
+        );
+        assert!(!painter.browser.shows_hidden());
+
+        click_control(&mut painter, Target::ToggleHidden);
+        assert!(painter.browser.shows_hidden(), "the state must flip");
+        assert_eq!(
+            painter.browser.len(),
+            4,
+            "both the dotfile and the dot-directory must appear"
+        );
+
+        click_control(&mut painter, Target::ToggleHidden);
+        assert!(!painter.browser.shows_hidden(), "and flip back");
+        assert_eq!(painter.browser.len(), 2, "hiding them again must restore");
+    }
+
+    /// The toggle and Ctrl-H drive the same state, so the button reflects a
+    /// change made from the keyboard rather than tracking a private flag.
+    #[test]
+    fn the_keyboard_shortcut_and_the_button_share_one_state() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("toolbar-hidden-key");
+        let outcome = painter.browser.act(crate::keymap::Action::ToggleHidden);
+        painter.apply(outcome);
+        assert!(painter.browser.shows_hidden());
+
+        click_control(&mut painter, Target::ToggleHidden);
+        assert!(
+            !painter.browser.shows_hidden(),
+            "the button must continue from where the shortcut left off"
+        );
     }
 
     /// A click on the back chevron must actually navigate.
@@ -2211,6 +2477,94 @@ mod tests {
         assert!(
             folder.join("b_file.txt").exists(),
             "the file must have landed inside the dropped-on directory"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An open rename box must actually reach the framebuffer -- a model
+    /// that renames correctly but paints nothing is invisible to the user.
+    #[test]
+    fn an_open_rename_box_changes_the_painted_frame() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("rename-paint");
+        let resting = paint_opaque(&mut painter, size);
+
+        painter.browser.act(crate::keymap::Action::List(
+            widget::ListCommand::Move(widget::Direction::Down),
+        ));
+        painter.browser.act(crate::keymap::Action::BeginRename);
+        assert!(painter.browser.is_renaming(), "F2 must open the box");
+        let editing = paint_opaque(&mut painter, size);
+
+        assert_ne!(
+            resting, editing,
+            "an open rename box must be visible on screen"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An illegal name is refused silently by the model, so the outline is
+    /// the only feedback the user gets. It has to differ from the valid one.
+    #[test]
+    fn an_illegal_rename_paints_differently_from_a_valid_one() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("rename-invalid");
+        painter.browser.act(crate::keymap::Action::BeginRename);
+        let valid = paint_opaque(&mut painter, size);
+
+        painter
+            .browser
+            .act(crate::keymap::Action::Edit(crate::keymap::EditAction::KillToStart));
+        for c in "a/b".chars() {
+            painter.browser.act(crate::keymap::Action::Insert(c));
+        }
+        let invalid = paint_opaque(&mut painter, size);
+
+        assert_ne!(
+            valid, invalid,
+            "an unusable name must be visibly marked, since Enter does nothing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Ctrl-X gives no other feedback, so the dimmed name is how the user
+    /// knows what their cut actually took.
+    ///
+    /// The cursor is placed first: with no cursor and no selection there is
+    /// nothing to cut, and the clipboard correctly stays empty.
+    #[test]
+    fn a_cut_entry_is_painted_dimmed() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("cut-paint");
+        painter.browser.act(crate::keymap::Action::List(
+            widget::ListCommand::Move(widget::Direction::Down),
+        ));
+        let resting = painter.painted_rows(size);
+
+        painter.browser.act(crate::keymap::Action::Cut);
+        let after_cut = painter.painted_rows(size);
+
+        assert_ne!(
+            resting, after_cut,
+            "a pending cut must be visible in the listing"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A copy is not going anywhere, so dimming it would promise a move that
+    /// never comes.
+    #[test]
+    fn a_copied_entry_is_not_dimmed() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("copy-paint");
+        painter.browser.act(crate::keymap::Action::List(
+            widget::ListCommand::Move(widget::Direction::Down),
+        ));
+        painter.browser.act(crate::keymap::Action::Copy);
+        let after_copy = painter.painted_rows(size);
+
+        painter.browser.act(crate::keymap::Action::Cut);
+        let after_cut = painter.painted_rows(size);
+
+        assert_ne!(
+            after_copy, after_cut,
+            "only a cut may dim its entries, never a copy"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

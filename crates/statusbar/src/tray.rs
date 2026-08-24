@@ -6,6 +6,7 @@
 //! `NeedsAttention` state, independently of a Wayland window's urgency bit.
 
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
 use dbus::{DbusConn, NameOwnerChanged, Value};
 
@@ -94,6 +95,21 @@ impl PendingTrayItem {
     }
 }
 
+/// Why one watcher session over one bus connection ended.
+///
+/// The distinction drives [`TrayWatcher::run`]'s supervision: a taken name
+/// means another bar is the session's rightful watcher (stop for good),
+/// while a lost/failed connection means this bar is still responsible and
+/// must reconnect. The old loop conflated the two -- any receive error
+/// (one malformed frame off the wide-open `PropertiesChanged` subscription,
+/// one bus disconnect) permanently killed the thread, released the watcher
+/// name, and left the bar painting its last tray snapshot forever: the
+/// "first state loads, never updates again" freeze.
+enum ServeEnd {
+    NameTaken,
+    BusLost,
+}
+
 /// Owns the long-lived `StatusNotifier` watcher loop on a dedicated thread.
 ///
 /// The bar's normal worker may block briefly for sensor reads; a tray watcher
@@ -111,7 +127,25 @@ impl TrayWatcher {
             .spawn(move || Self::run(&snapshot_tx, &wake));
     }
 
+    /// Supervise watcher sessions for the thread's whole life. Each session
+    /// owns one bus connection; when that connection fails, the stale tray
+    /// is cleared from the bar (truth over a frozen icon), then a fresh
+    /// session reconnects and re-claims the name after a short delay.
     fn run(snapshot_tx: &Sender<TraySnapshot>, wake: &waker::Waker) {
+        const RETRY_DELAY: Duration = Duration::from_secs(2);
+        loop {
+            match Self::serve(snapshot_tx, wake) {
+                ServeEnd::NameTaken => return,
+                ServeEnd::BusLost => {
+                    let _ = snapshot_tx.send(TraySnapshot::default());
+                    wake.signal();
+                    std::thread::sleep(RETRY_DELAY);
+                }
+            }
+        }
+    }
+
+    fn serve(snapshot_tx: &Sender<TraySnapshot>, wake: &waker::Waker) -> ServeEnd {
         // Report *why* the bus was unreachable. This used to print a bare
         // "no session D-Bus" line, which gave no hint that the usual cause
         // is a missing DBUS_SESSION_BUS_ADDRESS in the compositor's
@@ -119,19 +153,19 @@ impl TrayWatcher {
         let mut conn = match DbusConn::session() {
             Ok(conn) => conn,
             Err(e) => {
-                eprintln!("statusbar: session D-Bus unavailable ({e}); system tray disabled");
-                return;
+                eprintln!("statusbar: session D-Bus unavailable ({e}); retrying tray");
+                return ServeEnd::BusLost;
             }
         };
         match conn.request_name(WATCHER_NAME) {
             Ok(true) => {}
             Ok(false) => {
                 eprintln!("statusbar: another StatusNotifier watcher owns the tray");
-                return;
+                return ServeEnd::NameTaken;
             }
             Err(e) => {
                 eprintln!("statusbar: could not claim system tray watcher: {e}");
-                return;
+                return ServeEnd::BusLost;
             }
         }
         // Claiming the watcher name is only half of the StatusNotifier
@@ -142,11 +176,11 @@ impl TrayWatcher {
         // state transition, so already-running clients stayed unregistered.
         if let Err(e) = conn.send_signal(WATCHER_PATH, WATCHER_NAME, HOST_REGISTERED, &[]) {
             eprintln!("statusbar: could not announce tray host registration: {e}");
-            return;
+            return ServeEnd::BusLost;
         }
         if let Err(e) = conn.add_match("type='signal',interface='org.kde.StatusNotifierItem'") {
             eprintln!("statusbar: could not subscribe to tray item updates: {e}");
-            return;
+            return ServeEnd::BusLost;
         }
         // The StatusNotifierItem specification names `NewIcon`/`NewStatus`
         // signals, but Electron clients in practice also use the generic
@@ -158,7 +192,7 @@ impl TrayWatcher {
         if let Err(e) = conn.add_match("type='signal',interface='org.freedesktop.DBus.Properties'")
         {
             eprintln!("statusbar: could not subscribe to tray property updates: {e}");
-            return;
+            return ServeEnd::BusLost;
         }
         // Clients like Mattermost/Electron sometimes reconnect to the bus
         // (a fresh unique name) and re-register rather than reusing their
@@ -170,15 +204,18 @@ impl TrayWatcher {
             .add_match("type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged'")
         {
             eprintln!("statusbar: could not subscribe to tray owner changes: {e}");
-            return;
+            return ServeEnd::BusLost;
         }
 
         let mut items = Vec::new();
         let mut pending = Vec::new();
         loop {
-            let Ok(message) = conn.recv_message() else {
-                eprintln!("statusbar: system tray D-Bus connection closed");
-                return;
+            let message = match conn.recv_message() {
+                Ok(message) => message,
+                Err(e) => {
+                    eprintln!("statusbar: system tray D-Bus receive failed: {e:?}");
+                    return ServeEnd::BusLost;
+                }
             };
             let changed = if Self::is_watcher_property_get(&message) {
                 Self::reply_watcher_property(&mut conn, &message);
@@ -187,6 +224,9 @@ impl TrayWatcher {
                 Self::register(&mut conn, &message, &mut items, &mut pending)
             } else if let Some(lost) = Self::name_owner_lost(&message) {
                 Self::drop_items_for_lost_owner(&lost, &mut items, &mut pending)
+            } else if message.kind == dbus::message::MessageType::MethodCall {
+                Self::reject_unknown_call(&mut conn, &message);
+                false
             } else {
                 Self::refresh_changed_item(&mut conn, &message, &mut items, &mut pending)
             };
@@ -197,6 +237,31 @@ impl TrayWatcher {
                 wake.signal();
             }
         }
+    }
+
+    /// Answer any method call the watcher does not implement with a proper
+    /// `UnknownMethod` error. Leaving a call unanswered stalls the caller
+    /// until its own timeout (libappindicator clients call `GetAll` and
+    /// `RegisterStatusNotifierHost`, which this watcher never handled), and
+    /// such a call previously fell through into `refresh_changed_item`,
+    /// which silently dropped it.
+    fn reject_unknown_call(conn: &mut DbusConn, message: &dbus::message::Reply) {
+        let Some(sender) = message.sender.as_deref() else {
+            return;
+        };
+        if message.path.as_deref() == Some(WATCHER_PATH)
+            && message.interface.as_deref() == Some(WATCHER_NAME)
+            && message.member.as_deref() == Some("RegisterStatusNotifierHost")
+        {
+            let _ = conn.send_method_return(sender, message.serial, &[]);
+            return;
+        }
+        let _ = conn.send_error(
+            sender,
+            message.serial,
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            "not implemented by this StatusNotifier watcher",
+        );
     }
 
     fn is_item_registration(message: &dbus::message::Reply) -> bool {
@@ -269,6 +334,13 @@ impl TrayWatcher {
         };
         if let Some(value) = value {
             let _ = conn.send_method_return(sender, message.serial, &[value]);
+        } else {
+            let _ = conn.send_error(
+                sender,
+                message.serial,
+                "org.freedesktop.DBus.Error.UnknownProperty",
+                "not a StatusNotifierWatcher property",
+            );
         }
     }
 

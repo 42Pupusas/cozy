@@ -765,6 +765,60 @@ impl SeatCapability {
     }
 }
 
+/// A `wl_data_device_manager.dnd_action` bit: what a drag-and-drop gesture
+/// will do to the dragged data.
+///
+/// # Why a drag must name one
+///
+/// The compositor matches the source's action mask against the
+/// destination's and delivers the intersection. A source that offers no
+/// action intersects to nothing, and a compositor then withholds
+/// `wl_data_device.drop` from a v3 destination entirely: the target paints
+/// its "drop here" affordance from `enter`, then receives nothing when the
+/// button is released. So the mask is not an optional refinement -- without
+/// it a drag is silently undeliverable to every modern toolkit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum DndAction {
+    None = 0,
+    Copy = 1,
+    Move = 2,
+    Ask = 4,
+}
+
+impl DndAction {
+    /// The `wl_data_device_manager` version that added `set_actions`,
+    /// `accept`'s binding result, and `finish`. Below it none of those
+    /// requests exist and sending one is a protocol error.
+    pub const SINCE_VERSION: u32 = 3;
+
+    /// This action as a one-bit mask, for building a mask up.
+    #[must_use]
+    pub const fn mask(self) -> u32 {
+        self as u32
+    }
+
+    /// Whether `bitmask` includes this action. [`Self::None`] is the empty
+    /// bit pattern, so it is never "in" any mask.
+    #[must_use]
+    pub const fn in_mask(self, bitmask: u32) -> bool {
+        bitmask & (self as u32) != 0
+    }
+
+    /// Decode the single action a compositor selected (`wl_data_offer.action`
+    /// / `wl_data_source.action`). The protocol guarantees at most one bit,
+    /// so anything else decodes to [`Self::None`] rather than guessing.
+    #[must_use]
+    pub const fn from_selected(bitmask: u32) -> Self {
+        match bitmask {
+            1 => Self::Copy,
+            2 => Self::Move,
+            4 => Self::Ask,
+            _ => Self::None,
+        }
+    }
+}
+
 /// Keyboard modifier state, decoded from `wl_keyboard.modifiers`.
 ///
 /// The depressed/latched/locked fields are bitmasks of the XKB modifier
@@ -874,8 +928,14 @@ pub const WL_OUTPUT: Interface = Interface {
 };
 pub const WL_DATA_DEVICE_MANAGER: Interface = Interface {
     name: "wl_data_device_manager",
-    // v1 has create_data_source/get_data_device — all plain clipboard needs.
-    version: 1,
+    // v3 is the minimum a *drag* works at, even though v1 covers the whole
+    // clipboard. From v3 the compositor negotiates a `dnd_action` between
+    // source and destination, and it withholds `wl_data_device.drop` from a
+    // v3 destination when that negotiation selected nothing. Binding v1
+    // leaves us unable to send `wl_data_source.set_actions` at all, so every
+    // drag into a modern toolkit shows its "drop here" affordance and then
+    // delivers nothing on release. See `DndAction`.
+    version: 3,
 };
 pub const XDG_ACTIVATION_V1: Interface = Interface {
     name: "xdg_activation_v1",

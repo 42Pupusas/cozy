@@ -32,6 +32,12 @@ pub enum Focus {
     List,
     /// The filter box. Letters type.
     Filter,
+    /// The inline rename box over a row. Letters type, and -- unlike the
+    /// filter -- the list keeps *none* of the navigation keys: an arrow key
+    /// must move the caret within the name, and moving the selection out
+    /// from under an open rename box would leave it editing a row the user
+    /// is no longer looking at.
+    Rename,
 }
 
 /// What a key press asked the application to do.
@@ -62,6 +68,22 @@ pub enum Action {
     ToggleFavorite,
     /// Show or hide the places sidebar.
     ToggleSidebar,
+    /// Put the selection on the clipboard to be duplicated (Ctrl-C).
+    Copy,
+    /// Put the selection on the clipboard to be relocated (Ctrl-X).
+    Cut,
+    /// Transfer the clipboard's contents into the open directory (Ctrl-V).
+    Paste,
+    /// Move the selection to the trash, where it can be recovered.
+    Trash,
+    /// Erase the selection outright, bypassing the trash (Shift-Delete).
+    DeletePermanently,
+    /// Open the inline rename box over the cursor row (F2).
+    BeginRename,
+    /// Apply the name typed into the rename box.
+    CommitRename,
+    /// Abandon the rename, keeping the original name.
+    CancelRename,
     /// Close the window.
     Quit,
 }
@@ -120,6 +142,13 @@ impl Keymap {
         matches!(self.focus, Focus::Filter)
     }
 
+    /// Whether the inline rename box is active.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const fn is_renaming(self) -> bool {
+        matches!(self.focus, Focus::Rename)
+    }
+
     /// Move focus.
     pub const fn set_focus(&mut self, focus: Focus) {
         self.focus = focus;
@@ -131,6 +160,7 @@ impl Keymap {
         match self.focus {
             Focus::List => Self::in_list(press),
             Focus::Filter => Self::in_filter(press),
+            Focus::Rename => Self::in_rename(press),
         }
     }
 
@@ -152,12 +182,21 @@ impl Keymap {
                 Key::Char('b' | 'B') => Some(Action::ToggleSidebar),
                 Key::Char('r' | 'R') => Some(Action::Refresh),
                 Key::Char('l' | 'L') => Some(Action::BeginFilter),
+                Key::Char('c' | 'C') => Some(Action::Copy),
+                Key::Char('x' | 'X') => Some(Action::Cut),
+                Key::Char('v' | 'V') => Some(Action::Paste),
                 Key::Char('q' | 'Q') => Some(Action::Quit),
                 _ => None,
             };
         }
 
         match press.key {
+            // Shift-Delete bypasses the trash, as it does in every desktop
+            // file manager. Checked before the plain Delete below, or the
+            // recoverable path would swallow both.
+            Key::Delete if shift => Some(Action::DeletePermanently),
+            Key::Delete => Some(Action::Trash),
+            Key::Function(2) => Some(Action::BeginRename),
             Key::Up if shift => Some(Action::List(ListCommand::Extend(Direction::Up))),
             Key::Down if shift => Some(Action::List(ListCommand::Extend(Direction::Down))),
             Key::Up => Some(Action::List(ListCommand::Move(Direction::Up))),
@@ -216,6 +255,42 @@ impl Keymap {
             Key::Enter => Some(Action::List(ListCommand::Activate)),
             Key::Escape => Some(Action::CancelFilter),
             Key::Tab => Some(Action::EndFilter),
+            Key::Backspace => Some(Action::Edit(EditAction::Backspace)),
+            Key::Delete => Some(Action::Edit(EditAction::Delete)),
+            Key::Left => Some(Action::Edit(EditAction::Left)),
+            Key::Right => Some(Action::Edit(EditAction::Right)),
+            Key::Home => Some(Action::Edit(EditAction::Home)),
+            Key::End => Some(Action::Edit(EditAction::End)),
+            Key::Char(c) => Some(Action::Insert(c)),
+            _ => None,
+        }
+    }
+
+    /// Bindings while the inline rename box has focus.
+    ///
+    /// The box is modal in a way the filter is not: it is editing one
+    /// specific row's name, so *every* key either edits that name or ends
+    /// the rename. Nothing reaches the list -- an arrow key moves the caret,
+    /// and Ctrl-C/X/V would be a text-clipboard operation the field cannot
+    /// perform, so they are deliberately inert rather than silently
+    /// operating on the file selection behind the box.
+    const fn in_rename(press: KeyPress) -> Option<Action> {
+        if press.modifiers.ctrl() {
+            return match press.key {
+                Key::Char('a' | 'A') => Some(Action::Edit(EditAction::Home)),
+                Key::Char('e' | 'E') => Some(Action::Edit(EditAction::End)),
+                Key::Char('k' | 'K') => Some(Action::Edit(EditAction::KillToEnd)),
+                Key::Char('u' | 'U') => Some(Action::Edit(EditAction::KillToStart)),
+                Key::Char('w' | 'W') => Some(Action::Edit(EditAction::DeleteWordLeft)),
+                Key::Left => Some(Action::Edit(EditAction::WordLeft)),
+                Key::Right => Some(Action::Edit(EditAction::WordRight)),
+                _ => None,
+            };
+        }
+
+        match press.key {
+            Key::Enter => Some(Action::CommitRename),
+            Key::Escape => Some(Action::CancelRename),
             Key::Backspace => Some(Action::Edit(EditAction::Backspace)),
             Key::Delete => Some(Action::Edit(EditAction::Delete)),
             Key::Left => Some(Action::Edit(EditAction::Left)),
@@ -547,5 +622,175 @@ mod tests {
             filter_map().translate(with_mods(Key::Char('q'), CTRL)),
             Some(Action::Quit)
         );
+    }
+
+    fn rename_map() -> Keymap {
+        let mut map = Keymap::new();
+        map.set_focus(Focus::Rename);
+        map
+    }
+
+    /// The three bindings every user already has in their fingers.
+    #[test]
+    fn the_clipboard_verbs_are_bound_on_the_list() {
+        let map = list_map();
+        assert_eq!(
+            map.translate(with_mods(Key::Char('c'), CTRL)),
+            Some(Action::Copy)
+        );
+        assert_eq!(
+            map.translate(with_mods(Key::Char('x'), CTRL)),
+            Some(Action::Cut)
+        );
+        assert_eq!(
+            map.translate(with_mods(Key::Char('v'), CTRL)),
+            Some(Action::Paste)
+        );
+    }
+
+    /// Capitals must work too: a user with Caps Lock on still means copy.
+    #[test]
+    fn the_clipboard_verbs_are_case_insensitive() {
+        let map = list_map();
+        assert_eq!(
+            map.translate(with_mods(Key::Char('C'), CTRL)),
+            Some(Action::Copy)
+        );
+        assert_eq!(
+            map.translate(with_mods(Key::Char('X'), CTRL)),
+            Some(Action::Cut)
+        );
+        assert_eq!(
+            map.translate(with_mods(Key::Char('V'), CTRL)),
+            Some(Action::Paste)
+        );
+    }
+
+    /// Without Ctrl these are ordinary letters that must still filter, or
+    /// searching for "cv.pdf" would cut and paste instead.
+    #[test]
+    fn the_bare_clipboard_letters_still_filter() {
+        let map = list_map();
+        for ch in ['c', 'x', 'v'] {
+            assert_eq!(
+                map.translate(press(Key::Char(ch))),
+                Some(Action::Insert(ch)),
+                "a bare {ch} must type"
+            );
+        }
+    }
+
+    /// The recoverable delete is the unmodified one; Shift is what makes it
+    /// permanent. Getting this backwards would be unrecoverable data loss.
+    #[test]
+    fn delete_trashes_but_shift_delete_erases() {
+        let map = list_map();
+        assert_eq!(map.translate(press(Key::Delete)), Some(Action::Trash));
+        assert_eq!(
+            map.translate(with_mods(Key::Delete, SHIFT)),
+            Some(Action::DeletePermanently)
+        );
+    }
+
+    #[test]
+    fn f2_opens_the_rename_box() {
+        assert_eq!(
+            list_map().translate(press(Key::Function(2))),
+            Some(Action::BeginRename)
+        );
+    }
+
+    #[test]
+    fn enter_commits_and_escape_cancels_a_rename() {
+        let map = rename_map();
+        assert!(map.is_renaming());
+        assert_eq!(map.translate(press(Key::Enter)), Some(Action::CommitRename));
+        assert_eq!(
+            map.translate(press(Key::Escape)),
+            Some(Action::CancelRename)
+        );
+    }
+
+    #[test]
+    fn letters_type_into_the_rename_box() {
+        let map = rename_map();
+        assert_eq!(
+            map.translate(press(Key::Char('z'))),
+            Some(Action::Insert('z'))
+        );
+    }
+
+    /// The rename box is editing one row's name. An arrow that moved the
+    /// selection would leave the box floating over a different file.
+    #[test]
+    fn arrows_move_the_caret_in_a_rename_rather_than_the_selection() {
+        let map = rename_map();
+        assert_eq!(
+            map.translate(press(Key::Left)),
+            Some(Action::Edit(EditAction::Left))
+        );
+        assert_eq!(
+            map.translate(press(Key::Right)),
+            Some(Action::Edit(EditAction::Right))
+        );
+        assert_eq!(
+            map.translate(press(Key::Up)),
+            None,
+            "vertical movement must not escape the rename box"
+        );
+        assert_eq!(map.translate(press(Key::Down)), None);
+    }
+
+    /// Delete inside a rename edits the text. If it fell through to the list
+    /// binding it would trash the file being renamed.
+    #[test]
+    fn delete_edits_the_name_rather_than_trashing_the_file() {
+        assert_eq!(
+            rename_map().translate(press(Key::Delete)),
+            Some(Action::Edit(EditAction::Delete))
+        );
+        assert_eq!(
+            rename_map().translate(with_mods(Key::Delete, SHIFT)),
+            Some(Action::Edit(EditAction::Delete)),
+            "shift-delete must not erase the file from inside a rename box"
+        );
+    }
+
+    /// Likewise Ctrl-X in a rename must not cut the file behind the box.
+    #[test]
+    fn the_file_clipboard_verbs_do_not_reach_through_a_rename_box() {
+        let map = rename_map();
+        assert_eq!(map.translate(with_mods(Key::Char('c'), CTRL)), None);
+        assert_eq!(map.translate(with_mods(Key::Char('x'), CTRL)), None);
+        assert_eq!(map.translate(with_mods(Key::Char('v'), CTRL)), None);
+    }
+
+    /// Nor may Delete in the *filter* box trash a file -- the same class of
+    /// bug, in the mode that already existed.
+    #[test]
+    fn delete_in_the_filter_box_edits_text_rather_than_trashing() {
+        assert_eq!(
+            filter_map().translate(press(Key::Delete)),
+            Some(Action::Edit(EditAction::Delete))
+        );
+    }
+
+    /// Readline motions are muscle memory in any text field.
+    #[test]
+    fn the_readline_motions_work_in_a_rename_box_too() {
+        let map = rename_map();
+        for (ch, expected) in [
+            ('a', EditAction::Home),
+            ('e', EditAction::End),
+            ('k', EditAction::KillToEnd),
+            ('u', EditAction::KillToStart),
+            ('w', EditAction::DeleteWordLeft),
+        ] {
+            assert_eq!(
+                map.translate(with_mods(Key::Char(ch), CTRL)),
+                Some(Action::Edit(expected)),
+                "ctrl-{ch}"
+            );
+        }
     }
 }

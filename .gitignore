@@ -1,3 +1,12 @@
 /target
 a.out
 *.o
+
+# Packed 1-bit clips built by `video-prepare`. Derived artefacts, and a
+# five-minute pack is tens of megabytes.
+*.mfp
+
+# Source video for the video-stress harness. The tool reads any file ffmpeg
+# can decode via `--input`, so the clip is the user's own choice rather than
+# something the repository has to carry. See examples/video-stress/README.md.
+/assets/

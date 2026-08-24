@@ -35,6 +35,8 @@ pub enum Target {
     Back,
     /// The forward chevron.
     Forward,
+    /// The dotfile visibility toggle.
+    ToggleHidden,
     /// The filter box -- clicking it focuses it.
     Filter,
     /// The list segment of the view toggle.
@@ -107,10 +109,36 @@ impl Toolbar {
         Some(Rect::new(x, self.centered_y(size), size, size))
     }
 
-    /// Where the breadcrumb path may start: after the navigation buttons.
+    /// The dotfile visibility toggle, or `None` if it would not fit.
+    ///
+    /// Set apart from the chevron pair by a gap rather than drawn flush with
+    /// it. The chevrons are *actions* that move you somewhere; this is a
+    /// *state* that changes what you are looking at. Making three buttons
+    /// share one outline would claim they are the same kind of thing, and the
+    /// user would reasonably expect the third to navigate too.
+    #[must_use]
+    pub fn hidden_toggle(&self) -> Option<Rect> {
+        let size = self.spacing.icon_button();
+        let x = self.bar.x + self.spacing.toolbar_pad() + size * 2 + self.spacing.s();
+        if x + size > self.bar.right() {
+            return None;
+        }
+        Some(Rect::new(x, self.centered_y(size), size, size))
+    }
+
+    /// Where the breadcrumb path may start: after the left-hand buttons.
+    ///
+    /// Reserves the toggle's width whether or not the toggle is drawn. The
+    /// path must not slide left the instant the window narrows past the
+    /// toggle's threshold -- and reserving unconditionally also keeps this
+    /// free of the mutual recursion it would otherwise have with the
+    /// right-hand controls, which test their own fit against this number.
     #[must_use]
     pub fn breadcrumb_x(&self) -> i32 {
-        self.bar.x + self.spacing.toolbar_pad() + self.spacing.icon_button() * 2 + self.spacing.s()
+        self.bar.x
+            + self.spacing.toolbar_pad()
+            + self.spacing.icon_button() * 3
+            + self.spacing.s() * 2
     }
 
     /// How many pixels the breadcrumb may occupy before it would collide with
@@ -206,6 +234,7 @@ impl Toolbar {
         let candidates = [
             (self.back(), Target::Back),
             (self.forward(), Target::Forward),
+            (self.hidden_toggle(), Target::ToggleHidden),
             (self.filter(), Target::Filter),
             (self.view_segment(0), Target::ViewList),
             (self.view_segment(1), Target::ViewGrid),
@@ -262,6 +291,7 @@ mod tests {
         for rect in [
             bar.back().expect("back"),
             bar.forward().expect("forward"),
+            bar.hidden_toggle().expect("hidden"),
             bar.filter().expect("filter"),
             bar.view_toggle().expect("toggle"),
         ] {
@@ -284,6 +314,7 @@ mod tests {
             let rects = [
                 bar.back().expect("back"),
                 bar.forward().expect("forward"),
+                bar.hidden_toggle().expect("hidden"),
                 bar.filter().expect("filter"),
                 bar.view_toggle().expect("toggle"),
             ];
@@ -338,6 +369,39 @@ mod tests {
             bar.breadcrumb_x() >= bar.forward().expect("forward").right(),
             "the path must not be drawn over the navigation buttons"
         );
+        assert!(
+            bar.breadcrumb_x() >= bar.hidden_toggle().expect("hidden").right(),
+            "nor over the hidden-files toggle"
+        );
+    }
+
+    /// The chevrons act; the toggle changes what is shown. A gap says so.
+    #[test]
+    fn the_hidden_toggle_is_set_apart_from_the_chevron_pair() {
+        let bar = toolbar_of(1200, false);
+        let forward = bar.forward().expect("forward");
+        let hidden = bar.hidden_toggle().expect("hidden");
+        assert!(
+            hidden.x > forward.right(),
+            "a state control must not read as a third chevron"
+        );
+        assert_eq!(hidden.w, forward.w, "but it is the same size button");
+        assert_eq!(hidden.y, forward.y, "and sits on the same baseline");
+    }
+
+    #[test]
+    fn a_click_on_the_hidden_toggle_reports_it() {
+        let bar = toolbar_of(1200, false);
+        let (x, y) = centre(bar.hidden_toggle().expect("hidden"));
+        assert_eq!(bar.hit(x, y), Some(Target::ToggleHidden));
+    }
+
+    /// Toggling dotfiles does not move any control, so the button cannot
+    /// slide out from under the pointer that is repeatedly clicking it.
+    #[test]
+    fn the_layout_does_not_depend_on_the_hidden_state() {
+        let bar = toolbar_of(1200, false);
+        assert_eq!(bar.hidden_toggle(), bar.hidden_toggle());
     }
 
     #[test]
@@ -446,6 +510,7 @@ mod tests {
         let bar = toolbar_of(240, false);
         assert!(bar.back().is_some(), "back must survive a narrow window");
         assert!(bar.forward().is_some(), "forward must survive too");
+        assert!(bar.hidden_toggle().is_some(), "and so must the toggle");
         assert!(bar.filter().is_none(), "the filter box has to go");
     }
 
@@ -453,6 +518,7 @@ mod tests {
     fn a_degenerate_toolbar_yields_no_controls_rather_than_negative_geometry() {
         let bar = toolbar_of(0, false);
         assert!(bar.back().is_none(), "nothing fits in a zero-width toolbar");
+        assert!(bar.hidden_toggle().is_none());
         assert!(bar.filter().is_none());
         assert!(bar.view_toggle().is_none());
         assert_eq!(bar.hit(0, 0), None, "and nothing can be clicked");
@@ -467,6 +533,7 @@ mod tests {
         for (rect, target) in [
             (bar.back().expect("back"), Target::Back),
             (bar.forward().expect("forward"), Target::Forward),
+            (bar.hidden_toggle().expect("hidden"), Target::ToggleHidden),
             (bar.filter().expect("filter"), Target::Filter),
             (bar.view_segment(0).expect("list"), Target::ViewList),
             (bar.view_segment(1).expect("grid"), Target::ViewGrid),

@@ -424,8 +424,13 @@ mod tests {
         use std::os::fd::FromRawFd;
         // memfd_create gives us a real fd backing real memory, exactly the
         // shape a `wl_keyboard.keymap` event's ancillary fd has.
+        //
+        // SAFETY: the name is a static NUL-terminated C string and the flags
+        // are zero, which is the call's documented minimal form.
         let raw = unsafe { memfd_create(c"xkb-test".as_ptr(), 0) };
         assert!(raw >= 0, "memfd_create failed");
+        // SAFETY: `raw` is a fresh, valid, unowned descriptor from the call
+        // above, checked non-negative, so ownership transfers exactly once.
         let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
         let mut file = std::fs::File::from(owned.try_clone().expect("dup memfd"));
         file.write_all(text.as_bytes()).unwrap();

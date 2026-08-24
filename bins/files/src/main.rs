@@ -16,8 +16,10 @@
 
 mod breadcrumb;
 mod browser;
+mod clipboard;
 mod columns;
 mod density;
+mod drag_badge;
 mod favorites;
 mod frame;
 mod headless;
@@ -28,6 +30,7 @@ mod kind_label;
 mod metric_overrides;
 mod moment;
 mod options;
+mod rename;
 mod row_format;
 mod sidebar;
 mod spacing;
@@ -195,7 +198,11 @@ impl App {
             // the painter here rather than through a callback -- exactly the
             // seam `start_drag` above needs in the other direction.
             painter.update_drag_hover(window.is_drag_over(), window.drag_position());
-            if window.is_drag_over() {
+            // The compositor holds the pointer grab for the whole gesture, so
+            // the release never reaches the painter. This is the only signal
+            // that the drag ended, and without it the badge never clears.
+            painter.update_drag_active(window.is_dragging());
+            if window.is_drag_over() || window.is_dragging() {
                 window.request_redraw();
             }
 

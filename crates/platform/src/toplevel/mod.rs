@@ -34,6 +34,8 @@
 pub mod activation;
 pub mod activation_report;
 pub mod drag;
+pub mod drag_offer;
+pub mod drag_source;
 pub mod geometry;
 pub mod globals;
 pub mod keyboard;
@@ -45,7 +47,9 @@ pub mod shell;
 pub mod window;
 
 pub use activation::{Activation, ActivationToken, LaunchEvidence, TOKEN_ENV};
-pub use drag::{DragController, Dropped};
+pub use drag::{DragController, Dropped, URI_LIST_MIME};
+pub use drag_offer::DragOffer;
+pub use drag_source::DragSource;
 pub use geometry::{Geometry, LogicalSize, PhysicalSize};
 pub use globals::{ToplevelGlobals, ToplevelGlobalsBuilder};
 pub use keyboard::{KeyPress, KeyboardState, RepeatInfo};

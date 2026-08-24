@@ -31,8 +31,10 @@ use fsmodel::reader::ReadError;
 use std::path::{Path, PathBuf};
 use widget::{GridPane, ListCommand, ListPane, Mods, PaneResponse, TextInput};
 
+use crate::clipboard::{FileClipboard, Transfer};
 use crate::history::{History, Trail};
 use crate::keymap::{Action, EditAction, Focus, Keymap};
+use crate::rename::Rename;
 
 /// Which presentation is active for the current directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -93,6 +95,24 @@ pub struct Browser {
     /// directory must not tear down the window, it must say so and leave the
     /// user where they were.
     error: Option<ReadError>,
+    /// Paths a Ctrl-C or Ctrl-X put aside, awaiting a paste.
+    clipboard: FileClipboard,
+    /// An explicit trash directory, overriding the user's home trash.
+    ///
+    /// `None` -- the only value in production -- resolves the home trash per
+    /// operation. The override exists so the tests below can prove that
+    /// Delete really trashes, without moving the developer's files into
+    /// their real desktop trash to do it.
+    trash: Option<fileops::Trash>,
+    /// The inline rename box, when F2 has opened one.
+    rename: Rename,
+    /// The outcome of the last file operation, shown in the status line.
+    ///
+    /// Separate from `error`, which describes the *directory* rather than an
+    /// action taken in it: a failed paste must not read as an unreadable
+    /// listing, and a successful one must not be silent -- moving twelve
+    /// files with no acknowledgement leaves the user unsure it happened.
+    notice: Option<String>,
 }
 
 impl Browser {
@@ -121,6 +141,10 @@ impl Browser {
             keymap: Keymap::new(),
             history: History::new(),
             error: None,
+            clipboard: FileClipboard::new(),
+            trash: None,
+            rename: Rename::new(),
+            notice: None,
         })
     }
 
@@ -185,6 +209,16 @@ impl Browser {
         let changed = !self.keymap.is_filtering();
         self.keymap.set_focus(Focus::Filter);
         Outcome::redraw_if(changed)
+    }
+
+    /// Whether dotfiles and dot-directories are currently listed.
+    ///
+    /// Read by the toolbar so its toggle can show the state it controls. A
+    /// toggle that does not report its own state is a button that appears to
+    /// do nothing every second press.
+    #[must_use]
+    pub const fn shows_hidden(&self) -> bool {
+        self.view.filter().show_hidden
     }
 
     /// Whether the back chevron should be live.
@@ -339,6 +373,12 @@ impl Browser {
         match action {
             Action::List(cmd) => self.list_command(cmd),
             Action::Insert(c) => {
+                // An open rename box takes the character; it is editing one
+                // file's name, and re-routing to the filter would rewrite
+                // the listing out from under it.
+                if let Some(input) = self.rename.input_mut() {
+                    return Outcome::redraw_if(input.insert(c));
+                }
                 // Typing on the list implicitly opens the filter, which is
                 // what makes search-as-you-type work with no prefix key.
                 self.keymap.set_focus(Focus::Filter);
@@ -346,6 +386,9 @@ impl Browser {
                     .or_redraw(self.keymap.is_filtering())
             }
             Action::Edit(edit) => {
+                if self.rename.is_active() {
+                    return Outcome::redraw_if(self.edit_rename(edit));
+                }
                 let changed = self.edit(edit);
                 if changed {
                     self.apply_query();
@@ -384,8 +427,296 @@ impl Browser {
             }
             Action::ToggleFavorite => Outcome::ToggleFavorite,
             Action::ToggleSidebar => Outcome::ToggleSidebar,
+            Action::Copy => self.copy_selection(),
+            Action::Cut => self.cut_selection(),
+            Action::Paste => self.paste(),
+            Action::Trash => self.trash_selection(),
+            Action::DeletePermanently => self.delete_selection(),
+            Action::BeginRename => self.begin_rename(),
+            Action::CommitRename => self.commit_rename(),
+            Action::CancelRename => self.cancel_rename(),
             Action::Quit => Outcome::Quit,
         }
+    }
+
+    /// The paths the user has selected, or the cursor row when the selection
+    /// is empty.
+    ///
+    /// The fallback is what makes the shortcuts feel right: arrowing to a
+    /// file and pressing Ctrl-C must copy it, without first requiring a
+    /// click or a Space to formally select it.
+    #[must_use]
+    pub fn selected_paths(&self) -> Vec<PathBuf> {
+        let selected = match self.view_mode {
+            ViewMode::List => self.pane.selection().selected(),
+            ViewMode::Grid => self.grid.selection().selected(),
+        };
+        if selected.is_empty() {
+            return self
+                .cursor_entry()
+                .map(|e| vec![e.path.clone()])
+                .unwrap_or_default();
+        }
+        selected
+            .iter()
+            .filter_map(|&row| self.entry(row))
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
+    /// The file clipboard, for painting cut entries dimmed.
+    #[must_use]
+    pub const fn clipboard(&self) -> &FileClipboard {
+        &self.clipboard
+    }
+
+    /// Send trashed files to `trash` instead of the user's home trash.
+    ///
+    /// Test-only: the production path resolves the home trash per operation.
+    #[cfg(test)]
+    pub fn set_trash(&mut self, trash: fileops::Trash) {
+        self.trash = Some(trash);
+    }
+
+    /// The inline rename box, for painting.
+    #[must_use]
+    pub const fn rename(&self) -> &Rename {
+        &self.rename
+    }
+
+    /// Whether an inline rename is open.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const fn is_renaming(&self) -> bool {
+        self.keymap.is_renaming()
+    }
+
+    /// The last file operation's result, for the status line.
+    #[must_use]
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
+    }
+
+    fn copy_selection(&mut self) -> Outcome {
+        let paths = self.selected_paths();
+        let count = paths.len();
+        self.clipboard.copy(paths);
+        self.notice = (count > 0).then(|| Self::describe(count, "copied"));
+        Outcome::redraw_if(count > 0)
+    }
+
+    fn cut_selection(&mut self) -> Outcome {
+        let paths = self.selected_paths();
+        let count = paths.len();
+        self.clipboard.cut(paths);
+        self.notice = (count > 0).then(|| Self::describe(count, "cut"));
+        Outcome::redraw_if(count > 0)
+    }
+
+    /// Transfer the clipboard's contents into the open directory.
+    ///
+    /// Conflicts are auto-renamed (`report (1).pdf`) rather than overwriting:
+    /// a paste must never destroy a file the user did not name. A source that
+    /// is already in this directory is skipped for a *move* -- it is already
+    /// where it was asked to go -- but honoured for a *copy*, which is how
+    /// "duplicate this file" is expressed.
+    fn paste(&mut self) -> Outcome {
+        let Some(pending) = self.clipboard.take_for_paste() else {
+            return Outcome::Ignored;
+        };
+        let target = self.view.path().to_path_buf();
+        let transfer = fileops::Transfer::new(
+            fileops::ConflictResolver::new(fileops::ConflictPolicy::Rename),
+            fileops::Progress::new(),
+        );
+        let mut done = 0usize;
+        let mut failed = 0usize;
+        for source in &pending.paths {
+            let moving = pending.transfer == Transfer::Move;
+            if moving && source.parent() == Some(target.as_path()) {
+                continue;
+            }
+            let result = if moving {
+                transfer.move_into(source, &target)
+            } else {
+                transfer.copy_into(source, &target)
+            };
+            match result {
+                Ok(_) => done += 1,
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("files: could not paste {}: {e}", source.display());
+                }
+            }
+        }
+        let verb = if pending.transfer == Transfer::Move {
+            "moved"
+        } else {
+            "copied"
+        };
+        self.notice = Some(Self::report(done, failed, verb));
+        if done > 0 {
+            self.refresh()
+        } else {
+            Outcome::Redraw
+        }
+    }
+
+    /// Move the selection to the trash, from which it can be restored.
+    ///
+    /// A session with no `HOME` has nowhere to put it; that is reported
+    /// rather than silently falling back to a permanent delete, which would
+    /// turn a recoverable action into an unrecoverable one.
+    fn trash_selection(&mut self) -> Outcome {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return Outcome::Ignored;
+        }
+        let trash = match self.trash.clone().map_or_else(fileops::Trash::home, Ok) {
+            Ok(trash) => trash,
+            Err(e) => {
+                self.notice = Some(format!("no trash available: {e}"));
+                return Outcome::Redraw;
+            }
+        };
+        let mut done = 0usize;
+        let mut failed = 0usize;
+        for path in &paths {
+            match trash.trash(path) {
+                Ok(_) => done += 1,
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("files: could not trash {}: {e}", path.display());
+                }
+            }
+        }
+        self.after_removal(done, failed, "trashed")
+    }
+
+    /// Erase the selection outright. There is no undo for this, which is why
+    /// it is bound to Shift-Delete and never to Delete alone.
+    fn delete_selection(&mut self) -> Outcome {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return Outcome::Ignored;
+        }
+        let transfer = fileops::Transfer::new(
+            fileops::ConflictResolver::default(),
+            fileops::Progress::new(),
+        );
+        let mut done = 0usize;
+        let mut failed = 0usize;
+        for path in &paths {
+            match transfer.delete(path) {
+                Ok(()) => done += 1,
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("files: could not delete {}: {e}", path.display());
+                }
+            }
+        }
+        self.after_removal(done, failed, "deleted")
+    }
+
+    /// Shared tail of trash and delete: clear any clipboard entry naming a
+    /// path that no longer exists, report, and re-read the directory.
+    ///
+    /// The clipboard clear is the part that is easy to forget: pasting a cut
+    /// that was subsequently deleted would fail on every path, with an error
+    /// that names a file the user already knows is gone.
+    fn after_removal(&mut self, done: usize, failed: usize, verb: &str) -> Outcome {
+        if done > 0 {
+            self.clipboard.clear();
+        }
+        self.notice = Some(Self::report(done, failed, verb));
+        if done > 0 {
+            self.refresh()
+        } else {
+            Outcome::Redraw
+        }
+    }
+
+    /// Open the rename box over the cursor row.
+    fn begin_rename(&mut self) -> Outcome {
+        let Some((row, path)) = self.cursor_row_and_path() else {
+            return Outcome::Ignored;
+        };
+        if !self.rename.begin(&path, row) {
+            return Outcome::Ignored;
+        }
+        self.keymap.set_focus(Focus::Rename);
+        Outcome::Redraw
+    }
+
+    /// The cursor's row index and path together, for opening a rename.
+    fn cursor_row_and_path(&self) -> Option<(usize, PathBuf)> {
+        let row = match self.view_mode {
+            ViewMode::List => self.pane.cursor(),
+            ViewMode::Grid => self.grid.cursor(),
+        }?;
+        Some((row, self.entry(row)?.path.clone()))
+    }
+
+    /// Apply the typed name. An illegal name leaves the box open (see
+    /// [`Rename::commit`]) so it can be corrected rather than lost.
+    fn commit_rename(&mut self) -> Outcome {
+        let Some(renamed) = self.rename.commit() else {
+            // Either the name was refused -- box stays open -- or it was
+            // unchanged, which closes the box with nothing to do.
+            if self.rename.is_active() {
+                return Outcome::Redraw;
+            }
+            self.keymap.set_focus(Focus::List);
+            return Outcome::Redraw;
+        };
+        self.keymap.set_focus(Focus::List);
+        // Refuse to clobber: renaming onto an existing name would destroy it,
+        // and the user asked for a rename, not a replacement.
+        if std::fs::symlink_metadata(&renamed.to).is_ok() {
+            self.notice = Some(format!(
+                "{} already exists",
+                renamed.to.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            return Outcome::Redraw;
+        }
+        match std::fs::rename(&renamed.from, &renamed.to) {
+            Ok(()) => {
+                self.notice = None;
+                let outcome = self.refresh();
+                self.select_path(&renamed.to);
+                outcome
+            }
+            Err(e) => {
+                self.notice = Some(format!("could not rename: {e}"));
+                Outcome::Redraw
+            }
+        }
+    }
+
+    fn cancel_rename(&mut self) -> Outcome {
+        let was_active = self.rename.is_active();
+        self.rename.cancel();
+        self.keymap.set_focus(Focus::List);
+        Outcome::redraw_if(was_active)
+    }
+
+    /// "3 files copied", "1 file copied" -- pluralised, because "1 files"
+    /// reads as a bug to anyone who sees it.
+    fn describe(count: usize, verb: &str) -> String {
+        let noun = if count == 1 { "item" } else { "items" };
+        format!("{count} {noun} {verb}")
+    }
+
+    /// A report covering partial failure, which is the case that must not be
+    /// silent: eleven of twelve files moved is not a success.
+    fn report(done: usize, failed: usize, verb: &str) -> String {
+        if failed == 0 {
+            return Self::describe(done, verb);
+        }
+        if done == 0 {
+            return format!("could not {} {failed}", verb.trim_end_matches("ed"));
+        }
+        format!("{}, {failed} failed", Self::describe(done, verb))
     }
 
     /// Translate and apply a key press in one step.
@@ -393,6 +724,31 @@ impl Browser {
         self.keymap
             .translate(press)
             .map_or(Outcome::Ignored, |action| self.act(action))
+    }
+
+    /// Apply an edit to the open rename box, reporting whether it changed.
+    ///
+    /// A separate walk from [`Self::edit`] rather than a shared helper taking
+    /// `&mut TextInput`: the two fields are reached through different
+    /// borrows, and the duplication is one exhaustive match that the compiler
+    /// checks, not logic that can drift.
+    fn edit_rename(&mut self, edit: EditAction) -> bool {
+        let Some(input) = self.rename.input_mut() else {
+            return false;
+        };
+        match edit {
+            EditAction::Backspace => input.backspace(),
+            EditAction::Delete => input.delete(),
+            EditAction::Left => input.move_left(),
+            EditAction::Right => input.move_right(),
+            EditAction::WordLeft => input.move_word_left(),
+            EditAction::WordRight => input.move_word_right(),
+            EditAction::Home => input.move_home(),
+            EditAction::End => input.move_end(),
+            EditAction::KillToEnd => input.delete_to_end(),
+            EditAction::KillToStart => input.delete_to_start(),
+            EditAction::DeleteWordLeft => input.delete_word_left(),
+        }
     }
 
     /// Apply an edit to the filter box, reporting whether it changed.
@@ -497,6 +853,11 @@ impl Browser {
                 // window and look like a failed read.
                 self.filter.clear();
                 self.view.set_query("");
+                // A rename is scoped to the row it opened over, which no
+                // longer exists in the new listing; keeping the session would
+                // leave the box floating over an unrelated file.
+                self.rename.cancel();
+                self.notice = None;
                 self.keymap.set_focus(Focus::List);
                 self.pane.reset(self.view.visible_len());
                 self.grid.reset(self.view.visible_len());
@@ -590,6 +951,12 @@ impl Browser {
 
     /// A pointer press at pane-relative coordinates.
     pub fn press(&mut self, x: i32, y: i32, mods: Mods) -> Outcome {
+        // Clicking away from an open rename box commits it, the way every
+        // desktop field behaves. Leaving the box open would strand it over
+        // whichever row the click selected instead.
+        if self.rename.is_active() {
+            self.commit_rename();
+        }
         // A click anywhere in the list takes focus away from the filter box,
         // so the next letter typed is a shortcut again.
         self.keymap.set_focus(Focus::List);
@@ -703,6 +1070,359 @@ mod tests {
         for c in text.chars() {
             browser.act(Action::Insert(c));
         }
+    }
+
+    /// Point the browser's trash at a scratch directory, so a Delete in a
+    /// test never lands in the developer's real desktop trash.
+    fn with_scratch_trash(browser: &mut Browser, dir: &TempDir) {
+        let root = dir.path().join("scratch-trash");
+        browser.set_trash(fileops::Trash::at(fileops::TrashDir::at(root)));
+    }
+
+    /// Move the cursor onto the row named `name`.
+    fn cursor_to(browser: &mut Browser, name: &str) {
+        for _ in 0..browser.len() {
+            if browser.cursor_entry().is_some_and(|e| e.name == name) {
+                return;
+            }
+            down(browser);
+        }
+        assert!(
+            browser.cursor_entry().is_some_and(|e| e.name == name),
+            "{name} must be reachable in the listing"
+        );
+    }
+
+    /// Ctrl-C then Ctrl-V into another directory must leave the original
+    /// where it was and put a copy in the target.
+    #[test]
+    fn copying_then_pasting_duplicates_into_the_open_directory() {
+        let dir = TempDir::new("clip_copy_paste");
+        dir.create_file("note.txt", b"hello");
+        dir.create_dir("target");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Copy);
+
+        browser.go_to(&dir.path().join("target"));
+        browser.act(Action::Paste);
+
+        assert!(
+            dir.path().join("note.txt").exists(),
+            "a copy must leave the original in place"
+        );
+        let pasted = dir.path().join("target/note.txt");
+        assert!(pasted.exists(), "the copy must land in the open directory");
+        assert_eq!(std::fs::read(&pasted).expect("read"), b"hello");
+        assert_eq!(names(&browser), vec!["note.txt".to_string()]);
+    }
+
+    /// Ctrl-X then Ctrl-V must relocate: gone from the source, present in
+    /// the target.
+    #[test]
+    fn cutting_then_pasting_moves_the_file() {
+        let dir = TempDir::new("clip_cut_paste");
+        dir.create_file("note.txt", b"hello");
+        dir.create_dir("target");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Cut);
+
+        browser.go_to(&dir.path().join("target"));
+        browser.act(Action::Paste);
+
+        assert!(
+            !dir.path().join("note.txt").exists(),
+            "a cut must remove the original"
+        );
+        assert!(dir.path().join("target/note.txt").exists());
+    }
+
+    /// The files must not move until the paste happens -- a cut with no
+    /// paste has to leave the directory exactly as it was.
+    #[test]
+    fn cutting_alone_does_not_touch_the_filesystem() {
+        let dir = TempDir::new("clip_cut_only");
+        dir.create_file("note.txt", b"hello");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Cut);
+        assert!(
+            dir.path().join("note.txt").exists(),
+            "a cut is intent only until a paste lands"
+        );
+    }
+
+    /// Pasting a copy into the directory it came from is how "duplicate" is
+    /// expressed, and the conflict policy must rename rather than overwrite.
+    #[test]
+    fn pasting_a_copy_into_its_own_directory_makes_a_renamed_duplicate() {
+        let dir = TempDir::new("clip_duplicate");
+        dir.create_file("note.txt", b"hello");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Copy);
+        browser.act(Action::Paste);
+
+        assert!(dir.path().join("note.txt").exists(), "the original stays");
+        assert!(
+            dir.path().join("note (1).txt").exists(),
+            "the duplicate must be renamed, never overwrite the original"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("note.txt")).expect("read"),
+            b"hello",
+            "the original's contents must be untouched"
+        );
+    }
+
+    /// The destructive case this must never become: pasting over a file of
+    /// the same name has to keep both.
+    #[test]
+    fn pasting_over_an_existing_name_renames_instead_of_destroying_it() {
+        let dir = TempDir::new("clip_no_clobber");
+        dir.create_file("note.txt", b"source");
+        dir.create_dir("target");
+        dir.create_file("target/note.txt", b"precious");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Copy);
+
+        browser.go_to(&dir.path().join("target"));
+        browser.act(Action::Paste);
+
+        assert_eq!(
+            std::fs::read(dir.path().join("target/note.txt")).expect("read"),
+            b"precious",
+            "an existing file must never be overwritten by a paste"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("target/note (1).txt")).expect("read"),
+            b"source"
+        );
+    }
+
+    /// One Ctrl-C must feed several pastes; a cut must not.
+    #[test]
+    fn a_copy_can_be_pasted_twice_but_a_cut_cannot() {
+        let dir = TempDir::new("clip_repeat");
+        dir.create_file("note.txt", b"hello");
+        dir.create_dir("one");
+        dir.create_dir("two");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Copy);
+
+        browser.go_to(&dir.path().join("one"));
+        browser.act(Action::Paste);
+        browser.go_to(&dir.path().join("two"));
+        browser.act(Action::Paste);
+        assert!(dir.path().join("one/note.txt").exists());
+        assert!(dir.path().join("two/note.txt").exists());
+
+        browser.go_to(dir.path());
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Cut);
+        browser.go_to(&dir.path().join("one"));
+        assert_eq!(
+            browser.act(Action::Paste),
+            Outcome::Redraw,
+            "the first paste of a cut does the work"
+        );
+        browser.go_to(&dir.path().join("two"));
+        assert_eq!(
+            browser.act(Action::Paste),
+            Outcome::Ignored,
+            "a cut is consumed by its paste and must not run again"
+        );
+    }
+
+    #[test]
+    fn pasting_an_empty_clipboard_does_nothing() {
+        let dir = TempDir::new("clip_empty_paste");
+        dir.create_file("note.txt", b"hello");
+        let mut browser = open(&dir);
+        assert_eq!(browser.act(Action::Paste), Outcome::Ignored);
+        assert_eq!(names(&browser), vec!["note.txt".to_string()]);
+    }
+
+    /// With nothing explicitly selected, the verbs must act on the cursor
+    /// row -- otherwise Ctrl-C after arrowing to a file would do nothing.
+    #[test]
+    fn the_clipboard_verbs_fall_back_to_the_cursor_row() {
+        let dir = TempDir::new("clip_cursor_fallback");
+        dir.create_file("note.txt", b"hello");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "note.txt");
+        assert_eq!(
+            browser.selected_paths(),
+            vec![dir.path().join("note.txt")],
+            "an empty selection must fall back to the cursor"
+        );
+    }
+
+    /// Delete must be recoverable: the file leaves the listing and arrives
+    /// in the trash, rather than being erased.
+    #[test]
+    fn delete_moves_the_file_to_the_trash() {
+        let dir = TempDir::new("trash_delete");
+        dir.create_file("note.txt", b"hello");
+        let mut browser = open(&dir);
+        with_scratch_trash(&mut browser, &dir);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Trash);
+
+        assert!(
+            !dir.path().join("note.txt").exists(),
+            "the file must leave the directory"
+        );
+        let trashed = dir.path().join("scratch-trash/files/note.txt");
+        assert!(
+            trashed.exists(),
+            "the file must be recoverable from the trash"
+        );
+        assert_eq!(std::fs::read(&trashed).expect("read"), b"hello");
+    }
+
+    #[test]
+    fn shift_delete_erases_without_using_the_trash() {
+        let dir = TempDir::new("perm_delete");
+        dir.create_file("note.txt", b"hello");
+        let mut browser = open(&dir);
+        with_scratch_trash(&mut browser, &dir);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::DeletePermanently);
+
+        assert!(!dir.path().join("note.txt").exists());
+        assert!(
+            !dir.path().join("scratch-trash/files/note.txt").exists(),
+            "a permanent delete must not go through the trash"
+        );
+    }
+
+    /// Pasting a cut whose source was deleted in between would fail on every
+    /// path, so a removal clears the clipboard.
+    #[test]
+    fn deleting_a_cut_file_clears_the_clipboard() {
+        let dir = TempDir::new("cut_then_delete");
+        dir.create_file("note.txt", b"hello");
+        dir.create_dir("target");
+        let mut browser = open(&dir);
+        with_scratch_trash(&mut browser, &dir);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Cut);
+        cursor_to(&mut browser, "note.txt");
+        browser.act(Action::Trash);
+
+        browser.go_to(&dir.path().join("target"));
+        assert_eq!(
+            browser.act(Action::Paste),
+            Outcome::Ignored,
+            "a clipboard naming deleted files must not survive the delete"
+        );
+    }
+
+    #[test]
+    fn f2_renames_the_cursor_entry_on_disk() {
+        let dir = TempDir::new("rename_commit");
+        dir.create_file("old.txt", b"hello");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "old.txt");
+        browser.act(Action::BeginRename);
+        assert!(browser.is_renaming());
+
+        browser.act(Action::Edit(EditAction::KillToStart));
+        type_text(&mut browser, "new.txt");
+        browser.act(Action::CommitRename);
+
+        assert!(!browser.is_renaming(), "committing closes the box");
+        assert!(!dir.path().join("old.txt").exists());
+        let renamed = dir.path().join("new.txt");
+        assert!(renamed.exists());
+        assert_eq!(std::fs::read(&renamed).expect("read"), b"hello");
+        assert_eq!(names(&browser), vec!["new.txt".to_string()]);
+    }
+
+    /// Typing during a rename must edit the name, not the filter -- a filter
+    /// keystroke would re-length the list under the open box.
+    #[test]
+    fn typing_during_a_rename_edits_the_name_not_the_filter() {
+        let dir = TempDir::new("rename_typing");
+        dir.create_file("old.txt", b"hello");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "old.txt");
+        browser.act(Action::BeginRename);
+        type_text(&mut browser, "zz");
+
+        assert_eq!(
+            browser.rename().input().expect("open box").text(),
+            "old.txtzz"
+        );
+        assert!(
+            browser.filter().is_empty(),
+            "the filter must not receive keystrokes meant for the rename box"
+        );
+    }
+
+    #[test]
+    fn escape_cancels_a_rename_and_leaves_the_file_alone() {
+        let dir = TempDir::new("rename_cancel");
+        dir.create_file("old.txt", b"hello");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "old.txt");
+        browser.act(Action::BeginRename);
+        browser.act(Action::Edit(EditAction::KillToStart));
+        type_text(&mut browser, "new.txt");
+        browser.act(Action::CancelRename);
+
+        assert!(!browser.is_renaming());
+        assert!(
+            dir.path().join("old.txt").exists(),
+            "a cancelled rename must not touch the file"
+        );
+        assert!(!dir.path().join("new.txt").exists());
+    }
+
+    /// Renaming onto a name that already exists would destroy that file.
+    #[test]
+    fn a_rename_onto_an_existing_name_is_refused() {
+        let dir = TempDir::new("rename_clobber");
+        dir.create_file("old.txt", b"source");
+        dir.create_file("taken.txt", b"precious");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "old.txt");
+        browser.act(Action::BeginRename);
+        browser.act(Action::Edit(EditAction::KillToStart));
+        type_text(&mut browser, "taken.txt");
+        browser.act(Action::CommitRename);
+
+        assert_eq!(
+            std::fs::read(dir.path().join("taken.txt")).expect("read"),
+            b"precious",
+            "an existing file must never be clobbered by a rename"
+        );
+        assert!(dir.path().join("old.txt").exists());
+        assert!(browser.notice().is_some_and(|n| n.contains("exists")));
+    }
+
+    /// An illegal name must leave the box open so it can be fixed, rather
+    /// than silently discarding what was typed.
+    #[test]
+    fn committing_an_illegal_name_keeps_the_box_open() {
+        let dir = TempDir::new("rename_illegal");
+        dir.create_file("old.txt", b"hello");
+        let mut browser = open(&dir);
+        cursor_to(&mut browser, "old.txt");
+        browser.act(Action::BeginRename);
+        browser.act(Action::Edit(EditAction::KillToStart));
+        type_text(&mut browser, "sub/new.txt");
+        browser.act(Action::CommitRename);
+
+        assert!(
+            browser.is_renaming(),
+            "an illegal name must leave the box open"
+        );
+        assert!(dir.path().join("old.txt").exists());
     }
 
     #[test]

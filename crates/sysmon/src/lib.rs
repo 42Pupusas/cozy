@@ -1194,7 +1194,7 @@ impl DiskValue {
     /// formatted text, so it is safe on the monitor's 60 Hz sample path.
     fn read() -> f32 {
         diskstat::DiskStat::for_path(std::path::Path::new("/"))
-            .map_or(0.0, |stat| stat.percent_used())
+            .map_or(0.0, diskstat::DiskStat::percent_used)
     }
 }
 

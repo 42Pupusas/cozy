@@ -1,0 +1,34 @@
+[package]
+name    = "video-stress"
+version = "0.1.0"
+edition.workspace = true
+description = "Source-agnostic monochrome video playback stress harness for the workspace renderer"
+publish = false
+
+[dependencies]
+font            = { path = "../../crates/font" }
+headless-stress = { path = "../../crates/headless-stress" }
+platform        = { path = "../../crates/platform" }
+pty             = { path = "../../crates/pty" }
+quetzalcoatl    = { workspace = true }
+ququmatz        = { workspace = true }
+waker           = { path = "../../crates/waker" }
+
+[[bin]]
+name = "video-prepare"
+path = "src/bin/prepare.rs"
+
+[[bin]]
+name = "video-terminal"
+path = "src/bin/terminal.rs"
+
+[[bin]]
+name = "video-fontcheck"
+path = "src/bin/fontcheck.rs"
+
+[[bin]]
+name = "video-wallpaper"
+path = "src/bin/wallpaper/main.rs"
+
+[lints]
+workspace = true

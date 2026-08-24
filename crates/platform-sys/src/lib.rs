@@ -3,9 +3,11 @@
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap
 )]
-//! The thin layer of raw syscalls and libc FFI `crates/platform` cannot avoid.
+//! Raw syscalls and libc FFI.
 //!
-//! With `io_uring` (via `ququmatz`) carrying all socket I/O, what's left here is:
+//! This is the thin layer `crates/platform` cannot avoid. With `io_uring`
+//! (via `ququmatz`) carrying all socket I/O, what remains here is a short
+//! list:
 //!
 //! * **the shared-memory pixel buffer** — `memfd_create` / `ftruncate` / `mmap`.
 //!   `ququmatz` doesn't cover memfd, so this stays as direct libc FFI.
@@ -35,11 +37,11 @@ use std::fmt;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
-
-
-/// The write-bytes-then-close response shape shared by every Wayland
-/// `*_source.send` handler (clipboard, drag-and-drop, `data-control`).
-/// See the module doc for why this was pulled out of three call sites.
+/// The write-bytes-then-close response shape.
+///
+/// Every Wayland `*_source.send` handler shares it: clipboard,
+/// drag-and-drop, and `data-control`. See the module doc for why this was
+/// pulled out of three call sites.
 pub mod fd_io;
 pub use fd_io::OwnedFdExt;
 

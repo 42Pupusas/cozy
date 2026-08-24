@@ -475,6 +475,11 @@ impl Toplevel {
             self.handle_event(ev, painter)?;
         }
         self.pump_repeat(painter);
+        // A drop payload is read on a helper thread, so its completion is
+        // not tied to any compositor event -- draining only from the
+        // data-device dispatch would strand the last drop of a gesture
+        // until some unrelated event happened to arrive.
+        self.deliver_drops(painter);
         // Drain first, *then* observe: a reader that hit a protocol error
         // pushes the explaining event before exiting, and checking liveness
         // first would discard it and turn a diagnosable fault into a silent
@@ -597,7 +602,7 @@ impl Toplevel {
             && ev.is(src)
         {
             if let Some(src_ev) = ev.event::<crate::protocol::DataSourceEvent>() {
-                self.drag.on_source_event(src_ev);
+                self.drag.on_source_event(src_ev, ev.arg(0));
             }
             return true;
         }
@@ -613,7 +618,7 @@ impl Toplevel {
                     .wire_bytes()
                     .and_then(crate::wire::WireEvent::parse)
                     .map(|(mut wire, _)| wire.string());
-                self.drag.on_offer_event(offer_ev, mime);
+                self.drag.on_offer_event(offer_ev, mime, ev.arg(0));
             }
             return true;
         }
@@ -625,21 +630,27 @@ impl Toplevel {
     fn dispatch_data_device_event(&mut self, ev: &RawEvent, painter: &mut impl Painter) {
         use crate::protocol::DataDeviceEvent;
         match ev.event::<DataDeviceEvent>() {
+            Some(DataDeviceEvent::DataOffer) => self.drag.on_new_offer(ev.arg(0)),
             Some(DataDeviceEvent::Enter) => {
-                // `enter(serial, surface, x, y, id)` -- x/y are wl_fixed
-                // surface-local coordinates, the offer id is the last arg.
+                // `enter(serial, surface, x, y, id)` -- five words, one more
+                // than `RawEvent::Wire` inlines, so the offer id must be
+                // read back out of the full message bytes. Taking it from
+                // `arg(4)` yields a constant 0, i.e. "this drag has no
+                // source", and every incoming drop is silently discarded.
                 let at = ev.point(2, 3);
-                self.drag.on_enter(ev.arg(4), (at.x, at.y));
+                let (serial, offer) = Self::parse_data_device_enter(ev);
+                self.drag
+                    .on_enter(&self.window_tx, offer, serial, (at.x, at.y));
                 self.present.mark_dirty();
             }
             Some(DataDeviceEvent::Leave) => {
-                self.drag.on_leave();
+                self.drag.on_leave(&self.window_tx);
                 self.present.mark_dirty();
             }
             Some(DataDeviceEvent::Motion) => {
                 // `motion(time, x, y)`.
                 let at = ev.point(1, 2);
-                self.drag.on_motion((at.x, at.y));
+                self.drag.on_motion(&self.window_tx, (at.x, at.y));
                 self.present.mark_dirty();
             }
             Some(DataDeviceEvent::Drop) => {
@@ -648,11 +659,46 @@ impl Toplevel {
             }
             _ => {}
         }
+        self.deliver_drops(painter);
+    }
+
+    /// Read `wl_data_device.enter`'s `(serial, offer_id)` out of the raw
+    /// message. Both are plain words, but the event has five of them and
+    /// only the first four are inlined -- see [`crate::event::RawEvent`].
+    fn parse_data_device_enter(ev: &RawEvent) -> (u32, u32) {
+        let Some(bytes) = ev.wire_bytes() else {
+            return (ev.serial(0).raw(), 0);
+        };
+        let Some((mut wire, _)) = crate::wire::WireEvent::parse(bytes) else {
+            return (ev.serial(0).raw(), 0);
+        };
+        let serial = wire.u32();
+        // surface, x, y -- skipped to reach the offer id.
+        let _ = (wire.u32(), wire.u32(), wire.u32());
+        (serial, wire.u32())
+    }
+
+    /// Hand any completed drop payload to the painter, then conclude the
+    /// transfer.
+    ///
+    /// The `finish` is what makes the *source* see `dnd_finished` rather
+    /// than `cancelled`, so a peer that deletes moved files knows the move
+    /// succeeded. It is sent after the painter has acted, so a drop is never
+    /// reported complete before it has been.
+    fn deliver_drops(&mut self, painter: &mut impl Painter) {
         let mut dropped = Vec::new();
         self.drag.drain_drops(|d| dropped.push(d));
-        for d in dropped {
+        if dropped.is_empty() {
+            return;
+        }
+        // An empty payload still completes the transfer, but there is
+        // nothing for the painter to act on -- a peer that advertised files
+        // and then wrote none must not look like a drop of zero files.
+        for d in dropped.into_iter().filter(|d| !d.paths.is_empty()) {
             painter.on_files_dropped(d.paths, d.position);
         }
+        self.drag.finish_drop(&self.window_tx);
+        self.present.mark_dirty();
     }
 
     /// Route one `RawEvent::Fd` to whichever wait it satisfies: the XKB

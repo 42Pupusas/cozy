@@ -111,6 +111,34 @@ pub struct Theme {
     /// a fraction of it. Painting a fill with the full accent would drown the
     /// text sitting on top of it.
     pub accent_surface: Color,
+    /// Fill behind a floating panel -- the password modal's card.
+    ///
+    /// A *raised* surface, so it must sit further from the window background
+    /// than any chrome band does. The chrome recedes (see
+    /// [`Self::sidebar_bg`], which is derived by stepping *away* from the
+    /// foreground); a modal is the opposite, because it is in front of
+    /// everything rather than behind it. Painting a floating card in a
+    /// receding colour makes it read as a hole cut in the window.
+    pub panel_surface: Color,
+    /// The outline around a floating panel.
+    ///
+    /// A distinct role from [`Self::control_border`] because that one is
+    /// derived from the same value as the panel fill, which would make the
+    /// outline invisible on exactly the surface it is drawn on.
+    pub panel_border: Color,
+    /// What a modal scrim is made of.
+    ///
+    /// Black, on every palette, because dimming is dimming: a scrim states
+    /// that the window behind it is not accepting input, and the only colour
+    /// that darkens both a near-black and a near-white palette is black.
+    ///
+    /// Emphatically *not* the window background. Blending a colour over
+    /// itself is a no-op, so a background-coloured scrim leaves the list
+    /// exactly as it was and *lightens* the darker chrome bands -- the
+    /// opposite of dimming, and invisible to any test that only asks whether
+    /// pixels changed.
+    pub panel_scrim: Color,
+
     /// Text and glyphs for a control that exists but cannot be used yet.
     ///
     /// A distinct role from [`Self::muted`], which means "subordinate but
@@ -194,6 +222,11 @@ impl Default for Theme {
             focus_ring: Color::rgb(0x89, 0xb4, 0xfa),
             accent: Color::rgb(0x89, 0xb4, 0xfa),
             accent_surface: Color::rgb(0x31, 0x32, 0x44),
+            // Lifted off the window background, not dropped below it: the
+            // card floats in front of the list.
+            panel_surface: Color::rgb(0x2a, 0x2a, 0x3c),
+            panel_border: Color::rgb(0x45, 0x47, 0x5a),
+            panel_scrim: Color::rgb(0x00, 0x00, 0x00),
             // Between the background and muted: readable as a shape, clearly
             // not as live text.
             disabled: Color::rgb(0x4a, 0x4d, 0x60),
@@ -234,6 +267,25 @@ impl Theme {
     /// to stay put. Comfortably ahead of [`Self::HOVER_WASH`] so a selected
     /// row still reads as selected while the pointer is over it.
     const SELECTION_WASH: f32 = 0.30;
+
+    /// How far the modal card is lifted from the window background toward
+    /// the text colour.
+    ///
+    /// Above [`Self::files_filter_bg`]'s 0.13 so the reply field, which uses
+    /// that value, still reads as an inset well within the card. Below the
+    /// selection wash so the card stays a surface rather than becoming the
+    /// brightest thing on screen -- the prompt text is what should draw the
+    /// eye, not the box around it.
+    ///
+    /// [`Self::files_filter_bg`]: config::Config::files_filter_bg
+    const PANEL_LIFT: f32 = 0.20;
+
+    /// The card's outline, lifted further still so it reads as an edge.
+    ///
+    /// A floating panel needs a visible boundary in a way a chrome band does
+    /// not: the band is bounded by the window, while the card's edge is the
+    /// only thing separating it from the dimmed list behind it.
+    const PANEL_BORDER_LIFT: f32 = 0.34;
 
     /// How far from the sidebar's background toward its *active* fill a hovered
     /// place sits.
@@ -365,6 +417,28 @@ impl Theme {
             // sidebar roles: a re-themed palette should carry the accent's
             // backing wash with it instead of stranding a stale colour.
             accent_surface: cfg.files_filter_bg().into(),
+
+            // The modal card is lifted *toward* the foreground, while the
+            // chrome bands recede away from it. Same palette, opposite
+            // direction, because a floating panel and a background strip are
+            // opposite things: one is in front of the list and one is behind
+            // it. Derived from the same two endpoints as every other surface
+            // so a re-themed palette carries the modal with it.
+            //
+            // Placed past `filter_bg` (0.13) so the reply field stays
+            // readable as an inset well *within* the card rather than
+            // dissolving into it.
+            panel_surface: cfg
+                .files_background()
+                .mix(cfg.files_text(), Self::PANEL_LIFT)
+                .into(),
+            panel_border: cfg
+                .files_background()
+                .mix(cfg.files_text(), Self::PANEL_BORDER_LIFT)
+                .into(),
+            // Black on every palette: see the field's documentation for why
+            // the window background is the one colour this must not be.
+            panel_scrim: Color::rgb(0, 0, 0),
             // Halfway between the muted text and the background it sits on,
             // so it recedes under a light or a dark palette alike.
             disabled: cfg.files_muted().mix(cfg.files_background(), 0.5).into(),
@@ -756,6 +830,140 @@ background = "#181616"
                 luma(file_fill)
             );
         }
+    }
+
+    /// The bug this pins: the scrim was painted in the window background, and
+    /// blending a colour over itself changes nothing. The list stayed exactly
+    /// as bright while the darker chrome bands were *lightened* -- the
+    /// opposite of dimming. A test that only asked whether pixels changed
+    /// passed on it.
+    #[test]
+    fn the_scrim_darkens_every_surface_it_covers() {
+        let luma = |c: Color| config::Color::from_rgb(c.r, c.g, c.b).luma();
+        for toml in [
+            "",
+            "[colors]\nbackground = \"#181616\"\nforeground = \"#c5c9c5\"\n",
+            "[colors]\nbackground = \"#ffffff\"\nforeground = \"#000000\"\n",
+        ] {
+            let cfg = config::Config::from_bytes(toml.as_bytes()).expect("valid config");
+            let t = Theme::from_config(&cfg);
+            let scrim = luma(t.panel_scrim);
+            for (surface, name) in [
+                (t.background, "the list"),
+                (t.sidebar_bg, "the sidebar"),
+                (t.toolbar_bg, "the toolbar"),
+                (t.status_bg, "the status strip"),
+            ] {
+                assert!(
+                    scrim < luma(surface),
+                    "the scrim ({scrim}) must darken {name} ({}) for {toml:?}",
+                    luma(surface)
+                );
+            }
+        }
+    }
+
+    /// A floating card must sit in *front* of the window, and the chrome
+    /// bands recede behind it. Deriving the card from a chrome colour made it
+    /// darker than the list it floats over, so it read as a hole rather than
+    /// a raised dialog.
+    #[test]
+    fn the_modal_card_is_lifted_while_the_chrome_recedes() {
+        let luma = |c: Color| config::Color::from_rgb(c.r, c.g, c.b).luma();
+        for toml in [
+            "",
+            "[colors]\nbackground = \"#181616\"\nforeground = \"#c5c9c5\"\n",
+            "[colors]\nbackground = \"#ffffff\"\nforeground = \"#000000\"\n",
+            "[files]\nbackground = \"#202020\"\ntext = \"#f0f0f0\"\n",
+        ] {
+            let cfg = config::Config::from_bytes(toml.as_bytes()).expect("valid config");
+            let t = Theme::from_config(&cfg);
+            let lift = (luma(t.panel_surface) - luma(t.background)).abs();
+            let recede = (luma(t.sidebar_bg) - luma(t.background)).abs();
+            assert!(
+                lift > recede,
+                "the card ({lift} from the background) must stand off further \
+                 than the chrome ({recede}) for {toml:?}"
+            );
+        }
+    }
+
+    /// The reply field is drawn *inside* the card, so it must be
+    /// distinguishable from it -- otherwise the box the user types into has
+    /// no visible edge at all.
+    #[test]
+    fn the_reply_field_stays_visible_against_the_card() {
+        let luma = |c: Color| config::Color::from_rgb(c.r, c.g, c.b).luma();
+        for toml in [
+            "",
+            "[colors]\nbackground = \"#181616\"\nforeground = \"#c5c9c5\"\n",
+            "[colors]\nbackground = \"#ffffff\"\nforeground = \"#000000\"\n",
+        ] {
+            let cfg = config::Config::from_bytes(toml.as_bytes()).expect("valid config");
+            let t = Theme::from_config(&cfg);
+            assert_ne!(t.filter_bg, t.panel_surface, "for {toml:?}");
+            assert!(
+                (luma(t.panel_surface) - luma(t.filter_bg)).abs() > 3.0,
+                "the field ({}) must separate from the card ({}) for {toml:?}",
+                luma(t.filter_bg),
+                luma(t.panel_surface)
+            );
+            // The card's own edge is the only boundary against the dimmed
+            // list behind it.
+            assert!(
+                (luma(t.panel_border) - luma(t.panel_surface)).abs() > 3.0,
+                "the card outline must be visible on the card for {toml:?}"
+            );
+        }
+    }
+
+    /// The shipped palette, stated in numbers rather than trusted to the eye.
+    ///
+    /// Pins the *ordering* against the real Kanagawa Dragon config, so a
+    /// change to any derivation that inverted the stack here would fail with
+    /// the actual figures rather than a vague "looks wrong".
+    #[test]
+    fn the_modal_stacks_correctly_on_the_shipped_palette() {
+        let cfg = config::Config::from_bytes(
+            b"[colors]\nforeground = \"#c5c9c5\"\nbackground = \"#181616\"\n",
+        )
+        .expect("parse");
+        let t = Theme::from_config(&cfg);
+        let luma = |c: Color| config::Color::from_rgb(c.r, c.g, c.b).luma();
+        // Darkest to brightest: scrim, chrome, list, field, card, outline.
+        let stack = [
+            ("scrim", luma(t.panel_scrim)),
+            ("chrome", luma(t.sidebar_bg)),
+            ("list", luma(t.background)),
+            ("field", luma(t.filter_bg)),
+            ("card", luma(t.panel_surface)),
+            ("outline", luma(t.panel_border)),
+        ];
+        for pair in stack.windows(2) {
+            let (below, above) = (pair[0], pair[1]);
+            assert!(
+                below.1 < above.1,
+                "{} ({:.1}) must sit below {} ({:.1})",
+                below.0,
+                below.1,
+                above.0,
+                above.1
+            );
+        }
+    }
+
+    /// The modal must follow a re-themed palette like every other surface,
+    /// rather than stranding a hand-picked colour.
+    #[test]
+    fn the_modal_follows_a_retheme() {
+        let dark = config::Config::from_bytes(b"[colors]\nbackground = \"#181616\"\n")
+            .expect("parse");
+        let light = config::Config::from_bytes(b"[colors]\nbackground = \"#fdf6e3\"\n")
+            .expect("parse");
+        assert_ne!(
+            Theme::from_config(&dark).panel_surface,
+            Theme::from_config(&light).panel_surface
+        );
     }
 
     /// Derived metrics replace the defaults, so a larger font grows the

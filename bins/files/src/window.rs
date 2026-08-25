@@ -1651,15 +1651,15 @@ impl FilesWindow {
         let theme = self.theme;
         PanelStyle {
             spacing: theme.spacing,
-            surface: theme.sidebar_bg,
-            border: theme.control_border,
+            surface: theme.panel_surface,
+            border: theme.panel_border,
             text: theme.text,
             muted: theme.muted,
             notice: theme.error,
             field: theme.filter_bg,
             focus_ring: theme.focus_ring,
             caret: theme.caret,
-            scrim: theme.background,
+            scrim: theme.panel_scrim,
         }
     }
 
@@ -3101,26 +3101,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The scrim must dim the window rather than replace it: the sidebar row
-    /// the user just clicked is the context for the question being asked.
+    /// The scrim must genuinely *darken* the window, not merely change it.
+    ///
+    /// The shipped bug this pins: the scrim was painted in the window's own
+    /// background colour, and blending a colour over itself is a no-op. The
+    /// list stayed exactly as bright while the darker chrome bands were
+    /// *lightened* -- the opposite of dimming. Asserting only that pixels
+    /// changed passed on precisely that, so this measures brightness on both
+    /// panes and requires every sampled pixel to lose some.
     #[test]
-    fn the_prompt_dims_the_window_without_hiding_it() {
+    fn the_prompt_darkens_both_panes_without_hiding_them() {
         let (mut painter, root, size) = painter_over_a_mixed_directory("password-scrim");
         let resting = paint_opaque(&mut painter, size);
         painter.browser.begin_password("Password: ", false);
         let prompting = paint_opaque(&mut painter, size);
 
-        // A corner pixel is scrim, never card: it must have changed, and it
-        // must not have become the flat background colour.
-        let corner = 0usize;
-        assert_ne!(
-            resting[corner], prompting[corner],
-            "the scrim must darken what is behind it"
-        );
-        assert_ne!(
-            prompting[corner], 0,
-            "but must not black the window out"
-        );
+        // The real luma, rather than the coefficients restated here, so this
+        // cannot drift from the brightness rule the theme is checked against.
+        let luma = |px: u32| {
+            let channel = |shift: u32| u8::try_from((px >> shift) & 0xff).unwrap_or(u8::MAX);
+            config::Color::from_rgb(channel(16), channel(8), channel(0)).luma()
+        };
+        // Sampled inside the sidebar and inside the list, both well clear of
+        // the centred card: the two panes take different fills, and the bug
+        // moved them in opposite directions.
+        let stride = size.width.cast_unsigned() as usize;
+        let row = stride * 4;
+        for (at, pane) in [(row + 4, "the sidebar"), (row + stride - 8, "the list")] {
+            let (before, after) = (luma(resting[at]), luma(prompting[at]));
+            assert!(
+                after < before,
+                "the scrim must darken {pane}: {before} -> {after}"
+            );
+            assert!(after > 0.0, "but must not black {pane} out");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 

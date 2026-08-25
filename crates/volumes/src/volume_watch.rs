@@ -12,13 +12,22 @@
 //! What makes the polling acceptable is that the expensive part is skipped
 //! almost always:
 //!
-//! - A poll first reads the file and compares the **bytes** to the previous
-//!   read. On an unchanged system that is one `read(2)` of a few kilobytes.
+//! - A poll first reads the tables and compares the **bytes** to the previous
+//!   read. On an unchanged system that is two `read(2)`s of a few kilobytes.
 //! - Only when the bytes differ does it parse, walk `/sys`, resolve symlinks
 //!   and scan `/dev/disk/by-label` -- the part that costs real syscalls.
 //!
 //! The kernel rewrites `mountinfo` on every read, so its mtime is useless as
 //! a change signal; the byte comparison is the cheap test available.
+//!
+//! # Two tables, because a device changes state in two ways
+//!
+//! The mount table alone cannot see a stick that is plugged in and left
+//! unmounted -- it has no mount entry to appear in. That device is exactly
+//! the one a Mount action exists for, so the watch compares
+//! [`SystemTables::read_device_text`], which is the mount table *and* the
+//! kernel's block-device list. Plugging in moves the second; mounting moves
+//! the first.
 //!
 //! # Why the interval is not the loop interval
 //!
@@ -27,6 +36,7 @@
 //! Polling on each pass would read the mount table while the user drags a
 //! scrollbar. [`Self::due`] therefore gates on elapsed time.
 
+use crate::device_scan::DeviceScan;
 use crate::system_tables::SystemTables;
 use crate::volume_set::VolumeSet;
 use std::time::{Duration, Instant};
@@ -54,12 +64,14 @@ impl VolumeChange {
     }
 }
 
-/// Watches the mount table for device changes.
+/// Watches the kernel tables for device changes.
 pub struct VolumeWatch {
-    /// The last raw mount table text, for the cheap change test.
+    /// The last raw table text, for the cheap change test.
     seen: String,
-    /// The volumes derived from it.
+    /// The mounted volumes derived from it.
     volumes: VolumeSet,
+    /// Every attached device, mounted or not.
+    devices: DeviceScan,
     /// When the last poll ran.
     last_poll: Instant,
     /// How long to wait between polls.
@@ -86,11 +98,13 @@ impl VolumeWatch {
     /// Watch arbitrary tables at an arbitrary interval, for testing.
     #[must_use]
     pub fn watching(tables: SystemTables, interval: Duration) -> Self {
-        let seen = tables.read_text();
-        let volumes = tables.volumes_of(&seen);
+        let seen = tables.read_device_text();
+        let volumes = tables.volumes();
+        let devices = tables.devices();
         Self {
             seen,
             volumes,
+            devices,
             last_poll: Instant::now(),
             interval,
             tables,
@@ -107,17 +121,24 @@ impl VolumeWatch {
         self.last_poll.elapsed() >= self.interval
     }
 
-    /// Poll the mount table, rebuilding the volume set only if it changed.
+    /// Poll the kernel tables, rebuilding only if they changed.
+    ///
+    /// Both scans are rebuilt whenever *either* differs, so the mounted set
+    /// and the attached set are always from one moment. Refreshing only the
+    /// one that changed would let a stick be listed as unmounted by one and
+    /// mounted by the other, and the sidebar reads both to draw one row.
     pub fn poll(&mut self) -> VolumeChange {
         self.last_poll = Instant::now();
-        let text = self.tables.read_text();
+        let text = self.tables.read_device_text();
         if text == self.seen {
             return VolumeChange::Unchanged;
         }
         self.seen = text;
-        let volumes = self.tables.volumes_of(&self.seen);
-        if volumes.differs_from(&self.volumes) {
+        let volumes = self.tables.volumes();
+        let devices = self.tables.devices();
+        if volumes.differs_from(&self.volumes) || devices.differs_from(&self.devices) {
             self.volumes = volumes;
+            self.devices = devices;
             return VolumeChange::Changed;
         }
         VolumeChange::Irrelevant
@@ -131,10 +152,16 @@ impl VolumeWatch {
         VolumeChange::Unchanged
     }
 
-    /// The volumes as of the last poll.
+    /// The mounted volumes as of the last poll.
     #[must_use]
     pub const fn volumes(&self) -> &VolumeSet {
         &self.volumes
+    }
+
+    /// Every attached device as of the last poll, mounted or not.
+    #[must_use]
+    pub const fn devices(&self) -> &DeviceScan {
+        &self.devices
     }
 }
 
@@ -149,6 +176,7 @@ mod tests {
     use super::{VolumeChange, VolumeWatch};
     use crate::system_tables::SystemTables;
     use crate::test_support::{fixtures, TempDir};
+    use std::path::Path;
     use std::time::Duration;
 
     const USB_BUS: &str = "pci0000:00/0000:00:14.0/usb2/2-1/2-1:1.0/host6/target6:0:0/6:0:0:0";
@@ -227,6 +255,66 @@ mod tests {
                 .at(std::path::Path::new("/run/media/user/USB"))
                 .is_none(),
             "the unplugged stick must be gone from the set"
+        );
+    }
+
+    /// The gap this watch could not see before: a stick that is plugged in
+    /// and left unmounted writes no mount entry at all, so a watch comparing
+    /// only the mount table would never notice it and the sidebar would
+    /// never offer to mount it.
+    #[test]
+    fn plugging_in_an_unmounted_stick_is_a_change() {
+        let tmp = system("watch-attach");
+        tmp.sized(USB_BUS, "sdb", Some("sdb1"), 8, 17, 1_953_792);
+        tmp.write("partitions", "major minor  #blocks  name\n");
+        let mut watch = watch(&tmp, fixtures::DESKTOP_WITHOUT_USB);
+        assert!(watch.devices().is_empty(), "udev knows nothing yet");
+        tmp.udev_block(8, 17, fixtures::UDEV_VFAT_PARTITION);
+        tmp.write("partitions", "major minor  #blocks  name\n   8 17  976896 sdb1\n");
+        assert!(watch.poll().needs_redraw(), "the new stick must be noticed");
+        assert_eq!(watch.devices().mountable().len(), 1);
+        assert!(
+            watch.volumes().at(Path::new("/run/media/user/USB")).is_none(),
+            "and it is still not mounted"
+        );
+    }
+
+    /// Mounting that same stick must register too, or the row would go on
+    /// offering a Mount action for a device that is already attached.
+    #[test]
+    fn mounting_an_attached_stick_is_a_change() {
+        let tmp = system("watch-attach-mount");
+        tmp.sized(USB_BUS, "sdb", Some("sdb1"), 8, 17, 1_953_792);
+        tmp.udev_block(8, 17, fixtures::UDEV_VFAT_PARTITION);
+        tmp.write("partitions", "major minor  #blocks  name\n   8 17  976896 sdb1\n");
+        let mut watch = watch(&tmp, fixtures::DESKTOP_WITHOUT_USB);
+        assert_eq!(watch.devices().mountable().len(), 1);
+        tmp.write("mountinfo", fixtures::DESKTOP);
+        assert!(watch.poll().needs_redraw());
+        assert!(
+            watch.devices().mountable().is_empty(),
+            "a mounted stick must stop offering the action"
+        );
+    }
+
+    /// The two scans are rebuilt together, so a row cannot be drawn from a
+    /// mounted set and an attached set read at different moments.
+    #[test]
+    fn both_scans_come_from_one_moment() {
+        let tmp = system("watch-coherent");
+        tmp.sized(USB_BUS, "sdb", Some("sdb1"), 8, 17, 1_953_792);
+        tmp.udev_block(8, 17, fixtures::UDEV_VFAT_PARTITION);
+        tmp.write("partitions", "major minor  #blocks  name\n   8 17  976896 sdb1\n");
+        let watch = watch(&tmp, fixtures::DESKTOP);
+        let mounted_here = watch.volumes().at(Path::new("/run/media/user/USB")).is_some();
+        let attached_mounted = watch
+            .devices()
+            .by_source("/dev/sdb1")
+            .is_some_and(crate::AttachedDevice::is_mounted);
+        assert!(mounted_here, "the fixture stick is mounted");
+        assert_eq!(
+            mounted_here, attached_mounted,
+            "the two scans must agree about the same stick"
         );
     }
 

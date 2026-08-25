@@ -48,6 +48,20 @@ impl DeviceScan {
         )
     }
 
+    /// Describe a set of devices directly, without scanning anything.
+    ///
+    /// The counterpart to [`crate::VolumeSet::of`], and public for the same
+    /// reason: the sidebar tests live in the file browser and cannot conjure
+    /// a `/sys` tree, a udev record and a mount table for a stick that is not
+    /// plugged in.
+    ///
+    /// The order is preserved as given rather than re-sorted, so a test can
+    /// state the display order it expects to see.
+    #[must_use]
+    pub const fn of(devices: Vec<AttachedDevice>) -> Self {
+        Self { devices }
+    }
+
     /// Scan arbitrary system tables, for testing.
     #[must_use]
     pub fn scan_in(sys_block: &Path, udev_root: &Path, mounts: &MountTable) -> Self {

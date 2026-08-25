@@ -43,15 +43,6 @@
 
 use crate::secret_input::SecretInput;
 
-/// How a closed prompt ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptOutcome {
-    /// The user submitted a reply.
-    Answered,
-    /// The user dismissed the prompt.
-    Dismissed,
-}
-
 /// One open password prompt.
 #[derive(Debug, Default)]
 pub struct PasswordModal {
@@ -112,7 +103,12 @@ impl PasswordModal {
     ///
     /// False when nothing is open: with no session there is nothing to echo,
     /// and the safe answer to "may I show this" is no.
+    ///
+    /// The painter does not ask -- it is handed [`Self::display_text`], which
+    /// has already obeyed the flag, so there is no path from a painter to a
+    /// concealed reply. This states the rule the tests check.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn echo(&self) -> bool {
         self.session.as_ref().is_some_and(|s| s.echo)
     }
@@ -133,14 +129,20 @@ impl PasswordModal {
         })
     }
 
-    /// How many characters have been typed, for placing a caret.
+    /// How many characters have been typed.
+    ///
+    /// The caret is placed by measuring the bullets the painter already has,
+    /// so this exists for the tests that pin character counting -- the rule
+    /// that keeps a CJK passphrase from leaking its composition.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn typed_count(&self) -> usize {
         self.session.as_ref().map_or(0, |s| s.input.char_count())
     }
 
     /// Whether anything has been typed.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_empty(&self) -> bool {
         self.session.as_ref().is_none_or(|s| s.input.is_empty())
     }
@@ -203,7 +205,7 @@ impl PasswordModal {
 
 #[cfg(test)]
 mod tests {
-    use super::{PasswordModal, PromptOutcome};
+    use super::PasswordModal;
 
     fn opened() -> PasswordModal {
         let mut modal = PasswordModal::new();
@@ -395,10 +397,5 @@ mod tests {
         type_text(&mut modal, "hunter2");
         let shown = format!("{modal:?}");
         assert!(!shown.contains("hunter2"), "got {shown}");
-    }
-
-    #[test]
-    fn an_outcome_distinguishes_an_answer_from_a_dismissal() {
-        assert_ne!(PromptOutcome::Answered, PromptOutcome::Dismissed);
     }
 }

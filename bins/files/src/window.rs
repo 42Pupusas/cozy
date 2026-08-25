@@ -28,6 +28,7 @@ use volumes::{AttachedDevice, VolumeFlush, VolumeWatch};
 
 use crate::mount_service::MountProgress;
 use crate::mount_session::{MountIdentity, MountSession};
+use crate::password_panel::{PanelStyle, PanelText, PasswordPanel};
 use crate::storage::Storage;
 use crate::theme::Theme;
 use crate::toolbar::{Target, Toolbar};
@@ -383,7 +384,12 @@ impl FilesWindow {
     fn rebuild_sidebar(&mut self) {
         let dirs = user_dirs::UserDirs::load();
         let visible = self.sidebar.visible();
-        self.sidebar = Sidebar::with_volumes(&dirs, &self.favorites, self.volumes.volumes());
+        self.sidebar = Sidebar::with_storage(
+            &dirs,
+            &self.favorites,
+            self.volumes.volumes(),
+            self.volumes.devices(),
+        );
         if !visible {
             self.sidebar.toggle();
         }
@@ -451,7 +457,6 @@ impl FilesWindow {
             // footer is re-read on any redraw-worthy change. Cheap enough --
             // one `statvfs` per keystroke, not per frame.
             Outcome::Redraw => self.refresh_storage(),
-            Outcome::Mount => self.begin_mount(),
             Outcome::Password(reply) => self.answer_password(reply),
             Outcome::Ignored => {}
         }
@@ -471,6 +476,46 @@ impl FilesWindow {
         }
         self.browser
             .set_notice(format!("Mounting {}...", device.display_name()));
+    }
+
+    /// Aim the Mount action at the device sidebar row `index` names.
+    ///
+    /// Returns whether the row was an unmounted device, so a click on an
+    /// ordinary place falls through to navigation.
+    ///
+    /// The device is looked up in the **live scan** rather than rebuilt from
+    /// the row: the row carries a label and a `/dev` path for drawing, while
+    /// mounting needs the filesystem type and the device numbers. Rebuilding
+    /// a device from what the sidebar happens to display would be inventing
+    /// facts about hardware.
+    fn aim_mount(&mut self, index: usize) -> bool {
+        let Some(source) = self
+            .sidebar
+            .rows()
+            .get(index)
+            .and_then(SidebarRow::mountable_source)
+        else {
+            return false;
+        };
+        // A stale row is a real case: the scan runs on a timer, so the stick
+        // may have been pulled between the last poll and this click. Doing
+        // nothing is right -- there is no device to attach.
+        let Some(device) = self.volumes.devices().by_source(source).cloned() else {
+            return true;
+        };
+        self.mount_candidate = Some(device);
+        true
+    }
+
+    /// Aim at, and immediately attach, the device sidebar row `index` names.
+    ///
+    /// Returns whether the click was consumed.
+    fn mount_from_sidebar(&mut self, index: usize) -> bool {
+        if !self.aim_mount(index) {
+            return false;
+        }
+        self.begin_mount();
+        true
     }
 
     /// Hand the user's reply to the waiting conversation.
@@ -1130,7 +1175,9 @@ impl FilesWindow {
                         theme.sidebar_bg,
                     );
                 }
-                SidebarRow::Place { label, .. } | SidebarRow::Device { label, .. } => {
+                SidebarRow::Place { label, .. }
+                | SidebarRow::Device { label, .. }
+                | SidebarRow::Unmounted { label, .. } => {
                     self.paint_sidebar_entry(
                         canvas,
                         row,
@@ -1208,8 +1255,14 @@ impl FilesWindow {
             return;
         }
         // The open directory is drawn in the accent; the rest in ordinary
-        // text, so exactly one row draws the eye.
-        let color = if at.active { theme.accent } else { theme.text };
+        // text, so exactly one row draws the eye. An unmounted device is
+        // dimmed: it is a place that does not exist yet, and drawing it as
+        // live as a browsable one invites a click that cannot navigate.
+        let color = match (at.active, row.mountable_source().is_some()) {
+            (true, _) => theme.accent,
+            (false, true) => theme.disabled,
+            (false, false) => theme.text,
+        };
         let inset = Self::sidebar_text_x(&theme);
         let mut room = at.width - inset - pad;
         // A device's filesystem sits at the row's right edge in the muted
@@ -1560,6 +1613,56 @@ impl FilesWindow {
         })
     }
 
+    /// Draw the password prompt over the whole window, if one is open.
+    ///
+    /// The style is assembled here rather than held on the panel: the theme
+    /// can be re-read at any time, and a cached copy of its colours would
+    /// paint the modal in the previous palette.
+    fn paint_password(&mut self, canvas: &mut Canvas<'_>) {
+        if !self.browser.password().is_open() {
+            return;
+        }
+        let bounds = self.frame().size();
+        let style = self.panel_style();
+        // Split so the panel borrows the modal while the renderers are
+        // borrowed from `type_scale` -- both live on `self`.
+        let Self {
+            browser,
+            type_scale,
+            ..
+        } = self;
+        let mut text = PanelText {
+            title: &mut type_scale.title,
+            body: &mut type_scale.body,
+            detail: &mut type_scale.detail,
+        };
+        let Some(panel) = PasswordPanel::lay_out(bounds, style, &text) else {
+            return;
+        };
+        panel.paint(canvas, browser.password(), style, &mut text, bounds);
+    }
+
+    /// The modal's colours, drawn from the theme's existing roles.
+    ///
+    /// Reused rather than given new config keys, for the same reason the
+    /// sidebar's are: a re-themed palette must carry the modal with it
+    /// instead of stranding a set of hand-picked colours.
+    const fn panel_style(&self) -> PanelStyle {
+        let theme = self.theme;
+        PanelStyle {
+            spacing: theme.spacing,
+            surface: theme.sidebar_bg,
+            border: theme.control_border,
+            text: theme.text,
+            muted: theme.muted,
+            notice: theme.error,
+            field: theme.filter_bg,
+            focus_ring: theme.focus_ring,
+            caret: theme.caret,
+            scrim: theme.background,
+        }
+    }
+
     /// Draw the floating "N items" badge while a drag is in flight.
     ///
     /// Uses the accent surface rather than a row fill: the badge belongs to
@@ -1841,6 +1944,9 @@ impl Painter for FilesWindow {
         // Last, and over everything: the badge is cargo the user is holding
         // above the window, so anything it covers is by definition behind it.
         self.paint_drag_badge(canvas);
+        // Later still: the modal covers the badge too. While it is up nothing
+        // behind it is usable, so nothing behind it may be drawn on top.
+        self.paint_password(canvas);
     }
 
     fn on_key(&mut self, press: KeyPress) {
@@ -1853,6 +1959,17 @@ impl Painter for FilesWindow {
     }
 
     fn on_pointer(&mut self, event: PointerEventKind) {
+        // A modal that lets a click through is not modal. Every gesture is
+        // swallowed while the prompt is up: a press would select a file, a
+        // motion would light a row the user cannot reach, and a scroll would
+        // move a list behind a box they are typing a password into.
+        //
+        // Swallowed rather than routed to the panel: the field has no caret
+        // to place and no text to select, so there is nothing on the modal a
+        // click could usefully do.
+        if self.browser.password().is_open() {
+            return;
+        }
         match event {
             PointerEventKind::Press {
                 button: PointerButton::Left,
@@ -1869,9 +1986,19 @@ impl Painter for FilesWindow {
                 // A click in the places pane navigates and goes no further:
                 // it must not also be routed to the list beside it.
                 if self.in_sidebar(at) {
+                    let Some(index) = self.sidebar_row_at(at) else {
+                        return;
+                    };
+                    // An unmounted device is checked first, and consumes the
+                    // click: it has no path, so falling through would find
+                    // nothing to navigate to and the row would appear dead.
+                    if self.mount_from_sidebar(index) {
+                        return;
+                    }
                     if let Some(path) = self
-                        .sidebar_row_at(at)
-                        .and_then(|i| self.sidebar.rows().get(i))
+                        .sidebar
+                        .rows()
+                        .get(index)
                         .and_then(SidebarRow::path)
                         .map(std::path::Path::to_path_buf)
                     {
@@ -2953,6 +3080,114 @@ mod tests {
         assert_ne!(
             after_copy, after_cut,
             "only a cut may dim its entries, never a copy"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The prompt must actually reach the framebuffer. A modal that models
+    /// the conversation correctly and paints nothing leaves the user staring
+    /// at a window that has silently stopped accepting input.
+    #[test]
+    fn an_open_password_prompt_changes_the_painted_frame() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("password-paint");
+        let resting = paint_opaque(&mut painter, size);
+
+        painter
+            .browser
+            .begin_password("Authentication is required to mount KINGSTON", false);
+        let prompting = paint_opaque(&mut painter, size);
+
+        assert_ne!(resting, prompting, "the modal must be visible on screen");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The scrim must dim the window rather than replace it: the sidebar row
+    /// the user just clicked is the context for the question being asked.
+    #[test]
+    fn the_prompt_dims_the_window_without_hiding_it() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("password-scrim");
+        let resting = paint_opaque(&mut painter, size);
+        painter.browser.begin_password("Password: ", false);
+        let prompting = paint_opaque(&mut painter, size);
+
+        // A corner pixel is scrim, never card: it must have changed, and it
+        // must not have become the flat background colour.
+        let corner = 0usize;
+        assert_ne!(
+            resting[corner], prompting[corner],
+            "the scrim must darken what is behind it"
+        );
+        assert_ne!(
+            prompting[corner], 0,
+            "but must not black the window out"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Typing must be visible, or the user cannot tell the keyboard is
+    /// reaching the field -- with the text concealed there is no other clue.
+    #[test]
+    fn typing_a_reply_changes_the_painted_prompt() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("password-typing");
+        painter.browser.begin_password("Password: ", false);
+        let empty = paint_opaque(&mut painter, size);
+
+        for c in "hunter2".chars() {
+            painter.browser.act(crate::keymap::Action::Insert(c));
+        }
+        let typed = paint_opaque(&mut painter, size);
+
+        assert_ne!(empty, typed, "the bullets must appear as they are typed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A warning from the helper must reach the screen: "2 attempts
+    /// remaining" is the only notice before an account locks.
+    #[test]
+    fn a_notice_from_the_helper_changes_the_painted_prompt() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("password-notice");
+        painter.browser.begin_password("Password: ", false);
+        let quiet = paint_opaque(&mut painter, size);
+
+        painter.browser.set_password_notice("2 attempts remaining");
+        let warned = paint_opaque(&mut painter, size);
+
+        assert_ne!(quiet, warned, "the warning must be visible");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Dismissing must restore the window exactly. A modal that leaves
+    /// residue behind reads as a rendering fault.
+    #[test]
+    fn dismissing_the_prompt_restores_the_frame() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("password-dismiss");
+        let resting = paint_opaque(&mut painter, size);
+        painter.browser.begin_password("Password: ", false);
+        let _ = paint_opaque(&mut painter, size);
+        painter.browser.end_password();
+        let restored = paint_opaque(&mut painter, size);
+
+        assert_eq!(resting, restored, "the modal must leave nothing behind");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The load-bearing rule: a click behind the modal must not reach the
+    /// list. Without this a stray press selects a file -- or worse, a
+    /// double-click opens one -- while the user believes they are typing a
+    /// password.
+    #[test]
+    fn a_click_behind_the_prompt_does_not_reach_the_list() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("password-click");
+        painter.browser.begin_password("Password: ", false);
+        let at = row_centre(&painter, 1);
+        left_press(&mut painter, at);
+        assert!(
+            painter.browser.selected_paths().is_empty(),
+            "a click behind the modal must select nothing"
+        );
+        assert!(
+            painter.take_pending_open().is_none(),
+            "and must certainly not open anything"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

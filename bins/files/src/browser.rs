@@ -67,12 +67,6 @@ pub enum Outcome {
     /// Show or hide the places pane -- a property of the window's layout,
     /// not of the directory being browsed.
     ToggleSidebar,
-    /// Attach the removable device the sidebar is pointing at.
-    ///
-    /// Bubbled up for the same reason as [`Self::Open`]: mounting needs a bus
-    /// connection, a polkit agent and a worker thread, none of which belong
-    /// to a headless state machine.
-    Mount,
     /// The user answered the password prompt, or dismissed it with `None`.
     ///
     /// Carried out rather than handled here because the reply belongs to a
@@ -464,7 +458,6 @@ impl Browser {
             Action::BeginRename => self.begin_rename(),
             Action::CommitRename => self.commit_rename(),
             Action::CancelRename => self.cancel_rename(),
-            Action::Mount => Outcome::Mount,
             Action::SubmitPassword => self.submit_password(),
             Action::DismissPassword => self.dismiss_password(),
             Action::ClearPassword => Outcome::redraw_if(self.password.clear()),

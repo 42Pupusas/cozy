@@ -39,7 +39,12 @@ pub struct MountIdentity {
 
 impl MountIdentity {
     /// Describe a user explicitly.
+    ///
+    /// Production builds the identity from the running process (see
+    /// [`Self::current`]); this is how a test states one, since the ids that
+    /// end up owning the files are the thing worth pinning.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(name: impl Into<String>, uid: u32, gid: u32) -> Self {
         Self {
             name: name.into(),
@@ -94,12 +99,6 @@ impl MountSession {
     #[must_use]
     pub const fn is_running(&self) -> bool {
         self.running.is_some()
-    }
-
-    /// The device being attached, for naming it in a message.
-    #[must_use]
-    pub fn device(&self) -> Option<&str> {
-        self.running.as_ref().map(|s| s.request().device())
     }
 
     /// Start attaching `device`, with a backend built by `build` on the
@@ -245,7 +244,6 @@ mod tests {
     fn a_fresh_session_is_idle() {
         let session = session();
         assert!(!session.is_running());
-        assert_eq!(session.device(), None);
     }
 
     #[test]
@@ -309,15 +307,6 @@ mod tests {
         assert!(session.abandon());
         assert!(!session.is_running());
         assert!(!session.abandon());
-    }
-
-    /// The message names the device, so "KINGSTON was mounted" is possible.
-    #[test]
-    fn the_session_names_the_device_being_attached() {
-        let device = stick("KINGSTON");
-        let mut session = session();
-        session.begin_with(&device, |_| ScriptedBackend::always_succeeding());
-        assert_eq!(session.device(), Some("/dev/sdb1"));
     }
 
     /// `$USER` may be absent or stale, and it must never be the thing that

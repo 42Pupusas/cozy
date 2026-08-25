@@ -90,8 +90,6 @@ pub enum Action {
     DismissPassword,
     /// Erase everything typed into the password field (Ctrl-U).
     ClearPassword,
-    /// Attach the removable device the sidebar cursor is on.
-    Mount,
     /// Open the inline rename box over the cursor row (F2).
     BeginRename,
     /// Apply the name typed into the rename box.

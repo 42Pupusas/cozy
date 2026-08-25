@@ -118,6 +118,16 @@ impl Frame {
         self.sidebar_width > 0
     }
 
+    /// The whole window.
+    ///
+    /// The one rectangle that is not a band: a modal floats over every column
+    /// at once, so it is laid out against the surface rather than against any
+    /// part of the layout.
+    #[must_use]
+    pub const fn size(&self) -> Rect {
+        self.size
+    }
+
     /// The left column, full window height.
     ///
     /// Full height is the point: it runs past the toolbar's top and the

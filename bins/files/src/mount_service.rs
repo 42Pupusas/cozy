@@ -128,8 +128,6 @@ pub struct MountService {
     progress: Receiver<MountProgress>,
     /// Replies to the worker. Dropped to release a blocked prompt.
     replies: Option<Sender<Option<String>>>,
-    /// The device being attached, so the UI can name it in a message.
-    request: MountRequest,
     /// Kept to detect completion; never joined on the UI thread.
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -164,15 +162,8 @@ impl MountService {
         Self {
             progress: progress_rx,
             replies: Some(reply_tx),
-            request: request.clone(),
             worker: Some(worker),
         }
-    }
-
-    /// The device this service is attaching.
-    #[must_use]
-    pub const fn request(&self) -> &MountRequest {
-        &self.request
     }
 
     /// Take the next message, if the worker has produced one.
@@ -412,16 +403,6 @@ mod tests {
             rx.try_recv(),
             Ok(MountProgress::Notice(String::from("2 attempts remaining")))
         );
-    }
-
-    /// The UI must be able to name the device in "KINGSTON was mounted".
-    #[test]
-    fn the_service_remembers_which_device_it_is_attaching() {
-        let wake = waker::Waker::new().expect("an eventfd");
-        let service = MountService::start(&request(), &wake, |_prompt| {
-            volumes::ScriptedBackend::always_succeeding()
-        });
-        assert_eq!(service.request().device(), "/dev/sdb1");
     }
 
     /// A prompt asked after the window has gone must not block the worker

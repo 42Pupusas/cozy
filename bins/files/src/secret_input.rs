@@ -81,7 +81,12 @@ impl SecretInput {
     }
 
     /// How many bytes are held.
+    ///
+    /// Bytes, not characters -- the capacity limit is a byte limit, so this
+    /// is what the overflow tests measure. Nothing on screen is derived from
+    /// it; the painter counts characters (see [`Self::char_count`]).
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const fn len(&self) -> usize {
         self.len
     }

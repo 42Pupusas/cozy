@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::favorites::Favorites;
 use user_dirs::{UserDir, UserDirs};
-use volumes::VolumeSet;
+use volumes::{DeviceScan, VolumeSet};
 
 /// One row in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,35 +53,74 @@ pub enum SidebarRow {
         /// Whether the volume refuses writes, so the painter can mark it.
         read_only: bool,
     },
+    /// A removable device that is plugged in but not mounted.
+    ///
+    /// A third variant rather than an `Option<PathBuf>` on [`Self::Device`],
+    /// because the difference is not cosmetic: this row has **no path**, so
+    /// it cannot navigate, cannot be flushed, and cannot be the highlighted
+    /// current directory. Making the path optional would push a `None` check
+    /// into every one of those call sites, and the one that forgot it would
+    /// navigate the browser to a directory that does not exist.
+    Unmounted {
+        label: String,
+        /// The `/dev` path, which names the device to mount.
+        source: String,
+        /// The filesystem and size, e.g. `vfat, 1.9g`.
+        detail: String,
+    },
 }
 
 impl SidebarRow {
     /// The path this row navigates to, if any.
+    ///
+    /// `None` for an unmounted device: it has no directory to open, and
+    /// returning any path for it would send the browser somewhere that does
+    /// not exist.
     #[must_use]
     pub fn path(&self) -> Option<&Path> {
         match self {
             Self::Place { path, .. } | Self::Device { path, .. } => Some(path.as_path()),
-            Self::Heading(_) | Self::Hint(_) => None,
+            Self::Heading(_) | Self::Hint(_) | Self::Unmounted { .. } => None,
         }
     }
 
     /// Whether the row can be clicked or moved onto.
+    ///
+    /// An unmounted device is selectable even though it navigates nowhere:
+    /// clicking it is how the user asks to mount it, and a row that could
+    /// not be clicked would offer no way to do that.
     #[must_use]
     pub const fn selectable(&self) -> bool {
-        matches!(self, Self::Place { .. } | Self::Device { .. })
+        matches!(
+            self,
+            Self::Place { .. } | Self::Device { .. } | Self::Unmounted { .. }
+        )
     }
 
-    /// Whether this row is a removable device.
+    /// Whether this row is a mounted removable device.
+    ///
+    /// False for an unmounted one: the flush action reaches devices through
+    /// this test, and flushing a device that is not attached would act on
+    /// nothing -- or, with a path, on the wrong thing.
     #[must_use]
     pub const fn is_device(&self) -> bool {
         matches!(self, Self::Device { .. })
     }
 
-    /// The device's detail line, if this is a device row.
+    /// The `/dev` path of an unmounted device, which names what to mount.
+    #[must_use]
+    pub const fn mountable_source(&self) -> Option<&str> {
+        match self {
+            Self::Unmounted { source, .. } => Some(source.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The device's detail line, if this row carries one.
     #[must_use]
     pub const fn detail(&self) -> Option<&str> {
         match self {
-            Self::Device { detail, .. } => Some(detail.as_str()),
+            Self::Device { detail, .. } | Self::Unmounted { detail, .. } => Some(detail.as_str()),
             _ => None,
         }
     }
@@ -104,6 +143,15 @@ impl Sidebar {
     /// Shown when nothing is bookmarked yet.
     const EMPTY_HINT: &'static str = "Ctrl+D to bookmark";
 
+    /// The caption on a device that is plugged in but not mounted.
+    ///
+    /// A verb, not a state. "not mounted" describes the row and leaves the
+    /// user to guess what to do about it; "mount" says what clicking does.
+    /// It is also short enough to survive the caption's fit test, which a
+    /// longer phrase would fail on a narrow sidebar -- leaving the row
+    /// indistinguishable from a mounted one.
+    const MOUNT_HINT: &'static str = "mount";
+
     /// The directories this sidebar offers, in display order.
     ///
     /// A subset of the spec's eight, in the order people reach for them
@@ -125,9 +173,30 @@ impl Sidebar {
         Self::with_volumes(dirs, favorites, &VolumeSet::default())
     }
 
-    /// Build the sidebar from the user's directories, bookmarks and devices.
+    /// Build the sidebar with only mounted devices listed.
     #[must_use]
     pub fn with_volumes(dirs: &UserDirs, favorites: &Favorites, volumes: &VolumeSet) -> Self {
+        Self::with_storage(dirs, favorites, volumes, &DeviceScan::default())
+    }
+
+    /// Build the sidebar from the user's directories, bookmarks and storage.
+    ///
+    /// `volumes` are the mounted filesystems and `devices` is every removable
+    /// device attached. The two overlap, so the mounted rows are taken from
+    /// `volumes` and only the *unmounted* devices are taken from `devices` --
+    /// listing a mounted stick from both would show one device twice, once
+    /// offering to mount what is already mounted.
+    ///
+    /// The mounted half comes from `volumes` rather than the scan because a
+    /// mount entry carries what the scan cannot: the read-only state, and a
+    /// label resolved through `/dev/disk/by-label`.
+    #[must_use]
+    pub fn with_storage(
+        dirs: &UserDirs,
+        favorites: &Favorites,
+        volumes: &VolumeSet,
+        devices: &DeviceScan,
+    ) -> Self {
         let mut rows = vec![SidebarRow::Heading(Self::PLACES)];
         // Home leads the list: it is where the browser opens and where people
         // navigate back to most.
@@ -171,7 +240,8 @@ impl Sidebar {
         // showing an empty heading. Unlike Favorites -- where a hint teaches
         // a keybinding -- there is nothing to teach here: the answer to "no
         // devices" is to plug one in, which the user already knows.
-        if !volumes.is_empty() {
+        let unmounted = devices.mountable();
+        if !volumes.is_empty() || !unmounted.is_empty() {
             rows.push(SidebarRow::Heading(Self::DEVICES));
             for volume in volumes.volumes() {
                 rows.push(SidebarRow::Device {
@@ -179,6 +249,17 @@ impl Sidebar {
                     path: volume.mount_point().to_path_buf(),
                     detail: volume.detail(),
                     read_only: volume.read_only(),
+                });
+            }
+            // Unmounted devices sit below the mounted ones, for the same
+            // reason the whole section sits last: this is the group that
+            // appears and disappears on its own, so it must not push the
+            // rows the user was aiming at.
+            for device in unmounted {
+                rows.push(SidebarRow::Unmounted {
+                    label: device.display_name().to_owned(),
+                    source: device.source().to_owned(),
+                    detail: Self::MOUNT_HINT.to_owned(),
                 });
             }
         }
@@ -270,7 +351,12 @@ mod tests {
     use crate::test_support::TempDir;
     use std::path::Path;
     use user_dirs::UserDirs;
-    use volumes::{DeviceClass, Volume, VolumeSet};
+    use volumes::{AttachedDevice, DeviceClass, DeviceScan, Volume, VolumeSet};
+
+    /// A stick that is plugged in and not mounted.
+    fn unmounted(label: &str) -> AttachedDevice {
+        AttachedDevice::new("/dev/sdb1", Some(label), "vfat", 1_000_000_000, 8, 17)
+    }
 
     /// A USB stick attached at `/run/media/user/<label>`.
     fn stick(label: &str, read_only: bool) -> Volume {
@@ -426,6 +512,118 @@ mod tests {
         let volumes = VolumeSet::of(vec![stick("ALPHA", false), stick("BETA", true)]);
         let bar = Sidebar::with_volumes(&dirs, &fav, &volumes);
         assert_eq!(bar.rows().iter().filter(|r| r.is_device()).count(), 2);
+    }
+
+    /// The row this whole feature exists for: a stick that is plugged in but
+    /// not mounted must be listed, so there is something to click.
+    #[test]
+    fn an_unmounted_device_is_listed_under_devices() {
+        let tmp = TempDir::new("sidebar-unmounted");
+        let (dirs, fav) = fixture(&tmp);
+        let devices = DeviceScan::of(vec![unmounted("KINGSTON")]);
+        let bar = Sidebar::with_storage(&dirs, &fav, &VolumeSet::default(), &devices);
+        assert_eq!(headings(&bar), ["Places", "Favorites", "Devices"]);
+        let row = bar
+            .rows()
+            .iter()
+            .find(|r| r.mountable_source().is_some())
+            .expect("the unmounted stick");
+        assert_eq!(row.mountable_source(), Some("/dev/sdb1"));
+        assert!(row.selectable(), "clicking it is how a mount is asked for");
+    }
+
+    /// The dangerous case: an unmounted device has nowhere to go, and a path
+    /// on this row would navigate the browser into a directory that does not
+    /// exist.
+    #[test]
+    fn an_unmounted_device_navigates_nowhere_and_cannot_be_flushed() {
+        let tmp = TempDir::new("sidebar-unmounted-nopath");
+        let (dirs, fav) = fixture(&tmp);
+        let devices = DeviceScan::of(vec![unmounted("KINGSTON")]);
+        let bar = Sidebar::with_storage(&dirs, &fav, &VolumeSet::default(), &devices);
+        let row = bar
+            .rows()
+            .iter()
+            .find(|r| r.mountable_source().is_some())
+            .expect("the stick");
+        assert_eq!(row.path(), None, "there is no directory to open");
+        assert!(!row.is_device(), "flushing an unmounted device acts on nothing");
+    }
+
+    /// A mounted stick appears once, as a mounted row. Listing it from both
+    /// sources would show one device twice, one of which offers to mount
+    /// what is already mounted.
+    #[test]
+    fn a_mounted_device_is_not_also_listed_as_mountable() {
+        let tmp = TempDir::new("sidebar-nodupe");
+        let (dirs, fav) = fixture(&tmp);
+        let volumes = VolumeSet::of(vec![stick("KINGSTON", false)]);
+        let devices = DeviceScan::of(vec![
+            unmounted("KINGSTON").mounted_at("/run/media/user/KINGSTON"),
+        ]);
+        let bar = Sidebar::with_storage(&dirs, &fav, &volumes, &devices);
+        assert_eq!(
+            bar.rows()
+                .iter()
+                .filter(|r| r.mountable_source().is_some())
+                .count(),
+            0,
+            "a mounted device offers no mount action"
+        );
+        assert_eq!(bar.rows().iter().filter(|r| r.is_device()).count(), 1);
+    }
+
+    /// The section must appear for an unmounted device alone -- otherwise a
+    /// stick plugged into a machine with nothing else attached is invisible.
+    #[test]
+    fn the_devices_section_appears_for_an_unmounted_device_alone() {
+        let tmp = TempDir::new("sidebar-onlyunmounted");
+        let (dirs, fav) = fixture(&tmp);
+        let devices = DeviceScan::of(vec![unmounted("KINGSTON")]);
+        let bar = Sidebar::with_storage(&dirs, &fav, &VolumeSet::default(), &devices);
+        assert!(headings(&bar).contains(&"Devices"));
+    }
+
+    /// The caption tells the user what clicking does, rather than restating
+    /// the state they can already see.
+    #[test]
+    fn an_unmounted_device_says_what_clicking_it_does() {
+        let tmp = TempDir::new("sidebar-hintverb");
+        let (dirs, fav) = fixture(&tmp);
+        let devices = DeviceScan::of(vec![unmounted("KINGSTON")]);
+        let bar = Sidebar::with_storage(&dirs, &fav, &VolumeSet::default(), &devices);
+        let row = bar
+            .rows()
+            .iter()
+            .find(|r| r.mountable_source().is_some())
+            .expect("the stick");
+        assert_eq!(row.detail(), Some("mount"));
+    }
+
+    /// Mounted devices keep their positions when an unmounted one appears.
+    #[test]
+    fn an_unmounted_device_sits_below_the_mounted_ones() {
+        let tmp = TempDir::new("sidebar-order");
+        let (dirs, fav) = fixture(&tmp);
+        let volumes = VolumeSet::of(vec![stick("MOUNTED", false)]);
+        let devices = DeviceScan::of(vec![unmounted("LOOSE")]);
+        let bar = Sidebar::with_storage(&dirs, &fav, &volumes, &devices);
+        let mounted = bar.rows().iter().position(SidebarRow::is_device).expect("mounted");
+        let loose = bar
+            .rows()
+            .iter()
+            .position(|r| r.mountable_source().is_some())
+            .expect("unmounted");
+        assert!(loose > mounted);
+    }
+
+    /// A plain place must never be mistaken for something to mount.
+    #[test]
+    fn a_plain_place_offers_no_mount_source() {
+        let tmp = TempDir::new("sidebar-placenomount");
+        let (dirs, fav) = fixture(&tmp);
+        let bar = Sidebar::new(&dirs, &fav);
+        assert!(bar.rows().iter().all(|r| r.mountable_source().is_none()));
     }
 
     #[test]

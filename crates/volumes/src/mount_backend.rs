@@ -34,6 +34,12 @@ pub enum MountOutcome {
     Mounted,
     /// A password is required and no agent answered. Prompt, then retry.
     NeedsAuthorization,
+    /// The user dismissed the password prompt.
+    ///
+    /// Distinct from [`Self::Denied`], which is the machine refusing. Telling
+    /// someone who closed a prompt that they lack permission is a lie, and it
+    /// sends them looking for a problem that does not exist.
+    Cancelled,
     /// Authorization was refused. Retrying will not help.
     Denied,
     /// The mounter was reached but the mount failed.
@@ -64,7 +70,7 @@ impl MountOutcome {
     #[must_use]
     pub fn message(&self) -> Option<String> {
         match self {
-            Self::Mounted => None,
+            Self::Mounted | Self::Cancelled => None,
             Self::NeedsAuthorization => {
                 Some(String::from("Authentication is required to mount this device."))
             }
@@ -141,8 +147,31 @@ mod tests {
         assert!(MountOutcome::NeedsAuthorization.is_retryable());
         assert!(!MountOutcome::Denied.is_retryable());
         assert!(!MountOutcome::Mounted.is_retryable());
+        assert!(!MountOutcome::Cancelled.is_retryable());
         assert!(!MountOutcome::Failed(String::from("x")).is_retryable());
         assert!(!MountOutcome::Unavailable(String::from("x")).is_retryable());
+    }
+
+    /// Dismissing a prompt is a deliberate act, so it needs no error: the
+    /// user knows what they did and an alert would be noise.
+    #[test]
+    fn a_dismissed_prompt_says_nothing_and_is_not_a_denial() {
+        assert!(MountOutcome::Cancelled.message().is_none());
+        assert_ne!(
+            MountOutcome::Cancelled,
+            MountOutcome::Denied,
+            "closing a prompt is not the machine refusing"
+        );
+        assert!(!MountOutcome::Cancelled.is_mounted());
+    }
+
+    /// The wording of a refusal must never be shown for a cancellation: it
+    /// tells someone who declined that they lack a permission they have.
+    #[test]
+    fn only_a_real_refusal_talks_about_permission() {
+        let denied = MountOutcome::Denied.message().expect("a message");
+        assert!(denied.contains("permission"), "{denied}");
+        assert!(MountOutcome::Cancelled.message().is_none());
     }
 
     #[test]
@@ -151,8 +180,8 @@ mod tests {
         assert!(!MountOutcome::Denied.is_mounted());
     }
 
-    /// Success needs no message; every failure needs one, or the UI has
-    /// nothing to show.
+    /// Success and cancellation need no message; every real failure needs
+    /// one, or the UI has nothing to show.
     #[test]
     fn every_failure_has_a_message_and_success_has_none() {
         assert!(MountOutcome::Mounted.message().is_none());

@@ -328,6 +328,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mounter"
+version = "0.1.0"
+dependencies = [
+ "dbus",
+ "dbus-server",
+ "polkit-agent",
+ "volumes",
+]
+
+[[package]]
 name = "open-bin"
 version = "0.1.0"
 dependencies = [

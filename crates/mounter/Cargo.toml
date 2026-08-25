@@ -1,0 +1,22 @@
+[package]
+name    = "mounter"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The vocabulary: `MountBackend`, `MountRequest`, `MountOutcome`. This crate
+# exists to implement that trait, so it depends on the seam rather than the
+# other way round -- `volumes` never learns what a bus is.
+volumes = { path = "../volumes" }
+# `StartTransientUnit`, which is how an unprivileged process gets a
+# filesystem mounted without shipping a setuid helper.
+dbus = { path = "../dbus" }
+# The password prompt polkit demands for `manage-units`. Without an agent the
+# mount is refused rather than queried, so the two are inseparable.
+polkit-agent = { path = "../polkit-agent" }
+# The agent is *served*: polkit calls `BeginAuthentication` on an object we
+# own, which needs the method router rather than only the client half.
+dbus-server = { path = "../dbus-server" }

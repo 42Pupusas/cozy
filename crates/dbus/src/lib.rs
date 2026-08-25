@@ -36,6 +36,7 @@
 //!   convenience wrappers the statusbar calls directly.
 
 pub mod bluez;
+pub mod call_flags;
 pub mod call_target;
 pub mod conn;
 pub mod fds;
@@ -51,6 +52,7 @@ pub mod systemd1;
 pub mod unit_name;
 pub mod value;
 
+pub use call_flags::CallFlags;
 pub use conn::{DbusConn, DbusError};
 pub use mount_options::MountOptions;
 pub use session_address::SessionAddress;

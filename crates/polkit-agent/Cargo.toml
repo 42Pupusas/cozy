@@ -11,3 +11,7 @@ workspace = true
 # org.freedesktop.PolicyKit1.AuthenticationAgent), so it needs the bus. The
 # PAM conversation itself is a plain unix socket and needs nothing.
 dbus = { path = "../dbus" }
+# The agent is *served*, not just called: polkit invokes BeginAuthentication
+# on an object we own, so this needs the method router rather than only the
+# client half.
+dbus-server = { path = "../dbus-server" }

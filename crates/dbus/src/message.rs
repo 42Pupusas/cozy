@@ -13,6 +13,7 @@
 //! (body, padded to start at an 8-byte boundary from message start)
 //! ```
 
+use crate::call_target::CallTarget;
 use crate::marshal::Marshaller;
 use crate::value::{Unmarshaller, Value};
 
@@ -532,6 +533,10 @@ impl MessageBuilder {
     /// [`BodyArg`] can express. Returns `None` on the same
     /// signature/value mismatch [`Self::build_method_return_with_values`]
     /// does.
+    ///
+    /// Kept as the plain-argument form because most callers name their four
+    /// routing strings inline; anything needing a flags byte goes through
+    /// [`Self::build_method_call_with_flags`].
     #[must_use]
     pub fn build_method_call_with_values(
         serial: u32,
@@ -542,6 +547,37 @@ impl MessageBuilder {
         values: &[Value],
         signature: &str,
     ) -> Option<Vec<u8>> {
+        Self::build_method_call_with_flags(
+            serial,
+            CallTarget::new(destination, path, interface, member),
+            values,
+            signature,
+            crate::call_flags::CallFlags::none(),
+        )
+    }
+
+    /// The same, with an explicit flags byte.
+    ///
+    /// A polkit-guarded method refuses outright unless the call carries
+    /// `ALLOW_INTERACTIVE_AUTHORIZATION`; see [`crate::call_flags`] for why
+    /// an authentication agent is useless without it.
+    ///
+    /// Takes a [`CallTarget`] rather than four loose strings, which keeps the
+    /// destination/path/interface/member group from being transposed.
+    #[must_use]
+    pub fn build_method_call_with_flags(
+        serial: u32,
+        target: CallTarget<'_>,
+        values: &[Value],
+        signature: &str,
+        flags: crate::call_flags::CallFlags,
+    ) -> Option<Vec<u8>> {
+        let (destination, path, interface, member) = (
+            target.destination(),
+            target.path(),
+            target.interface(),
+            target.member(),
+        );
         let body = Marshaller::marshal_body(values, signature)?;
 
         let mut header_fields = Vec::new();
@@ -558,7 +594,12 @@ impl MessageBuilder {
             Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', signature);
         }
 
-        let mut out = vec![b'l', MessageType::MethodCall.as_byte(), 0, 1];
+        let mut out = vec![
+            b'l',
+            MessageType::MethodCall.as_byte(),
+            flags.as_byte(),
+            1,
+        ];
         out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
         out.extend_from_slice(&serial.to_le_bytes());
         out.extend_from_slice(

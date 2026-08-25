@@ -83,6 +83,35 @@ impl LogindSession {
         Err(DbusError::Malformed)
     }
 
+    /// The id of the session this process belongs to, e.g. `"c2"`.
+    ///
+    /// Polkit identifies an authentication agent by session *id*, not by the
+    /// session's object path, so a caller registering an agent needs this
+    /// rather than [`Self::own_path`]'s result.
+    ///
+    /// Reads the `Id` property of our own session object, so it agrees with
+    /// logind even when `XDG_SESSION_ID` is unset or stale.
+    pub fn own_session_id(conn: &mut DbusConn) -> Result<String, DbusError> {
+        let session_path = Self::own_path(conn)?;
+        let reply = conn.call(
+            DEST,
+            &session_path,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            &[
+                BodyArg::Str(SESSION_IFACE.to_string()),
+                BodyArg::Str("Id".to_string()),
+            ],
+        )?;
+        reply
+            .values()
+            .into_iter()
+            .next()
+            .map(Value::into_inner)
+            .and_then(|v| v.as_display_string())
+            .ok_or(DbusError::Malformed)
+    }
+
     /// Set `/sys/class/backlight/<name>/brightness` to `value`.
     ///
     /// Calls `Session.SetBrightness("backlight", name, value)` on our own

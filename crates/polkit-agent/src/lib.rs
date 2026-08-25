@@ -22,11 +22,15 @@
 //! the caller into the socket and the buffer holding it is wiped.
 
 pub mod agent_identity;
+pub mod agent_registration;
+pub mod auth_request;
 #[cfg(test)]
 mod fake_helper;
 pub mod helper_line;
 pub mod helper_session;
 
 pub use agent_identity::AgentIdentity;
+pub use agent_registration::AgentRegistration;
+pub use auth_request::AuthRequest;
 pub use helper_line::HelperLine;
 pub use helper_session::{AuthOutcome, HelperSession, SessionError};

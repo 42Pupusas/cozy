@@ -154,7 +154,17 @@ impl MountProbe {
             println!("  {action}\n    -> {verdict}");
         }
 
+        Self::probe_session_id(&mut conn);
         Self::probe_real_mount(&mut conn);
+    }
+
+    /// The session id polkit needs to register an agent.
+    fn probe_session_id(conn: &mut DbusConn) {
+        println!("\nlogind session:\n");
+        match dbus::logind::LogindSession::own_session_id(conn) {
+            Ok(id) => println!("  our session id -> {id:?}"),
+            Err(err) => println!("  could not resolve a session id: {err:?}"),
+        }
     }
 
     /// Attempt a mount that cannot succeed, to see which error the bus

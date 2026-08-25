@@ -21,6 +21,8 @@
 //! [`MountError::NeedsAuthorization`], and it is a normal outcome rather than
 //! a bug: the caller is expected to run an agent and retry.
 
+use crate::call_flags::CallFlags;
+use crate::call_target::CallTarget;
 use crate::conn::{DbusConn, DbusError};
 use crate::mount_options::MountOptions;
 use crate::unit_name::UnitName;
@@ -155,13 +157,11 @@ impl TransientMount {
             Value::Array(vec![]),
         ];
         let reply = conn
-            .call_with_values(
-                DEST,
-                MANAGER_PATH,
-                MANAGER_IFACE,
-                "StartTransientUnit",
+            .call_with_flags(
+                CallTarget::new(DEST, MANAGER_PATH, MANAGER_IFACE, "StartTransientUnit"),
                 &values,
                 "ssa(sv)a(sa(sv))",
+                CallFlags::allow_interactive_authorization(),
             )
             .map_err(|err| MountError::from_dbus(&err))?;
         reply
@@ -197,7 +197,12 @@ impl TransientUnmount {
             Value::Str(String::from("replace")),
         ];
         let reply = conn
-            .call_with_values(DEST, MANAGER_PATH, MANAGER_IFACE, "StopUnit", &values, "ss")
+            .call_with_flags(
+                CallTarget::new(DEST, MANAGER_PATH, MANAGER_IFACE, "StopUnit"),
+                &values,
+                "ss",
+                CallFlags::allow_interactive_authorization(),
+            )
             .map_err(|err| MountError::from_dbus(&err))?;
         reply
             .values()
@@ -351,6 +356,44 @@ mod tests {
         ];
         let body = crate::marshal::Marshaller::marshal_body(&values, "ssa(sv)a(sa(sv))");
         assert!(body.is_some(), "the body must marshal");
+    }
+
+    /// The flag that makes a prompt possible. Without it polkit refuses
+    /// instead of asking, so a perfectly correct authentication agent is
+    /// never consulted -- which is exactly what happened on the first live
+    /// run. Pinned on the wire, since the failure is silent.
+    #[test]
+    fn the_mount_call_permits_an_interactive_prompt() {
+        let flags = CallFlags::allow_interactive_authorization();
+        let frame = crate::message::MessageBuilder::build_method_call_with_flags(
+            1,
+            CallTarget::new(DEST, MANAGER_PATH, MANAGER_IFACE, "StartTransientUnit"),
+            &[Value::Str(String::from("x")), Value::Str(String::new())],
+            "ss",
+            flags,
+        )
+        .expect("the frame builds");
+        assert_eq!(
+            frame[2] & 0x4,
+            0x4,
+            "the flags byte must carry ALLOW_INTERACTIVE_AUTHORIZATION"
+        );
+    }
+
+    /// And the default stays off, so no existing caller starts prompting.
+    #[test]
+    fn an_ordinary_call_does_not_permit_a_prompt() {
+        let frame = crate::message::MessageBuilder::build_method_call_with_values(
+            1,
+            DEST,
+            MANAGER_PATH,
+            MANAGER_IFACE,
+            "ListUnits",
+            &[],
+            "",
+        )
+        .expect("the frame builds");
+        assert_eq!(frame[2], 0, "an ordinary call carries no flags");
     }
 
     /// Unmounting names the same unit as mounting, so the two cannot drift.

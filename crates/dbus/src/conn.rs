@@ -692,6 +692,33 @@ impl DbusConn {
         Ok(reply)
     }
 
+    /// The same, with an explicit flags byte.
+    ///
+    /// A caller that expects the user to be asked for a password must pass
+    /// `CallFlags::allow_interactive_authorization()`; without it a
+    /// polkit-guarded method refuses instead of prompting, however correct
+    /// the session's authentication agent is.
+    pub fn call_with_flags(
+        &mut self,
+        target: crate::call_target::CallTarget<'_>,
+        values: &[crate::value::Value],
+        signature: &str,
+        flags: crate::call_flags::CallFlags,
+    ) -> Result<Reply, DbusError> {
+        let serial = self.take_serial();
+        let msg = crate::message::MessageBuilder::build_method_call_with_flags(
+            serial, target, values, signature, flags,
+        )
+        .ok_or(DbusError::Malformed)?;
+        self.send_raw(&msg)?;
+        let reply = self.await_reply(serial)?;
+        if reply.kind == MessageType::Error {
+            let name = reply.error_name.unwrap_or_default();
+            return Err(DbusError::Reply { name });
+        }
+        Ok(reply)
+    }
+
     fn call_raw(
         &mut self,
         destination: &str,

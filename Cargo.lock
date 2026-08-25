@@ -384,6 +384,7 @@ name = "polkit-agent"
 version = "0.1.0"
 dependencies = [
  "dbus",
+ "dbus-server",
 ]
 
 [[package]]

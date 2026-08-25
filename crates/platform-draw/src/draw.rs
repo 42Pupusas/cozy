@@ -464,6 +464,32 @@ impl<'a> Canvas<'a> {
         self.fill_rect_packed(rect, self.format.pack_glass(color));
     }
 
+    /// Composite `color` at `alpha/255` over everything already in `rect`.
+    ///
+    /// The rect-sized companion to [`Self::blend_pixel`], and the primitive a
+    /// modal scrim needs: [`Self::fill_rect`] would *replace* the pixels and
+    /// hide the window entirely, while [`Self::fill_rect_argb`] treats alpha
+    /// as the paint's own and writes it into the buffer -- correct for a
+    /// shaped surface, wrong for dimming one thing behind another.
+    ///
+    /// Delegates the compositing algebra to the surface's [`SurfaceFormat`]
+    /// for the same reason `blend_pixel` does: on a translucent surface the
+    /// destination is premultiplied, and treating it as straight RGB darkens
+    /// every blended pixel by the window's own alpha.
+    pub fn blend_rect(&mut self, rect: Rect, color: Color, alpha: u8) {
+        let Some((x0, y0, x1, y1)) = self.clip(rect) else {
+            return;
+        };
+        let w = self.width.cast_unsigned() as usize;
+        for y in y0..y1 {
+            let row = (y.cast_unsigned() as usize) * w;
+            for x in x0..x1 {
+                let idx = row + x.cast_unsigned() as usize;
+                self.pixels[idx] = self.format.blend_over(self.pixels[idx], color, alpha);
+            }
+        }
+    }
+
     /// Fill `rect` with `color` honouring **`color`'s own alpha channel**,
     /// packed premultiplied as `wl_shm` requires.
     ///
@@ -823,6 +849,65 @@ mod tests {
         assert_eq!(buf[8 + 2], w);
         // ...corners untouched.
         assert_eq!(buf[0], 0);
+        assert_eq!(buf[3 * 4 + 3], 0);
+    }
+
+    /// A scrim must *dim* what is behind it, not replace it -- otherwise a
+    /// modal blacks out the row the user just clicked and removes the
+    /// context for the question it is asking.
+    #[test]
+    fn blend_rect_dims_what_is_behind_it_rather_than_replacing_it() {
+        let mut buf = canvas_buf(4, 4);
+        let mut c = Canvas::new(&mut buf, 4, 4);
+        c.fill_rect(Rect::new(0, 0, 4, 4), Color::WHITE);
+        c.blend_rect(Rect::new(0, 0, 4, 4), Color::BLACK, 128);
+        let pixel = buf[0];
+        assert_ne!(pixel, Color::WHITE.to_xrgb8888(), "it must darken");
+        assert_ne!(pixel, Color::BLACK.to_xrgb8888(), "but not to black");
+    }
+
+    /// Full alpha is the degenerate case and must land on the solid colour,
+    /// so a caller can sweep the strength without a special case at the end.
+    #[test]
+    fn blend_rect_at_full_alpha_is_a_solid_fill() {
+        let mut buf = canvas_buf(4, 4);
+        let mut c = Canvas::new(&mut buf, 4, 4);
+        c.fill_rect(Rect::new(0, 0, 4, 4), Color::WHITE);
+        c.blend_rect(Rect::new(0, 0, 4, 4), Color::BLACK, 255);
+        assert_eq!(buf[0], Color::BLACK.to_xrgb8888());
+    }
+
+    /// Zero alpha must be a no-op, not a silent clear.
+    #[test]
+    fn blend_rect_at_zero_alpha_changes_nothing() {
+        let mut buf = canvas_buf(4, 4);
+        let mut c = Canvas::new(&mut buf, 4, 4);
+        c.fill_rect(Rect::new(0, 0, 4, 4), Color::WHITE);
+        let before = buf.clone();
+        Canvas::new(&mut buf, 4, 4).blend_rect(Rect::new(0, 0, 4, 4), Color::BLACK, 0);
+        assert_eq!(buf, before);
+    }
+
+    /// A scrim covers the whole window, so it is always clipped; a stray
+    /// write outside the canvas would be a buffer overrun.
+    #[test]
+    fn blend_rect_clips_to_the_canvas() {
+        let mut buf = canvas_buf(4, 4);
+        let mut c = Canvas::new(&mut buf, 4, 4);
+        c.blend_rect(Rect::new(-10, -10, 100, 100), Color::WHITE, 255);
+        assert_eq!(buf[0], Color::WHITE.to_xrgb8888());
+        assert_eq!(buf[15], Color::WHITE.to_xrgb8888());
+    }
+
+    /// Only the named rectangle may be touched, or a modal would dim the
+    /// area it is supposed to leave alone.
+    #[test]
+    fn blend_rect_writes_only_inside() {
+        let mut buf = canvas_buf(4, 4);
+        let mut c = Canvas::new(&mut buf, 4, 4);
+        c.blend_rect(Rect::new(1, 1, 2, 2), Color::WHITE, 255);
+        assert_eq!(buf[4 + 1], Color::WHITE.to_xrgb8888());
+        assert_eq!(buf[0], 0, "outside the rect is untouched");
         assert_eq!(buf[3 * 4 + 3], 0);
     }
 

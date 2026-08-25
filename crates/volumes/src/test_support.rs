@@ -51,6 +51,32 @@ pub mod fixtures {
 26 25 8:1 / /boot rw,relatime shared:2 - ext2 /dev/sda1 rw
 40 25 8:33 / /media/backup rw,relatime shared:3 - ext4 /dev/sdc1 rw
 ";
+
+    /// A udev record for a `vfat` partition, trimmed from this machine's
+    /// `/run/udev/data/b259:1`. Keeps the `S:` symlink lines and the
+    /// trailers, because ignoring them is part of what is tested.
+    pub const UDEV_VFAT_PARTITION: &str = "\
+S:disk/by-label/EFI
+S:disk/by-partuuid/81203d92-7a40-4a7d-b67a-0b8f858a11ba
+I:6945096
+E:ID_PART_ENTRY_NAME=EFI\\x20System
+E:ID_FS_LABEL=EFI
+E:ID_FS_UUID=D7BC-1ECA
+E:ID_FS_VERSION=FAT32
+E:ID_FS_TYPE=vfat
+E:ID_FS_USAGE=filesystem
+G:systemd
+V:1
+";
+
+    /// A udev record for swap, which carries an `ID_FS_TYPE` while being
+    /// entirely unmountable.
+    pub const UDEV_SWAP: &str = "\
+E:ID_FS_LABEL=zram0
+E:ID_FS_TYPE=swap
+E:ID_FS_USAGE=other
+V:1
+";
 }
 
 /// Monotonic counter keeping scratch directories unique across parallel
@@ -93,6 +119,16 @@ impl TempDir {
         full
     }
 
+    /// The fake `/run/udev/data` directory.
+    pub fn udev_data(&self) -> PathBuf {
+        self.path.join("data")
+    }
+
+    /// Write a udev record for a block device, named as udev names it.
+    pub fn udev_block(&self, major: u32, minor: u32, contents: &str) {
+        self.write(&format!("data/b{major}:{minor}"), contents);
+    }
+
     /// The fake `/sys/class/block` directory.
     ///
     /// Callers pass this to `DeviceClass::of_device_in`, exactly as
@@ -127,6 +163,28 @@ impl TempDir {
         let node = format!("devices/{bus_path}/block/{disk}/{partition}");
         self.write(&format!("{node}/partition"), &format!("{number}\n"));
         self.link_into_class(&node, partition);
+    }
+
+    /// Give a device the `dev` and `size` files a real node carries.
+    ///
+    /// `partition` names the partition when the numbers belong to one, or is
+    /// `None` for the disk itself. `sectors` is in 512-byte units, exactly as
+    /// the kernel writes it.
+    pub fn sized(
+        &self,
+        bus_path: &str,
+        disk: &str,
+        partition: Option<&str>,
+        major: u32,
+        minor: u32,
+        sectors: u64,
+    ) {
+        let node = partition.map_or_else(
+            || format!("devices/{bus_path}/block/{disk}"),
+            |part| format!("devices/{bus_path}/block/{disk}/{part}"),
+        );
+        self.write(&format!("{node}/dev"), &format!("{major}:{minor}\n"));
+        self.write(&format!("{node}/size"), &format!("{sectors}\n"));
     }
 
     /// Symlink `class/block/<name>` to a node in the fake device tree.

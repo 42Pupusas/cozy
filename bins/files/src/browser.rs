@@ -34,6 +34,7 @@ use widget::{GridPane, ListCommand, ListPane, Mods, PaneResponse, TextInput};
 use crate::clipboard::{FileClipboard, Transfer};
 use crate::history::{History, Trail};
 use crate::keymap::{Action, EditAction, Focus, Keymap};
+use crate::password_modal::PasswordModal;
 use crate::rename::Rename;
 
 /// Which presentation is active for the current directory.
@@ -66,6 +67,17 @@ pub enum Outcome {
     /// Show or hide the places pane -- a property of the window's layout,
     /// not of the directory being browsed.
     ToggleSidebar,
+    /// Attach the removable device the sidebar is pointing at.
+    ///
+    /// Bubbled up for the same reason as [`Self::Open`]: mounting needs a bus
+    /// connection, a polkit agent and a worker thread, none of which belong
+    /// to a headless state machine.
+    Mount,
+    /// The user answered the password prompt, or dismissed it with `None`.
+    ///
+    /// Carried out rather than handled here because the reply belongs to a
+    /// conversation running on another thread.
+    Password(Option<String>),
     /// The user asked to close the window.
     Quit,
 }
@@ -106,6 +118,8 @@ pub struct Browser {
     trash: Option<fileops::Trash>,
     /// The inline rename box, when F2 has opened one.
     rename: Rename,
+    /// The password prompt, when a mount has provoked one.
+    password: PasswordModal,
     /// The outcome of the last file operation, shown in the status line.
     ///
     /// Separate from `error`, which describes the *directory* rather than an
@@ -144,6 +158,7 @@ impl Browser {
             clipboard: FileClipboard::new(),
             trash: None,
             rename: Rename::new(),
+            password: PasswordModal::new(),
             notice: None,
         })
     }
@@ -373,6 +388,12 @@ impl Browser {
         match action {
             Action::List(cmd) => self.list_command(cmd),
             Action::Insert(c) => {
+                // The password prompt takes precedence over both: it is a
+                // modal, and a character typed into it must never reach the
+                // filter box, where it would be visible on screen.
+                if self.password.is_open() {
+                    return Outcome::redraw_if(self.password.insert(c));
+                }
                 // An open rename box takes the character; it is editing one
                 // file's name, and re-routing to the filter would rewrite
                 // the listing out from under it.
@@ -386,6 +407,14 @@ impl Browser {
                     .or_redraw(self.keymap.is_filtering())
             }
             Action::Edit(edit) => {
+                if self.password.is_open() {
+                    // Backspace is the only edit the prompt accepts; the
+                    // keymap sends no other, and anything else must not fall
+                    // through to the filter behind the modal.
+                    return Outcome::redraw_if(
+                        matches!(edit, EditAction::Backspace) && self.password.backspace(),
+                    );
+                }
                 if self.rename.is_active() {
                     return Outcome::redraw_if(self.edit_rename(edit));
                 }
@@ -435,6 +464,10 @@ impl Browser {
             Action::BeginRename => self.begin_rename(),
             Action::CommitRename => self.commit_rename(),
             Action::CancelRename => self.cancel_rename(),
+            Action::Mount => Outcome::Mount,
+            Action::SubmitPassword => self.submit_password(),
+            Action::DismissPassword => self.dismiss_password(),
+            Action::ClearPassword => Outcome::redraw_if(self.password.clear()),
             Action::Quit => Outcome::Quit,
         }
     }
@@ -495,6 +528,12 @@ impl Browser {
     #[must_use]
     pub fn notice(&self) -> Option<&str> {
         self.notice.as_deref()
+    }
+
+    /// Report the result of an action the window performed on the browser's
+    /// behalf, such as a mount.
+    pub fn set_notice(&mut self, message: String) {
+        self.notice = Some(message);
     }
 
     fn copy_selection(&mut self) -> Outcome {
@@ -691,6 +730,58 @@ impl Browser {
                 Outcome::Redraw
             }
         }
+    }
+
+    /// The password prompt, for the window to paint.
+    #[must_use]
+    pub const fn password(&self) -> &PasswordModal {
+        &self.password
+    }
+
+    /// Open the password prompt, taking the keyboard.
+    ///
+    /// The focus change is the load-bearing half: without it the next
+    /// keystroke would reach the file list, and the user typing a password
+    /// would be issuing shortcuts against their own files.
+    pub fn begin_password(&mut self, prompt: &str, echo: bool) {
+        self.password.open(prompt, echo);
+        self.keymap.set_focus(Focus::Password);
+    }
+
+    /// Record a notice from the authentication helper.
+    pub fn set_password_notice(&mut self, message: &str) {
+        self.password.set_notice(message);
+    }
+
+    /// Close the prompt and return the keyboard to the list.
+    ///
+    /// Used when the conversation ends on its own -- the mount finished while
+    /// the prompt was still up -- so the focus cannot be stranded in a mode
+    /// whose modal is gone, which would leave the browser accepting no keys.
+    pub fn end_password(&mut self) -> bool {
+        let closed = self.password.dismiss();
+        if self.keymap.is_prompting() {
+            self.keymap.set_focus(Focus::List);
+        }
+        closed
+    }
+
+    /// Send the typed reply, closing the prompt.
+    fn submit_password(&mut self) -> Outcome {
+        let Some(reply) = self.password.submit() else {
+            return Outcome::Ignored;
+        };
+        self.keymap.set_focus(Focus::List);
+        Outcome::Password(Some(reply))
+    }
+
+    /// Dismiss the prompt, answering nothing.
+    fn dismiss_password(&mut self) -> Outcome {
+        if !self.password.dismiss() {
+            return Outcome::Ignored;
+        }
+        self.keymap.set_focus(Focus::List);
+        Outcome::Password(None)
     }
 
     fn cancel_rename(&mut self) -> Outcome {

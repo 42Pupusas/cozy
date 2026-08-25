@@ -38,6 +38,12 @@ pub enum Focus {
     /// from under an open rename box would leave it editing a row the user
     /// is no longer looking at.
     Rename,
+    /// The password prompt. Letters type, and it is the most exclusive mode
+    /// of the four: a key that is not part of the reply is *swallowed*
+    /// rather than passed to the list. A password prompt that let Delete
+    /// through to the file list would trash the selection while the user
+    /// believed they were typing.
+    Password,
 }
 
 /// What a key press asked the application to do.
@@ -78,6 +84,14 @@ pub enum Action {
     Trash,
     /// Erase the selection outright, bypassing the trash (Shift-Delete).
     DeletePermanently,
+    /// Send the typed reply to the authentication conversation.
+    SubmitPassword,
+    /// Dismiss the password prompt without answering.
+    DismissPassword,
+    /// Erase everything typed into the password field (Ctrl-U).
+    ClearPassword,
+    /// Attach the removable device the sidebar cursor is on.
+    Mount,
     /// Open the inline rename box over the cursor row (F2).
     BeginRename,
     /// Apply the name typed into the rename box.
@@ -149,6 +163,15 @@ impl Keymap {
         matches!(self.focus, Focus::Rename)
     }
 
+    /// Whether the password prompt is active.
+    ///
+    /// The window asks this to decide whether to draw the modal and to stop
+    /// hover and click reaching the list behind it.
+    #[must_use]
+    pub const fn is_prompting(self) -> bool {
+        matches!(self.focus, Focus::Password)
+    }
+
     /// Move focus.
     pub const fn set_focus(&mut self, focus: Focus) {
         self.focus = focus;
@@ -161,6 +184,40 @@ impl Keymap {
             Focus::List => Self::in_list(press),
             Focus::Filter => Self::in_filter(press),
             Focus::Rename => Self::in_rename(press),
+            Focus::Password => Self::in_password(press),
+        }
+    }
+
+    /// Bindings while the password prompt has focus.
+    ///
+    /// Every key is either part of the reply or ends the prompt. Nothing
+    /// reaches the list, and nothing reaches the filter: the prompt is a
+    /// modal over a browser whose selection must not move while it is up.
+    ///
+    /// The caret keys are absent because the field has no caret -- with the
+    /// text concealed there is nothing to aim one at, and a caret the user
+    /// cannot see is a caret they will misplace. Backspace and Ctrl-U are
+    /// the whole editing vocabulary, which is what every other password
+    /// prompt on a Linux desktop offers.
+    const fn in_password(press: KeyPress) -> Option<Action> {
+        if press.modifiers.ctrl() {
+            return match press.key {
+                // Erase the lot and start again -- the standard answer to
+                // "I have lost track of what I typed".
+                Key::Char('u' | 'U') => Some(Action::ClearPassword),
+                // Ctrl-C is a dismissal here, matching every terminal
+                // password prompt. It must NOT reach the browser's copy.
+                Key::Char('c' | 'C') => Some(Action::DismissPassword),
+                _ => None,
+            };
+        }
+
+        match press.key {
+            Key::Enter => Some(Action::SubmitPassword),
+            Key::Escape => Some(Action::DismissPassword),
+            Key::Backspace => Some(Action::Edit(EditAction::Backspace)),
+            Key::Char(c) => Some(Action::Insert(c)),
+            _ => None,
         }
     }
 
@@ -773,6 +830,112 @@ mod tests {
             filter_map().translate(press(Key::Delete)),
             Some(Action::Edit(EditAction::Delete))
         );
+    }
+
+    fn password_map() -> Keymap {
+        let mut map = Keymap::new();
+        map.set_focus(Focus::Password);
+        map
+    }
+
+    #[test]
+    fn the_password_focus_is_reported_for_painting_the_modal() {
+        let map = password_map();
+        assert!(map.is_prompting());
+        assert!(!map.is_filtering());
+        assert!(!Keymap::new().is_prompting());
+    }
+
+    #[test]
+    fn typing_fills_the_password_reply() {
+        let map = password_map();
+        assert_eq!(map.translate(press(Key::Char('h'))), Some(Action::Insert('h')));
+        assert_eq!(
+            map.translate(press(Key::Char(' '))),
+            Some(Action::Insert(' ')),
+            "a passphrase may contain spaces"
+        );
+    }
+
+    #[test]
+    fn enter_submits_and_escape_dismisses_the_prompt() {
+        let map = password_map();
+        assert_eq!(map.translate(press(Key::Enter)), Some(Action::SubmitPassword));
+        assert_eq!(
+            map.translate(press(Key::Escape)),
+            Some(Action::DismissPassword)
+        );
+    }
+
+    #[test]
+    fn backspace_edits_the_reply_rather_than_leaving_the_directory() {
+        assert_eq!(
+            password_map().translate(press(Key::Backspace)),
+            Some(Action::Edit(EditAction::Backspace)),
+            "Backspace goes up a directory on the list; here it must not"
+        );
+    }
+
+    /// The worst possible bug in this mode: a key the prompt does not use
+    /// falling through to the list and acting on files the user cannot see
+    /// behind the modal.
+    #[test]
+    fn delete_is_swallowed_rather_than_trashing_the_selection() {
+        let map = password_map();
+        assert_eq!(
+            map.translate(press(Key::Delete)),
+            None,
+            "Delete must not trash files from behind a password prompt"
+        );
+        assert_eq!(
+            map.translate(with_mods(Key::Delete, SHIFT)),
+            None,
+            "nor may Shift-Delete erase them outright"
+        );
+    }
+
+    /// Ctrl-V behind a password prompt would paste the clipboard into the
+    /// open directory while the user believes they are typing a password.
+    #[test]
+    fn the_file_clipboard_verbs_do_not_reach_through_a_password_prompt() {
+        let map = password_map();
+        assert_eq!(map.translate(with_mods(Key::Char('x'), CTRL)), None);
+        assert_eq!(map.translate(with_mods(Key::Char('v'), CTRL)), None);
+    }
+
+    /// Ctrl-C is a dismissal at every terminal password prompt, and must not
+    /// be the browser's copy.
+    #[test]
+    fn ctrl_c_dismisses_the_prompt_rather_than_copying_files() {
+        assert_eq!(
+            password_map().translate(with_mods(Key::Char('c'), CTRL)),
+            Some(Action::DismissPassword)
+        );
+    }
+
+    #[test]
+    fn ctrl_u_clears_the_typed_reply() {
+        assert_eq!(
+            password_map().translate(with_mods(Key::Char('u'), CTRL)),
+            Some(Action::ClearPassword)
+        );
+    }
+
+    /// Quit must not be reachable either: the mount is mid-conversation, and
+    /// tearing the window down would abandon a registered polkit agent.
+    #[test]
+    fn quit_does_not_reach_through_a_password_prompt() {
+        assert_eq!(password_map().translate(with_mods(Key::Char('q'), CTRL)), None);
+    }
+
+    /// The selection must not move under the modal, or the user answers a
+    /// prompt and finds the cursor somewhere else.
+    #[test]
+    fn navigation_keys_do_not_move_the_list_behind_the_prompt() {
+        let map = password_map();
+        for key in [Key::Up, Key::Down, Key::PageUp, Key::PageDown, Key::Home, Key::End] {
+            assert_eq!(map.translate(press(key)), None, "{key:?} must be swallowed");
+        }
     }
 
     /// Readline motions are muscle memory in any text field.

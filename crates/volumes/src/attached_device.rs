@@ -27,6 +27,8 @@
 //! [`Volume`]: crate::volume::Volume
 
 use crate::block_device::BlockDevice;
+use crate::mount_point::MountPoint;
+use crate::mount_request::MountRequest;
 use crate::udev_properties::UdevProperties;
 use std::path::{Path, PathBuf};
 
@@ -73,6 +75,41 @@ impl AttachedDevice {
             major: device.major(),
             minor: device.minor(),
         })
+    }
+
+    /// Describe a device directly, without reading `/sys`.
+    ///
+    /// The counterpart to [`Self::describe`], which is the scanning path.
+    /// Public for the same reason [`crate::ScriptedBackend`] is: the
+    /// interesting tests for mounting live in the file browser, and they
+    /// cannot conjure a `/sys` tree and a udev record for a stick that is not
+    /// plugged in. [`crate::Volume::new`] is public for exactly this reason
+    /// already.
+    #[must_use]
+    pub fn new(
+        source: impl Into<String>,
+        label: Option<&str>,
+        fs_type: impl Into<String>,
+        bytes: u64,
+        major: u32,
+        minor: u32,
+    ) -> Self {
+        let source = source.into();
+        let name = Path::new(&source)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&source)
+            .to_owned();
+        Self {
+            source,
+            name,
+            label: label.map(str::to_owned),
+            fs_type: fs_type.into(),
+            bytes,
+            mounted_at: None,
+            major,
+            minor,
+        }
     }
 
     /// Record where this device is mounted.
@@ -140,6 +177,31 @@ impl AttachedDevice {
     #[must_use]
     pub const fn is_mountable(&self) -> bool {
         !self.is_mounted()
+    }
+
+    /// Describe the mount this device is asking for.
+    ///
+    /// `None` when the device is already mounted, or when the label yields no
+    /// usable path component -- see [`MountPoint`] for why a label may not be
+    /// turned into a path by concatenation.
+    ///
+    /// Built here rather than at the call site so that the destination is
+    /// derived from the label in exactly one place. A caller assembling its
+    /// own path would be re-deriving the sanitising, and getting it wrong
+    /// there means a privileged mounter attaching a filesystem over `/etc`.
+    #[must_use]
+    pub fn mount_request(&self, user: &str, uid: u32, gid: u32) -> Option<MountRequest> {
+        if self.is_mounted() {
+            return None;
+        }
+        let point = MountPoint::for_user(user, self.label(), &self.source)?;
+        Some(MountRequest::new(
+            self.source.clone(),
+            self.fs_type.clone(),
+            point,
+            uid,
+            gid,
+        ))
     }
 
     /// The name to show in the sidebar.
@@ -275,8 +337,58 @@ mod tests {
         assert_eq!(attached.display_name(), "EFI");
     }
 
+    #[test]
+    fn a_mountable_device_describes_the_mount_it_wants() {
+        let tmp = TempDir::new("attached-request");
+        let device = stick(&tmp, 1_024);
+        let props = UdevProperties::parse(fixtures::UDEV_VFAT_PARTITION);
+        let attached = AttachedDevice::describe(&device, &props).expect("mountable");
+        let request = attached.mount_request("ada", 1000, 1000).expect("a request");
+        assert_eq!(request.device(), "/dev/sdb1");
+        assert_eq!(request.fs_type(), "vfat");
+        assert_eq!(
+            request.mount_point().path(),
+            Path::new("/run/media/ada/EFI")
+        );
+    }
+
+    /// A label is chosen by whoever formatted the stick. Building the
+    /// destination by concatenation would let it escape the media root and
+    /// ask a privileged mounter to attach over a system directory.
+    #[test]
+    fn a_traversing_label_cannot_escape_the_media_root() {
+        let tmp = TempDir::new("attached-evil");
+        let device = stick(&tmp, 1_024);
+        let props = UdevProperties::parse(
+            "E:ID_FS_TYPE=vfat\nE:ID_FS_USAGE=filesystem\nE:ID_FS_LABEL=..\\x2f..\\x2fetc\n",
+        );
+        let attached = AttachedDevice::describe(&device, &props).expect("mountable");
+        let request = attached.mount_request("ada", 1000, 1000).expect("a request");
+        let path = request.mount_point().path();
+        assert_eq!(
+            path.parent(),
+            Some(Path::new("/run/media/ada")),
+            "the mount point must stay directly under the user's media root"
+        );
+        assert!(!path.to_string_lossy().contains("/etc"));
+    }
+
+    /// An already-mounted device has nothing to ask for, and re-mounting it
+    /// would attach a second copy over the first.
+    #[test]
+    fn a_mounted_device_asks_for_no_mount() {
+        let tmp = TempDir::new("attached-already");
+        let device = stick(&tmp, 1_024);
+        let props = UdevProperties::parse(fixtures::UDEV_VFAT_PARTITION);
+        let attached = AttachedDevice::describe(&device, &props)
+            .expect("mountable")
+            .mounted_at("/run/media/ada/EFI");
+        assert!(attached.mount_request("ada", 1000, 1000).is_none());
+    }
+
     /// The numbers are how this device is matched against the mount table,
     /// so they must survive being carried through.
+
     #[test]
     fn the_device_numbers_are_carried_for_matching() {
         let tmp = TempDir::new("attached-numbers");

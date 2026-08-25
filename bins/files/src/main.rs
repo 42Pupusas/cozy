@@ -29,9 +29,13 @@ mod keymap;
 mod kind_label;
 mod metric_overrides;
 mod moment;
+mod mount_service;
+mod mount_session;
 mod options;
+mod password_modal;
 mod rename;
 mod row_format;
+mod secret_input;
 mod sidebar;
 mod spacing;
 mod storage;
@@ -127,6 +131,11 @@ impl App {
         // desktop-wide setting moves every client together and the browser
         // does not sit among them as the one opaque window.
         let surface = platform::SurfaceFormat::from_opacity(cfg.files_opacity());
+        // Cloned before the toplevel takes ownership: the mount worker signals
+        // the same eventfd the loop sleeps on, which is what makes a password
+        // prompt appear the instant polkit asks rather than at the next
+        // unrelated event.
+        let mount_wake = wake.clone();
         let mut window = Toplevel::new_with_format(
             &browser.path().display().to_string(),
             "cozy.files",
@@ -146,6 +155,7 @@ impl App {
                 width: size.width,
                 height: size.height,
             },
+            mount_wake,
         );
         // Adopt the true physical size before the first paint.
         painter.resize(window.size());
@@ -206,13 +216,7 @@ impl App {
                 window.request_redraw();
             }
 
-            // Devices attach and detach without any input from the user, so
-            // this is the one thing in the loop that is not a response to an
-            // event. It is gated on an interval inside, so the common pass --
-            // a keystroke, a pointer motion -- costs a clock read.
-            if painter.poll_volumes() {
-                window.request_redraw();
-            }
+            Self::poll_storage(&mut window, &mut painter);
 
             // The title follows the directory, so the taskbar entry stays
             // meaningful as the user navigates. Compared first because
@@ -228,6 +232,28 @@ impl App {
             }
 
             window.wait(Self::IDLE_TIMEOUT_MS);
+        }
+    }
+
+    /// Poll the two storage sources that produce work without any input.
+    ///
+    /// Both are pulled once per pass, and neither is a response to an event:
+    ///
+    /// * Devices attach and detach on their own. That poll is interval-gated
+    ///   inside, so an ordinary pass costs a clock read.
+    /// * A mount runs on a worker thread, and its password prompt **blocks
+    ///   that thread** until this call collects it. A skipped pass is a
+    ///   worker left waiting and a modal that never appears, so this is the
+    ///   one poll here that must not be gated on anything.
+    ///
+    /// Both are called unconditionally, and the results combined afterwards:
+    /// `||` short-circuits, so a device change would skip the mount poll
+    /// entirely and strand the worker for as long as devices kept changing.
+    fn poll_storage(window: &mut Toplevel, painter: &mut FilesWindow) {
+        let devices = painter.poll_volumes();
+        let mount = painter.poll_mount();
+        if devices || mount {
+            window.request_redraw();
         }
     }
 

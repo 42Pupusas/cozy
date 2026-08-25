@@ -23,7 +23,11 @@ use crate::kind_label::KindLabel;
 use crate::moment::Moment;
 use crate::row_format::RowFormat;
 use crate::sidebar::{Sidebar, SidebarRow};
-use volumes::{VolumeFlush, VolumeWatch};
+use volumes::mount_backend::MountOutcome;
+use volumes::{AttachedDevice, VolumeFlush, VolumeWatch};
+
+use crate::mount_service::MountProgress;
+use crate::mount_session::{MountIdentity, MountSession};
 use crate::storage::Storage;
 use crate::theme::Theme;
 use crate::toolbar::{Target, Toolbar};
@@ -204,6 +208,14 @@ pub struct FilesWindow {
     drop_hover_row: Option<usize>,
     /// The floating "N items" label shown while a drag is in flight.
     drag_badge: DragBadge,
+    /// The mount in flight, and the identity mounts run as.
+    mount: MountSession,
+    /// The device a Mount action would attach.
+    ///
+    /// Held rather than re-derived at the moment of the action: the scan that
+    /// produced it walks `/sys` and udev, and the sidebar row the user
+    /// clicked is the thing that names it.
+    mount_candidate: Option<AttachedDevice>,
     /// Watches the mount table so attached devices appear and disappear.
     ///
     /// Held here rather than in the event loop because the sidebar it feeds
@@ -222,9 +234,12 @@ impl FilesWindow {
         sidebar: Sidebar,
         favorites: Favorites,
         size: PhysicalSize,
+        wake: waker::Waker,
     ) -> Self {
         Self {
             volumes: VolumeWatch::new(),
+            mount: MountSession::new(wake, MountIdentity::current()),
+            mount_candidate: None,
             browser,
             theme,
             type_scale,
@@ -436,8 +451,90 @@ impl FilesWindow {
             // footer is re-read on any redraw-worthy change. Cheap enough --
             // one `statvfs` per keystroke, not per frame.
             Outcome::Redraw => self.refresh_storage(),
+            Outcome::Mount => self.begin_mount(),
+            Outcome::Password(reply) => self.answer_password(reply),
             Outcome::Ignored => {}
         }
+    }
+
+    /// Start attaching the device the sidebar cursor names.
+    ///
+    /// Silent when the row is not an unmounted device: the action is offered
+    /// from a sidebar row, and a Mount that acted on whatever happened to be
+    /// selected would attach a device the user never pointed at.
+    fn begin_mount(&mut self) {
+        let Some(device) = self.mount_candidate.clone() else {
+            return;
+        };
+        if !self.mount.begin(&device) {
+            return;
+        }
+        self.browser
+            .set_notice(format!("Mounting {}...", device.display_name()));
+    }
+
+    /// Hand the user's reply to the waiting conversation.
+    ///
+    /// A dismissal abandons the mount outright rather than merely answering
+    /// `None`: the conversation would otherwise ask again, and a prompt the
+    /// user just closed reappearing is indistinguishable from a stuck window.
+    fn answer_password(&mut self, reply: Option<String>) {
+        let dismissed = reply.is_none();
+        self.mount.answer(reply);
+        if dismissed {
+            self.mount.abandon();
+            self.browser.set_notice(String::from("Mounting cancelled"));
+        }
+    }
+
+    /// Drain whatever the running mount has to say, returning whether the
+    /// window must repaint.
+    ///
+    /// Called once per pass of the event loop. A prompt arriving here is what
+    /// opens the modal, so this is the path that must not be skipped -- the
+    /// worker is blocked until it runs.
+    pub fn poll_mount(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(progress) = self.mount.poll() {
+            changed = true;
+            match progress {
+                MountProgress::Prompt { prompt, echo } => {
+                    self.browser.begin_password(&prompt, echo);
+                }
+                MountProgress::Notice(message) => {
+                    self.browser.set_password_notice(&message);
+                }
+                MountProgress::Finished(outcome) => self.finish_mount(&outcome),
+            }
+        }
+        changed
+    }
+
+    /// Report a finished mount and show the new volume.
+    ///
+    /// The prompt is closed first and unconditionally: a conversation can end
+    /// while its question is still on screen -- the authorization was cached,
+    /// or another agent answered -- and a modal left open over a finished
+    /// mount holds the keyboard in a mode with nothing to answer.
+    fn finish_mount(&mut self, outcome: &MountOutcome) {
+        self.browser.end_password();
+        self.browser.set_notice(Self::describe_mount(outcome));
+        if outcome.is_mounted() {
+            // The new volume is not in the mount table this window last read,
+            // so the sidebar would not show it until the poll interval
+            // elapsed -- seconds after the user typed their password.
+            self.volumes.poll();
+            self.rebuild_sidebar();
+            self.refresh_storage();
+        }
+    }
+
+    /// The status line for a finished mount.
+    fn describe_mount(outcome: &MountOutcome) -> String {
+        outcome.message().unwrap_or_else(|| match outcome {
+            MountOutcome::Cancelled => String::from("Mounting cancelled"),
+            _ => String::from("Device mounted"),
+        })
     }
 
     /// Convert a pointer position into list-pane coordinates.
@@ -1957,7 +2054,15 @@ mod tests {
         // without depending on anything in the developer's home.
         let browser = crate::browser::Browser::open(&std::env::temp_dir(), 700, 400, 28)
             .expect("the temp dir must be listable");
-        let mut painter = FilesWindow::new(browser, theme, type_scale, sidebar, favorites, size);
+        let mut painter = FilesWindow::new(
+            browser,
+            theme,
+            type_scale,
+            sidebar,
+            favorites,
+            size,
+            waker::Waker::new().expect("an eventfd"),
+        );
         let px = (size.width * size.height).cast_unsigned() as usize;
         let mut buf = vec![0u32; px];
         {
@@ -2038,7 +2143,15 @@ mod tests {
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
         let browser = crate::browser::Browser::open(&std::env::temp_dir(), 700, 400, 28)
             .expect("the temp dir must be listable");
-        let mut painter = FilesWindow::new(browser, theme, type_scale, sidebar, favorites, size);
+        let mut painter = FilesWindow::new(
+            browser,
+            theme,
+            type_scale,
+            sidebar,
+            favorites,
+            size,
+            waker::Waker::new().expect("an eventfd"),
+        );
         let px = (size.width * size.height).cast_unsigned() as usize;
         // A sentinel the painter can never legitimately produce on an opaque
         // surface, where every packed word has a zero top byte.
@@ -2089,7 +2202,15 @@ mod tests {
         let user_dirs = user_dirs::UserDirs::load();
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
         let browser = crate::browser::Browser::open(&root, 700, 400, 28).expect("listable");
-        let painter = FilesWindow::new(browser, theme, type_scale, sidebar, favorites, size);
+        let painter = FilesWindow::new(
+            browser,
+            theme,
+            type_scale,
+            sidebar,
+            favorites,
+            size,
+            waker::Waker::new().expect("an eventfd"),
+        );
         (painter, root, size)
     }
 

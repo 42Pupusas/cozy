@@ -45,6 +45,13 @@ fileops  = { path = "../../crates/fileops" }
 # cards are attached, read from the kernel's own tables rather than from a
 # UDisks2 daemon that is not installed on every machine.
 volumes  = { path = "../../crates/volumes" }
+# The privileged half of mounting: a transient systemd `.mount` unit, and the
+# polkit agent that answers the password prompt it provokes. Split from
+# `volumes` so that listing storage keeps needing no bus at all.
+mounter  = { path = "../../crates/mounter" }
+# Only for the real uid behind a mount request: `vfat` stores no ownership, so
+# the mounter must be told who the files belong to.
+dbus     = { path = "../../crates/dbus" }
 # The XDG user directories the sidebar's "places" section lists, shared with
 # `bins/xdg-user-dirs` so the reader and the writer cannot disagree about the
 # `user-dirs.dirs` format.

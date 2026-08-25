@@ -380,6 +380,13 @@ name = "platform-wire"
 version = "0.1.0"
 
 [[package]]
+name = "polkit-agent"
+version = "0.1.0"
+dependencies = [
+ "dbus",
+]
+
+[[package]]
 name = "portal-bin"
 version = "0.1.0"
 dependencies = [

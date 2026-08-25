@@ -1,0 +1,13 @@
+[package]
+name    = "polkit-agent"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The agent is a D-Bus service (it owns an object implementing
+# org.freedesktop.PolicyKit1.AuthenticationAgent), so it needs the bus. The
+# PAM conversation itself is a plain unix socket and needs nothing.
+dbus = { path = "../dbus" }

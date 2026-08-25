@@ -632,6 +632,32 @@ impl Sender {
         self.sock_owned.try_clone()
     }
 
+    /// Tear down both directions of a connection, leaving the descriptor open.
+    const SHUT_RDWR: i32 = 2;
+
+    /// Half-close the connection so the reader's blocking recv returns EOF,
+    /// **without** closing the file descriptor.
+    ///
+    /// This is the shutdown signal the two threads lacked. Dropping the
+    /// `Sender` also unblocks the reader, but by closing the fd *number* the
+    /// reader's in-flight `recvmsg` was submitted against -- so the recv
+    /// completes `EBADF` and the reader reports an I/O failure on a perfectly
+    /// clean exit.
+    ///
+    /// `shutdown(SHUT_RDWR)` instead tears down the *connection* while the
+    /// descriptor stays valid: the compositor sees the disconnect, the recv
+    /// completes with a zero-length read, and the reader recognises real EOF.
+    /// Close the fd afterwards, once the reader has been joined.
+    pub fn shutdown(&self) -> io::Result<()> {
+        // SAFETY: `sock_owned` is a valid open socket for the whole call, and
+        // `shutdown` only affects the connection, never the descriptor.
+        let result = unsafe { libc_shutdown(self.sock_owned.as_raw_fd(), Self::SHUT_RDWR) };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Create a stub `Sender` that panics on any I/O attempt.
     /// Used by the winit-paint backend before the real connection is wired up.
     #[doc(hidden)]
@@ -1069,6 +1095,11 @@ impl CqeFlagsExt for CqeFlags {
 unsafe extern "C" {
     #[link_name = "socket"]
     fn libc_socket(domain: i32, ty: i32, protocol: i32) -> i32;
+
+    /// Half-close a connection while leaving the descriptor open, so a
+    /// blocked reader sees EOF rather than the `EBADF` a `close` produces.
+    #[link_name = "shutdown"]
+    fn libc_shutdown(fd: i32, how: i32) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,5 +1246,77 @@ impl Sender {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::Reader;
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::net::UnixStream;
+
+    /// The distinction the whole fix rests on, asserted against real
+    /// sockets rather than assumed from the manual page.
+    ///
+    /// A blocked reader must see a zero-length read (EOF) after a
+    /// `shutdown`, and the descriptor must still be usable -- that is what
+    /// lets the reader be joined *before* the fd is closed.
+    #[test]
+    fn shutdown_yields_eof_while_the_descriptor_stays_open() {
+        let (a, b) = UnixStream::pair().expect("a socket pair");
+        let raw = a.as_raw_fd();
+        // SAFETY: `a` is a live socket for the whole call.
+        let result = unsafe { super::libc_shutdown(raw, super::Sender::SHUT_RDWR) };
+        assert_eq!(result, 0, "shutdown must succeed on a connected socket");
+
+        let mut buf = [0_u8; 8];
+        let read = (&b).read(&mut buf).expect("the peer reads rather than erroring");
+        assert_eq!(read, 0, "a shut-down connection must report EOF");
+
+        // The descriptor is still ours: `fcntl(F_GETFD)` succeeds only while
+        // it is open, which is exactly the property that makes joining the
+        // reader before dropping the sender safe.
+        // SAFETY: `raw` is `a`'s live descriptor; F_GETFD only reads flags.
+        let flags = unsafe { libc_fcntl(raw, 1) };
+        assert!(flags >= 0, "the descriptor must remain open after shutdown");
+    }
+
+    /// The failure the user actually saw. Closing the descriptor while a
+    /// read is outstanding is what produces `EBADF`; the point of the fix
+    /// is that a clean close no longer takes this path.
+    #[test]
+    fn a_closed_descriptor_is_the_bad_file_descriptor_case() {
+        let (a, _b) = UnixStream::pair().expect("a socket pair");
+        let raw = a.as_raw_fd();
+        // SAFETY: adopting the descriptor to close it deterministically.
+        drop(unsafe { OwnedFd::from_raw_fd(raw) });
+        std::mem::forget(a);
+
+        // SAFETY: `raw` is now closed; F_GETFD reports that rather than
+        // dereferencing anything.
+        let flags = unsafe { libc_fcntl(raw, 1) };
+        assert_eq!(flags, -1, "a closed descriptor must not read as open");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(9),
+            "EBADF is what the reader reported on a clean exit"
+        );
+    }
+
+    /// EOF is classified as a closed connection rather than an I/O error,
+    /// so the reader returns `Ok` and the window reports no failure.
+    #[test]
+    fn a_zero_length_read_is_not_an_error_errno() {
+        assert!(
+            !Reader::errno_is_disconnect(9),
+            "EBADF is a genuine fault, not a disconnect -- so it must never \
+             be produced by an ordinary close"
+        );
+    }
+
+    unsafe extern "C" {
+        #[link_name = "fcntl"]
+        fn libc_fcntl(fd: i32, cmd: i32) -> i32;
     }
 }

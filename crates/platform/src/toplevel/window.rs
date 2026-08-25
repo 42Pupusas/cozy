@@ -997,9 +997,14 @@ impl Toplevel {
     /// later -- which prints an alarming "connection wedged" line on every
     /// clean exit.
     ///
-    /// So: send the destroy requests, flush them, then **drop the sender**
-    /// (closing the socket, which the compositor sees as a disconnect and
-    /// the reader sees as EOF), and only then join.
+    /// So: send the destroy requests, flush them, **shut the socket down**,
+    /// join the reader, and only then drop the sender.
+    ///
+    /// Shutting down rather than dropping is the whole point. Both unblock
+    /// the reader, but a drop closes the descriptor the reader's in-flight
+    /// `recvmsg` was submitted against, so the recv completes `EBADF` and a
+    /// clean exit prints an I/O error. `shutdown` ends the connection while
+    /// the descriptor stays valid, so the recv completes with a real EOF.
     pub fn close(self) -> Result<()> {
         // Partial move rather than `&mut` field juggling; `Toplevel` has no
         // `Drop` impl, so destructuring is allowed and makes the ordering
@@ -1015,28 +1020,24 @@ impl Toplevel {
 
         shell.destroy(&window_tx);
         let _ = sender.drain_requests(&mut request_rx);
-        // Closes the socket, so the reader's blocking recv completes and its
-        // loop returns promptly instead of parking until its watchdog fires.
-        drop(sender);
+        // Ends the connection so the reader's blocking recv completes with a
+        // zero-length read -- real EOF, which its loop already recognises --
+        // instead of parking until its watchdog fires. The descriptor stays
+        // open until `sender` drops below, *after* the join, so the recv
+        // io_uring submitted against this fd number can never fail `EBADF`.
+        let _ = sender.shutdown();
 
-        // The reader's I/O result is deliberately discarded here, and only
-        // here -- on a shutdown *we* initiated.
-        //
-        // The reader submits its `recvmsg` against the socket's raw fd
-        // *number*. Dropping the `Sender` closes that number, so an
-        // in-flight recv completes with `EBADF`. (A dup'd `OwnedFd` keeps
-        // the underlying description alive but does not help: io_uring has
-        // already captured the integer.) Short of a shutdown protocol
-        // between the two threads, this error is the unavoidable and
-        // *expected* signature of a clean close.
-        //
-        // A reader that dies mid-session is still reported: `tick()`
-        // observes it via `ReaderHealth` and returns `PlatformError::ReaderStopped`.
-        reader.map_or(Ok(()), |handle| {
+        // A reader that dies mid-session is still reported separately:
+        // `tick()` observes it via `ReaderHealth` and returns
+        // `PlatformError::ReaderStopped`.
+        let joined = reader.map_or(Ok(()), |handle| {
             // A panic is never expected, so it still propagates.
             handle
                 .join()
-                .map_or(Err(PlatformError::ReaderPanicked), |_| Ok(()))
-        })
+                .map_or(Err(PlatformError::ReaderPanicked), |result| result)
+        });
+        // Only now is the descriptor unreferenced by the reader's ring.
+        drop(sender);
+        joined
     }
 }

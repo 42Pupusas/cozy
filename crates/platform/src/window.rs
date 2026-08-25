@@ -2546,7 +2546,18 @@ impl TermWindow {
     }
 
     /// Gracefully close the window and join the reader thread.
+    ///
+    /// The socket is shut down first. Without it the reader stays parked on
+    /// a connection nobody will ever write to again, and only its
+    /// no-progress watchdog releases it -- 4096 completions later, printing
+    /// a "connection wedged" line on an ordinary exit.
+    ///
+    /// `shutdown` rather than closing the descriptor: the reader's recv was
+    /// submitted against this fd *number*, so closing it first completes
+    /// that recv with `EBADF` and turns a clean exit into a reported I/O
+    /// error. The descriptor stays open until `self` drops, after the join.
     pub fn close(mut self) -> Result<()> {
+        let _ = self.sender.shutdown();
         self.join_reader()
     }
 }

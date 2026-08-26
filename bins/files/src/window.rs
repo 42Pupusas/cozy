@@ -649,15 +649,18 @@ impl FilesWindow {
         let outcome = match target {
             Target::Back => self.browser.go_back(),
             Target::Forward => self.browser.go_forward(),
+            // The same action the keyboard's Left and Backspace already
+            // reach, so the button and the key cannot diverge.
+            Target::Up => self.browser.act(crate::keymap::Action::GoUp),
             Target::ToggleHidden => self.browser.act(crate::keymap::Action::ToggleHidden),
             Target::Filter => self.browser.focus_filter(),
             Target::ViewList => self.browser.set_view_mode(ViewMode::List),
             Target::ViewGrid => self.browser.set_view_mode(ViewMode::Grid),
         };
         self.apply(outcome);
-        // Back and forward can cross a filesystem boundary, exactly as a
+        // Every navigation can cross a filesystem boundary, exactly as a
         // sidebar jump can, so the storage footer must be re-read.
-        if matches!(target, Target::Back | Target::Forward) {
+        if matches!(target, Target::Back | Target::Forward | Target::Up) {
             self.refresh_storage();
         }
     }
@@ -734,13 +737,18 @@ impl FilesWindow {
         )
     }
 
-    /// Draw the back and forward chevrons at the toolbar's left.
+    /// Draw the back, forward and up buttons at the toolbar's left.
     ///
-    /// Each is live only when the history actually holds a step in that
-    /// direction, and is drawn muted when it does not -- a disabled control
-    /// that looks enabled teaches the user the application is broken, and one
-    /// that looks disabled but works is just as confusing. Hover is drawn only
-    /// on a live button, for the same reason.
+    /// Each is live only when it would actually go somewhere, and is drawn
+    /// muted when it would not -- a disabled control that looks enabled
+    /// teaches the user the application is broken, and one that looks
+    /// disabled but works is just as confusing. Hover is drawn only on a live
+    /// button, for the same reason.
+    ///
+    /// Up is dead at the filesystem root, which is the same rule
+    /// `Browser::go_up` already applies by refusing to move: the button
+    /// states what the action would do rather than inventing its own
+    /// condition.
     fn paint_nav_buttons(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
         let bar = self.toolbar();
@@ -757,6 +765,7 @@ impl FilesWindow {
                 self.browser.can_go_forward(),
                 Target::Forward,
             ),
+            (bar.up(), "\u{2191}", self.browser.can_go_up(), Target::Up),
         ] {
             // Dropped for want of room: nothing to draw, and `Toolbar::hit`
             // will not report it either.
@@ -793,7 +802,13 @@ impl FilesWindow {
     /// in, and an unlit button gives them nothing to notice.
     ///
     /// The glyph changes with the state as well as the fill, because a colour
-    /// alone is not an answer for anyone who cannot distinguish it.
+    /// alone is not an answer for anyone who cannot distinguish it. A filled
+    /// disc means "showing everything" and a hollow ring means "showing some",
+    /// which is the same full/empty metaphor the storage meter uses.
+    ///
+    /// `\u{25cf}` rather than `\u{25c9}`: the fisheye's inner dot is a
+    /// hairline at label size, so the pair differed by a couple of pixels
+    /// that vanished into the accent wash behind them.
     fn paint_hidden_toggle(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
         let Some(rect) = self.toolbar().hidden_toggle() else {
@@ -812,7 +827,7 @@ impl FilesWindow {
             theme.toolbar_bg
         };
         let color = if on { theme.accent } else { theme.text };
-        let glyph = if on { "\u{25c9}" } else { "\u{25cb}" };
+        let glyph = if on { "\u{25cf}" } else { "\u{25cb}" };
         let tier = &mut self.type_scale.label;
         let text_w = tier.measure(glyph);
         let text_y = rect.y + (rect.h - tier.line_height()) / 2;
@@ -874,7 +889,11 @@ impl FilesWindow {
             theme.accent_surface,
         );
         canvas.draw_round_rect(Rect::new(x, y, width, height), theme.control_border, radius);
-        for (i, glyph) in ["\u{2261}", "\u{22ee}"].into_iter().enumerate() {
+        // `\u{25a6}` rather than `\u{22ee}` for the grid segment: the
+        // vertical ellipsis is absent from the shipped face and rendered as
+        // tofu. A squared-fill glyph also describes a grid of cells, which a
+        // column of three dots never did.
+        for (i, glyph) in ["\u{2261}", "\u{25a6}"].into_iter().enumerate() {
             let bg = if i32::try_from(i).unwrap_or(-1) == active {
                 theme.accent_surface
             } else {
@@ -1723,7 +1742,16 @@ impl FilesWindow {
                 }
                 theme.background
             };
-            let icon = if entry.is_navigable() { "□" } else { "◇" };
+            // `\u{25a1}` WHITE SQUARE is a hollow box -- the exact shape a
+            // font draws for a codepoint it does not have, so every card in
+            // the grid read as tofu even though the glyph was present. A
+            // filled shape cannot be mistaken for a missing one, and the
+            // pair still differs in silhouette rather than only in fill.
+            let icon = if entry.is_navigable() {
+                "\u{25b0}"
+            } else {
+                "\u{25c6}"
+            };
             let icon_tier = &mut self.type_scale.title;
             let icon_w = icon_tier.measure(icon);
             icon_tier.draw_text(
@@ -2361,6 +2389,7 @@ mod tests {
             Target::ToggleHidden => bar.hidden_toggle(),
             Target::Filter => bar.filter(),
             Target::ViewList => bar.view_segment(0),
+            Target::Up => bar.up(),
             Target::ViewGrid => bar.view_segment(1),
         }
         .expect("the control must be drawn at this window size");
@@ -2578,6 +2607,56 @@ mod tests {
             painter.browser.path(),
             sub,
             "and clicking forward must return to the child"
+        );
+    }
+
+    /// The up arrow must actually leave the directory, through the same
+    /// whole path a user's click takes.
+    #[test]
+    fn clicking_up_leaves_the_open_directory_for_its_parent() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("toolbar-up");
+        let sub = root.join("a_directory");
+        let outcome = painter.browser.go_to(&sub);
+        painter.apply(outcome);
+        assert_eq!(painter.browser.path(), sub, "we start in the subdirectory");
+
+        click_control(&mut painter, Target::Up);
+        assert_eq!(
+            painter.browser.path(),
+            root,
+            "clicking up must land in the parent"
+        );
+    }
+
+    /// Going up is a step like any other, so back must undo it. This is the
+    /// property that would break if the button called `navigate` directly
+    /// instead of reusing the keyboard's own action.
+    #[test]
+    fn back_undoes_a_click_on_the_up_arrow() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("toolbar-up-back");
+        let sub = root.join("a_directory");
+        let outcome = painter.browser.go_to(&sub);
+        painter.apply(outcome);
+
+        click_control(&mut painter, Target::Up);
+        click_control(&mut painter, Target::Back);
+        assert_eq!(
+            painter.browser.path(),
+            sub,
+            "up must be recorded in the trail like any other navigation"
+        );
+    }
+
+    /// At the filesystem root there is nowhere above, and the button must say
+    /// so rather than looking live and doing nothing.
+    #[test]
+    fn the_up_arrow_is_dead_at_the_filesystem_root() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("toolbar-up-root");
+        let outcome = painter.browser.go_to(std::path::Path::new("/"));
+        painter.apply(outcome);
+        assert!(
+            !painter.browser.can_go_up(),
+            "the root has no parent, so the button must be drawn dead"
         );
     }
 

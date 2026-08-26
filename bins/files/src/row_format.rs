@@ -46,15 +46,21 @@ impl RowFormat {
 
     /// Bytes in the shortest unambiguous form.
     ///
-    /// Powers of 1024 with single-letter suffixes, one decimal place below
-    /// 10 so `1.5K` is distinguishable from `1.9K` while `340K` does not
-    /// waste three characters on `.0`.
+    /// Powers of 1024 with their proper IEC names, one decimal place below
+    /// 10 so `1.5 KiB` is distinguishable from `1.9 KiB` while `340 KiB`
+    /// does not waste three characters on `.0`.
+    ///
+    /// The unit is `KiB`, not `kB`. These are powers of 1024, and `kB` means
+    /// 1000 bytes -- so writing `kB` here would state a figure we did not
+    /// compute. `K` alone was worse still: it is not a unit of anything.
+    /// A space precedes the unit because SI writes one between a number and
+    /// its unit, and because `340KiB` reads as one token.
     #[must_use]
     pub fn human_size(bytes: u64) -> String {
-        const UNITS: [&str; 6] = ["B", "K", "M", "G", "T", "P"];
-        // Plain bytes get no decimal point at all: "512B" not "512.0B".
+        const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+        // Plain bytes get no decimal point at all: "512 B" not "512.0 B".
         if bytes < 1024 {
-            return format!("{bytes}B");
+            return format!("{bytes} B");
         }
         // f64 has 53 bits of mantissa, so it represents every u64 up to 2^53
         // exactly; beyond that the rounding error is far below the one
@@ -68,9 +74,9 @@ impl RowFormat {
         }
         let suffix = UNITS[unit];
         if value < 10.0 {
-            format!("{value:.1}{suffix}")
+            format!("{value:.1} {suffix}")
         } else {
-            format!("{value:.0}{suffix}")
+            format!("{value:.0} {suffix}")
         }
     }
 
@@ -127,22 +133,22 @@ mod tests {
 
     #[test]
     fn plain_bytes_get_no_decimal_point() {
-        assert_eq!(RowFormat::human_size(0), "0B");
-        assert_eq!(RowFormat::human_size(512), "512B");
-        assert_eq!(RowFormat::human_size(1023), "1023B");
+        assert_eq!(RowFormat::human_size(0), "0 B");
+        assert_eq!(RowFormat::human_size(512), "512 B");
+        assert_eq!(RowFormat::human_size(1023), "1023 B");
     }
 
     #[test]
     fn kilobytes_and_up_use_one_decimal_below_ten() {
-        assert_eq!(RowFormat::human_size(1024), "1.0K");
-        assert_eq!(RowFormat::human_size(1536), "1.5K");
-        assert_eq!(RowFormat::human_size(1024 * 1024), "1.0M");
+        assert_eq!(RowFormat::human_size(1024), "1.0 KiB");
+        assert_eq!(RowFormat::human_size(1536), "1.5 KiB");
+        assert_eq!(RowFormat::human_size(1024 * 1024), "1.0 MiB");
     }
 
     #[test]
     fn larger_values_drop_the_decimal_to_save_a_column() {
-        assert_eq!(RowFormat::human_size(1024 * 340), "340K");
-        assert_eq!(RowFormat::human_size(1024 * 1024 * 15), "15M");
+        assert_eq!(RowFormat::human_size(1024 * 340), "340 KiB");
+        assert_eq!(RowFormat::human_size(1024 * 1024 * 15), "15 MiB");
     }
 
     /// The unit table must run out gracefully rather than indexing past its
@@ -150,7 +156,45 @@ mod tests {
     #[test]
     fn an_enormous_size_saturates_at_the_last_unit() {
         let formatted = RowFormat::human_size(u64::MAX);
-        assert!(formatted.ends_with('P'), "got {formatted}");
+        assert!(formatted.ends_with(" PiB"), "got {formatted}");
+    }
+
+    /// The binary units must be spelled the binary way. `kB` is 1000 bytes;
+    /// these are powers of 1024, so writing `kB` would state a figure that
+    /// was never computed.
+    #[test]
+    fn the_units_are_the_iec_binary_names() {
+        for (bytes, expected) in [
+            (1024_u64, "KiB"),
+            (1024 * 1024, "MiB"),
+            (1024 * 1024 * 1024, "GiB"),
+            (1024 * 1024 * 1024 * 1024, "TiB"),
+        ] {
+            let formatted = RowFormat::human_size(bytes);
+            assert!(
+                formatted.ends_with(expected),
+                "{bytes} formatted as {formatted}, wanted {expected}"
+            );
+        }
+    }
+
+    /// A number and its unit are two tokens, so a space separates them.
+    #[test]
+    fn a_space_separates_the_figure_from_its_unit() {
+        for bytes in [0_u64, 999, 1024, 4096, 1024 * 1024 * 7] {
+            let formatted = RowFormat::human_size(bytes);
+            let (figure, unit) = formatted
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("{formatted} must separate figure and unit"));
+            assert!(
+                figure.chars().all(|c| c.is_ascii_digit() || c == '.'),
+                "the figure must be numeric, got {figure}"
+            );
+            assert!(
+                unit.chars().all(char::is_alphabetic),
+                "the unit must be letters, got {unit}"
+            );
+        }
     }
 
     #[test]

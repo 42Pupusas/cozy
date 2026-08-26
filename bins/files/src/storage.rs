@@ -118,11 +118,15 @@ impl Usage {
         format!("{}%", self.percent())
     }
 
-    /// Capacity in the guide's shorthand -- `128g`, `1t`, `512m`.
+    /// Capacity in the footer's shorthand -- `128 GiB`, `1 TiB`, `512 MiB`.
     ///
     /// Deliberately coarser than the size column's format: this is ambient
-    /// context in a 10px caption, where `1.4t` earns its extra glyphs but
-    /// `1.44t` does not.
+    /// context in a 10px caption, where `1.4 TiB` earns its extra glyphs but
+    /// `1.44 TiB` does not.
+    ///
+    /// The guide draws this as a bare lowercase `128g`. That was followed
+    /// literally and it was wrong: `g` is not a unit of storage, and the
+    /// figure is a power of 1024, so the honest name is `GiB`.
     #[must_use]
     pub fn capacity_label(self) -> String {
         Self::short_bytes(self.total)
@@ -139,15 +143,14 @@ impl Usage {
 
     /// Format a byte count in the footer's shorthand.
     ///
-    /// Lowercase single-letter units, one decimal only below ten, matching
-    /// the guide's `128g` / `1t` captions.
+    /// IEC binary units, one decimal only below ten.
     ///
     /// Done in integer arithmetic rather than with an `f64` divide: a
     /// multi-terabyte array exceeds `f64`'s 52-bit mantissa, and while the
     /// visible error would be small, there is no reason to accept rounding
     /// noise in a calculation this simple.
     fn short_bytes(bytes: u64) -> String {
-        const UNITS: [&str; 5] = ["b", "k", "m", "g", "t"];
+        const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
         let mut divisor: u128 = 1;
         let mut unit = 0;
         while u128::from(bytes) / divisor >= 1024 && unit + 1 < UNITS.len() {
@@ -155,7 +158,7 @@ impl Usage {
             unit += 1;
         }
         if unit == 0 {
-            return format!("{bytes}{}", UNITS[0]);
+            return format!("{bytes} {}", UNITS[0]);
         }
         // Value in tenths of the chosen unit, so one decimal place is
         // available without ever building a float.
@@ -163,15 +166,15 @@ impl Usage {
         if tenths < 100 {
             let whole = tenths / 10;
             let frac = tenths % 10;
-            // Trim a trailing `.0` so `1.0t` reads as `1t`, as in the guide.
+            // Trim a trailing `.0` so `1.0 TiB` reads as `1 TiB`.
             if frac == 0 {
-                format!("{whole}{}", UNITS[unit])
+                format!("{whole} {}", UNITS[unit])
             } else {
-                format!("{whole}.{frac}{}", UNITS[unit])
+                format!("{whole}.{frac} {}", UNITS[unit])
             }
         } else {
             // Round to nearest whole unit.
-            format!("{}{}", (tenths + 5) / 10, UNITS[unit])
+            format!("{} {}", (tenths + 5) / 10, UNITS[unit])
         }
     }
 }
@@ -354,13 +357,26 @@ mod tests {
     }
 
     #[test]
-    fn capacities_use_the_guides_shorthand() {
+    fn capacities_use_the_binary_units() {
         assert_eq!(
             Usage::new(128 * 1024_u64.pow(3), 0).capacity_label(),
-            "128g"
+            "128 GiB"
         );
-        assert_eq!(Usage::new(1024_u64.pow(4), 0).capacity_label(), "1t");
-        assert_eq!(Usage::new(512 * 1024 * 1024, 0).capacity_label(), "512m");
+        assert_eq!(Usage::new(1024_u64.pow(4), 0).capacity_label(), "1 TiB");
+        assert_eq!(
+            Usage::new(512 * 1024 * 1024, 0).capacity_label(),
+            "512 MiB"
+        );
+    }
+
+    /// The footer and the size column divide by the same 1024, so they must
+    /// not disagree about what to call the result.
+    #[test]
+    fn the_footer_and_the_size_column_name_units_alike() {
+        let g = 1024_u64.pow(3);
+        let footer = Usage::new(128 * g, 0).capacity_label();
+        let column = crate::row_format::RowFormat::human_size(128 * g);
+        assert_eq!(footer, column, "one figure must have one name");
     }
 
     /// Below ten the extra digit carries real information; at and above it,
@@ -368,14 +384,14 @@ mod tests {
     #[test]
     fn only_small_values_keep_a_decimal() {
         let g = 1024_u64.pow(3);
-        assert_eq!(Usage::new(3 * g + g / 2, 0).capacity_label(), "3.5g");
-        assert_eq!(Usage::new(128 * g, 0).capacity_label(), "128g");
+        assert_eq!(Usage::new(3 * g + g / 2, 0).capacity_label(), "3.5 GiB");
+        assert_eq!(Usage::new(128 * g, 0).capacity_label(), "128 GiB");
     }
 
     #[test]
     fn plain_bytes_keep_their_unit() {
-        assert_eq!(Usage::new(0, 0).capacity_label(), "0b");
-        assert_eq!(Usage::new(512, 0).capacity_label(), "512b");
+        assert_eq!(Usage::new(0, 0).capacity_label(), "0 B");
+        assert_eq!(Usage::new(512, 0).capacity_label(), "512 B");
     }
 
     /// An absurd capacity saturates at the largest unit rather than running
@@ -383,7 +399,7 @@ mod tests {
     #[test]
     fn an_enormous_capacity_saturates_at_terabytes() {
         let label = Usage::new(u64::MAX, 0).capacity_label();
-        assert!(label.ends_with('t'), "got {label}");
+        assert!(label.ends_with(" TiB"), "got {label}");
     }
 
     #[test]

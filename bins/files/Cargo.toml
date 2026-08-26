@@ -63,3 +63,7 @@ headless-stress = { path = "../../crates/headless-stress" }
 # launcher uses, so a malformed entry fails the build rather than quietly
 # vanishing from the menu.
 launcher = { path = "../../crates/launcher" }
+# `FontFace::has_glyph`, to assert every glyph the chrome draws actually
+# exists in the face that will draw it. A missing one renders as tofu, which
+# no other check in this workspace would notice.
+font     = { path = "../../crates/font" }

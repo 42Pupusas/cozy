@@ -185,6 +185,7 @@ dependencies = [
  "dbus",
  "diskstat",
  "fileops",
+ "font",
  "fsmodel",
  "headless-stress",
  "launcher",

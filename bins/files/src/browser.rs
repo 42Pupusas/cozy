@@ -242,6 +242,16 @@ impl Browser {
         self.history.can_go_forward()
     }
 
+    /// Whether the up arrow should be live.
+    ///
+    /// Asks the same question [`Self::go_up`] asks -- is there a parent --
+    /// rather than restating the rule, so the button cannot promise a
+    /// navigation the action would then refuse.
+    #[must_use]
+    pub fn can_go_up(&self) -> bool {
+        self.view.parent().is_some()
+    }
+
     /// Step back to the previously visited directory.
     pub fn go_back(&mut self) -> Outcome {
         let Some(target) = self.history.peek_back().map(Path::to_path_buf) else {

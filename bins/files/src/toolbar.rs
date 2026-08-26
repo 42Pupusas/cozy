@@ -35,6 +35,8 @@ pub enum Target {
     Back,
     /// The forward chevron.
     Forward,
+    /// The up arrow -- leave the open directory for its parent.
+    Up,
     /// The dotfile visibility toggle.
     ToggleHidden,
     /// The filter box -- clicking it focuses it.
@@ -94,10 +96,23 @@ impl Toolbar {
         self.nav_button(1)
     }
 
+    /// The up arrow's square, or `None` if it would not fit.
+    ///
+    /// Grouped flush with the chevrons rather than set apart, because all
+    /// three are the same kind of thing: actions that move you somewhere.
+    /// Back and forward walk the trail you have already walked; up walks the
+    /// tree. That is a different axis, not a different category -- and the
+    /// keyboard has always had it on `Left` and `Backspace`, so the button
+    /// exposes a navigation that already existed rather than adding one.
+    #[must_use]
+    pub fn up(&self) -> Option<Rect> {
+        self.nav_button(2)
+    }
+
     /// The `index`th navigation square, counting from the left edge.
     ///
-    /// The two sit flush against each other with no gap: they read as one
-    /// paired control, which is what the guide draws.
+    /// The three sit flush against each other with no gap: they read as one
+    /// grouped control, which is what the guide draws for the chevron pair.
     fn nav_button(&self, index: i32) -> Option<Rect> {
         let size = self.spacing.icon_button();
         let x = self.bar.x + self.spacing.toolbar_pad() + size * index;
@@ -119,7 +134,7 @@ impl Toolbar {
     #[must_use]
     pub fn hidden_toggle(&self) -> Option<Rect> {
         let size = self.spacing.icon_button();
-        let x = self.bar.x + self.spacing.toolbar_pad() + size * 2 + self.spacing.s();
+        let x = self.bar.x + self.spacing.toolbar_pad() + size * 3 + self.spacing.s();
         if x + size > self.bar.right() {
             return None;
         }
@@ -137,7 +152,7 @@ impl Toolbar {
     pub fn breadcrumb_x(&self) -> i32 {
         self.bar.x
             + self.spacing.toolbar_pad()
-            + self.spacing.icon_button() * 3
+            + self.spacing.icon_button() * 4
             + self.spacing.s() * 2
     }
 
@@ -234,6 +249,7 @@ impl Toolbar {
         let candidates = [
             (self.back(), Target::Back),
             (self.forward(), Target::Forward),
+            (self.up(), Target::Up),
             (self.hidden_toggle(), Target::ToggleHidden),
             (self.filter(), Target::Filter),
             (self.view_segment(0), Target::ViewList),
@@ -291,6 +307,7 @@ mod tests {
         for rect in [
             bar.back().expect("back"),
             bar.forward().expect("forward"),
+            bar.up().expect("up"),
             bar.hidden_toggle().expect("hidden"),
             bar.filter().expect("filter"),
             bar.view_toggle().expect("toggle"),
@@ -314,6 +331,7 @@ mod tests {
             let rects = [
                 bar.back().expect("back"),
                 bar.forward().expect("forward"),
+                bar.up().expect("up"),
                 bar.hidden_toggle().expect("hidden"),
                 bar.filter().expect("filter"),
                 bar.view_toggle().expect("toggle"),
@@ -362,11 +380,34 @@ mod tests {
         assert_eq!(resting.breadcrumb_width(), focused.breadcrumb_width());
     }
 
+    /// The three navigation buttons are one group, so the new arrow sits
+    /// flush with the pair rather than floating beside it.
+    #[test]
+    fn the_up_arrow_joins_the_chevron_group() {
+        let bar = toolbar_of(1200, false);
+        let forward = bar.forward().expect("forward");
+        let up = bar.up().expect("up");
+        assert_eq!(
+            forward.right(),
+            up.x,
+            "all three are actions, so they share an edge"
+        );
+        assert_eq!(up.w, forward.w, "and are the same size");
+        assert_eq!(up.y, forward.y, "on the same baseline");
+    }
+
+    #[test]
+    fn a_click_on_the_up_arrow_reports_it() {
+        let bar = toolbar_of(1200, false);
+        let (x, y) = centre(bar.up().expect("up"));
+        assert_eq!(bar.hit(x, y), Some(Target::Up));
+    }
+
     #[test]
     fn the_breadcrumb_starts_after_the_chevrons() {
         let bar = toolbar_of(1200, false);
         assert!(
-            bar.breadcrumb_x() >= bar.forward().expect("forward").right(),
+            bar.breadcrumb_x() >= bar.up().expect("up").right(),
             "the path must not be drawn over the navigation buttons"
         );
         assert!(
@@ -382,8 +423,8 @@ mod tests {
         let forward = bar.forward().expect("forward");
         let hidden = bar.hidden_toggle().expect("hidden");
         assert!(
-            hidden.x > forward.right(),
-            "a state control must not read as a third chevron"
+            hidden.x > bar.up().expect("up").right(),
+            "a state control must not read as a fourth navigation button"
         );
         assert_eq!(hidden.w, forward.w, "but it is the same size button");
         assert_eq!(hidden.y, forward.y, "and sits on the same baseline");
@@ -449,7 +490,7 @@ mod tests {
     #[test]
     fn the_gap_between_the_chevrons_and_the_path_hits_nothing() {
         let bar = toolbar_of(1200, false);
-        let x = bar.forward().expect("forward").right() + 1;
+        let x = bar.up().expect("up").right() + 1;
         let y = bar.bar.h / 2;
         assert_eq!(
             bar.hit(x, y),
@@ -510,6 +551,7 @@ mod tests {
         let bar = toolbar_of(240, false);
         assert!(bar.back().is_some(), "back must survive a narrow window");
         assert!(bar.forward().is_some(), "forward must survive too");
+        assert!(bar.up().is_some(), "and so must up");
         assert!(bar.hidden_toggle().is_some(), "and so must the toggle");
         assert!(bar.filter().is_none(), "the filter box has to go");
     }
@@ -518,6 +560,7 @@ mod tests {
     fn a_degenerate_toolbar_yields_no_controls_rather_than_negative_geometry() {
         let bar = toolbar_of(0, false);
         assert!(bar.back().is_none(), "nothing fits in a zero-width toolbar");
+        assert!(bar.up().is_none());
         assert!(bar.hidden_toggle().is_none());
         assert!(bar.filter().is_none());
         assert!(bar.view_toggle().is_none());
@@ -533,6 +576,7 @@ mod tests {
         for (rect, target) in [
             (bar.back().expect("back"), Target::Back),
             (bar.forward().expect("forward"), Target::Forward),
+            (bar.up().expect("up"), Target::Up),
             (bar.hidden_toggle().expect("hidden"), Target::ToggleHidden),
             (bar.filter().expect("filter"), Target::Filter),
             (bar.view_segment(0).expect("list"), Target::ViewList),

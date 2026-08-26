@@ -19,13 +19,18 @@
 #   clipboard-bin  -> clipboard -- the clipboard daemon        (bins/clipboard)
 #   wallpaper-bin  -> wallpaper -- the wallpaper setter        (bins/wallpaper)
 #   shot-bin       -> shot      -- the screenshot utility      (bins/shot)
+#   files-bin      -> files     -- the file browser            (bins/files)
 #
-# All seven matter to a niri session: ~/.config/niri/config.kdl spawns
+# All eight matter to a niri session: ~/.config/niri/config.kdl spawns
 # statusbar, wallpaper and clipboard at startup, and binds terminal, launcher,
-# monitor and shot to keys. Every one of those references the install root by
-# absolute path, so a binary missing from here is a silently broken keybind or
-# a stale daemon -- which is why this installs the whole set rather than the
-# four it used to cover.
+# monitor, shot and files to keys. Every one of those references the install
+# root by absolute path, so a binary missing from here is a silently broken
+# keybind or a stale daemon -- which is why this installs the whole set rather
+# than the four it used to cover.
+#
+# `files` additionally gets an XDG desktop entry installed (see the
+# "desktop entry" section below), so it is reachable from an application
+# menu and not only from its keybind.
 #
 # `launcher` additionally needs `terminal` on PATH: it shells out to a bare
 # `terminal -e <cmd>` (or whatever $TERMINAL names) to run Terminal=true
@@ -59,10 +64,37 @@ cargo build --release --workspace --bins
 echo
 
 for pkg in bins/terminal bins/statusbar bins/monitor bins/launcher \
-           bins/clipboard bins/wallpaper bins/shot; do
+           bins/clipboard bins/wallpaper bins/shot bins/files; do
     echo ">> cargo install --path $pkg --force"
     cargo install --path "$pkg" --force --root "$install_root"
 done
+
+# The desktop entry for `files`.
+#
+# Written here rather than shipped ready-made because `Exec=` must name an
+# absolute path, and that path is only known once $install_root is resolved
+# above. The basename must stay `cozy.files.desktop`: it matches the Wayland
+# app_id the binary sets, which is how a taskbar maps the window back to this
+# entry. See bins/files/data/README.md.
+#
+# $XDG_DATA_HOME (default ~/.local/share) needs no root, and it is the
+# highest-priority `applications` directory both our own launcher and every
+# other XDG menu already scan.
+desktop_dir=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+desktop_file="$desktop_dir/cozy.files.desktop"
+echo
+echo ">> installing desktop entry into $desktop_dir"
+mkdir -p "$desktop_dir"
+sed "s|@EXEC@|$bin_dir/files|" bins/files/data/cozy.files.desktop.in \
+    > "$desktop_file"
+
+# The menu reads a cache, not the directory, on desktops that build one.
+# Without this the entry is invisible until something else happens to
+# refresh it. Absent on a minimal system, and not an error there -- our own
+# launcher scans the directory directly.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$desktop_dir" 2>/dev/null || true
+fi
 
 # Clean up leftovers from the era when binaries were deployed by copying:
 # replacing a running executable with `cp` fails, so the old inode was moved
@@ -79,13 +111,19 @@ fi
 
 echo
 echo "Installed into $bin_dir:"
-for bin in terminal statusbar monitor launcher clipboard wallpaper shot; do
+for bin in terminal statusbar monitor launcher clipboard wallpaper shot files; do
     if [ -x "$bin_dir/$bin" ]; then
         echo "  ok      $bin"
     else
         echo "  MISSING $bin"
     fi
 done
+
+if [ -f "$desktop_file" ]; then
+    echo "  ok      cozy.files.desktop"
+else
+    echo "  MISSING cozy.files.desktop"
+fi
 
 # Long-lived binaries keep running the code they started with: cargo's rename
 # leaves the old inode alive for any existing process. Say so explicitly --

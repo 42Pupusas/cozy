@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Files
+GenericName=File Manager
+Comment=Browse files and removable storage
+Exec=@EXEC@ %f
+Icon=system-file-manager
+Terminal=false
+Categories=System;Utility;Core;FileTools;FileManager;
+MimeType=inode/directory;
+StartupNotify=true

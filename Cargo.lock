@@ -182,12 +182,15 @@ name = "files-bin"
 version = "0.1.0"
 dependencies = [
  "config",
+ "dbus",
  "diskstat",
  "fileops",
  "fsmodel",
  "headless-stress",
+ "launcher",
  "localtime",
  "mime",
+ "mounter",
  "opener",
  "platform",
  "statusbar",

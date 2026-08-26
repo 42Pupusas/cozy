@@ -88,27 +88,36 @@ pretend parity. My proposed cut:
 ### Explicitly **out** of scope (delegate or skip)
 - **Network/virtual filesystems** (GVfs — smb://, sftp://, mtp://, trash://).
   This is a whole daemon and IPC protocol. Local POSIX paths only.
-- **Removable-device *mounting*.** Note the narrowing: detection and browsing
-  are now **in** scope and implemented (`crates/volumes`); only the privileged
-  act of mounting stays out.
+- **Removable devices are now fully in scope and implemented.** This entry is
+  kept as a record of two blockers that were claimed here and turned out not
+  to hold.
 
-  The original reason given here — that `crates/dbus` cannot marshal `a{sv}` —
-  **is stale**. It marshals `a{sv}` today, and `crates/dbus/src/bluez.rs`
-  already walks `a{oa{sa{sv}}}` for `GetManagedObjects`, which is exactly the
-  shape UDisks2 returns. The D-Bus blocker is gone.
+  *Detection* (`crates/volumes`) reads the kernel's own tables —
+  `/proc/self/mountinfo`, `/sys/class/block`, udev's blkid cache under
+  `/run/udev/data`, `/dev/disk/by-label` — and needs no daemon at all, so it
+  works on a machine with no UDisks2 installed, as this one is. It offers
+  `syncfs(2)` ("Flush writes") rather than an eject, because that is the part
+  that protects data and needs no privilege.
 
-  The real blocker is privilege, and it does not expire. `mount(2)` requires
-  `CAP_SYS_ADMIN`. The only routes are an fstab `user` entry (which must name
-  the device in advance), a setuid helper, or a polkit-backed root daemon —
-  i.e. reimplementing UDisks2. A user namespace does not help: the mount would
-  be invisible to every other process, which is useless for a file manager.
+  *Mounting* (`crates/mounter`, `crates/polkit-agent`) starts a transient
+  systemd `.mount` unit over the system bus and answers the polkit password
+  prompt in-process.
 
-  So `crates/volumes` reads the kernel's own tables (`/proc/self/mountinfo`,
-  `/sys/class/block`, `/dev/disk/by-label`) and needs no daemon at all — which
-  also means it works on machines with no UDisks2 installed, as this one is.
-  It offers `syncfs(2)` ("Flush writes") instead of an eject, because that is
-  the part that protects data and needs no privilege. A `SystemTables` seam
-  keeps a future privileged backend possible.
+  The first stale claim was that `crates/dbus` cannot marshal `a{sv}`. It
+  marshals `a{sv}` today, and `bluez.rs` already walks `a{oa{sa{sv}}}` for
+  `GetManagedObjects` — exactly UDisks2's shape.
+
+  The second was that privilege is an absolute blocker. `mount(2)` does
+  require `CAP_SYS_ADMIN`, and we still hold none — but we do not need it.
+  systemd holds it, and polkit decides whether to lend it. What was actually
+  needed was an *authentication agent*, which turned out not to require a
+  setuid helper either: modern polkit accepts the PAM conversation over
+  `/run/polkit/agent-helper.socket`.
+
+  What remains genuinely out of reach is mounting **without a password**. That
+  needs a scoped polkit rule, which is a system administration decision rather
+  than a code change. `volumes::MountBackend` is the seam a different backend
+  would fill.
 - **File indexing / content search** (Tracker). Recursive walk is enough.
 - **Archive integration**, batch rename, extensions/scripting.
 

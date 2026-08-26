@@ -57,3 +57,9 @@ dbus     = { path = "../../crates/dbus" }
 # `user-dirs.dirs` format.
 user-dirs = { path = "../../crates/user-dirs" }
 headless-stress = { path = "../../crates/headless-stress" }
+
+[dev-dependencies]
+# Only to read `data/cozy.files.desktop.in` back with the same parser the
+# launcher uses, so a malformed entry fails the build rather than quietly
+# vanishing from the menu.
+launcher = { path = "../../crates/launcher" }

@@ -247,8 +247,10 @@ impl PasswordPanel {
         // consequence, not a caption.
         if let Some(notice) = modal.notice() {
             let room = self.card.w - self.inset * 2;
-            let shown =
-                crate::row_format::RowFormat::truncate(notice, Self::columns_for(text.detail, room));
+            let shown = crate::row_format::RowFormat::truncate(
+                notice,
+                Self::columns_for(text.detail, room),
+            );
             text.detail.draw_text(
                 canvas,
                 &shown,

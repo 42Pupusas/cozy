@@ -30,6 +30,8 @@ pub mod filter;
 pub mod kind;
 pub mod reader;
 pub mod sort;
+pub mod tally;
+pub mod walk;
 
 #[cfg(test)]
 mod test_support;

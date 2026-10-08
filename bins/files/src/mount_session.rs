@@ -21,9 +21,9 @@
 //! for and knows nothing about how the question is drawn.
 
 use crate::mount_service::{MountProgress, MountService};
+use volumes::AttachedDevice;
 use volumes::mount_backend::MountBackend;
 use volumes::mount_request::MountRequest;
-use volumes::AttachedDevice;
 
 /// The user a mount runs on behalf of.
 ///
@@ -64,7 +64,11 @@ impl MountIdentity {
     pub fn current() -> Self {
         let uid = dbus::sys::DbusSys::effective_uid();
         let name = std::env::var("USER").unwrap_or_else(|_| uid.to_string());
-        Self { name, uid, gid: uid }
+        Self {
+            name,
+            uid,
+            gid: uid,
+        }
     }
 
     /// The user name, for the media directory.

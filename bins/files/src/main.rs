@@ -4,8 +4,9 @@
 //!
 //! ```text
 //! fsmodel::DirectoryView   read / filter / sort   (no UI at all)
-//! widget::ListPane         scroll / select        (no platform at all)
+//! widget::ListPane         cursor / select        (no platform at all)
 //! browser::Browser         the state machine      (no pixels at all)
+//! tile_field::TileField    rank / spiral layout   (no pixels at all)
 //! window::FilesWindow      paint + route input    (the only Wayland part)
 //! ```
 //!
@@ -17,8 +18,9 @@
 mod breadcrumb;
 mod browser;
 mod clipboard;
-mod columns;
 mod density;
+mod dir_sizes;
+mod dirs_watch;
 mod drag_badge;
 mod favorites;
 mod frame;
@@ -26,29 +28,34 @@ mod headless;
 mod history;
 mod hover;
 mod keymap;
-mod kind_label;
 mod metric_overrides;
-mod moment;
 mod mount_service;
 mod mount_session;
 mod options;
 mod password_modal;
 mod password_panel;
+mod pinned_card;
 mod rename;
 mod row_format;
+mod row_kind;
 mod secret_input;
 mod sidebar;
 mod spacing;
+mod spiral;
+mod spiral_cursor;
 mod storage;
 mod test_support;
 mod theme;
+mod tile_field;
+mod tile_painter;
+mod tile_rank;
 mod toolbar;
 mod typography;
 mod window;
 
 use browser::Browser;
-use platform::toplevel::activation_report::ActivationReport;
 use options::Options;
+use platform::toplevel::activation_report::ActivationReport;
 use platform::toplevel::{LogicalSize, Toplevel, WindowEvent};
 use theme::Theme;
 use window::FilesWindow;
@@ -104,28 +111,15 @@ impl App {
             width: options.width,
             height: options.height,
         };
-        // The same two-column decomposition the painter uses, so the browser
-        // is laid out against the geometry it will actually be drawn into
-        // rather than a second, hand-maintained approximation of it.
-        let frame = frame::Frame::new(
+        let field = frame::Frame::new(
             size.width,
             size.height,
             sidebar.visible(),
             theme.spacing,
-            theme.header_height,
-            theme.status_height,
-            theme.column_header(),
-        );
-        // The browser is built with the *logical* size, then corrected the
-        // moment the compositor tells us the real physical geometry. Guessing
-        // the scale here instead would give a first frame with the wrong
-        // number of rows on any HiDPI screen.
-        let browser = Browser::open(
-            &options.path,
-            frame.rows().w,
-            frame.rows().h,
-            theme.row_height,
-        )?;
+            theme.card_metrics(),
+        )
+        .field();
+        let browser = Browser::open(&options.path, field.w, field.h, theme.row_height)?;
 
         // The browser is as translucent as the terminal, bar, launcher and
         // monitor -- `[files].opacity` mirrors `[window].opacity`, so one
@@ -232,13 +226,43 @@ impl App {
                 return Self::finish(window);
             }
 
-            window.wait(Self::IDLE_TIMEOUT_MS);
+            Self::idle_wait(&window, &painter);
         }
     }
 
-    /// Poll the two storage sources that produce work without any input.
+    /// Sleep until the compositor, the directory watcher, or the idle
+    /// timeout wakes the loop.
     ///
-    /// Both are pulled once per pass, and neither is a response to an event:
+    /// [`Toplevel::wait`] can only sleep on its own eventfd; with a live
+    /// directory watch the loop must also wake when files change, so both
+    /// fds go through the same `poll(2)` primitive the portal loop uses to
+    /// multiplex its bus socket. The waker is drained here, exactly as
+    /// [`Toplevel::wait`] drains it, so an armed counter cannot turn every
+    /// later wait into an instant return; the counter semantics still
+    /// preserve any signal that raced in during the pass.
+    fn idle_wait(window: &Toplevel, painter: &FilesWindow) {
+        let timeout = window.wait_timeout_ms(Self::IDLE_TIMEOUT_MS);
+        match painter.watch_fd() {
+            Some(watch_fd) => {
+                let (waker_ready, _) =
+                    waker::Poller::two(window.waker().raw_fd(), watch_fd).poll_two(timeout);
+                if waker_ready {
+                    window.waker().drain();
+                }
+                // The watcher side is read by `poll_storage` on the next
+                // pass; nothing to do with the readiness bit here.
+            }
+            None => {
+                window.wait(timeout);
+            }
+        }
+    }
+
+    /// Poll the sources that produce work without any input: devices, the
+    /// mount worker, the folder-size worker behind the tiles, and the
+    /// directory watcher behind the listing.
+    ///
+    /// Each is pulled once per pass, and none is a response to an event:
     ///
     /// * Devices attach and detach on their own. That poll is interval-gated
     ///   inside, so an ordinary pass costs a clock read.
@@ -246,14 +270,19 @@ impl App {
     ///   that thread** until this call collects it. A skipped pass is a
     ///   worker left waiting and a modal that never appears, so this is the
     ///   one poll here that must not be gated on anything.
+    /// * The directory watcher reports files other processes created,
+    ///   renamed or deleted; the re-read goes through the browser, so the
+    ///   cursor follows the file rather than the row number.
     ///
-    /// Both are called unconditionally, and the results combined afterwards:
+    /// All are called unconditionally, and the results combined afterwards:
     /// `||` short-circuits, so a device change would skip the mount poll
     /// entirely and strand the worker for as long as devices kept changing.
     fn poll_storage(window: &mut Toplevel, painter: &mut FilesWindow) {
         let devices = painter.poll_volumes();
         let mount = painter.poll_mount();
-        if devices || mount {
+        let sizes = painter.poll_tiles();
+        let listing = painter.poll_listing();
+        if devices || mount || sizes || listing {
             window.request_redraw();
         }
     }

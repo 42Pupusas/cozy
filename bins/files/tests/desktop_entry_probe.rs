@@ -48,8 +48,7 @@ impl EntryTemplate {
 
     /// The template with `@EXEC@` resolved, as installed on disk.
     fn installed(&self) -> String {
-        self.source
-            .replace(Self::PLACEHOLDER, Self::INSTALLED_BIN)
+        self.source.replace(Self::PLACEHOLDER, Self::INSTALLED_BIN)
     }
 
     /// Parse the installed form, failing the test if the parser rejects it.
@@ -89,17 +88,42 @@ impl Installer {
     /// since the point is `sed`'s handling of it rather than its contents.
     const BIN_DIR: &'static str = "/var/cache/example/cargo/bin";
 
+    /// The entry name this probe stands for. The installer loops over
+    /// several, so the expression it lifts must be resolved for one of them.
+    const ENTRY: &'static str = "files";
+
     /// Lift the `s|@EXEC@|...|` expression out of the script and resolve the
-    /// one shell variable it interpolates.
+    /// shell variables it interpolates.
     ///
     /// Reading it from the script rather than restating it is the whole
     /// point: a restated copy would keep passing after the real one broke.
     fn sed_expression(script: &str) -> Option<String> {
-        let line = script.lines().find(|l| l.trim_start().starts_with("sed "))?;
+        let line = script
+            .lines()
+            .find(|l| l.trim_start().starts_with("sed "))?;
         let start = line.find('"')?;
         let rest = &line[start + 1..];
         let end = rest.find('"')?;
-        Some(rest[..end].replace("$bin_dir", Self::BIN_DIR))
+        Some(
+            rest[..end]
+                .replace("$bin_dir", Self::BIN_DIR)
+                .replace("$name", Self::ENTRY),
+        )
+    }
+
+    /// Whether the installer's entry list names `entry`.
+    ///
+    /// The list is a shell word list, so a bare `contains` would also match
+    /// a longer name that happens to end in the same letters.
+    fn installs_entry(script: &str, entry: &str) -> bool {
+        script
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("desktop_entries="))
+            .any(|list| {
+                list.trim_matches(['"', '\''])
+                    .split_whitespace()
+                    .any(|name| name == entry)
+            })
     }
 
     /// Ask `sh` to parse the installer without running it.
@@ -113,8 +137,7 @@ impl Installer {
             .arg(&script)
             .output()
             .ok()?;
-        (!output.status.success())
-            .then(|| String::from_utf8_lossy(&output.stderr).into_owned())
+        (!output.status.success()).then(|| String::from_utf8_lossy(&output.stderr).into_owned())
     }
 
     /// Apply `expression` to `path` with the real `sed`.
@@ -286,9 +309,16 @@ fn the_entry_basename_matches_the_wayland_app_id() {
         "src/main.rs no longer sets the app_id this entry is named for"
     );
     let install = Sibling::install_sh();
+    // The installer derives each basename from the entry name, so the
+    // literal string never appears. What must hold is that `files` is one
+    // of the names it iterates, and that the derived name is app_id-shaped.
     assert!(
-        install.contains("cozy.files.desktop"),
-        "the installer must write the entry under the app_id's name"
+        install.contains("cozy.$name.desktop"),
+        "the installer must name entries after their app_id"
+    );
+    assert!(
+        Installer::installs_entry(&install, "files"),
+        "the installer must write an entry for files"
     );
 }
 
@@ -302,8 +332,12 @@ fn the_installer_covers_the_browser() {
         "install.sh must build and install the files package"
     );
     assert!(
-        install.contains("cozy.files.desktop.in"),
+        install.contains("cozy.$name.desktop.in"),
         "install.sh must substitute the shipped template"
+    );
+    assert!(
+        Installer::installs_entry(&install, "files"),
+        "install.sh must list files among the entries it installs"
     );
 }
 

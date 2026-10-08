@@ -31,8 +31,6 @@ impl FileStress {
             browser.act(Action::ToggleHidden);
             browser.act(Action::Refresh);
             browser.act(Action::ToggleHidden);
-            let width_offset = i32::try_from(round % 5).unwrap_or_default() * 20;
-            browser.resize(900 + width_offset, 600);
         });
         println!(
             "files headless stress: {completed} rounds, {} visible entries",

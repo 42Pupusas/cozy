@@ -28,24 +28,16 @@
 use fsmodel::DirectoryView;
 use fsmodel::entry::Entry;
 use fsmodel::reader::ReadError;
+use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use widget::{GridPane, ListCommand, ListPane, Mods, PaneResponse, TextInput};
+use widget::{ListCommand, ListPane, Mods, PaneResponse, TextInput};
 
 use crate::clipboard::{FileClipboard, Transfer};
+use crate::dirs_watch::DirsWatch;
 use crate::history::{History, Trail};
 use crate::keymap::{Action, EditAction, Focus, Keymap};
 use crate::password_modal::PasswordModal;
 use crate::rename::Rename;
-
-/// Which presentation is active for the current directory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ViewMode {
-    /// Metadata-rich rows.
-    #[default]
-    List,
-    /// Square file cards.
-    Grid,
-}
 
 /// What the browser did with an input, for the window to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,10 +79,6 @@ impl Outcome {
 pub struct Browser {
     view: DirectoryView,
     pane: ListPane,
-    /// The grid keeps independent scroll geometry; selection transfers when
-    /// switching views because it describes files, not their presentation.
-    grid: GridPane,
-    view_mode: ViewMode,
     filter: TextInput,
     keymap: Keymap,
     /// Where the user has been, for the toolbar's chevrons.
@@ -121,6 +109,14 @@ pub struct Browser {
     /// listing, and a successful one must not be silent -- moving twelve
     /// files with no acknowledgement leaves the user unsure it happened.
     notice: Option<String>,
+    /// Bumped whenever the visible entries may have changed.
+    listing: u64,
+    /// Bumped whenever the open directory is re-read from disk.
+    refreshes: u64,
+    /// inotify eyes on the open directory, so files other processes
+    /// create, rename or delete appear without a navigate-out-and-back.
+    /// Headless like everything else here: an fd, not a window object.
+    watch: DirsWatch,
 }
 
 impl Browser {
@@ -129,22 +125,11 @@ impl Browser {
     pub fn open(path: &Path, width: i32, height: i32, row_height: i32) -> Result<Self, ReadError> {
         let view = DirectoryView::open(path)?;
         let pane = ListPane::new(width, height, row_height, view.visible_len());
-        // The guide's 114px card follows the list scale, so a density or font
-        // adjustment cannot make the two presentations disagree in size.
-        let card = row_height.saturating_mul(114).div_euclid(49).max(1);
-        let grid = GridPane::new(
-            width,
-            height,
-            card,
-            card,
-            row_height / 6,
-            view.visible_len(),
-        );
+        let mut watch = DirsWatch::new();
+        watch.follow(path);
         Ok(Self {
             view,
             pane,
-            grid,
-            view_mode: ViewMode::List,
             filter: TextInput::new(),
             keymap: Keymap::new(),
             history: History::new(),
@@ -154,7 +139,44 @@ impl Browser {
             rename: Rename::new(),
             password: PasswordModal::new(),
             notice: None,
+            listing: 0,
+            refreshes: 0,
+            watch,
         })
+    }
+
+    /// Drain the directory watcher and re-read the open directory if it
+    /// reported a change, exactly as manual F5 does -- cursor stays on the
+    /// same file, tiles re-rank. Returns whether anything is newly visible.
+    ///
+    /// A successful read re-arms the watch on the directory now shown,
+    /// which is also how navigation moves the watch along.
+    pub fn poll_listing(&mut self) -> bool {
+        if !self.watch.poll() {
+            return false;
+        }
+        self.refresh();
+        true
+    }
+
+    /// The watched inotify fd, for the event loop's `poll(2)`. `None` when
+    /// nothing is armed, so the loop keeps its plain idle timeout rather
+    /// than waiting on a descriptor that can never fire.
+    #[must_use]
+    pub fn watch_fd(&self) -> Option<RawFd> {
+        self.watch.fd()
+    }
+
+    /// Changes whenever the visible entries may have changed.
+    #[must_use]
+    pub const fn listing_revision(&self) -> u64 {
+        self.listing
+    }
+
+    /// Changes whenever the open directory is re-read from disk.
+    #[must_use]
+    pub const fn refresh_count(&self) -> u64 {
+        self.refreshes
     }
 
     /// The directory being shown.
@@ -167,35 +189,6 @@ impl Browser {
     #[must_use]
     pub const fn pane(&self) -> &ListPane {
         &self.pane
-    }
-
-    /// The card grid, for grid painting.
-    #[must_use]
-    pub const fn grid(&self) -> &GridPane {
-        &self.grid
-    }
-
-    /// The presentation currently active.
-    #[must_use]
-    pub const fn view_mode(&self) -> ViewMode {
-        self.view_mode
-    }
-
-    /// Switch presentation, preserving the user's selected files.
-    pub fn set_view_mode(&mut self, mode: ViewMode) -> Outcome {
-        if self.view_mode == mode {
-            return Outcome::Ignored;
-        }
-        match mode {
-            ViewMode::Grid => self
-                .grid
-                .replace_selection(self.pane.selection().selected(), self.pane.cursor()),
-            ViewMode::List => self
-                .pane
-                .replace_selection(self.grid.selection().selected(), self.grid.cursor()),
-        }
-        self.view_mode = mode;
-        Outcome::Redraw
     }
 
     /// The filter box, for painting.
@@ -308,11 +301,7 @@ impl Browser {
     /// The entry under the cursor.
     #[must_use]
     pub fn cursor_entry(&self) -> Option<&Entry> {
-        let cursor = match self.view_mode {
-            ViewMode::List => self.pane.cursor(),
-            ViewMode::Grid => self.grid.cursor(),
-        };
-        cursor.and_then(|row| self.entry(row))
+        self.pane.cursor().and_then(|row| self.entry(row))
     }
 
     /// The paths a drag started from `row` would carry.
@@ -328,10 +317,7 @@ impl Browser {
     /// before calling this.
     #[must_use]
     pub fn drag_paths(&self, row: usize) -> Vec<PathBuf> {
-        let selected = match self.view_mode {
-            ViewMode::List => self.pane.selection().selected(),
-            ViewMode::Grid => self.grid.selection().selected(),
-        };
+        let selected = self.pane.selection().selected();
         if selected.contains(&row) {
             selected
                 .iter()
@@ -347,44 +333,52 @@ impl Browser {
         }
     }
 
-    /// The row (of either presentation) at pane-relative `(x, y)`, if any --
-    /// the shared hit-test a drag press resolves its source row through.
+    /// `row`, if it names an entry a drop could land in: a directory, or a
+    /// symlink to one. Dropping onto a plain file has no defined meaning.
     #[must_use]
-    pub fn row_at(&self, x: i32, y: i32) -> Option<usize> {
-        match self.view_mode {
-            ViewMode::List => self.pane.viewport().row_at_y(y),
-            ViewMode::Grid => self.grid.item_at(x, y),
-        }
+    pub fn navigable_row(&self, row: Option<usize>) -> Option<usize> {
+        row.filter(|&row| self.entry(row).is_some_and(Entry::is_navigable))
     }
 
-    /// Which row, if any, a drop at pane-relative `(x, y)` would land on --
-    /// and only if that row is a valid drop target (a directory, or a
-    /// symlink to one). Dropping onto a plain file has no defined meaning
-    /// here, so it is deliberately not reported as a target.
+    /// The directory a drop onto `row` lands in: that row's folder, or the
+    /// open directory when the row is absent or not a folder -- dropping
+    /// into empty space is dropping into the folder currently shown.
     #[must_use]
-    pub fn drop_target_row(&self, x: i32, y: i32) -> Option<usize> {
-        let row = self.row_at(x, y)?;
-        self.entry(row)
-            .is_some_and(Entry::is_navigable)
-            .then_some(row)
-    }
-
-    /// The directory a drop at pane-relative `(x, y)` would land in: the
-    /// row under the point if it is navigable (see [`Self::drop_target_row`]),
-    /// otherwise the browser's own open directory -- dropping into empty
-    /// space below the list is the same as dropping into the folder
-    /// currently shown, exactly as every desktop file manager treats it.
-    #[must_use]
-    pub fn drop_target_dir(&self, x: i32, y: i32) -> PathBuf {
-        self.drop_target_row(x, y)
+    pub fn drop_dir(&self, row: Option<usize>) -> PathBuf {
+        self.navigable_row(row)
             .and_then(|row| self.entry(row))
             .map_or_else(|| self.view.path().to_path_buf(), |e| e.path.clone())
     }
 
-    /// Resize the pane.
-    pub fn resize(&mut self, width: i32, height: i32) {
-        self.pane.resize(width, height);
-        self.grid.resize(width, height);
+    /// Select entry `row` as a click with `mods` would, for a presentation
+    /// that resolved the row through its own geometry.
+    pub fn pick(&mut self, row: usize, mods: Mods) -> Outcome {
+        if self.rename.is_active() {
+            self.commit_rename();
+        }
+        self.keymap.set_focus(Focus::List);
+        Outcome::redraw_if(self.pane.pick(row, mods).needs_redraw())
+    }
+
+    /// Move the keyboard cursor to entry `row`, extending the selection from
+    /// the anchor when `extend` is set, as Shift-arrow does.
+    pub fn steer_to(&mut self, row: usize, extend: bool) -> Outcome {
+        let mods = if extend { Mods::shift() } else { Mods::none() };
+        Outcome::redraw_if(self.pane.pick(row, mods).needs_redraw())
+    }
+
+    /// Select entry `row` and act on it: enter a folder, or open a file.
+    pub fn activate_entry(&mut self, row: usize) -> Outcome {
+        if self.pane.pick(row, Mods::none()) == PaneResponse::Ignored {
+            return Outcome::Ignored;
+        }
+        self.activate(row)
+    }
+
+    /// Drop the selection, as a click on empty space does.
+    pub fn clear_selection(&mut self) -> Outcome {
+        self.keymap.set_focus(Focus::List);
+        self.list_command(ListCommand::ClearSelection)
     }
 
     /// Apply a translated key action.
@@ -483,10 +477,7 @@ impl Browser {
     /// click or a Space to formally select it.
     #[must_use]
     pub fn selected_paths(&self) -> Vec<PathBuf> {
-        let selected = match self.view_mode {
-            ViewMode::List => self.pane.selection().selected(),
-            ViewMode::Grid => self.grid.selection().selected(),
-        };
+        let selected = self.pane.selection().selected();
         if selected.is_empty() {
             return self
                 .cursor_entry()
@@ -692,10 +683,7 @@ impl Browser {
 
     /// The cursor's row index and path together, for opening a rename.
     fn cursor_row_and_path(&self) -> Option<(usize, PathBuf)> {
-        let row = match self.view_mode {
-            ViewMode::List => self.pane.cursor(),
-            ViewMode::Grid => self.grid.cursor(),
-        }?;
+        let row = self.pane.cursor()?;
         Some((row, self.entry(row)?.path.clone()))
     }
 
@@ -813,6 +801,12 @@ impl Browser {
         format!("{}, {failed} failed", Self::describe(done, verb))
     }
 
+    /// What `press` would do under the current focus, without doing it.
+    #[must_use]
+    pub const fn translate(&self, press: platform::toplevel::KeyPress) -> Option<Action> {
+        self.keymap.translate(press)
+    }
+
     /// Translate and apply a key press in one step.
     pub fn key(&mut self, press: platform::toplevel::KeyPress) -> Outcome {
         self.keymap
@@ -875,7 +869,7 @@ impl Browser {
 
     /// Run a list command, resolving an activation against the model.
     fn list_command(&mut self, cmd: ListCommand) -> Outcome {
-        match self.active_command(cmd) {
+        match self.pane.command(cmd) {
             PaneResponse::Ignored => Outcome::Ignored,
             PaneResponse::Redraw => Outcome::Redraw,
             PaneResponse::Activate(row) => self.activate(row),
@@ -935,6 +929,7 @@ impl Browser {
             Ok(view) => {
                 self.view = view;
                 self.error = None;
+                self.watch.follow(path);
                 // Recorded only on success, and only for a genuinely new move:
                 // a back/forward step has already accounted for itself, and
                 // recording it here would make the chevrons toggle between two
@@ -953,8 +948,8 @@ impl Browser {
                 self.rename.cancel();
                 self.notice = None;
                 self.keymap.set_focus(Focus::List);
+                self.listing += 1;
                 self.pane.reset(self.view.visible_len());
-                self.grid.reset(self.view.visible_len());
                 if let Some(target) = select {
                     self.select_path(target);
                 }
@@ -979,10 +974,7 @@ impl Browser {
         // Through the active presentation rather than a bare selection, so
         // the target is also scrolled into view -- landing on an off-screen
         // cursor would look exactly like landing at the top.
-        match self.view_mode {
-            ViewMode::List => self.pane.select_row(row),
-            ViewMode::Grid => self.grid.select_item(row),
-        }
+        self.pane.select_row(row)
     }
 
     /// Move `paths` into `target_dir` (a real filesystem mutation via
@@ -1029,7 +1021,12 @@ impl Browser {
         let cursor_path = self.cursor_entry().map(|e| e.path.clone());
         match self.view.refresh() {
             Ok(()) => {
+                self.refreshes += 1;
                 self.error = None;
+                // Re-armed even though the path is unchanged: a directory
+                // deleted and recreated while unwatched is a different
+                // inode, and only a fresh `add_watch` follows it again.
+                self.watch.follow(self.view.path());
                 self.set_len(self.view.visible_len());
                 if let Some(path) = cursor_path {
                     self.select_path(&path);
@@ -1043,87 +1040,9 @@ impl Browser {
         }
     }
 
-    /// A pointer press at pane-relative coordinates.
-    pub fn press(&mut self, x: i32, y: i32, mods: Mods) -> Outcome {
-        // Clicking away from an open rename box commits it, the way every
-        // desktop field behaves. Leaving the box open would strand it over
-        // whichever row the click selected instead.
-        if self.rename.is_active() {
-            self.commit_rename();
-        }
-        // A click anywhere in the list takes focus away from the filter box,
-        // so the next letter typed is a shortcut again.
-        self.keymap.set_focus(Focus::List);
-        match self.active_press(x, y, mods) {
-            PaneResponse::Ignored => Outcome::Ignored,
-            PaneResponse::Redraw => Outcome::Redraw,
-            PaneResponse::Activate(row) => self.activate(row),
-        }
-    }
-
-    /// Pointer motion, for scrollbar drags.
-    pub fn motion(&mut self, y: i32) -> Outcome {
-        Outcome::redraw_if(self.active_motion(y).needs_redraw())
-    }
-
-    /// Pointer release.
-    pub const fn release(&mut self) -> Outcome {
-        Outcome::redraw_if(self.active_release().needs_redraw())
-    }
-
-    /// A double-click, which activates the row under the pointer.
-    pub fn double_click(&mut self, x: i32, y: i32) -> Outcome {
-        match self.active_double_click(x, y) {
-            PaneResponse::Activate(row) => self.activate(row),
-            PaneResponse::Redraw => Outcome::Redraw,
-            PaneResponse::Ignored => Outcome::Ignored,
-        }
-    }
-
-    /// Keep both presentations' backing lengths consistent after a filter or refresh.
     fn set_len(&mut self, len: usize) {
+        self.listing += 1;
         self.pane.set_len(len);
-        self.grid.set_len(len);
-    }
-
-    fn active_command(&mut self, command: ListCommand) -> PaneResponse {
-        match self.view_mode {
-            ViewMode::List => self.pane.command(command),
-            ViewMode::Grid => self.grid.command(command),
-        }
-    }
-
-    fn active_press(&mut self, x: i32, y: i32, mods: Mods) -> PaneResponse {
-        match self.view_mode {
-            ViewMode::List => self.pane.press(x, y, mods),
-            ViewMode::Grid => self.grid.press(x, y, mods),
-        }
-    }
-
-    fn active_motion(&mut self, y: i32) -> PaneResponse {
-        match self.view_mode {
-            ViewMode::List => self.pane.motion(y),
-            ViewMode::Grid => self.grid.motion(y),
-        }
-    }
-
-    const fn active_release(&mut self) -> PaneResponse {
-        match self.view_mode {
-            ViewMode::List => self.pane.release(),
-            ViewMode::Grid => self.grid.release(),
-        }
-    }
-
-    fn active_double_click(&mut self, x: i32, y: i32) -> PaneResponse {
-        match self.view_mode {
-            ViewMode::List => self.pane.double_click(x, y),
-            ViewMode::Grid => self.grid.double_click(x, y),
-        }
-    }
-
-    /// A wheel scroll, in lines.
-    pub fn scroll(&mut self, lines: i32) -> Outcome {
-        self.list_command(ListCommand::Scroll(lines))
     }
 }
 
@@ -1520,40 +1439,6 @@ mod tests {
     }
 
     #[test]
-    fn changing_views_keeps_the_selected_entry() {
-        let dir = TempDir::new("grid_selection_transfer");
-        dir.create_file("alpha.txt", b"a");
-        dir.create_file("beta.txt", b"b");
-        let mut browser = open(&dir);
-        down(&mut browser);
-        let selected = browser.cursor_entry().expect("cursor").path.clone();
-
-        assert_eq!(
-            browser.set_view_mode(super::ViewMode::Grid),
-            Outcome::Redraw
-        );
-        assert_eq!(browser.view_mode(), super::ViewMode::Grid);
-        assert_eq!(browser.cursor_entry().expect("grid cursor").path, selected);
-
-        assert_eq!(
-            browser.set_view_mode(super::ViewMode::List),
-            Outcome::Redraw
-        );
-        assert_eq!(browser.cursor_entry().expect("list cursor").path, selected);
-    }
-
-    #[test]
-    fn grid_activation_uses_the_same_directory_navigation_as_the_list() {
-        let dir = TempDir::new("grid_activation");
-        dir.create_dir("child");
-        let mut browser = open(&dir);
-        browser.set_view_mode(super::ViewMode::Grid);
-        browser.press(10, 10, Mods::none());
-        assert_eq!(activate(&mut browser), Outcome::Redraw);
-        assert!(browser.path().ends_with("child"));
-    }
-
-    #[test]
     fn dragging_an_unselected_row_carries_only_that_row() {
         let dir = TempDir::new("drag_unselected");
         dir.create_file("a.txt", b"a");
@@ -1593,8 +1478,7 @@ mod tests {
         let dir = TempDir::new("drop_target_dir_row");
         dir.create_dir("folder");
         let browser = open(&dir);
-        // Row 0 is the (only) entry, a directory, at y in [0, 20).
-        assert_eq!(browser.drop_target_row(5, 5), Some(0));
+        assert_eq!(browser.navigable_row(Some(0)), Some(0));
     }
 
     #[test]
@@ -1602,15 +1486,15 @@ mod tests {
         let dir = TempDir::new("drop_target_file_row");
         dir.create_file("a.txt", b"a");
         let browser = open(&dir);
-        assert_eq!(browser.drop_target_row(5, 5), None);
+        assert_eq!(browser.navigable_row(Some(0)), None);
     }
 
     #[test]
-    fn empty_space_below_the_list_targets_the_open_directory() {
+    fn empty_space_targets_the_open_directory() {
         let dir = TempDir::new("drop_target_empty_space");
         dir.create_file("a.txt", b"a");
         let browser = open(&dir);
-        assert_eq!(browser.drop_target_dir(5, 500), browser.path());
+        assert_eq!(browser.drop_dir(None), browser.path());
     }
 
     #[test]
@@ -1618,7 +1502,7 @@ mod tests {
         let dir = TempDir::new("drop_target_dir_resolves");
         let folder = dir.create_dir("folder");
         let browser = open(&dir);
-        assert_eq!(browser.drop_target_dir(5, 5), folder);
+        assert_eq!(browser.drop_dir(Some(0)), folder);
     }
 
     #[test]
@@ -2084,7 +1968,7 @@ mod tests {
         let mut browser = open(&dir);
         type_text(&mut browser, "a");
         assert!(browser.is_filtering());
-        browser.press(10, 10, Mods::none());
+        browser.pick(0, Mods::none());
         assert!(!browser.is_filtering());
     }
 
@@ -2141,6 +2025,83 @@ mod tests {
         browser.act(Action::Refresh);
         assert_eq!(browser.len(), 1);
         assert!(browser.pane().cursor().is_some_and(|c| c < 1));
+    }
+
+    // -- directory watching -----------------------------------------------
+
+    /// A file another process created must appear on the next poll, with no
+    /// navigation and no manual refresh -- the whole point of the watcher.
+    #[test]
+    fn a_file_created_by_another_process_appears_on_the_next_poll() {
+        let dir = TempDir::new("watched_create");
+        dir.create_file("first.txt", b"x");
+        let mut browser = open(&dir);
+        assert_eq!(browser.len(), 1);
+
+        dir.create_file("second.txt", b"x");
+        assert!(browser.poll_listing(), "the creation must be reported");
+        assert_eq!(browser.len(), 2, "the new file must be listed");
+    }
+
+    #[test]
+    fn a_file_deleted_by_another_process_disappears_on_the_next_poll() {
+        let dir = TempDir::new("watched_delete");
+        let file = dir.create_file("doomed.txt", b"x");
+        let mut browser = open(&dir);
+        assert_eq!(browser.len(), 1);
+
+        std::fs::remove_file(&file).expect("remove");
+        assert!(browser.poll_listing());
+        assert_eq!(browser.len(), 0);
+    }
+
+    /// The rename round-trip another process performs: one poll must show
+    /// the new name and no longer the old one.
+    #[test]
+    fn a_rename_by_another_process_is_visible_after_one_poll() {
+        let dir = TempDir::new("watched_rename");
+        let file = dir.create_file("before.txt", b"x");
+        let mut browser = open(&dir);
+
+        std::fs::rename(&file, dir.path().join("after.txt")).expect("rename");
+        assert!(browser.poll_listing());
+        assert_eq!(names(&browser), vec!["after.txt".to_string()]);
+    }
+
+    /// A quiet directory must cost nothing: no re-read, no revision bump --
+    /// otherwise an idle browser would refresh forever.
+    #[test]
+    fn polling_a_quiet_directory_costs_no_refresh() {
+        let dir = TempDir::new("watched_quiet");
+        dir.create_file("a.txt", b"x");
+        let mut browser = open(&dir);
+        let listing = browser.listing_revision();
+        let refreshes = browser.refresh_count();
+
+        assert!(!browser.poll_listing());
+        assert_eq!(browser.listing_revision(), listing);
+        assert_eq!(browser.refresh_count(), refreshes);
+    }
+
+    /// Navigating moves the watch: changes in the directory left behind
+    /// must not refresh the window now showing somewhere else, and changes
+    /// in the directory entered must.
+    #[test]
+    fn the_watch_follows_the_open_directory() {
+        let dir = TempDir::new("watched_follow");
+        let sub = dir.create_dir("sub");
+        dir.create_file("sub/keep.txt", b"x");
+        let mut browser = open(&dir);
+        browser.go_to(&sub);
+
+        dir.create_file("late.txt", b"x");
+        assert!(
+            !browser.poll_listing(),
+            "the directory left behind must be ignored"
+        );
+        dir.create_file("sub/fresh.txt", b"x");
+        assert!(browser.poll_listing(), "the directory entered must fire");
+        assert_eq!(browser.len(), 2);
     }
 
     // -- errors -----------------------------------------------------------

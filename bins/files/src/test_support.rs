@@ -57,16 +57,6 @@ impl TempDir {
         full
     }
 
-    /// Create a symlink at `rel` pointing at `target`.
-    ///
-    /// `target` is used verbatim, so callers can create deliberately broken
-    /// links -- which are a real state a browser must render, not an error.
-    pub fn create_symlink(&self, rel: &str, target: &str) -> PathBuf {
-        let full = self.path.join(rel);
-        std::os::unix::fs::symlink(target, &full).expect("create symlink");
-        full
-    }
-
     pub fn remove(&self, rel: &str) {
         let full = self.path.join(rel);
         let _ = std::fs::remove_file(&full);

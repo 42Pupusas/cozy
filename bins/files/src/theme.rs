@@ -14,6 +14,7 @@ use platform::draw::Color;
 
 use crate::density::Density;
 use crate::metric_overrides::MetricOverrides;
+use crate::pinned_card::CardMetrics;
 use crate::spacing::Spacing;
 
 /// Colours and metrics for the file browser.
@@ -49,21 +50,28 @@ pub struct Theme {
     pub muted: Color,
     /// The header strip showing the current path.
     ///
-    /// Retained as a distinct role from [`Self::toolbar_bg`] because the
-    /// config exposes it and a user may have set it; the toolbar mirrors it
+    /// Retained as a distinct role from [`Self::sidebar_bg`] because the
+    /// config exposes it and a user may have set it; the card mirrors it
     /// by default, so they only diverge if someone asks them to.
     #[allow(dead_code)]
     pub header_bg: Color,
+    /// `[files].status_bg`. The status line now sits inside the pinned card
+    /// and paints on the card's surface; kept so the documented config key
+    /// still parses into a role.
+    #[allow(dead_code)]
     pub status_bg: Color,
     pub error: Color,
     pub scrollbar_track: Color,
+    /// `[files].scrollbar_thumb`. The tiles do not scroll; kept so the
+    /// documented config key still parses into a role.
+    #[allow(dead_code)]
     pub scrollbar_thumb: Color,
     /// Fill behind the filter box while it has focus.
     pub filter_bg: Color,
     pub caret: Color,
 
-    /// Fill behind the places sidebar. Slightly off the list background so
-    /// the two panes read as separate regions without needing a hard border.
+    /// Fill behind the pinned chrome card. Slightly off the list background
+    /// so the card reads as a separate surface.
     pub sidebar_bg: Color,
     /// The hairline between the sidebar and the list.
     pub sidebar_border: Color,
@@ -94,8 +102,6 @@ pub struct Theme {
     pub selection_dir: Color,
     /// Selection fill for a file row.
     pub selection_file: Color,
-    /// Fill behind the toolbar strip.
-    pub toolbar_bg: Color,
     /// Outline around toolbar controls (the filter box, the view switch).
     pub control_border: Color,
     /// Outline around a control while it has keyboard focus.
@@ -104,7 +110,7 @@ pub struct Theme {
     /// -- per the guide it indicates state rather than decorating.
     pub accent: Color,
     /// A quiet wash of the accent, for the fill *behind* accented content:
-    /// the active sidebar row and the selected half of the view toggle.
+    /// the active sidebar row and the lit hidden-files toggle.
     ///
     /// Distinct from [`Self::accent`] because the guide uses the accent for
     /// two different jobs -- a 2px rule at full strength, and a background at
@@ -217,7 +223,6 @@ impl Default for Theme {
             hover_file: Color::rgb(0x28, 0x2a, 0x3a),
             selection_dir: Color::rgb(0x33, 0x40, 0x5c),
             selection_file: Color::rgb(0x3a, 0x3d, 0x50),
-            toolbar_bg: Color::rgb(0x18, 0x18, 0x25),
             control_border: Color::rgb(0x31, 0x32, 0x44),
             focus_ring: Color::rgb(0x89, 0xb4, 0xfa),
             accent: Color::rgb(0x89, 0xb4, 0xfa),
@@ -406,7 +411,6 @@ impl Theme {
                 cfg.files_text(),
                 Self::SELECTION_WASH,
             ),
-            toolbar_bg: cfg.files_header_bg().into(),
             control_border: cfg.files_filter_bg().into(),
             // The cursor colour already means "keyboard is here", so the
             // focus ring reuses it rather than introducing a second
@@ -511,15 +515,8 @@ impl Theme {
         self
     }
 
-    /// Whether the window is narrow enough for the guide's compact rules:
-    /// a collapsed sidebar rail and a dropped `modified` column.
-    #[must_use]
-    pub fn is_compact(&self, window_width: i32) -> bool {
-        window_width < self.spacing.collapse_below()
-    }
-
-    /// Height of a toolbar control (the filter box, the view toggle), packed
-    /// to this theme's density.
+    /// Height of a toolbar control (the filter box), packed to this theme's
+    /// density.
     ///
     /// Exists so call sites cannot reach for the raw `spacing.control_height()`
     /// and land a guide-sized control in a density-tightened band. Reading the
@@ -529,16 +526,26 @@ impl Theme {
         self.density.row(self.spacing.control_height())
     }
 
+    /// The section heights the pinned card asks for. The navigation row is
+    /// never shorter than a button plus a gap, whatever `header_height` says,
+    /// because a shorter row would drop every button.
+    #[must_use]
+    pub fn card_metrics(&self) -> CardMetrics {
+        let button_row = self.spacing.icon_button() + self.spacing.s();
+        CardMetrics {
+            nav: self.header_height.max(button_row),
+            crumbs: self.sidebar_row(),
+            filter: self.control_height() + self.spacing.m(),
+            places_row: self.sidebar_row(),
+            storage: self.spacing.storage_height(),
+            status: self.status_height,
+        }
+    }
+
     /// A sidebar navigation row, packed to this theme's density.
     #[must_use]
     pub fn sidebar_row(&self) -> i32 {
         self.density.row(self.spacing.sidebar_row())
-    }
-
-    /// The column-header strip above the list, packed to this theme's density.
-    #[must_use]
-    pub fn column_header(&self) -> i32 {
-        self.density.row(self.spacing.column_header())
     }
 
     /// Adopt the metrics derived from the loaded type scale.
@@ -570,15 +577,6 @@ impl Theme {
 #[cfg(test)]
 mod tests {
     use super::{Color, Density, Spacing, Theme};
-
-    /// The guide's responsive rule: a narrow window collapses the sidebar to
-    /// an icon rail so filenames keep their room.
-    #[test]
-    fn a_narrow_window_collapses_the_sidebar_to_a_rail() {
-        let theme = Theme::default().with_spacing(Spacing::new(13.0, 1.0));
-        assert!(theme.is_compact(700));
-        assert!(!theme.is_compact(1280));
-    }
 
     /// The guide's geometry must actually arrive when nothing is configured --
     /// stated at [`Density::GUIDE`], since the shipped policy deliberately
@@ -740,15 +738,15 @@ background = "#181616"
             assert_ne!(t.sidebar_active, t.sidebar_bg, "active place on sidebar");
             assert_ne!(t.sidebar_border, t.background, "the pane divider");
             assert_ne!(t.hover, t.background, "a hovered row");
-            assert_ne!(t.toolbar_bg, t.background, "the toolbar strip");
-            assert_ne!(t.control_border, t.toolbar_bg, "a control outline");
-            assert_ne!(t.focus_ring, t.toolbar_bg, "the focus ring");
+            assert_ne!(t.sidebar_bg, t.background, "the chrome card");
+            assert_ne!(t.control_border, t.sidebar_bg, "a control outline");
+            assert_ne!(t.focus_ring, t.sidebar_bg, "the focus ring");
             assert_ne!(t.accent, t.background, "the accent");
             assert_ne!(t.accent_surface, t.background, "the accent wash");
             // Disabled must be distinguishable from live muted text, or a
             // working timestamp reads as a dead control.
             assert_ne!(t.disabled, t.muted, "disabled vs muted");
-            assert_ne!(t.disabled, t.toolbar_bg, "a disabled glyph");
+            assert_ne!(t.disabled, t.sidebar_bg, "a disabled glyph");
         }
     }
 
@@ -764,6 +762,14 @@ background = "#181616"
     /// colours, so the property survives a re-themed palette: whatever the
     /// hues are, the directory fill must carry the directory ink's cast and
     /// the file fill must not, at a brightness the two share.
+    /// A configured header shorter than the buttons must not drop them.
+    #[test]
+    fn the_card_navigation_row_always_holds_its_buttons() {
+        let cfg = config::Config::from_bytes(b"[files]\nheader_height = 10\n").expect("parse");
+        let theme = Theme::from_config(&cfg).with_spacing(Spacing::new(13.0, 1.0));
+        assert!(theme.card_metrics().nav >= theme.spacing.icon_button());
+    }
+
     /// The sidebar's three row states must read in order: plain background,
     /// then hover, then the active place. Asserted on *brightness* rather than
     /// on inequality, because the failure this exists to catch is not "two
@@ -850,8 +856,7 @@ background = "#181616"
             let scrim = luma(t.panel_scrim);
             for (surface, name) in [
                 (t.background, "the list"),
-                (t.sidebar_bg, "the sidebar"),
-                (t.toolbar_bg, "the toolbar"),
+                (t.sidebar_bg, "the chrome card"),
                 (t.status_bg, "the status strip"),
             ] {
                 assert!(
@@ -956,10 +961,10 @@ background = "#181616"
     /// rather than stranding a hand-picked colour.
     #[test]
     fn the_modal_follows_a_retheme() {
-        let dark = config::Config::from_bytes(b"[colors]\nbackground = \"#181616\"\n")
-            .expect("parse");
-        let light = config::Config::from_bytes(b"[colors]\nbackground = \"#fdf6e3\"\n")
-            .expect("parse");
+        let dark =
+            config::Config::from_bytes(b"[colors]\nbackground = \"#181616\"\n").expect("parse");
+        let light =
+            config::Config::from_bytes(b"[colors]\nbackground = \"#fdf6e3\"\n").expect("parse");
         assert_ne!(
             Theme::from_config(&dark).panel_surface,
             Theme::from_config(&light).panel_surface

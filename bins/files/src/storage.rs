@@ -363,10 +363,7 @@ mod tests {
             "128 GiB"
         );
         assert_eq!(Usage::new(1024_u64.pow(4), 0).capacity_label(), "1 TiB");
-        assert_eq!(
-            Usage::new(512 * 1024 * 1024, 0).capacity_label(),
-            "512 MiB"
-        );
+        assert_eq!(Usage::new(512 * 1024 * 1024, 0).capacity_label(), "512 MiB");
     }
 
     /// The footer and the size column divide by the same 1024, so they must

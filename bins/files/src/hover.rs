@@ -23,10 +23,12 @@ use crate::toolbar::Target;
 /// clearing the other, that is exactly what would be painted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Spot {
-    /// A row in one of the two list panes.
-    Row(Pane, usize),
+    /// An entry in the tile field, or a row in the places list.
+    Item(Pane, usize),
     /// A control in the toolbar.
     Control(Target),
+    /// The tile that opens the next page of smaller entries.
+    Overflow,
 }
 
 /// Which pane a hovered row belongs to.
@@ -37,8 +39,8 @@ pub enum Spot {
 /// its pane makes that mistake unrepresentable rather than merely unlikely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pane {
-    /// The file list.
-    List,
+    /// The tile field.
+    Tiles,
     /// The places sidebar.
     Sidebar,
 }
@@ -74,7 +76,7 @@ impl Hover {
     /// invites -- and so the two panes cannot light each other's rows.
     #[must_use]
     pub fn is(self, pane: Pane, row: usize) -> bool {
-        self.spot == Some(Spot::Row(pane, row))
+        self.spot == Some(Spot::Item(pane, row))
     }
 
     /// The hovered toolbar control, if the pointer is over one.
@@ -84,6 +86,12 @@ impl Hover {
             Some(Spot::Control(target)) => Some(target),
             _ => None,
         }
+    }
+
+    /// Whether the pointer is over the overflow tile.
+    #[must_use]
+    pub fn is_overflow(self) -> bool {
+        self.spot == Some(Spot::Overflow)
     }
 
     /// Move the hover to `spot`, reporting whether a repaint is owed.
@@ -124,7 +132,7 @@ mod tests {
 
     impl HoverRow for Hover {
         fn to_row(&mut self, pane: Pane, row: usize) -> bool {
-            self.move_to(Some(Spot::Row(pane, row)))
+            self.move_to(Some(Spot::Item(pane, row)))
         }
 
         fn off_rows(&mut self) -> bool {
@@ -138,7 +146,7 @@ mod tests {
         assert_eq!(hover.spot(), None);
         assert_eq!(hover.control(), None);
         assert!(
-            !hover.is(Pane::List, 0),
+            !hover.is(Pane::Tiles, 0),
             "nothing hovered must not match row 0"
         );
     }
@@ -149,7 +157,7 @@ mod tests {
     fn an_empty_hover_never_matches_a_row() {
         let hover = Hover::default();
         for row in 0..4 {
-            assert!(!hover.is(Pane::List, row));
+            assert!(!hover.is(Pane::Tiles, row));
             assert!(!hover.is(Pane::Sidebar, row));
         }
     }
@@ -157,11 +165,11 @@ mod tests {
     #[test]
     fn moving_to_a_new_row_owes_a_repaint() {
         let mut hover = Hover::none();
-        assert!(hover.to_row(Pane::List, 3), "first hover is a change");
-        assert!(hover.is(Pane::List, 3));
-        assert!(hover.to_row(Pane::List, 4), "a different row is a change");
-        assert!(!hover.is(Pane::List, 3));
-        assert!(hover.is(Pane::List, 4));
+        assert!(hover.to_row(Pane::Tiles, 3), "first hover is a change");
+        assert!(hover.is(Pane::Tiles, 3));
+        assert!(hover.to_row(Pane::Tiles, 4), "a different row is a change");
+        assert!(!hover.is(Pane::Tiles, 3));
+        assert!(hover.is(Pane::Tiles, 4));
     }
 
     /// The frame-saving property: dragging the pointer within one row must not
@@ -169,10 +177,10 @@ mod tests {
     #[test]
     fn staying_on_the_same_row_owes_nothing() {
         let mut hover = Hover::none();
-        assert!(hover.to_row(Pane::List, 2));
+        assert!(hover.to_row(Pane::Tiles, 2));
         for _ in 0..64 {
             assert!(
-                !hover.to_row(Pane::List, 2),
+                !hover.to_row(Pane::Tiles, 2),
                 "re-hovering the same row must be free"
             );
         }
@@ -206,15 +214,15 @@ mod tests {
     #[test]
     fn a_control_replaces_a_hovered_row_rather_than_joining_it() {
         let mut hover = Hover::none();
-        hover.to_row(Pane::List, 5);
-        assert!(hover.move_to(Some(Spot::Control(Target::Filter))));
+        hover.to_row(Pane::Tiles, 5);
+        assert!(hover.move_to(Some(Spot::Control(Target::FilterBox))));
         assert!(
-            !hover.is(Pane::List, 5),
+            !hover.is(Pane::Tiles, 5),
             "the row must go dark when a button lights up"
         );
-        assert_eq!(hover.control(), Some(Target::Filter));
+        assert_eq!(hover.control(), Some(Target::FilterBox));
         // And back the other way.
-        hover.to_row(Pane::List, 5);
+        hover.to_row(Pane::Tiles, 5);
         assert_eq!(
             hover.control(),
             None,
@@ -233,7 +241,7 @@ mod tests {
     #[test]
     fn leaving_clears_and_owes_a_repaint() {
         let mut hover = Hover::none();
-        hover.to_row(Pane::List, 1);
+        hover.to_row(Pane::Tiles, 1);
         assert!(hover.clear(), "losing the highlight is a visible change");
         assert_eq!(hover.spot(), None);
         assert!(!hover.clear(), "clearing twice owes nothing");
@@ -249,7 +257,7 @@ mod tests {
     #[test]
     fn moving_off_the_rows_owes_a_repaint() {
         let mut hover = Hover::none();
-        hover.to_row(Pane::List, 0);
+        hover.to_row(Pane::Tiles, 0);
         assert!(hover.off_rows());
         assert!(!hover.off_rows(), "already off owes nothing");
     }
@@ -263,7 +271,7 @@ mod tests {
         hover.to_row(Pane::Sidebar, 2);
         assert!(hover.is(Pane::Sidebar, 2));
         assert!(
-            !hover.is(Pane::List, 2),
+            !hover.is(Pane::Tiles, 2),
             "the list must not light the sidebar's row"
         );
     }
@@ -275,10 +283,10 @@ mod tests {
         let mut hover = Hover::none();
         hover.to_row(Pane::Sidebar, 1);
         assert!(
-            hover.to_row(Pane::List, 1),
+            hover.to_row(Pane::Tiles, 1),
             "same index, different pane, is still a change"
         );
-        assert!(hover.is(Pane::List, 1));
+        assert!(hover.is(Pane::Tiles, 1));
         assert!(!hover.is(Pane::Sidebar, 1));
     }
 }

@@ -193,7 +193,6 @@ impl MountService {
             .as_ref()
             .is_some_and(|tx| tx.send(reply).is_ok())
     }
-
 }
 
 /// Releases a worker blocked on a prompt that will never be answered.
@@ -334,10 +333,7 @@ mod tests {
             outcome: MountOutcome::Mounted,
         });
         for _ in 0..3 {
-            assert!(matches!(
-                next(&mut service),
-                MountProgress::Prompt { .. }
-            ));
+            assert!(matches!(next(&mut service), MountProgress::Prompt { .. }));
             assert!(service.answer(Some(String::from("correct"))));
         }
         assert_eq!(

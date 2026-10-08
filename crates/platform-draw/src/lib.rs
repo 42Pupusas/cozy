@@ -27,7 +27,9 @@
 //! the outside.
 
 pub mod draw;
+pub mod ellipse;
 pub mod font;
+pub mod line;
 pub mod round_rect;
 pub mod surface_format;
 pub mod text;

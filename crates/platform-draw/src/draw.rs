@@ -17,7 +17,6 @@
 use crate::font;
 use crate::round_rect::RoundRect;
 use crate::surface_format::SurfaceFormat;
-
 /// An RGBA color.
 ///
 /// Alpha is ignored by the surface-packed paths (`fill_rect`, `clear`), which
@@ -568,28 +567,51 @@ impl<'a> Canvas<'a> {
     /// A zero radius degenerates to exactly [`Self::fill_rect`], so callers
     /// with a configurable corner radius need no branch of their own.
     pub fn fill_round_rect(&mut self, rect: Rect, color: Color, radius: i32) {
+        let packed = self.format.pack_paint(color);
+        self.fill_round_rect_packed(rect, color, radius, packed, u8::MAX);
+    }
+
+    /// [`Self::fill_round_rect`] for *background*: the rounded counterpart of
+    /// [`Self::fill_rect_glass`], carrying the window's opacity.
+    ///
+    /// The anti-aliased corner pixels are blended at their coverage scaled by
+    /// the window's own alpha, so the arc fades into the desktop rather than
+    /// leaving an opaque fringe around a translucent card.
+    pub fn fill_round_rect_glass(&mut self, rect: Rect, color: Color, radius: i32) {
+        let packed = self.format.pack_glass(color);
+        let edge = self.format.bg_alpha();
+        self.fill_round_rect_packed(rect, color, radius, packed, edge);
+    }
+
+    fn fill_round_rect_packed(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        radius: i32,
+        packed: u32,
+        edge_alpha: u8,
+    ) {
         let shape = RoundRect::new(rect, radius);
         if shape.is_empty() {
             return;
         }
         if shape.radius() == 0 {
-            self.fill_rect(rect, color);
+            self.fill_rect_packed(rect, packed);
             return;
         }
-        let packed = self.format.pack_paint(color);
+        let scale = |coverage: u8| {
+            u8::try_from(u16::from(coverage) * u16::from(edge_alpha) / 255).unwrap_or(u8::MAX)
+        };
         for y in rect.y..rect.bottom() {
             let Some(span) = shape.span_at(y) else {
                 continue;
             };
             self.fill_rect_packed(Rect::new(span.x0, y, span.x1 - span.x0, 1), packed);
-            // The two fractional pixels bracketing the run. Blending rather
-            // than filling is what keeps a 4px corner from reading as a
-            // staircase.
             if span.left_alpha > 0 {
-                self.blend_pixel(span.x0 - 1, y, color, span.left_alpha);
+                self.blend_pixel(span.x0 - 1, y, color, scale(span.left_alpha));
             }
             if span.right_alpha > 0 {
-                self.blend_pixel(span.x1, y, color, span.right_alpha);
+                self.blend_pixel(span.x1, y, color, scale(span.right_alpha));
             }
         }
     }
@@ -738,6 +760,47 @@ impl<'a> Canvas<'a> {
             self.pixels[(y.cast_unsigned() as usize) * stride + col.cast_unsigned() as usize] =
                 packed;
         }
+    }
+
+    /// Draw a line from `(x0, y0)` to `(x1, y1)`, `width` pixels thick,
+    /// clipped per-pixel to the canvas.
+    ///
+    /// The Bresenham walk lives in [`crate::line`]; this is the packing and
+    /// clipping seam. `width < 1` draws nothing; `width == 1` is the plain
+    /// 1px walk.
+    pub fn draw_line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, width: i32, color: Color) {
+        let packed = self.format.pack_paint(color);
+        crate::line::walk_thick(x0, y0, x1, y1, width, |x, y| {
+            if x >= 0 && y >= 0 && x < self.width && y < self.height {
+                // Checked non-negative and in-bounds above, so these
+                // sign-preserving casts are exact.
+                let idx = (y.cast_unsigned() as usize) * (self.width.cast_unsigned() as usize)
+                    + (x.cast_unsigned() as usize);
+                self.pixels[idx] = packed;
+            }
+        });
+    }
+
+    /// Draw the 1px outline of an ellipse inscribed in `rect` (clipped).
+    ///
+    /// The midpoint scan-conversion lives in [`crate::ellipse`]. A degenerate
+    /// (zero) extent draws the corresponding straight segment, so a dragged
+    /// ellipse that collapses mid-gesture still reads as a line.
+    pub fn draw_ellipse(&mut self, rect: Rect, color: Color) {
+        let rx = rect.w / 2;
+        let ry = rect.h / 2;
+        let cx = rect.x + rx;
+        let cy = rect.y + ry;
+        let packed = self.format.pack_paint(color);
+        crate::ellipse::outline(cx, cy, rx, ry, &mut |x, y| {
+            if x >= 0 && y >= 0 && x < self.width && y < self.height {
+                // Checked non-negative and in-bounds above, so these
+                // sign-preserving casts are exact.
+                let idx = (y.cast_unsigned() as usize) * (self.width.cast_unsigned() as usize)
+                    + (x.cast_unsigned() as usize);
+                self.pixels[idx] = packed;
+            }
+        });
     }
 
     /// Blit a decoded RGBA8 image (`src`, `src_w`×`src_h` pixels, straight
@@ -920,6 +983,29 @@ mod tests {
         Canvas::new(&mut buf_a, 8, 8).fill_rect(Rect::new(1, 1, 6, 6), Color::WHITE);
         Canvas::new(&mut buf_b, 8, 8).fill_round_rect(Rect::new(1, 1, 6, 6), Color::WHITE, 0);
         assert_eq!(buf_a, buf_b);
+    }
+
+    #[test]
+    fn a_glass_round_rect_on_an_opaque_surface_matches_the_painted_one() {
+        let mut painted = canvas_buf(20, 20);
+        let mut glass = canvas_buf(20, 20);
+        let rect = Rect::new(2, 2, 16, 16);
+        Canvas::new(&mut painted, 20, 20).fill_round_rect(rect, Color::WHITE, 5);
+        Canvas::new(&mut glass, 20, 20).fill_round_rect_glass(rect, Color::WHITE, 5);
+        assert_eq!(painted, glass);
+    }
+
+    #[test]
+    fn a_glass_round_rect_carries_the_window_alpha() {
+        let mut buf = canvas_buf(20, 20);
+        let mut c = Canvas::new(&mut buf, 20, 20).with_format(SurfaceFormat::with_bg_alpha(128));
+        c.fill_round_rect_glass(Rect::new(0, 0, 20, 20), Color::WHITE, 6);
+        assert_eq!(buf[10 * 20 + 10] >> 24, 128, "the interior is glass");
+        assert!(buf[0] >> 24 < 128, "the corner fades below the glass alpha");
+        assert!(
+            buf.iter().all(|&p| p >> 24 <= 128),
+            "no pixel of a glass card may turn opaque"
+        );
     }
 
     /// The corners must actually be lighter than the middle -- the whole point

@@ -7,22 +7,24 @@
 //! of the layering -- the file-manager behaviour is tested headlessly, and
 //! what is left here is a straight transcription onto a canvas.
 
-use platform::draw::{Canvas, Color, Rect};
+use platform::draw::{Canvas, Color, Point, Rect};
 use platform::protocol::PointerButton;
 use platform::toplevel::{KeyPress, Painter, PhysicalSize, PointerEventKind, Position};
+use std::os::fd::RawFd;
 use widget::{DragArm, Mods};
 
 use crate::breadcrumb::Breadcrumb;
-use crate::browser::{Browser, Outcome, ViewMode};
-use crate::columns::{Column, Columns};
+use crate::browser::{Browser, Outcome};
 use crate::drag_badge::{BadgeStyle, DragBadge};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
 use crate::hover::{Hover, Pane, Spot};
-use crate::kind_label::KindLabel;
-use crate::moment::Moment;
+use crate::pinned_card::PinnedCard;
 use crate::row_format::RowFormat;
+use crate::row_kind::RowKind;
 use crate::sidebar::{Sidebar, SidebarRow};
+use crate::spiral::MinCell;
+use crate::spiral_cursor::{Landing, SpiralCursor};
 use volumes::mount_backend::MountOutcome;
 use volumes::{AttachedDevice, VolumeFlush, VolumeWatch};
 
@@ -31,6 +33,9 @@ use crate::mount_session::{MountIdentity, MountSession};
 use crate::password_panel::{PanelStyle, PanelText, PasswordPanel};
 use crate::storage::Storage;
 use crate::theme::Theme;
+use crate::tile_field::{PlacedTile, TileField};
+use crate::tile_painter::{PaintedTile, TileFace, TilePainter, TileRename};
+use crate::tile_rank::Tile;
 use crate::toolbar::{Target, Toolbar};
 use crate::typography::Typography;
 
@@ -48,102 +53,25 @@ const DOUBLE_CLICK_MS: u64 = 400;
 /// user never meant to open.
 const DOUBLE_CLICK_SLOP: i32 = 4;
 
-/// Which family of highlight colours a row draws from.
-///
-/// A two-variant enum rather than the `navigable: bool` it replaced, because
-/// `bool` at a call site reads as "true means... what, exactly?" -- and because
-/// this is the axis most likely to gain a third case (a symlink family, say),
-/// which a bool cannot express without every call site changing shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RowKind {
-    /// Anything Enter would descend into -- a directory, or a symlink to one.
-    /// The same test `RowFormat::name` uses for its trailing slash, so the
-    /// highlight tint and the slash cannot disagree about what a row is.
-    Navigable,
-    /// A leaf: a regular file, a device, a broken link.
-    Leaf,
-}
-
-impl RowKind {
-    /// Classify an entry.
-    const fn of(entry: &fsmodel::entry::Entry) -> Self {
-        if entry.is_navigable() {
-            Self::Navigable
-        } else {
-            Self::Leaf
-        }
-    }
-
-    /// The selection fill for this kind.
-    ///
-    /// The two lookups sit side by side deliberately: a mismatched pair (hover
-    /// reading the directory colour while selection reads the file one) is
-    /// obvious here and invisible if they live at separate call sites.
-    const fn selection_fill(self, theme: &Theme) -> Color {
-        match self {
-            Self::Navigable => theme.selection_dir,
-            Self::Leaf => theme.selection_file,
-        }
-    }
-
-    /// The hover fill for this kind.
-    const fn hover_fill(self, theme: &Theme) -> Color {
-        match self {
-            Self::Navigable => theme.hover_dir,
-            Self::Leaf => theme.hover_file,
-        }
-    }
-}
-
-/// One row's strings and states, gathered before drawing.
-///
-/// A named struct rather than a tuple because six positional fields of which
-/// two are `bool` is exactly the shape that silently swaps `selected` and
-/// `is_cursor` during a refactor.
-#[allow(clippy::struct_excessive_bools)] // each flag is an independent, unrelated painted state, not a state machine
-struct PaintedRow {
-    y: i32,
-    name: String,
-    kind: String,
-    modified: String,
-    size: String,
-    color: Color,
-    selected: bool,
-    is_cursor: bool,
-    hovered: bool,
-    /// Whether an incoming drag is currently hovering this row -- painted
-    /// as an outline so it reads distinctly from selection/hover fills
-    /// (which mean "this is what you've chosen" or "this is under the
-    /// pointer", not "dropping here will move files into this folder").
-    drop_target: bool,
-    /// Whether a Ctrl-X marked this entry to be moved by the next paste.
-    /// Painted dimmed, the way every file manager shows a pending cut, so
-    /// the user can see what their Ctrl-X actually took.
-    cut: bool,
-    /// Which highlight family this row draws from.
-    row_kind: RowKind,
-}
-
 /// Where one sidebar entry sits, and in what state.
 ///
-/// A struct rather than six positional arguments: `y`, `width` and `row_h`
-/// are all `i32`, and `active`, `hovered` and `compact` are all `bool`, so a
-/// transposed pair would compile and paint the wrong thing.
+/// A struct rather than positional arguments: `x`, `y`, `width` and `row_h`
+/// are all `i32`, and `active` and `hovered` are both `bool`, so a transposed
+/// pair would compile and paint the wrong thing.
 #[derive(Clone, Copy)]
 struct SidebarEntry {
+    x: i32,
     y: i32,
     width: i32,
     row_h: i32,
     active: bool,
     hovered: bool,
-    compact: bool,
 }
 
 /// The inline rename box's contents for one frame.
 ///
-/// Gathered before painting for the same reason as [`PaintedRow`]: drawing
-/// borrows `self.type_scale` mutably, which cannot coexist with a borrow of
-/// `self.browser`.
+/// Gathered before painting: drawing borrows `self.type_scale` mutably, which
+/// cannot coexist with a borrow of `self.browser`.
 struct PaintedRename {
     row: usize,
     text: String,
@@ -224,6 +152,11 @@ pub struct FilesWindow {
     /// hand the new set across the same seam the loop already crosses for
     /// drags and opens.
     volumes: VolumeWatch,
+    /// The tile presentation: size ranking, overflow pages, armed folder.
+    tiles: TileField,
+    /// How many places rows the sidebar's list is scrolled past. The compact
+    /// card shows a handful of rows; the wheel over the card moves this.
+    places_scroll: i32,
 }
 
 impl FilesWindow {
@@ -239,6 +172,7 @@ impl FilesWindow {
     ) -> Self {
         Self {
             volumes: VolumeWatch::new(),
+            tiles: TileField::new(wake.clone()),
             mount: MountSession::new(wake, MountIdentity::current()),
             mount_candidate: None,
             browser,
@@ -259,6 +193,7 @@ impl FilesWindow {
             pending_drag: None,
             drop_hover_row: None,
             drag_badge: DragBadge::new(),
+            places_scroll: 0,
         }
     }
 
@@ -276,11 +211,9 @@ impl FilesWindow {
     /// `Toplevel`, not delivered to `Painter` as a callback, so the event
     /// loop reports them here once per tick instead.
     pub fn update_drag_hover(&mut self, over: bool, at: (i32, i32)) {
+        self.sync_tiles();
         self.drop_hover_row = if over {
-            let rows_top = self.frame().rows().y;
-            let rows_left = self.frame().rows().x;
-            self.browser
-                .drop_target_row(at.0 - rows_left, at.1 - rows_top)
+            self.browser.navigable_row(self.entry_at(at))
         } else {
             None
         };
@@ -298,6 +231,307 @@ impl FilesWindow {
     pub const fn update_drag_active(&mut self, dragging: bool) {
         if !dragging {
             self.drag_badge.end();
+        }
+    }
+
+    /// The entry whose tile lies under window position `at`.
+    fn entry_at(&self, at: (i32, i32)) -> Option<usize> {
+        self.tile_at(Point::new(at.0, at.1)).and_then(Tile::item)
+    }
+
+    /// The field the spiral fills and the room the card needs in it, so
+    /// every layout, hit-test and page query sees one shape.
+    fn flow_parts(&self) -> (Rect, Option<MinCell>) {
+        let frame = self.frame();
+        (frame.field(), frame.card_need())
+    }
+
+    /// The pinned card, fitted to the spiral's innermost cell.
+    fn card(&self) -> Option<PinnedCard> {
+        let frame = self.frame();
+        let need = frame.card_need()?;
+        let cell =
+            self.tiles
+                .card_cell(frame.field(), self.theme.spacing.tile_min(), Some(need))?;
+        Some(frame.card_in(cell))
+    }
+
+    fn tile_layout(&self) -> Vec<PlacedTile> {
+        let (spiral, tail) = self.flow_parts();
+        self.tiles
+            .layout(spiral, self.theme.spacing.tile_min(), tail)
+    }
+
+    fn tile_at(&self, at: Point) -> Option<Tile> {
+        let (spiral, tail) = self.flow_parts();
+        self.tiles
+            .hit(spiral, self.theme.spacing.tile_min(), tail, at)
+    }
+
+    /// Bring the tile ranking up to date with the browser.
+    fn sync_tiles(&mut self) {
+        self.tiles.sync(&self.browser);
+    }
+
+    /// Drain the directory watcher through the browser, re-reading the open
+    /// directory when a change was reported. Returns whether anything is
+    /// newly visible -- the same contract [`Self::poll_tiles`] keeps.
+    pub fn poll_listing(&mut self) -> bool {
+        self.browser.poll_listing()
+    }
+
+    /// The open directory's watched inotify fd, for the event loop's
+    /// `poll(2)`. `None` while nothing is armed.
+    #[must_use]
+    pub fn watch_fd(&self) -> Option<RawFd> {
+        self.browser.watch_fd()
+    }
+
+    /// Fold in folder totals the size worker produced. Returns whether the
+    /// tiles must be redrawn.
+    pub fn poll_tiles(&mut self) -> bool {
+        let arrived = self.tiles.poll();
+        self.tiles.sync(&self.browser);
+        arrived
+    }
+
+    /// Whether the up control has somewhere to go: out of an overflow page,
+    /// or to the parent directory.
+    fn can_step_out(&self) -> bool {
+        self.tiles.depth() > 0 || self.browser.can_go_up()
+    }
+
+    /// Close the innermost overflow page if one is open, else go up a
+    /// directory.
+    fn step_out(&mut self) -> Outcome {
+        if self.tiles.close_page() {
+            return Outcome::Redraw;
+        }
+        self.browser.act(crate::keymap::Action::GoUp)
+    }
+
+    /// A movement key in the tile view: walk the spiral in rank order,
+    /// crossing into and out of overflow pages at their edges.
+    fn steer_tiles(&mut self, command: widget::ListCommand) -> Outcome {
+        let (spiral, tail) = self.flow_parts();
+        let (page, more) = self.tiles.page(spiral, self.theme.spacing.tile_min(), tail);
+        let cursor = self.browser.pane().cursor();
+        let landing =
+            SpiralCursor::new(&page, more.is_some(), self.tiles.depth() > 0).land(cursor, command);
+        let extend = matches!(command, widget::ListCommand::Extend(_));
+        match landing {
+            Landing::At(row) => self.browser.steer_to(row, extend),
+            Landing::NextPage => {
+                let Some(from) = more else {
+                    return Outcome::Ignored;
+                };
+                self.tiles.open_more(from);
+                self.steer_to_page_edge(true, extend)
+            }
+            Landing::PrevPage => {
+                self.tiles.close_page();
+                self.steer_to_page_edge(false, extend)
+            }
+            Landing::Stay => Outcome::Ignored,
+        }
+    }
+
+    /// After a page change, put the cursor on the new page's first entry
+    /// when walking forward, or its last when walking back.
+    fn steer_to_page_edge(&mut self, first: bool, extend: bool) -> Outcome {
+        let (spiral, tail) = self.flow_parts();
+        let (page, _) = self.tiles.page(spiral, self.theme.spacing.tile_min(), tail);
+        let edge = if first { page.first() } else { page.last() };
+        match edge {
+            Some(&row) => {
+                let _ = self.browser.steer_to(row, extend);
+                Outcome::Redraw
+            }
+            None => Outcome::Redraw,
+        }
+    }
+
+    /// A left press anywhere in the window.
+    ///
+    /// The card's controls are checked before anything else, and a click in
+    /// the places list goes no further, so neither can fall through to an
+    /// entry lying under it.
+    fn press_left(&mut self, at: Position, mods: Mods) {
+        if self.tiles.swallows(Self::now_ms(), DOUBLE_CLICK_MS) {
+            self.last_click = None;
+            return;
+        }
+        if let Some(target) = self.toolbar_hit(at) {
+            self.activate_control(target);
+            return;
+        }
+        if self.in_sidebar(at) {
+            self.press_sidebar(at);
+            return;
+        }
+        let over_card = self
+            .card()
+            .is_some_and(|card| card.bounds().contains(Point::new(at.x, at.y)));
+        if !over_card && self.frame().field().contains(Point::new(at.x, at.y)) {
+            self.press_tile(at, mods);
+        }
+    }
+
+    /// A left press on the places list: attach an unmounted device, or go to
+    /// the place.
+    ///
+    /// The device check comes first and consumes the click: a device row has
+    /// no path, so falling through would find nothing to navigate to and the
+    /// row would appear dead.
+    fn press_sidebar(&mut self, at: Position) {
+        let Some(index) = self.sidebar_row_at(at) else {
+            return;
+        };
+        if self.mount_from_sidebar(index) {
+            return;
+        }
+        if let Some(path) = self
+            .sidebar
+            .rows()
+            .get(index)
+            .and_then(SidebarRow::path)
+            .map(std::path::Path::to_path_buf)
+        {
+            let outcome = self.browser.go_to(&path);
+            self.apply(outcome);
+            // A new directory may live on a different filesystem.
+            self.refresh_storage();
+        }
+    }
+
+    /// A left press in the tile field.
+    ///
+    /// A folder enters on release rather than on press, so pressing and
+    /// dragging it carries it instead of opening it. Files need a
+    /// double-click to open, as in the other presentations.
+    fn press_tile(&mut self, at: Position, mods: Mods) {
+        let now = Self::now_ms();
+        let doubled = self.is_double_click(now, at);
+        match self.tile_at(Point::new(at.x, at.y)) {
+            None => {
+                let outcome = self.browser.clear_selection();
+                self.apply(outcome);
+            }
+            Some(Tile::More { from, .. }) => {
+                self.tiles.open_more(from);
+                let _ = self.hover.clear();
+            }
+            Some(Tile::Item(row)) => {
+                let navigable = self.browser.navigable_row(Some(row)).is_some();
+                let outcome = if doubled && !navigable {
+                    self.browser.activate_entry(row)
+                } else {
+                    self.browser.pick(row, mods)
+                };
+                self.apply(outcome);
+                if navigable && mods == Mods::none() {
+                    self.tiles.arm(row);
+                }
+                self.drag_row = Some(row);
+                self.drag_arm.press((at.x, at.y));
+            }
+        }
+    }
+
+    /// Enter the folder a tile press armed, if the gesture stayed a click.
+    fn release_tile(&mut self) {
+        let Some(row) = self.tiles.take_armed() else {
+            return;
+        };
+        let outcome = self.browser.activate_entry(row);
+        self.apply(outcome);
+        self.tiles.entered(Self::now_ms());
+    }
+
+    /// The tiles of the open page, gathered for painting.
+    fn painted_tiles(&self, placed: &[PlacedTile]) -> Vec<PaintedTile> {
+        placed
+            .iter()
+            .filter_map(|placed| match placed.tile {
+                Tile::Item(row) => self.painted_entry_tile(placed.rect, row),
+                Tile::More { from, count } => {
+                    Some(self.painted_overflow_tile(placed.rect, from, count))
+                }
+            })
+            .collect()
+    }
+
+    fn painted_entry_tile(&self, rect: Rect, row: usize) -> Option<PaintedTile> {
+        let entry = self.browser.entry(row)?;
+        let sizes = self.tiles.sizes();
+        let detail = if sizes.is_pending(entry) {
+            String::from("measuring…")
+        } else {
+            RowFormat::human_size(sizes.of(entry))
+        };
+        let pane = self.browser.pane();
+        let cut = self.browser.clipboard().is_cut(&entry.path);
+        Some(PaintedTile {
+            rect,
+            face: TileFace::Item(RowKind::of(entry)),
+            name: entry.name.clone(),
+            detail,
+            name_color: if cut {
+                self.theme.muted
+            } else {
+                RowFormat::color(entry, &self.theme)
+            },
+            selected: pane.is_selected(row),
+            hovered: self.hover.is(Pane::Tiles, row)
+                || (self.focused && pane.cursor() == Some(row)),
+            drop_target: self.drop_hover_row == Some(row),
+        })
+    }
+
+    fn painted_overflow_tile(&self, rect: Rect, from: usize, count: usize) -> PaintedTile {
+        let sizes = self.tiles.sizes();
+        let bytes: u64 = self
+            .tiles
+            .ranked()
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|&row| self.browser.entry(row))
+            .map(|entry| sizes.of(entry))
+            .sum();
+        PaintedTile {
+            rect,
+            face: TileFace::Overflow,
+            name: format!("{count} more…"),
+            detail: RowFormat::human_size(bytes),
+            name_color: self.theme.text,
+            selected: false,
+            hovered: self.hover.is_overflow(),
+            drop_target: false,
+        }
+    }
+
+    fn tile_rename(&self, placed: &[PlacedTile]) -> Option<TileRename> {
+        let editing = self.painted_rename()?;
+        let tile = placed
+            .iter()
+            .find(|placed| placed.tile == Tile::Item(editing.row))?;
+        Some(TileRename {
+            tile: tile.rect,
+            text: editing.text,
+            before_caret: editing.before_caret,
+            valid: editing.valid,
+        })
+    }
+
+    fn paint_tiles(&mut self, canvas: &mut Canvas<'_>) {
+        let placed = self.tile_layout();
+        let tiles = self.painted_tiles(&placed);
+        let rename = self.tile_rename(&placed);
+        let mut brush = TilePainter::new(&self.theme, &mut self.type_scale);
+        brush.paint(canvas, &tiles);
+        if let Some(rename) = rename {
+            brush.paint_rename(canvas, &rename);
         }
     }
 
@@ -373,10 +607,9 @@ impl FilesWindow {
         self.rebuild_sidebar();
     }
 
-    /// Show or hide the places pane, re-laying out the list to match.
-    pub fn toggle_sidebar(&mut self) {
+    /// Show or hide the pinned card.
+    pub const fn toggle_sidebar(&mut self) {
         self.sidebar.toggle();
-        self.relayout();
     }
 
     /// Rebuild the sidebar rows after the favorites list or the attached
@@ -395,16 +628,6 @@ impl FilesWindow {
         }
     }
 
-    /// Tell the browser how much room the list actually has.
-    ///
-    /// Factored out of `resize` because toggling the sidebar changes the
-    /// list's width without any window resize -- and forgetting to re-layout
-    /// there would leave the list hit-testing against a stale width.
-    fn relayout(&mut self) {
-        let rows = self.frame().rows();
-        self.browser.resize(rows.w.max(0), rows.h.max(0));
-    }
-
     /// The window's resolved geometry.
     ///
     /// Every band the painter draws and every hit-test it performs goes
@@ -417,9 +640,7 @@ impl FilesWindow {
             self.size.height,
             self.sidebar.visible(),
             self.theme.spacing,
-            self.theme.header_height,
-            self.theme.status_height,
-            self.theme.column_header(),
+            self.theme.card_metrics(),
         )
     }
 
@@ -440,10 +661,9 @@ impl FilesWindow {
         self.browser.path().display().to_string()
     }
 
-    /// Tell the browser about a new window size.
-    pub fn resize(&mut self, size: PhysicalSize) {
+    /// Record a new window size.
+    pub const fn resize(&mut self, size: PhysicalSize) {
         self.size = size;
-        self.relayout();
     }
 
     /// Fold an [`Outcome`] into window state.
@@ -582,46 +802,34 @@ impl FilesWindow {
         })
     }
 
-    /// Convert a pointer position into list-pane coordinates.
-    ///
-    /// Returns `None` above or below the list, so a click on the header or
-    /// status bar cannot be mistaken for a click on whichever row happens to
-    /// line up with it -- and `None` over the sidebar, so a click on a place
-    /// does not also land on the row beside it.
-    fn to_pane(&self, at: Position) -> Option<(i32, i32)> {
-        let rows = self.frame().rows();
-        let y = at.y - rows.y;
-        if y < 0 || y >= rows.h {
-            return None;
+    /// Scroll the places list by wheel `lines`, clamped to its content.
+    /// No-op without a card; the pointer event itself dirties the frame.
+    fn scroll_places(&mut self, lines: i32) {
+        let Some(card) = self.card() else {
+            return;
+        };
+        let row_h = self.theme.sidebar_row();
+        if row_h <= 0 {
+            return;
         }
-        let x = at.x - rows.x;
-        if x < 0 || x >= rows.w {
-            return None;
-        }
-        Some((x, y))
+        let rows = i32::try_from(self.sidebar.rows().len()).unwrap_or(0);
+        let visible_rows = (card.places().h / row_h).max(1);
+        let max = (rows - visible_rows).max(0);
+        self.places_scroll = (self.places_scroll + lines).clamp(0, max);
     }
 
-    /// Whether `at` falls inside the places pane's clickable rows.
-    ///
-    /// The sidebar now runs the full height of the window, so this is the
-    /// whole column *except* the storage footer -- which is a readout, not a
-    /// control, and must not navigate anywhere when clicked.
+    /// Whether `at` falls inside the card's places list. The storage footer
+    /// is a readout, not a control, so it is excluded.
     fn in_sidebar(&self, at: Position) -> bool {
-        let frame = self.frame();
-        let body = frame.sidebar_body();
-        frame.has_sidebar() && at.x < body.w && at.y >= body.y && at.y < body.y + body.h
+        self.card().is_some_and(|card| {
+            card.places()
+                .contains(platform::draw::Point::new(at.x, at.y))
+        })
     }
 
-    /// Which sidebar row a pointer position falls on, if any.
-    ///
-    /// Shared by the press handler and the hover tracker deliberately: they
-    /// must agree, and two copies of this arithmetic would be free to drift by
-    /// a row -- lighting one place while clicking another, which reads as a
-    /// rendering bug rather than a logic one. It also has to match where
-    /// `paint_sidebar` starts drawing, hence the same top inset.
-    /// Which toolbar control is under `at`, if any.
+    /// Which card control is under `at`, if any.
     fn toolbar_hit(&self, at: Position) -> Option<Target> {
-        self.toolbar().hit(at.x, at.y)
+        self.toolbar().and_then(|bar| bar.hit(at.x, at.y))
     }
 
     /// What the pointer at `at` is over: a control, or a row in one of the panes.
@@ -634,14 +842,14 @@ impl FilesWindow {
             return Some(Spot::Control(target));
         }
         if self.in_sidebar(at) {
-            return self.sidebar_row_at(at).map(|i| Spot::Row(Pane::Sidebar, i));
+            return self
+                .sidebar_row_at(at)
+                .map(|i| Spot::Item(Pane::Sidebar, i));
         }
-        self.to_pane(at)
-            .and_then(|(x, y)| match self.browser.view_mode() {
-                ViewMode::List => self.browser.pane().viewport().row_at_y(y),
-                ViewMode::Grid => self.browser.grid().item_at(x, y),
-            })
-            .map(|i| Spot::Row(Pane::List, i))
+        self.tile_at(Point::new(at.x, at.y)).map(|tile| {
+            tile.item()
+                .map_or(Spot::Overflow, |i| Spot::Item(Pane::Tiles, i))
+        })
     }
 
     /// Act on a click on toolbar control `target`.
@@ -651,11 +859,9 @@ impl FilesWindow {
             Target::Forward => self.browser.go_forward(),
             // The same action the keyboard's Left and Backspace already
             // reach, so the button and the key cannot diverge.
-            Target::Up => self.browser.act(crate::keymap::Action::GoUp),
+            Target::Up => self.step_out(),
             Target::ToggleHidden => self.browser.act(crate::keymap::Action::ToggleHidden),
-            Target::Filter => self.browser.focus_filter(),
-            Target::ViewList => self.browser.set_view_mode(ViewMode::List),
-            Target::ViewGrid => self.browser.set_view_mode(ViewMode::Grid),
+            Target::FilterBox => self.browser.focus_filter(),
         };
         self.apply(outcome);
         // Every navigation can cross a filesystem boundary, exactly as a
@@ -665,9 +871,13 @@ impl FilesWindow {
         }
     }
 
+    /// Which sidebar row a pointer position falls on. Shared by the press
+    /// handler, the hover tracker and the painter, so all three agree.
     fn sidebar_row_at(&self, at: Position) -> Option<usize> {
-        let y = at.y - self.frame().sidebar_body().y - self.theme.spacing.sidebar_pad_y();
-        self.sidebar.row_index_at(y, self.theme.sidebar_row())
+        let card = self.card()?;
+        let row_h = self.theme.sidebar_row();
+        let y = at.y - card.places().y + self.places_scroll * row_h;
+        self.sidebar.row_index_at(y, row_h)
     }
 
     /// Whether this click, at `now`, continues a double-click gesture.
@@ -695,46 +905,34 @@ impl FilesWindow {
         u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// Draw the toolbar: navigation affordances, the breadcrumb path, the
-    /// filter control and the view toggle.
-    ///
-    /// Confined to the right column, per the guide's shell: the sidebar runs
-    /// past it, top to bottom.
-    fn paint_toolbar(&mut self, canvas: &mut Canvas<'_>) {
+    /// Draw the pinned card: its glass surface and outline, then every piece
+    /// of chrome it holds. Nothing is drawn when the user has hidden it.
+    fn paint_card(&mut self, canvas: &mut Canvas<'_>) {
+        let Some(card) = self.card() else {
+            return;
+        };
         let theme = self.theme;
-        let bar = self.frame().toolbar();
-        // Background band -- see `paint`'s note on glass versus paint.
-        canvas.fill_rect_glass(bar, theme.toolbar_bg);
-        // A hairline under the toolbar separates it from the list without
-        // spending a whole row of vertical space on a gap.
-        canvas.fill_rect(
-            Rect::new(
-                bar.x,
-                bar.bottom() - theme.spacing.hairline(),
-                bar.w,
-                theme.spacing.hairline(),
-            ),
-            theme.sidebar_border,
-        );
+        let radius = theme.spacing.radius() * 2;
+        canvas.fill_round_rect_glass(card.bounds(), theme.sidebar_bg, radius);
+        canvas.draw_round_rect(card.bounds(), theme.sidebar_border, radius);
         self.paint_nav_buttons(canvas);
         self.paint_hidden_toggle(canvas);
         self.paint_breadcrumb(canvas);
         self.paint_filter_control(canvas);
-        self.paint_view_toggle(canvas);
+        self.paint_sidebar(canvas);
+        self.paint_storage(canvas);
+        self.paint_status(canvas);
     }
 
-    /// The toolbar's control geometry for the current window.
-    ///
-    /// The single source of truth for where the buttons are, shared by the
-    /// painter and the pointer handler so the clickable region cannot drift
-    /// away from the drawn one.
-    fn toolbar(&self) -> Toolbar {
-        Toolbar::new(
-            self.frame().toolbar(),
+    /// The card's control geometry, shared by the painter and the pointer
+    /// handler so the clickable region cannot drift from the drawn one.
+    fn toolbar(&self) -> Option<Toolbar> {
+        let card = self.card()?;
+        Some(Toolbar::new(
+            card,
             self.theme.spacing,
             self.theme.control_height(),
-            self.browser.is_filtering(),
-        )
+        ))
     }
 
     /// Draw the back, forward and up buttons at the toolbar's left.
@@ -751,7 +949,9 @@ impl FilesWindow {
     /// condition.
     fn paint_nav_buttons(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let bar = self.toolbar();
+        let Some(bar) = self.toolbar() else {
+            return;
+        };
         for (rect, glyph, enabled, target) in [
             (
                 bar.back(),
@@ -765,7 +965,7 @@ impl FilesWindow {
                 self.browser.can_go_forward(),
                 Target::Forward,
             ),
-            (bar.up(), "\u{2191}", self.browser.can_go_up(), Target::Up),
+            (bar.up(), "\u{2191}", self.can_step_out(), Target::Up),
         ] {
             // Dropped for want of room: nothing to draw, and `Toolbar::hit`
             // will not report it either.
@@ -777,7 +977,7 @@ impl FilesWindow {
                 canvas.fill_round_rect(rect, theme.hover, theme.spacing.radius_small());
                 theme.hover
             } else {
-                theme.toolbar_bg
+                theme.sidebar_bg
             };
             let color = if enabled { theme.text } else { theme.disabled };
             let tier = &mut self.type_scale.title;
@@ -796,9 +996,8 @@ impl FilesWindow {
 
     /// Draw the dotfile visibility toggle, beside the navigation chevrons.
     ///
-    /// Drawn in the accent wash while hidden files are shown, exactly as the
-    /// active segment of the view toggle is. That is the whole job of this
-    /// control: dotfiles being listed is a mode the user can forget they are
+    /// Drawn in the accent wash while hidden files are shown. That is the
+    /// whole job of this control: dotfiles being listed is a mode the user can forget they are
     /// in, and an unlit button gives them nothing to notice.
     ///
     /// The glyph changes with the state as well as the fill, because a colour
@@ -811,7 +1010,7 @@ impl FilesWindow {
     /// that vanished into the accent wash behind them.
     fn paint_hidden_toggle(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let Some(rect) = self.toolbar().hidden_toggle() else {
+        let Some(rect) = self.toolbar().and_then(|bar| bar.hidden_toggle()) else {
             return;
         };
         let on = self.browser.shows_hidden();
@@ -824,7 +1023,7 @@ impl FilesWindow {
             canvas.fill_round_rect(rect, theme.hover, radius);
             theme.hover
         } else {
-            theme.toolbar_bg
+            theme.sidebar_bg
         };
         let color = if on { theme.accent } else { theme.text };
         let glyph = if on { "\u{25cf}" } else { "\u{25cb}" };
@@ -841,84 +1040,6 @@ impl FilesWindow {
         );
     }
 
-    /// Draw the list/grid view toggle at the toolbar's right end.
-    ///
-    /// Two live segments share an outline; the active presentation gets the
-    /// accent wash, so the toggle states what the content is showing.
-    fn paint_view_toggle(&mut self, canvas: &mut Canvas<'_>) {
-        let theme = self.theme;
-        // Dropped entirely rather than overlapped when the toolbar is too
-        // tight: the filter box and the path outrank it.
-        let Some(outline) = self.toolbar().view_toggle() else {
-            return;
-        };
-        let button = theme.spacing.view_button();
-        let (x, y, width, height) = (outline.x, outline.y, outline.w, outline.h);
-        // The active segment is filled, which is what makes the pair read as
-        // a state rather than as two buttons. Only its *outer* corners are
-        // rounded -- it shares a straight edge with the segment beside it, so
-        // rounding all four would leave a notch mid-pair. Drawing the fill one
-        // radius wider and squaring off that overhang gives the D-shape.
-        let radius = theme.spacing.radius();
-        let active = match self.browser.view_mode() {
-            ViewMode::List => 0,
-            ViewMode::Grid => 1,
-        };
-        let fill_x = x + button * active;
-        canvas.fill_round_rect(
-            Rect::new(
-                fill_x - if active == 1 { radius } else { 0 },
-                y,
-                button + radius,
-                height,
-            ),
-            theme.accent_surface,
-            radius,
-        );
-        canvas.fill_rect(
-            Rect::new(
-                if active == 0 {
-                    fill_x + button
-                } else {
-                    fill_x - radius
-                },
-                y,
-                radius,
-                height,
-            ),
-            theme.accent_surface,
-        );
-        canvas.draw_round_rect(Rect::new(x, y, width, height), theme.control_border, radius);
-        // `\u{25a6}` rather than `\u{22ee}` for the grid segment: the
-        // vertical ellipsis is absent from the shipped face and rendered as
-        // tofu. A squared-fill glyph also describes a grid of cells, which a
-        // column of three dots never did.
-        for (i, glyph) in ["\u{2261}", "\u{25a6}"].into_iter().enumerate() {
-            let bg = if i32::try_from(i).unwrap_or(-1) == active {
-                theme.accent_surface
-            } else {
-                theme.toolbar_bg
-            };
-            let color = if i32::try_from(i).unwrap_or(-1) == active {
-                theme.accent
-            } else {
-                theme.text
-            };
-            let tier = &mut self.type_scale.label;
-            let text_w = tier.measure(glyph);
-            let text_y = y + (height - tier.line_height()) / 2;
-            let seg_x = x + button * i32::try_from(i).unwrap_or(0);
-            tier.draw_text(
-                canvas,
-                glyph,
-                seg_x + (button - text_w) / 2,
-                text_y,
-                color,
-                bg,
-            );
-        }
-    }
-
     /// Draw the breadcrumb path, most-significant segment first.
     ///
     /// The current segment is drawn in full-strength text and the ancestors
@@ -927,14 +1048,12 @@ impl FilesWindow {
     fn paint_breadcrumb(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
         let crumbs = self.crumbs();
-        let bar = self.frame().toolbar();
-        let toolbar = self.toolbar();
-        let mut x = toolbar.breadcrumb_x();
-        // The filter control and view toggle own the right end of the toolbar,
-        // so the path gets what is left after them and their gaps.
-        let limit = toolbar.breadcrumb_width();
+        let Some(bar) = self.toolbar().map(|bar| bar.breadcrumbs()) else {
+            return;
+        };
+        let mut x = bar.x;
 
-        let (shown, elided) = crumbs.tail(self.crumb_budget(limit));
+        let (shown, elided) = crumbs.tail(self.crumb_budget(bar.w));
         if elided {
             let label = &mut self.type_scale.label;
             let y = label.baseline_y(bar.h) + bar.y;
@@ -944,7 +1063,7 @@ impl FilesWindow {
                 x,
                 y,
                 theme.muted,
-                theme.toolbar_bg,
+                theme.sidebar_bg,
             );
             x += theme.spacing.xs();
         }
@@ -955,7 +1074,7 @@ impl FilesWindow {
             if i > 0 || elided {
                 let label = &mut self.type_scale.label;
                 let y = label.baseline_y(bar.h) + bar.y;
-                x = label.draw_text(canvas, "/", x, y, theme.muted, theme.toolbar_bg);
+                x = label.draw_text(canvas, "/", x, y, theme.muted, theme.sidebar_bg);
                 x += theme.spacing.xs();
             }
             let (color, tier) = if crumb.current {
@@ -964,7 +1083,7 @@ impl FilesWindow {
                 (theme.muted, &mut self.type_scale.body)
             };
             let y = tier.baseline_y(bar.h) + bar.y;
-            x = tier.draw_text(canvas, &crumb.label, x, y, color, theme.toolbar_bg);
+            x = tier.draw_text(canvas, &crumb.label, x, y, color, theme.sidebar_bg);
             x += theme.spacing.xs();
         }
     }
@@ -1003,7 +1122,7 @@ impl FilesWindow {
         let filtering = self.browser.is_filtering();
         // Guard against a column too narrow to hold the control at all --
         // drawing it at a negative x would wrap around the canvas.
-        let Some(rect) = self.toolbar().filter() else {
+        let Some(rect) = self.toolbar().and_then(|bar| bar.filter()) else {
             return;
         };
         let (x, y, height) = (rect.x, rect.y, rect.h);
@@ -1049,69 +1168,6 @@ impl FilesWindow {
         }
     }
 
-    /// Draw the column-header row: small, lowercase, letter-spaced labels
-    /// over a hairline, per the guide.
-    fn paint_column_headers(&mut self, canvas: &mut Canvas<'_>) {
-        let theme = self.theme;
-        let band = self.frame().column_headers();
-        let (y, height, left, width) = (band.y, band.h, band.x, band.w);
-        canvas.fill_rect_glass(band, theme.background);
-
-        let columns = self.list_columns();
-        for cell in columns.cells() {
-            let heading = cell.column.heading();
-            let label = &mut self.type_scale.label;
-            let text_y = y + (height - label.line_height()) / 2;
-            // Right-aligned headings sit over right-aligned data, so the
-            // "size" label lines up with the digits beneath it.
-            let text_x = cell.text_x(label.measure(heading));
-            label.draw_text(
-                canvas,
-                heading,
-                text_x,
-                text_y,
-                theme.muted,
-                theme.background,
-            );
-        }
-
-        // The rule under the headings, which is what makes them read as a
-        // table header rather than as a first row.
-        canvas.fill_rect(
-            Rect::new(
-                left,
-                y + height - theme.spacing.hairline(),
-                width,
-                theme.spacing.hairline(),
-            ),
-            theme.sidebar_border,
-        );
-    }
-
-    /// The column layout for the current window.
-    ///
-    /// Recomputed per paint rather than cached: it depends on the window
-    /// width, the sidebar's visibility and the scrollbar's presence, and a
-    /// stale copy would put the headings out of line with the data.
-    fn list_columns(&self) -> Columns {
-        let theme = self.theme;
-        let frame = self.frame();
-        // The rows reserve the scrollbar gutter, so the headers must too or
-        // the "size" heading floats away from the numbers below it.
-        let content = self.browser.pane().content_width();
-        Columns::new(
-            frame.content_x(),
-            // The pane's own width, not the frame's: the rows reserve a
-            // scrollbar gutter the frame does not know about, and the table
-            // must stop short of it rather than run underneath.
-            (content - frame.inset() * 2)
-                .max(0)
-                .min(frame.content_width()),
-            theme.spacing.s(),
-            theme.is_compact(self.size.width),
-        )
-    }
-
     /// Draw the places sidebar: section headings, places, bookmarks, and the
     /// storage footer pinned to the bottom.
     ///
@@ -1119,52 +1175,33 @@ impl FilesWindow {
     /// top and the status strip's bottom -- because in the guide's shell
     /// those bands belong to the right column alone.
     fn paint_sidebar(&mut self, canvas: &mut Canvas<'_>) {
-        let frame = self.frame();
-        if !frame.has_sidebar() {
+        let Some(card) = self.card() else {
             return;
-        }
+        };
         let theme = self.theme;
-        let column = frame.sidebar();
-        let body = frame.sidebar_body();
-        // The places list is inset from the top by the guide's own sidebar
-        // padding, so the first row does not collide with the toolbar's
-        // baseline across the seam.
-        let top = body.y + theme.spacing.sidebar_pad_y();
-        let width = column.w;
-        // Below the guide's threshold the pane collapses to an icon rail.
-        // With icons not yet drawn, labels are simply omitted rather than
-        // painted clipped -- a half-cut word is worse than none.
-        let compact = theme.is_compact(self.size.width);
-        canvas.fill_rect_glass(column, theme.sidebar_bg);
-        // The divider carries the eye down the seam between the two panes,
-        // the full height of the window.
-        canvas.fill_rect(
-            Rect::new(
-                column.right() - theme.spacing.hairline(),
-                column.y,
-                theme.spacing.hairline(),
-                column.h,
-            ),
-            theme.sidebar_border,
-        );
-        self.paint_storage(canvas);
-
-        let theme = self.theme;
+        let body = card.places();
+        let top = body.y;
+        let left = body.x;
+        let width = body.w;
         let active = self.sidebar.index_of(self.browser.path());
         let row_h = theme.sidebar_row();
-        // Collected first because drawing needs `&mut self.type_scale` while
-        // the rows live behind `&self.sidebar`.
         let rows: Vec<SidebarRow> = self.sidebar.rows().to_vec();
-        for (i, row) in rows.iter().enumerate() {
-            let y = top + i32::try_from(i).unwrap_or(0) * row_h;
+        // Clamp here as well as at the wheel: rows can disappear (a device
+        // unplugged) while the offset is stale, and painting must slice
+        // rather than trust it.
+        let visible = (body.h / row_h).max(1);
+        let max = rows
+            .len()
+            .saturating_sub(usize::try_from(visible).unwrap_or(1));
+        let start = usize::try_from(self.places_scroll).unwrap_or(0).min(max);
+        for (i, row) in rows.iter().enumerate().skip(start) {
+            let y =
+                top + (i32::try_from(i).unwrap_or(0) - i32::try_from(start).unwrap_or(0)) * row_h;
             // Stop at the storage footer rather than painting through it.
             if y + row_h > body.y + body.h {
                 break;
             }
             match row {
-                // A rail has no room for headings, and the guide hides them
-                // there rather than compressing them.
-                SidebarRow::Heading(_) | SidebarRow::Hint(_) if compact => {}
                 SidebarRow::Heading(text) => {
                     // Headings sit in the small label tier and the muted
                     // colour, so they read as structure rather than as
@@ -1176,7 +1213,7 @@ impl FilesWindow {
                     label.draw_text(
                         canvas,
                         text,
-                        Self::sidebar_text_x(&theme),
+                        left + Self::sidebar_text_x(&theme),
                         ty,
                         theme.muted,
                         theme.sidebar_bg,
@@ -1188,7 +1225,7 @@ impl FilesWindow {
                     detail.draw_text(
                         canvas,
                         text,
-                        Self::sidebar_text_x(&theme),
+                        left + Self::sidebar_text_x(&theme),
                         ty,
                         theme.muted,
                         theme.sidebar_bg,
@@ -1202,12 +1239,12 @@ impl FilesWindow {
                         row,
                         label,
                         SidebarEntry {
+                            x: left,
                             y,
                             width,
                             row_h,
                             active: active == Some(i),
                             hovered: self.hover.is(Pane::Sidebar, i),
-                            compact,
                         },
                     );
                 }
@@ -1245,7 +1282,7 @@ impl FilesWindow {
             // bleeding into the divider. Hover shares the geometry exactly,
             // so the fill appears to change colour under the pointer rather
             // than to also change shape.
-            let pill = Rect::new(pad, at.y, (at.width - pad * 2).max(0), at.row_h);
+            let pill = Rect::new(at.x + pad, at.y, (at.width - pad * 2).max(0), at.row_h);
             canvas.fill_round_rect(pill, fill, theme.spacing.radius());
             if at.active {
                 // The guide's 2px accent rule on the leading edge, which is
@@ -1260,7 +1297,7 @@ impl FilesWindow {
                 let r = theme.spacing.radius();
                 canvas.fill_rect(
                     Rect::new(
-                        pad,
+                        at.x + pad,
                         at.y + r,
                         theme.spacing.rule(),
                         (at.row_h - r * 2).max(1),
@@ -1270,9 +1307,6 @@ impl FilesWindow {
             }
             fill
         });
-        if at.compact {
-            return;
-        }
         // The open directory is drawn in the accent; the rest in ordinary
         // text, so exactly one row draws the eye. An unmounted device is
         // dimmed: it is a place that does not exist yet, and drawing it as
@@ -1282,8 +1316,8 @@ impl FilesWindow {
             (false, true) => theme.disabled,
             (false, false) => theme.text,
         };
-        let inset = Self::sidebar_text_x(&theme);
-        let mut room = at.width - inset - pad;
+        let inset = at.x + Self::sidebar_text_x(&theme);
+        let mut room = at.width - Self::sidebar_text_x(&theme) - pad;
         // A device's filesystem sits at the row's right edge in the muted
         // caption tier, so "vfat" or "read-only" is available without
         // competing with the name. The name is measured against what is left,
@@ -1328,13 +1362,12 @@ impl FilesWindow {
     /// opposite rather than like "no data".
     fn paint_storage(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let Some(area) = self.frame().storage() else {
+        let Some(area) = self.card().and_then(|card| card.storage()) else {
             return;
         };
         let Some(storage) = self.storage.clone() else {
             return;
         };
-        canvas.fill_rect_glass(area, theme.sidebar_bg);
         // A rule above the footer separates it from the places it sits under,
         // mirroring the guide's `border-top`.
         canvas.fill_rect(
@@ -1431,195 +1464,6 @@ impl FilesWindow {
         usize::try_from(width / advance).unwrap_or(0)
     }
 
-    /// Draw the visible rows across the guide's four columns.
-    fn paint_rows(&mut self, canvas: &mut Canvas<'_>) {
-        let theme = self.theme;
-        let band = self.frame().rows();
-        let (left, top) = (band.x, band.y);
-        let content_width = self.browser.pane().content_width();
-        let columns = self.list_columns();
-        // One clock read for the whole frame: `modified` is relative to now,
-        // and re-reading the clock per row could straddle midnight and render
-        // two rows of the same directory against different "today"s.
-        let now = localtime::LocalTime::now();
-
-        // Gathered up front: drawing needs `&mut self.type_scale`, which
-        // cannot coexist with an iterator borrowing `self.browser`.
-        let rows: Vec<PaintedRow> = self
-            .browser
-            .pane()
-            .visible_rows()
-            .filter_map(|row| {
-                let y = self.browser.pane().row_y(row)?;
-                let entry = self.browser.entry(row)?;
-                Some(PaintedRow {
-                    y,
-                    name: RowFormat::name(entry),
-                    // Detection is skipped for directories and links, whose
-                    // label is structural -- that avoids a database lookup
-                    // for the majority of rows in a typical tree.
-                    kind: KindLabel::of(entry, None),
-                    modified: now.map_or_else(
-                        || Moment::UNKNOWN.to_owned(),
-                        |now| Moment::relative(entry.modified, now),
-                    ),
-                    size: RowFormat::size(entry),
-                    color: RowFormat::color(entry, &theme),
-                    selected: self.browser.pane().is_selected(row),
-                    is_cursor: self.browser.pane().cursor() == Some(row),
-                    hovered: self.hover.is(Pane::List, row),
-                    drop_target: self.drop_hover_row == Some(row),
-                    cut: self.browser.clipboard().is_cut(&entry.path),
-                    // The highlight colour follows what the row *is*, not what
-                    // its name looks like, so a directory keeps its tint even
-                    // when the name column is truncated to nothing.
-                    row_kind: RowKind::of(entry),
-                })
-            })
-            .collect();
-
-        for row in rows {
-            let y = top + row.y;
-            let rect = Rect::new(left, y, content_width, theme.row_height);
-            let radius = theme.spacing.radius();
-            // Selection outranks hover on the same row: it is a state the user
-            // chose, so it must not be overwritten by the pointer merely
-            // passing over it. Both are washes of the row's own type colour --
-            // see `Theme::hover_dir` -- so the fill says "directory" or "file"
-            // even while it covers the coloured name that would have said so.
-            // The keyboard cursor is folded in as a *fill* rather than the
-            // outline it used to be: an outline is a border, and a border on
-            // the highlight is exactly what was asked to go. It still has to
-            // be locatable, so an unselected cursor row takes the hover wash --
-            // the same treatment the pointer gives, since both mean "this row
-            // is where your attention is". Only when focused: claiming
-            // keyboard focus in an unfocused window is a lie.
-            let cursor_here = self.focused && row.is_cursor;
-            // A pending cut is shown by fading the name toward the
-            // background, which is the one signal that survives every
-            // combination of selection, hover and cursor fill beneath it.
-            let name_color = if row.cut {
-                theme.muted
-            } else {
-                row.color
-            };
-            let bg = match (row.selected, row.hovered || cursor_here) {
-                (true, _) => {
-                    let fill = row.row_kind.selection_fill(&theme);
-                    canvas.fill_round_rect(rect, fill, radius);
-                    fill
-                }
-                (false, true) => {
-                    let fill = row.row_kind.hover_fill(&theme);
-                    canvas.fill_round_rect(rect, fill, radius);
-                    fill
-                }
-                (false, false) => theme.background,
-            };
-            // A drop-target outline is drawn over whatever fill the row
-            // already has -- selection and hover are states the row already
-            // carries; "a drag is hovering here" is a distinct, temporary
-            // fact about the pointer, not a replacement for them.
-            if row.drop_target {
-                canvas.draw_round_rect(rect, row.row_kind.selection_fill(&theme), radius);
-            }
-            // A thin separator per row rather than a card, per the guide.
-            canvas.fill_rect(
-                Rect::new(
-                    left,
-                    y + theme.row_height - theme.spacing.hairline(),
-                    content_width,
-                    theme.spacing.hairline(),
-                ),
-                theme.sidebar_border,
-            );
-
-            for cell in columns.cells() {
-                // The filename keeps the body tier and the type colour; the
-                // metadata is subordinate, so it takes the smaller tier and
-                // the muted colour -- until its row is selected, where the
-                // guide asks for the whole row to brighten.
-                let (text, color, tier) = match cell.column {
-                    Column::Name => (&row.name, name_color, &mut self.type_scale.body),
-                    Column::Modified => (
-                        &row.modified,
-                        Self::meta_color(&theme, row.selected),
-                        &mut self.type_scale.detail,
-                    ),
-                    Column::Kind => (
-                        &row.kind,
-                        Self::meta_color(&theme, row.selected),
-                        &mut self.type_scale.detail,
-                    ),
-                    Column::Size => (
-                        &row.size,
-                        Self::meta_color(&theme, row.selected),
-                        &mut self.type_scale.detail,
-                    ),
-                };
-                let text_y = y + (theme.row_height - tier.line_height()) / 2;
-                let shown = RowFormat::truncate(text, Self::columns_for(tier, cell.width));
-                let text_x = cell.text_x(tier.measure(&shown));
-                tier.draw_text(canvas, &shown, text_x, text_y, color, bg);
-            }
-        }
-
-        self.paint_rename_box(canvas, &columns);
-    }
-
-    /// Draw the inline rename box over the row being renamed.
-    ///
-    /// Painted after every row, not in place of one: the box covers only the
-    /// name column, so the row's metadata stays visible beside it and the
-    /// user keeps the context of what they are renaming.
-    fn paint_rename_box(&mut self, canvas: &mut Canvas<'_>, columns: &Columns) {
-        let Some(editing) = self.painted_rename() else {
-            return;
-        };
-        let Some(cell) = columns.cells().iter().find(|c| c.column == Column::Name) else {
-            return;
-        };
-        let Some(row_y) = self.browser.pane().row_y(editing.row) else {
-            return;
-        };
-        let theme = self.theme;
-        let band = self.frame().rows();
-        let radius = theme.spacing.radius();
-        let rect = Rect::new(
-            band.x + cell.x,
-            band.y + row_y,
-            cell.width,
-            theme.row_height,
-        );
-        canvas.fill_round_rect(rect, theme.filter_bg, radius);
-        // An illegal name is outlined in the error colour rather than
-        // refused silently: the box stays open on Enter, and without this the
-        // user gets no explanation for why nothing happened.
-        let border = if editing.valid {
-            theme.focus_ring
-        } else {
-            theme.error
-        };
-        canvas.draw_round_rect(rect, border, radius);
-
-        let inner_x = rect.x + theme.spacing.m();
-        let body = &mut self.type_scale.body;
-        let text_y = rect.y + (theme.row_height - body.line_height()) / 2;
-        body.draw_text(
-            canvas,
-            &editing.text,
-            inner_x,
-            text_y,
-            theme.text,
-            theme.filter_bg,
-        );
-        let caret_x = inner_x + body.measure(&editing.before_caret);
-        canvas.fill_rect(
-            Rect::new(caret_x, text_y, theme.spacing.rule(), body.line_height()),
-            theme.caret,
-        );
-    }
-
     /// The open rename box's contents, or `None` when no rename is active.
     fn painted_rename(&self) -> Option<PaintedRename> {
         let rename = self.browser.rename();
@@ -1692,7 +1536,7 @@ impl FilesWindow {
             return;
         }
         let theme = self.theme;
-        let bounds = self.frame().main();
+        let bounds = self.frame().field();
         self.drag_badge.paint(
             canvas,
             &mut self.type_scale.detail,
@@ -1706,134 +1550,17 @@ impl FilesWindow {
         );
     }
 
-    /// The colour for a metadata cell.
-    ///
-    /// The guide's rule: metadata stays subdued *until its row is selected*,
-    /// at which point holding it muted against the selection fill would make
-    /// it the least readable thing on screen.
-    const fn meta_color(theme: &Theme, selected: bool) -> Color {
-        if selected { theme.text } else { theme.muted }
-    }
-
-    /// Draw square cards for the grid presentation.
-    fn paint_grid(&mut self, canvas: &mut Canvas<'_>) {
-        let theme = self.theme;
-        let band = self.frame().rows();
-        let cells = self.browser.grid().visible_cells();
-        for cell in cells {
-            let Some(entry) = self.browser.entry(cell.index) else {
-                continue;
-            };
-            let rect = Rect::new(band.x + cell.x, band.y + cell.y, cell.width, cell.height);
-            let selected = self.browser.grid().is_selected(cell.index);
-            let hovered = self.hover.is(Pane::List, cell.index);
-            let cursor = self.focused && self.browser.grid().cursor() == Some(cell.index);
-            let kind = RowKind::of(entry);
-            let background = if selected {
-                let fill = kind.selection_fill(&theme);
-                canvas.fill_round_rect(rect, fill, theme.spacing.radius());
-                fill
-            } else {
-                if hovered || cursor {
-                    // Grid hover is deliberately an outline, preserving the
-                    // guide's quiet card geometry instead of turning cards
-                    // into list-row surfaces.
-                    canvas.draw_round_rect(rect, kind.hover_fill(&theme), theme.spacing.radius());
-                }
-                theme.background
-            };
-            // `\u{25a1}` WHITE SQUARE is a hollow box -- the exact shape a
-            // font draws for a codepoint it does not have, so every card in
-            // the grid read as tofu even though the glyph was present. A
-            // filled shape cannot be mistaken for a missing one, and the
-            // pair still differs in silhouette rather than only in fill.
-            let icon = if entry.is_navigable() {
-                "\u{25b0}"
-            } else {
-                "\u{25c6}"
-            };
-            let icon_tier = &mut self.type_scale.title;
-            let icon_w = icon_tier.measure(icon);
-            icon_tier.draw_text(
-                canvas,
-                icon,
-                rect.x + (rect.w - icon_w) / 2,
-                rect.y + theme.spacing.m(),
-                RowFormat::color(entry, &theme),
-                background,
-            );
-            let label = RowFormat::truncate(
-                &RowFormat::name(entry),
-                Self::columns_for(&mut self.type_scale.detail, rect.w - theme.spacing.m() * 2),
-            );
-            let detail = &mut self.type_scale.detail;
-            let label_w = detail.measure(&label);
-            detail.draw_text(
-                canvas,
-                &label,
-                rect.x + (rect.w - label_w) / 2,
-                rect.bottom() - theme.spacing.m() - detail.line_height(),
-                theme.text,
-                background,
-            );
-        }
-    }
-
-    /// Draw the active presentation's scrollbar, if it overflows.
-    fn paint_scrollbar(&self, canvas: &mut Canvas<'_>) {
-        let (visible, gutter_x, scrollbar, viewport) = match self.browser.view_mode() {
-            ViewMode::List => {
-                let pane = self.browser.pane();
-                (
-                    pane.scrollbar_visible(),
-                    pane.gutter_x(),
-                    pane.scrollbar(),
-                    pane.viewport(),
-                )
-            }
-            ViewMode::Grid => {
-                let grid = self.browser.grid();
-                (
-                    grid.scrollbar_visible(),
-                    grid.gutter_x(),
-                    grid.scrollbar(),
-                    grid.viewport(),
-                )
-            }
-        };
-        if !visible {
-            return;
-        }
-        let theme = &self.theme;
-        let band = self.frame().rows();
-        let x = band.x + gutter_x;
-        let gutter = (band.right() - x).max(0);
-        canvas.fill_rect(Rect::new(x, band.y, gutter, band.h), theme.scrollbar_track);
-        let thumb = scrollbar.thumb(viewport);
-        // The thumb is rounded to its own half-width, i.e. a capsule: it is a
-        // free-floating element with nothing to align a square edge against.
-        let thumb_w = (gutter - 4).max(1);
-        canvas.fill_round_rect(
-            Rect::new(x + 2, band.y + thumb.offset, thumb_w, thumb.length),
-            theme.scrollbar_thumb,
-            thumb_w / 2,
-        );
-    }
-
     /// Draw the status line: the filter box, or a summary.
     fn paint_status(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
-        let band = self.frame().status();
-        let y = band.y;
-        let filtering = self.browser.is_filtering();
-        let background = if filtering {
-            theme.filter_bg
-        } else {
-            theme.status_bg
+        let Some(band) = self.card().map(|card| card.status()) else {
+            return;
         };
-        canvas.fill_rect_glass(band, background);
-        // A hairline above the strip, mirroring the one under the toolbar, so
-        // the right column reads as distinct bands.
+        if band.h == 0 {
+            return;
+        }
+        let y = band.y;
+        let background = theme.sidebar_bg;
         canvas.fill_rect(
             Rect::new(band.x, y, band.w, theme.spacing.hairline()),
             theme.sidebar_border,
@@ -1887,14 +1614,15 @@ impl FilesWindow {
             background,
         );
 
-        self.paint_status_hint(canvas, y, background);
+        self.paint_status_hint(canvas, band, background);
     }
 
     /// Draw the keyboard hint at the status line's right end.
     ///
     /// The guide gives the hint a minimal keycap: an outlined box around the
     /// chord with its description beside it in muted text.
-    fn paint_status_hint(&mut self, canvas: &mut Canvas<'_>, y: i32, background: Color) {
+    fn paint_status_hint(&mut self, canvas: &mut Canvas<'_>, band: Rect, background: Color) {
+        let y = band.y;
         let theme = self.theme;
         // Which hint earns the space depends on what the user can do next:
         // while filtering, escaping is what they will want.
@@ -1904,7 +1632,6 @@ impl FilesWindow {
             ("select all", "ctrl+a")
         };
 
-        let band = self.frame().status();
         let label = &mut self.type_scale.label;
         let pad = theme.spacing.xs();
         let chord_w = label.measure(chord) + pad * 2;
@@ -1949,26 +1676,9 @@ impl Painter for FilesWindow {
             self.refresh_storage();
         }
         canvas.clear(self.theme.background);
-        // The right column is filled explicitly rather than relying on the
-        // clear: the sidebar and the list may take different backgrounds, and
-        // painting the column that owns the list makes the seam between them
-        // independent of whatever the window's clear colour happens to be.
-        //
-        // `fill_rect_glass`, not `fill_rect`: this is background, so on a
-        // translucent window it must stay as see-through as the clear it
-        // covers. Painting it solid would make the whole list area opaque and
-        // leave the window transparent only in the slivers no band reaches.
-        canvas.fill_rect_glass(self.frame().main(), self.theme.background);
-        self.paint_toolbar(canvas);
-        self.paint_sidebar(canvas);
-        if self.browser.view_mode() == ViewMode::List {
-            self.paint_column_headers(canvas);
-            self.paint_rows(canvas);
-        } else {
-            self.paint_grid(canvas);
-        }
-        self.paint_scrollbar(canvas);
-        self.paint_status(canvas);
+        self.sync_tiles();
+        self.paint_tiles(canvas);
+        self.paint_card(canvas);
         // Last, and over everything: the badge is cargo the user is holding
         // above the window, so anything it covers is by definition behind it.
         self.paint_drag_badge(canvas);
@@ -1978,8 +1688,16 @@ impl Painter for FilesWindow {
     }
 
     fn on_key(&mut self, press: KeyPress) {
-        let outcome = self.browser.key(press);
+        self.sync_tiles();
+        let outcome = match self.browser.translate(press) {
+            Some(crate::keymap::Action::GoUp) => self.step_out(),
+            Some(crate::keymap::Action::List(command)) if SpiralCursor::steers(command) => {
+                self.steer_tiles(command)
+            }
+            _ => self.browser.key(press),
+        };
         self.apply(outcome);
+        self.sync_tiles();
     }
 
     fn on_focus(&mut self, focused: bool) {
@@ -1998,69 +1716,19 @@ impl Painter for FilesWindow {
         if self.browser.password().is_open() {
             return;
         }
+        self.sync_tiles();
         match event {
             PointerEventKind::Press {
                 button: PointerButton::Left,
                 at,
                 modifiers,
-            } => {
-                // The toolbar is checked before either pane: its controls sit
-                // above the list, and a click on one must not fall through to
-                // whatever row happens to be under it.
-                if let Some(target) = self.toolbar_hit(at) {
-                    self.activate_control(target);
-                    return;
-                }
-                // A click in the places pane navigates and goes no further:
-                // it must not also be routed to the list beside it.
-                if self.in_sidebar(at) {
-                    let Some(index) = self.sidebar_row_at(at) else {
-                        return;
-                    };
-                    // An unmounted device is checked first, and consumes the
-                    // click: it has no path, so falling through would find
-                    // nothing to navigate to and the row would appear dead.
-                    if self.mount_from_sidebar(index) {
-                        return;
-                    }
-                    if let Some(path) = self
-                        .sidebar
-                        .rows()
-                        .get(index)
-                        .and_then(SidebarRow::path)
-                        .map(std::path::Path::to_path_buf)
-                    {
-                        let outcome = self.browser.go_to(&path);
-                        self.apply(outcome);
-                        // A new directory may live on a different filesystem.
-                        self.refresh_storage();
-                    }
-                    return;
-                }
-                let Some((x, y)) = self.to_pane(at) else {
-                    return;
-                };
-                let outcome = if self.is_double_click(Self::now_ms(), at) {
-                    self.browser.double_click(x, y)
-                } else {
-                    self.browser.press(
-                        x,
-                        y,
-                        Mods {
-                            ctrl: modifiers.ctrl(),
-                            shift: modifiers.shift(),
-                        },
-                    )
-                };
-                self.apply(outcome);
-                // Arm a potential drag from this press -- but only over a
-                // real row. A press on empty list space or a scrollbar drag
-                // must never turn into a file drag.
-                self.drag_row = self.browser.row_at(x, y);
-                if self.drag_row.is_some() {
-                    self.drag_arm.press((at.x, at.y));
-                }
-            }
+            } => self.press_left(
+                at,
+                Mods {
+                    ctrl: modifiers.ctrl(),
+                    shift: modifiers.shift(),
+                },
+            ),
             // A secondary click on a device flushes it. The one honest
             // removal step available without privileges: `umount(2)` needs
             // CAP_SYS_ADMIN, so "eject" is not ours to offer, but pushing
@@ -2078,10 +1746,9 @@ impl Painter for FilesWindow {
                 }
             }
             PointerEventKind::Release { .. } => {
-                let outcome = self.browser.release();
-                self.apply(outcome);
                 self.drag_arm.cancel();
                 self.drag_row = None;
+                self.release_tile();
             }
             PointerEventKind::Motion(at) => {
                 // A drag is armed only while a row press hasn't yet crossed
@@ -2095,21 +1762,9 @@ impl Painter for FilesWindow {
                     self.drag_badge.begin(paths.len(), (at.x, at.y));
                     self.pending_drag = Some(paths);
                     self.drag_row = None;
+                    self.tiles.disarm();
                     return;
                 }
-                // Motion is forwarded unconditionally rather than only when
-                // inside the list: a scrollbar drag that wanders over the
-                // header must keep scrolling, exactly as it does everywhere
-                // else. The pane ignores it unless a drag is live.
-                let rows_top = self.frame().rows().y;
-                let outcome = self.browser.motion(at.y - rows_top);
-                self.apply(outcome);
-                // Hover is tracked separately from the drag above, and only
-                // over the list proper: `to_pane` rejects the gutter and the
-                // chrome, so sliding along the scrollbar or across the toolbar
-                // correctly drops the row highlight instead of leaving the last
-                // row lit.
-                //
                 // The changed-flag is deliberately discarded: `Toplevel`
                 // marks the surface dirty after *every* pointer event it
                 // routes, so there is no frame here for us to save. `Hover`
@@ -2123,9 +1778,19 @@ impl Painter for FilesWindow {
                 let spot = self.spot_at(at);
                 let _ = self.hover.move_to(spot);
             }
-            PointerEventKind::Scroll { lines, .. } => {
-                let outcome = self.browser.scroll(lines);
-                self.apply(outcome);
+            PointerEventKind::Scroll { lines, at, .. } => {
+                if self.in_sidebar(at) {
+                    self.scroll_places(lines);
+                    return;
+                }
+                let (spiral, tail) = self.flow_parts();
+                if self
+                    .tiles
+                    .wheel(spiral, self.theme.spacing.tile_min(), tail, lines)
+                {
+                    let spot = self.spot_at(at);
+                    let _ = self.hover.move_to(spot);
+                }
             }
             // The pointer left the surface, so the highlight must go with it;
             // otherwise a row stays lit while the pointer is in another window.
@@ -2133,6 +1798,7 @@ impl Painter for FilesWindow {
                 let _ = self.hover.clear();
                 self.drag_arm.cancel();
                 self.drag_row = None;
+                self.tiles.disarm();
             }
             // Enter carries a position, but the Motion event that follows it
             // does the hover work -- handling it here too would only duplicate
@@ -2143,8 +1809,8 @@ impl Painter for FilesWindow {
     }
 
     fn on_files_dropped(&mut self, paths: Vec<std::path::PathBuf>, at: (i32, i32)) {
-        let rows = self.frame().rows();
-        let target = self.browser.drop_target_dir(at.0 - rows.x, at.1 - rows.y);
+        self.sync_tiles();
+        let target = self.browser.drop_dir(self.entry_at(at));
         let outcome = self.browser.accept_drop(&paths, &target);
         self.apply(outcome);
         self.drop_hover_row = None;
@@ -2154,30 +1820,32 @@ impl Painter for FilesWindow {
 
 #[cfg(test)]
 impl FilesWindow {
-    /// Paint one frame and digest the pixels of the file-row band.
+    /// Paint one frame and digest the pixels of the tile field.
     ///
-    /// The crop is what makes a row test mean anything: the status line
+    /// The crop is what makes a tile test mean anything: the status line
     /// reports "1 item cut" against "1 item copied", so a whole-frame
     /// comparison passes on that text alone and proves nothing about the
-    /// listing.
+    /// tiles.
     ///
     /// A digest rather than the pixels themselves, because a failed
     /// `assert_ne!` prints its operands: half a million integers is not a
     /// diagnostic, it is a flooded terminal.
-    fn painted_rows(&mut self, size: platform::toplevel::PhysicalSize) -> u64 {
+    fn painted_field(&mut self, size: platform::toplevel::PhysicalSize) -> u64 {
         let px = (size.width * size.height).cast_unsigned() as usize;
         let mut buf = vec![0u32; px];
         {
             let mut canvas = platform::draw::Canvas::new(&mut buf, size.width, size.height);
             self.paint(&mut canvas, size);
         }
-        let band = self.frame().rows();
+        let band = self.frame().field();
         let stride = size.width.cast_unsigned() as usize;
         let top = (band.y.max(0).cast_unsigned() as usize * stride).min(px);
         let bottom = ((band.y + band.h).max(0).cast_unsigned() as usize * stride).min(px);
-        buf[top..bottom].iter().fold(0xcbf2_9ce4_8422_2325, |h, &p| {
-            (h ^ u64::from(p)).wrapping_mul(0x0000_0100_0000_01b3)
-        })
+        buf[top..bottom]
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325, |h, &p| {
+                (h ^ u64::from(p)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
     }
 }
 
@@ -2357,7 +2025,7 @@ mod tests {
         let user_dirs = user_dirs::UserDirs::load();
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
         let browser = crate::browser::Browser::open(&root, 700, 400, 28).expect("listable");
-        let painter = FilesWindow::new(
+        let mut painter = FilesWindow::new(
             browser,
             theme,
             type_scale,
@@ -2366,6 +2034,7 @@ mod tests {
             size,
             waker::Waker::new().expect("an eventfd"),
         );
+        painter.sync_tiles();
         (painter, root, size)
     }
 
@@ -2382,15 +2051,13 @@ mod tests {
 
     /// The centre of a toolbar control, as a pointer position.
     fn control_centre(painter: &FilesWindow, target: Target) -> super::Position {
-        let bar = painter.toolbar();
+        let bar = painter.toolbar().expect("the card is shown");
         let rect = match target {
             Target::Back => bar.back(),
             Target::Forward => bar.forward(),
             Target::ToggleHidden => bar.hidden_toggle(),
-            Target::Filter => bar.filter(),
-            Target::ViewList => bar.view_segment(0),
+            Target::FilterBox => bar.filter(),
             Target::Up => bar.up(),
-            Target::ViewGrid => bar.view_segment(1),
         }
         .expect("the control must be drawn at this window size");
         super::Position {
@@ -2401,6 +2068,7 @@ mod tests {
 
     /// Click a toolbar control by its target, through the real pointer path.
     fn click_control(painter: &mut FilesWindow, target: Target) {
+        painter.sync_tiles();
         let at = control_centre(painter, target);
         painter.on_pointer(PointerEventKind::Press {
             button: PointerButton::Left,
@@ -2413,8 +2081,8 @@ mod tests {
     /// when a device appears.
     fn attach_devices(painter: &mut FilesWindow, volumes: &volumes::VolumeSet) {
         let dirs = user_dirs::UserDirs::load();
-        painter.sidebar =
-            crate::sidebar::Sidebar::with_volumes(&dirs, &painter.favorites, volumes);
+        painter.sidebar = crate::sidebar::Sidebar::with_volumes(&dirs, &painter.favorites, volumes);
+        painter.scroll_places(i32::MAX / 2);
     }
 
     /// A USB stick attached at `/run/media/user/<label>`.
@@ -2431,12 +2099,13 @@ mod tests {
 
     /// The centre of sidebar row `index`, as a pointer position.
     fn sidebar_row_centre(painter: &FilesWindow, index: usize) -> super::Position {
-        let frame = painter.frame();
+        let places = painter.card().expect("the card is shown").places();
         let row_h = painter.theme.sidebar_row();
-        let top = frame.sidebar_body().y + painter.theme.spacing.sidebar_pad_y();
         super::Position {
-            x: frame.sidebar().w / 2,
-            y: top + i32::try_from(index).expect("a small index") * row_h + row_h / 2,
+            x: places.x + places.w / 2,
+            y: places.y
+                + (i32::try_from(index).expect("a small index") - painter.places_scroll) * row_h
+                + row_h / 2,
         }
     }
 
@@ -2666,7 +2335,7 @@ mod tests {
     fn clicking_the_filter_box_focuses_it() {
         let (mut painter, _root, _size) = painter_over_a_mixed_directory("toolbar-filter");
         assert!(!painter.browser.is_filtering(), "it starts unfocused");
-        click_control(&mut painter, Target::Filter);
+        click_control(&mut painter, Target::FilterBox);
         assert!(
             painter.browser.is_filtering(),
             "clicking the box must give it focus"
@@ -2678,7 +2347,7 @@ mod tests {
     fn a_toolbar_click_does_not_reach_the_list() {
         let (mut painter, _root, _size) = painter_over_a_mixed_directory("toolbar-no-fallthrough");
         let before = painter.browser.pane().cursor();
-        click_control(&mut painter, Target::Filter);
+        click_control(&mut painter, Target::FilterBox);
         assert_eq!(
             painter.browser.pane().cursor(),
             before,
@@ -2743,14 +2412,17 @@ mod tests {
     #[test]
     fn the_pointer_lights_either_a_row_or_a_control_but_never_both() {
         let (mut painter, _root, _size) = painter_over_a_mixed_directory("toolbar-exclusive");
-        let at = control_centre(&painter, Target::Filter);
+        let at = control_centre(&painter, Target::FilterBox);
         painter.on_pointer(PointerEventKind::Motion(at));
         assert_eq!(
             painter.hover.control(),
-            Some(Target::Filter),
+            Some(Target::FilterBox),
             "the pointer is over the filter box"
         );
-        assert!(!painter.hover.is(Pane::List, 0), "and so no row may be lit");
+        assert!(
+            !painter.hover.is(Pane::Tiles, 0),
+            "and so no row may be lit"
+        );
     }
 
     /// Hovering a row must actually change what gets painted.
@@ -2765,7 +2437,7 @@ mod tests {
         let cold = paint_opaque(&mut painter, size);
 
         assert!(
-            painter.hover.move_to(Some(Spot::Row(Pane::List, 0))),
+            painter.hover.move_to(Some(Spot::Item(Pane::Tiles, 0))),
             "row 0 becomes hovered"
         );
         let hot = paint_opaque(&mut painter, size);
@@ -2796,7 +2468,11 @@ mod tests {
             .expect("the sidebar always offers at least Home");
         let cold = paint_opaque(&mut painter, size);
 
-        assert!(painter.hover.move_to(Some(Spot::Row(Pane::Sidebar, place))));
+        assert!(
+            painter
+                .hover
+                .move_to(Some(Spot::Item(Pane::Sidebar, place)))
+        );
         let hot = paint_opaque(&mut painter, size);
         assert_ne!(cold, hot, "a hovered place must be visibly highlighted");
 
@@ -2822,12 +2498,7 @@ mod tests {
 
         // The hover tracker refuses the row outright, so the frame cannot
         // change: `row_index_at` filters unselectable rows for both paths.
-        let row_h = painter.theme.sidebar_row();
-        let top = painter.frame().sidebar_body().y + painter.theme.spacing.sidebar_pad_y();
-        let at = super::Position {
-            x: 20,
-            y: top + i32::try_from(heading).unwrap_or(0) * row_h + row_h / 2,
-        };
+        let at = sidebar_row_centre(&painter, heading);
         assert_eq!(
             painter.sidebar_row_at(at),
             None,
@@ -2856,7 +2527,11 @@ mod tests {
         painter.apply(outcome);
 
         let resting = paint_opaque(&mut painter, size);
-        assert!(painter.hover.move_to(Some(Spot::Row(Pane::Sidebar, index))));
+        assert!(
+            painter
+                .hover
+                .move_to(Some(Spot::Item(Pane::Sidebar, index)))
+        );
         let hovered = paint_opaque(&mut painter, size);
         assert_eq!(
             resting, hovered,
@@ -2938,9 +2613,9 @@ mod tests {
             "row 1 must be the file"
         );
 
-        painter.hover.move_to(Some(Spot::Row(Pane::List, 0)));
+        painter.hover.move_to(Some(Spot::Item(Pane::Tiles, 0)));
         let dir_hovered = paint_opaque(&mut painter, size);
-        painter.hover.move_to(Some(Spot::Row(Pane::List, 1)));
+        painter.hover.move_to(Some(Spot::Item(Pane::Tiles, 1)));
         let file_hovered = paint_opaque(&mut painter, size);
         assert_ne!(
             dir_hovered, file_hovered,
@@ -2968,22 +2643,6 @@ mod tests {
         );
     }
 
-    /// The pane-relative position of the centre of list row `row`, as a
-    /// window-relative pointer position -- what a real click on that row
-    /// would report.
-    fn row_centre(painter: &FilesWindow, row: usize) -> super::Position {
-        let rows = painter.frame().rows();
-        let y = painter
-            .browser
-            .pane()
-            .row_y(row)
-            .expect("row must be visible");
-        super::Position {
-            x: rows.x + 10,
-            y: rows.y + y + painter.theme.row_height / 2,
-        }
-    }
-
     fn left_press(painter: &mut FilesWindow, at: super::Position) {
         painter.on_pointer(PointerEventKind::Press {
             button: PointerButton::Left,
@@ -2997,8 +2656,8 @@ mod tests {
     /// threshold exists to prevent.
     #[test]
     fn a_plain_click_does_not_start_a_drag() {
-        let (mut painter, _root, _size) = painter_over_a_mixed_directory("drag-plain-click");
-        let at = row_centre(&painter, 0);
+        let (mut painter, _root, _size) = tiled("drag-plain-click");
+        let at = tile_centre(&painter, "b_file.txt");
         left_press(&mut painter, at);
         painter.on_pointer(PointerEventKind::Release {
             button: PointerButton::Left,
@@ -3008,12 +2667,12 @@ mod tests {
         assert!(painter.take_pending_drag().is_none());
     }
 
-    /// Moving the pointer past the drag threshold after pressing on a row
-    /// must queue that row's path as a pending drag.
+    /// Moving the pointer past the drag threshold after pressing on a tile
+    /// must queue that entry's path as a pending drag.
     #[test]
-    fn dragging_past_the_threshold_queues_the_row_for_a_drag() {
-        let (mut painter, _root, _size) = painter_over_a_mixed_directory("drag-threshold");
-        let at = row_centre(&painter, 0);
+    fn dragging_past_the_threshold_queues_the_entry_for_a_drag() {
+        let (mut painter, _root, _size) = tiled("drag-threshold");
+        let at = tile_centre(&painter, "b_file.txt");
         left_press(&mut painter, at);
         assert!(
             painter.take_pending_drag().is_none(),
@@ -3030,42 +2689,41 @@ mod tests {
         assert_eq!(dragged.len(), 1);
     }
 
-    /// A press on empty space below the list (no row under the pointer) must
-    /// never arm a drag, no matter how far the pointer then moves.
+    /// A press on empty field space (no tile under the pointer) must never
+    /// arm a drag, no matter how far the pointer then moves. An empty folder
+    /// is the one field with no tiles in it.
     #[test]
     fn pressing_empty_space_never_arms_a_drag() {
-        let (mut painter, _root, size) = painter_over_a_mixed_directory("drag-empty-space");
-        let rows = painter.frame().rows();
+        let (mut painter, root) = crowded("drag-empty-space", 0);
+        let field = painter.frame().field();
         let at = super::Position {
-            x: rows.x + 10,
-            y: rows.y + rows.h - 2,
+            x: field.x + field.w / 2,
+            y: field.y + field.h / 2,
         };
+        assert!(
+            painter
+                .tile_at(platform::draw::Point::new(at.x, at.y))
+                .is_none()
+        );
         left_press(&mut painter, at);
         let moved = super::Position {
-            x: at.x + 50,
+            x: at.x - 50,
             y: at.y,
         };
         painter.on_pointer(PointerEventKind::Motion(moved));
         assert!(painter.take_pending_drag().is_none());
-        let _ = size;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Dropping files onto a directory row must move them there and refresh
+    /// Dropping files onto a folder tile must move them there and refresh
     /// the listing -- the full path from `Painter::on_files_dropped` through
     /// to a real filesystem mutation.
     #[test]
-    fn dropping_files_onto_a_directory_row_moves_them_there() {
-        let (mut painter, root, _size) = painter_over_a_mixed_directory("drag-drop-onto-dir");
+    fn dropping_files_onto_a_folder_tile_moves_them_there() {
+        let (mut painter, root, _size) = tiled("drag-drop-onto-dir");
         let file = root.join("b_file.txt");
         let folder = root.join("a_directory");
-        assert!(
-            painter
-                .browser
-                .entry(0)
-                .is_some_and(fsmodel::entry::Entry::is_navigable),
-            "row 0 must be the directory to drop onto"
-        );
-        let at = row_centre(&painter, 0);
+        let at = tile_centre(&painter, "a_directory");
         painter.on_files_dropped(vec![file.clone()], (at.x, at.y));
         assert!(!file.exists(), "the file must have moved out of the root");
         assert!(
@@ -3082,9 +2740,11 @@ mod tests {
         let (mut painter, root, size) = painter_over_a_mixed_directory("rename-paint");
         let resting = paint_opaque(&mut painter, size);
 
-        painter.browser.act(crate::keymap::Action::List(
-            widget::ListCommand::Move(widget::Direction::Down),
-        ));
+        painter
+            .browser
+            .act(crate::keymap::Action::List(widget::ListCommand::Move(
+                widget::Direction::Down,
+            )));
         painter.browser.act(crate::keymap::Action::BeginRename);
         assert!(painter.browser.is_renaming(), "F2 must open the box");
         let editing = paint_opaque(&mut painter, size);
@@ -3104,9 +2764,9 @@ mod tests {
         painter.browser.act(crate::keymap::Action::BeginRename);
         let valid = paint_opaque(&mut painter, size);
 
-        painter
-            .browser
-            .act(crate::keymap::Action::Edit(crate::keymap::EditAction::KillToStart));
+        painter.browser.act(crate::keymap::Action::Edit(
+            crate::keymap::EditAction::KillToStart,
+        ));
         for c in "a/b".chars() {
             painter.browser.act(crate::keymap::Action::Insert(c));
         }
@@ -3127,13 +2787,15 @@ mod tests {
     #[test]
     fn a_cut_entry_is_painted_dimmed() {
         let (mut painter, root, size) = painter_over_a_mixed_directory("cut-paint");
-        painter.browser.act(crate::keymap::Action::List(
-            widget::ListCommand::Move(widget::Direction::Down),
-        ));
-        let resting = painter.painted_rows(size);
+        painter
+            .browser
+            .act(crate::keymap::Action::List(widget::ListCommand::Move(
+                widget::Direction::Down,
+            )));
+        let resting = painter.painted_field(size);
 
         painter.browser.act(crate::keymap::Action::Cut);
-        let after_cut = painter.painted_rows(size);
+        let after_cut = painter.painted_field(size);
 
         assert_ne!(
             resting, after_cut,
@@ -3147,14 +2809,16 @@ mod tests {
     #[test]
     fn a_copied_entry_is_not_dimmed() {
         let (mut painter, root, size) = painter_over_a_mixed_directory("copy-paint");
-        painter.browser.act(crate::keymap::Action::List(
-            widget::ListCommand::Move(widget::Direction::Down),
-        ));
+        painter
+            .browser
+            .act(crate::keymap::Action::List(widget::ListCommand::Move(
+                widget::Direction::Down,
+            )));
         painter.browser.act(crate::keymap::Action::Copy);
-        let after_copy = painter.painted_rows(size);
+        let after_copy = painter.painted_field(size);
 
         painter.browser.act(crate::keymap::Action::Cut);
-        let after_cut = painter.painted_rows(size);
+        let after_cut = painter.painted_field(size);
 
         assert_ne!(
             after_copy, after_cut,
@@ -3201,12 +2865,15 @@ mod tests {
             let channel = |shift: u32| u8::try_from((px >> shift) & 0xff).unwrap_or(u8::MAX);
             config::Color::from_rgb(channel(16), channel(8), channel(0)).luma()
         };
-        // Sampled inside the sidebar and inside the list, both well clear of
-        // the centred card: the two panes take different fills, and the bug
-        // moved them in opposite directions.
+        // Sampled inside the chrome card and inside the field, both well
+        // clear of the centred modal: the two take different fills, and the
+        // bug moved them in opposite directions.
         let stride = size.width.cast_unsigned() as usize;
+        let card = painter.card().expect("the card is shown").bounds();
+        let card_px = (card.bottom() - 8).cast_unsigned() as usize * stride
+            + (card.right() - 8).cast_unsigned() as usize;
         let row = stride * 4;
-        for (at, pane) in [(row + 4, "the sidebar"), (row + stride - 8, "the list")] {
+        for (at, pane) in [(card_px, "the card"), (row + stride - 8, "the field")] {
             let (before, after) = (luma(resting[at]), luma(prompting[at]));
             assert!(
                 after < before,
@@ -3270,9 +2937,9 @@ mod tests {
     /// password.
     #[test]
     fn a_click_behind_the_prompt_does_not_reach_the_list() {
-        let (mut painter, root, _size) = painter_over_a_mixed_directory("password-click");
+        let (mut painter, root, _size) = tiled("password-click");
         painter.browser.begin_password("Password: ", false);
-        let at = row_centre(&painter, 1);
+        let at = tile_centre(&painter, "b_file.txt");
         left_press(&mut painter, at);
         assert!(
             painter.browser.selected_paths().is_empty(),
@@ -3285,19 +2952,320 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Reporting drag-hover state must resolve to the row under the given
-    /// position, so the drop-target outline lands on the row a drop would
-    /// actually use.
+    fn left_release(painter: &mut FilesWindow, at: super::Position) {
+        painter.on_pointer(PointerEventKind::Release {
+            button: PointerButton::Left,
+            at,
+            modifiers: platform::toplevel::ModifierState::default(),
+        });
+    }
+
+    /// A painter over the mixed directory with its tiles laid out.
+    fn tiled(tag: &str) -> (FilesWindow, std::path::PathBuf, PhysicalSize) {
+        let (mut painter, root, size) = painter_over_a_mixed_directory(tag);
+        painter.sync_tiles();
+        (painter, root, size)
+    }
+
+    /// The centre of the tile showing the entry named `name`.
+    fn tile_centre(painter: &FilesWindow, name: &str) -> super::Position {
+        let placed = painter
+            .tile_layout()
+            .into_iter()
+            .find(|placed| {
+                placed
+                    .tile
+                    .item()
+                    .and_then(|row| painter.browser.entry(row))
+                    .is_some_and(|entry| entry.name == name)
+            })
+            .expect("the entry has a tile");
+        super::Position {
+            x: placed.rect.x + placed.rect.w / 2,
+            y: placed.rect.y + placed.rect.h / 2,
+        }
+    }
+
     #[test]
-    fn update_drag_hover_resolves_to_the_row_under_the_position() {
-        let (mut painter, _root, _size) = painter_over_a_mixed_directory("drag-hover-resolve");
-        let at = row_centre(&painter, 0);
-        painter.update_drag_hover(true, (at.x, at.y));
-        assert_eq!(painter.drop_hover_row, Some(0));
-        painter.update_drag_hover(false, (at.x, at.y));
+    fn every_visible_entry_gets_a_tile_inside_the_field() {
+        let (painter, root, _size) = tiled("tiles-layout");
+        let field = painter.frame().field();
+        let placed = painter.tile_layout();
+        assert_eq!(placed.len(), painter.browser.len());
+        for tile in placed {
+            assert!(tile.rect.x >= field.x && tile.rect.right() <= field.right());
+            assert!(tile.rect.y >= field.y && tile.rect.bottom() <= field.bottom());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clicking_a_folder_tile_enters_the_folder() {
+        let (mut painter, root, _size) = tiled("tiles-enter");
+        let at = tile_centre(&painter, "a_directory");
+        left_press(&mut painter, at);
+        assert_eq!(
+            painter.browser.path(),
+            root,
+            "a press alone must not navigate"
+        );
+        left_release(&mut painter, at);
+        assert_eq!(painter.browser.path(), root.join("a_directory"));
+        assert!(painter.browser.can_go_back(), "the step is in the history");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_double_click_on_a_folder_tile_does_not_also_hit_the_next_tile() {
+        let (mut painter, root, _size) = tiled("tiles-double");
+        let at = tile_centre(&painter, "a_directory");
+        left_press(&mut painter, at);
+        left_release(&mut painter, at);
+        left_press(&mut painter, at);
+        left_release(&mut painter, at);
+        assert_eq!(painter.browser.path(), root.join("a_directory"));
+        assert!(painter.browser.selected_paths().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn clicking_a_file_tile_selects_it_and_a_double_click_opens_it() {
+        let (mut painter, root, _size) = tiled("tiles-file");
+        let at = tile_centre(&painter, "b_file.txt");
+        left_press(&mut painter, at);
+        left_release(&mut painter, at);
+        assert_eq!(painter.browser.selected_paths(), [root.join("b_file.txt")]);
+        assert!(painter.take_pending_open().is_none());
+        left_press(&mut painter, at);
+        left_release(&mut painter, at);
+        assert_eq!(painter.take_pending_open(), Some(root.join("b_file.txt")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dragging_a_folder_tile_carries_it_instead_of_entering() {
+        let (mut painter, root, _size) = tiled("tiles-drag");
+        let at = tile_centre(&painter, "a_directory");
+        left_press(&mut painter, at);
+        painter.on_pointer(PointerEventKind::Motion(super::Position {
+            x: at.x + 40,
+            y: at.y + 40,
+        }));
+        assert_eq!(
+            painter.take_pending_drag(),
+            Some(vec![root.join("a_directory")])
+        );
+        left_release(&mut painter, at);
+        assert_eq!(painter.browser.path(), root);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_drag_over_a_folder_tile_targets_it() {
+        let (mut painter, root, _size) = tiled("tiles-drop");
+        let folder = tile_centre(&painter, "a_directory");
+        painter.update_drag_hover(true, (folder.x, folder.y));
+        let row = painter.drop_hover_row.expect("a folder is a drop target");
+        assert_eq!(painter.browser.entry(row).expect("row").name, "a_directory");
+        painter.update_drag_hover(false, (folder.x, folder.y));
         assert_eq!(
             painter.drop_hover_row, None,
-            "the highlight must clear once the drag leaves"
+            "the highlight clears when the drag leaves"
         );
+        let file = tile_centre(&painter, "b_file.txt");
+        painter.update_drag_hover(true, (file.x, file.y));
+        assert_eq!(painter.drop_hover_row, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hovering_a_tile_changes_the_frame() {
+        let (mut painter, root, size) = tiled("tiles-hover");
+        let resting = paint_opaque(&mut painter, size);
+        let at = tile_centre(&painter, "b_file.txt");
+        painter.on_pointer(PointerEventKind::Motion(at));
+        assert!(painter.hover.spot().is_some());
+        assert_ne!(paint_opaque(&mut painter, size), resting);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn crowded(tag: &str, files: usize) -> (FilesWindow, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("files-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        for i in 0..files {
+            std::fs::write(root.join(format!("f{i:03}")), vec![0; 10 + i]).expect("file");
+        }
+        let cfg = config::Config::default();
+        let favorites = crate::favorites::Favorites::default();
+        let sidebar = crate::sidebar::Sidebar::new(&user_dirs::UserDirs::load(), &favorites);
+        let mut painter = FilesWindow::new(
+            crate::browser::Browser::open(&root, 700, 400, 28).expect("listable"),
+            crate::theme::Theme::from_config(&cfg),
+            crate::typography::Typography::load(&cfg, 1.0),
+            sidebar,
+            favorites,
+            PhysicalSize {
+                width: 900,
+                height: 600,
+            },
+            waker::Waker::new().expect("an eventfd"),
+        );
+        painter.sync_tiles();
+        (painter, root)
+    }
+
+    #[test]
+    fn the_overflow_tile_opens_a_page_and_up_closes_it() {
+        let (mut painter, root) = crowded("tiles-overflow", 60);
+        let more = painter
+            .tile_layout()
+            .into_iter()
+            .find(|placed| placed.tile.item().is_none())
+            .expect("sixty files overflow a 900x600 window");
+        let at = super::Position {
+            x: more.rect.x + more.rect.w / 2,
+            y: more.rect.y + more.rect.h / 2,
+        };
+        left_press(&mut painter, at);
+        left_release(&mut painter, at);
+        assert_eq!(painter.tiles.depth(), 1);
+        assert!(painter.can_step_out());
+        click_control(&mut painter, Target::Up);
+        assert_eq!(painter.tiles.depth(), 0);
+        assert_eq!(
+            painter.browser.path(),
+            root,
+            "up closed the page, not the folder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn key(painter: &mut FilesWindow, key: platform::toplevel::Key, shift: bool) {
+        let modifiers = if shift {
+            platform::toplevel::ModifierState::from_wire(1, 0, 0, 0)
+        } else {
+            platform::toplevel::ModifierState::default()
+        };
+        painter.on_key(platform::toplevel::KeyPress {
+            key,
+            modifiers,
+            repeat: false,
+        });
+    }
+
+    fn cursor_name(painter: &FilesWindow) -> String {
+        painter
+            .browser
+            .cursor_entry()
+            .expect("a cursor")
+            .name
+            .clone()
+    }
+
+    #[test]
+    fn arrow_keys_walk_the_tiles_largest_first() {
+        let (mut painter, root) = crowded("tiles-keys", 3);
+        key(&mut painter, platform::toplevel::Key::Down, false);
+        assert_eq!(
+            cursor_name(&painter),
+            "f002",
+            "the largest file comes first"
+        );
+        key(&mut painter, platform::toplevel::Key::Down, false);
+        assert_eq!(cursor_name(&painter), "f001");
+        key(&mut painter, platform::toplevel::Key::Up, false);
+        assert_eq!(cursor_name(&painter), "f002");
+        key(&mut painter, platform::toplevel::Key::End, false);
+        assert_eq!(cursor_name(&painter), "f000");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn shift_arrows_extend_the_selection_along_the_spiral() {
+        let (mut painter, root) = crowded("tiles-keys-shift", 5);
+        key(&mut painter, platform::toplevel::Key::Down, false);
+        key(&mut painter, platform::toplevel::Key::Down, true);
+        key(&mut painter, platform::toplevel::Key::Down, true);
+        let mut names: Vec<String> = painter
+            .browser
+            .selected_paths()
+            .iter()
+            .map(|p| p.file_name().expect("name").to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["f002", "f003", "f004"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn walking_off_the_last_tile_opens_the_overflow_page() {
+        let (mut painter, root) = crowded("tiles-keys-overflow", 60);
+        key(&mut painter, platform::toplevel::Key::End, false);
+        let last = cursor_name(&painter);
+        key(&mut painter, platform::toplevel::Key::Down, false);
+        assert_eq!(painter.tiles.depth(), 1);
+        assert_ne!(cursor_name(&painter), last);
+        key(&mut painter, platform::toplevel::Key::Up, false);
+        assert_eq!(painter.tiles.depth(), 0);
+        assert_eq!(
+            cursor_name(&painter),
+            last,
+            "walking back lands where it left"
+        );
+        key(&mut painter, platform::toplevel::Key::PageDown, false);
+        assert_eq!(painter.tiles.depth(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn wheel(painter: &mut FilesWindow, lines: i32) {
+        let field = painter.frame().field();
+        painter.on_pointer(PointerEventKind::Scroll {
+            lines,
+            at: super::Position {
+                x: field.x + field.w / 2,
+                y: field.y + field.h / 2,
+            },
+            modifiers: platform::toplevel::ModifierState::default(),
+        });
+    }
+
+    #[test]
+    fn the_wheel_turns_tile_pages() {
+        let (mut painter, root) = crowded("tiles-wheel", 60);
+        wheel(&mut painter, -3);
+        assert_eq!(painter.tiles.depth(), 0);
+        wheel(&mut painter, 3);
+        assert_eq!(painter.tiles.depth(), 1);
+        wheel(&mut painter, -3);
+        assert_eq!(painter.tiles.depth(), 0);
+        assert_eq!(
+            painter.browser.path(),
+            root,
+            "the wheel never leaves the folder"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_go_up_key_closes_an_overflow_page_first() {
+        let (mut painter, root) = crowded("tiles-overflow-key", 60);
+        let from = painter
+            .tile_layout()
+            .into_iter()
+            .find_map(|placed| match placed.tile {
+                crate::tile_rank::Tile::More { from, .. } => Some(from),
+                crate::tile_rank::Tile::Item(_) => None,
+            })
+            .expect("overflow");
+        painter.tiles.open_more(from);
+        painter.on_key(platform::toplevel::KeyPress {
+            key: platform::toplevel::Key::Backspace,
+            modifiers: platform::toplevel::ModifierState::default(),
+            repeat: false,
+        });
+        assert_eq!(painter.tiles.depth(), 0);
+        assert_eq!(painter.browser.path(), root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

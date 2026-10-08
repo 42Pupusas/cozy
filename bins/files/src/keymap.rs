@@ -847,7 +847,10 @@ mod tests {
     #[test]
     fn typing_fills_the_password_reply() {
         let map = password_map();
-        assert_eq!(map.translate(press(Key::Char('h'))), Some(Action::Insert('h')));
+        assert_eq!(
+            map.translate(press(Key::Char('h'))),
+            Some(Action::Insert('h'))
+        );
         assert_eq!(
             map.translate(press(Key::Char(' '))),
             Some(Action::Insert(' ')),
@@ -858,7 +861,10 @@ mod tests {
     #[test]
     fn enter_submits_and_escape_dismisses_the_prompt() {
         let map = password_map();
-        assert_eq!(map.translate(press(Key::Enter)), Some(Action::SubmitPassword));
+        assert_eq!(
+            map.translate(press(Key::Enter)),
+            Some(Action::SubmitPassword)
+        );
         assert_eq!(
             map.translate(press(Key::Escape)),
             Some(Action::DismissPassword)
@@ -923,7 +929,10 @@ mod tests {
     /// tearing the window down would abandon a registered polkit agent.
     #[test]
     fn quit_does_not_reach_through_a_password_prompt() {
-        assert_eq!(password_map().translate(with_mods(Key::Char('q'), CTRL)), None);
+        assert_eq!(
+            password_map().translate(with_mods(Key::Char('q'), CTRL)),
+            None
+        );
     }
 
     /// The selection must not move under the modal, or the user answers a
@@ -931,7 +940,14 @@ mod tests {
     #[test]
     fn navigation_keys_do_not_move_the_list_behind_the_prompt() {
         let map = password_map();
-        for key in [Key::Up, Key::Down, Key::PageUp, Key::PageDown, Key::Home, Key::End] {
+        for key in [
+            Key::Up,
+            Key::Down,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Home,
+            Key::End,
+        ] {
             assert_eq!(map.translate(press(key)), None, "{key:?} must be swallowed");
         }
     }

@@ -324,6 +324,15 @@ impl ListPane {
             self.selection.clear();
             return PaneResponse::Redraw;
         };
+        self.pick(row, mods)
+    }
+
+    /// Select `row` as a click with `mods` would, for a caller that resolved
+    /// the row through its own geometry. Ignores an out-of-range index.
+    pub fn pick(&mut self, row: usize, mods: Mods) -> PaneResponse {
+        if row >= self.viewport.len() {
+            return PaneResponse::Ignored;
+        }
         // Shift is checked before Ctrl: with both held, extending is the
         // behaviour every file manager settles on, and a toggle-then-extend
         // interpretation would leave the anchor somewhere the user never put
@@ -415,6 +424,18 @@ mod tests {
                 pane.viewport().offset()
             );
         }
+    }
+
+    #[test]
+    fn picking_follows_click_modifiers_and_ignores_out_of_range_rows() {
+        let mut pane = pane();
+        assert_eq!(pane.pick(3, Mods::none()), PaneResponse::Redraw);
+        assert_eq!(pane.pick(6, Mods::shift()), PaneResponse::Redraw);
+        assert_eq!(pane.selection().selected(), &[3, 4, 5, 6]);
+        pane.pick(4, Mods::ctrl());
+        assert!(!pane.is_selected(4));
+        assert_eq!(pane.pick(50, Mods::none()), PaneResponse::Ignored);
+        assert_cursor_visible(&pane);
     }
 
     #[test]

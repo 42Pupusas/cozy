@@ -147,34 +147,18 @@ impl Spacing {
         self.at(3.0)
     }
 
-    /// Horizontal padding inside the toolbar, before the first control and
-    /// after the last (guide: 20px).
-    ///
-    /// The guide's toolbar has `padding: 0 20px`, which is deliberately *not*
-    /// one of the five rhythm steps -- it sits between L and XL, so the chrome
-    /// at the window's edge breathes more than the gaps between the controls
-    /// inside it. Encoded rather than approximated to M, because approximating
-    /// it is exactly what left the filter box touching the border.
+    /// Half the space between neighbouring cells. Every cell, tile or card,
+    /// is drawn this far inside its slot, and the window margin is the same
+    /// value, so the outer margin equals the gap between cells.
     #[must_use]
-    pub fn toolbar_pad(self) -> i32 {
-        self.at(20.0)
+    pub fn gutter(self) -> i32 {
+        self.xs()
     }
 
-    /// Horizontal padding inside the sidebar (guide: 12px).
-    ///
-    /// The guide's `.sidebar { padding: 18px 12px }` is asymmetric, and the
-    /// asymmetry is the point: rows are full-width hit targets that want
-    /// little horizontal inset, while the column as a whole wants a clear
-    /// margin from the window's top edge.
+    /// Horizontal padding inside the pinned card (guide: 12px).
     #[must_use]
     pub fn sidebar_pad(self) -> i32 {
         self.at(12.0)
-    }
-
-    /// Vertical padding at the top of the sidebar (guide: 18px).
-    #[must_use]
-    pub fn sidebar_pad_y(self) -> i32 {
-        self.at(18.0)
     }
 
     /// Inset of a sidebar row's label from the row's own left edge
@@ -224,12 +208,6 @@ impl Spacing {
         self.at(35.0)
     }
 
-    /// Column-header row height (guide: 30px).
-    #[must_use]
-    pub fn column_header(self) -> i32 {
-        self.at(30.0)
-    }
-
     /// Height of the sidebar's storage footer (guide: 42px).
     ///
     /// The guide builds this from parts -- 14px of top padding, a ~14px
@@ -258,47 +236,21 @@ impl Spacing {
         self.at(210.0)
     }
 
-    /// Collapsed sidebar rail width (guide: 58px).
+    /// Width of the pinned chrome card, and with it the shortest side a
+    /// spiral tile may have: the card is the flow's last tile, so one token
+    /// sets both. Derived from what the card's own toolbar honestly needs --
+    /// four icon buttons plus padding, at least as wide as the old guide
+    /// floor so tiles still hold their labels.
     #[must_use]
-    pub fn rail_width(self) -> i32 {
-        self.at(58.0)
-    }
-
-    /// The window width below which the sidebar collapses to a rail
-    /// (guide: 780px).
-    #[must_use]
-    pub fn collapse_below(self) -> i32 {
-        self.at(780.0)
+    pub fn tile_min(self) -> i32 {
+        let toolbar = self.icon_button() * 4 + self.sidebar_pad() * 2 + self.s();
+        toolbar.max(self.at(72.0))
     }
 
     /// Width of a toolbar icon button (guide: 30px square).
-    ///
-    /// Unused until the toolbar's buttons are drawn -- iconography is a
-    /// separate, deliberately deferred piece of work -- but the dimension
-    /// belongs with the rest of the guide's table rather than being
-    /// rediscovered later.
     #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn icon_button(self) -> i32 {
         self.at(30.0)
-    }
-
-    /// Width of one view-toggle button (guide: 31px square).
-    #[must_use]
-    pub fn view_button(self) -> i32 {
-        self.at(31.0)
-    }
-
-    /// Resting width of the filter control (guide: 200px).
-    #[must_use]
-    pub fn search_width(self) -> i32 {
-        self.at(200.0)
-    }
-
-    /// Focused width of the filter control (guide: 245px).
-    #[must_use]
-    pub fn search_width_focused(self) -> i32 {
-        self.at(245.0)
     }
 }
 
@@ -323,31 +275,13 @@ mod tests {
         assert_eq!(s.control_height(), 31);
         assert_eq!(s.status_height(), 35);
         assert_eq!(s.sidebar_width(), 210);
-        assert_eq!(s.rail_width(), 58);
+        assert_eq!(s.tile_min(), 152);
         assert_eq!(s.storage_height(), 42);
         assert_eq!(s.meter_height(), 2);
-        assert_eq!(s.view_button(), 31);
         assert_eq!(s.radius(), 6);
         assert_eq!(s.radius_small(), 3);
-        assert_eq!(s.toolbar_pad(), 20);
         assert_eq!(s.sidebar_pad(), 12);
-        assert_eq!(s.sidebar_pad_y(), 18);
         assert_eq!(s.sidebar_row_pad(), 9);
-    }
-
-    /// The toolbar's edge padding must exceed the gaps between the controls
-    /// inside it, or the first control reads as falling out of the window --
-    /// the specific complaint this token was added to fix.
-    #[test]
-    fn the_toolbar_edge_padding_is_roomier_than_its_internal_gaps() {
-        for font in [8.0, 13.0, 20.0] {
-            let s = Spacing::new(font, 1.0);
-            assert!(
-                s.toolbar_pad() > s.s(),
-                "toolbar padding must beat the control gap at {font}"
-            );
-            assert!(s.toolbar_pad() >= s.l(), "and land above L at {font}");
-        }
     }
 
     /// A corner radius must never be so large it swallows a control whole, nor
@@ -443,34 +377,25 @@ mod tests {
             ("list_row", s.list_row()),
             ("control", s.control_height()),
             ("status", s.status_height()),
-            ("column_header", s.column_header()),
             ("icon_button", s.icon_button()),
-            ("rail", s.rail_width()),
+            ("tile_min", s.tile_min()),
             ("radius", s.radius()),
             ("radius_small", s.radius_small()),
-            ("toolbar_pad", s.toolbar_pad()),
             ("sidebar_pad", s.sidebar_pad()),
-            ("sidebar_pad_y", s.sidebar_pad_y()),
             ("sidebar_row_pad", s.sidebar_row_pad()),
         ] {
             assert!(value > 0, "{name} must be positive");
         }
     }
 
-    /// The focused filter box must actually be wider than at rest, or the
-    /// guide's grow-on-focus affordance is invisible.
+    /// The card's navigation row must hold four buttons and the gap after
+    /// the chevrons without dropping any.
     #[test]
-    fn the_filter_grows_when_focused() {
-        let s = Spacing::new(13.0, 1.0);
-        assert!(s.search_width_focused() > s.search_width());
-    }
-
-    /// The collapse threshold must exceed the expanded sidebar itself,
-    /// otherwise the rail would never engage before the list ran out of room.
-    #[test]
-    fn the_collapse_threshold_leaves_room_for_a_list() {
-        let s = Spacing::new(13.0, 1.0);
-        assert!(s.collapse_below() > s.sidebar_width() * 2);
-        assert!(s.rail_width() < s.sidebar_width());
+    fn the_card_fits_its_navigation_row() {
+        for font in [8.0, 13.0, 20.0] {
+            let s = Spacing::new(font, 1.0);
+            let row = s.sidebar_pad() * 2 + s.icon_button() * 4 + s.s();
+            assert!(row <= s.tile_min(), "the nav row overflows at {font}");
+        }
     }
 }

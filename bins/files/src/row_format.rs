@@ -16,34 +16,6 @@ use crate::theme::Theme;
 pub struct RowFormat;
 
 impl RowFormat {
-    /// The name as shown, with a trailing `/` on anything navigable.
-    ///
-    /// The slash is on *navigable* rather than on `kind == Dir`, so a symlink
-    /// to a directory also gets it -- the marker answers "what happens if I
-    /// press Enter", which is the question a user is actually asking.
-    #[must_use]
-    pub fn name(entry: &Entry) -> String {
-        if entry.is_navigable() {
-            format!("{}/", entry.name)
-        } else {
-            entry.name.clone()
-        }
-    }
-
-    /// The size column.
-    ///
-    /// Directories get `--` rather than a number: the size of a directory
-    /// inode is real but meaningless to a user, and showing `4.0K` next to a
-    /// folder holding gigabytes is worse than showing nothing.
-    #[must_use]
-    pub fn size(entry: &Entry) -> String {
-        if entry.is_navigable() {
-            "--".to_owned()
-        } else {
-            Self::human_size(entry.size)
-        }
-    }
-
     /// Bytes in the shortest unambiguous form.
     ///
     /// Powers of 1024 with their proper IEC names, one decimal place below

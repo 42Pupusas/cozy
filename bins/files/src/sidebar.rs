@@ -423,7 +423,10 @@ mod tests {
             .iter()
             .position(|r| matches!(r, SidebarRow::Heading("Devices")))
             .expect("the devices heading");
-        let device = rows.iter().position(SidebarRow::is_device).expect("the stick");
+        let device = rows
+            .iter()
+            .position(SidebarRow::is_device)
+            .expect("the stick");
         assert!(device > heading, "a device must sit under its heading");
     }
 
@@ -468,7 +471,9 @@ mod tests {
         let (dirs, fav) = fixture(&tmp);
         let volumes = VolumeSet::of(vec![stick("DISC", true)]);
         let bar = Sidebar::with_volumes(&dirs, &fav, &volumes);
-        let device = bar.device_at(Path::new("/run/media/user/DISC")).expect("found");
+        let device = bar
+            .device_at(Path::new("/run/media/user/DISC"))
+            .expect("found");
         assert_eq!(device.detail(), Some("vfat, read-only"));
         let home = bar
             .rows()
@@ -547,7 +552,10 @@ mod tests {
             .find(|r| r.mountable_source().is_some())
             .expect("the stick");
         assert_eq!(row.path(), None, "there is no directory to open");
-        assert!(!row.is_device(), "flushing an unmounted device acts on nothing");
+        assert!(
+            !row.is_device(),
+            "flushing an unmounted device acts on nothing"
+        );
     }
 
     /// A mounted stick appears once, as a mounted row. Listing it from both
@@ -608,7 +616,11 @@ mod tests {
         let volumes = VolumeSet::of(vec![stick("MOUNTED", false)]);
         let devices = DeviceScan::of(vec![unmounted("LOOSE")]);
         let bar = Sidebar::with_storage(&dirs, &fav, &volumes, &devices);
-        let mounted = bar.rows().iter().position(SidebarRow::is_device).expect("mounted");
+        let mounted = bar
+            .rows()
+            .iter()
+            .position(SidebarRow::is_device)
+            .expect("mounted");
         let loose = bar
             .rows()
             .iter()

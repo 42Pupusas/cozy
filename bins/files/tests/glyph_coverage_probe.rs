@@ -64,15 +64,13 @@ struct ChromeGlyphs;
 
 impl ChromeGlyphs {
     /// `(what it draws, the string drawn)`.
-    const ALL: [(&'static str, &'static str); 8] = [
+    const ALL: [(&'static str, &'static str); 6] = [
         ("back chevron", "\u{2039}"),
         ("forward chevron", "\u{203a}"),
         ("up arrow", "\u{2191}"),
         ("hidden toggle, on", "\u{25cf}"),
         ("hidden toggle, off", "\u{25cb}"),
-        ("view toggle, list", "\u{2261}"),
-        ("view toggle, grid", "\u{25a6}"),
-        ("grid card icons", "\u{25b0}\u{25c6}"),
+        ("tile labels", "\u{2026}"),
     ];
 }
 
@@ -121,11 +119,14 @@ impl ConfiguredFace {
     }
 
     /// Characters of `text` that no available face maps.
-    fn unmapped(primary: &font::FontFace, fallback: Option<&font::FontFace>, text: &str) -> Vec<char> {
+    fn unmapped(
+        primary: &font::FontFace,
+        fallback: Option<&font::FontFace>,
+        text: &str,
+    ) -> Vec<char> {
         text.chars()
             .filter(|c| {
-                !primary.has_glyph(*c as u32)
-                    && !fallback.is_some_and(|f| f.has_glyph(*c as u32))
+                !primary.has_glyph(*c as u32) && !fallback.is_some_and(|f| f.has_glyph(*c as u32))
             })
             .collect()
     }

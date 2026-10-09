@@ -8,6 +8,7 @@
 
 use std::collections::VecDeque;
 
+use platform::SurfaceFormat;
 use platform::draw::{Canvas, Color, Rect};
 
 use crate::chart::Chart;
@@ -36,6 +37,7 @@ pub struct ChartCache {
     width: i32,
     height: i32,
     panel: Color,
+    format: SurfaceFormat,
     scroll_remainder: f32,
     seen_samples: u64,
 }
@@ -48,6 +50,7 @@ impl ChartCache {
             width: 0,
             height: 0,
             panel,
+            format: SurfaceFormat::opaque(),
             scroll_remainder: 0.0,
             seen_samples: 0,
         }
@@ -79,6 +82,10 @@ impl ChartCache {
         sequence: u64,
         background_cleared: bool,
     ) -> DamageList {
+        if self.format != target.format() {
+            self.format = target.format();
+            self.pixels.clear();
+        }
         // How many right-edge columns this frame actually rewrote in the
         // cached surface -- a full rebuild rewrites everything, a steady-state
         // advance rewrites only the freshly scrolled-in strip (often zero when
@@ -143,10 +150,11 @@ impl ChartCache {
         self.width = bounds.w.max(0);
         self.height = bounds.h.max(0);
         let area = self.width.cast_unsigned() as usize * self.height.cast_unsigned() as usize;
-        self.pixels.resize(area, self.panel.to_xrgb8888());
+        self.pixels.resize(area, self.format.pack_paint(self.panel));
         self.scroll_remainder = 0.0;
         self.seen_samples = sequence;
-        let mut canvas = Canvas::new(&mut self.pixels, self.width, self.height);
+        let mut canvas =
+            Canvas::new(&mut self.pixels, self.width, self.height).with_format(self.format);
         let chart = Chart::new(Rect::new(0, 0, self.width, self.height), color, self.panel);
         chart.draw(&mut canvas, primary, maximum);
         for overlay in overlays {
@@ -198,7 +206,7 @@ impl ChartCache {
         let width = self.width.cast_unsigned() as usize;
         let columns = columns.cast_unsigned() as usize;
         if columns >= width {
-            self.pixels.fill(self.panel.to_xrgb8888());
+            self.pixels.fill(self.format.pack_paint(self.panel));
             return;
         }
         for row in 0..self.height.cast_unsigned() as usize {
@@ -217,7 +225,8 @@ impl ChartCache {
         overlays: &[Overlay<'_>],
     ) {
         let start = (self.width - columns).max(0);
-        let mut canvas = Canvas::new(&mut self.pixels, self.width, self.height);
+        let mut canvas =
+            Canvas::new(&mut self.pixels, self.width, self.height).with_format(self.format);
         canvas.fill_rect(Rect::new(start, 0, columns, self.height), self.panel);
         for x in start..self.width {
             Self::draw_primary_column(

@@ -501,12 +501,7 @@ impl TermWindow {
         // translucent window's initial backbuffer must carry the configured
         // alpha from frame one, not flash fully opaque until the first real
         // paint.
-        let pixels = crate::pixel_buffers::PixelBuffers::new(
-            width,
-            height,
-            renderer.bg_packed(),
-            renderer.background_alpha(),
-        );
+        let pixels = crate::pixel_buffers::PixelBuffers::new(width, height, renderer.bg_packed());
         // Both shm frames start as blank memory (freshly mmap'd), so every
         // row is "stale" relative to the backbuffer until the first present
         // copies it in -- `PresentState::new` seeds that.
@@ -835,19 +830,6 @@ impl TermWindow {
         if self.cursor_anim.advance(dt_ms) {
             self.present.mark_dirty();
         }
-    }
-
-    /// Rebuilds the damaged rows of the premultiplied custom-painter cache
-    /// from the XRGB backbuffer. This runs on every present of a translucent
-    /// custom-painted window (e.g. `monitor` under compositor opacity < 1.0);
-    /// see [`crate::pixel_buffers::PixelBuffers::update_custom_argb`] for the
-    /// SIMD kernel this delegates to.
-    fn update_custom_argb(&mut self, damage: crate::draw::Rect) {
-        if !self.renderer.needs_alpha() {
-            return;
-        }
-        let alpha = self.renderer.background_alpha();
-        self.pixels.update_custom_argb(self.width, damage, alpha);
     }
 
     /// Milliseconds until the bell's title flash must be reverted, if one is
@@ -2094,24 +2076,6 @@ impl TermWindow {
         folded
     }
 
-    /// Premultiply only the pixels a custom painter actually touched this
-    /// frame. A full repaint (or a painter that doesn't track regions)
-    /// reports `Full` and rebuilds the whole image; a steady-state dashboard
-    /// frame reports a handful of small rects (chart edges, moved bars) and
-    /// pays for only those pixels -- the difference between premultiplying
-    /// ~2M pixels and ~3K every frame. Partial premul is safe because the
-    /// ARGB cache is persistent: untouched regions still hold last frame's
-    /// correct premultiplied pixels.
-    fn update_custom_argb_for_damage(&mut self, damage: &crate::draw::Damage) {
-        if damage.is_full() {
-            self.update_custom_argb(crate::draw::Rect::new(0, 0, self.width, self.height));
-        } else {
-            for rect in damage.rects() {
-                self.update_custom_argb(*rect);
-            }
-        }
-    }
-
     /// Convert a custom painter's damage into stale logical rows so the shm
     /// upload copies only the touched bands into both slots. A full repaint
     /// marks every row; a region set marks just the rows its rectangles span.
@@ -2274,17 +2238,7 @@ impl TermWindow {
         // caches and swap chain are disjoint state, but holding this narrow
         // slice makes that separation explicit to both Rust and readers.
         let (custom_source, custom_fill) = if custom_painted {
-            if self.renderer.needs_alpha() {
-                (
-                    self.pixels.custom_argb(),
-                    crate::pixel_buffers::PixelBuffers::premultiply_pixel(
-                        self.renderer.bg_packed(),
-                        self.renderer.background_alpha(),
-                    ),
-                )
-            } else {
-                (self.pixels.backbuffer(), self.renderer.bg_packed())
-            }
+            (self.pixels.backbuffer(), self.renderer.bg_packed())
         } else {
             // This slice is never read on the terminal-grid path. Supplying an
             // empty one keeps the later copy loop branch-free with respect to
@@ -2317,10 +2271,6 @@ impl TermWindow {
             let len = (y1 - y0) * cols_bytes;
             if let Some(dst_slice) = dst.get_mut(src_off..src_off + len) {
                 if custom_painted {
-                    // A custom surface can be made dirty by a resize/configure
-                    // even when the app had no new telemetry to paint. It must
-                    // therefore use its ARGB cache on *every* such present,
-                    // rather than only the tick that happened to repaint.
                     let available = custom_source.len().saturating_sub(src_off);
                     let copy_len = available.min(dst_slice.len());
                     dst_slice[..copy_len]
@@ -2429,11 +2379,13 @@ impl TermWindow {
         // owns the spike instead of lumping them under `blit`.
         let t_snapshot = present_start.elapsed();
         let custom_painted = custom_paint.is_some();
+        let mut canvas = canvas.with_format(crate::SurfaceFormat::with_bg_alpha(
+            self.renderer.background_alpha(),
+        ));
         let custom_damage = custom_paint.map(|paint| paint(&mut canvas));
         let _ = canvas;
         let t_paint = present_start.elapsed();
         if let Some(damage) = &custom_damage {
-            self.update_custom_argb_for_damage(damage);
             self.extend_touched_rows_for_custom_damage(damage, &mut touched_rows);
         }
         // Sub-phase timers (only read when DebugFps::Log fires below on a slow
@@ -2513,14 +2465,8 @@ impl TermWindow {
         // keep showing the previous content so the window doesn't flash
         // blank mid-drag. See [`crate::pixel_buffers::PixelBuffers::resize`]
         // for why `bg_packed()` (not `bg_xrgb()`) is used for the fill.
-        self.pixels.resize(
-            self.width,
-            self.height,
-            w,
-            h,
-            self.renderer.bg_packed(),
-            self.renderer.background_alpha(),
-        );
+        self.pixels
+            .resize(self.width, self.height, w, h, self.renderer.bg_packed());
         // A configure can end between cell boundaries. The carried old image
         // is useful for complete grid rows while the reflow snapshot is in
         // flight, but no grid cell owns the remaining bottom scanlines. Clear

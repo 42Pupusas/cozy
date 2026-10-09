@@ -84,11 +84,13 @@ impl GlyphBlit for Canvas<'_> {
         }
 
         let buf_width = self.width().cast_unsigned();
-        let fg_px = if bg_alpha == 255 {
+        let solid_background = bg_alpha == 255 && !self.format().needs_alpha();
+        let fg_px = if solid_background {
             fg.to_xrgb8888()
         } else {
             fg.premultiplied_argb8888(255)
         };
+        let opaque_edge = if solid_background { 0 } else { 0xff00_0000 };
 
         let pen_x0 = i64::from(origin_x) + i64::from(entry.bearing_x);
         let top_y = i64::from(origin_y) + i64::from(entry.bearing_y);
@@ -131,10 +133,78 @@ impl GlyphBlit for Canvas<'_> {
                 let dst = &mut pixels[dst_base + i];
                 *dst = if a == 255 {
                     fg_px
+                } else if bg_alpha == 255 {
+                    fg.blend_glyph(bg, a, bg_alpha) | opaque_edge
                 } else {
                     fg.blend_glyph(bg, a, bg_alpha)
                 };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use font::{Atlas, GlyphEntry};
+
+    use super::GlyphBlit;
+    use crate::SurfaceFormat;
+    use crate::draw::{Canvas, Color};
+
+    struct Glyph;
+
+    impl Glyph {
+        const COVERAGE: u8 = 100;
+
+        fn atlas() -> Atlas {
+            let mut atlas = Atlas::new(1, 1);
+            atlas.data[0] = Self::COVERAGE;
+            atlas
+        }
+
+        fn entry() -> GlyphEntry {
+            GlyphEntry {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+                bearing_x: 0,
+                bearing_y: 0,
+                advance: 1,
+            }
+        }
+
+        fn edge_pixel(format: SurfaceFormat) -> u32 {
+            let mut pixels = [0u32; 1];
+            let mut canvas = Canvas::new(&mut pixels, 1, 1).with_format(format);
+            canvas.blit_glyph(
+                &Self::atlas(),
+                &Self::entry(),
+                0,
+                0,
+                Color::WHITE,
+                Color::BLACK,
+                255,
+            );
+            pixels[0]
+        }
+    }
+
+    #[test]
+    fn an_edge_pixel_on_an_opaque_surface_carries_no_alpha_byte() {
+        assert_eq!(Glyph::edge_pixel(SurfaceFormat::opaque()) >> 24, 0);
+    }
+
+    #[test]
+    fn an_edge_pixel_over_a_solid_background_on_an_alpha_surface_is_opaque() {
+        let pixel = Glyph::edge_pixel(SurfaceFormat::with_bg_alpha(200));
+        assert_eq!(pixel >> 24, 0xff);
+    }
+
+    #[test]
+    fn the_edge_colour_is_the_same_on_both_surfaces() {
+        let opaque = Glyph::edge_pixel(SurfaceFormat::opaque());
+        let glass = Glyph::edge_pixel(SurfaceFormat::with_bg_alpha(200));
+        assert_eq!(opaque & 0x00ff_ffff, glass & 0x00ff_ffff);
     }
 }

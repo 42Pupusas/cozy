@@ -68,6 +68,9 @@ impl Value {
                     .collect();
                 bytes.map(|b| String::from_utf8_lossy(&b).into_owned())
             }
+            // See `as_u64`'s variant arm: `a{sv}` dict values arrive
+            // variant-wrapped.
+            Self::Variant(inner) => inner.as_display_string(),
             _ => None,
         }
     }
@@ -87,6 +90,12 @@ impl Value {
             Self::I16(v) if *v >= 0 => Some(v.cast_unsigned().into()),
             Self::I32(v) if *v >= 0 => Some(v.cast_unsigned().into()),
             Self::I64(v) if *v >= 0 => Some(v.cast_unsigned()),
+            // Every dict value in an `a{sv}` off the wire is
+            // variant-wrapped; a view that stopped at the wrapper made
+            // `dict_get("Powered").and_then(Value::as_bool)` read `None`
+            // forever (the statusbar's bluetooth module silently showed
+            // "off" for years this way).
+            Self::Variant(inner) => inner.as_u64(),
             _ => None,
         }
     }
@@ -108,6 +117,10 @@ impl Value {
     pub const fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(b) => Some(*b),
+            // See `as_u64`'s variant arm: `a{sv}` dict values arrive
+            // variant-wrapped, and a bool view that ignored that read
+            // `None` from every property bluez/NM ever reported.
+            Self::Variant(inner) => inner.as_bool(),
             _ => None,
         }
     }
@@ -570,15 +583,34 @@ mod tests {
     #[test]
     fn a_unix_fd_reports_the_h_signature() {
         assert_eq!(Value::UnixFd(0).signature(), "h");
-        assert_eq!(
-            Value::Variant(Box::new(Value::UnixFd(0))).signature(),
-            "v"
-        );
+        assert_eq!(Value::Variant(Box::new(Value::UnixFd(0))).signature(), "v");
     }
 
     #[test]
     fn as_display_string_decodes_byte_array_ssid() {
         let v = Value::Array(vec![Value::Byte(b'h'), Value::Byte(b'i')]);
         assert_eq!(v.as_display_string().as_deref(), Some("hi"));
+    }
+
+    /// Dict values off an `a{sv}` wire dict arrive variant-wrapped; every
+    /// view must look through the wrapper or a caller reading bluez/NM
+    /// properties gets `None` forever (the pre-fix statusbar bluetooth
+    /// widget read "adapter off" this way).
+    #[test]
+    fn views_look_through_variant_wrappers() {
+        let v = |inner: Value| Value::Variant(Box::new(inner));
+        assert_eq!(v(Value::Bool(true)).as_bool(), Some(true));
+        assert_eq!(v(Value::Bool(false)).as_bool(), Some(false));
+        assert_eq!(v(Value::U32(9)).as_u64(), Some(9));
+        assert_eq!(
+            v(Value::Str("x".into())).as_display_string().as_deref(),
+            Some("x")
+        );
+        // The descriptor-slot guard must survive the wrapper.
+        assert_eq!(v(Value::UnixFd(3)).as_u64(), None);
+        // Non-matching shapes still read `None`, not a panic or a wrong
+        // default.
+        assert_eq!(Value::Bool(true).as_u64(), None);
+        assert_eq!(Value::Str("3".into()).as_u64(), None);
     }
 }

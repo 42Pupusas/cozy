@@ -195,7 +195,7 @@ impl UdevProperties {
 #[cfg(test)]
 mod tests {
     use super::UdevProperties;
-    use crate::test_support::{fixtures, TempDir};
+    use crate::test_support::{TempDir, fixtures};
     use std::path::Path;
 
     #[test]

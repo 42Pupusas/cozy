@@ -1,45 +1,33 @@
 //! [`VolumeWatch`] -- notice devices appearing and disappearing, cheaply.
 //!
-//! # Why polling, and why this is not as bad as it sounds
+//! # Driven by the kernel, not by a clock
 //!
-//! `/proc/self/mountinfo` supports `poll(2)` with `POLLPRI`: the kernel wakes
-//! a waiter when the mount table changes. That is the right mechanism, and it
-//! is what a dedicated thread would use. It is not what this does, because
-//! the file browser's event loop already wakes every 250ms and adding a
-//! thread to a single-threaded painter buys nothing but a synchronisation
-//! problem.
+//! The watch owns [`DeviceSignals`], whose descriptors become ready when the
+//! mount table or udev's block records change. The caller waits on them in
+//! its own event loop, reports readiness through [`Self::absorb`], and only
+//! then does [`Self::poll_signalled`] do any work. With no signal it returns
+//! at once without reading a file.
 //!
-//! What makes the polling acceptable is that the expensive part is skipped
-//! almost always:
+//! # A signal is a hint, the bytes are the truth
 //!
-//! - A poll first reads the tables and compares the **bytes** to the previous
-//!   read. On an unchanged system that is two `read(2)`s of a few kilobytes.
-//! - Only when the bytes differ does it parse, walk `/sys`, resolve symlinks
-//!   and scan `/dev/disk/by-label` -- the part that costs real syscalls.
-//!
-//! The kernel rewrites `mountinfo` on every read, so its mtime is useless as
-//! a change signal; the byte comparison is the cheap test available.
+//! A signalled poll still reads the tables and compares the **bytes** to the
+//! previous read, and only a difference parses, walks `/sys`, resolves
+//! symlinks and scans `/dev/disk/by-label`. Many signals change nothing the
+//! sidebar shows: a snap mount or a container starting rewrites `mountinfo`
+//! without touching removable storage, and repainting for it is wasted work.
 //!
 //! # Two tables, because a device changes state in two ways
 //!
 //! The mount table alone cannot see a stick that is plugged in and left
 //! unmounted -- it has no mount entry to appear in. That device is exactly
-//! the one a Mount action exists for, so the watch compares
+//! the one a Mount action exists for, so the comparison covers
 //! [`SystemTables::read_device_text`], which is the mount table *and* the
-//! kernel's block-device list. Plugging in moves the second; mounting moves
-//! the first.
-//!
-//! # Why the interval is not the loop interval
-//!
-//! The event loop's 250ms timeout is a safety net against a missed wakeup,
-//! not a clock, and it also fires on every keystroke and pointer motion.
-//! Polling on each pass would read the mount table while the user drags a
-//! scrollbar. [`Self::due`] therefore gates on elapsed time.
+//! kernel's block-device list, and the signals cover both sources.
 
 use crate::device_scan::DeviceScan;
+use crate::device_signals::DeviceSignals;
 use crate::system_tables::SystemTables;
 use crate::volume_set::VolumeSet;
-use std::time::{Duration, Instant};
 
 /// What a poll found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,32 +60,28 @@ pub struct VolumeWatch {
     volumes: VolumeSet,
     /// Every attached device, mounted or not.
     devices: DeviceScan,
-    /// When the last poll ran.
-    last_poll: Instant,
-    /// How long to wait between polls.
-    interval: Duration,
     /// Which kernel tables to read.
     tables: SystemTables,
+    /// The descriptors the kernel makes ready when those tables change.
+    signals: DeviceSignals,
+    /// A signal arrived that [`Self::poll_signalled`] has not yet acted on.
+    signalled: bool,
 }
 
 impl VolumeWatch {
-    /// How long between polls of the mount table.
-    ///
-    /// One second: plugging in a stick is a physical act, and the delay
-    /// between the plug and the row appearing is dominated by the kernel
-    /// probing the device and the automounter mounting it. A tighter poll
-    /// would not make the row appear sooner.
-    pub const INTERVAL: Duration = Duration::from_secs(1);
-
     /// Start watching the live mount table.
     #[must_use]
     pub fn new() -> Self {
-        Self::watching(SystemTables::live(), Self::INTERVAL)
+        Self::watching(SystemTables::live())
     }
 
-    /// Watch arbitrary tables at an arbitrary interval, for testing.
+    /// Watch arbitrary tables, for testing.
+    ///
+    /// The signals are armed before the first scan, so a change landing
+    /// between the scan and the caller's first wait is reported, not lost.
     #[must_use]
-    pub fn watching(tables: SystemTables, interval: Duration) -> Self {
+    pub fn watching(tables: SystemTables) -> Self {
+        let signals = DeviceSignals::arm(&tables);
         let seen = tables.read_device_text();
         let volumes = tables.volumes();
         let devices = tables.devices();
@@ -105,22 +89,34 @@ impl VolumeWatch {
             seen,
             volumes,
             devices,
-            last_poll: Instant::now(),
-            interval,
             tables,
+            signals,
+            signalled: false,
         }
     }
 
-    /// Whether enough time has passed to poll again.
-    ///
-    /// Checked by the caller before [`Self::poll`] so the common path -- an
-    /// event loop pass triggered by a keystroke -- costs one clock read
-    /// rather than a file read.
+    /// The mount table descriptor, to wait on for `POLLPRI`.
     #[must_use]
-    pub fn due(&self) -> bool {
-        self.last_poll.elapsed() >= self.interval
+    pub fn mounts_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.signals.mounts_fd()
     }
 
+    /// The udev watch descriptor, to wait on for readability.
+    #[must_use]
+    pub fn udev_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.signals.udev_fd()
+    }
+
+    /// Record what the caller's wait found.
+    ///
+    /// Must be called with the readiness of [`Self::mounts_fd`] and
+    /// [`Self::udev_fd`] after every wait. The kernel reports a mount table
+    /// change once per open file, so a wait that consumed it and a caller
+    /// that did not pass it on would lose the change.
+    pub fn absorb(&mut self, mounts_ready: bool, udev_ready: bool) {
+        let block_record = udev_ready && self.signals.drain_block_events();
+        self.signalled |= mounts_ready || block_record;
+    }
     /// Poll the kernel tables, rebuilding only if they changed.
     ///
     /// Both scans are rebuilt whenever *either* differs, so the mounted set
@@ -128,7 +124,7 @@ impl VolumeWatch {
     /// one that changed would let a stick be listed as unmounted by one and
     /// mounted by the other, and the sidebar reads both to draw one row.
     pub fn poll(&mut self) -> VolumeChange {
-        self.last_poll = Instant::now();
+        self.signalled = false;
         let text = self.tables.read_device_text();
         if text == self.seen {
             return VolumeChange::Unchanged;
@@ -144,9 +140,9 @@ impl VolumeWatch {
         VolumeChange::Irrelevant
     }
 
-    /// Poll only if the interval has elapsed.
-    pub fn poll_if_due(&mut self) -> VolumeChange {
-        if self.due() {
+    /// Poll only if a signal arrived since the last poll.
+    pub fn poll_signalled(&mut self) -> VolumeChange {
+        if self.signalled {
             return self.poll();
         }
         VolumeChange::Unchanged
@@ -175,9 +171,8 @@ impl Default for VolumeWatch {
 mod tests {
     use super::{VolumeChange, VolumeWatch};
     use crate::system_tables::SystemTables;
-    use crate::test_support::{fixtures, TempDir};
+    use crate::test_support::{TempDir, fixtures};
     use std::path::Path;
-    use std::time::Duration;
 
     const USB_BUS: &str = "pci0000:00/0000:00:14.0/usb2/2-1/2-1:1.0/host6/target6:0:0/6:0:0:0";
     const SD_BUS: &str = "pci0000:00/0000:00:1c.0/mmc_host/mmc0/mmc0:0001";
@@ -195,10 +190,10 @@ mod tests {
         tmp
     }
 
-    /// A watch over a system the test controls, polling with no delay.
+    /// A watch over a system the test controls.
     fn watch(tmp: &TempDir, text: &str) -> VolumeWatch {
         tmp.write("mountinfo", text);
-        VolumeWatch::watching(SystemTables::rooted_at(tmp.path()), Duration::ZERO)
+        VolumeWatch::watching(SystemTables::rooted_at(tmp.path()))
     }
 
     #[test]
@@ -270,11 +265,17 @@ mod tests {
         let mut watch = watch(&tmp, fixtures::DESKTOP_WITHOUT_USB);
         assert!(watch.devices().is_empty(), "udev knows nothing yet");
         tmp.udev_block(8, 17, fixtures::UDEV_VFAT_PARTITION);
-        tmp.write("partitions", "major minor  #blocks  name\n   8 17  976896 sdb1\n");
+        tmp.write(
+            "partitions",
+            "major minor  #blocks  name\n   8 17  976896 sdb1\n",
+        );
         assert!(watch.poll().needs_redraw(), "the new stick must be noticed");
         assert_eq!(watch.devices().mountable().len(), 1);
         assert!(
-            watch.volumes().at(Path::new("/run/media/user/USB")).is_none(),
+            watch
+                .volumes()
+                .at(Path::new("/run/media/user/USB"))
+                .is_none(),
             "and it is still not mounted"
         );
     }
@@ -286,7 +287,10 @@ mod tests {
         let tmp = system("watch-attach-mount");
         tmp.sized(USB_BUS, "sdb", Some("sdb1"), 8, 17, 1_953_792);
         tmp.udev_block(8, 17, fixtures::UDEV_VFAT_PARTITION);
-        tmp.write("partitions", "major minor  #blocks  name\n   8 17  976896 sdb1\n");
+        tmp.write(
+            "partitions",
+            "major minor  #blocks  name\n   8 17  976896 sdb1\n",
+        );
         let mut watch = watch(&tmp, fixtures::DESKTOP_WITHOUT_USB);
         assert_eq!(watch.devices().mountable().len(), 1);
         tmp.write("mountinfo", fixtures::DESKTOP);
@@ -304,9 +308,15 @@ mod tests {
         let tmp = system("watch-coherent");
         tmp.sized(USB_BUS, "sdb", Some("sdb1"), 8, 17, 1_953_792);
         tmp.udev_block(8, 17, fixtures::UDEV_VFAT_PARTITION);
-        tmp.write("partitions", "major minor  #blocks  name\n   8 17  976896 sdb1\n");
+        tmp.write(
+            "partitions",
+            "major minor  #blocks  name\n   8 17  976896 sdb1\n",
+        );
         let watch = watch(&tmp, fixtures::DESKTOP);
-        let mounted_here = watch.volumes().at(Path::new("/run/media/user/USB")).is_some();
+        let mounted_here = watch
+            .volumes()
+            .at(Path::new("/run/media/user/USB"))
+            .is_some();
         let attached_mounted = watch
             .devices()
             .by_source("/dev/sdb1")
@@ -345,19 +355,14 @@ mod tests {
         assert_eq!(watch.poll(), VolumeChange::Unchanged);
     }
 
-    /// The interval gate is the whole reason this is affordable in an event
-    /// loop that wakes on every keystroke.
+    /// Without a signal the watch reads nothing, which is what lets an event
+    /// loop that wakes on every keystroke call it each pass.
     #[test]
-    fn a_poll_before_the_interval_elapses_does_nothing() {
-        let tmp = system("watch-interval");
-        tmp.write("mountinfo", fixtures::DESKTOP);
-        let mut watch = VolumeWatch::watching(
-            SystemTables::rooted_at(tmp.path()),
-            Duration::from_hours(1),
-        );
+    fn without_a_signal_nothing_is_read() {
+        let tmp = system("watch-quiet");
+        let mut watch = watch(&tmp, fixtures::DESKTOP);
         tmp.write("mountinfo", fixtures::DESKTOP_WITHOUT_USB);
-        assert!(!watch.due());
-        assert_eq!(watch.poll_if_due(), VolumeChange::Unchanged);
+        assert_eq!(watch.poll_signalled(), VolumeChange::Unchanged);
         assert!(
             watch.poll().needs_redraw(),
             "an explicit poll still sees the change"
@@ -365,18 +370,53 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_interval_is_always_due() {
-        let tmp = system("watch-due");
-        let watch = watch(&tmp, fixtures::DESKTOP);
-        assert!(watch.due());
+    fn a_mount_table_signal_triggers_the_read() {
+        let tmp = system("watch-mount-signal");
+        let mut watch = watch(&tmp, fixtures::DESKTOP);
+        tmp.write("mountinfo", fixtures::DESKTOP_WITHOUT_USB);
+        watch.absorb(true, false);
+        assert!(watch.poll_signalled().needs_redraw());
+    }
+
+    #[test]
+    fn a_signalled_poll_is_consumed() {
+        let tmp = system("watch-consumed");
+        let mut watch = watch(&tmp, fixtures::DESKTOP);
+        tmp.write("mountinfo", fixtures::DESKTOP_WITHOUT_USB);
+        watch.absorb(true, false);
+        assert!(watch.poll_signalled().needs_redraw());
+        assert_eq!(watch.poll_signalled(), VolumeChange::Unchanged);
+    }
+
+    /// A udev notification for something other than a block device must not
+    /// cause a read.
+    #[test]
+    fn a_udev_event_for_another_device_kind_is_ignored() {
+        let tmp = system("watch-udev-other");
+        std::fs::create_dir_all(tmp.path().join("data")).expect("udev dir");
+        let mut watch = watch(&tmp, fixtures::DESKTOP);
+        tmp.write("mountinfo", fixtures::DESKTOP_WITHOUT_USB);
+        std::fs::write(tmp.path().join("data").join("c13:64"), "x").expect("write");
+        watch.absorb(false, true);
+        assert_eq!(watch.poll_signalled(), VolumeChange::Unchanged);
+    }
+
+    #[test]
+    fn a_udev_block_record_triggers_the_read() {
+        let tmp = system("watch-udev-block");
+        std::fs::create_dir_all(tmp.path().join("data")).expect("udev dir");
+        let mut watch = watch(&tmp, fixtures::DESKTOP);
+        tmp.write("mountinfo", fixtures::DESKTOP_WITHOUT_USB);
+        std::fs::write(tmp.path().join("data").join("b8:17"), "x").expect("write");
+        watch.absorb(false, true);
+        assert!(watch.poll_signalled().needs_redraw());
     }
 
     /// A vanishing mount table must read as "no devices", not panic.
     #[test]
     fn an_unreadable_table_lists_nothing() {
         let tmp = TempDir::new("watch-unreadable");
-        let watch =
-            VolumeWatch::watching(SystemTables::rooted_at(tmp.path()), Duration::ZERO);
+        let watch = VolumeWatch::watching(SystemTables::rooted_at(tmp.path()));
         assert!(watch.volumes().is_empty());
     }
 
@@ -384,6 +424,9 @@ mod tests {
     #[test]
     fn the_live_watch_polls_without_error() {
         let mut watch = VolumeWatch::new();
-        assert!(!watch.poll().needs_redraw(), "nothing changed in microseconds");
+        assert!(
+            !watch.poll().needs_redraw(),
+            "nothing changed in microseconds"
+        );
     }
 }

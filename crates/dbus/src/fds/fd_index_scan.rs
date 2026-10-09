@@ -188,9 +188,9 @@ mod tests {
 
     #[test]
     fn a_nested_index_past_the_attachment_is_caught() {
-        let scan = FdIndexScan::of(&[Value::Array(vec![Value::Variant(Box::new(
-            Value::UnixFd(9),
-        ))])]);
+        let scan = FdIndexScan::of(&[Value::Array(vec![Value::Variant(Box::new(Value::UnixFd(
+            9,
+        )))])]);
         assert!(!scan.fits(1));
     }
 }

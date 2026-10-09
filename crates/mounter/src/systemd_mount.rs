@@ -13,9 +13,9 @@
 
 use dbus::conn::DbusConn;
 use dbus::systemd1::{MountError, TransientMount, TransientUnmount};
+use std::path::Path;
 use volumes::mount_backend::{MountBackend, MountOutcome};
 use volumes::mount_request::MountRequest;
-use std::path::Path;
 
 /// Mounts through systemd's `StartTransientUnit`.
 pub struct SystemdMount {
@@ -97,10 +97,10 @@ impl MountBackend for SystemdMount {
 mod tests {
     use super::SystemdMount;
     use dbus::systemd1::MountError;
+    use std::path::Path;
     use volumes::mount_backend::MountOutcome;
     use volumes::mount_point::MountPoint;
     use volumes::mount_request::MountRequest;
-    use std::path::Path;
 
     fn request(fs: &str) -> MountRequest {
         let point = MountPoint::under(Path::new("/run/media/bob"), Some("KINGSTON"), "/dev/sdb1")
@@ -138,7 +138,10 @@ mod tests {
     #[test]
     fn a_mount_failure_keeps_its_detail() {
         let outcome = SystemdMount::outcome_of(&MountError::Failed(String::from("bad superblock")));
-        assert_eq!(outcome, MountOutcome::Failed(String::from("bad superblock")));
+        assert_eq!(
+            outcome,
+            MountOutcome::Failed(String::from("bad superblock"))
+        );
     }
 
     /// No error maps to success, or a failed mount would leave the browser

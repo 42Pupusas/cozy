@@ -127,8 +127,7 @@ impl SessionHandle {
     /// returned.
     #[must_use]
     pub fn is_owned_by(&self, sender: &str) -> bool {
-        CallerId::from_unique_name(sender)
-            .is_some_and(|caller| caller.as_segment() == self.owner)
+        CallerId::from_unique_name(sender).is_some_and(|caller| caller.as_segment() == self.owner)
     }
 
     /// End the session, reporting whether a `Closed` signal is owed.

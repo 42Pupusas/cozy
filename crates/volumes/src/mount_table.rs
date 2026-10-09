@@ -187,7 +187,10 @@ mod tests {
     #[test]
     fn the_live_table_is_readable_and_has_a_root() {
         let table = MountTable::read();
-        assert!(!table.is_empty(), "a running Linux system always has mounts");
+        assert!(
+            !table.is_empty(),
+            "a running Linux system always has mounts"
+        );
         assert!(table.at("/").is_some(), "there is always a root mount");
     }
 }

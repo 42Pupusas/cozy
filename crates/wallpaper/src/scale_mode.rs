@@ -91,13 +91,13 @@ impl ScaleMode {
         // uncovered pixels untouched, including when the pad is transparent
         // black and the caller supplied a previously used buffer.
         if target_width == 0 || target_height == 0 || image.width == 0 || image.height == 0 {
-            for px in out.chunks_exact_mut(4) {
+            for px in out.as_chunks_mut::<4>().0 {
                 px.copy_from_slice(&pad);
             }
             return;
         }
         if self.leaves_uncovered_pixels(image, target_width, target_height) {
-            for px in out.chunks_exact_mut(4) {
+            for px in out.as_chunks_mut::<4>().0 {
                 px.copy_from_slice(&pad);
             }
         }
@@ -237,8 +237,10 @@ impl ScaleMode {
                 .skip(first_y)
                 .take(last_y - first_y),
         ) {
-            let destination_pixels =
-                destination_row[first_column_byte..last_column_byte].chunks_exact_mut(4);
+            let destination_pixels = destination_row[first_column_byte..last_column_byte]
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut();
             for (source_column, destination_pixel) in source_x_bytes.iter().zip(destination_pixels)
             {
                 let source = source_row + source_column;
@@ -380,8 +382,18 @@ mod tests {
         let mut out = vec![0xaa; 4 * 4 * 4];
         ScaleMode::Fit.blit_into(&img, 4, 4, [17, 18, 19, 20], &mut out);
 
-        assert!(out.chunks_exact(4).all(|pixel| pixel != [0xaa; 4]));
-        assert!(out.chunks_exact(4).all(|pixel| pixel != [17, 18, 19, 20]));
+        assert!(
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel != [0xaa; 4])
+        );
+        assert!(
+            out.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel != [17, 18, 19, 20])
+        );
     }
 
     #[test]
@@ -429,7 +441,7 @@ mod tests {
         // appear anywhere in the output.
         let img = tiny_image();
         let out = ScaleMode::Fill.blit(&img, 8, 4, [9, 9, 9, 9]);
-        assert!(out.chunks_exact(4).all(|px| px != [9, 9, 9, 9]));
+        assert!(out.as_chunks::<4>().0.iter().all(|px| *px != [9, 9, 9, 9]));
     }
 
     #[test]

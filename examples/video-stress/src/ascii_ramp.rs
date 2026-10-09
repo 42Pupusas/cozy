@@ -147,8 +147,8 @@ mod tests {
         rows: u32,
         subcells: SubcellGrid,
     ) -> String {
-        let mut ramp = AsciiRamp::new(header.width, header.height, columns, rows, subcells)
-            .with_dither(false);
+        let mut ramp =
+            AsciiRamp::new(header.width, header.height, columns, rows, subcells).with_dither(false);
         let mut out = String::new();
         ramp.render_into(&MonoFrame::new(packed, header), &mut out);
         out
@@ -165,7 +165,10 @@ mod tests {
     fn a_full_frame_renders_only_full_blocks() {
         let header = PackHeader::new(4, 4, 1, 30).unwrap();
         let out = render(&[0xF0u8; 4], header, 4, 2, SubcellGrid::Half);
-        assert_eq!(out, "\u{2588}\u{2588}\u{2588}\u{2588}\n\u{2588}\u{2588}\u{2588}\u{2588}");
+        assert_eq!(
+            out,
+            "\u{2588}\u{2588}\u{2588}\u{2588}\n\u{2588}\u{2588}\u{2588}\u{2588}"
+        );
     }
 
     #[test]
@@ -178,7 +181,13 @@ mod tests {
     #[test]
     fn quadrants_double_the_horizontal_resolution() {
         let header = PackHeader::new(2, 2, 1, 30).unwrap();
-        let out = render(&[0b1000_0000, 0b0100_0000], header, 1, 1, SubcellGrid::Quadrant);
+        let out = render(
+            &[0b1000_0000, 0b0100_0000],
+            header,
+            1,
+            1,
+            SubcellGrid::Quadrant,
+        );
         assert_eq!(out, "\u{259A}");
     }
 
@@ -188,7 +197,10 @@ mod tests {
         let packed = [0b1100_0000, 0b0000_0000, 0b1100_0000];
         let out = render(&packed, header, 1, 1, SubcellGrid::Sextant);
         assert_eq!(out.chars().count(), 1);
-        assert_eq!(out.chars().next().unwrap(), SubcellGrid::Sextant.glyph(0b11_0011));
+        assert_eq!(
+            out.chars().next().unwrap(),
+            SubcellGrid::Sextant.glyph(0b11_0011)
+        );
     }
 
     #[test]

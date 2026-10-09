@@ -19,7 +19,7 @@ impl<'pack> MonoFrame<'pack> {
 
     /// The pixel at `(x, y)`, where `true` is a lit pixel.
     #[must_use]
-    pub fn pixel(&self, x: u32, y: u32) -> bool {
+    pub const fn pixel(&self, x: u32, y: u32) -> bool {
         if x >= self.header.width || y >= self.header.height {
             return false;
         }
@@ -71,7 +71,11 @@ impl<'pack> MonoFrame<'pack> {
         let mut scratch = vec![0u32; source_width];
         let mut last_source_row = usize::MAX;
         for (y, out_row) in out.chunks_exact_mut(width as usize).enumerate() {
-            let source_y = Self::sample(u32::try_from(y).unwrap_or(u32::MAX), height, self.header.height);
+            let source_y = Self::sample(
+                u32::try_from(y).unwrap_or(u32::MAX),
+                height,
+                self.header.height,
+            );
             if source_y != last_source_row {
                 let start = source_y * row_bytes;
                 table.expand_row(
@@ -82,8 +86,11 @@ impl<'pack> MonoFrame<'pack> {
                 last_source_row = source_y;
             }
             for (x, pixel) in out_row.iter_mut().enumerate() {
-                *pixel =
-                    scratch[Self::sample(u32::try_from(x).unwrap_or(u32::MAX), width, self.header.width)];
+                *pixel = scratch[Self::sample(
+                    u32::try_from(x).unwrap_or(u32::MAX),
+                    width,
+                    self.header.width,
+                )];
             }
         }
     }
@@ -100,7 +107,10 @@ mod tests {
     use super::{MonoFrame, PackHeader, UnpackTable};
 
     fn frame() -> ([u8; 2], PackHeader) {
-        ([0b1010_0000, 0b0101_0000], PackHeader::new(4, 2, 1, 30).unwrap())
+        (
+            [0b1010_0000, 0b0101_0000],
+            PackHeader::new(4, 2, 1, 30).unwrap(),
+        )
     }
 
     #[test]
@@ -129,7 +139,16 @@ mod tests {
         MonoFrame::new(&packed, header).expand_into(&table, &mut out);
         assert_eq!(
             out,
-            [0x00FF_FFFF, 0, 0x00FF_FFFF, 0, 0, 0x00FF_FFFF, 0, 0x00FF_FFFF]
+            [
+                0x00FF_FFFF,
+                0,
+                0x00FF_FFFF,
+                0,
+                0,
+                0x00FF_FFFF,
+                0,
+                0x00FF_FFFF
+            ]
         );
     }
 

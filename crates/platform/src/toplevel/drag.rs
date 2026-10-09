@@ -56,6 +56,8 @@ use crate::protocol::{
 use crate::toplevel::drag_offer::DragOffer;
 use crate::toplevel::drag_source::DragSource;
 use crate::wire::MessageBuilder;
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::{Consumer, Producer, RingBuffer};
 
 pub use crate::toplevel::drag_source::URI_LIST_MIME;
 
@@ -97,11 +99,13 @@ pub struct DragController {
     /// the decoded payload here once the peer finishes writing; the UI loop
     /// drains it in `tick`. Mirrors [`crate::clipboard::ClipboardState`]'s
     /// paste channel exactly, and for the same reason (see module docs).
-    drop_tx: std::sync::mpsc::Sender<Dropped>,
-    drop_rx: std::sync::mpsc::Receiver<Dropped>,
+    drop_tx: Producer<Dropped>,
+    drop_rx: Consumer<Dropped>,
 }
 
 impl DragController {
+    const DROP_SLOTS: usize = 4;
+
     /// Build drag-and-drop state from an already-bound `(manager, device)`
     /// pair (or `None` if the compositor never advertised a manager).
     ///
@@ -113,7 +117,7 @@ impl DragController {
     /// clipboard and so binds this device itself.
     #[must_use]
     pub fn new(data_device: Option<(DataDeviceManagerId, DataDeviceId)>) -> Self {
-        let (drop_tx, drop_rx) = std::sync::mpsc::channel();
+        let (drop_tx, drop_rx) = RingBuffer::new(Capacity::exact(Self::DROP_SLOTS)).split();
         Self {
             data_device,
             source: DragSource::new(),
@@ -154,6 +158,13 @@ impl DragController {
             Some((_, dev)) => Some(dev),
             None => None,
         }
+    }
+
+    /// The `(manager, device)` pair, for another selection owner on this
+    /// seat to publish through: the seat has one `wl_data_device`.
+    #[must_use]
+    pub const fn data_device(&self) -> Option<(DataDeviceManagerId, DataDeviceId)> {
+        self.data_device
     }
 
     /// Start dragging `paths` from `origin` (the surface the press happened
@@ -336,7 +347,7 @@ impl DragController {
             // on that completion; a silent thread would leave the compositor
             // waiting for a `finish` that never comes, and the source stuck
             // mid-drag.
-            let _ = tx.send(Dropped { paths, position });
+            let _ = tx.push_block(Dropped { paths, position });
             wake.signal();
         });
     }
@@ -370,10 +381,8 @@ impl DragController {
     /// stream -- but this drains in a loop like
     /// [`crate::clipboard::ClipboardState::drain_pastes`] for the same
     /// reason: a stale, unread completion must never silently accumulate.
-    pub fn drain_drops(&self, mut push: impl FnMut(Dropped)) {
-        while let Ok(dropped) = self.drop_rx.try_recv() {
-            push(dropped);
-        }
+    pub fn drain_drops(&mut self, push: impl FnMut(Dropped)) {
+        self.drop_rx.drain(push);
     }
 }
 
@@ -403,11 +412,7 @@ mod tests {
     /// events, then `enter`.
     fn hovering(drag: &mut DragController, window_tx: &WindowSender) {
         drag.on_new_offer(42);
-        drag.on_offer_event(
-            DataOfferEvent::Offer,
-            Some(URI_LIST_MIME.to_string()),
-            0,
-        );
+        drag.on_offer_event(DataOfferEvent::Offer, Some(URI_LIST_MIME.to_string()), 0);
         drag.on_enter(window_tx, 42, 7, (10, 20));
     }
 
@@ -555,7 +560,7 @@ mod tests {
 
     #[test]
     fn draining_drops_with_nothing_pending_yields_nothing() {
-        let drag = with_device();
+        let mut drag = with_device();
         let mut got = Vec::new();
         drag.drain_drops(|d| got.push(d));
         assert!(got.is_empty());
@@ -568,7 +573,7 @@ mod tests {
     fn a_real_write_on_the_pipe_is_decoded_and_delivered() {
         use std::io::Write as _;
 
-        let drag = with_device();
+        let mut drag = with_device();
 
         // `handle_drop` sends the write end as an ancillary fd on the
         // (unexecuted, in this test) `Receive` request; recover a peer-side
@@ -584,7 +589,7 @@ mod tests {
                 let body = String::from_utf8_lossy(&buf);
                 let paths = crate::file_uri::UriList::decode(&body);
                 if !paths.is_empty() {
-                    let _ = tx.send(Dropped {
+                    let _ = tx.push_block(Dropped {
                         paths,
                         position: (0, 0),
                     });
@@ -594,16 +599,13 @@ mod tests {
         peer_writer.write_all(b"file:///a.txt\r\n").expect("write");
         drop(peer_writer);
 
-        // Poll briefly for the helper thread to finish -- no compositor
-        // round-trip involved, so this settles in well under the timeout.
         let mut got = Vec::new();
-        for _ in 0..200 {
-            drag.drain_drops(|d| got.push(d));
-            if !got.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        got.push(
+            drag.drop_rx
+                .pop_block()
+                .expect("the helper delivers a drop"),
+        );
+        drag.drain_drops(|d| got.push(d));
         assert_eq!(
             got,
             vec![Dropped {

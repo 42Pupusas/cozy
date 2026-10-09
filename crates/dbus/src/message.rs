@@ -461,7 +461,12 @@ impl MessageBuilder {
             b's',
             target.interface(),
         );
-        Self::write_string_field(&mut header_fields, field_code::MEMBER, b's', target.member());
+        Self::write_string_field(
+            &mut header_fields,
+            field_code::MEMBER,
+            b's',
+            target.member(),
+        );
         if !signature.is_empty() {
             Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', signature);
         }
@@ -594,12 +599,7 @@ impl MessageBuilder {
             Self::write_string_field(&mut header_fields, field_code::SIGNATURE, b'g', signature);
         }
 
-        let mut out = vec![
-            b'l',
-            MessageType::MethodCall.as_byte(),
-            flags.as_byte(),
-            1,
-        ];
+        let mut out = vec![b'l', MessageType::MethodCall.as_byte(), flags.as_byte(), 1];
         out.extend_from_slice(&u32::try_from(body.len()).unwrap_or(u32::MAX).to_le_bytes());
         out.extend_from_slice(&serial.to_le_bytes());
         out.extend_from_slice(
@@ -894,7 +894,9 @@ impl Reply {
                     reply_serial = val.as_u64().map(|n| u32::try_from(n).unwrap_or(u32::MAX));
                 }
                 field_code::UNIX_FDS => {
-                    unix_fds = val.as_u64().map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+                    unix_fds = val
+                        .as_u64()
+                        .map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
                 }
                 _ => {}
             }

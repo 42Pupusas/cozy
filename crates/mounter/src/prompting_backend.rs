@@ -33,9 +33,9 @@ use dbus_server::serve::IncomingCall;
 use polkit_agent::agent_registration::AgentRegistration;
 use polkit_agent::auth_request::AuthRequest;
 use polkit_agent::helper_session::{AuthOutcome, HelperSession};
+use std::path::Path;
 use volumes::mount_backend::{MountBackend, MountOutcome};
 use volumes::mount_request::MountRequest;
-use std::path::Path;
 
 use crate::systemd_mount::SystemdMount;
 
@@ -265,7 +265,8 @@ mod tests {
     /// echoes shows the password on screen.
     #[test]
     fn the_prompt_receives_the_echo_flag_it_is_given() {
-        let mut prompt = ScriptedPrompt::new(vec![Some(String::from("x")), Some(String::from("y"))]);
+        let mut prompt =
+            ScriptedPrompt::new(vec![Some(String::from("x")), Some(String::from("y"))]);
         prompt.ask("Password: ", false);
         prompt.ask("Token: ", true);
         assert_eq!(prompt.echo_flags, [false, true]);
@@ -325,7 +326,10 @@ mod tests {
             MountOutcome::Cancelled
         );
         assert!(
-            backend.reinterpret(MountOutcome::Denied).message().is_none(),
+            backend
+                .reinterpret(MountOutcome::Denied)
+                .message()
+                .is_none(),
             "a dismissed prompt must not accuse the user of lacking permission"
         );
     }

@@ -5,9 +5,11 @@
 //! of the directory being left instead of finishing it for nobody.
 
 use crate::walk::DirWalk;
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::{Consumer, RingBuffer};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tallied {
@@ -15,20 +17,21 @@ pub struct Tallied {
     pub bytes: u64,
 }
 
-#[derive(Debug)]
 pub struct SizeTally {
-    results: mpsc::Receiver<Tallied>,
+    results: Consumer<Tallied>,
     cancel: Arc<AtomicBool>,
 }
 
 impl SizeTally {
+    const RESULT_SLOTS: usize = 64;
+
     /// Walk `dirs` in order, calling `notify` after each total is queued so
     /// the owner can wake whatever loop will call [`Self::drain`].
     pub fn start<N>(dirs: Vec<PathBuf>, notify: N) -> std::io::Result<Self>
     where
         N: Fn() + Send + 'static,
     {
-        let (sender, results) = mpsc::channel();
+        let (sender, results) = RingBuffer::new(Capacity::exact(Self::RESULT_SLOTS)).split();
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
         std::thread::Builder::new()
@@ -39,7 +42,7 @@ impl SizeTally {
                     let Some(bytes) = walk.total(&path) else {
                         return;
                     };
-                    if sender.send(Tallied { path, bytes }).is_err() {
+                    if sender.push_block(Tallied { path, bytes }).is_err() {
                         return;
                     }
                     notify();
@@ -50,8 +53,10 @@ impl SizeTally {
 
     /// Every total that has arrived since the last drain. Never blocks.
     #[must_use]
-    pub fn drain(&self) -> Vec<Tallied> {
-        self.results.try_iter().collect()
+    pub fn drain(&mut self) -> Vec<Tallied> {
+        let mut arrived = Vec::new();
+        self.results.drain(|tallied| arrived.push(tallied));
+        arrived
     }
 }
 
@@ -65,15 +70,19 @@ impl Drop for SizeTally {
 mod tests {
     use super::{SizeTally, Tallied};
     use crate::test_support::TempDir;
-    use std::sync::mpsc;
-    use std::time::Duration;
+    use quetzalcoatl::capacity::Capacity;
+    use quetzalcoatl::mpsc::{Consumer, Producer, RingBuffer};
 
-    fn collect(tally: &SizeTally, wakes: &mpsc::Receiver<()>, want: usize) -> Vec<Tallied> {
+    fn wake_ring() -> (Producer<()>, Consumer<()>) {
+        RingBuffer::new(Capacity::exact(64)).split()
+    }
+
+    fn collect(tally: &mut SizeTally, wakes: &mut Consumer<()>, want: usize) -> Vec<Tallied> {
         let mut got = Vec::new();
         while got.len() < want {
             wakes
-                .recv_timeout(Duration::from_secs(5))
-                .expect("the worker signals each total");
+                .pop_block()
+                .expect("the worker signals each total before it exits");
             got.extend(tally.drain());
         }
         got
@@ -87,12 +96,12 @@ mod tests {
         dir.create_file("a/x", &[0; 3]);
         dir.create_file("b/y/z", &[0; 40]);
 
-        let (wake, wakes) = mpsc::channel();
-        let tally = SizeTally::start(vec![a.clone(), b.clone()], move || {
-            let _ = wake.send(());
+        let (wake, mut wakes) = wake_ring();
+        let mut tally = SizeTally::start(vec![a.clone(), b.clone()], move || {
+            let _ = wake.push_block(());
         })
         .expect("spawn");
-        let got = collect(&tally, &wakes, 2);
+        let got = collect(&mut tally, &mut wakes, 2);
         assert_eq!(
             got,
             [
@@ -104,12 +113,16 @@ mod tests {
 
     #[test]
     fn an_empty_batch_finishes_without_signalling() {
-        let (wake, wakes) = mpsc::channel();
-        let tally = SizeTally::start(Vec::new(), move || {
-            let _ = wake.send(());
+        let (wake, mut wakes) = wake_ring();
+        let mut tally = SizeTally::start(Vec::new(), move || {
+            let _ = wake.push_block(());
         })
         .expect("spawn");
-        assert!(wakes.recv_timeout(Duration::from_secs(5)).is_err());
+        assert_eq!(
+            wakes.pop_block(),
+            None,
+            "the worker exits without signalling"
+        );
         assert!(tally.drain().is_empty());
     }
 
@@ -119,20 +132,16 @@ mod tests {
         for i in 0..200 {
             dir.create_file(&format!("d/{i}"), b"x");
         }
-        let (wake, wakes) = mpsc::channel();
+        let (wake, mut wakes) = wake_ring();
         let batch = 10_000;
         let tally = SizeTally::start(vec![dir.path().join("d"); batch], move || {
-            let _ = wake.send(());
+            let _ = wake.push_block(());
         })
         .expect("spawn");
         drop(tally);
         let mut walked = 0;
-        loop {
-            match wakes.recv_timeout(Duration::from_secs(30)) {
-                Ok(()) => walked += 1,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => panic!("worker never exited"),
-            }
+        while wakes.pop_block().is_some() {
+            walked += 1;
         }
         assert!(walked < batch, "the worker walked all {walked} directories");
     }

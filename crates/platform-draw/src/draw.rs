@@ -629,6 +629,35 @@ impl<'a> Canvas<'a> {
         );
     }
 
+    /// Composite `color` at `alpha/255` over everything already under the
+    /// rounded rectangle: the rounded counterpart of [`Self::blend_rect`].
+    ///
+    /// The anti-aliased corner pixels carry their coverage scaled by `alpha`,
+    /// so a translucent shape keeps a soft arc instead of a hard fringe.
+    pub fn blend_round_rect(&mut self, rect: Rect, color: Color, radius: i32, alpha: u8) {
+        let shape = RoundRect::new(rect, radius);
+        if shape.is_empty() || alpha == 0 {
+            return;
+        }
+        let scale = |coverage: u8| {
+            u8::try_from(u16::from(coverage) * u16::from(alpha) / 255).unwrap_or(u8::MAX)
+        };
+        for y in rect.y..rect.bottom() {
+            let Some(span) = shape.span_at(y) else {
+                continue;
+            };
+            if span.x1 > span.x0 {
+                self.blend_rect(Rect::new(span.x0, y, span.x1 - span.x0, 1), color, alpha);
+            }
+            if span.left_alpha > 0 {
+                self.blend_pixel(span.x0 - 1, y, color, scale(span.left_alpha));
+            }
+            if span.right_alpha > 0 {
+                self.blend_pixel(span.x1, y, color, scale(span.right_alpha));
+            }
+        }
+    }
+
     fn fill_round_rect_packed(
         &mut self,
         rect: Rect,
@@ -1008,6 +1037,41 @@ mod tests {
         let before = buf.clone();
         Canvas::new(&mut buf, 4, 4).blend_rect(Rect::new(0, 0, 4, 4), Color::BLACK, 0);
         assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn a_blended_round_rect_dims_what_is_under_it_and_rounds_its_corners() {
+        let mut buf = canvas_buf(20, 20);
+        let mut c = Canvas::new(&mut buf, 20, 20);
+        c.fill_rect(Rect::new(0, 0, 20, 20), Color::WHITE);
+        c.blend_round_rect(Rect::new(2, 2, 16, 16), Color::BLACK, 6, 128);
+        let white = Color::WHITE.to_xrgb8888();
+        let centre = buf[10 * 20 + 10];
+        assert_ne!(centre, white, "the middle is dimmed");
+        assert_ne!(centre, Color::BLACK.to_xrgb8888(), "but not replaced");
+        assert_eq!(buf[2 * 20 + 2], white, "the corner pixel is cut away");
+        assert_eq!(buf[10 * 20 + 1], white, "nothing outside the rect");
+    }
+
+    #[test]
+    fn a_blended_round_rect_at_zero_alpha_changes_nothing() {
+        let mut buf = canvas_buf(8, 8);
+        Canvas::new(&mut buf, 8, 8).fill_rect(Rect::new(0, 0, 8, 8), Color::WHITE);
+        let before = buf.clone();
+        Canvas::new(&mut buf, 8, 8).blend_round_rect(Rect::new(1, 1, 6, 6), Color::BLACK, 2, 0);
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn a_blended_round_rect_clips_to_the_canvas() {
+        let mut buf = canvas_buf(8, 8);
+        Canvas::new(&mut buf, 8, 8).blend_round_rect(
+            Rect::new(-20, -20, 100, 100),
+            Color::WHITE,
+            6,
+            255,
+        );
+        assert_eq!(buf[4 * 8 + 4], Color::WHITE.to_xrgb8888());
     }
 
     /// A scrim covers the whole window, so it is always clipped; a stray

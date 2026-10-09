@@ -85,10 +85,7 @@ impl AuthRequest {
         let Some(items) = unwrapped.as_items() else {
             return Vec::new();
         };
-        items
-            .iter()
-            .filter_map(Self::decode_identity)
-            .collect()
+        items.iter().filter_map(Self::decode_identity).collect()
     }
 
     /// Decode one `(s, a{sv})` identity struct.

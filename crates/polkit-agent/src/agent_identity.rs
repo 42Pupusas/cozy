@@ -133,7 +133,11 @@ mod tests {
             AgentIdentity::new(1000, "alice"),
         ];
         let chosen = AgentIdentity::choose(&offered, 1000).expect("a choice");
-        assert_eq!(chosen.name(), "alice", "must ask for the user's own password");
+        assert_eq!(
+            chosen.name(),
+            "alice",
+            "must ask for the user's own password"
+        );
     }
 
     /// The order polkit sends must not change the choice.

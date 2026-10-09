@@ -17,6 +17,7 @@ pub mod bar_window;
 pub mod battery;
 pub mod bluetooth;
 pub mod brightness;
+mod bus_socket_watch;
 pub mod click;
 pub mod clock;
 pub mod colors;

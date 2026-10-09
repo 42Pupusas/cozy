@@ -2,10 +2,12 @@
 //! volume/brightness adjustment, on its own thread away from the Wayland
 //! render/event loop -- see `main.rs`'s module doc for why.
 
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+use panel_ui::CommandInbox;
+use quetzalcoatl::mpsc::Producer;
 use statusbar::{ModuleKind, ScrollAccumulator, TrayItem, Volume};
+use waker::Poller;
 
 /// How often each module recomputes. Cheap `/proc`/`/sys` reads run often;
 /// modules that shell out to a CLI (`iw`, `pactl`, `bluetoothctl`) run less
@@ -33,9 +35,6 @@ const CONTROL_REFRESH_DEBOUNCE_MS: u64 = 150;
 /// Minimum spacing between actually spawning a `pactl`/sysfs-brightness
 /// *adjustment* while scrolling.
 const SCROLL_APPLY_DEBOUNCE_MS: u64 = 60;
-/// Idle poll granularity when nothing's due and no scroll is queued --
-/// matches the render thread's own idle cadence.
-const IDLE_POLL_MS: u64 = 100;
 /// Minimum spacing between spawning `cosmic-settings` for a click, so a
 /// double-click (or two clicks landing in the same channel-drain batch)
 /// only opens one window instead of two racing to grab focus.
@@ -82,6 +81,18 @@ impl Cadence {
     const fn mark(&mut self, now: Instant) {
         self.last = now;
     }
+
+    /// How long until this cadence is next due; zero once it already is.
+    fn remaining(&self, now: Instant) -> Duration {
+        self.period.saturating_sub(now.duration_since(self.last))
+    }
+}
+
+/// What the render thread asks of the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarCommand {
+    Scroll { kind: ModuleKind, raw_px: i32 },
+    Click { kind: ModuleKind, x0: i32, x1: i32 },
 }
 
 /// A fully-rendered set of module strings, sent to the render thread
@@ -236,6 +247,42 @@ impl State {
             vol_out_known: None,
             vol_in_known: None,
             brightness_known: None,
+        }
+    }
+
+    /// How long the worker may sleep before something is due: the soonest
+    /// module refresh, or the scroll debounce while whole detents wait to be
+    /// applied.
+    fn next_wake(&self, now: Instant) -> Duration {
+        let mut soonest = [&self.clock, &self.fast, &self.slow, &self.notifications]
+            .into_iter()
+            .map(|cadence| cadence.remaining(now))
+            .min()
+            .unwrap_or(CLOCK_PERIOD);
+        if self.has_unapplied_steps() {
+            soonest = soonest.min(self.scroll_apply.remaining(now));
+        }
+        soonest
+    }
+
+    /// Whether the pending scroll holds at least one whole detent that
+    /// `apply_pending_scroll` has not yet turned into a mutation.
+    fn has_unapplied_steps(&self) -> bool {
+        self.pending_scroll.is_some_and(|(_, acc)| {
+            let mut peek = acc;
+            peek.take_steps() != 0
+        })
+    }
+
+    /// Apply one command from the render thread; returns whether the
+    /// snapshot changed.
+    fn execute(&mut self, command: BarCommand, clicks: &config::BarClickConfig) -> bool {
+        match command {
+            BarCommand::Scroll { kind, raw_px } => self.queue_scroll(kind, raw_px),
+            BarCommand::Click { kind, x0, x1 } => {
+                self.handle_click(kind, x0, x1, clicks);
+                false
+            }
         }
     }
 
@@ -540,15 +587,19 @@ impl State {
         self.advance_known(kind, delta)
     }
 
-    /// Open the COSMIC settings page for `kind`, if it has one (see
-    /// `ModuleKind::settings_page` -- mirrors the user's own
-    /// `~/.config/waybar/config` `on-click` bindings), debounced so a
-    /// double-click doesn't race two `cosmic-settings` instances for
-    /// focus. Fire-and-forget, same posture as the volume/brightness
-    /// mutations: spawn and immediately let go, never block the worker
-    /// loop on it.
-    fn handle_click(&mut self, kind: ModuleKind) {
-        let Some(page) = kind.settings_page() else {
+    /// Open the clicked module's panel (or COSMIC settings page, see
+    /// `ModuleKind::settings_page`), debounced so a double-click doesn't
+    /// race two instances for focus. Fire-and-forget, same posture as
+    /// the volume/brightness mutations: spawn and immediately let go,
+    /// never block the worker loop on it.
+    fn handle_click(
+        &mut self,
+        kind: ModuleKind,
+        x0: i32,
+        x1: i32,
+        clicks: &config::BarClickConfig,
+    ) {
+        let Some(action) = statusbar::click::ClickAction::for_module(kind, clicks, x0, x1) else {
             return;
         };
         let now = Instant::now();
@@ -556,19 +607,17 @@ impl State {
             return;
         }
         self.click_spawn.mark(now);
-        // Prefer the user's own `cosmic-popup` wrapper (auto-closes the
-        // settings window on focus loss, exactly like waybar's binding
-        // does) when it's on PATH; fall back to bare `cosmic-settings`
-        // otherwise so this still works without that convenience script.
-        let spawned = std::process::Command::new("cosmic-popup")
-            .arg(page)
+        let spawned = std::process::Command::new(&action.program)
+            .args(&action.args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-        if spawned.is_err() {
-            let _ = std::process::Command::new("cosmic-settings")
-                .arg(page)
+        if spawned.is_err()
+            && let Some((program, args)) = action.fallback
+        {
+            let _ = std::process::Command::new(program)
+                .args(args)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -589,80 +638,161 @@ impl Worker {
     /// to keep that function under clippy's line-count lint; no behavior
     /// of its own beyond the `Builder::spawn` call itself.
     pub fn spawn_thread(
-        snapshot_tx: mpsc::Sender<Snapshot>,
-        scroll_rx: mpsc::Receiver<(ModuleKind, i32)>,
-        click_rx: mpsc::Receiver<ModuleKind>,
+        snapshot_tx: Producer<Snapshot>,
+        inbox: CommandInbox<BarCommand>,
         wake: waker::Waker,
         notification_rules: Vec<config::NotificationRule>,
+        click_config: config::BarClickConfig,
     ) {
         std::thread::Builder::new()
             .name("statusbar-worker".into())
             .spawn(move || {
                 Self::run(
                     &snapshot_tx,
-                    &scroll_rx,
-                    &click_rx,
+                    inbox,
                     &wake,
                     notification_rules,
+                    &click_config,
                 );
             })
             .expect("spawn statusbar worker thread");
     }
 
-    /// Run forever: refresh modules on their timers, drain queued scroll
-    /// deltas and apply/read-back volume-brightness adjustments, sending a
-    /// fresh [`Snapshot`] to `snapshot_tx` (and signalling `wake`) whenever
+    /// Run until the render thread goes away: refresh modules when their
+    /// periods fall due, apply queued scroll and click commands, and send a
+    /// fresh [`Snapshot`] to `snapshot_tx` (and signal `wake`) whenever
     /// anything changes. All the blocking work (process spawns, `/proc`
-    /// reads, the deliberate ~120ms `cpu_usage` sample window) lives
-    /// entirely on this thread -- see `main.rs`'s module doc.
+    /// reads) lives entirely on this thread -- see `main.rs`'s module doc.
+    ///
+    /// Between passes the thread sleeps in `poll(2)` on the command inbox,
+    /// for exactly as long as the soonest module period or scroll debounce
+    /// has left. A command wakes it at once; nothing else does.
     fn run(
-        snapshot_tx: &Sender<Snapshot>,
-        scroll_rx: &Receiver<(ModuleKind, i32)>,
-        click_rx: &Receiver<ModuleKind>,
+        snapshot_tx: &Producer<Snapshot>,
+        mut inbox: CommandInbox<BarCommand>,
         wake: &waker::Waker,
         notification_rules: Vec<config::NotificationRule>,
+        click_config: &config::BarClickConfig,
     ) {
         let mut state = State::new(notification_rules);
         loop {
             let mut changed = state.refresh();
-
-            while let Ok(kind) = click_rx.try_recv() {
-                state.handle_click(kind);
-            }
-
-            // Block on the scroll channel itself (not a plain sleep) so a
-            // wheel event is picked up the instant it arrives instead of
-            // waiting out an idle poll interval -- `recv_timeout` still
-            // returns on its own after `wait_ms` so module timers keep firing
-            // when nothing's scrolling. Drain every already-queued delta once
-            // one arrives (each one repaints the optimistic percentage as it
-            // goes -- see `queue_scroll`), same coalescing behavior as before
-            // for the real mutation.
-            let wait = if state.pending_scroll.is_some() {
-                Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS)
-            } else {
-                Duration::from_millis(IDLE_POLL_MS)
-            };
-            match scroll_rx.recv_timeout(wait) {
-                Ok((kind, raw_px)) => {
-                    changed |= state.queue_scroll(kind, raw_px);
-                    loop {
-                        match scroll_rx.try_recv() {
-                            Ok((kind, raw_px)) => changed |= state.queue_scroll(kind, raw_px),
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => return,
-                        }
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            let batch = inbox.take();
+            for command in batch.commands {
+                changed |= state.execute(command, click_config);
             }
             changed |= state.apply_pending_scroll();
 
             if changed {
-                let _ = snapshot_tx.send(state.snap.clone());
+                if snapshot_tx.push_block(state.snap.clone()).is_err() {
+                    return;
+                }
                 wake.signal();
             }
+            if batch.closed {
+                return;
+            }
+            let due_in = state.next_wake(Instant::now());
+            let _ = Poller::one(inbox.raw_fd()).poll(Self::poll_timeout_ms(due_in));
         }
+    }
+
+    /// `due_in` as a `poll(2)` timeout, rounded up so the thread never wakes
+    /// a hair before the deadline and spins through a zero-length wait.
+    fn poll_timeout_ms(due_in: Duration) -> i32 {
+        let millis = due_in.as_nanos().div_ceil(1_000_000);
+        i32::try_from(millis).unwrap_or(i32::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CLOCK_PERIOD, Cadence, SCROLL_APPLY_DEBOUNCE_MS, State, Worker};
+    use statusbar::{ModuleKind, scroll::PX_PER_STEP};
+    use std::time::{Duration, Instant};
+
+    fn settled_state(now: Instant) -> State {
+        let mut state = State::new(Vec::new());
+        state.clock.mark(now);
+        state.fast.mark(now);
+        state.slow.mark(now);
+        state.notifications.mark(now);
+        state.scroll_apply.mark(now);
+        state
+    }
+
+    #[test]
+    fn a_fresh_cadence_is_due_with_nothing_left_to_wait() {
+        let now = Instant::now();
+
+        assert_eq!(
+            Cadence::due_now(CLOCK_PERIOD, now).remaining(now),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn a_marked_cadence_waits_out_its_period() {
+        let now = Instant::now();
+        let mut cadence = Cadence::due_now(Duration::from_secs(5), now);
+        cadence.mark(now);
+
+        assert_eq!(cadence.remaining(now), Duration::from_secs(5));
+        assert_eq!(
+            cadence.remaining(now + Duration::from_secs(2)),
+            Duration::from_secs(3)
+        );
+        assert_eq!(
+            cadence.remaining(now + Duration::from_secs(9)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn an_idle_worker_sleeps_until_the_clock_next_changes() {
+        let now = Instant::now();
+        let state = settled_state(now);
+
+        assert_eq!(state.next_wake(now), CLOCK_PERIOD);
+    }
+
+    #[test]
+    fn the_soonest_module_period_sets_the_sleep() {
+        let now = Instant::now();
+        let state = settled_state(now);
+
+        assert_eq!(
+            state.next_wake(now + Duration::from_millis(400)),
+            Duration::from_millis(600)
+        );
+    }
+
+    #[test]
+    fn a_sub_detent_scroll_adds_no_deadline() {
+        let now = Instant::now();
+        let mut state = settled_state(now);
+        state.queue_scroll(ModuleKind::VolOut, PX_PER_STEP - 1);
+
+        assert_eq!(state.next_wake(now), CLOCK_PERIOD);
+    }
+
+    #[test]
+    fn a_whole_detent_wakes_the_worker_at_the_scroll_debounce() {
+        let now = Instant::now();
+        let mut state = settled_state(now);
+        state.queue_scroll(ModuleKind::VolOut, PX_PER_STEP);
+
+        assert_eq!(
+            state.next_wake(now),
+            Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS)
+        );
+    }
+
+    #[test]
+    fn poll_timeouts_round_up_to_a_whole_millisecond() {
+        assert_eq!(Worker::poll_timeout_ms(Duration::ZERO), 0);
+        assert_eq!(Worker::poll_timeout_ms(Duration::from_micros(1)), 1);
+        assert_eq!(Worker::poll_timeout_ms(Duration::from_millis(60)), 60);
+        assert_eq!(Worker::poll_timeout_ms(Duration::from_micros(59_001)), 60);
     }
 }

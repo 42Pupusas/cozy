@@ -65,13 +65,7 @@ impl<'a> Updater<'a> {
     }
 
     /// Bring one directory into line with the rules.
-    fn reconcile(
-        &self,
-        dirs: &mut UserDirs,
-        dir: UserDir,
-        dry: bool,
-        outcome: &mut UpdateOutcome,
-    ) {
+    fn reconcile(&self, dirs: &mut UserDirs, dir: UserDir, dry: bool, outcome: &mut UpdateOutcome) {
         let path = dirs.path(dir).to_path_buf();
         if path.is_dir() {
             return;
@@ -186,7 +180,10 @@ mod tests {
         let outcome = Updater::new(&paths, &forced).run().expect("run");
         assert!(outcome.reset.is_empty(), "nothing should be reset");
         assert!(paths.home().join("Music").is_dir());
-        assert_eq!(scratch.dirs().path(UserDir::Music), paths.home().join("Music"));
+        assert_eq!(
+            scratch.dirs().path(UserDir::Music),
+            paths.home().join("Music")
+        );
     }
 
     /// An existing directory is left exactly where it is.
@@ -197,7 +194,10 @@ mod tests {
         std::fs::create_dir_all(paths.home().join("Music")).expect("create");
         let outcome = Updater::new(&paths, &options()).run().expect("run");
         assert!(!outcome.reset.contains(&UserDir::Music));
-        assert_eq!(scratch.dirs().path(UserDir::Music), paths.home().join("Music"));
+        assert_eq!(
+            scratch.dirs().path(UserDir::Music),
+            paths.home().join("Music")
+        );
     }
 
     #[test]

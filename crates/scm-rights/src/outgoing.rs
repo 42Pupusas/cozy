@@ -61,17 +61,18 @@ impl OutgoingMessage {
     /// buffer. The returned header borrows `self`; keep `self` alive until the
     /// send completes.
     pub fn header(&mut self) -> MsgHdr {
-        let mut hdr = MsgHdr::default();
-        hdr.msg_iov = &raw mut self.iov;
-        hdr.msg_iovlen = 1;
-        if self.control.is_empty() {
-            hdr.msg_control = std::ptr::null_mut();
-            hdr.msg_controllen = 0;
+        let (msg_control, msg_controllen) = if self.control.is_empty() {
+            (std::ptr::null_mut(), 0)
         } else {
-            hdr.msg_control = self.control.as_mut_ptr();
-            hdr.msg_controllen = self.control.len();
+            (self.control.as_mut_ptr(), self.control.len())
+        };
+        MsgHdr {
+            msg_iov: &raw mut self.iov,
+            msg_iovlen: 1,
+            msg_control,
+            msg_controllen,
+            ..MsgHdr::default()
         }
-        hdr
     }
 
     /// The assembled control region, for a caller that must inspect or

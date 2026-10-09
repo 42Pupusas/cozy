@@ -219,7 +219,7 @@ impl AttachedDevice {
 mod tests {
     use super::AttachedDevice;
     use crate::block_device::BlockDevice;
-    use crate::test_support::{fixtures, TempDir};
+    use crate::test_support::{TempDir, fixtures};
     use crate::udev_properties::UdevProperties;
     use std::path::Path;
 
@@ -343,7 +343,9 @@ mod tests {
         let device = stick(&tmp, 1_024);
         let props = UdevProperties::parse(fixtures::UDEV_VFAT_PARTITION);
         let attached = AttachedDevice::describe(&device, &props).expect("mountable");
-        let request = attached.mount_request("ada", 1000, 1000).expect("a request");
+        let request = attached
+            .mount_request("ada", 1000, 1000)
+            .expect("a request");
         assert_eq!(request.device(), "/dev/sdb1");
         assert_eq!(request.fs_type(), "vfat");
         assert_eq!(
@@ -363,7 +365,9 @@ mod tests {
             "E:ID_FS_TYPE=vfat\nE:ID_FS_USAGE=filesystem\nE:ID_FS_LABEL=..\\x2f..\\x2fetc\n",
         );
         let attached = AttachedDevice::describe(&device, &props).expect("mountable");
-        let request = attached.mount_request("ada", 1000, 1000).expect("a request");
+        let request = attached
+            .mount_request("ada", 1000, 1000)
+            .expect("a request");
         let path = request.mount_point().path();
         assert_eq!(
             path.parent(),

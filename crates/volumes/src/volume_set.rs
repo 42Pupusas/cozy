@@ -66,7 +66,11 @@ impl VolumeSet {
             .map(build)
             .filter(Volume::is_listable)
             .collect();
-        volumes.sort_by(|a, b| a.label().cmp(b.label()).then(a.mount_point().cmp(b.mount_point())));
+        volumes.sort_by(|a, b| {
+            a.label()
+                .cmp(b.label())
+                .then(a.mount_point().cmp(b.mount_point()))
+        });
         volumes.dedup_by(|a, b| a.mount_point() == b.mount_point());
         Self { volumes }
     }
@@ -131,7 +135,7 @@ impl VolumeSet {
 mod tests {
     use super::VolumeSet;
     use crate::mount_table::MountTable;
-    use crate::test_support::{fixtures, TempDir};
+    use crate::test_support::{TempDir, fixtures};
     use std::path::Path;
 
     const USB_BUS: &str = "pci0000:00/0000:00:14.0/usb2/2-1/2-1:1.0/host6/target6:0:0/6:0:0:0";
@@ -235,7 +239,11 @@ mod tests {
         let before = set_of(fixtures::DESKTOP, &tmp);
         let after = set_of(fixtures::DESKTOP_WITHOUT_USB, &tmp);
         assert!(after.differs_from(&before));
-        assert_eq!(after.len(), before.len() - 2, "the usb stick and the disc go");
+        assert_eq!(
+            after.len(),
+            before.len() - 2,
+            "the usb stick and the disc go"
+        );
     }
 
     /// A rescan finding the same hardware must NOT report a change, or the

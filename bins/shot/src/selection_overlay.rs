@@ -188,13 +188,21 @@ impl SelectionOverlay {
                 }
                 SelectionOutcome::Pending => {}
             }
-            // Park until the reader signals rather than spinning; the picker
-            // is idle whenever the user isn't moving the mouse. The bounded
-            // timeout is also what lets the deadman switches above run even
-            // when no event ever arrives.
-            let _ = wake.wait(100);
+            let _ = wake.wait(self.deadman_wait_ms());
             wake.drain();
         }
+    }
+
+    /// Milliseconds until the nearest deadman switch can trip, so the loop
+    /// sleeps exactly that long when no event arrives.
+    fn deadman_wait_ms(&self) -> i32 {
+        let mut remaining = IDLE_DEADLINE.saturating_sub(self.last_input.elapsed());
+        if self.size.is_none() {
+            remaining = remaining.min(CONFIGURE_DEADLINE.saturating_sub(self.created.elapsed()));
+        }
+        i32::try_from(remaining.as_millis())
+            .unwrap_or(i32::MAX)
+            .max(1)
     }
 
     /// Whether a deadman switch has tripped, and why.

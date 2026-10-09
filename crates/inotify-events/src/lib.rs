@@ -60,7 +60,9 @@ impl InotifyEvents {
             // EAGAIN (queue empty) or a transient error either way -- both
             // end the drain, not a caller-visible failure. The kernel never
             // splits an event across reads, so parsing per read is safe.
-            let Ok(n) = ququmatz::syscall::read(ino.fd(), buf.as_mut_ptr(), buf.len()) else {
+            // SAFETY: `buf` is a live local array and `len` is its length.
+            let read = unsafe { ququmatz::syscall::read(ino.fd(), buf.as_mut_ptr(), buf.len()) };
+            let Ok(n) = read else {
                 return;
             };
             if n == 0 {
@@ -216,7 +218,7 @@ mod tests {
         });
         assert_eq!(events.len(), 1, "one CREATE with a name");
         assert_eq!(events[0].0, wd, "the wd the watch was registered under");
-        assert_eq!(events[0].2.as_deref(), Some("target.txt".as_bytes()));
+        assert_eq!(events[0].2.as_deref(), Some(&b"target.txt"[..]));
 
         // Deleting the watched directory itself reports the nameless
         // DELETE_SELF rather than dropping the event on the floor. The

@@ -156,7 +156,11 @@ mod tests {
     fn a_prompt_does_not_end_the_conversation() {
         let line = HelperLine::parse("PAM_PROMPT_ECHO_OFF Password: ").expect("known");
         assert!(!line.is_final());
-        assert!(!HelperLine::parse("PAM_TEXT_INFO hello").expect("known").is_final());
+        assert!(
+            !HelperLine::parse("PAM_TEXT_INFO hello")
+                .expect("known")
+                .is_final()
+        );
     }
 
     /// Errors and notices carry their text for display.

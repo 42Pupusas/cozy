@@ -140,8 +140,8 @@ mod tests {
     /// volumes attached.
     #[test]
     fn the_error_message_names_the_path() {
-        let error = VolumeFlush::flush(Path::new("/nonexistent-volume-for-tests"))
-            .expect_err("must fail");
+        let error =
+            VolumeFlush::flush(Path::new("/nonexistent-volume-for-tests")).expect_err("must fail");
         assert!(
             error.to_string().contains("/nonexistent-volume-for-tests"),
             "got: {error}"

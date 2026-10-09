@@ -33,3 +33,5 @@ localtime = { path = "../../crates/localtime" }
 # anticipated: capture produces RGBA8 scanlines, which is precisely what
 # `Encoder::encode` takes.
 ixiptla-core.workspace = true
+# Decoding and encoding the compositor's window-management IPC.
+json-bourne = { workspace = true }

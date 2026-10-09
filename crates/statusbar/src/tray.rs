@@ -5,11 +5,10 @@
 //! is the channel Mattermost uses for its native logo and its
 //! `NeedsAttention` state, independently of a Wayland window's urgency bit.
 
-use std::sync::mpsc::Sender;
-use std::time::Duration;
-
 use dbus::{DbusConn, NameOwnerChanged, Value};
+use quetzalcoatl::mpsc::Producer;
 
+use crate::bus_socket_watch::BusSocketWatch;
 use crate::{TrayIcon, TrayPixmap};
 
 const WATCHER_NAME: &str = "org.kde.StatusNotifierWatcher";
@@ -105,9 +104,17 @@ impl PendingTrayItem {
 /// one bus disconnect) permanently killed the thread, released the watcher
 /// name, and left the bar painting its last tray snapshot forever: the
 /// "first state loads, never updates again" freeze.
+///
+/// The two reconnect cases differ in how the next attempt is triggered. A
+/// session whose connection died while serving lost a bus that was
+/// working, so reconnecting at once is sound. A session that never got to
+/// serving (no bus, or a setup call failed) would fail again immediately if
+/// retried at once, so its next attempt waits for the bus to create its
+/// socket file.
 enum ServeEnd {
     NameTaken,
-    BusLost,
+    ConnectionDied,
+    CouldNotStart,
 }
 
 /// Owns the long-lived `StatusNotifier` watcher loop on a dedicated thread.
@@ -121,7 +128,7 @@ impl TrayWatcher {
     /// Start the watcher. Failure is non-fatal: another bar may already own
     /// the standard watcher name, in which case that bar remains responsible
     /// for all tray items and ours simply has an empty tray.
-    pub fn spawn(snapshot_tx: Sender<TraySnapshot>, wake: waker::Waker) {
+    pub fn spawn(snapshot_tx: Producer<TraySnapshot>, wake: waker::Waker) {
         let _ = std::thread::Builder::new()
             .name("statusbar-tray".to_owned())
             .spawn(move || Self::run(&snapshot_tx, &wake));
@@ -130,22 +137,43 @@ impl TrayWatcher {
     /// Supervise watcher sessions for the thread's whole life. Each session
     /// owns one bus connection; when that connection fails, the stale tray
     /// is cleared from the bar (truth over a frozen icon), then a fresh
-    /// session reconnects and re-claims the name after a short delay.
-    fn run(snapshot_tx: &Sender<TraySnapshot>, wake: &waker::Waker) {
-        const RETRY_DELAY: Duration = Duration::from_secs(2);
+    /// session reconnects and re-claims the name.
+    ///
+    /// The socket watch is armed once, before the first connection attempt,
+    /// and its backlog is dropped before each attempt. A socket created
+    /// during an attempt that then fails is therefore still queued when the
+    /// wait begins, so no creation is missed.
+    fn run(snapshot_tx: &Producer<TraySnapshot>, wake: &waker::Waker) {
+        let socket_watch = BusSocketWatch::arm()
+            .map_err(|e| eprintln!("statusbar: cannot watch for the session bus socket: {e}"))
+            .ok();
         loop {
-            match Self::serve(snapshot_tx, wake) {
+            if let Some(watch) = &socket_watch {
+                watch.discard_pending();
+            }
+            let ended = Self::serve(snapshot_tx, wake);
+            if matches!(ended, ServeEnd::NameTaken) {
+                return;
+            }
+            if snapshot_tx.push_block(TraySnapshot::default()).is_err() {
+                return;
+            }
+            wake.signal();
+            match ended {
                 ServeEnd::NameTaken => return,
-                ServeEnd::BusLost => {
-                    let _ = snapshot_tx.send(TraySnapshot::default());
-                    wake.signal();
-                    std::thread::sleep(RETRY_DELAY);
+                ServeEnd::ConnectionDied => {}
+                ServeEnd::CouldNotStart => {
+                    let Some(watch) = &socket_watch else {
+                        eprintln!("statusbar: tray stopped; no way to learn when the bus returns");
+                        return;
+                    };
+                    watch.wait_for_socket();
                 }
             }
         }
     }
 
-    fn serve(snapshot_tx: &Sender<TraySnapshot>, wake: &waker::Waker) -> ServeEnd {
+    fn serve(snapshot_tx: &Producer<TraySnapshot>, wake: &waker::Waker) -> ServeEnd {
         // Report *why* the bus was unreachable. This used to print a bare
         // "no session D-Bus" line, which gave no hint that the usual cause
         // is a missing DBUS_SESSION_BUS_ADDRESS in the compositor's
@@ -153,8 +181,8 @@ impl TrayWatcher {
         let mut conn = match DbusConn::session() {
             Ok(conn) => conn,
             Err(e) => {
-                eprintln!("statusbar: session D-Bus unavailable ({e}); retrying tray");
-                return ServeEnd::BusLost;
+                eprintln!("statusbar: session D-Bus unavailable ({e}); tray waits for the bus");
+                return ServeEnd::CouldNotStart;
             }
         };
         match conn.request_name(WATCHER_NAME) {
@@ -165,7 +193,7 @@ impl TrayWatcher {
             }
             Err(e) => {
                 eprintln!("statusbar: could not claim system tray watcher: {e}");
-                return ServeEnd::BusLost;
+                return ServeEnd::CouldNotStart;
             }
         }
         // Claiming the watcher name is only half of the StatusNotifier
@@ -176,11 +204,11 @@ impl TrayWatcher {
         // state transition, so already-running clients stayed unregistered.
         if let Err(e) = conn.send_signal(WATCHER_PATH, WATCHER_NAME, HOST_REGISTERED, &[]) {
             eprintln!("statusbar: could not announce tray host registration: {e}");
-            return ServeEnd::BusLost;
+            return ServeEnd::CouldNotStart;
         }
         if let Err(e) = conn.add_match("type='signal',interface='org.kde.StatusNotifierItem'") {
             eprintln!("statusbar: could not subscribe to tray item updates: {e}");
-            return ServeEnd::BusLost;
+            return ServeEnd::CouldNotStart;
         }
         // The StatusNotifierItem specification names `NewIcon`/`NewStatus`
         // signals, but Electron clients in practice also use the generic
@@ -192,7 +220,7 @@ impl TrayWatcher {
         if let Err(e) = conn.add_match("type='signal',interface='org.freedesktop.DBus.Properties'")
         {
             eprintln!("statusbar: could not subscribe to tray property updates: {e}");
-            return ServeEnd::BusLost;
+            return ServeEnd::CouldNotStart;
         }
         // Clients like Mattermost/Electron sometimes reconnect to the bus
         // (a fresh unique name) and re-register rather than reusing their
@@ -204,7 +232,7 @@ impl TrayWatcher {
             .add_match("type='signal',interface='org.freedesktop.DBus',member='NameOwnerChanged'")
         {
             eprintln!("statusbar: could not subscribe to tray owner changes: {e}");
-            return ServeEnd::BusLost;
+            return ServeEnd::CouldNotStart;
         }
 
         let mut items = Vec::new();
@@ -214,7 +242,7 @@ impl TrayWatcher {
                 Ok(message) => message,
                 Err(e) => {
                     eprintln!("statusbar: system tray D-Bus receive failed: {e:?}");
-                    return ServeEnd::BusLost;
+                    return ServeEnd::ConnectionDied;
                 }
             };
             let changed = if Self::is_watcher_property_get(&message) {
@@ -231,7 +259,7 @@ impl TrayWatcher {
                 Self::refresh_changed_item(&mut conn, &message, &mut items, &mut pending)
             };
             if changed {
-                let _ = snapshot_tx.send(TraySnapshot {
+                let _ = snapshot_tx.push_block(TraySnapshot {
                     items: items.clone(),
                 });
                 wake.signal();
@@ -526,8 +554,10 @@ impl TrayWatcher {
                     })
                     .collect::<Option<_>>()?;
                 let argb = bytes
-                    .chunks_exact(4)
-                    .map(|pixel| u32::from_be_bytes(pixel.try_into().unwrap_or([0; 4])))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|pixel| u32::from_be_bytes(*pixel))
                     .collect();
                 TrayPixmap::new(width, height, argb)
             })

@@ -4,9 +4,10 @@
 //!
 //! Run: `cargo run -p statusbar --example tray_watch`
 
-use std::sync::mpsc;
 use std::time::Instant;
 
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::RingBuffer;
 use statusbar::{TraySnapshot, TrayWatcher};
 
 struct TrayWatch;
@@ -14,12 +15,15 @@ struct TrayWatch;
 impl TrayWatch {
     fn run() {
         let started = Instant::now();
-        let (tx, rx) = mpsc::channel::<TraySnapshot>();
+        let (tx, mut rx) = RingBuffer::<TraySnapshot>::new(Capacity::exact(16)).split();
         let wake = waker::Waker::new().expect("waker");
         TrayWatcher::spawn(tx, wake);
-        println!("[{:7.3}s] real TrayWatcher spawned", started.elapsed().as_secs_f64());
+        println!(
+            "[{:7.3}s] real TrayWatcher spawned",
+            started.elapsed().as_secs_f64()
+        );
         loop {
-            let Ok(snapshot) = rx.recv() else {
+            let Some(snapshot) = rx.pop_block() else {
                 println!("watcher channel closed");
                 return;
             };

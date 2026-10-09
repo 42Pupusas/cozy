@@ -2,14 +2,15 @@
 //! live shell on the actual kernel.
 //!
 //! Each test spawns the loop on a dedicated thread (as production does),
-//! feeds it input through closures + an eventfd wake, and asserts on the
-//! output bytes / exit codes it produces.
+//! feeds it input through a ring + eventfd wake, and asserts on the output
+//! bytes / exit codes it produces.
 
 use pty::{Pty, PtyInput, WinSize};
-use std::collections::VecDeque;
-use std::sync::atomic::AtomicBool;
-use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::{Consumer, Producer, RingBuffer};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const WIN: WinSize = WinSize {
@@ -19,109 +20,128 @@ const WIN: WinSize = WinSize {
     ypixel: 0,
 };
 
-/// Test harness: an eventfd-backed input queue + collected output.
 struct Harness {
     wake: waker::Waker,
-    inputs: Arc<Mutex<VecDeque<PtyInput>>>,
-    output: Arc<Mutex<Vec<u8>>>,
-    exit_rx: std_mpsc::Receiver<Result<i32, String>>,
+    inputs: Producer<PtyInput>,
+    output: Consumer<Vec<u8>>,
+    rejections: Consumer<()>,
+    seen: Vec<u8>,
+    gate: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    run: JoinHandle<Result<i32, String>>,
 }
 
 impl Harness {
+    const INPUT_SLOTS: usize = 16;
+    const OUTPUT_SLOTS: usize = 4096;
+    const REJECTION_SLOTS: usize = 2;
+
     fn spawn(shell: &str, args: &[&str]) -> Self {
+        Self::start(shell, args, true)
+    }
+
+    fn spawn_gated(shell: &str, args: &[&str]) -> Self {
+        Self::start(shell, args, false)
+    }
+
+    fn start(shell: &str, args: &[&str], accepting: bool) -> Self {
         let wake = waker::Waker::new().expect("eventfd");
         let shutdown = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new(AtomicBool::new(accepting));
         let pty =
             Pty::spawn(shell, args, WIN, wake.raw_fd(), Arc::clone(&shutdown)).expect("Pty::spawn");
 
-        let inputs: Arc<Mutex<VecDeque<PtyInput>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-        let (exit_tx, exit_rx) = std_mpsc::channel();
+        let (inputs, mut inputs_rx) =
+            RingBuffer::<PtyInput>::new(Capacity::exact(Self::INPUT_SLOTS)).split();
+        let (output_tx, output) =
+            RingBuffer::<Vec<u8>>::new(Capacity::exact(Self::OUTPUT_SLOTS)).split();
+        let (rejections_tx, rejections) =
+            RingBuffer::<()>::new(Capacity::exact(Self::REJECTION_SLOTS)).split();
 
-        let inputs_loop = Arc::clone(&inputs);
-        let output_loop = Arc::clone(&output);
-        std::thread::spawn(move || {
-            let next_input = move || inputs_loop.lock().unwrap().pop_front();
+        let gate_loop = Arc::clone(&gate);
+        let run = std::thread::spawn(move || {
+            let next_input = move || inputs_rx.pop();
             let on_output = move |bytes: &[u8]| {
-                output_loop.lock().unwrap().extend_from_slice(bytes);
-                true
+                if !gate_loop.load(Ordering::Acquire) {
+                    let _ = rejections_tx.push(());
+                    return false;
+                }
+                output_tx.push(bytes.to_vec()).is_ok()
             };
-            let _ = exit_tx.send(pty.run(next_input, on_output).map_err(|e| e.to_string()));
+            pty.run(next_input, on_output).map_err(|e| e.to_string())
         });
 
         Self {
             wake,
             inputs,
             output,
-            exit_rx,
+            rejections,
+            seen: Vec::new(),
+            gate,
             shutdown,
+            run,
         }
     }
 
-    /// Queue an input message and rouse the loop.
     fn send(&self, msg: PtyInput) {
-        self.inputs.lock().unwrap().push_back(msg);
+        assert!(self.inputs.push(msg).is_ok(), "input ring full");
         self.wake.signal();
     }
 
-    /// Wait until the collected output satisfies `pred`, or panic.
-    fn wait_output(&self, deadline: Duration, pred: impl Fn(&[u8]) -> bool) -> Vec<u8> {
-        let start = Instant::now();
+    fn open_gate(&self) {
+        self.gate.store(true, Ordering::Release);
+        self.wake.signal();
+    }
+
+    /// Block until the collected output satisfies `pred`. Panics if the
+    /// event loop ends first, since no further output can arrive.
+    fn wait_output(&mut self, pred: impl Fn(&[u8]) -> bool) -> Vec<u8> {
         loop {
-            {
-                let out = self.output.lock().unwrap();
-                if pred(&out) {
-                    return out.clone();
-                }
+            if pred(&self.seen) {
+                return self.seen.clone();
             }
-            assert!(
-                start.elapsed() < deadline,
-                "timed out waiting for output; got: {:?}",
-                String::from_utf8_lossy(&self.output.lock().unwrap())
-            );
-            std::thread::sleep(Duration::from_millis(5));
+            let was_full = self.output.is_full();
+            let Some(chunk) = self.output.pop_block() else {
+                panic!(
+                    "event loop ended before the output matched; got: {:?}",
+                    String::from_utf8_lossy(&self.seen)
+                );
+            };
+            self.seen.extend_from_slice(&chunk);
+            if was_full {
+                self.wake.signal();
+            }
         }
     }
 
-    /// Wait for the event loop to finish and return its result.
-    fn wait_exit(self, deadline: Duration) -> Result<i32, String> {
-        self.exit_rx
-            .recv_timeout(deadline)
-            .expect("event loop did not exit in time")
+    fn wait_exit(self) -> Result<i32, String> {
+        self.run.join().expect("event loop thread panicked")
     }
 }
 
 #[test]
 fn uring_captures_child_output() {
-    let h = Harness::spawn("/bin/sh", &["-c", "echo hello_uring"]);
-    let out = h.wait_output(Duration::from_secs(5), |o| {
-        o.windows(11).any(|w| w == b"hello_uring")
-    });
+    let mut h = Harness::spawn("/bin/sh", &["-c", "echo hello_uring"]);
+    let out = h.wait_output(|o| o.windows(11).any(|w| w == b"hello_uring"));
     assert!(!out.is_empty());
-    let code = h.wait_exit(Duration::from_secs(5)).expect("run ok");
+    let code = h.wait_exit().expect("run ok");
     assert_eq!(code, 0);
 }
 
 #[test]
 fn uring_write_roundtrips_through_cat() {
-    let h = Harness::spawn("/bin/cat", &[]);
+    let mut h = Harness::spawn("/bin/cat", &[]);
     h.send(PtyInput::Bytes(b"ping_pong\n".to_vec().into_boxed_slice()));
-    // cat echoes; the PTY line discipline echoes too — either way the bytes
-    // must come back through the read SQE path.
-    h.wait_output(Duration::from_secs(5), |o| {
-        o.windows(9).any(|w| w == b"ping_pong")
-    });
+    h.wait_output(|o| o.windows(9).any(|w| w == b"ping_pong"));
     h.send(PtyInput::Quit);
-    let code = h.wait_exit(Duration::from_secs(5)).expect("run ok");
-    // Quit path hangs the child up; exit code is the loop's default 0.
+    let code = h.wait_exit().expect("run ok");
     assert_eq!(code, 0);
 }
 
 #[test]
 fn uring_reports_child_exit_code() {
     let h = Harness::spawn("/bin/sh", &["-c", "exit 42"]);
-    let code = h.wait_exit(Duration::from_secs(5)).expect("run ok");
+    let code = h.wait_exit().expect("run ok");
     assert_eq!(code, 42);
 }
 
@@ -129,72 +149,38 @@ fn uring_reports_child_exit_code() {
 fn uring_quit_message_stops_loop_with_live_child() {
     let h = Harness::spawn("/bin/sh", &["-c", "sleep 30"]);
     h.send(PtyInput::Quit);
-    // Must return promptly (hangup + reap), not wait out the sleep.
     let start = Instant::now();
-    let _ = h.wait_exit(Duration::from_secs(5)).expect("run ok");
+    let _ = h.wait_exit().expect("run ok");
     assert!(start.elapsed() < Duration::from_secs(5));
 }
 
 #[test]
 fn uring_shutdown_flag_stops_loop() {
     let h = Harness::spawn("/bin/sh", &["-c", "sleep 30"]);
-    h.shutdown.store(true, std::sync::atomic::Ordering::Release);
-    h.wake.signal(); // rouse the parked loop so it observes the flag
+    h.shutdown.store(true, Ordering::Release);
+    h.wake.signal();
     let start = Instant::now();
-    let _ = h.wait_exit(Duration::from_secs(5)).expect("run ok");
+    let _ = h.wait_exit().expect("run ok");
     assert!(start.elapsed() < Duration::from_secs(5));
 }
 
 #[test]
 fn uring_resize_reaches_child() {
-    // `stty size` prints "rows cols" of the tty — spawn a shell that reports
-    // its size after a brief pause, and resize before it samples.
-    let h = Harness::spawn("/bin/sh", &["-c", "sleep 0.3; stty size"]);
+    let mut h = Harness::spawn("/bin/sh", &["-c", "sleep 0.3; stty size"]);
     h.send(PtyInput::Resize(WinSize {
         rows: 31,
         cols: 113,
         xpixel: 0,
         ypixel: 0,
     }));
-    h.wait_output(Duration::from_secs(5), |o| {
-        o.windows(6).any(|w| w == b"31 113")
-    });
-    let _ = h.wait_exit(Duration::from_secs(5));
+    h.wait_output(|o| o.windows(6).any(|w| w == b"31 113"));
+    let _ = h.wait_exit();
 }
 
 #[test]
 fn uring_large_write_stress_many_iterations() {
     for iter in 0..40 {
-        let h = Harness::spawn("/bin/sh", &["-c", "stty -echo; echo READY; exec cat"]);
-        h.wait_output(Duration::from_secs(5), |o| {
-            o.windows(5).any(|w| w == b"READY")
-        });
-        let mut payload = Vec::with_capacity(20_000);
-        for i in 0..2000u32 {
-            payload.extend_from_slice(format!("{i:07}\n").as_bytes());
-        }
-        let needle_last = b"0001999\r\n".to_vec();
-        h.send(PtyInput::Bytes(payload.into_boxed_slice()));
-        let deadline = Duration::from_secs(3);
-        let start = Instant::now();
-        loop {
-            let out = h.output.lock().unwrap().clone();
-            if out
-                .windows(needle_last.len())
-                .any(|w| w == &needle_last[..])
-            {
-                break;
-            }
-            assert!(
-                start.elapsed() < deadline,
-                "iter {iter}: stalled; got {} bytes, last bit: {:?}",
-                out.len(),
-                String::from_utf8_lossy(&out[out.len().saturating_sub(60)..])
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        h.send(PtyInput::Quit);
-        let _ = h.wait_exit(Duration::from_secs(5));
+        uring_large_write_is_chunked_and_ordered_once(iter);
     }
 }
 
@@ -203,102 +189,23 @@ fn uring_large_write_is_chunked_and_ordered() {
     uring_large_write_is_chunked_and_ordered_once(0);
 }
 
+/// Real backpressure: when `on_output` rejects a chunk (simulating a full
+/// downstream ring), `Pty::run` must retry the exact same bytes once the
+/// caller starts accepting again, never dropping them.
 #[test]
 fn uring_on_output_false_is_retried_not_dropped() {
-    // Regression test for real backpressure: when `on_output` rejects a
-    // chunk (simulating a full downstream ring), `Pty::run` must not
-    // silently drop it -- it must retry the exact same bytes once the
-    // caller starts accepting again, and never re-arm the read meanwhile
-    // (so no *further* reads race ahead of the pending one either).
-    use std::sync::atomic::{AtomicBool as StdAtomicBool, AtomicUsize, Ordering as O};
+    let mut h = Harness::spawn_gated("/bin/sh", &["-c", "stty -echo; echo READY; exec cat"]);
+    h.send(PtyInput::Bytes(b"stall_me\n".to_vec().into_boxed_slice()));
 
-    let wake = waker::Waker::new().expect("eventfd");
-    let shutdown = Arc::new(StdAtomicBool::new(false));
-    let pty = Pty::spawn(
-        "/bin/sh",
-        &["-c", "stty -echo; echo READY; exec cat"],
-        WIN,
-        wake.raw_fd(),
-        Arc::clone(&shutdown),
-    )
-    .expect("Pty::spawn");
+    h.rejections
+        .pop_block()
+        .expect("the gated loop rejects the child's output");
 
-    let inputs: Arc<Mutex<VecDeque<PtyInput>>> = Arc::new(Mutex::new(VecDeque::new()));
-    let output: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    // Gate: while false, on_output rejects every chunk (simulating a full
-    // ring); flipped true partway through the test.
-    let accept = Arc::new(StdAtomicBool::new(false));
-    // Counts how many times on_output was called with ANY data, accepted or
-    // not -- used only to sanity-check the retry actually happened more
-    // than once (i.e. the test isn't vacuously passing because the gate was
-    // already open).
-    let reject_count = Arc::new(AtomicUsize::new(0));
+    h.open_gate();
 
-    let inputs_loop = Arc::clone(&inputs);
-    let output_loop = Arc::clone(&output);
-    let accept_loop = Arc::clone(&accept);
-    let reject_count_loop = Arc::clone(&reject_count);
-    let (exit_tx, exit_rx) = std_mpsc::channel();
-    std::thread::spawn(move || {
-        let next_input = move || inputs_loop.lock().unwrap().pop_front();
-        let on_output = move |bytes: &[u8]| {
-            if accept_loop.load(O::Acquire) {
-                output_loop.lock().unwrap().extend_from_slice(bytes);
-                true
-            } else {
-                reject_count_loop.fetch_add(1, O::Relaxed);
-                false
-            }
-        };
-        let _ = exit_tx.send(pty.run(next_input, on_output).map_err(|e| e.to_string()));
-    });
-
-    let send = |msg: PtyInput| {
-        inputs.lock().unwrap().push_back(msg);
-        wake.signal();
-    };
-
-    // Nothing is accepted yet -- these bytes must be retried, not lost, once
-    // we flip the gate below.
-    send(PtyInput::Bytes(b"stall_me\n".to_vec().into_boxed_slice()));
-
-    // Give the loop a chance to observe (and reject) the echoed output at
-    // least once before we open the gate, so this test actually exercises
-    // the retry path instead of racing it.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while reject_count.load(O::Relaxed) == 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(
-        reject_count.load(O::Relaxed) > 0,
-        "on_output was never called while gated -- test didn't exercise the retry path"
-    );
-
-    accept.store(true, O::Release);
-    wake.signal(); // rouse the loop so it retries the pending chunk promptly
-
-    // `cat`'s echo comes back through the tty's ONLCR flag, which rewrites
-    // the line discipline's \n to \r\n on the way out -- search for the
-    // needle without the trailing newline so it matches either way.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        {
-            let out = output.lock().unwrap();
-            if out.windows(8).any(|w| w == b"stall_me") {
-                break;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "stalled chunk was never retried/delivered"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-
-    send(PtyInput::Quit);
-    let _ = exit_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("run finished");
+    h.wait_output(|o| o.windows(8).any(|w| w == b"stall_me"));
+    h.send(PtyInput::Quit);
+    let _ = h.wait_exit();
 }
 
 /// Stress variant: repeats the single-shot check many times in one process,
@@ -313,28 +220,20 @@ fn uring_large_write_is_chunked_and_ordered_stress() {
 }
 
 fn uring_large_write_is_chunked_and_ordered_once(iter: u32) {
-    // 20 KiB of patterned input through cat — crosses the 4 KiB write-buffer
-    // boundary several times; ordering must survive the requeue path.
     // `stty -echo` first: the line discipline's echo interleaves with cat's
     // output byte-for-byte, which would shred the needles mid-line.
-    let h = Harness::spawn("/bin/sh", &["-c", "stty -echo; echo READY; exec cat"]);
-    // Wait for echo to actually be off before sending anything, else bytes
-    // landing early are echoed by the line discipline and interleave.
-    h.wait_output(Duration::from_secs(5), |o| {
-        o.windows(5).any(|w| w == b"READY")
-    });
+    let mut h = Harness::spawn("/bin/sh", &["-c", "stty -echo; echo READY; exec cat"]);
+    h.wait_output(|o| o.windows(5).any(|w| w == b"READY"));
     let mut payload = Vec::with_capacity(20_000);
     for i in 0..2000u32 {
         payload.extend_from_slice(format!("{i:07}\n").as_bytes());
     }
-    // Push in one giant Bytes message. Needles use \r\n: the tty's ONLCR
-    // output flag rewrites cat's \n on the way back out.
+    // Needles use \r\n: the tty's ONLCR output flag rewrites cat's \n on the
+    // way back out.
     let needle_first = b"0000000\r\n".to_vec();
     let needle_last = b"0001999\r\n".to_vec();
     h.send(PtyInput::Bytes(payload.into_boxed_slice()));
-    let out = h.wait_output(Duration::from_secs(10), |o| {
-        o.windows(needle_last.len()).any(|w| w == &needle_last[..])
-    });
+    let out = h.wait_output(|o| o.windows(needle_last.len()).any(|w| w == &needle_last[..]));
     let first_pos = out
         .windows(needle_first.len())
         .position(|w| w == &needle_first[..])
@@ -355,5 +254,5 @@ fn uring_large_write_is_chunked_and_ordered_once(iter: u32) {
         "iter {iter}: order preserved across write chunks"
     );
     h.send(PtyInput::Quit);
-    let _ = h.wait_exit(Duration::from_secs(5));
+    let _ = h.wait_exit();
 }

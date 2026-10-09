@@ -18,8 +18,18 @@ use dbus::message::BodyArg;
 use dbus::value::Value;
 use dbus_server::ServerLoop;
 use portal_bin::{ConfigWatcher, PortalLoop, SettingsService, SettingsState};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::{Consumer, Producer, RingBuffer};
 
 const NAMESPACE: &str = "org.freedesktop.appearance";
+
+struct Rendezvous;
+
+impl Rendezvous {
+    fn open() -> (Producer<()>, Consumer<()>) {
+        RingBuffer::new(Capacity::exact(2)).split()
+    }
+}
 
 fn session_bus_reachable() -> bool {
     match DbusConn::session() {
@@ -37,7 +47,7 @@ fn session_bus_reachable() -> bool {
 /// counts dispatches rather than `serve_one` invocations (unsolicited bus
 /// housekeeping like `NameAcquired` would otherwise desync the count).
 fn spawn_server(name: &'static str, count: usize) -> std::thread::JoinHandle<()> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, mut ready_rx) = Rendezvous::open();
     let handle = std::thread::spawn(move || {
         let conn = DbusConn::session().expect("session bus was reachable a moment ago");
         let state = SettingsState::new(&config::Config::default());
@@ -47,7 +57,7 @@ fn spawn_server(name: &'static str, count: usize) -> std::thread::JoinHandle<()>
             Ok(false) => panic!("another connection already owns {name}"),
             Err(e) => panic!("could not claim {name}: {e}"),
         }
-        let _ = ready_tx.send(());
+        let _ = ready_tx.push(());
         let mut calls_dispatched = 0;
         while calls_dispatched < count {
             match server.serve_one() {
@@ -58,7 +68,7 @@ fn spawn_server(name: &'static str, count: usize) -> std::thread::JoinHandle<()>
         }
     });
     ready_rx
-        .recv()
+        .pop_block()
         .expect("server thread should signal readiness before panicking");
     handle
 }
@@ -185,8 +195,8 @@ fn a_config_save_emits_a_real_setting_changed_signal_to_a_subscribed_client() {
     std::fs::write(&config_path, initial_toml).unwrap();
     let initial_cfg = config::Config::from_bytes(initial_toml).expect("parse initial config");
 
-    let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel::<()>();
-    let (client_subscribed_tx, client_subscribed_rx) = std::sync::mpsc::channel::<()>();
+    let (server_ready_tx, mut server_ready_rx) = Rendezvous::open();
+    let (client_subscribed_tx, mut client_subscribed_rx) = Rendezvous::open();
     let config_path_for_server = config_path.clone();
 
     let handle = std::thread::spawn(move || {
@@ -199,9 +209,9 @@ fn a_config_save_emits_a_real_setting_changed_signal_to_a_subscribed_client() {
             Ok(false) => panic!("another connection already owns {NAME}"),
             Err(e) => panic!("could not claim {NAME}: {e}"),
         }
-        let _ = server_ready_tx.send(());
+        let _ = server_ready_tx.push(());
         client_subscribed_rx
-            .recv()
+            .pop_block()
             .expect("test thread should signal once subscribed");
 
         // Exactly one iteration: the config-file write below is this
@@ -214,7 +224,7 @@ fn a_config_save_emits_a_real_setting_changed_signal_to_a_subscribed_client() {
     });
 
     server_ready_rx
-        .recv()
+        .pop_block()
         .expect("server thread should signal readiness before panicking");
 
     let Some(mut client) = client() else {
@@ -226,7 +236,7 @@ fn a_config_save_emits_a_real_setting_changed_signal_to_a_subscribed_client() {
             SettingsService::IFACE
         ))
         .expect("add_match should succeed");
-    let _ = client_subscribed_tx.send(());
+    let _ = client_subscribed_tx.push(());
 
     // A background crossing the dark/light threshold -- the one
     // `AppearanceSettings` key with an unconditional, deterministic

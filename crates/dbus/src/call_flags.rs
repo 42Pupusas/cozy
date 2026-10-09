@@ -106,9 +106,7 @@ mod tests {
     /// asked for a prompt.
     #[test]
     fn the_interactive_flag_reads_back() {
-        assert!(
-            CallFlags::allow_interactive_authorization().allows_interactive_authorization()
-        );
+        assert!(CallFlags::allow_interactive_authorization().allows_interactive_authorization());
         assert!(!CallFlags::none().allows_interactive_authorization());
     }
 

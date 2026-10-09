@@ -51,7 +51,11 @@ impl TerminalPrompt {
             return None;
         }
         let trimmed = line.trim_end_matches(['\n', '\r']).to_owned();
-        if trimmed.is_empty() { None } else { Some(trimmed) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
     }
 }
 

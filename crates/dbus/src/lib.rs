@@ -35,6 +35,7 @@
 //! * [`network_manager`] / [`bluez`] / [`logind`] — thin, service-specific
 //!   convenience wrappers the statusbar calls directly.
 
+pub mod bluetooth;
 pub mod bluez;
 pub mod call_flags;
 pub mod call_target;
@@ -45,6 +46,7 @@ pub mod marshal;
 pub mod message;
 pub mod mount_options;
 pub mod network_manager;
+pub mod nm_wifi;
 pub mod session_address;
 pub mod signals;
 pub mod sys;
@@ -56,7 +58,7 @@ pub use call_flags::CallFlags;
 pub use conn::{DbusConn, DbusError};
 pub use mount_options::MountOptions;
 pub use session_address::SessionAddress;
+pub use signals::NameOwnerChanged;
 pub use systemd1::{MountError, TransientMount, TransientUnmount};
 pub use unit_name::UnitName;
-pub use signals::NameOwnerChanged;
 pub use value::Value;

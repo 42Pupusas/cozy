@@ -1,0 +1,24 @@
+[package]
+name    = "panel-volume-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "panel_volume"
+path = "src/lib.rs"
+
+[[bin]]
+name = "panel-volume"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+panel-ui    = { path = "../../crates/panel-ui" }
+platform    = { path = "../../crates/platform" }
+statusbar   = { path = "../../crates/statusbar" }
+config      = { path = "../../crates/config" }
+waker       = { path = "../../crates/waker" }
+quetzalcoatl = { workspace = true }
+json-bourne = { workspace = true }

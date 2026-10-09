@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16,11 +25,35 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "bourne-derive"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "canvas-bin"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "headless-stress",
+ "json-bourne",
+ "launcher",
+ "platform",
+ "statusbar",
+ "waker",
+ "widget",
+]
+
+[[package]]
+name = "cc"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f74872d07caf508b30a21f6836e7d7016a2eaf7d9ff4f48deaa58cd8a0407630"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
 ]
 
 [[package]]
@@ -90,7 +123,7 @@ checksum = "baf0a07a401f374238ab8e2f11a104d2851bf9ce711ec69804834de8af45c7af"
 name = "config"
 version = "0.1.0"
 dependencies = [
- "shelby",
+ "toml-shelby",
 ]
 
 [[package]]
@@ -123,6 +156,7 @@ name = "dbus-server"
 version = "0.1.0"
 dependencies = [
  "dbus",
+ "quetzalcoatl",
 ]
 
 [[package]]
@@ -155,12 +189,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "equivalent"
-version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
-
-[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -188,12 +216,15 @@ dependencies = [
  "font",
  "fsmodel",
  "headless-stress",
+ "inotify-events",
  "launcher",
  "localtime",
  "mime",
  "mounter",
  "opener",
  "platform",
+ "quetzalcoatl",
+ "ququmatz",
  "statusbar",
  "user-dirs",
  "volumes",
@@ -202,12 +233,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "find-msvc-tools"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
+
+[[package]]
 name = "font"
 version = "0.1.0"
 
 [[package]]
 name = "fsmodel"
 version = "0.1.0"
+dependencies = [
+ "quetzalcoatl",
+]
+
+[[package]]
+name = "generator"
+version = "0.8.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54ade96dc9003043bce7c035c85a9df5a858bfb2039c5a2e6fdf00f324f6c551"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "log",
+ "rustversion",
+ "windows-link",
+ "windows-result",
+]
 
 [[package]]
 name = "grid"
@@ -220,24 +275,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "hashbrown"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-
-[[package]]
 name = "headless-stress"
 version = "0.1.0"
-
-[[package]]
-name = "indexmap"
-version = "2.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
-dependencies = [
- "equivalent",
- "hashbrown",
-]
 
 [[package]]
 name = "inotify-events"
@@ -263,10 +302,9 @@ dependencies = [
 
 [[package]]
 name = "json-bourne"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "bourne-derive",
- "indexmap",
 ]
 
 [[package]]
@@ -289,6 +327,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lazy_static"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
+
+[[package]]
 name = "libc"
 version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -305,6 +349,40 @@ name = "localtime"
 version = "0.1.0"
 
 [[package]]
+name = "log"
+version = "0.4.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+
+[[package]]
+name = "loom"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
+dependencies = [
+ "cfg-if",
+ "generator",
+ "scoped-tls",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
+name = "memchr"
+version = "2.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
+
+[[package]]
 name = "mime"
 version = "0.1.0"
 
@@ -315,6 +393,7 @@ dependencies = [
  "config",
  "headless-stress",
  "platform",
+ "quetzalcoatl",
  "statusbar",
  "sysmon",
  "waker",
@@ -342,6 +421,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
+name = "once_cell"
+version = "1.21.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
 name = "open-bin"
 version = "0.1.0"
 dependencies = [
@@ -355,6 +449,64 @@ dependencies = [
  "launcher",
  "mime",
 ]
+
+[[package]]
+name = "panel-bluetooth-bin"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "dbus",
+ "dbus-server",
+ "panel-ui",
+ "platform",
+ "quetzalcoatl",
+ "statusbar",
+ "waker",
+]
+
+[[package]]
+name = "panel-ui"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "platform",
+ "quetzalcoatl",
+ "statusbar",
+ "waker",
+ "xkb",
+]
+
+[[package]]
+name = "panel-volume-bin"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "json-bourne",
+ "panel-ui",
+ "platform",
+ "quetzalcoatl",
+ "statusbar",
+ "waker",
+]
+
+[[package]]
+name = "panel-wifi-bin"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "dbus",
+ "panel-ui",
+ "platform",
+ "quetzalcoatl",
+ "statusbar",
+ "waker",
+]
+
+[[package]]
+name = "pin-project-lite"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "platform"
@@ -444,9 +596,9 @@ dependencies = [
 
 [[package]]
 name = "quetzal-uring"
-version = "0.2.1"
+version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "511ba63cbd3d14932ef822122e61400a9936c902c1bb31282278c404e97e6ef0"
+checksum = "2f3c37181c9ff2f806e748eca30609290132d8c64ce8a324529cf357dff9329a"
 dependencies = [
  "quetzalcoatl",
  "ququmatz",
@@ -454,9 +606,12 @@ dependencies = [
 
 [[package]]
 name = "quetzalcoatl"
-version = "0.13.1"
+version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d8cd58a47b5eee43376c57194902bae665cf6960eb841ff7cde00d2adfb04a8"
+checksum = "81eea00c7a8c79f8ef98c0a60f924b4b1c7cb846a30936c64c706fb972574ab7"
+dependencies = [
+ "loom",
+]
 
 [[package]]
 name = "quote"
@@ -469,15 +624,32 @@ dependencies = [
 
 [[package]]
 name = "ququmatz"
-version = "0.15.1"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c73f784a5c91fc9d1dc48016bfff71f2955f2cf430fb34bf3fff98b6ecc77b56"
+checksum = "f2db8fb915ead2e6983baf6a89b0115cafb6bc32364328ca438b0383a5b9350e"
+
+[[package]]
+name = "regex-automata"
+version = "0.4.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad8553b9b26413251cbf30e620595c7a41b3887f03da04579c0e6b0d6a06b4b2"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-syntax",
+]
 
 [[package]]
 name = "regex-lite"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
+
+[[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rustix"
@@ -493,11 +665,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustversion"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
+
+[[package]]
 name = "scm-rights"
 version = "0.1.0"
 dependencies = [
  "ququmatz",
 ]
+
+[[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "screencopy"
@@ -508,8 +692,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "shelby"
-version = "0.1.0"
+name = "sharded-slab"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "shot-bin"
@@ -519,6 +714,7 @@ dependencies = [
  "clipboard-wayland",
  "headless-stress",
  "ixiptla-core",
+ "json-bourne",
  "localtime",
  "platform",
  "quetzalcoatl",
@@ -527,16 +723,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "smallvec"
+version = "1.16.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
+
+[[package]]
 name = "statusbar"
 version = "0.1.0"
 dependencies = [
  "config",
  "dbus",
  "font",
+ "inotify-events",
  "json-bourne",
  "localtime",
  "platform",
  "quetzalcoatl",
+ "ququmatz",
  "waker",
 ]
 
@@ -557,7 +761,9 @@ version = "0.1.0"
 dependencies = [
  "config",
  "headless-stress",
+ "panel-ui",
  "platform",
+ "quetzalcoatl",
  "statusbar",
  "waker",
 ]
@@ -625,8 +831,70 @@ name = "text_layout"
 version = "0.1.0"
 
 [[package]]
+name = "thread_local"
+version = "1.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "tlog"
 version = "0.1.0"
+
+[[package]]
+name = "toml-shelby"
+version = "0.1.0"
+
+[[package]]
+name = "tracing"
+version = "0.1.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
+dependencies = [
+ "pin-project-lite",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-core"
+version = "0.1.36"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
+dependencies = [
+ "once_cell",
+ "valuable",
+]
+
+[[package]]
+name = "tracing-log"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
+dependencies = [
+ "log",
+ "once_cell",
+ "tracing-core",
+]
+
+[[package]]
+name = "tracing-subscriber"
+version = "0.3.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
+dependencies = [
+ "matchers",
+ "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
+ "sharded-slab",
+ "smallvec",
+ "thread_local",
+ "tracing",
+ "tracing-core",
+ "tracing-log",
+]
 
 [[package]]
 name = "tty-benches"
@@ -653,6 +921,12 @@ name = "user-dirs"
 version = "0.1.0"
 
 [[package]]
+name = "valuable"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
+
+[[package]]
 name = "video-stress"
 version = "0.1.0"
 dependencies = [
@@ -668,6 +942,11 @@ dependencies = [
 [[package]]
 name = "volumes"
 version = "0.1.0"
+dependencies = [
+ "inotify-events",
+ "ququmatz",
+ "waker",
+]
 
 [[package]]
 name = "vt_parser"
@@ -708,6 +987,15 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-result"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
+dependencies = [
+ "windows-link",
+]
 
 [[package]]
 name = "windows-sys"

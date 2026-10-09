@@ -23,6 +23,7 @@
 use statusbar::TextRenderer;
 
 use crate::density::Density;
+use crate::tile_geometry::LineHeights;
 
 /// The four text renderers the browser draws with.
 pub struct Typography {
@@ -110,6 +111,16 @@ impl Typography {
     #[must_use]
     pub fn natural_header_height(&self) -> i32 {
         self.title.line_height() + 14
+    }
+
+    /// The line heights a tile lays its text out with.
+    #[must_use]
+    pub fn tile_lines(&self) -> LineHeights {
+        LineHeights {
+            title: self.title.line_height(),
+            body: self.body.line_height(),
+            detail: self.detail.line_height(),
+        }
     }
 
     /// The natural status-strip height.

@@ -2293,13 +2293,7 @@ mod tests {
                 let mut pixels = vec![0u32; (bw * bh) as usize];
                 let renderer = Renderer::builtin(Theme::builtin());
                 let mut canvas = Canvas::new(&mut pixels, bw.cast_signed(), bh.cast_signed());
-                renderer.draw_cursor(
-                    &mut canvas,
-                    (cols - 1) as f32,
-                    visual_row,
-                    shape,
-                    1.0,
-                );
+                renderer.draw_cursor(&mut canvas, (cols - 1) as f32, visual_row, shape, 1.0);
                 for y in 0..bh {
                     for x in 0..bw {
                         if x >= cols * cell_w || y >= rows * cell_h {

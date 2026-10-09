@@ -51,6 +51,15 @@ pub enum Edge {
     Bottom,
 }
 
+impl From<config::BarPosition> for Edge {
+    fn from(position: config::BarPosition) -> Self {
+        match position {
+            config::BarPosition::Top => Self::Top,
+            config::BarPosition::Bottom => Self::Bottom,
+        }
+    }
+}
+
 impl Edge {
     fn anchor_bits(self) -> u32 {
         match self {
@@ -595,9 +604,7 @@ impl BarWindow {
     fn do_present(&mut self, slot: usize, paint: &mut impl FnMut(&mut Canvas)) {
         {
             let bg_packed = self.pack_bg();
-            for p in &mut self.backbuffer {
-                *p = bg_packed;
-            }
+            self.backbuffer.fill(bg_packed);
             // The canvas carries this window's packing, so the painter's
             // drawing calls (and `TextRenderer`'s glyph-edge blending, which
             // reads the alpha back off the canvas) are correct without each
@@ -634,5 +641,16 @@ impl BarWindow {
     /// `platform::TermWindow`.
     fn output_scale(sender: &mut Sender, events: &mut Consumer<RawEvent>, output: OutputId) -> i32 {
         surface::SurfaceBootstrap::output_scale(sender, events, output)
+    }
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::Edge;
+
+    #[test]
+    fn config_position_maps_to_matching_edge() {
+        assert_eq!(Edge::from(config::BarPosition::Top), Edge::Top);
+        assert_eq!(Edge::from(config::BarPosition::Bottom), Edge::Bottom);
     }
 }

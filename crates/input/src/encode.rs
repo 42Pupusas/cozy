@@ -102,7 +102,7 @@ impl<'a> SeqWriter<'a> {
         self.n
     }
 
-    fn byte(&mut self, b: u8) -> &mut Self {
+    const fn byte(&mut self, b: u8) -> &mut Self {
         self.buf[self.n] = b;
         self.n += 1;
         self
@@ -115,12 +115,12 @@ impl<'a> SeqWriter<'a> {
     }
 
     /// `ESC` — used to prefix almost every escape sequence below.
-    fn esc(&mut self) -> &mut Self {
+    const fn esc(&mut self) -> &mut Self {
         self.byte(b'\x1b')
     }
 
     /// `ESC [` — CSI, the common introducer for cursor/functional keys.
-    fn csi(&mut self) -> &mut Self {
+    const fn csi(&mut self) -> &mut Self {
         self.esc().byte(b'[')
     }
 
@@ -444,7 +444,7 @@ impl Encoder {
         w.len()
     }
 
-    fn kp_arrow(&self, buf: &mut [u8], letter: u8) -> usize {
+    const fn kp_arrow(&self, buf: &mut [u8], letter: u8) -> usize {
         // App-keypad and app-cursor both select SS3; default is CSI.
         let intro = if self.app_keypad || self.app_cursor {
             b'O'

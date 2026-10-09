@@ -130,8 +130,18 @@ mod tests {
     fn parses_every_control() {
         let options = PrepareOptions::parse(
             [
-                "--input", "a.mp4", "--output", "b.mfp", "--width", "64", "--height", "48",
-                "--fps", "30", "--threshold", "200",
+                "--input",
+                "a.mp4",
+                "--output",
+                "b.mfp",
+                "--width",
+                "64",
+                "--height",
+                "48",
+                "--fps",
+                "30",
+                "--threshold",
+                "200",
             ]
             .map(str::to_owned),
         )
@@ -149,10 +159,8 @@ mod tests {
 
     #[test]
     fn rejects_zero_geometry() {
-        let error = PrepareOptions::parse(
-            ["--input", "a.mp4", "--width", "0"].map(str::to_owned),
-        )
-        .unwrap_err();
+        let error = PrepareOptions::parse(["--input", "a.mp4", "--width", "0"].map(str::to_owned))
+            .unwrap_err();
         assert!(error.contains("non-zero"));
     }
 
@@ -171,7 +179,10 @@ mod tests {
     #[test]
     fn ffmpeg_arguments_request_raw_luma_at_the_chosen_rate() {
         let options = PrepareOptions::parse(
-            ["--input", "a.mp4", "--fps", "60", "--width", "8", "--height", "4"].map(str::to_owned),
+            [
+                "--input", "a.mp4", "--fps", "60", "--width", "8", "--height", "4",
+            ]
+            .map(str::to_owned),
         )
         .unwrap();
         let arguments = options.ffmpeg_arguments();

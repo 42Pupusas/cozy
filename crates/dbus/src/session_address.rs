@@ -7,6 +7,8 @@
 //! connecting to a live bus -- so the branch that matters most in practice
 //! (no `DBUS_SESSION_BUS_ADDRESS` at all) had no test coverage.
 
+use std::path::PathBuf;
+
 /// Where the session bus socket lives, as a connectable endpoint.
 ///
 /// D-Bus addresses distinguish filesystem sockets from Linux abstract
@@ -48,6 +50,37 @@ impl SessionAddress {
             return Some(address);
         }
         Self::from_runtime_dir(std::env::var("XDG_RUNTIME_DIR").ok().as_deref())
+    }
+
+    /// Where the session bus socket file is, or will appear, in the
+    /// current environment.
+    ///
+    /// Unlike [`Self::resolve`], the answer does not depend on the socket
+    /// existing, so a caller can start watching for its creation before the
+    /// bus is up. `None` for an abstract address, which has no file to
+    /// watch.
+    #[must_use]
+    pub fn expected_socket_path() -> Option<PathBuf> {
+        Self::expected_socket_path_in(
+            std::env::var("DBUS_SESSION_BUS_ADDRESS").ok().as_deref(),
+            std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        )
+    }
+
+    /// [`Self::expected_socket_path`] with the environment passed in.
+    #[must_use]
+    pub fn expected_socket_path_in(
+        address_variable: Option<&str>,
+        runtime_dir: Option<&str>,
+    ) -> Option<PathBuf> {
+        match address_variable.and_then(Self::parse) {
+            Some(Self::Path(path)) => Some(PathBuf::from(path)),
+            Some(Self::Abstract(_)) => None,
+            None => {
+                let dir = runtime_dir.filter(|dir| !dir.is_empty())?;
+                Some(PathBuf::from(dir).join(Self::RUNTIME_SOCKET))
+            }
+        }
     }
 
     /// Build the well-known `$XDG_RUNTIME_DIR/bus` endpoint.
@@ -143,6 +176,45 @@ mod tests {
     #[test]
     fn rejects_an_empty_path_rather_than_connecting_to_nothing() {
         assert_eq!(SessionAddress::parse("unix:path="), None);
+    }
+
+    #[test]
+    fn expected_path_follows_the_address_variable() {
+        assert_eq!(
+            SessionAddress::expected_socket_path_in(
+                Some("unix:path=/run/user/7/custom-bus,guid=ab"),
+                Some("/run/user/1000"),
+            ),
+            Some(PathBuf::from("/run/user/7/custom-bus"))
+        );
+    }
+
+    #[test]
+    fn expected_path_falls_back_to_the_runtime_dir_without_requiring_the_socket() {
+        assert_eq!(
+            SessionAddress::expected_socket_path_in(None, Some("/nonexistent-xdg-runtime-dir")),
+            Some(PathBuf::from("/nonexistent-xdg-runtime-dir/bus"))
+        );
+    }
+
+    #[test]
+    fn expected_path_is_absent_for_an_abstract_address() {
+        assert_eq!(
+            SessionAddress::expected_socket_path_in(
+                Some("unix:abstract=/tmp/dbus-AbCdEf"),
+                Some("/run/user/1000"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn expected_path_needs_some_location_to_name() {
+        assert_eq!(SessionAddress::expected_socket_path_in(None, None), None);
+        assert_eq!(
+            SessionAddress::expected_socket_path_in(None, Some("")),
+            None
+        );
     }
 
     #[test]

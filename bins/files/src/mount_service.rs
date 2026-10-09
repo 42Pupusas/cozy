@@ -37,9 +37,10 @@
 //! window with the prompt open. If that were a hang, the browser could not
 //! exit -- and it would still hold a registered polkit agent.
 //!
-//! So the reply is delivered over a channel whose *sender* the UI thread
-//! owns, and a receive error is read as dismissal. Dropping the service
-//! releases the worker rather than waiting for it. This is the same reason
+//! So the reply is delivered over a ring whose *producer* the UI thread
+//! owns, and `pop_block` returning `None` (every producer gone) is read as
+//! dismissal. Dropping the service releases the worker rather than waiting
+//! for it. This is the same reason
 //! `PasswordPrompt` returns `Option<String>` at all.
 //!
 //! # Why the waker is signalled
@@ -56,7 +57,8 @@
 //! the *threading* -- the part that deadlocks, hangs, or drops a reply --
 //! without any of that.
 
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::{Consumer, Producer, RingBuffer};
 use volumes::mount_backend::{MountBackend, MountOutcome};
 use volumes::mount_request::MountRequest;
 
@@ -77,24 +79,36 @@ pub enum MountProgress {
     Finished(MountOutcome),
 }
 
-/// The prompt handed to the backend: a pair of channel ends pretending to be
+/// Opens the rings both directions of a mount conversation travel over.
+struct Rings;
+
+impl Rings {
+    const SLOTS: usize = 16;
+
+    fn open<T>() -> (Producer<T>, Consumer<T>) {
+        RingBuffer::new(Capacity::exact(Self::SLOTS)).split()
+    }
+}
+
+/// The prompt handed to the backend: a pair of ring ends pretending to be
 /// a user.
 ///
 /// Lives on the **worker** thread. `ask` blocks it, which is the entire
 /// point -- the UI thread must stay free.
 pub struct ChannelPrompt {
     /// Questions out to the UI thread.
-    progress: Sender<MountProgress>,
+    progress: Producer<MountProgress>,
     /// Replies back from it.
-    replies: Receiver<Option<String>>,
+    replies: Consumer<Option<String>>,
     /// Woken so the loop notices a question immediately.
     wake: waker::Waker,
 }
 
 impl ChannelPrompt {
-    /// Send one message and wake the loop to see it.
+    /// Send one message and wake the loop to see it. Fails only once the UI
+    /// side has gone away.
     fn report(&self, progress: MountProgress) -> bool {
-        let sent = self.progress.send(progress).is_ok();
+        let sent = self.progress.push_block(progress).is_ok();
         self.wake.signal();
         sent
     }
@@ -103,7 +117,7 @@ impl ChannelPrompt {
 impl mounter::PasswordPrompt for ChannelPrompt {
     /// Ask the UI thread, and block this one until it answers.
     ///
-    /// A closed channel -- the window went away -- reads as dismissal, so the
+    /// A closed ring -- the window went away -- reads as dismissal, so the
     /// worker unblocks and the mount ends instead of hanging forever.
     fn ask(&mut self, prompt: &str, echo: bool) -> Option<String> {
         if !self.report(MountProgress::Prompt {
@@ -112,9 +126,7 @@ impl mounter::PasswordPrompt for ChannelPrompt {
         }) {
             return None;
         }
-        // A closed channel means the window went away; `unwrap_or_default`
-        // is `None`, which is dismissal.
-        self.replies.recv().unwrap_or_default()
+        self.replies.pop_block().flatten()
     }
 
     fn notify(&mut self, message: &str) {
@@ -125,9 +137,9 @@ impl mounter::PasswordPrompt for ChannelPrompt {
 /// A mount in flight on a worker thread.
 pub struct MountService {
     /// Messages from the worker.
-    progress: Receiver<MountProgress>,
+    progress: Consumer<MountProgress>,
     /// Replies to the worker. Dropped to release a blocked prompt.
-    replies: Option<Sender<Option<String>>>,
+    replies: Option<Producer<Option<String>>>,
     /// Kept to detect completion; never joined on the UI thread.
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -144,8 +156,8 @@ impl MountService {
         B: MountBackend,
         F: FnOnce(ChannelPrompt) -> B + Send + 'static,
     {
-        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = Rings::open();
+        let (reply_tx, reply_rx) = Rings::open();
         let prompt = ChannelPrompt {
             progress: progress_tx.clone(),
             replies: reply_rx,
@@ -156,7 +168,7 @@ impl MountService {
         let worker = std::thread::spawn(move || {
             let mut backend = build(prompt);
             let outcome = backend.mount(&job);
-            let _ = progress_tx.send(MountProgress::Finished(outcome));
+            let _ = progress_tx.push_block(MountProgress::Finished(outcome));
             wake_at_end.signal();
         });
         Self {
@@ -174,24 +186,27 @@ impl MountService {
     /// the backend -- which is reported as a failure rather than leaving the
     /// UI waiting for a message that cannot come.
     pub fn poll(&mut self) -> Option<MountProgress> {
-        match self.progress.try_recv() {
-            Ok(progress) => Some(progress),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => self.worker.take().map(|_| {
+        let closed = self.progress.is_closed();
+        match self.progress.pop() {
+            Some(progress) => Some(progress),
+            None if closed => self.worker.take().map(|_| {
                 MountProgress::Finished(MountOutcome::Failed(String::from(
                     "the mount ended without reporting",
                 )))
             }),
+            None => None,
         }
     }
 
     /// Deliver the user's reply, releasing the blocked worker.
     ///
-    /// `None` dismisses. Returns whether anyone was still listening.
+    /// `None` dismisses. Returns whether the reply was accepted; it is not
+    /// while a previous reply is still unread, since this runs on the UI
+    /// thread and must never block.
     pub fn answer(&self, reply: Option<String>) -> bool {
         self.replies
             .as_ref()
-            .is_some_and(|tx| tx.send(reply).is_ok())
+            .is_some_and(|tx| tx.push(reply).is_ok())
     }
 }
 
@@ -208,7 +223,7 @@ impl Drop for MountService {
 
 #[cfg(test)]
 mod tests {
-    use super::{ChannelPrompt, MountProgress, MountService};
+    use super::{ChannelPrompt, MountProgress, MountService, Rings};
     use mounter::PasswordPrompt;
     use volumes::mount_backend::{MountBackend, MountOutcome};
     use volumes::mount_point::MountPoint;
@@ -255,15 +270,16 @@ mod tests {
         )
     }
 
-    /// Wait for a message, failing rather than hanging the suite forever.
-    fn next(service: &mut MountService) -> MountProgress {
-        for _ in 0..2000 {
+    /// Block until the worker's next message, by parking on the same waker
+    /// the event loop sleeps on.
+    fn next(service: &mut MountService, wake: &waker::Waker) -> MountProgress {
+        loop {
             if let Some(progress) = service.poll() {
                 return progress;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            assert!(wake.wait(-1));
+            wake.drain();
         }
-        panic!("the worker produced no message");
     }
 
     #[test]
@@ -273,7 +289,7 @@ mod tests {
             volumes::ScriptedBackend::always_succeeding()
         });
         assert_eq!(
-            next(&mut service),
+            next(&mut service, &wake),
             MountProgress::Finished(MountOutcome::Mounted)
         );
     }
@@ -289,7 +305,7 @@ mod tests {
             outcome: MountOutcome::Mounted,
         });
         assert_eq!(
-            next(&mut service),
+            next(&mut service, &wake),
             MountProgress::Prompt {
                 prompt: String::from("Password: "),
                 echo: false,
@@ -297,7 +313,7 @@ mod tests {
         );
         assert!(service.answer(Some(String::from("correct"))));
         assert_eq!(
-            next(&mut service),
+            next(&mut service, &wake),
             MountProgress::Finished(MountOutcome::Mounted)
         );
     }
@@ -314,11 +330,8 @@ mod tests {
             rounds: 1,
             outcome: MountOutcome::Mounted,
         });
-        assert!(
-            wake.wait(2000),
-            "the loop must be woken to paint the prompt"
-        );
-        let _ = next(&mut service);
+        assert!(wake.wait(-1), "the loop must be woken to paint the prompt");
+        let _ = next(&mut service, &wake);
         service.answer(None);
     }
 
@@ -333,11 +346,14 @@ mod tests {
             outcome: MountOutcome::Mounted,
         });
         for _ in 0..3 {
-            assert!(matches!(next(&mut service), MountProgress::Prompt { .. }));
+            assert!(matches!(
+                next(&mut service, &wake),
+                MountProgress::Prompt { .. }
+            ));
             assert!(service.answer(Some(String::from("correct"))));
         }
         assert_eq!(
-            next(&mut service),
+            next(&mut service, &wake),
             MountProgress::Finished(MountOutcome::Mounted)
         );
     }
@@ -351,10 +367,13 @@ mod tests {
             rounds: 1,
             outcome: MountOutcome::Mounted,
         });
-        assert!(matches!(next(&mut service), MountProgress::Prompt { .. }));
+        assert!(matches!(
+            next(&mut service, &wake),
+            MountProgress::Prompt { .. }
+        ));
         assert!(service.answer(None));
         assert_eq!(
-            next(&mut service),
+            next(&mut service, &wake),
             MountProgress::Finished(MountOutcome::Cancelled)
         );
     }
@@ -369,17 +388,13 @@ mod tests {
             rounds: 1,
             outcome: MountOutcome::Mounted,
         });
-        assert!(matches!(next(&mut service), MountProgress::Prompt { .. }));
+        assert!(matches!(
+            next(&mut service, &wake),
+            MountProgress::Prompt { .. }
+        ));
         let worker = service.worker.take().expect("the worker is running");
         drop(service);
-        for _ in 0..2000 {
-            if worker.is_finished() {
-                worker.join().expect("the worker ends cleanly");
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        panic!("the worker is still blocked on a prompt nobody will answer");
+        worker.join().expect("the worker ends cleanly");
     }
 
     /// A helper notice arrives between prompts and is worthless afterwards,
@@ -387,8 +402,8 @@ mod tests {
     #[test]
     fn a_notice_reaches_the_ui_as_its_own_message() {
         let wake = waker::Waker::new().expect("an eventfd");
-        let (progress, rx) = std::sync::mpsc::channel();
-        let (_reply_tx, replies) = std::sync::mpsc::channel();
+        let (progress, mut rx) = Rings::open();
+        let (_reply_tx, replies) = Rings::open();
         let mut prompt = ChannelPrompt {
             progress,
             replies,
@@ -396,8 +411,8 @@ mod tests {
         };
         prompt.notify("2 attempts remaining");
         assert_eq!(
-            rx.try_recv(),
-            Ok(MountProgress::Notice(String::from("2 attempts remaining")))
+            rx.pop(),
+            Some(MountProgress::Notice(String::from("2 attempts remaining")))
         );
     }
 
@@ -406,8 +421,8 @@ mod tests {
     #[test]
     fn a_prompt_with_no_listener_dismisses_rather_than_blocking() {
         let wake = waker::Waker::new().expect("an eventfd");
-        let (progress, dropped) = std::sync::mpsc::channel();
-        let (_reply_tx, replies) = std::sync::mpsc::channel();
+        let (progress, dropped) = Rings::open();
+        let (_reply_tx, replies) = Rings::open();
         drop(dropped);
         let mut prompt = ChannelPrompt {
             progress,

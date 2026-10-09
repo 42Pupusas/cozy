@@ -15,4 +15,6 @@ statusbar    = { path = "../../crates/statusbar" }
 platform     = { path = "../../crates/platform" }
 config       = { path = "../../crates/config" }
 waker        = { path = "../../crates/waker" }
+panel-ui     = { path = "../../crates/panel-ui" }
+quetzalcoatl = { workspace = true }
 headless-stress = { path = "../../crates/headless-stress" }

@@ -12,6 +12,8 @@ localtime    = { path = "../localtime" }
 font         = { path = "../font" }
 config       = { path = "../config" }
 waker        = { path = "../waker" }
+inotify-events = { path = "../inotify-events" }
+ququmatz     = { workspace = true }
 dbus         = { path = "../dbus" }
 quetzalcoatl = { workspace = true }
 json-bourne  = { workspace = true }

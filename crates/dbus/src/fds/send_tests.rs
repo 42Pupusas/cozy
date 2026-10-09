@@ -10,9 +10,9 @@
 
 use std::os::fd::AsFd;
 
+use super::SocketPair;
 use super::marked_file::MarkedFile;
 use super::test_fds::{FdTestGuard, LoanedFds};
-use super::SocketPair;
 use crate::conn::{DbusConn, DbusError};
 use crate::value::Value;
 
@@ -303,7 +303,9 @@ fn sending_a_descriptor_leaves_the_senders_copy_open() {
         .expect("send");
     let _ = linked.receiver.read_frame().expect("read");
 
-    let owned = file.try_clone().expect("the sender's descriptor stays open");
+    let owned = file
+        .try_clone()
+        .expect("the sender's descriptor stays open");
     assert_eq!(MarkedFile::read_through(&owned.into()), "still-mine");
 }
 

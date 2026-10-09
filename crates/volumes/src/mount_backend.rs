@@ -71,9 +71,9 @@ impl MountOutcome {
     pub fn message(&self) -> Option<String> {
         match self {
             Self::Mounted | Self::Cancelled => None,
-            Self::NeedsAuthorization => {
-                Some(String::from("Authentication is required to mount this device."))
-            }
+            Self::NeedsAuthorization => Some(String::from(
+                "Authentication is required to mount this device.",
+            )),
             Self::Denied => Some(String::from(
                 "You do not have permission to mount this device.",
             )),
@@ -202,7 +202,10 @@ mod tests {
     fn the_default_unmount_refuses_rather_than_pretending() {
         let outcome = RefusingBackend.unmount(Path::new("/run/media/bob/K"));
         assert!(!outcome.is_mounted());
-        assert!(!outcome.is_retryable(), "a missing feature is not retryable");
+        assert!(
+            !outcome.is_retryable(),
+            "a missing feature is not retryable"
+        );
     }
 
     /// The trait must be usable as a trait object, since the UI holds one

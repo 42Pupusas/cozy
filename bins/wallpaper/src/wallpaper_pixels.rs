@@ -56,7 +56,7 @@ impl WallpaperPixels {
         rgba.resize(out.len() * 4, 0);
         self.mode
             .blit_into(&self.image, width, height, pad, &mut rgba);
-        for (destination, pixel) in out.iter_mut().zip(rgba.chunks_exact(4)) {
+        for (destination, pixel) in out.iter_mut().zip(rgba.as_chunks::<4>().0.iter()) {
             *destination = Self::pack_xrgb(pixel);
         }
     }

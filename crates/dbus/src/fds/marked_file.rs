@@ -15,7 +15,8 @@ pub struct MarkedFile {
 
 impl MarkedFile {
     pub fn new(marker: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("cozy-conn-fd-{}-{marker}", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("cozy-conn-fd-{}-{marker}", std::process::id()));
         let mut file = std::fs::File::create(&path).expect("create");
         file.write_all(marker.as_bytes()).expect("write");
         Self { path }

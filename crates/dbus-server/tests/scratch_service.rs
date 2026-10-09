@@ -28,6 +28,16 @@ use dbus::conn::{DbusConn, DbusError};
 use dbus::message::Reply;
 use dbus::value::Value;
 use dbus_server::{Dispatcher, InterfaceDescriptor, ServerLoop};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::{Consumer, Producer, RingBuffer};
+
+struct Rendezvous;
+
+impl Rendezvous {
+    fn open() -> (Producer<()>, Consumer<()>) {
+        RingBuffer::new(Capacity::exact(2)).split()
+    }
+}
 
 const SCRATCH_PATH: &str = "/org/freedesktop/dbusserver/Scratch";
 const SCRATCH_IFACE: &str = "org.freedesktop.dbusserver.Scratch1";
@@ -83,7 +93,7 @@ fn session_bus_reachable() -> bool {
 /// `RequestName` completes and see a spurious `ServiceUnknown` instead of
 /// exercising the scratch service at all.
 fn spawn_server(name: &'static str, count: usize) -> std::thread::JoinHandle<()> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, mut ready_rx) = Rendezvous::open();
     let handle = std::thread::spawn(move || {
         let conn = DbusConn::session().expect("session bus was reachable a moment ago");
         let mut server = ServerLoop::new(conn, scratch_dispatcher());
@@ -92,7 +102,7 @@ fn spawn_server(name: &'static str, count: usize) -> std::thread::JoinHandle<()>
             Ok(false) => panic!("another connection already owns {name}"),
             Err(e) => panic!("could not claim {name}: {e}"),
         }
-        let _ = ready_tx.send(());
+        let _ = ready_tx.push(());
         // Loop on real dispatched calls, not on `serve_one` invocations:
         // this connection also receives unsolicited bus housekeeping
         // (e.g. `NameAcquired` right after `RequestName`), which
@@ -110,7 +120,7 @@ fn spawn_server(name: &'static str, count: usize) -> std::thread::JoinHandle<()>
         }
     });
     ready_rx
-        .recv()
+        .pop_block()
         .expect("server thread should signal readiness before panicking");
     handle
 }
@@ -262,8 +272,8 @@ fn scratch_service_emits_a_signal_an_external_client_can_receive() {
     // claimed the name, and the client signals once it has subscribed
     // (so the signal isn't emitted before anyone is listening for it) --
     // the bus does not buffer broadcasts for latecomers.
-    let (server_ready_tx, server_ready_rx) = std::sync::mpsc::channel::<()>();
-    let (client_subscribed_tx, client_subscribed_rx) = std::sync::mpsc::channel::<()>();
+    let (server_ready_tx, mut server_ready_rx) = Rendezvous::open();
+    let (client_subscribed_tx, mut client_subscribed_rx) = Rendezvous::open();
 
     let handle = std::thread::spawn(move || {
         let conn = DbusConn::session().expect("session bus was reachable a moment ago");
@@ -273,9 +283,9 @@ fn scratch_service_emits_a_signal_an_external_client_can_receive() {
             Ok(false) => panic!("another connection already owns {NAME}"),
             Err(e) => panic!("could not claim {NAME}: {e}"),
         }
-        let _ = server_ready_tx.send(());
+        let _ = server_ready_tx.push(());
         client_subscribed_rx
-            .recv()
+            .pop_block()
             .expect("test thread should signal once subscribed");
 
         // Emit the signal directly on the server's connection (not
@@ -294,7 +304,7 @@ fn scratch_service_emits_a_signal_an_external_client_can_receive() {
     });
 
     server_ready_rx
-        .recv()
+        .pop_block()
         .expect("server thread should signal readiness before panicking");
 
     let Some(mut client) = client() else {
@@ -307,7 +317,7 @@ fn scratch_service_emits_a_signal_an_external_client_can_receive() {
     client
         .add_match(&format!("type='signal',interface='{SCRATCH_IFACE}'"))
         .expect("add_match should succeed");
-    let _ = client_subscribed_tx.send(());
+    let _ = client_subscribed_tx.push(());
 
     // Skip past whatever bus housekeeping (e.g. this connection's own
     // `NameAcquired`) arrives ahead of the scratch service's signal.

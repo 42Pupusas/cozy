@@ -92,12 +92,10 @@ impl SecretResponse {
 
 impl Drop for SecretResponse {
     fn drop(&mut self) {
-        for byte in &mut self.bytes {
-            // A volatile write would be stronger, but this crate takes no
-            // dependencies; the vector is dropped immediately after, so the
-            // window is a single statement.
-            *byte = 0;
-        }
+        // A volatile write would be stronger, but this crate takes no
+        // dependencies; the vector is dropped immediately after, so the
+        // window is a single statement.
+        self.bytes.fill(0);
     }
 }
 
@@ -139,8 +137,7 @@ impl HelperSession {
         if !Self::socket_available() {
             return Err(SessionError::NoHelperSocket);
         }
-        let mut stream =
-            UnixStream::connect(Self::SOCKET_PATH).map_err(SessionError::Connect)?;
+        let mut stream = UnixStream::connect(Self::SOCKET_PATH).map_err(SessionError::Connect)?;
         write!(stream, "{user}\n{cookie}\n").map_err(SessionError::Io)?;
         stream.flush().map_err(SessionError::Io)?;
         Ok(Self { stream })

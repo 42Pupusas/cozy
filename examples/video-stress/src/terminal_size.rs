@@ -158,7 +158,9 @@ impl TerminalSize {
 
     /// Clamp a fitted extent into the grid, never returning zero cells.
     fn at_least_one(fitted: u64, limit: u32) -> u32 {
-        u32::try_from(fitted).unwrap_or(limit).clamp(1, limit.max(1))
+        u32::try_from(fitted)
+            .unwrap_or(limit)
+            .clamp(1, limit.max(1))
     }
 }
 

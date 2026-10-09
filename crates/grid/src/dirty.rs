@@ -155,9 +155,7 @@ impl DirtyRegion {
 
     /// Mark every row dirty (full redraw).
     pub(crate) fn mark_all(&mut self) {
-        for w in &mut self.words {
-            *w = u64::MAX;
-        }
+        self.words.fill(u64::MAX);
     }
 
     /// Take a snapshot of current dirty rows and reset the tracker.
@@ -203,9 +201,7 @@ impl DirtyRegion {
             }
         }
         // Reset.
-        for w in &mut self.words {
-            *w = 0;
-        }
+        self.words.fill(0);
         DirtySnapshot {
             rows,
             cols: self.cols,
@@ -218,9 +214,7 @@ impl DirtyRegion {
 
     /// Reset the tracker without emitting any rows (a clean, empty snapshot).
     pub(crate) fn clear(&mut self) {
-        for w in &mut self.words {
-            *w = 0;
-        }
+        self.words.fill(0);
     }
 }
 

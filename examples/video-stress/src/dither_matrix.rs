@@ -16,12 +16,7 @@ const ORDER: usize = 4;
 const RANK_STEP: u8 = 16;
 
 /// The 4x4 Bayer matrix, in its conventional 0..15 ranking.
-const RANKS: [[u8; ORDER]; ORDER] = [
-    [0, 8, 2, 10],
-    [12, 4, 14, 6],
-    [3, 11, 1, 9],
-    [15, 7, 13, 5],
-];
+const RANKS: [[u8; ORDER]; ORDER] = [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]];
 
 /// Position-dependent thresholds spread evenly across the coverage range.
 pub struct DitherMatrix {

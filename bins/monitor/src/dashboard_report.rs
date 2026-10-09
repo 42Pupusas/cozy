@@ -12,9 +12,9 @@
 
 use sysmon::{MonitorSample, ProcessInfo};
 
-/// One dashboard card's text content, in the exact order it is painted: a
-/// title, right-aligned metadata, a hero number with its unit, and a row of
-/// label/value detail pairs.
+/// One device's text content. `meta` is the static identity of the device
+/// and belongs on the info card; `hero` and `details` change every sample and
+/// belong on the device's chart tile.
 pub struct CardReport {
     pub title: &'static str,
     pub meta: String,
@@ -97,7 +97,6 @@ impl DashboardReport {
             hero: format!("{:.0}", sample.memory),
             unit: "%",
             details: vec![
-                ("Used", format!("{:.0}%", sample.memory)),
                 (
                     "Available",
                     format!("{:.1} GB", sample.memory_available_mb / 1024.0),
@@ -129,13 +128,12 @@ impl DashboardReport {
         };
         CardReport {
             title: "Network",
-            meta: sample.network_device.clone(),
+            meta: format!("{} · {link}", sample.network_device),
             hero: format!("{:.1}", sample.network_ping_ms),
             unit: "ms",
             details: vec![
                 ("RX", format!("{:.2} MB/s", sample.network_rx)),
                 ("TX", format!("{:.2} MB/s", sample.network_tx)),
-                ("LINK", link),
             ],
         }
     }
@@ -153,7 +151,7 @@ mod tests {
             ..Default::default()
         };
         let report = DashboardReport::from_sample(&sample, &[]);
-        assert_eq!(report.memory.details[2].1, "ZRAM —");
+        assert_eq!(report.memory.details[1].1, "ZRAM —");
     }
 
     #[test]
@@ -164,7 +162,7 @@ mod tests {
             ..Default::default()
         };
         let report = DashboardReport::from_sample(&sample, &[]);
-        assert_eq!(report.memory.details[2].1, "0.5/2.0 GB");
+        assert_eq!(report.memory.details[1].1, "0.5/2.0 GB");
     }
 
     #[test]
@@ -174,7 +172,11 @@ mod tests {
             ..Default::default()
         };
         let report = DashboardReport::from_sample(&sample, &[]);
-        assert_eq!(report.network.details[2].1, "Up");
+        assert!(
+            report.network.meta.ends_with("Up"),
+            "{}",
+            report.network.meta
+        );
     }
 
     #[test]

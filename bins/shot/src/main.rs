@@ -10,13 +10,18 @@ use clipboard::ScreenshotPayload;
 use clipboard_wayland::ClipboardSession;
 mod drag_selection;
 mod headless;
+mod niri_windows;
 mod output_registry;
+mod png_delivery;
 mod seat_devices;
 mod selection_overlay;
 mod selection_painter;
 mod shot_archive;
 mod shot_options;
 mod shot_writer;
+mod window_command;
+mod window_selector;
+mod window_source;
 
 use output_registry::OutputRegistry;
 use platform::conn::Sender;
@@ -25,13 +30,14 @@ use platform::id::{CompositorId, LayerShellId, RegistryId, ScreencopyManagerId, 
 use platform::protocol as proto;
 use platform::surface::{GlobalCollector, RegistryDiscovery, SurfaceBootstrap};
 use platform::{PlatformError, Result};
+use png_delivery::PngDelivery;
 use quetzalcoatl::spsc::Consumer;
 use screencopy::{CaptureRegion, ScreencopySession};
 use seat_devices::SeatDevices;
 use selection_overlay::SelectionOverlay;
-use shot_archive::ShotArchive;
-use shot_options::{CaptureTarget, ShotOptions};
+use shot_options::{CaptureTarget, ShotAction, ShotOptions};
 use shot_writer::ShotWriter;
+use window_command::WindowCommand;
 
 /// Capture is a short-lived, low-event-rate operation: a registry burst, a
 /// handful of frame events, done. It never needs the deep ring a live window
@@ -251,36 +257,11 @@ impl ShotApp {
             )
             .map_err(|e| e.to_string())?;
         let png = ShotWriter::encode(&frame)?;
-        // Archive first, and always. Clipboard publishing parks this process
-        // for as long as it owns the selection, so anything sequenced after it
-        // would not happen until the user copied something else -- and would
-        // never happen at all if the process were killed while waiting.
-        let archived = options.save.then(|| Self::archive(&png)).transpose()?;
+        let path = PngDelivery::new(&png, options).persist()?;
         if options.clipboard {
-            // A saved copy doubles as the clipboard's `text/uri-list` target,
-            // so pasting into a file manager lands the permanent file rather
-            // than a temporary that this process deletes on exit.
-            let path = options.output_path.as_deref().or(archived.as_deref());
-            self.publish_clipboard(&png, path)?;
-        } else if archived.is_none() || options.output_path.is_some() {
-            // With `--save` alone the bytes are already on disk; writing them
-            // again to stdout would dump a PNG into the user's terminal.
-            ShotWriter::write(&png, options.output_path.as_deref())?;
+            self.publish_clipboard(&png, path.as_deref())?;
         }
         Ok(())
-    }
-
-    /// Write a timestamped copy into the screenshot archive.
-    ///
-    /// The path is reported on stdout so a keybind wrapper or script can pick
-    /// it up, and so a user running this by hand can see where it went.
-    fn archive(png: &[u8]) -> std::result::Result<std::path::PathBuf, String> {
-        let now = localtime::LocalTime::now()
-            .ok_or_else(|| "cannot read the local time to name the file".to_string())?;
-        let path = ShotArchive::from_environment()?.reserve(&now)?;
-        ShotWriter::write(png, Some(&path))?;
-        println!("{}", path.display());
-        Ok(path)
     }
 
     /// Resolve what to capture, running the interactive picker when asked.
@@ -417,6 +398,9 @@ impl ShotApp {
             CaptureTarget::Selection(_) => Err(
                 "internal: interactive selection must be resolved before this point".to_string(),
             ),
+            CaptureTarget::Window(_) => {
+                Err("internal: window capture does not go through an output".to_string())
+            }
             CaptureTarget::Output(name) => self
                 .outputs
                 .by_name(name)
@@ -454,6 +438,12 @@ impl Application {
 
     fn run() -> std::result::Result<(), String> {
         let options = ShotOptions::parse(std::env::args_os())?;
+        if options.action == ShotAction::ListWindows {
+            return WindowCommand::list();
+        }
+        if matches!(options.target, CaptureTarget::Window(_)) {
+            return WindowCommand::capture(&options);
+        }
         let wake = waker::Waker::new().map_err(|e| PlatformError::ReaderSpawn(e).to_string())?;
         ShotApp::connect(wake)?.run(&options)
     }

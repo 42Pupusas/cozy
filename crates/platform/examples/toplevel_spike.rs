@@ -145,7 +145,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("window opened at {:?}", window.size());
 
-    let mut ticks = 0u32;
     loop {
         window.tick(&mut painter)?;
 
@@ -159,22 +158,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        ticks += 1;
         if let Some(max) = args.max_frames
             && painter.frames >= max
         {
             println!("painted {} frames; exiting", painter.frames);
             break;
         }
-        // A guard so a compositor that never configures us cannot hang a
-        // scripted run forever.
-        if args.max_frames.is_some() && ticks > 10_000 {
-            return Err("timed out waiting for frames".into());
-        }
-
-        // Keep asking for frames so the band animates.
         window.request_redraw();
-        window.wait(16);
+        window.wait(-1);
     }
 
     println!("painted {} frames total", painter.frames);

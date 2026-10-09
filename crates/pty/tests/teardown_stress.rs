@@ -30,10 +30,10 @@
 //! `cargo test -p pty --test teardown_stress -- --ignored --nocapture`.
 
 use pty::{Pty, PtyInput, WinSize};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::{Consumer, Producer, RingBuffer};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const WIN: WinSize = WinSize {
     rows: 24,
@@ -65,6 +65,22 @@ enum StopMode {
 }
 
 impl TeardownCycle {
+    const INPUT_SLOTS: usize = 4;
+    const OUTPUT_SLOTS: usize = 2;
+
+    fn rings() -> (
+        Producer<PtyInput>,
+        Consumer<PtyInput>,
+        Producer<()>,
+        Consumer<()>,
+    ) {
+        let (inputs, inputs_rx) =
+            RingBuffer::<PtyInput>::new(Capacity::exact(Self::INPUT_SLOTS)).split();
+        let (first_output, first_output_rx) =
+            RingBuffer::<()>::new(Capacity::exact(Self::OUTPUT_SLOTS)).split();
+        (inputs, inputs_rx, first_output, first_output_rx)
+    }
+
     const fn new(shell_command: &'static str, stop: StopMode) -> Self {
         Self {
             shell_command,
@@ -90,15 +106,12 @@ impl TeardownCycle {
         )
         .expect("Pty::spawn");
 
-        let inputs: Arc<Mutex<VecDeque<PtyInput>>> = Arc::new(Mutex::new(VecDeque::new()));
-        let seen = Arc::new(AtomicUsize::new(0));
+        let (inputs, mut inputs_rx, first_output, mut first_output_rx) = Self::rings();
 
-        let inputs_loop = Arc::clone(&inputs);
-        let seen_loop = Arc::clone(&seen);
         let handle = std::thread::spawn(move || {
-            let next_input = move || inputs_loop.lock().unwrap().pop_front();
-            let on_output = move |bytes: &[u8]| {
-                seen_loop.fetch_add(bytes.len(), Ordering::Relaxed);
+            let next_input = move || inputs_rx.pop();
+            let on_output = move |_: &[u8]| {
+                let _ = first_output.push(());
                 true
             };
             let outcome = pty.run(next_input, on_output).map_err(|e| e.to_string());
@@ -108,11 +121,11 @@ impl TeardownCycle {
             outcome
         });
 
-        Self::wait_for_output(&seen);
+        let _ = first_output_rx.pop_block();
 
         match self.stop {
             StopMode::QuitMessage => {
-                inputs.lock().unwrap().push_back(PtyInput::Quit);
+                assert!(inputs.push(PtyInput::Quit).is_ok());
                 wake.signal();
             }
             StopMode::ShutdownFlag => {
@@ -122,15 +135,6 @@ impl TeardownCycle {
         }
 
         handle.join().expect("event loop thread panicked")
-    }
-
-    /// Wait until the child has produced some output, so a read SQE is
-    /// certainly armed when the stop request arrives.
-    fn wait_for_output(seen: &Arc<AtomicUsize>) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while seen.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(1));
-        }
     }
 
     /// Allocate and free a burst of blocks sized like the PTY buffers, to
@@ -153,7 +157,10 @@ impl TeardownCycle {
 #[test]
 #[ignore = "stress probe: minutes long, run explicitly when hunting the abort"]
 fn repeated_quit_teardown_under_output_does_not_corrupt_the_heap() {
-    let cycle = TeardownCycle::new("while :; do echo spew_spew_spew; done", StopMode::QuitMessage);
+    let cycle = TeardownCycle::new(
+        "while :; do echo spew_spew_spew; done",
+        StopMode::QuitMessage,
+    );
     for iteration in 0..300 {
         let outcome = cycle.run();
         assert!(
@@ -230,13 +237,12 @@ fn immediate_teardown_with_a_read_in_flight_does_not_corrupt_the_heap() {
         )
         .expect("Pty::spawn");
 
-        let inputs: Arc<Mutex<VecDeque<PtyInput>>> = Arc::new(Mutex::new(VecDeque::new()));
-        inputs.lock().unwrap().push_back(PtyInput::Quit);
+        let (inputs, mut inputs_rx, _first_output, _first_output_rx) = TeardownCycle::rings();
+        assert!(inputs.push(PtyInput::Quit).is_ok());
         wake.signal();
 
-        let inputs_loop = Arc::clone(&inputs);
         let handle = std::thread::spawn(move || {
-            let next_input = move || inputs_loop.lock().unwrap().pop_front();
+            let next_input = move || inputs_rx.pop();
             let on_output = |_: &[u8]| true;
             let outcome = pty.run(next_input, on_output).map_err(|e| e.to_string());
             TeardownCycle::churn_heap();

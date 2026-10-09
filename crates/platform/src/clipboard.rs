@@ -19,6 +19,8 @@ use crate::protocol::{
     DataSourceRequest,
 };
 use crate::wire::MessageBuilder;
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::{Consumer, Producer, RingBuffer};
 
 /// Clipboard state: the data device, our outgoing source, the peer's offer,
 /// and the paste channel. `None`/empty fields mean "no clipboard support" or
@@ -39,10 +41,10 @@ pub struct ClipboardState {
     /// pipe to write our clipboard text into.
     awaiting_send_fd: bool,
     /// Paste channel: helper threads that read a paste pipe send the bytes
-    /// here; the UI loop drains it in `tick`. (std mpsc — multiple paste
-    /// helper threads may be in flight, so a multi-producer channel.)
-    paste_tx: std::sync::mpsc::Sender<Vec<u8>>,
-    paste_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    /// here; the UI loop drains it in `tick`. Multiple paste helper threads
+    /// may be in flight, so each holds its own clone of the producer.
+    paste_tx: Producer<Vec<u8>>,
+    paste_rx: Consumer<Vec<u8>>,
     /// The serial from the most recent `wl_keyboard.enter` (keyboard-focus)
     /// event. This is the serial the compositor expects in
     /// `wl_data_device.set_selection`: it proves we hold keyboard focus at
@@ -54,6 +56,8 @@ pub struct ClipboardState {
 }
 
 impl ClipboardState {
+    const PASTE_SLOTS: usize = 16;
+
     /// Create the per-seat data device, if the compositor advertised a
     /// `wl_data_device_manager`. Without one (rare), copy/paste is simply
     /// unavailable and every method below becomes a no-op.
@@ -71,7 +75,7 @@ impl ClipboardState {
             );
             (mgr, dev)
         });
-        let (paste_tx, paste_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (paste_tx, paste_rx) = RingBuffer::new(Capacity::exact(Self::PASTE_SLOTS)).split();
         Self {
             data_device,
             source: None,
@@ -160,7 +164,7 @@ impl ClipboardState {
             use std::io::Read as _;
             let mut buf = Vec::new();
             if reader.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                let _ = tx.send(buf);
+                let _ = tx.push_block(buf);
                 wake.signal();
             }
         });
@@ -168,10 +172,8 @@ impl ClipboardState {
 
     /// Drain any paste bytes a helper thread has finished reading, calling
     /// `push` once per completed paste (in arrival order).
-    pub(crate) fn drain_pastes(&self, mut push: impl FnMut(Vec<u8>)) {
-        while let Ok(bytes) = self.paste_rx.try_recv() {
-            push(bytes);
-        }
+    pub(crate) fn drain_pastes(&mut self, push: impl FnMut(Vec<u8>)) {
+        self.paste_rx.drain(push);
     }
 
     /// Whether a `data_source.send` is in flight, i.e. the next
@@ -300,7 +302,7 @@ mod tests {
     #[test]
     fn drain_pastes_yields_nothing_when_no_helper_thread_has_delivered() {
         let mut window_tx = test_sender();
-        let cb = ClipboardState::new(None, SeatId(1), &mut window_tx);
+        let mut cb = ClipboardState::new(None, SeatId(1), &mut window_tx);
         let mut got = Vec::new();
         cb.drain_pastes(|b| got.push(b));
         assert!(got.is_empty());

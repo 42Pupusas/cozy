@@ -31,14 +31,8 @@ impl TerminalPlayer {
         let header = pack.header();
         let source = Self::subcell_source(header.width, header.height, &options);
         let (columns, rows) = size.fit(source.0, source.1);
-        let ramp = AsciiRamp::new(
-            header.width,
-            header.height,
-            columns,
-            rows,
-            options.subcells,
-        )
-        .with_dither(options.dithered);
+        let ramp = AsciiRamp::new(header.width, header.height, columns, rows, options.subcells)
+            .with_dither(options.dithered);
         Self {
             pack,
             ramp,
@@ -79,7 +73,10 @@ impl TerminalPlayer {
         let started = Instant::now();
         let mut screen = String::new();
         Self::enter_full_screen(out)?;
-        while !self.options.is_complete(stats.presented(), started.elapsed()) {
+        while !self
+            .options
+            .is_complete(stats.presented(), started.elapsed())
+        {
             match clock.tick() {
                 Tick::Present { index, skipped } => {
                     let paint_started = Instant::now();

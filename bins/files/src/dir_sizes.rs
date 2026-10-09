@@ -66,7 +66,7 @@ impl DirSizes {
     /// Fold in every total that has arrived. Returns whether any did, so the
     /// loop knows the tiles need reranking.
     pub fn poll(&mut self) -> bool {
-        let Some(tally) = &self.tally else {
+        let Some(tally) = &mut self.tally else {
             return false;
         };
         let arrived = tally.drain();

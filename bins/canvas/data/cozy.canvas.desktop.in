@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Canvas
+GenericName=Diagram Editor
+Comment=Sketch notes and diagrams on an infinite canvas
+Exec=@EXEC@ %f
+Icon=applications-graphics
+Terminal=false
+Categories=Graphics;Utility;Core;VectorGraphics;
+StartupNotify=true

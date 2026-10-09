@@ -38,8 +38,8 @@
 //! instrumentation should use [`trace!`] instead.
 
 use std::io::Write as _;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 /// One bit per subsystem. Add new variants here as new call sites need them
 /// -- remember to extend [`Channel::ALL`], [`Channel::bit`], [`Channel::name`],
@@ -97,7 +97,16 @@ impl Channel {
 
 enum Sink {
     Stderr,
-    File(Mutex<std::fs::File>),
+    File(std::fs::File),
+}
+
+impl Sink {
+    fn write_line(&self, line: &str) {
+        let _ = match self {
+            Self::Stderr => std::io::stderr().write_all(line.as_bytes()),
+            Self::File(file) => (&*file).write_all(line.as_bytes()),
+        };
+    }
 }
 
 /// Owns the process-global tracing state.
@@ -163,7 +172,7 @@ impl Logger {
                     .create(true)
                     .append(true)
                     .open(&path)
-                    .map_or(Sink::Stderr, |f| Sink::File(Mutex::new(f)))
+                    .map_or(Sink::Stderr, Sink::File)
             })
         })
     }
@@ -172,14 +181,7 @@ impl Logger {
     /// called directly -- use [`trace!`].
     #[doc(hidden)]
     pub fn emit(channel: Channel, args: std::fmt::Arguments) {
-        match Self::sink() {
-            Sink::Stderr => eprintln!("[{:>8}] {args}", channel.name()),
-            Sink::File(f) => {
-                if let Ok(mut f) = f.lock() {
-                    let _ = writeln!(f, "[{:>8}] {args}", channel.name());
-                }
-            }
-        }
+        Self::sink().write_line(&format!("[{:>8}] {args}\n", channel.name()));
     }
 }
 
@@ -240,7 +242,40 @@ impl std::fmt::Display for Escaped<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Channel, Escaped, Logger};
+    use super::{Channel, Escaped, Logger, Sink};
+
+    #[test]
+    fn concurrent_lines_to_an_append_file_arrive_whole() {
+        const THREADS: usize = 8;
+        const LINES: usize = 200;
+        let path = std::env::temp_dir().join(format!("tlog-append-{}", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .expect("open");
+        let sink = Sink::File(file);
+
+        std::thread::scope(|scope| {
+            for t in 0..THREADS {
+                let sink = &sink;
+                scope.spawn(move || {
+                    for n in 0..LINES {
+                        sink.write_line(&format!("[{t}] line {n} {}\n", "x".repeat(200)));
+                    }
+                });
+            }
+        });
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let _ = std::fs::remove_file(&path);
+        let tail = format!(" {}", "x".repeat(200));
+        assert_eq!(text.lines().count(), THREADS * LINES);
+        assert!(
+            text.lines()
+                .all(|l| l.starts_with('[') && l.ends_with(&tail))
+        );
+    }
 
     #[test]
     fn parse_mask_empty_is_zero() {

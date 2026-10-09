@@ -73,8 +73,11 @@ impl CoverageSampler {
                 );
                 for (column, span) in self.column_spans.iter().enumerate() {
                     let (from, to) = (span.0 as usize, (span.1 as usize).min(source_width));
-                    self.lit[base + column] +=
-                        self.scratch[from..to].iter().copied().map(u32::from).sum::<u32>();
+                    self.lit[base + column] += self.scratch[from..to]
+                        .iter()
+                        .copied()
+                        .map(u32::from)
+                        .sum::<u32>();
                 }
             }
         }

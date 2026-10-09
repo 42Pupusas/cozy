@@ -1,0 +1,25 @@
+[package]
+name    = "panel-bluetooth-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[lib]
+name = "panel_bluetooth"
+path = "src/lib.rs"
+
+[[bin]]
+name = "panel-bluetooth"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+panel-ui    = { path = "../../crates/panel-ui" }
+dbus        = { path = "../../crates/dbus" }
+dbus-server = { path = "../../crates/dbus-server" }
+platform    = { path = "../../crates/platform" }
+statusbar   = { path = "../../crates/statusbar" }
+config      = { path = "../../crates/config" }
+waker       = { path = "../../crates/waker" }
+quetzalcoatl = { workspace = true }

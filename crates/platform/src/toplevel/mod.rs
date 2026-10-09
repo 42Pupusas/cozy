@@ -32,7 +32,9 @@
 //! discovery, the common event routing) is reused as-is.
 
 pub mod activation;
+pub mod activation_queue;
 pub mod activation_report;
+pub mod cursor_set;
 pub mod drag;
 pub mod drag_offer;
 pub mod drag_source;
@@ -44,9 +46,12 @@ pub mod lifecycle;
 pub mod modifiers;
 pub mod pointer;
 pub mod shell;
+pub mod text_selection;
 pub mod window;
 
 pub use activation::{Activation, ActivationToken, LaunchEvidence, TOKEN_ENV};
+pub use activation_queue::{ActivationOutcome, ActivationQueue, ActivationTicket, PendingLaunches};
+pub use cursor_set::CursorSet;
 pub use drag::{DragController, Dropped, URI_LIST_MIME};
 pub use drag_offer::DragOffer;
 pub use drag_source::DragSource;

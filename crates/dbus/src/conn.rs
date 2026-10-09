@@ -192,7 +192,9 @@ impl DbusConn {
             .build()
             .map_err(DbusError::Setup)?;
 
-        let cqe = Self::run_one(&mut ring, Sqe::connect(sock_fd, addr.as_bytes()))?;
+        // SAFETY: `addr` outlives the blocking `run_one` below.
+        let connect = unsafe { Sqe::connect(sock_fd, addr.as_bytes()) };
+        let cqe = Self::run_one(&mut ring, connect)?;
         if cqe < 0 {
             return Err(DbusError::Connect(io::Error::from_raw_os_error(-cqe)));
         }
@@ -259,7 +261,7 @@ impl DbusConn {
         let cqe = ring
             .complete()
             .ok_or_else(|| DbusError::Io(io::Error::other("no completion")))?;
-        Ok(cqe.result)
+        Ok(cqe.raw_result())
     }
 
     /// `submit_and_wait`, retrying transparently on `EINTR` — same rationale
@@ -868,6 +870,17 @@ impl DbusConn {
         self.sock_fd.as_i32()
     }
 
+    /// Whether a message is already queued and would be returned by
+    /// [`Self::recv_message`] without touching the socket.
+    ///
+    /// A caller that waits for socket readiness with `poll(2)` must check
+    /// this first: a message read ahead by [`Self::call`] is not readable on
+    /// the fd any more.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     /// Did the peer agree to unix descriptor passing during SASL?
     ///
     /// A caller that means to use an FD-bearing interface should check this
@@ -922,6 +935,31 @@ impl DbusConn {
     /// Convenience: `org.freedesktop.DBus.Properties.Get`, unwrapping the
     /// single returned `Variant` — the overwhelmingly common shape every
     /// property read in this crate's callers wants.
+    /// `org.freedesktop.DBus.Properties.GetAll` — every property of one
+    /// interface as a `a{sv}` dict, the bulk sibling of [`Self::get_property`].
+    /// A property round trip that needs more than one or two fields should
+    /// always come here instead: one call replaces N `Get`s, each of which
+    /// pays its own full bus round trip on this blocking connection.
+    pub fn get_all_properties(
+        &mut self,
+        destination: &str,
+        path: &str,
+        interface: &str,
+    ) -> Result<crate::value::Value, DbusError> {
+        let reply = self.call(
+            destination,
+            path,
+            "org.freedesktop.DBus.Properties",
+            "GetAll",
+            &[BodyArg::Str(interface.to_string())],
+        )?;
+        Ok(reply
+            .values()
+            .into_iter()
+            .next()
+            .unwrap_or(crate::value::Value::Array(Vec::new())))
+    }
+
     pub fn get_property(
         &mut self,
         destination: &str,

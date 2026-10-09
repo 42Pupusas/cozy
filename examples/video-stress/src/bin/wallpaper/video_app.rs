@@ -8,6 +8,7 @@
 
 use crate::video_globals::{VideoGlobals, VideoGlobalsBuilder, VideoOutput, VideoOutputs};
 use crate::video_surface::VideoSurface;
+use platform::PlatformError;
 use platform::Result;
 use platform::conn::Sender;
 use platform::event::RawEvent;
@@ -15,12 +16,9 @@ use platform::id::{DisplayId, ObjectId, RegistryId};
 use platform::protocol::{DisplayEvent, RegistryEvent};
 use platform::surface::{RegistryDiscovery, SurfaceBootstrap};
 use platform::wire::WireEvent;
-use platform::PlatformError;
 use quetzalcoatl::spsc::Consumer;
 use std::time::Instant;
-use video_stress::{
-    FramePack, PlaybackClock, PlaybackStats, PlayerOptions, Tick, VideoPalette,
-};
+use video_stress::{FramePack, PlaybackClock, PlaybackStats, PlayerOptions, Tick, VideoPalette};
 
 const EVENT_RING_CAP: usize = 256;
 

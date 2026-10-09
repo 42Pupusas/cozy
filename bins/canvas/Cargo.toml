@@ -1,0 +1,33 @@
+[package]
+name    = "canvas-bin"
+version = "0.1.0"
+edition.workspace = true
+
+[[bin]]
+name = "canvas"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The window: xdg-shell toplevel, pixel input, and the software canvas.
+platform = { path = "../../crates/platform" }
+# `TextRenderer`: scalable font loading with bitmap fallback, shared with
+# files/monitor rather than reimplemented, so note text behaves identically.
+statusbar = { path = "../../crates/statusbar" }
+# The `[canvas]` table and the terminal palette its unset keys mirror.
+config  = { path = "../../crates/config" }
+waker   = { path = "../../crates/waker" }
+# Typed JSON persistence for the document, shared with the bar's
+# notifications reader rather than adding a second JSON stack.
+json-bourne = { workspace = true }
+# Click-vs-drag threshold for shape grabs.
+widget = { path = "../../crates/widget" }
+headless-stress = { path = "../../crates/headless-stress" }
+
+[dev-dependencies]
+# Only to read `data/cozy.canvas.desktop.in` back with the same parser the
+# launcher uses, so a malformed entry fails the build rather than quietly
+# vanishing from the menu.
+launcher = { path = "../../crates/launcher" }

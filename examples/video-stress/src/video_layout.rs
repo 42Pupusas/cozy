@@ -61,8 +61,13 @@ impl VideoLayout {
         source_height: u32,
         mode: FitMode,
     ) -> Self {
-        let (width, height) =
-            Self::extent(surface_width, surface_height, source_width, source_height, mode);
+        let (width, height) = Self::extent(
+            surface_width,
+            surface_height,
+            source_width,
+            source_height,
+            mode,
+        );
         Self {
             surface_width,
             surface_height,

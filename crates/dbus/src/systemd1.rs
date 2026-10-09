@@ -334,7 +334,9 @@ mod tests {
         let options = props
             .iter()
             .find_map(|p| {
-                let Value::Struct(fields) = p else { return None };
+                let Value::Struct(fields) = p else {
+                    return None;
+                };
                 let key = fields[0].clone().as_display_string()?;
                 (key == "Options").then(|| fields[1].clone().into_inner().as_display_string())?
             })

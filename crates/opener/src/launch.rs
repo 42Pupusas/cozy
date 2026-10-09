@@ -34,10 +34,7 @@ pub enum OpenError {
     /// Nothing on this machine claims the type or scheme.
     NoHandler,
     /// A handler resolved, but the program would not start.
-    SpawnFailed {
-        program: String,
-        reason: String,
-    },
+    SpawnFailed { program: String, reason: String },
 }
 
 impl std::fmt::Display for OpenError {
@@ -195,7 +192,6 @@ impl Opener {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -360,8 +356,8 @@ mod tests {
     #[test]
     fn a_carried_token_reaches_the_launched_process() {
         let probe = EnvProbe::new("token", "$XDG_ACTIVATION_TOKEN");
-        let opener = Opener::new(probe.handlers())
-            .with_activation(Some(ActivationToken::new("tok-abc")));
+        let opener =
+            Opener::new(probe.handlers()).with_activation(Some(ActivationToken::new("tok-abc")));
 
         opener.try_open(&probe.target()).expect("spawned");
 

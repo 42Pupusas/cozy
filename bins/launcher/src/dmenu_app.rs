@@ -126,7 +126,7 @@ impl DmenuApp {
             if self.done {
                 break;
             }
-            self.window.wait(100);
+            self.window.wait(-1);
         }
         self.picked
     }

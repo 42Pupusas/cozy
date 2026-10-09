@@ -14,6 +14,8 @@
 //! while the absolute sizes follow the user's font and output. A row that
 //! stayed 49px tall under a 20px font would clip its own glyphs.
 
+use platform::draw::Rect;
+
 /// The spacing scale and the dimensions derived from it.
 ///
 /// `Copy` because it is read constantly during paint and is four words wide;
@@ -255,11 +257,51 @@ impl Spacing {
     pub fn nav_button_height(self) -> i32 {
         self.at(36.0)
     }
+
+    /// How far a hovered tile rises.
+    #[must_use]
+    pub fn tile_lift(self) -> i32 {
+        self.at(3.0)
+    }
+
+    /// Edge of a tile's action button when the tile has room to spare.
+    #[must_use]
+    pub fn action_button(self) -> i32 {
+        self.at(28.0)
+    }
+
+    /// How far each edge of an action button moves out when it is hovered.
+    #[must_use]
+    pub fn action_grow(self) -> i32 {
+        self.at(2.0)
+    }
+
+    /// The smallest action button worth drawing; a tile too narrow for four
+    /// of these shows none.
+    #[must_use]
+    pub fn action_button_min(self) -> i32 {
+        self.at(18.0)
+    }
+
+    /// A tile's face: its cell less the gutter on every side, so neighbours
+    /// read as separate cards.
+    #[must_use]
+    pub fn tile_face(self, cell: Rect) -> Rect {
+        cell.inset(self.gutter())
+    }
+
+    /// Whether a tile face this tall sets its name in the title tier rather
+    /// than the body tier.
+    #[must_use]
+    pub fn is_roomy_tile(self, face_height: i32) -> bool {
+        face_height >= self.tile_min() * 2
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Spacing;
+    use platform::draw::Rect;
 
     /// At the guide's own font size and scale 1, the tokens must reproduce
     /// the guide's literal pixel table -- that is the contract this module
@@ -282,6 +324,10 @@ mod tests {
         assert_eq!(s.tile_floor(), 112);
         assert_eq!(s.card_width(), 304);
         assert_eq!(s.nav_button_height(), 36);
+        assert_eq!(s.tile_lift(), 3);
+        assert_eq!(s.action_button(), 28);
+        assert_eq!(s.action_grow(), 2);
+        assert_eq!(s.action_button_min(), 18);
         assert_eq!(s.storage_height(), 42);
         assert_eq!(s.radius(), 6);
         assert_eq!(s.radius_small(), 3);
@@ -345,6 +391,36 @@ mod tests {
         assert_eq!(two.xl(), one.xl() * 2);
     }
 
+    #[test]
+    fn a_tile_face_is_its_cell_less_the_gutter() {
+        let s = Spacing::new(13.0, 1.0);
+        let face = s.tile_face(Rect::new(10, 20, 100, 80));
+        assert_eq!(face, Rect::new(14, 24, 92, 72));
+    }
+
+    #[test]
+    fn only_a_tall_tile_gets_the_title_tier() {
+        let s = Spacing::new(13.0, 1.0);
+        assert!(!s.is_roomy_tile(s.tile_min() * 2 - 1));
+        assert!(s.is_roomy_tile(s.tile_min() * 2));
+    }
+
+    #[test]
+    fn a_lift_stays_inside_the_gutter() {
+        for font in [8.0, 13.0, 20.0, 40.0] {
+            let s = Spacing::new(font, 1.0);
+            assert!(
+                s.tile_lift() <= s.gutter(),
+                "a lifted tile must not touch its neighbour at {font}"
+            );
+            assert!(s.action_button_min() <= s.action_button());
+            assert!(
+                s.action_grow() * 2 <= s.xs(),
+                "two grown neighbours must not touch at {font}"
+            );
+        }
+    }
+
     /// A degenerate font size or scale must not collapse the layout to zero;
     /// an invisible window is worse than an ugly one.
     #[test]
@@ -375,6 +451,10 @@ mod tests {
             ("control", s.control_height()),
             ("status", s.status_height()),
             ("icon_button", s.icon_button()),
+            ("tile_lift", s.tile_lift()),
+            ("action_button", s.action_button()),
+            ("action_grow", s.action_grow()),
+            ("action_button_min", s.action_button_min()),
             ("tile_min", s.tile_min()),
             ("radius", s.radius()),
             ("radius_small", s.radius_small()),

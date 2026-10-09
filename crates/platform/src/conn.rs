@@ -423,7 +423,8 @@ impl WaylandConn {
         let path_bytes = path.as_os_str().as_encoded_bytes();
         let addr = sys::SockAddrUn::new(path_bytes);
         // SAFETY: `addr` outlives the blocking submit below.
-        let cqe = Sender::run_one(&mut ring_tx, Sqe::connect(sock, addr.as_bytes()))?;
+        let connect = unsafe { Sqe::connect(sock, addr.as_bytes()) };
+        let cqe = Sender::run_one(&mut ring_tx, connect)?;
         if cqe < 0 {
             return Err(ConnError::Connect(io::Error::from_raw_os_error(-cqe)));
         }
@@ -484,11 +485,6 @@ impl WaylandConn {
 /// Owns the send ring and the socket fd. Allocates object ids and submits
 /// requests. Stays on the main thread.
 ///
-/// # Safety
-///
-/// While the underlying `io_uring` ring is `!Send`, the `Sender` is always used
-/// from the main/event-loop thread. The `Send` impl is needed so `Arc<Mutex<Sender>>`
-/// can satisfy `Sync` bounds in winit's `Window` type.
 pub struct Sender {
     sock: RawFd,
     /// Keeps the socket open for both rings; closed when the Sender drops.
@@ -497,16 +493,6 @@ pub struct Sender {
     /// Next client object id. Id 1 is `wl_display`, so we start at 2.
     next_id: u32,
 }
-
-// SAFETY: The Sender is always used from the thread that created it
-// (the main/event-loop thread). It's wrapped in `Arc<Mutex<>>` only for
-// structural reasons — io_uring ops are never submitted from other threads.
-// `ring: IoUring` is the only non-Send field and is exactly the field this
-// impl exists to paper over (clippy's non_send_fields_in_send_ty lint has
-// no other way to express "deliberately unsafe-impl-Send, see the comment
-// above" than to allow it at the impl site).
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl Send for Sender {}
 
 impl std::os::fd::AsRawFd for Sender {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
@@ -545,7 +531,7 @@ impl Sender {
         ring.push(sqe).map_err(ConnError::Submit)?;
         ring.submit_and_wait_retry(1)?;
         let cqe = ring.complete().ok_or(ConnError::NoCompletion)?;
-        Ok(cqe.result)
+        Ok(cqe.raw_result())
     }
 
     /// Create an `AF_UNIX`, `SOCK_STREAM` socket and wrap it in an `OwnedFd`.
@@ -614,8 +600,10 @@ impl Sender {
         self.ring.submit_and_wait_retry(1)?;
         let cqe = self.ring.complete().ok_or(ConnError::NoCompletion)?;
         drop(out);
-        if cqe.result < 0 {
-            return Err(ConnError::Io(io::Error::from_raw_os_error(-cqe.result)));
+        if cqe.raw_result() < 0 {
+            return Err(ConnError::Io(io::Error::from_raw_os_error(
+                -cqe.raw_result(),
+            )));
         }
         Ok(())
     }
@@ -845,11 +833,11 @@ impl Reader {
     fn reap_completions(&mut self, producer: &Producer<RawEvent>) -> Result<Reaped, ConnError> {
         let mut reaped = Reaped::default();
         while let Some(cqe) = self.ring.complete() {
-            if cqe.user_data == UD_TIMER {
-                self.absorb_timer_cqe(cqe.result, producer)?;
+            if cqe.user_data() == UD_TIMER {
+                self.absorb_timer_cqe(cqe.raw_result(), producer)?;
                 reaped.pushed = true;
             } else {
-                let recv = self.absorb_recv_cqe(cqe.result, cqe.flags)?;
+                let recv = self.absorb_recv_cqe(cqe.raw_result(), cqe.flags())?;
                 reaped.closed |= recv.closed;
                 reaped.absorbed |= recv.absorbed;
             }
@@ -1072,26 +1060,6 @@ struct Reaped {
     absorbed: bool,
 }
 
-/// Extends `ququmatz`'s `CqeFlags` with the provided-buffer-id decode --
-/// was a free `buffer_id(flags)` function taking `CqeFlags` as its only
-/// arg, the shape an extension trait exists for (`CqeFlags` is external,
-/// so no inherent impl is possible).
-trait CqeFlagsExt {
-    /// Decode the buffer id from the CQE's flags (upper 16 bits), or `None`
-    /// if the `BUFFER` bit isn't set.
-    fn buffer_id(self) -> Option<u16>;
-}
-
-impl CqeFlagsExt for CqeFlags {
-    fn buffer_id(self) -> Option<u16> {
-        if self.contains(Self::BUFFER) {
-            Some((self.bits() >> 16) as u16)
-        } else {
-            None
-        }
-    }
-}
-
 unsafe extern "C" {
     #[link_name = "socket"]
     fn libc_socket(domain: i32, ty: i32, protocol: i32) -> i32;
@@ -1271,7 +1239,9 @@ mod shutdown_tests {
         assert_eq!(result, 0, "shutdown must succeed on a connected socket");
 
         let mut buf = [0_u8; 8];
-        let read = (&b).read(&mut buf).expect("the peer reads rather than erroring");
+        let read = (&b)
+            .read(&mut buf)
+            .expect("the peer reads rather than erroring");
         assert_eq!(read, 0, "a shut-down connection must report EOF");
 
         // The descriptor is still ours: `fcntl(F_GETFD)` succeeds only while

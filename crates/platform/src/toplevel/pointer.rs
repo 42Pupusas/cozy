@@ -75,6 +75,8 @@ pub struct PointerState {
     /// Serial of the most recent button press, which the compositor requires
     /// to start an interactive move/resize or open a popup.
     last_serial: u32,
+    /// Serial of the last `enter`, which `set_cursor` must quote.
+    enter_serial: u32,
 }
 
 impl PointerState {
@@ -113,9 +115,20 @@ impl PointerState {
         self.last_serial
     }
 
+    /// The serial of the most recent `wl_pointer.enter`.
+    ///
+    /// Distinct from [`Self::last_serial`]: `wl_pointer.set_cursor` must
+    /// quote the *enter* serial, and a window that sets its cursor on hover
+    /// has no button press to quote.
+    #[must_use]
+    pub const fn enter_serial(&self) -> u32 {
+        self.enter_serial
+    }
+
     /// `wl_pointer.enter`.
-    pub const fn enter(&mut self, x: Fixed, y: Fixed) -> PointerEventKind {
+    pub const fn enter(&mut self, serial: u32, x: Fixed, y: Fixed) -> PointerEventKind {
         self.inside = true;
+        self.enter_serial = serial;
         self.position = Self::to_position(x, y);
         PointerEventKind::Enter(self.position)
     }
@@ -250,7 +263,7 @@ mod tests {
     #[test]
     fn entering_records_the_position() {
         let mut p = PointerState::new();
-        let ev = p.enter(px(10), px(20));
+        let ev = p.enter(1, px(10), px(20));
         assert_eq!(ev, PointerEventKind::Enter(Position { x: 10, y: 20 }));
         assert!(p.is_inside());
         assert_eq!(p.position(), Position { x: 10, y: 20 });
@@ -259,7 +272,7 @@ mod tests {
     #[test]
     fn motion_updates_the_position() {
         let mut p = PointerState::new();
-        p.enter(px(0), px(0));
+        p.enter(1, px(0), px(0));
         let ev = p.motion(px(5), px(7));
         assert_eq!(ev, PointerEventKind::Motion(Position { x: 5, y: 7 }));
         assert_eq!(p.position(), Position { x: 5, y: 7 });
@@ -271,14 +284,14 @@ mod tests {
     fn fixed_point_coordinates_are_converted_not_read_raw() {
         let mut p = PointerState::new();
         // 2.5 logical pixels.
-        p.enter(Fixed(640), Fixed(640));
+        p.enter(1, Fixed(640), Fixed(640));
         assert_eq!(p.position(), Position { x: 2, y: 2 });
     }
 
     #[test]
     fn leaving_clears_inside() {
         let mut p = PointerState::new();
-        p.enter(px(1), px(1));
+        p.enter(1, px(1), px(1));
         assert_eq!(p.leave(), PointerEventKind::Leave);
         assert!(!p.is_inside());
     }
@@ -288,7 +301,7 @@ mod tests {
     #[test]
     fn leaving_mid_drag_ends_the_drag() {
         let mut p = PointerState::new();
-        p.enter(px(1), px(1));
+        p.enter(1, px(1), px(1));
         p.button(1, 0x110, true, mods());
         assert!(p.is_dragging());
         p.leave();
@@ -302,7 +315,7 @@ mod tests {
     #[test]
     fn pressing_and_releasing_tracks_the_held_button() {
         let mut p = PointerState::new();
-        p.enter(px(3), px(4));
+        p.enter(1, px(3), px(4));
 
         let ev = p.button(7, 0x110, true, mods());
         assert_eq!(
@@ -332,7 +345,7 @@ mod tests {
     #[test]
     fn releasing_another_button_does_not_end_the_drag() {
         let mut p = PointerState::new();
-        p.enter(px(0), px(0));
+        p.enter(1, px(0), px(0));
         p.button(1, 0x110, true, mods());
         p.button(2, 0x111, false, mods());
         assert_eq!(
@@ -355,6 +368,34 @@ mod tests {
 
     /// Only presses carry a usable serial; overwriting it on release would
     /// hand the compositor a stale serial for popups and interactive moves.
+    #[test]
+    fn entering_records_the_serial_set_cursor_must_quote() {
+        let mut p = PointerState::new();
+        assert_eq!(p.enter_serial(), 0, "nothing to quote before an enter");
+        p.enter(42, px(1), px(1));
+        assert_eq!(p.enter_serial(), 42);
+    }
+
+    #[test]
+    fn the_enter_serial_is_not_the_button_serial() {
+        // set_cursor needs the enter serial specifically; a press must not
+        // overwrite it, or the cursor request quotes the wrong one.
+        let mut p = PointerState::new();
+        p.enter(7, px(1), px(1));
+        p.button(99, 0x110, true, ModifierState::default());
+        assert_eq!(p.enter_serial(), 7);
+        assert_eq!(p.last_serial(), 99);
+    }
+
+    #[test]
+    fn re_entering_updates_the_serial() {
+        let mut p = PointerState::new();
+        p.enter(5, px(1), px(1));
+        p.leave();
+        p.enter(6, px(1), px(1));
+        assert_eq!(p.enter_serial(), 6);
+    }
+
     #[test]
     fn only_presses_update_the_serial() {
         let mut p = PointerState::new();
@@ -435,7 +476,7 @@ mod tests {
     #[test]
     fn a_scroll_reports_the_position_under_the_pointer() {
         let mut p = PointerState::new();
-        p.enter(px(40), px(80));
+        p.enter(1, px(40), px(80));
         let Some(PointerEventKind::Scroll { at, .. }) = p.axis(0, px(15), mods()) else {
             panic!("expected a scroll");
         };

@@ -6,5 +6,8 @@ edition.workspace = true
 [dependencies]
 dbus = { path = "../dbus" }
 
+[dev-dependencies]
+quetzalcoatl = { workspace = true }
+
 [lints]
 workspace = true

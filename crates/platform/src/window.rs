@@ -202,13 +202,7 @@ pub struct TermWindow {
     /// The serial of the last press or key-down, which is what makes a token
     /// request trustworthy. See [`crate::input_serial::InputSerial`].
     input_serial: crate::input_serial::InputSerial,
-    /// Events pulled off the ring during a token exchange that were not the
-    /// exchange's own answer.
-    ///
-    /// They must be routed afterwards rather than dropped: this consumer is
-    /// the window's only source of pointer, keyboard, configure and frame
-    /// events, and discarding them loses input and stalls presentation.
-    deferred: std::collections::VecDeque<RawEvent>,
+    activations: crate::toplevel::activation_queue::ActivationQueue,
 
     /// Keyboard auto-repeat: the held key, negotiated rate/delay, and the
     /// `timerfd` that paces synthesized repeats. Extracted from this struct
@@ -537,7 +531,7 @@ impl TermWindow {
             keyboard: None,
             activation: activation.map(crate::toplevel::activation::Activation::new),
             input_serial: crate::input_serial::InputSerial::new(),
-            deferred: std::collections::VecDeque::new(),
+            activations: crate::toplevel::activation_queue::ActivationQueue::new(),
             key_repeat: crate::key_repeat::KeyRepeatState::new(repeat_timer),
             modifiers: Modifiers::default(),
             xkb: None,
@@ -727,6 +721,21 @@ impl TermWindow {
         self.wake.drain();
     }
 
+    /// [`Self::wait`], also returning when `extra` becomes readable. The
+    /// caller reads `extra` itself on the next pass.
+    pub fn wait_also_on(&self, timeout_ms: i32, extra: Option<std::os::fd::RawFd>) {
+        let Some(extra) = extra else {
+            return self.wait(timeout_ms);
+        };
+        let mut set = waker::PollSet::new();
+        let wake = set.watch(self.wake.raw_fd(), waker::Interest::Readable);
+        set.watch(extra, waker::Interest::Readable);
+        let _ = set.wait(timeout_ms);
+        if set.is_ready(wake) {
+            self.wake.drain();
+        }
+    }
+
     /// Process pending Wayland events (non-blocking).
     /// Returns `true` while the window should stay open.
     pub fn tick(&mut self) -> Result<bool> {
@@ -757,14 +766,6 @@ impl TermWindow {
         self.sender
             .drain_requests(&mut self.request_rx)
             .map_err(PlatformError::Conn)?;
-
-        // Deferred events first, in arrival order: they came off the ring
-        // before anything still queued, and routing them late would reorder
-        // input against the events that followed them.
-        self.handle_deferred()?;
-        if self.lifecycle.is_closing() {
-            return Ok(false);
-        }
 
         // Drain all queued events non-blocking.
         while let Some(ev) = self.events.pop() {
@@ -847,6 +848,20 @@ impl TermWindow {
         }
         let alpha = self.renderer.background_alpha();
         self.pixels.update_custom_argb(self.width, damage, alpha);
+    }
+
+    /// Milliseconds until the bell's title flash must be reverted, if one is
+    /// showing. A deadline the loop has to wake for: nothing else signals
+    /// when it passes.
+    #[must_use]
+    pub fn bell_wait_ms(&self) -> Option<i32> {
+        let until = self.bell_until?;
+        let remaining = until.saturating_duration_since(std::time::Instant::now());
+        Some(
+            i32::try_from(remaining.as_millis())
+                .unwrap_or(i32::MAX)
+                .max(1),
+        )
     }
 
     /// Whether the caller should keep polling at animation-frame-rate
@@ -1012,45 +1027,62 @@ impl TermWindow {
         self.shell.set_title(&self.window_tx, title);
     }
 
-    /// Mint an activation token for a program this window is about to
-    /// launch, so the launched window may raise itself.
+    /// Ask for an activation token for a program this window is about to
+    /// launch, so the launched window may raise itself, and return at once.
     ///
     /// Call this from the handler for the input event that caused the launch
     /// -- a Ctrl+click on a link. The token carries that event's serial and
     /// this window's surface, which together are the compositor's own
     /// evidence that a user acted.
     ///
-    /// Returns `None` when the compositor offers no `xdg_activation_v1`,
-    /// when no input has been seen yet, or when the compositor does not
-    /// answer in time. All three mean "launch without a token": the child
-    /// still starts, it simply appears where it already lived.
+    /// The answer is collected with [`Self::next_activation`], matched to the
+    /// returned ticket. When the compositor offers no `xdg_activation_v1`, or
+    /// no input has been seen yet, the ticket resolves at once with no token.
+    /// That means "launch without one": the child still starts, it simply
+    /// appears where it already lived.
     ///
     /// `app_id` names the program being launched, not this one.
-    pub fn activation_token(
+    pub fn request_activation_token(
         &mut self,
         app_id: Option<&str>,
-    ) -> Option<crate::toplevel::activation::ActivationToken> {
-        let activation = self.activation?;
-        let serial = self.input_serial.get()?;
+    ) -> crate::toplevel::activation_queue::ActivationTicket {
+        let (Some(activation), Some(serial)) = (self.activation, self.input_serial.get()) else {
+            return self.resolve_activation_unavailable();
+        };
         // The id must come from this window's own reserved block: an id from
         // anywhere else names an object the connection already handed out,
         // and the compositor kills the connection over it.
         let token: crate::id::ActivationTokenId = self.window_tx.alloc_id();
-        let result = activation.request(
-            token,
-            &mut self.sender,
-            &mut self.events,
-            &mut self.deferred,
-            crate::toplevel::activation::LaunchEvidence {
-                seat: self.seat,
-                surface: self.shell.surface,
-                serial,
-                app_id,
-            },
-        );
-        // A failed exchange must not take the terminal down: the launch
-        // proceeds unactivated, which is the pre-protocol behaviour.
-        result.unwrap_or_default()
+        let evidence = crate::toplevel::activation::LaunchEvidence {
+            seat: self.seat,
+            surface: self.shell.surface,
+            serial,
+            app_id,
+        };
+        match activation.begin(token, &mut self.sender, evidence) {
+            Ok(()) => self.activations.track(token),
+            Err(_) => self.resolve_activation_unavailable(),
+        }
+    }
+
+    /// An answer that needs no compositor still has to wake the loop, or it
+    /// would sit uncollected until some unrelated event arrived.
+    fn resolve_activation_unavailable(
+        &mut self,
+    ) -> crate::toplevel::activation_queue::ActivationTicket {
+        let ticket = self.activations.resolve_unavailable();
+        self.wake.signal();
+        ticket
+    }
+
+    /// The oldest token answer not yet collected.
+    ///
+    /// Poll after [`Self::tick`], which is where answers are read off the
+    /// connection.
+    pub fn next_activation(
+        &mut self,
+    ) -> Option<crate::toplevel::activation_queue::ActivationOutcome> {
+        self.activations.pop()
     }
 
     /// Whether the compositor offers `xdg_activation_v1` at all.
@@ -1087,15 +1119,6 @@ impl TermWindow {
             .drain_requests(&mut self.request_rx)
             .map_err(PlatformError::Conn)?;
 
-        // A token exchange may have left events here. Route them before
-        // blocking: they are already older than anything the ring will
-        // deliver, and blocking on a ring that may stay quiet would strand
-        // input the user already produced.
-        self.handle_deferred()?;
-        if self.lifecycle.is_closing() {
-            return Ok(false);
-        }
-
         let Some(first) = self.events.pop_block() else {
             return Ok(false);
         };
@@ -1112,22 +1135,6 @@ impl TermWindow {
     }
 
     // ── private ───────────────────────────────────────────────────────────
-
-    /// Route everything a token exchange set aside, oldest first.
-    ///
-    /// `pop_front` per iteration rather than draining into a local: the queue
-    /// is only ever appended to by [`Self::activation_token`], which the
-    /// window's own event handlers never call, so nothing can grow it while
-    /// this walks it.
-    fn handle_deferred(&mut self) -> Result<()> {
-        while let Some(ev) = self.deferred.pop_front() {
-            self.handle_event(ev)?;
-            if self.lifecycle.is_closing() {
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
 
     /// Consume the fd batch that followed a clipboard `send`/`receive`, or a
     /// `wl_keyboard.keymap` event. `send` → we write our `clipboard_text` to
@@ -1196,6 +1203,11 @@ impl TermWindow {
         // message that triggered them (see conn.rs). Route by what we asked for.
         if let RawEvent::Fd(fds) = ev {
             self.handle_clipboard_fds(fds);
+            return Ok(());
+        }
+
+        if let Some(token) = self.activations.absorb(&ev) {
+            let _ = crate::toplevel::activation::Activation::release(&mut self.sender, token);
             return Ok(());
         }
 
@@ -2809,7 +2821,10 @@ mod tests {
     fn underline_fits_exactly_when_the_width_is_a_whole_number_of_cells() {
         // No dead strip at all (96 = 12 * 8): the last column still underlines
         // to the very edge, proving the clamp costs nothing in the exact case.
-        assert_eq!(TermWindow::underline_span(11, 11, 12, 8, 96), Some((88, 96)));
+        assert_eq!(
+            TermWindow::underline_span(11, 11, 12, 8, 96),
+            Some((88, 96))
+        );
     }
 
     #[test]

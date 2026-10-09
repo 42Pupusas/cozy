@@ -99,7 +99,10 @@ mod tests {
     const PAD: u32 = 0x0012_3456;
 
     fn checker() -> ([u8; 2], PackHeader) {
-        ([0b1010_0000, 0b0101_0000], PackHeader::new(4, 2, 1, 30).unwrap())
+        (
+            [0b1010_0000, 0b0101_0000],
+            PackHeader::new(4, 2, 1, 30).unwrap(),
+        )
     }
 
     fn painter(surface_width: u32, surface_height: u32, mode: FitMode) -> FramePainter {
@@ -153,10 +156,7 @@ mod tests {
         let painter = painter(37, 23, FitMode::Fit);
         let mut out = vec![0u32; painter.pixel_count()];
         painter.paint(&MonoFrame::new(&packed, header), &mut out);
-        assert!(
-            out.iter()
-                .all(|pixel| [UNLIT, LIT, PAD].contains(pixel))
-        );
+        assert!(out.iter().all(|pixel| [UNLIT, LIT, PAD].contains(pixel)));
     }
 
     #[test]

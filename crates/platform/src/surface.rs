@@ -388,6 +388,20 @@ impl SurfaceBootstrap {
         Ok(new_obj)
     }
 
+    /// Read `output`'s logical size, preserving unrelated events.
+    ///
+    /// Delegates to [`crate::output_probe::OutputProbe`]: callers must replay
+    /// its spill, because a plain drop-what-you-don't-want probe loop can eat
+    /// the one-shot `wl_seat.capabilities` and leave the client with no input.
+    #[must_use]
+    pub fn output_probe(
+        sender: &mut Sender,
+        events: &mut Consumer<RawEvent>,
+        output: OutputId,
+    ) -> crate::output_probe::OutputProbe {
+        crate::output_probe::OutputProbe::read(sender, events, output)
+    }
+
     /// Pack a background color at `bg_alpha`: plain XRGB8888 when fully
     /// opaque (byte-identical to the pre-transparency path), or
     /// premultiplied ARGB8888 otherwise. The buffer format (`Xrgb8888` vs
@@ -430,6 +444,7 @@ impl SurfaceBootstrap {
         let reader_handle = std::thread::Builder::new()
             .name(thread_name.to_string())
             .spawn(move || {
+                let _exit = ReaderExitSignal(reader_wake.clone());
                 let r = reader
                     .run(&producer, Some(&reader_wake))
                     .map_err(PlatformError::Conn);
@@ -440,6 +455,16 @@ impl SurfaceBootstrap {
             })
             .map_err(PlatformError::ReaderSpawn)?;
         Ok((sender, repeat_timer, events, reader_handle))
+    }
+}
+
+/// Wakes the UI loop when the reader thread ends by any route (clean close,
+/// error, or panic), so a loop that blocks without a timeout learns of it.
+struct ReaderExitSignal(waker::Waker);
+
+impl Drop for ReaderExitSignal {
+    fn drop(&mut self) {
+        self.0.signal();
     }
 }
 

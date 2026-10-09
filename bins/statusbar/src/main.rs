@@ -30,10 +30,12 @@
 mod headless;
 mod worker;
 
-use std::sync::mpsc;
-
+use panel_ui::{CommandChannel, CommandSender};
 use platform::draw::{Canvas, Color};
+use quetzalcoatl::capacity::Capacity;
+use quetzalcoatl::mpsc::{Consumer, RingBuffer};
 use statusbar::{BarWindow, Edge, ModuleKind, TextRenderer, TraySnapshot, TrayWatcher};
+use worker::BarCommand;
 pub(crate) use worker::Snapshot;
 
 /// Per-frame paint parameters that stay constant for the run's whole
@@ -192,13 +194,15 @@ struct BarApp {
     paint_style: PaintStyle,
     segment_rects: Vec<(ModuleKind, i32, i32)>,
     snapshot: Snapshot,
-    snapshot_rx: mpsc::Receiver<Snapshot>,
-    tray_rx: mpsc::Receiver<TraySnapshot>,
-    scroll_tx: mpsc::Sender<(ModuleKind, i32)>,
-    click_tx: mpsc::Sender<ModuleKind>,
+    snapshot_rx: Consumer<Snapshot>,
+    tray_rx: Consumer<TraySnapshot>,
+    commands: CommandSender<BarCommand>,
 }
 
 impl BarApp {
+    const SNAPSHOT_SLOTS: usize = 16;
+    const TRAY_SLOTS: usize = 16;
+
     /// Load config, open the layer-shell window, and spawn the worker +
     /// tray-watcher threads. Exits the process on an unrecoverable window
     /// error (mirrors the old `main`'s behavior -- there's no window to
@@ -222,18 +226,22 @@ impl BarApp {
         // lose the race. Nothing below needs the tray to exist yet -- the
         // watcher only feeds `tray_rx` -- so hoisting the claim shrinks the
         // race to the process's own startup rather than its first frame.
-        let (tray_tx, tray_rx) = mpsc::channel::<TraySnapshot>();
+        let (tray_tx, tray_rx) = RingBuffer::new(Capacity::exact(Self::TRAY_SLOTS)).split();
         TrayWatcher::spawn(tray_tx, wake.clone());
 
         let bar_height = i32::try_from(cfg.bar_height()).unwrap_or(i32::MAX);
-        let mut window =
-            match BarWindow::new(Edge::Top, bar_height, cfg.bar_opacity(), wake.clone()) {
-                Ok(w) => w,
-                Err(e) => {
-                    eprintln!("statusbar: failed to open layer-shell window: {e}");
-                    std::process::exit(1);
-                }
-            };
+        let mut window = match BarWindow::new(
+            Edge::from(cfg.bar_position()),
+            bar_height,
+            cfg.bar_opacity(),
+            wake.clone(),
+        ) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("statusbar: failed to open layer-shell window: {e}");
+                std::process::exit(1);
+            }
+        };
 
         let scale = window.scale();
         let bg: Color = cfg.bar_background().into();
@@ -270,11 +278,12 @@ impl BarApp {
         // delivers a full [`Snapshot`] whenever anything changes; `scroll_tx`
         // forwards raw wheel-pixel deltas the worker accumulates and, once a
         // whole detent's built up, turns into a debounced `pactl`/sysfs nudge.
-        let (snapshot_tx, snapshot_rx) = mpsc::channel::<Snapshot>();
-        let (scroll_tx, scroll_rx) = mpsc::channel::<(ModuleKind, i32)>();
-        let (click_tx, click_rx) = mpsc::channel::<ModuleKind>();
+        let (snapshot_tx, snapshot_rx) =
+            RingBuffer::new(Capacity::exact(Self::SNAPSHOT_SLOTS)).split();
+        let (commands, inbox) = CommandChannel::open();
         let notification_rules = cfg.bar_notifications().to_vec();
-        worker::Worker::spawn_thread(snapshot_tx, scroll_rx, click_rx, wake, notification_rules);
+        let click_config = cfg.bar_clicks().clone();
+        worker::Worker::spawn_thread(snapshot_tx, inbox, wake, notification_rules, click_config);
 
         let bar_height = window.height();
         let paint_style = PaintStyle {
@@ -292,8 +301,7 @@ impl BarApp {
             snapshot: Snapshot::default(),
             snapshot_rx,
             tray_rx,
-            scroll_tx,
-            click_tx,
+            commands,
         }
     }
 
@@ -326,12 +334,7 @@ impl BarApp {
             self.handle_scroll();
             self.handle_click();
 
-            // Poll at ~10fps when idle -- the worker wakes us directly (via
-            // the shared `waker::Waker`) the instant a new snapshot is
-            // ready, so this is just a safety-net cadence for
-            // resize/output-change events that don't otherwise signal, not
-            // the module refresh clock anymore.
-            self.window.wait(100);
+            self.window.wait(-1);
         }
     }
 
@@ -356,13 +359,13 @@ impl BarApp {
     /// instead; the loop below still applies any real tray update on top.
     fn drain_worker_updates(&mut self) {
         let mut changed = false;
-        while let Ok(s) = self.snapshot_rx.try_recv() {
+        while let Some(s) = self.snapshot_rx.pop() {
             let tray = self.snapshot.tray_items().to_vec();
             self.snapshot = s;
             self.snapshot.replace_tray(tray);
             changed = true;
         }
-        while let Ok(TraySnapshot { items }) = self.tray_rx.try_recv() {
+        while let Some(TraySnapshot { items }) = self.tray_rx.pop() {
             self.snapshot.replace_tray(items);
             changed = true;
         }
@@ -394,26 +397,31 @@ impl BarApp {
             kind,
             ModuleKind::VolOut | ModuleKind::VolIn | ModuleKind::Brightness
         ) {
-            let _ = self.scroll_tx.send((kind, raw_px));
+            self.commands.send(BarCommand::Scroll { kind, raw_px });
         }
     }
 
-    /// Left-click: open the module's COSMIC settings page (mirrors waybar's
-    /// own "on-click": "cosmic-popup <page>" bindings -- see
-    /// `statusbar::ModuleKind::settings_page`). Same hit-test as scroll; the
-    /// actual `cosmic-settings`/`cosmic-popup` spawn happens on the worker
-    /// thread so a slow launch never stalls the Wayland pump.
+    /// Left-click: open the module's panel/settings page (see
+    /// `statusbar::ModuleKind::settings_page`). Same hit-test as scroll,
+    /// forwarding the *segment's* x-span (not the pointer's x) so a
+    /// `--at {x} --at-right {x1}` panel opens beside the module no
+    /// matter which pixel of it was clicked. The actual spawn happens
+    /// on the worker thread so a slow launch never stalls the pump.
     fn handle_click(&mut self) {
         if !self.window.take_click() {
             return;
         }
         let px = self.window.pointer_pos().x;
-        if let Some((kind, ..)) = self
+        if let Some((kind, x0, x1)) = self
             .segment_rects
             .iter()
             .find(|(_, x0, x1)| px >= *x0 && px < *x1)
         {
-            let _ = self.click_tx.send(*kind);
+            self.commands.send(BarCommand::Click {
+                kind: *kind,
+                x0: *x0,
+                x1: *x1,
+            });
         }
     }
 }

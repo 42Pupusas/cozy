@@ -34,7 +34,10 @@ use crate::mount_session::{MountIdentity, MountSession};
 use crate::password_panel::{PanelStyle, PanelText, PasswordPanel};
 use crate::storage::Storage;
 use crate::theme::Theme;
+use crate::tile_action::TileAction;
 use crate::tile_field::{PlacedTile, TileField};
+use crate::tile_geometry::TileGeometry;
+use crate::tile_motion::{TileKey, TileMotion};
 use crate::tile_painter::{PaintedTile, TileFace, TilePainter, TileRename};
 use crate::tile_rank::Tile;
 use crate::toolbar::{Target, Toolbar};
@@ -53,6 +56,9 @@ const DOUBLE_CLICK_MS: u64 = 400;
 /// succession registers as a double-click on the second and opens a file the
 /// user never meant to open.
 const DOUBLE_CLICK_SLOP: i32 = 4;
+
+/// The interval between frames while a tile is gliding, about sixty a second.
+const FRAME_MS: i32 = 16;
 
 /// The inline rename box's contents for one frame.
 ///
@@ -141,6 +147,14 @@ pub struct FilesWindow {
     volumes: VolumeWatch,
     /// The tile presentation: size ranking, overflow pages, armed folder.
     tiles: TileField,
+    /// The glides tiles make as the pointer arrives and leaves.
+    motion: TileMotion,
+    /// The tile button the left button is held down on. It fires on release,
+    /// and only if the pointer is still on it.
+    pressed_action: Option<(usize, TileAction)>,
+    /// Text queued for the system clipboard, for the loop to hand to the
+    /// `Toplevel` that owns it.
+    pending_copy: Option<String>,
 }
 
 impl FilesWindow {
@@ -157,6 +171,9 @@ impl FilesWindow {
         Self {
             volumes: VolumeWatch::new(),
             tiles: TileField::new(wake.clone()),
+            motion: TileMotion::new(),
+            pressed_action: None,
+            pending_copy: None,
             mount: MountSession::new(wake, MountIdentity::current()),
             mount_candidate: None,
             browser,
@@ -178,6 +195,49 @@ impl FilesWindow {
             drop_hover_row: None,
             drag_badge: DragBadge::new(),
         }
+    }
+
+    /// Take any text a tile button queued for the system clipboard, for the
+    /// event loop to hand to `Toplevel::copy_text`.
+    pub const fn take_pending_copy(&mut self) -> Option<String> {
+        self.pending_copy.take()
+    }
+
+    /// [`Self::step_motion`] at the current time, for the event loop.
+    pub fn advance_motion(&mut self) -> bool {
+        self.step_motion(Self::now_ms())
+    }
+
+    /// Carry the tile glides on to `now_ms` and point them at what is under
+    /// the pointer. Returns whether a frame is owed: one while a glide is
+    /// running, and the one that lands it.
+    ///
+    /// Stepped by the loop before each tick rather than inside `paint`, so
+    /// painting stays a pure function of state and a test can choose the
+    /// time. The first frame of a glide is always its start, so aiming one
+    /// pass behind the pointer is invisible.
+    pub fn step_motion(&mut self, now_ms: u64) -> bool {
+        let was_moving = self.motion.is_animating();
+        let cursor = self.focused.then(|| self.browser.pane().cursor()).flatten();
+        self.motion.aim(
+            self.hover.spot(),
+            cursor,
+            !self.browser.is_renaming(),
+            now_ms,
+        );
+        let held = self
+            .pressed_action
+            .filter(|&(row, action)| self.hover.spot() == Some(Spot::Action(row, action)));
+        self.motion.press_on(held, now_ms);
+        self.motion.advance(now_ms);
+        was_moving || self.motion.is_animating()
+    }
+
+    /// How long the loop may sleep before the next glide frame is due, or
+    /// `None` when nothing is moving.
+    #[must_use]
+    pub fn motion_wait_ms(&self) -> Option<i32> {
+        self.motion.is_animating().then_some(FRAME_MS)
     }
 
     /// Take any drag the last pointer gesture started, for the event loop to
@@ -383,6 +443,10 @@ impl FilesWindow {
     /// dragging it carries it instead of opening it. Files need a
     /// double-click to open, as in the other presentations.
     fn press_tile(&mut self, at: Position, mods: Mods) {
+        if let Some(held) = self.live_action_at(at) {
+            self.pressed_action = Some(held);
+            return;
+        }
         let now = Self::now_ms();
         let doubled = self.is_double_click(now, at);
         match self.tile_at(Point::new(at.x, at.y)) {
@@ -411,6 +475,16 @@ impl FilesWindow {
         }
     }
 
+    /// Run the tile button a press began on, if the pointer is still on it.
+    fn release_action(&mut self, at: Position) {
+        let Some(held) = self.pressed_action.take() else {
+            return;
+        };
+        if self.live_action_at(at) == Some(held) {
+            self.run_action(held.0, held.1);
+        }
+    }
+
     /// Enter the folder a tile press armed, if the gesture stayed a click.
     fn release_tile(&mut self) {
         let Some(row) = self.tiles.take_armed() else {
@@ -434,6 +508,7 @@ impl FilesWindow {
 
     fn painted_entry_tile(&self, placed: &PlacedTile, row: usize) -> Option<PaintedTile> {
         let entry = self.browser.entry(row)?;
+        let key = TileKey::Item(row);
         let sizes = self.tiles.sizes();
         let detail = if sizes.is_pending(entry) {
             String::from("measuring…")
@@ -454,9 +529,11 @@ impl FilesWindow {
                 RowFormat::color(entry, &self.theme)
             },
             selected: pane.is_selected(row),
-            hovered: self.hover.is(Pane::Tiles, row)
-                || (self.focused && pane.cursor() == Some(row)),
             drop_target: self.drop_hover_row == Some(row),
+            raise: self.motion.raise(key),
+            reveal: self.motion.reveal(key),
+            glow: TileAction::ALL.map(|action| self.motion.glow(row, action)),
+            press: TileAction::ALL.map(|action| self.motion.press(row, action)),
         })
     }
 
@@ -479,8 +556,11 @@ impl FilesWindow {
             detail: RowFormat::human_size(bytes),
             name_color: self.theme.text,
             selected: false,
-            hovered: self.hover.is_overflow(),
             drop_target: false,
+            raise: self.motion.raise(TileKey::Overflow),
+            reveal: 0,
+            glow: [0; TileAction::ALL.len()],
+            press: [0; TileAction::ALL.len()],
         }
     }
 
@@ -494,6 +574,7 @@ impl FilesWindow {
             text: editing.text,
             before_caret: editing.before_caret,
             valid: editing.valid,
+            raise: self.motion.raise(TileKey::Item(editing.row)),
         })
     }
 
@@ -780,10 +861,67 @@ impl FilesWindow {
         if let Some(target) = self.toolbar_hit(at) {
             return Some(Spot::Control(target));
         }
-        self.tile_at(Point::new(at.x, at.y)).map(|tile| {
-            tile.item()
-                .map_or(Spot::Overflow, |i| Spot::Item(Pane::Tiles, i))
-        })
+        let placed = self.placed_at(at)?;
+        let Tile::Item(row) = placed.tile else {
+            return Some(Spot::Overflow);
+        };
+        Some(
+            self.action_at(&placed, row, at)
+                .map_or(Spot::Item(Pane::Tiles, row), |action| {
+                    Spot::Action(row, action)
+                }),
+        )
+    }
+
+    /// The tile whose cell holds `at`.
+    fn placed_at(&self, at: Position) -> Option<PlacedTile> {
+        let point = Point::new(at.x, at.y);
+        self.tile_layout()
+            .into_iter()
+            .find(|placed| placed.rect.contains(point))
+    }
+
+    /// The action button of the tile at `row` that `at` is over, where the
+    /// button is *drawn* -- risen with its tile and settling as it appears.
+    fn action_at(&self, placed: &PlacedTile, row: usize, at: Position) -> Option<TileAction> {
+        if self.browser.is_renaming() {
+            return None;
+        }
+        let spacing = self.theme.spacing;
+        let key = TileKey::Item(row);
+        let shift =
+            TilePainter::button_shift(spacing, self.motion.raise(key), self.motion.reveal(key));
+        let geometry = TileGeometry::of(placed.rect, spacing, self.type_scale.tile_lines());
+        let point = Point::new(at.x, at.y - shift);
+        geometry.bar.hit(point)
+    }
+
+    /// The action a press at `at` would run: a button the pointer is on,
+    /// once the tile has shown it clearly enough to be pressed.
+    fn live_action_at(&self, at: Position) -> Option<(usize, TileAction)> {
+        let placed = self.placed_at(at)?;
+        let Tile::Item(row) = placed.tile else {
+            return None;
+        };
+        let action = self.action_at(&placed, row, at)?;
+        self.motion.buttons_are_live(row).then_some((row, action))
+    }
+
+    /// Do what a tile button promises to the entry at `row`.
+    fn run_action(&mut self, row: usize, action: TileAction) {
+        let outcome = match action {
+            TileAction::CopyPath => {
+                let Some(path) = self.browser.path_of(row) else {
+                    return;
+                };
+                self.pending_copy = Some(path.display().to_string());
+                Outcome::Redraw
+            }
+            TileAction::Copy => self.browser.clip_entry(row, false),
+            TileAction::Cut => self.browser.clip_entry(row, true),
+            TileAction::Rename => self.browser.rename_entry(row),
+        };
+        self.apply(outcome);
     }
 
     fn home_dir() -> Option<std::path::PathBuf> {
@@ -1326,9 +1464,10 @@ impl Painter for FilesWindow {
                     shift: modifiers.shift(),
                 },
             ),
-            PointerEventKind::Release { .. } => {
+            PointerEventKind::Release { at, .. } => {
                 self.drag_arm.cancel();
                 self.drag_row = None;
+                self.release_action(at);
                 self.release_tile();
             }
             PointerEventKind::Motion(at) => {
@@ -1373,6 +1512,7 @@ impl Painter for FilesWindow {
             // otherwise a row stays lit while the pointer is in another window.
             PointerEventKind::Leave => {
                 let _ = self.hover.clear();
+                self.pressed_action = None;
                 self.drag_arm.cancel();
                 self.drag_row = None;
                 self.tiles.disarm();
@@ -1428,7 +1568,9 @@ impl FilesWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilesWindow, Painter, PointerEventKind, Target};
+    use super::{
+        FilesWindow, Painter, PointerEventKind, Target, TileAction, TileGeometry, TileKey,
+    };
     use crate::hover::{Pane, Spot};
     use platform::SurfaceFormat;
     use platform::draw::Canvas;
@@ -1891,20 +2033,30 @@ mod tests {
             Some(Target::FilterBox),
             "the pointer is over the filter box"
         );
-        assert!(
-            !painter.hover.is(Pane::Tiles, 0),
+        assert_ne!(
+            painter.hover.spot(),
+            Some(Spot::Item(Pane::Tiles, 0)),
             "and so no row may be lit"
         );
     }
 
-    /// Hovering a row must actually change what gets painted.
+    /// Carry the tile glides forward by `frames` ticks of 16 ms, as the loop
+    /// would, and return the time reached.
+    fn glide(painter: &mut FilesWindow, from_ms: u64, frames: u64) -> u64 {
+        for frame in 1..=frames {
+            painter.step_motion(from_ms + frame * 16);
+        }
+        from_ms + frames * 16
+    }
+
+    /// Hovering a row must actually change what gets painted -- by gliding,
+    /// not by jumping.
     ///
-    /// Compares whole frames rather than probing a pixel: the highlight's exact
+    /// Compares whole frames rather than probing a pixel: the tile's exact
     /// position depends on the frame geometry, and a test that hardcodes a
-    /// coordinate breaks every time the layout is tuned -- which is exactly
-    /// what this change did to the row height.
+    /// coordinate breaks every time the layout is tuned.
     #[test]
-    fn hovering_a_row_changes_the_painted_frame() {
+    fn hovering_a_row_changes_the_painted_frame_by_gliding() {
         let (mut painter, root, size) = painter_over_a_mixed_directory("hover-frame");
         let cold = paint_opaque(&mut painter, size);
 
@@ -1912,14 +2064,31 @@ mod tests {
             painter.hover.move_to(Some(Spot::Item(Pane::Tiles, 0))),
             "row 0 becomes hovered"
         );
+        painter.step_motion(1000);
+        assert_eq!(
+            paint_opaque(&mut painter, size),
+            cold,
+            "the first frame of a glide has not moved yet"
+        );
+        let started = glide(&mut painter, 1000, 3);
+        let part_way = paint_opaque(&mut painter, size);
+        assert_ne!(cold, part_way, "a few frames in, the tile is moving");
+        let settled = glide(&mut painter, started, 20);
         let hot = paint_opaque(&mut painter, size);
-        assert_ne!(cold, hot, "a hovered row must be visibly highlighted");
+        assert_ne!(part_way, hot, "and it keeps going to the end");
+        assert!(
+            !painter.motion.is_animating(),
+            "then it stops asking for frames"
+        );
 
-        // ...and clearing it must restore the original frame exactly, or the
-        // highlight leaks and rows stay lit after the pointer leaves.
         assert!(painter.hover.clear(), "the hover is dropped");
-        let cleared = paint_opaque(&mut painter, size);
-        assert_eq!(cold, cleared, "clearing hover must restore the frame");
+        painter.step_motion(settled);
+        let end = glide(&mut painter, settled, 20);
+        assert_eq!(
+            paint_opaque(&mut painter, size),
+            cold,
+            "leaving restores the frame exactly once the glide has run, at {end}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1954,49 +2123,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A directory and a file must not get the same highlight -- the whole
-    /// point of the per-type fills, and the property most at risk of quietly
-    /// collapsing if both roles are ever derived from the same colour.
+    /// A directory and a file must not get the same selection fill, and each
+    /// must differ from the plain background or it is invisible.
     #[test]
-    fn a_directory_and_a_file_highlight_differently() {
-        let (painter, root, _) = painter_over_a_mixed_directory("hover-theme");
+    fn a_directory_and_a_file_select_differently() {
+        let (painter, root, _) = painter_over_a_mixed_directory("select-theme");
         let theme = &painter.theme;
-        assert_ne!(
-            theme.hover_dir, theme.hover_file,
-            "hover must distinguish a directory from a file"
-        );
         assert_ne!(
             theme.selection_dir, theme.selection_file,
             "selection must distinguish a directory from a file"
         );
-        // Selection has to outrank hover, or selecting a row the pointer is
-        // over would appear to do nothing.
-        assert_ne!(theme.selection_dir, theme.hover_dir);
-        assert_ne!(theme.selection_file, theme.hover_file);
-        // Every highlight must differ from the plain row background too, or it
-        // is invisible rather than subtle.
-        for fill in [
-            theme.hover_dir,
-            theme.hover_file,
-            theme.selection_dir,
-            theme.selection_file,
-        ] {
+        for fill in [theme.selection_dir, theme.selection_file] {
             assert_ne!(fill, theme.background, "a highlight must be visible");
         }
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Hovering the two kinds of row must paint *differently* from each other,
-    /// not merely differ in the theme. This is the end-to-end version: it
-    /// proves the painter actually consults the row's kind rather than reaching
-    /// for one fill for everything.
+    /// A selected folder and a selected file must still be told apart by
+    /// their fill; only the *hover* stopped carrying a kind colour.
     #[test]
-    fn the_painted_highlight_follows_the_rows_kind() {
-        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-kind");
-        // Sorted with directories first, so row 0 is the directory and row 1
-        // the file. Asserted rather than assumed -- if the sort order ever
-        // changes, this test must fail loudly instead of silently comparing
-        // two files.
+    fn a_selected_folder_and_a_selected_file_are_painted_differently() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("select-kind");
         assert!(
             painter
                 .browser
@@ -2008,15 +2155,11 @@ mod tests {
             painter.browser.entry(1).is_some_and(|e| !e.is_navigable()),
             "row 1 must be the file"
         );
-
-        painter.hover.move_to(Some(Spot::Item(Pane::Tiles, 0)));
-        let dir_hovered = paint_opaque(&mut painter, size);
-        painter.hover.move_to(Some(Spot::Item(Pane::Tiles, 1)));
-        let file_hovered = paint_opaque(&mut painter, size);
-        assert_ne!(
-            dir_hovered, file_hovered,
-            "the two rows must not receive the same highlight"
-        );
+        painter.browser.pick(0, widget::Mods::none());
+        let dir_selected = paint_opaque(&mut painter, size);
+        painter.browser.pick(1, widget::Mods::none());
+        let file_selected = paint_opaque(&mut painter, size);
+        assert_ne!(dir_selected, file_selected);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2481,7 +2624,271 @@ mod tests {
         let at = tile_centre(&painter, "b_file.txt");
         painter.on_pointer(PointerEventKind::Motion(at));
         assert!(painter.hover.spot().is_some());
+        painter.step_motion(500);
+        glide(&mut painter, 500, 20);
         assert_ne!(paint_opaque(&mut painter, size), resting);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Point at the middle of the tile named `name`, and let it settle.
+    fn settle_on(painter: &mut FilesWindow, name: &str) -> super::Position {
+        let at = tile_centre(painter, name);
+        painter.on_pointer(PointerEventKind::Motion(at));
+        painter.step_motion(10_000);
+        glide(painter, 10_000, 30);
+        at
+    }
+
+    /// The middle of one of the settled tile's buttons, where it is drawn.
+    fn button_centre(painter: &FilesWindow, name: &str, action: TileAction) -> super::Position {
+        let placed = painter
+            .tile_layout()
+            .into_iter()
+            .find(|placed| {
+                placed
+                    .tile
+                    .item()
+                    .and_then(|row| painter.browser.entry(row))
+                    .is_some_and(|entry| entry.name == name)
+            })
+            .expect("the tile exists");
+        let geometry = TileGeometry::of(
+            placed.rect,
+            painter.theme.spacing,
+            painter.type_scale.tile_lines(),
+        );
+        let (_, rect) = geometry
+            .bar
+            .buttons()
+            .iter()
+            .find(|(a, _)| *a == action)
+            .expect("this tile has room for its buttons");
+        let lift = painter.theme.spacing.tile_lift();
+        super::Position {
+            x: rect.x + rect.w / 2,
+            y: rect.y + rect.h / 2 - lift,
+        }
+    }
+
+    #[test]
+    fn pointing_at_a_tile_lifts_it_and_reveals_its_buttons() {
+        let (mut painter, root, _size) = tiled("tiles-reveal");
+        settle_on(&mut painter, "b_file.txt");
+        let row = (0..painter.browser.len())
+            .find(|&r| {
+                painter
+                    .browser
+                    .entry(r)
+                    .is_some_and(|e| e.name == "b_file.txt")
+            })
+            .expect("the file is listed");
+        assert_eq!(painter.motion.raise(TileKey::Item(row)), 255);
+        assert_eq!(painter.motion.reveal(TileKey::Item(row)), 255);
+        assert!(painter.motion.buttons_are_live(row));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_settled_tile_button_runs_its_action_on_that_tile_only() {
+        let (mut painter, root, _size) = tiled("tiles-copy");
+        settle_on(&mut painter, "b_file.txt");
+        let at = button_centre(&painter, "b_file.txt", TileAction::Cut);
+        painter.on_pointer(PointerEventKind::Motion(at));
+        assert!(matches!(
+            painter.hover.spot(),
+            Some(Spot::Action(_, TileAction::Cut))
+        ));
+        left_press(&mut painter, at);
+        assert!(
+            !painter.browser.clipboard().is_cut(&root.join("b_file.txt")),
+            "pressing alone does nothing yet"
+        );
+        left_release(&mut painter, at);
+        assert!(
+            painter.browser.clipboard().is_cut(&root.join("b_file.txt")),
+            "releasing on the button cut its own tile"
+        );
+        assert!(
+            painter.browser.selected_paths().is_empty(),
+            "and the click did not also select it"
+        );
+        assert_eq!(
+            painter.browser.notice(),
+            None,
+            "the footer is left alone; the button is the feedback"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn sliding_off_a_held_button_before_releasing_cancels_it() {
+        let (mut painter, root, _size) = tiled("tiles-cancel");
+        settle_on(&mut painter, "b_file.txt");
+        let on = button_centre(&painter, "b_file.txt", TileAction::Cut);
+        painter.on_pointer(PointerEventKind::Motion(on));
+        left_press(&mut painter, on);
+        let away = button_centre(&painter, "b_file.txt", TileAction::Rename);
+        painter.on_pointer(PointerEventKind::Motion(away));
+        left_release(&mut painter, away);
+        assert!(!painter.browser.clipboard().is_cut(&root.join("b_file.txt")));
+        assert!(!painter.browser.is_renaming(), "nor did it fire the other");
+        assert!(painter.pressed_action.is_none(), "the hold is over");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_held_button_takes_the_press_colour_and_shrinks_back_from_its_hover_size() {
+        let (mut painter, root, size) = tiled("tiles-held");
+        settle_on(&mut painter, "b_file.txt");
+        let on = button_centre(&painter, "b_file.txt", TileAction::Copy);
+        painter.on_pointer(PointerEventKind::Motion(on));
+        painter.step_motion(50_000);
+        glide(&mut painter, 50_000, 20);
+        let hovered = paint_opaque(&mut painter, size);
+        left_press(&mut painter, on);
+        painter.step_motion(51_000);
+        glide(&mut painter, 51_000, 20);
+        let held = paint_opaque(&mut painter, size);
+        assert_ne!(hovered, held, "holding the button changes how it looks");
+        left_release(&mut painter, on);
+        painter.step_motion(52_000);
+        glide(&mut painter, 52_000, 20);
+        assert_ne!(
+            paint_opaque(&mut painter, size),
+            held,
+            "and releasing lets go"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hovered_button_is_larger_than_a_resting_one() {
+        let (mut painter, root, size) = tiled("tiles-grow");
+        settle_on(&mut painter, "b_file.txt");
+        let beside = button_centre(&painter, "b_file.txt", TileAction::Copy);
+        let resting = paint_opaque(&mut painter, size);
+        let on = button_centre(&painter, "b_file.txt", TileAction::CopyPath);
+        painter.on_pointer(PointerEventKind::Motion(on));
+        painter.step_motion(60_000);
+        glide(&mut painter, 60_000, 20);
+        let grown = paint_opaque(&mut painter, size);
+        let grow = painter.theme.spacing.action_grow();
+        let edge = |buf: &[u32], x: i32, y: i32| buf[(y * size.width + x).cast_unsigned() as usize];
+        let rect = {
+            let placed = painter.placed_at(on).expect("on a tile");
+            let geometry = TileGeometry::of(
+                placed.rect,
+                painter.theme.spacing,
+                painter.type_scale.tile_lines(),
+            );
+            geometry.bar.buttons()[0].1
+        };
+        let lift = painter.theme.spacing.tile_lift();
+        let probe_y = rect.y + rect.h / 2 - lift;
+        let just_outside = rect.x - grow;
+        assert_ne!(
+            edge(&grown, just_outside, probe_y),
+            edge(&resting, just_outside, probe_y),
+            "the hovered button reaches {grow} px further than it rests"
+        );
+        assert_eq!(
+            edge(&grown, beside.x, beside.y),
+            edge(&resting, beside.x, beside.y),
+            "the neighbouring button is unchanged"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_copy_path_button_queues_the_path_for_the_system_clipboard() {
+        let (mut painter, root, _size) = tiled("tiles-copy-path");
+        settle_on(&mut painter, "b_file.txt");
+        let at = button_centre(&painter, "b_file.txt", TileAction::CopyPath);
+        painter.on_pointer(PointerEventKind::Motion(at));
+        left_press(&mut painter, at);
+        left_release(&mut painter, at);
+        assert_eq!(
+            painter.take_pending_copy(),
+            Some(root.join("b_file.txt").display().to_string())
+        );
+        assert_eq!(painter.take_pending_copy(), None, "taken once");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_rename_button_opens_the_rename_box_over_its_tile() {
+        let (mut painter, root, _size) = tiled("tiles-rename-button");
+        settle_on(&mut painter, "b_file.txt");
+        let at = button_centre(&painter, "b_file.txt", TileAction::Rename);
+        painter.on_pointer(PointerEventKind::Motion(at));
+        left_press(&mut painter, at);
+        left_release(&mut painter, at);
+        assert!(painter.browser.is_renaming());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_press_before_the_buttons_have_appeared_selects_the_tile_instead() {
+        let (mut painter, root, _size) = tiled("tiles-early");
+        let at = tile_centre(&painter, "b_file.txt");
+        painter.on_pointer(PointerEventKind::Motion(at));
+        painter.step_motion(20_000);
+        let button = button_centre(&painter, "b_file.txt", TileAction::Cut);
+        painter.on_pointer(PointerEventKind::Motion(button));
+        left_press(&mut painter, button);
+        left_release(&mut painter, button);
+        assert!(
+            !painter.browser.clipboard().is_cut(&root.join("b_file.txt")),
+            "an invisible button must not fire"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_tile_with_no_room_for_buttons_is_clicked_as_before() {
+        let (mut painter, root) = crowded("tiles-narrow", 60);
+        let small = painter
+            .tile_layout()
+            .into_iter()
+            .filter(|placed| placed.tile.item().is_some())
+            .find(|placed| {
+                TileGeometry::of(
+                    placed.rect,
+                    painter.theme.spacing,
+                    painter.type_scale.tile_lines(),
+                )
+                .bar
+                .buttons()
+                .is_empty()
+            });
+        if let Some(placed) = small {
+            let at = super::Position {
+                x: placed.rect.x + placed.rect.w / 2,
+                y: placed.rect.y + placed.rect.h / 2,
+            };
+            painter.on_pointer(PointerEventKind::Motion(at));
+            assert!(matches!(
+                painter.hover.spot(),
+                Some(Spot::Item(Pane::Tiles, _))
+            ));
+            painter.step_motion(30_000);
+            glide(&mut painter, 30_000, 30);
+            assert!(painter.live_action_at(at).is_none());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn leaving_the_window_lets_the_tile_settle_back() {
+        let (mut painter, root, size) = tiled("tiles-leave");
+        let resting = paint_opaque(&mut painter, size);
+        let at = settle_on(&mut painter, "b_file.txt");
+        assert_ne!(paint_opaque(&mut painter, size), resting);
+        painter.on_pointer(PointerEventKind::Leave);
+        painter.step_motion(40_000);
+        glide(&mut painter, 40_000, 30);
+        assert_eq!(paint_opaque(&mut painter, size), resting, "from {at:?}");
+        assert!(!painter.motion.is_animating());
         let _ = std::fs::remove_dir_all(&root);
     }
 

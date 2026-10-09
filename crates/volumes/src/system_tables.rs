@@ -76,6 +76,12 @@ impl SystemTables {
         &self.mountinfo
     }
 
+    /// The directory holding udev's per-device records.
+    #[must_use]
+    pub fn udev_root(&self) -> &Path {
+        &self.udev_root
+    }
+
     /// The raw mount table text, empty when unreadable.
     #[must_use]
     pub fn read_text(&self) -> String {
@@ -138,7 +144,7 @@ impl Default for SystemTables {
 #[cfg(test)]
 mod tests {
     use super::SystemTables;
-    use crate::test_support::{fixtures, TempDir};
+    use crate::test_support::{TempDir, fixtures};
     use std::path::Path;
 
     const USB_BUS: &str = "pci0000:00/0000:00:14.0/usb2/2-1/2-1:1.0/host6/target6:0:0/6:0:0:0";
@@ -181,7 +187,10 @@ mod tests {
     fn attaching_an_unmounted_device_changes_the_device_text() {
         let tmp = TempDir::new("tables-attach");
         tmp.write("mountinfo", fixtures::DESKTOP);
-        tmp.write("partitions", "major minor  #blocks  name\n 259  1  524288 nvme0n1p1\n");
+        tmp.write(
+            "partitions",
+            "major minor  #blocks  name\n 259  1  524288 nvme0n1p1\n",
+        );
         let tables = SystemTables::rooted_at(tmp.path());
         let mounts_before = tables.read_text();
         let before = tables.read_device_text();
@@ -194,7 +203,11 @@ mod tests {
             mounts_before,
             "an unmounted device leaves the mount table untouched"
         );
-        assert_ne!(before, tables.read_device_text(), "the new device must show");
+        assert_ne!(
+            before,
+            tables.read_device_text(),
+            "the new device must show"
+        );
     }
 
     /// The mirror: mounting a device rewrites the mount table and leaves
@@ -202,7 +215,10 @@ mod tests {
     #[test]
     fn mounting_a_device_changes_the_device_text() {
         let tmp = TempDir::new("tables-mount");
-        tmp.write("partitions", "major minor  #blocks  name\n   8 17  976896 sdb1\n");
+        tmp.write(
+            "partitions",
+            "major minor  #blocks  name\n   8 17  976896 sdb1\n",
+        );
         tmp.write("mountinfo", fixtures::DESKTOP_WITHOUT_USB);
         let tables = SystemTables::rooted_at(tmp.path());
         let before = tables.read_device_text();

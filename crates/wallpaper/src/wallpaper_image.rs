@@ -117,7 +117,7 @@ mod tests {
             0u8, 255, 0, 0, 0, 255, 0, // row 0: red, green
             0, 0, 0, 255, 255, 255, 255, // row 1: blue, white
         ];
-        let zlib_data = ixchel::zlib::compress(&raw);
+        let zlib_data = ixchel::ZlibEncoder::new().compress(&raw);
         file.extend(encode_chunk(*b"IDAT", &zlib_data));
         file.extend(encode_chunk(*b"IEND", b""));
         file

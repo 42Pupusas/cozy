@@ -74,17 +74,19 @@ impl Volume {
     /// Build a volume from a mount entry, reading the real system tables.
     #[must_use]
     pub fn from_mount(entry: &MountEntry) -> Self {
-        Self::from_mount_in(entry, Path::new(DeviceClass::SYS_BLOCK), Path::new(Self::BY_LABEL))
+        Self::from_mount_in(
+            entry,
+            Path::new(DeviceClass::SYS_BLOCK),
+            Path::new(Self::BY_LABEL),
+        )
     }
 
     /// Build a volume against arbitrary system tables, for testing.
     #[must_use]
     pub fn from_mount_in(entry: &MountEntry, sys_block: &Path, by_label: &Path) -> Self {
-        let class = entry
-            .device_name()
-            .map_or(DeviceClass::Virtual, |device| {
-                DeviceClass::of_device_in(sys_block, device)
-            });
+        let class = entry.device_name().map_or(DeviceClass::Virtual, |device| {
+            DeviceClass::of_device_in(sys_block, device)
+        });
         Self {
             label: Self::name_for(entry, by_label),
             mount_point: PathBuf::from(entry.mount_point()),

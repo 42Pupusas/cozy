@@ -117,7 +117,7 @@ impl Edge {
             return;
         }
         // Split the quadratic Bézier at t=0.5 (de Casteljau).
-        let mid = |a: (f32, f32), b: (f32, f32)| ((a.0 + b.0) * 0.5, (a.1 + b.1) * 0.5);
+        let mid = |a: (f32, f32), b: (f32, f32)| (f32::midpoint(a.0, b.0), f32::midpoint(a.1, b.1));
         let p01 = mid(p0, ctrl);
         let p12 = mid(ctrl, p1);
         let split = mid(p01, p12);

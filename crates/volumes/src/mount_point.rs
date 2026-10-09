@@ -151,7 +151,10 @@ mod tests {
 
     #[test]
     fn an_ordinary_label_becomes_its_own_directory() {
-        assert_eq!(under("KINGSTON").path(), Path::new("/run/media/bob/KINGSTON"));
+        assert_eq!(
+            under("KINGSTON").path(),
+            Path::new("/run/media/bob/KINGSTON")
+        );
     }
 
     /// The hole this type exists to close. A privileged mounter told to

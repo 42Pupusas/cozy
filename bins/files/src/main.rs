@@ -15,6 +15,7 @@
 //! where you came from -- has unit tests that run in microseconds instead of
 //! needing a compositor and a pair of eyes.
 
+mod action_icon;
 mod breadcrumb;
 mod browser;
 mod card_surface;
@@ -23,6 +24,7 @@ mod density;
 mod dir_sizes;
 mod dirs_watch;
 mod drag_badge;
+mod fade;
 mod favorites;
 mod file_launcher;
 mod frame;
@@ -52,8 +54,11 @@ mod spiral_cursor;
 mod storage;
 mod test_support;
 mod theme;
+mod tile_action;
 mod tile_coloring;
 mod tile_field;
+mod tile_geometry;
+mod tile_motion;
 mod tile_painter;
 mod tile_rank;
 mod toolbar;
@@ -158,6 +163,9 @@ impl App {
 
         let mut title = painter.title();
         loop {
+            if painter.advance_motion() {
+                window.request_redraw();
+            }
             window.tick(&mut painter)?;
 
             while let Some(event) = window.next_event() {
@@ -176,6 +184,12 @@ impl App {
                 launcher.request(&mut window, path);
             }
             launcher.open_answered(&mut window);
+
+            // Same seam as the open above: the clipboard belongs to the
+            // `Toplevel`, which a tile button's click cannot reach.
+            if let Some(text) = painter.take_pending_copy() {
+                window.copy_text(text);
+            }
 
             // Same reasoning as `take_pending_open`: starting a drag talks
             // to the `Toplevel`, which `Painter::on_pointer` cannot reach.

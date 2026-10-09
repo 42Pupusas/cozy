@@ -104,7 +104,9 @@ impl InFlight {
 
     /// The outstanding tags, for cancelling each one.
     pub fn armed(self) -> impl Iterator<Item = OpTag> {
-        OpTag::ALL.into_iter().filter(move |tag| self.is_armed(*tag))
+        OpTag::ALL
+            .into_iter()
+            .filter(move |tag| self.is_armed(*tag))
     }
 }
 

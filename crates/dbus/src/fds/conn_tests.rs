@@ -10,10 +10,10 @@
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
+use super::SocketPair;
 use super::fd_frame::FdFrame;
 use super::marked_file::MarkedFile;
 use super::test_fds::{FdTestGuard, LoanedFds};
-use super::SocketPair;
 use crate::conn::{DbusConn, DbusError};
 
 /// A client and a peer joined by a real socket pair.

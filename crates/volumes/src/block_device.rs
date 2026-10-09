@@ -191,7 +191,14 @@ mod tests {
     fn an_empty_card_slot_is_not_a_candidate() {
         let tmp = TempDir::new("block-empty-slot");
         tmp.block_disk("pci0000:00/0000:00:1c.0/mmc_host/mmc0", "mmcblk0", true);
-        tmp.sized("pci0000:00/0000:00:1c.0/mmc_host/mmc0", "mmcblk0", None, 179, 0, 0);
+        tmp.sized(
+            "pci0000:00/0000:00:1c.0/mmc_host/mmc0",
+            "mmcblk0",
+            None,
+            179,
+            0,
+            0,
+        );
         let device = BlockDevice::read(&tmp.class_block(), "mmcblk0").expect("the slot");
         assert!(device.is_empty());
         assert!(!device.is_candidate(), "an empty slot must not be offered");

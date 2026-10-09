@@ -27,6 +27,17 @@ pub enum CaptureTarget {
     /// Drag a rectangle out interactively, optionally on one named output.
     /// `None` chooses the first output for single-output use.
     Selection(Option<String>),
+    /// One window by id, app id, or title substring, whether or not it is
+    /// visible. Resolved through the compositor's window IPC rather than the
+    /// output capture protocol, which can only see what is on screen.
+    Window(String),
+}
+
+/// What the invocation does with the compositor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShotAction {
+    Capture,
+    ListWindows,
 }
 
 /// Everything the binary needs from its arguments.
@@ -45,6 +56,7 @@ pub struct ShotOptions {
     /// *both* (a keybind that copies and archives in one press), so this is a
     /// separate flag rather than a mode that displaces clipboard publishing.
     pub save: bool,
+    pub action: ShotAction,
 }
 
 impl ShotOptions {
@@ -63,6 +75,8 @@ impl ShotOptions {
         let mut overlay_cursor = false;
         let mut clipboard = false;
         let mut save = false;
+        let mut window = None;
+        let mut action = ShotAction::Capture;
 
         while let Some(argument) = arguments.next() {
             let text = argument.to_string_lossy().into_owned();
@@ -70,6 +84,14 @@ impl ShotOptions {
                 "-c" | "--cursor" => overlay_cursor = true,
                 "-C" | "--clipboard" => clipboard = true,
                 "-S" | "--save" => save = true,
+                "-w" | "--window" => {
+                    window = Some(
+                        Self::value_for(&mut arguments, &text)?
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                "-l" | "--list-windows" => action = ShotAction::ListWindows,
                 "-s" | "--select" => {
                     target = match target {
                         CaptureTarget::Output(name) => CaptureTarget::Selection(Some(name)),
@@ -108,12 +130,22 @@ impl ShotOptions {
             };
         }
 
+        if let Some(query) = window {
+            if !matches!(target, CaptureTarget::AllOutputs) {
+                return Err(
+                    "--window cannot be combined with --select, --output or --geometry".to_string(),
+                );
+            }
+            target = CaptureTarget::Window(query);
+        }
+
         Ok(Self {
             target,
             output_path,
             overlay_cursor,
             clipboard,
             save,
+            action,
         })
     }
 
@@ -180,6 +212,9 @@ impl ShotOptions {
              options:\n  \
                -s, --select          drag out a region interactively\n  \
                -o, --output NAME     capture only this output (e.g. DP-1)\n  \
+               -w, --window QUERY    capture one window by id, app id or title,\n                        \
+                             even if it is hidden or off screen\n  \
+               -l, --list-windows    print `id app-id title` for each open window\n  \
                -g, --geometry GEOM   capture output-local region, as `X,Y WxH`\n  \
                -c, --cursor          include the cursor in the capture\n  \
                -C, --clipboard       offer the PNG through the Wayland clipboard\n  \
@@ -193,7 +228,7 @@ impl ShotOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureTarget, ShotOptions};
+    use super::{CaptureTarget, ShotAction, ShotOptions};
     use screencopy::CaptureRegion;
     use std::ffi::OsString;
     use std::path::PathBuf;
@@ -388,6 +423,52 @@ mod tests {
     fn a_bare_dash_means_stdout() {
         let options = ShotOptions::parse(argv(&["-"])).expect("valid");
         assert_eq!(options.output_path, None);
+    }
+
+    #[test]
+    fn window_takes_a_query_in_either_spelling() {
+        for flag in ["-w", "--window"] {
+            let options = ShotOptions::parse(argv(&[flag, "firefox"])).expect("valid");
+            assert_eq!(options.target, CaptureTarget::Window("firefox".into()));
+            assert_eq!(options.action, ShotAction::Capture);
+        }
+    }
+
+    #[test]
+    fn window_composes_with_clipboard_save_and_cursor() {
+        let options = ShotOptions::parse(argv(&["-w", "foot", "-C", "-S", "-c"])).expect("valid");
+        assert_eq!(options.target, CaptureTarget::Window("foot".into()));
+        assert!(options.clipboard && options.save && options.overlay_cursor);
+    }
+
+    #[test]
+    fn window_conflicts_with_every_other_target() {
+        for args in [
+            ["-w", "foot", "-s"].as_slice(),
+            &["-w", "foot", "-o", "DP-1"],
+            &["-w", "foot", "-g", "0,0 10x10"],
+            &["-s", "-w", "foot"],
+            &["-o", "DP-1", "-w", "foot"],
+        ] {
+            assert!(
+                ShotOptions::parse(argv(args)).is_err(),
+                "expected {args:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn window_without_a_query_is_an_error_not_a_panic() {
+        assert!(ShotOptions::parse(argv(&["-w"])).is_err());
+    }
+
+    #[test]
+    fn list_windows_is_a_flag_that_leaves_the_target_alone() {
+        for flag in ["-l", "--list-windows"] {
+            let options = ShotOptions::parse(argv(&[flag])).expect("valid");
+            assert_eq!(options.action, ShotAction::ListWindows);
+            assert_eq!(options.target, CaptureTarget::AllOutputs);
+        }
     }
 
     #[test]

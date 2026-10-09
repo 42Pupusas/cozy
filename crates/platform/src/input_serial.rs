@@ -33,7 +33,11 @@ impl InputSerial {
     /// a serial that would simply be refused.
     #[must_use]
     pub const fn get(self) -> Option<u32> {
-        if self.last == 0 { None } else { Some(self.last) }
+        if self.last == 0 {
+            None
+        } else {
+            Some(self.last)
+        }
     }
 
     /// Record a pointer button press.

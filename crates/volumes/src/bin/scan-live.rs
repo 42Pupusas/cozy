@@ -7,8 +7,8 @@
 //! cargo run -p volumes --bin scan-live
 //! ```
 
-use volumes::{BlockDevice, DeviceClass, DeviceScan, UdevProperties, VolumeSet};
 use std::path::PathBuf;
+use volumes::{BlockDevice, DeviceClass, DeviceScan, UdevProperties, VolumeSet};
 
 /// Prints a live scan of the tables it is pointed at.
 struct Probe {
@@ -89,7 +89,11 @@ impl Probe {
         let mounted = VolumeSet::scan();
         println!("mounted volumes: {}", mounted.len());
         for volume in mounted.volumes() {
-            println!("  {:<10} {}", volume.label(), volume.mount_point().display());
+            println!(
+                "  {:<10} {}",
+                volume.label(),
+                volume.mount_point().display()
+            );
         }
 
         let mountable = scan.mountable();

@@ -196,13 +196,14 @@ impl FdPassing {
         let cqe = ring
             .complete()
             .ok_or_else(|| FdError::Io(io::Error::other("no completion")))?;
-        if cqe.result < 0 {
-            return Err(FdError::Io(io::Error::from_raw_os_error(-cqe.result)));
+        let result = cqe.raw_result();
+        if result < 0 {
+            return Err(FdError::Io(io::Error::from_raw_os_error(-result)));
         }
-        if cqe.result == 0 {
+        if result == 0 {
             return Err(FdError::Closed);
         }
-        Ok(usize::try_from(cqe.result).unwrap_or(0))
+        Ok(usize::try_from(result).unwrap_or(0))
     }
 }
 

@@ -268,8 +268,9 @@ enum UiEvent {
     PaletteColor(u8, (u8, u8, u8)),
 }
 
-/// Stores `true` into a shared quit flag when dropped -- including when the
-/// stack is unwinding from a panic, not just on a normal return.
+/// Stores `true` into a shared quit flag when dropped and wakes the UI loop
+/// that is parked waiting on it -- including when the stack is unwinding from
+/// a panic, not just on a normal return.
 ///
 /// Without this, a panic on the PTY or parser thread (a bug, an unexpected
 /// `unwrap`/index-out-of-bounds, whatever) skips straight past that thread's
@@ -281,11 +282,24 @@ enum UiEvent {
 /// already printed to stderr by the default hook. Held for the whole
 /// duration of a worker's `run`, this guarantees the flag flips regardless
 /// of *how* that function stops running.
-struct QuitGuard(Arc<AtomicBool>);
+struct QuitGuard {
+    quit: Arc<AtomicBool>,
+    ui_wake: waker::Waker,
+}
+
+impl QuitGuard {
+    fn new(quit: &Arc<AtomicBool>, ui_wake: &waker::Waker) -> Self {
+        Self {
+            quit: Arc::clone(quit),
+            ui_wake: ui_wake.clone(),
+        }
+    }
+}
 
 impl Drop for QuitGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.quit.store(true, Ordering::Relaxed);
+        self.ui_wake.signal();
     }
 }
 
@@ -500,6 +514,7 @@ impl<'cfg> App<'cfg> {
         let ui_wake = platform::Waker::new().expect("create ui waker");
         let pty_wake = waker::Waker::new().expect("create pty waker");
         let parser_ui_wake = ui_wake.clone();
+        let pty_ui_wake = ui_wake.clone();
         let parser_pty_wake = pty_wake.clone();
         let ui_pty_wake = pty_wake.clone();
         // Kept for the always-run teardown after the UI loop returns (see
@@ -522,6 +537,7 @@ impl<'cfg> App<'cfg> {
             parser_tx: parser_data_tx,
             input_rx,
             input_wake: pty_wake,
+            ui_wake: pty_ui_wake,
             quit: quit_pty,
             shell_pid: shell_pid_pty,
         }
@@ -631,6 +647,7 @@ struct PtyWorker {
     parser_tx: mpsc::Producer<ParserMsg>,
     input_rx: mpsc::Consumer<InputMsg>,
     input_wake: waker::Waker,
+    ui_wake: waker::Waker,
     quit: Arc<AtomicBool>,
     /// Written once, right after the shell is forked -- see the field doc
     /// on `App::shell_pid`.
@@ -653,12 +670,13 @@ impl PtyWorker {
             parser_tx,
             mut input_rx,
             input_wake,
+            ui_wake,
             quit,
             shell_pid,
         } = self;
-        // Guarantees `quit` flips even if this thread panics below -- see
-        // `QuitGuard`'s doc.
-        let _quit_guard = QuitGuard(Arc::clone(&quit));
+        // Guarantees `quit` flips and the UI wakes even if this thread
+        // panics below -- see `QuitGuard`'s doc.
+        let _quit_guard = QuitGuard::new(&quit, &ui_wake);
 
         // All PTY I/O goes through io_uring: the master fd, the SIGCHLD
         // signalfd, and the input-wake eventfd each keep one read SQE armed,
@@ -805,9 +823,9 @@ impl ParserWorker {
             ui_events_tx,
             quit,
         } = self;
-        // Guarantees `quit` flips even if this thread panics below -- see
-        // `QuitGuard`'s doc.
-        let _quit_guard = QuitGuard(Arc::clone(&quit));
+        // Guarantees `quit` flips and the UI wakes even if this thread
+        // panics below -- see `QuitGuard`'s doc.
+        let _quit_guard = QuitGuard::new(&quit, &ui_wake);
         let mut grid = Grid::new(cols, rows);
         grid.set_default_colors(default_fg, default_bg);
         ParserSession {
@@ -1074,6 +1092,8 @@ struct UiLoop<'a> {
     /// Says which way a Ctrl+click's token request degraded, when
     /// `COZY_DEBUG_ACTIVATION` is set. Read once here rather than per click.
     activation_report: platform::toplevel::activation_report::ActivationReport,
+    /// Clicked links waiting for the compositor to answer their token request.
+    pending_links: platform::toplevel::PendingLaunches<String>,
     /// See `ConfigWatcher`'s doc for the save-detection strategy and why
     /// it's best-effort.
     config_watcher: ConfigWatcher,
@@ -1140,8 +1160,10 @@ impl<'a> UiLoop<'a> {
             grid_rows: ROWS,
             resize_debounce: ResizeDebounce::new(),
             links: std::collections::HashMap::new(),
-            activation_report:
-                platform::toplevel::activation_report::ActivationReport::from_env("terminal"),
+            activation_report: platform::toplevel::activation_report::ActivationReport::from_env(
+                "terminal",
+            ),
+            pending_links: platform::toplevel::PendingLaunches::new(),
             config_watcher: ConfigWatcher::new(),
         })
     }
@@ -1181,6 +1203,7 @@ impl<'a> UiLoop<'a> {
             if !self.win.tick()? {
                 break;
             }
+            self.launch_answered_links();
 
             if !did_work {
                 self.idle_wait();
@@ -1584,17 +1607,31 @@ impl<'a> UiLoop<'a> {
     /// is a rare, human-paced action, and a terminal that cached them at
     /// startup would keep answering with the associations that existed then.
     ///
-    /// The token is minted here, inside the click handler, because it must
-    /// carry *this* click's serial. Minting it earlier or later would present
-    /// the compositor evidence of a different moment.
+    /// The token is requested here, inside the click handler, because it
+    /// must carry *this* click's serial. Requesting it earlier or later would
+    /// present the compositor evidence of a different moment. The link is
+    /// opened by [`Self::launch_answered_links`] once the answer arrives.
     fn open_link(&mut self, uri: &str) {
-        let token = self.win.activation_token(None);
-        self.activation_report
-            .record(token.as_ref(), self.win.supports_activation());
-        let opener = opener::Opener::load()
-            .with_activation(token.map(|t| opener::ActivationToken::new(t.into_string())));
-        if let Err(error) = opener.try_open(&opener::Target::parse(uri)) {
-            eprintln!("terminal: {uri}: {error}");
+        let ticket = self.win.request_activation_token(None);
+        self.pending_links.hold(ticket, uri.to_owned());
+    }
+
+    /// Open every link whose token request has been answered.
+    fn launch_answered_links(&mut self) {
+        while let Some(outcome) = self.win.next_activation() {
+            let Some(uri) = self.pending_links.take(outcome.ticket) else {
+                continue;
+            };
+            self.activation_report
+                .record(outcome.token.as_ref(), self.win.supports_activation());
+            let opener = opener::Opener::load().with_activation(
+                outcome
+                    .token
+                    .map(|t| opener::ActivationToken::new(t.into_string())),
+            );
+            if let Err(error) = opener.try_open(&opener::Target::parse(&uri)) {
+                eprintln!("terminal: {uri}: {error}");
+            }
         }
     }
 
@@ -1627,23 +1664,24 @@ impl<'a> UiLoop<'a> {
     /// during this iteration's reads leaves the counter set, so the poll
     /// returns at once (no lost wakeup).
     ///
-    /// While the cursor is mid-slide or blinking-and-visible, cap the wait at
-    /// `anim_poll_cap_ms` instead of the normal 100ms so the animation
-    /// actually advances smoothly instead of updating in big 100ms jumps;
-    /// otherwise it stays the full 100ms, bounding only quit-flag latency as
-    /// before. A pending debounced resize must also wake the loop when its
-    /// quiet period elapses, even if nothing else arrives — otherwise the
-    /// held winsize could sit unsent until the next unrelated event.
+    /// Everything that can end the wait arrives on a descriptor: the UI
+    /// eventfd (Wayland reader, parser, and the PTY/parser threads on exit)
+    /// and the config directory's inotify fd. The only deadlines are real
+    /// ones: the next animation frame while the cursor is moving, and the
+    /// moment a debounced winsize may be released, and the end of a bell
+    /// flash.
     fn idle_wait(&self) {
-        let mut cap = if self.win.wants_animation_frame() {
-            self.anim_poll_cap_ms
-        } else {
-            100
-        };
-        if let Some(resize_cap) = self.resize_debounce.wait_cap_ms() {
-            cap = cap.min(resize_cap.max(1));
-        }
-        self.win.wait(cap);
+        let animation = self
+            .win
+            .wants_animation_frame()
+            .then_some(self.anim_poll_cap_ms);
+        let resize = self.resize_debounce.wait_cap_ms().map(|ms| ms.max(1));
+        let deadline = [animation, resize, self.win.bell_wait_ms()]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(-1);
+        self.win.wait_also_on(deadline, self.config_watcher.fd());
     }
 }
 
@@ -1774,6 +1812,11 @@ impl ConfigWatcher {
             file_name,
             path,
         }
+    }
+
+    /// The config directory's inotify fd, for the event loop to wait on.
+    fn fd(&self) -> Option<std::os::fd::RawFd> {
+        self.inotify.as_ref().map(|ino| ino.fd().as_i32())
     }
 
     /// If our config file was touched since the last call, re-parse and

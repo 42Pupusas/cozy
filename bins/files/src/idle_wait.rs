@@ -8,8 +8,11 @@
 //! * the open directory's inotify fd;
 //! * the mount table (`POLLPRI`) and udev's block records, for devices.
 //!
-//! The one deadline is key auto-repeat, which is a real due time rather than
-//! a guess at how long to sleep.
+//! The deadlines are key auto-repeat, which is a real due time rather than
+//! a guess at how long to sleep, and the next frame of a tile glide while
+//! one is running. The compositor's frame callback wakes the loop through the
+//! waker as well, so the glide deadline is only the fallback for a callback
+//! that never comes.
 
 use platform::toplevel::Toplevel;
 use waker::{Interest, PollSet};
@@ -27,6 +30,14 @@ pub struct Wakeup {
 pub struct IdleWait;
 
 impl IdleWait {
+    /// The sooner of two deadlines, where `-1` means none.
+    const fn timeout(repeat_ms: i32, motion_ms: Option<i32>) -> i32 {
+        match (repeat_ms, motion_ms) {
+            (repeat, Some(motion)) if repeat < 0 || motion < repeat => motion,
+            (repeat, _) => repeat,
+        }
+    }
+
     /// Sleep until a source has work, handing device readiness to `painter`.
     pub fn sleep(window: &Toplevel, painter: &mut FilesWindow) {
         let mut set = PollSet::new();
@@ -41,7 +52,10 @@ impl IdleWait {
             .udev_fd()
             .map(|fd| set.watch(fd, Interest::Readable));
 
-        let _ = set.wait(window.repeat_wait_ms());
+        let _ = set.wait(Self::timeout(
+            window.repeat_wait_ms(),
+            painter.motion_wait_ms(),
+        ));
 
         if set.is_ready(waker) {
             window.waker().drain();

@@ -33,12 +33,4 @@ impl RowKind {
             Self::Leaf => theme.selection_file,
         }
     }
-
-    #[must_use]
-    pub const fn hover_fill(self, theme: &Theme) -> Color {
-        match self {
-            Self::Navigable => theme.hover_dir,
-            Self::Leaf => theme.hover_file,
-        }
-    }
 }

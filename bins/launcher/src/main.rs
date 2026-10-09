@@ -15,6 +15,7 @@ mod launcher_options;
 mod launcher_window;
 
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 use dmenu_app::DmenuApp;
@@ -220,20 +221,16 @@ impl LauncherApp {
                 // workspace.
                 break;
             }
-            // `request_redraw` (called from `handle_keys` above whenever a
-            // key changed anything) signals the waker itself, so this cap
-            // is only a safety net for the rare tick where nothing queued a
-            // signal -- keep it short so any missed wake is still
-            // imperceptible instead of a visible stall.
-            self.window.wait(100);
+            self.window
+                .wait_also_on(self.singleton.listener().as_raw_fd());
         }
     }
 
     /// Whether a second launch invocation has connected to our singleton
     /// socket, asking us to close (see [`Self::singleton`]'s doc). The
-    /// listener is nonblocking (set once, at construction time in `main`),
-    /// so this is a cheap poll -- safe to call every loop iteration
-    /// alongside the Wayland tick.
+    /// listener is nonblocking (set once, at construction time in `main`)
+    /// and is one of the descriptors the loop sleeps on, so a second launch
+    /// wakes it.
     fn singleton_notified(&self) -> bool {
         self.singleton.listener().accept().is_ok()
     }

@@ -40,7 +40,11 @@ impl Endpoint {
         }
     }
 
-    fn send(&mut self, bytes: &[u8], fds: &[std::os::fd::BorrowedFd<'_>]) -> Result<usize, FdError> {
+    fn send(
+        &mut self,
+        bytes: &[u8],
+        fds: &[std::os::fd::BorrowedFd<'_>],
+    ) -> Result<usize, FdError> {
         self.passing
             .send_with_fds(&mut self.ring, self.fd, bytes, fds)
     }
@@ -91,10 +95,7 @@ struct MarkedFile {
 impl MarkedFile {
     fn new(marker: &str) -> Self {
         use std::io::Write as _;
-        let path = std::env::temp_dir().join(format!(
-            "cozy-fd-{}-{marker}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("cozy-fd-{}-{marker}", std::process::id()));
         let mut file = std::fs::File::create(&path).expect("create temp file");
         file.write_all(marker.as_bytes()).expect("write marker");
         Self { path }
@@ -160,7 +161,11 @@ fn several_descriptors_in_one_message_arrive_in_order() {
     let mut buf = [0u8; 16];
     wired.receiver.recv(&mut buf).expect("recv");
 
-    let claimed = wired.receiver.passing.claim(markers.len()).expect("all four");
+    let claimed = wired
+        .receiver
+        .passing
+        .claim(markers.len())
+        .expect("all four");
     let read: Vec<String> = claimed.iter().map(read_through).collect();
     assert_eq!(read, markers, "h indexes are positional");
 }

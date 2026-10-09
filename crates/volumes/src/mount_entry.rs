@@ -275,7 +275,10 @@ mod tests {
     #[test]
     fn a_lone_backslash_is_left_alone() {
         let line = "1 2 8:1 / /a\\bc rw - ext4 /dev/sdb1 rw";
-        assert_eq!(MountEntry::parse(line).expect("parses").mount_point(), "/a\\bc");
+        assert_eq!(
+            MountEntry::parse(line).expect("parses").mount_point(),
+            "/a\\bc"
+        );
     }
 
     #[test]

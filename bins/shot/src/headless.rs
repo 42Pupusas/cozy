@@ -30,7 +30,7 @@ impl ShotStress {
         let height = 720_u32;
         let stride = width * 4;
         let mut pixels = vec![0_u8; (stride * height) as usize];
-        for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
+        for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let x = index % width as usize;
             let y = index / width as usize;
             pixel[0] = u8::try_from(x % 256).expect("pixel channel fits");

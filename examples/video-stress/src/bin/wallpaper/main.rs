@@ -34,8 +34,8 @@ impl Application {
         }
         let header = pack.header();
         let wake = waker::Waker::new().map_err(|error| error.to_string())?;
-        let mut app = VideoApp::connect(&wake, options, pack, palette)
-            .map_err(|error| error.to_string())?;
+        let mut app =
+            VideoApp::connect(&wake, options, pack, palette).map_err(|error| error.to_string())?;
         println!(
             "clip {}x{} | {} frames | playing at {} fps",
             header.width,

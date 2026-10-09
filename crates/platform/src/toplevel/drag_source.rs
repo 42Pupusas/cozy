@@ -260,8 +260,7 @@ mod tests {
         use quetzalcoatl::capacity::Capacity;
         use quetzalcoatl::mpsc;
 
-        let (tx, mut rx) =
-            mpsc::RingBuffer::<WindowRequest>::new(Capacity::exact(64)).split();
+        let (tx, mut rx) = mpsc::RingBuffer::<WindowRequest>::new(Capacity::exact(64)).split();
         let mut window_tx = WindowSender {
             tx,
             next_id: 100,

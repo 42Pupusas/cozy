@@ -92,15 +92,7 @@ pub struct Toplevel {
     request_rx: mpsc::Consumer<crate::conn::WindowRequest>,
     window_tx: WindowSender,
     events: Consumer<RawEvent>,
-    /// Events popped off `events` by a synchronous exchange that was
-    /// looking for one specific reply, held in arrival order until
-    /// [`Self::tick`] routes them.
-    ///
-    /// `events` is this window's only source of input, configure and frame
-    /// events, and a `RawEvent::Fd` correlates with the message before it by
-    /// position. So a blocking round trip may not discard what it pops, and
-    /// may not reorder it either.
-    deferred: std::collections::VecDeque<RawEvent>,
+    activations: crate::toplevel::activation_queue::ActivationQueue,
     reader: Option<std::thread::JoinHandle<Result<()>>>,
     reader_health: crate::ReaderHealth,
     wake: waker::Waker,
@@ -138,6 +130,10 @@ pub struct Toplevel {
     pointer: PointerState,
     keyboard: KeyboardState,
 
+    /// Cursor images, built on demand. Empty until a painter asks for a
+    /// shape, so a window that never changes its cursor pays nothing.
+    cursors: crate::toplevel::cursor_set::CursorSet,
+
     /// The XKB translator, once the keymap fd has been received and parsed.
     ///
     /// `None` means no keymap yet (or `libxkbcommon` is unavailable), in
@@ -157,6 +153,10 @@ pub struct Toplevel {
     /// [`crate::toplevel::drag::DragController`] for why this handles both
     /// dragging out of and dropping into this window.
     drag: crate::toplevel::drag::DragController,
+
+    /// Text this window has put on the clipboard, published through the
+    /// same data device the drag controller owns.
+    selection: crate::toplevel::text_selection::TextSelection,
 
     /// `xdg_activation_v1`, when the compositor offers it. `None` means a
     /// launched window cannot ask to be raised, which is the pre-protocol
@@ -247,13 +247,7 @@ impl Toplevel {
         });
         let physical = geometry.physical();
 
-        // Opaque windows use the cheaper XRGB format the compositor never
-        // has to blend; a translucent one needs the per-pixel alpha channel.
-        let buf_format = if format.needs_alpha() {
-            Format::Argb8888
-        } else {
-            Format::Xrgb8888
-        };
+        let buf_format = Self::buffer_format(format);
         let (frames, shm_mem, pool) = Frame::create_pair(
             &mut sender,
             shm,
@@ -320,10 +314,12 @@ impl Toplevel {
             keyboard_id: None,
             pointer: PointerState::new(),
             keyboard: KeyboardState::new(),
+            cursors: crate::toplevel::cursor_set::CursorSet::new(shm, compositor, scale),
             xkb: None,
             awaiting_keymap_fd: None,
-            deferred: std::collections::VecDeque::new(),
+            activations: crate::toplevel::activation_queue::ActivationQueue::new(),
             drag,
+            selection: crate::toplevel::text_selection::TextSelection::new(),
             activation: activation.map(crate::toplevel::activation::Activation::new),
         };
         window.bind_seat_devices_eagerly();
@@ -336,6 +332,17 @@ impl Toplevel {
         self.geometry.physical()
     }
 
+    /// The output buffer scale this window opened at (1 = normal DPI,
+    /// 2 = `HiDPI` @2x, ...).
+    ///
+    /// Pointer events arrive in **logical** surface-local pixels while the
+    /// painter's canvas is **physical**; a painter that hit-tests in physical
+    /// coordinates needs this to convert (`physical = logical * scale`).
+    #[must_use]
+    pub const fn scale(&self) -> i32 {
+        self.geometry.scale()
+    }
+
     /// A handle the owner can use to wake this window's event loop from
     /// another thread.
     #[must_use]
@@ -343,58 +350,101 @@ impl Toplevel {
         self.wake.clone()
     }
 
+    /// Set the pointer image while it is over this window.
+    ///
+    /// `key` names the shape and must be stable for it (it is the cache
+    /// key); `names` are the Xcursor aliases to try, best first, because
+    /// themes disagree about which alias they ship.
+    ///
+    /// Repeating the same `key` is free: the request is skipped. A shape no
+    /// installed theme provides leaves the pointer as it was, so a sparse
+    /// theme degrades to a plain arrow rather than an invisible cursor.
+    ///
+    /// Does nothing before the pointer has entered the surface, since the
+    /// protocol requires the enter serial.
+    pub fn set_cursor(&mut self, key: &'static str, names: &[&str]) {
+        let Some(pointer) = self.pointer_id else {
+            return;
+        };
+        // `set_cursor` must quote the enter serial, not a button serial.
+        let serial = self.pointer.enter_serial();
+        if serial == 0 {
+            return;
+        }
+        self.cursors
+            .apply(&mut self.window_tx, pointer, serial, key, names);
+    }
+
     /// Change the window title.
     pub fn set_title(&self, title: &str) {
         self.shell.set_title(&self.window_tx, title);
     }
 
-    /// Mint an activation token for a program this window is about to
-    /// launch, so the launched window may raise itself.
+    /// Ask for an activation token for a program this window is about to
+    /// launch, so the launched window may raise itself, and return at once.
     ///
     /// Call this from the handler for the input event that caused the
     /// launch. The token carries that event's serial and this window's
     /// surface, which together are the compositor's own evidence that a
     /// user acted -- see [`crate::toplevel::activation`].
     ///
-    /// Returns `None` when the compositor offers no `xdg_activation_v1`, or
-    /// does not answer in time. Both mean "launch without a token": the
+    /// The answer is collected with [`Self::next_activation`], matched to the
+    /// returned ticket. A compositor with no `xdg_activation_v1` answers
+    /// immediately with no token, which means "launch without one": the
     /// child still starts, it simply appears where it already lived instead
     /// of on the current workspace.
     ///
     /// `app_id` names the program being launched, not this one; pass `None`
     /// when it is not known.
-    pub fn activation_token(
+    pub fn request_activation_token(
         &mut self,
         app_id: Option<&str>,
-    ) -> Option<crate::toplevel::activation::ActivationToken> {
-        let activation = self.activation?;
+    ) -> crate::toplevel::activation_queue::ActivationTicket {
+        let Some(activation) = self.activation else {
+            return self.resolve_activation_unavailable();
+        };
         // The id must come from this window's reserved block, like every
         // other object created after startup. `Sender::alloc_id` hands out
         // ids from the range that block was carved out of, so using it here
         // names an object the window already owns -- and the compositor
         // rejects the request as invalid arguments.
         let token: crate::id::ActivationTokenId = self.window_tx.alloc_id();
-        match activation.request(
-            token,
-            &mut self.sender,
-            &mut self.events,
-            &mut self.deferred,
-            crate::toplevel::activation::LaunchEvidence {
-                seat: self.seat,
-                surface: self.shell.surface,
-                serial: self.pointer.last_serial(),
-                app_id,
-            },
-        ) {
-            Ok(token) => token,
+        let evidence = crate::toplevel::activation::LaunchEvidence {
+            seat: self.seat,
+            surface: self.shell.surface,
+            serial: self.pointer.last_serial(),
+            app_id,
+        };
+        match activation.begin(token, &mut self.sender, evidence) {
+            Ok(()) => self.activations.track(token),
             // Reported, not swallowed: a protocol error means the compositor
             // is about to drop the connection, and the window would
             // otherwise die a few frames later with no stated cause.
             Err(e) => {
                 eprintln!("platform: activation token unavailable: {e}");
-                None
+                self.resolve_activation_unavailable()
             }
         }
+    }
+
+    /// An answer that needs no compositor still has to wake the loop, or it
+    /// would sit uncollected until some unrelated event arrived.
+    fn resolve_activation_unavailable(
+        &mut self,
+    ) -> crate::toplevel::activation_queue::ActivationTicket {
+        let ticket = self.activations.resolve_unavailable();
+        self.wake.signal();
+        ticket
+    }
+
+    /// The oldest token answer not yet collected.
+    ///
+    /// Poll after [`Self::tick`], which is where answers are read off the
+    /// connection.
+    pub fn next_activation(
+        &mut self,
+    ) -> Option<crate::toplevel::activation_queue::ActivationOutcome> {
+        self.activations.pop()
     }
 
     /// Whether the compositor can issue activation tokens.
@@ -416,6 +466,23 @@ impl Toplevel {
         let serial = self.pointer.last_serial();
         self.drag
             .start_drag(&mut self.window_tx, self.shell.surface, serial, paths);
+    }
+
+    /// Put `text` on the system clipboard.
+    ///
+    /// Must follow a pointer press, whose serial the compositor checks. A
+    /// compositor without `wl_data_device_manager`, an empty `text`, or a
+    /// window that has not yet seen a press makes this a no-op.
+    pub fn copy_text(&mut self, text: String) {
+        let serial = self.pointer.last_serial();
+        let Some(device) = self.drag.data_device() else {
+            return;
+        };
+        if serial == 0 {
+            return;
+        }
+        self.selection
+            .publish(&mut self.window_tx, device, serial, text);
     }
 
     /// Whether a drag started from this window (via [`Self::start_drag`]) is
@@ -465,12 +532,6 @@ impl Toplevel {
     /// until something happens.
     pub fn tick(&mut self, painter: &mut impl Painter) -> Result<()> {
         self.sender.drain_requests(&mut self.request_rx)?;
-        // Deferred first: these arrived *before* anything still queued in
-        // `events`, and routing them out of order would apply a stale
-        // configure or mis-pair a keymap fd.
-        while let Some(ev) = self.deferred.pop_front() {
-            self.handle_event(ev, painter)?;
-        }
         while let Some(ev) = self.events.pop() {
             self.handle_event(ev, painter)?;
         }
@@ -519,6 +580,11 @@ impl Toplevel {
         // than by id -- routed by which one is currently expected.
         if let RawEvent::Fd(fds) = ev {
             self.handle_fd_event(fds.into_iter().next().as_ref());
+            return Ok(());
+        }
+
+        if let Some(token) = self.activations.absorb(&ev) {
+            let _ = crate::toplevel::activation::Activation::release(&mut self.sender, token);
             return Ok(());
         }
 
@@ -606,6 +672,14 @@ impl Toplevel {
             }
             return true;
         }
+        if let Some(src) = self.selection.id()
+            && ev.is(src)
+        {
+            if let Some(src_ev) = ev.event::<crate::protocol::DataSourceEvent>() {
+                self.selection.on_event(&mut self.window_tx, src_ev);
+            }
+            return true;
+        }
         if let Some(offer) = self.drag.incoming_offer_id()
             && ev.is(offer)
         {
@@ -678,6 +752,16 @@ impl Toplevel {
         (serial, wire.u32())
     }
 
+    /// Opaque windows use the cheaper XRGB format the compositor never has
+    /// to blend; a translucent one needs the per-pixel alpha channel.
+    const fn buffer_format(format: SurfaceFormat) -> Format {
+        if format.needs_alpha() {
+            Format::Argb8888
+        } else {
+            Format::Xrgb8888
+        }
+    }
+
     /// Hand any completed drop payload to the painter, then conclude the
     /// transfer.
     ///
@@ -720,6 +804,13 @@ impl Toplevel {
             if let Ok(owned) = fd.as_fd().try_clone_to_owned() {
                 self.drag.write_send_fd(owned);
             }
+            return;
+        }
+        if self.selection.is_awaiting_send_fd()
+            && let Some(fd) = fd
+            && let Ok(owned) = fd.as_fd().try_clone_to_owned()
+        {
+            self.selection.write_send_fd(owned);
         }
     }
 
@@ -788,7 +879,15 @@ impl Toplevel {
         let emitted = match ev.event::<PointerEvent>() {
             // Enter carries `serial, surface, x, y` -- coordinates start at
             // arg 2, unlike Motion's `time, x, y`.
-            Some(PointerEvent::Enter) => Some(self.pointer.enter(ev.fixed(2), ev.fixed(3))),
+            Some(PointerEvent::Enter) => {
+                // The compositor resets the cursor on every enter, so the
+                // cached "already applied" shape is stale now.
+                self.cursors.invalidate();
+                Some(
+                    self.pointer
+                        .enter(ev.serial(0).raw(), ev.fixed(2), ev.fixed(3)),
+                )
+            }
             Some(PointerEvent::Leave) => Some(self.pointer.leave()),
             Some(PointerEvent::Motion) => Some(self.pointer.motion(ev.fixed(1), ev.fixed(2))),
             Some(PointerEvent::Button) => {
@@ -904,6 +1003,22 @@ impl Toplevel {
     #[must_use]
     pub const fn next_repeat_due_ms(&self) -> Option<u64> {
         self.keyboard.next_repeat_due_ms()
+    }
+
+    /// How long until the next key auto-repeat is due, or `-1` (block
+    /// forever) when no key is held.
+    ///
+    /// The only deadline an otherwise event-driven loop has: everything else
+    /// that wakes it arrives on a descriptor. Pass it to [`Self::wait`] so a
+    /// held key repeats at the compositor's rate instead of the loop's.
+    #[must_use]
+    pub fn repeat_wait_ms(&self) -> i32 {
+        let Some(due) = self.next_repeat_due_ms() else {
+            return -1;
+        };
+        let remaining = due.saturating_sub(Self::now_ms());
+        // Zero would spin; one millisecond is the shortest honest wait.
+        i32::try_from(remaining).unwrap_or(i32::MAX).max(1)
     }
 
     /// Apply a coalesced resize: grow the shm pool, resize the backbuffer,
@@ -1032,9 +1147,7 @@ impl Toplevel {
         // `PlatformError::ReaderStopped`.
         let joined = reader.map_or(Ok(()), |handle| {
             // A panic is never expected, so it still propagates.
-            handle
-                .join()
-                .map_or(Err(PlatformError::ReaderPanicked), |result| result)
+            handle.join().unwrap_or(Err(PlatformError::ReaderPanicked))
         });
         // Only now is the descriptor unreferenced by the reader's ring.
         drop(sender);

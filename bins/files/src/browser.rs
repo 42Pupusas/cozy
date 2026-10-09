@@ -298,6 +298,38 @@ impl Browser {
         self.pane.cursor().and_then(|row| self.entry(row))
     }
 
+    /// The path of the entry at `row`.
+    #[must_use]
+    pub fn path_of(&self, row: usize) -> Option<PathBuf> {
+        self.entry(row).map(|e| e.path.clone())
+    }
+
+    /// Put the entry at `row` on the file clipboard, to be pasted as a copy
+    /// (or, with `cut`, as a move), whatever is selected.
+    pub fn clip_entry(&mut self, row: usize, cut: bool) -> Outcome {
+        let Some(path) = self.path_of(row) else {
+            return Outcome::Ignored;
+        };
+        if cut {
+            self.clipboard.cut(vec![path]);
+        } else {
+            self.clipboard.copy(vec![path]);
+        }
+        Outcome::Redraw
+    }
+
+    /// Open the rename box over the entry at `row`, whatever the cursor is on.
+    pub fn rename_entry(&mut self, row: usize) -> Outcome {
+        let Some(path) = self.path_of(row) else {
+            return Outcome::Ignored;
+        };
+        if !self.rename.begin(&path, row) {
+            return Outcome::Ignored;
+        }
+        self.keymap.set_focus(Focus::Rename);
+        Outcome::Redraw
+    }
+
     /// The paths a drag started from `row` would carry.
     ///
     /// If `row` is part of the active selection, every selected path is
@@ -1458,6 +1490,54 @@ mod tests {
             3,
             "dragging a selected row carries every selected path"
         );
+    }
+
+    #[test]
+    fn a_tile_button_clips_its_own_entry_whatever_is_selected() {
+        let dir = TempDir::new("clip_entry");
+        let a = dir.create_file("a.txt", b"a");
+        dir.create_file("b.txt", b"b");
+        let mut browser = open(&dir);
+        browser.act(Action::List(ListCommand::SelectAll));
+        assert_eq!(browser.clip_entry(0, false), Outcome::Redraw);
+        assert!(!browser.clipboard().is_cut(&a));
+        assert_eq!(browser.clip_entry(0, true), Outcome::Redraw);
+        assert!(browser.clipboard().is_cut(&a), "only the pointed entry");
+        assert_eq!(
+            browser.notice(),
+            None,
+            "the button is its own feedback; the footer stays as it was"
+        );
+        assert!(!browser.clipboard().is_cut(&dir.path().join("b.txt")));
+    }
+
+    #[test]
+    fn clipping_a_row_that_is_not_there_does_nothing() {
+        let dir = TempDir::new("clip_entry_missing");
+        let mut browser = open(&dir);
+        assert_eq!(browser.clip_entry(9, false), Outcome::Ignored);
+        assert_eq!(browser.notice(), None);
+    }
+
+    #[test]
+    fn a_tile_button_renames_its_own_entry_not_the_cursors() {
+        let dir = TempDir::new("rename_entry");
+        dir.create_file("a.txt", b"a");
+        dir.create_file("b.txt", b"b");
+        let mut browser = open(&dir);
+        assert_eq!(browser.rename_entry(1), Outcome::Redraw);
+        assert!(browser.is_renaming());
+        assert_eq!(browser.rename().row(), Some(1));
+        assert_eq!(browser.rename_entry(9), Outcome::Ignored);
+    }
+
+    #[test]
+    fn a_path_is_offered_for_the_clipboard() {
+        let dir = TempDir::new("path_of");
+        let a = dir.create_file("a.txt", b"a");
+        let browser = open(&dir);
+        assert_eq!(browser.path_of(0), Some(a));
+        assert_eq!(browser.path_of(9), None);
     }
 
     #[test]

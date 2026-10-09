@@ -90,9 +90,7 @@ impl CoreBars {
         // drifting strips. Invalidate the height cache so each bar takes the
         // full-column redraw path below (old_height < 0).
         if paint.background_cleared {
-            for height in &mut self.last_heights {
-                *height = -1;
-            }
+            self.last_heights.fill(-1);
         }
         let gap = 3;
         let bar_width = ((w - gap * (i32::try_from(cores.len()).unwrap_or(1) - 1))

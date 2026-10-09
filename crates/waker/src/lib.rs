@@ -17,6 +17,10 @@
 //! The fd is shared by cloning ([`Waker`] is `Clone` via an `Arc<OwnedFd>`), so
 //! several producer threads can signal the same waiter.
 
+mod poll_set;
+
+pub use poll_set::{Interest, PollSet};
+
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
@@ -87,10 +91,10 @@ impl Waker {
 
 /// `struct pollfd`.
 #[repr(C)]
-struct PollFd {
-    fd: RawFd,
-    events: i16,
-    revents: i16,
+pub(crate) struct PollFd {
+    pub(crate) fd: RawFd,
+    pub(crate) events: i16,
+    pub(crate) revents: i16,
 }
 
 /// A small `poll(2)` wrapper over one or two raw file descriptors.
@@ -186,7 +190,7 @@ impl Poller {
 
 unsafe extern "C" {
     fn eventfd(initval: u32, flags: i32) -> RawFd;
-    fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    pub(crate) fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
     fn read(fd: RawFd, buf: *mut core::ffi::c_void, count: usize) -> isize;
     fn write(fd: RawFd, buf: *const core::ffi::c_void, count: usize) -> isize;
 }

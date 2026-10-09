@@ -18,22 +18,8 @@ const SEXTANT_RIGHT_COLUMN: u8 = 0b10_1010;
 
 /// The 16 quadrant glyphs, indexed by a mask of set subcells.
 const QUADRANTS: [char; 16] = [
-    ' ',
-    '\u{2598}',
-    '\u{259D}',
-    '\u{2580}',
-    '\u{2596}',
-    '\u{258C}',
-    '\u{259E}',
-    '\u{259B}',
-    '\u{2597}',
-    '\u{259A}',
-    '\u{2590}',
-    '\u{259C}',
-    '\u{2584}',
-    '\u{2599}',
-    '\u{259F}',
-    '\u{2588}',
+    ' ', '\u{2598}', '\u{259D}', '\u{2580}', '\u{2596}', '\u{258C}', '\u{259E}', '\u{259B}',
+    '\u{2597}', '\u{259A}', '\u{2590}', '\u{259C}', '\u{2584}', '\u{2599}', '\u{259F}', '\u{2588}',
 ];
 
 /// The four half-block glyphs, indexed by a mask of set subcells.
@@ -150,9 +136,15 @@ mod tests {
 
     #[test]
     fn each_mode_reports_its_subcell_shape() {
-        assert_eq!((SubcellGrid::Half.columns(), SubcellGrid::Half.rows()), (1, 2));
         assert_eq!(
-            (SubcellGrid::Quadrant.columns(), SubcellGrid::Quadrant.rows()),
+            (SubcellGrid::Half.columns(), SubcellGrid::Half.rows()),
+            (1, 2)
+        );
+        assert_eq!(
+            (
+                SubcellGrid::Quadrant.columns(),
+                SubcellGrid::Quadrant.rows()
+            ),
             (2, 2)
         );
         assert_eq!(
@@ -216,7 +208,9 @@ mod tests {
 
     #[test]
     fn every_sextant_mask_maps_to_a_distinct_glyph() {
-        let mut seen: Vec<char> = (0..64u8).map(|mask| SubcellGrid::Sextant.glyph(mask)).collect();
+        let mut seen: Vec<char> = (0..64u8)
+            .map(|mask| SubcellGrid::Sextant.glyph(mask))
+            .collect();
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), 64);

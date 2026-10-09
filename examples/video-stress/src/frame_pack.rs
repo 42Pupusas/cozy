@@ -167,8 +167,7 @@ mod tests {
 
     #[test]
     fn renders_native_and_scaled_sizes() {
-        let pack =
-            FramePack::from_bytes(&pack_bytes(&[[0b1010_0000, 0b0101_0000]]), 0, 1).unwrap();
+        let pack = FramePack::from_bytes(&pack_bytes(&[[0b1010_0000, 0b0101_0000]]), 0, 1).unwrap();
         let mut native = [0u32; 8];
         pack.render_into(0, 4, 2, &mut native);
         assert_eq!(native, [1, 0, 1, 0, 0, 1, 0, 1]);

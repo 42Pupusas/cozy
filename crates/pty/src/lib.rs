@@ -63,9 +63,7 @@ use inflight::{InFlight, OpTag};
 /// for an operation completing.
 const CANCEL_USER_DATA: u64 = 0xffff_0001;
 
-/// How long teardown waits for the kernel to give the buffers back before
-/// leaking them instead.
-const QUIESCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const EINTR: i32 = 4;
 
 /// One message from the application into the PTY event loop.
 ///
@@ -300,10 +298,10 @@ impl Pty {
             let mut completed: Vec<OpTag> = Vec::new();
             let cq = &self.cq;
             cq.drain(|cqe| {
-                if let Some(tag) = OpTag::from_user_data(cqe.user_data) {
+                if let Some(tag) = OpTag::from_user_data(cqe.user_data()) {
                     completed.push(tag);
                 }
-                actions.push(CqeAction::from_cqe(cqe.user_data, cqe.result));
+                actions.push(CqeAction::from_cqe(cqe.user_data(), cqe.raw_result()));
             });
             // Clear before dispatch: an action may re-arm the very tag whose
             // completion this batch carried.
@@ -569,49 +567,55 @@ impl Pty {
     /// (`malloc(): unaligned tcache chunk`). The completion of an operation
     /// is the only proof that the kernel has let its buffer go.
     ///
-    /// If the kernel does not return every completion within
-    /// [`QUIESCE_TIMEOUT`], this reports failure and the caller leaks the
-    /// buffers instead. A bounded leak on a teardown path is recoverable;
-    /// freeing memory the kernel still writes into is not.
+    /// Sleeps in the kernel until every outstanding operation has posted its
+    /// completion; cancelling a read or write on a pollable fd always does.
+    /// When the kernel reports nothing submitted and uncompleted, every
+    /// completion is already in the queue, so one last reap settles it.
+    ///
+    /// Returns `false` only when the wait itself fails. The caller then
+    /// leaks the buffers, because freeing memory the kernel may still write
+    /// into is not recoverable.
     fn quiesce(&mut self) -> bool {
         if self.in_flight.is_quiet() {
             return true;
         }
-
-        for tag in self.in_flight.armed() {
-            let sqe = Sqe::cancel(tag.as_user_data()).user_data(CANCEL_USER_DATA);
-            if self.sq.push(sqe).is_err() {
-                break;
-            }
-        }
-        let _ = self.queue.submit();
-
-        // Poll rather than block in the kernel. `submit_and_wait(1)` sleeps
-        // until a completion arrives, which makes the deadline below
-        // unenforceable: an operation the kernel declines to cancel would
-        // hang teardown forever instead of falling back to the leak. A
-        // cancelled operation completes almost immediately, so this loop
-        // normally runs a single pass.
-        let deadline = std::time::Instant::now() + QUIESCE_TIMEOUT;
-        while !self.in_flight.is_quiet() {
-            let _ = self.queue.submit();
-            let in_flight = &mut self.in_flight;
-            // A cancelled operation still posts a CQE (with `-ECANCELED`),
-            // so its arrival is what confirms the buffer is idle.
-            self.cq.drain(|cqe| {
-                if let Some(tag) = OpTag::from_user_data(cqe.user_data) {
-                    in_flight.complete(tag);
-                }
-            });
+        self.cancel_outstanding();
+        loop {
+            self.reap_completions();
             if self.in_flight.is_quiet() {
-                break;
+                return true;
             }
-            if std::time::Instant::now() >= deadline {
-                return false;
+            match self.queue.submit_and_wait_pending() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.reap_completions();
+                    return self.in_flight.is_quiet();
+                }
+                Err(ququmatz::Error::Syscall(errno)) if errno.raw() == EINTR => {}
+                Err(_) => return false,
             }
-            std::thread::sleep(std::time::Duration::from_micros(200));
         }
-        true
+    }
+
+    fn cancel_outstanding(&self) {
+        for tag in self.in_flight.armed() {
+            let mut sqe = Sqe::cancel(tag.as_user_data()).user_data(CANCEL_USER_DATA);
+            while let Err(rejected) = self.sq.push(sqe) {
+                if self.queue.submit().is_err() {
+                    return;
+                }
+                sqe = rejected;
+            }
+        }
+    }
+
+    fn reap_completions(&mut self) {
+        let in_flight = &mut self.in_flight;
+        self.cq.drain(|cqe| {
+            if let Some(tag) = OpTag::from_user_data(cqe.user_data()) {
+                in_flight.complete(tag);
+            }
+        });
     }
 
     fn cleanup(&self, reaped: bool) {

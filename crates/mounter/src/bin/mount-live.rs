@@ -15,10 +15,10 @@
 //! the prompt, which makes the run unattended.
 
 use mounter::prompting_backend::{PasswordPrompt, PromptingBackend};
+use std::io::{BufRead, Write};
 use volumes::mount_backend::MountBackend;
 use volumes::mount_point::MountPoint;
 use volumes::mount_request::MountRequest;
-use std::io::{BufRead, Write};
 
 /// What the run was asked to do.
 struct ProbeOptions {
@@ -81,7 +81,11 @@ impl PasswordPrompt for TerminalPrompt {
             return None;
         }
         let trimmed = line.trim_end_matches(['\n', '\r']).to_owned();
-        if trimmed.is_empty() { None } else { Some(trimmed) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
     }
 
     fn notify(&mut self, message: &str) {

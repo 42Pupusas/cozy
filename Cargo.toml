@@ -30,15 +30,17 @@ opt-level = 3
 opt-level = 3
 
 [workspace.dependencies]
-# 0.15.1 adds MsgFlags::CMSG_CLOEXEC, required by `crates/scm-rights`.
-ququmatz      = "0.15.1"
+# Needs MsgFlags::CMSG_CLOEXEC (since 0.15.1) for `crates/scm-rights`, and
+# must be the same 0.16 copy quetzal-uring 0.2.3 links, so `Inotify` and
+# `MsgFlags` are one type across the workspace.
+ququmatz      = "0.16.1"
 # Must come from the registry, not a path: quetzal-uring's own ququmatz
 # dependency would otherwise resolve to a second, distinct copy of the crate.
-quetzal-uring = "0.2.1"
+quetzal-uring = "0.2.3"
 # Must come from the registry, not a path: quetzal-uring depends on
 # quetzalcoatl too, and a path copy resolves as a second, distinct crate.
-quetzalcoatl  = "0.13.1"
-shelby        = { path = "/home/cuarentaydos/Code/tooling/shelby/crates/shelby", features = ["std"] }
+quetzalcoatl  = "0.15.2"
+shelby        = { package = "toml-shelby", path = "/home/cuarentaydos/Code/tooling/shelby/crates/shelby", features = ["std"] }
 json-bourne   = { path = "/home/cuarentaydos/Code/tooling/bourne/crates/bourne", features = ["derive"] }
 # Zero-dependency PNG encode/decode, shared by `bins/wallpaper` (decode, for
 # loading a wallpaper image) and any future `bins/shot`-style screenshot tool

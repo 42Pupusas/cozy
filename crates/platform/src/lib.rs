@@ -25,6 +25,7 @@ pub mod keymap;
 pub mod layer;
 pub mod link_scan;
 pub mod multi_click;
+pub mod output_probe;
 pub mod pixel_buffers;
 pub mod premultiply;
 pub mod present;

@@ -99,26 +99,10 @@ pub struct Theme {
     pub tile_fills: [Color; 4],
 
     /// Fill under a hovered sidebar row or control (the filter box, a toolbar
-    /// button).
-    ///
-    /// List *rows* use [`Self::hover_dir`] / [`Self::hover_file`] instead,
-    /// which carry the entry's type; this stays the neutral wash for chrome
-    /// that has no type to express. Every place in the sidebar is a directory,
-    /// so there is no type distinction to make there -- a two-colour scheme
-    /// would encode a difference that does not exist.
+    /// button). Tiles do not use it: they answer the pointer with motion.
     pub hover: Color,
-    /// Fill under a hovered directory row, and behind a selected one.
-    ///
-    /// Tinted toward [`Self::dir`] so the highlight itself says what kind of
-    /// thing is under the pointer. A single neutral highlight for both kinds
-    /// throws away information the row is already carrying in its text
-    /// colour -- and the text colour is the thing the highlight covers up.
-    pub hover_dir: Color,
-    /// Fill under a hovered file row, and behind a selected one.
-    pub hover_file: Color,
-    /// Selection fill for a directory row -- the same hue as
-    /// [`Self::hover_dir`], carried further from the background so selection
-    /// still outranks hover when both apply to the same row.
+    /// Selection fill for a directory tile, tinted toward [`Self::dir`] so the
+    /// highlight says what kind of thing is selected.
     pub selection_dir: Color,
     /// Selection fill for a file row.
     pub selection_file: Color,
@@ -249,8 +233,6 @@ impl Default for Theme {
             // hue the filename already uses, at a fraction that reads as a
             // surface rather than as ink. Hover is the quieter pair, selection
             // the stronger, so a selected row still wins under the pointer.
-            hover_dir: Color::rgb(0x25, 0x2c, 0x3d),
-            hover_file: Color::rgb(0x28, 0x2a, 0x3a),
             selection_dir: Color::rgb(0x33, 0x40, 0x5c),
             selection_file: Color::rgb(0x3a, 0x3d, 0x50),
             control_border: Color::rgb(0x31, 0x32, 0x44),
@@ -283,24 +265,12 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// How far a hover highlight carries its type colour over the background.
+    /// How far a selection carries its type colour over the background.
     ///
-    /// Low on purpose: hover is transient feedback that follows the pointer,
-    /// and a strong fill flashing under the cursor as it crosses a list is
-    /// noise. It only has to be *findable*, not loud.
-    ///
-    /// Raised from 0.14 after measuring the result rather than trusting the
-    /// fraction: against this palette's near-black `#181616` list background,
-    /// 0.14 of the directory colour landed on `#282a2c` -- eighteen levels of
-    /// lift, which reads as "slightly less black" rather than as a highlight.
-    /// The trap is that a *fraction* of a very dark surface is a very small
-    /// absolute step, which is the same mistake 74d250f fixed for the chrome
-    /// shades. Still the quieter of the two washes, just now actually visible.
-    const HOVER_WASH: f32 = 0.22;
-
-    /// The same for a selection, which is a state the user chose and expects
-    /// to stay put. Comfortably ahead of [`Self::HOVER_WASH`] so a selected
-    /// row still reads as selected while the pointer is over it.
+    /// Measured rather than trusted: against this palette's near-black
+    /// `#181616` list background a small fraction of a colour is a very small
+    /// absolute step, which reads as "slightly less black" rather than as a
+    /// highlight.
     const SELECTION_WASH: f32 = 0.30;
 
     /// How far the modal card is lifted from the window background toward
@@ -444,18 +414,6 @@ impl Theme {
             // `files_text` is the brightness reference for both kinds, so the
             // directory ink contributes only its hue and the two fills sit at
             // one lightness -- see `Self::wash`.
-            hover_dir: Self::wash(
-                cfg.files_background(),
-                cfg.files_dir(),
-                cfg.files_text(),
-                Self::HOVER_WASH,
-            ),
-            hover_file: Self::wash(
-                cfg.files_background(),
-                cfg.files_text(),
-                cfg.files_text(),
-                Self::HOVER_WASH,
-            ),
             selection_dir: Self::wash(
                 cfg.files_background(),
                 cfg.files_dir(),
@@ -847,7 +805,7 @@ background = "#181616"
     }
 
     #[test]
-    fn the_tile_hover_and_selection_fills_stand_off_every_resting_fill() {
+    fn the_selection_fill_stands_off_every_resting_fill() {
         let luma = |c: Color| config::Color::from_rgb(c.r, c.g, c.b).luma();
         for toml in [
             "",
@@ -856,14 +814,12 @@ background = "#181616"
             let cfg = config::Config::from_bytes(toml.as_bytes()).expect("parse");
             let t = Theme::from_config(&cfg);
             for fill in t.tile_fills {
-                for (state, name) in [(t.hover_file, "hover"), (t.selection_file, "selection")] {
-                    assert!(
-                        luma(state) > luma(fill),
-                        "{name} ({}) must be brighter than a resting tile ({}) for {toml:?}",
-                        luma(state),
-                        luma(fill)
-                    );
-                }
+                assert!(
+                    luma(t.selection_file) > luma(fill),
+                    "selection ({}) must be brighter than a resting tile ({}) for {toml:?}",
+                    luma(t.selection_file),
+                    luma(fill)
+                );
             }
         }
     }
@@ -913,10 +869,8 @@ background = "#181616"
         )
         .expect("parse");
         let t = Theme::from_config(&cfg);
-        for (dir_fill, file_fill, what) in [
-            (t.hover_dir, t.hover_file, "hover"),
-            (t.selection_dir, t.selection_file, "selection"),
-        ] {
+        {
+            let (dir_fill, file_fill, what) = (t.selection_dir, t.selection_file, "selection");
             let lean = |c: Color| i32::from(c.b) - i32::from(c.r);
             assert!(
                 lean(dir_fill) > lean(file_fill) + 4,

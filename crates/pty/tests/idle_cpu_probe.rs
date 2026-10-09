@@ -79,15 +79,9 @@ fn idle_loop_burns_negligible_cpu() {
 
     shutdown.store(true, Ordering::Relaxed);
     wake.signal();
-
-    // Bound the join so a real hang fails fast instead of blocking CI.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = handle.join();
-        let _ = tx.send(());
-    });
-    rx.recv_timeout(Duration::from_secs(5))
-        .expect("Pty::run did not exit after shutdown flag was set + wake");
+    handle
+        .join()
+        .expect("Pty::run exits after the shutdown flag is set and the loop woken");
 
     // Tick counts here are small (a few hundred over a 5s probe window), so
     // this narrowing to u32 (then losslessly to f64) is exact -- nowhere

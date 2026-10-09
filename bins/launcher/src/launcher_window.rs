@@ -329,11 +329,11 @@ impl LauncherWindow {
     /// Marking dirty alone isn't enough: `wait` parks on the Wayland
     /// reader's wakeup eventfd, which only fires for genuine protocol
     /// events. Without this signal, a redraw requested right before the
-    /// run loop's `wait(1000)` (e.g. every keystroke, since `main.rs`
-    /// handles keys *then* waits) would sit unpainted for up to a second --
-    /// or until the next real Wayland event happened to arrive -- which is
-    /// exactly the "laggy typing" symptom: each character only appeared
-    /// once you typed the *next* one, or after a long stall.
+    /// run loop's wait (e.g. every keystroke, since `main.rs`
+    /// handles keys *then* waits) would sit unpainted until the next real
+    /// Wayland event happened to arrive -- which is exactly the "laggy
+    /// typing" symptom: each character only appeared once you typed the
+    /// *next* one.
     pub fn request_redraw(&mut self) {
         self.present.mark_dirty();
         self.wake.signal();
@@ -347,6 +347,16 @@ impl LauncherWindow {
     pub fn wait(&self, timeout_ms: i32) {
         let _ = self.wake.wait(timeout_ms);
         self.wake.drain();
+    }
+
+    pub fn wait_also_on(&self, extra: std::os::fd::RawFd) {
+        let mut set = waker::PollSet::new();
+        let wake = set.watch(self.wake.raw_fd(), waker::Interest::Readable);
+        set.watch(extra, waker::Interest::Readable);
+        let _ = set.wait(-1);
+        if set.is_ready(wake) {
+            self.wake.drain();
+        }
     }
 
     /// Process pending events and present if dirty. Returns `false` once
@@ -583,9 +593,7 @@ impl LauncherWindow {
     fn do_present(&mut self, slot: usize, paint: &mut impl FnMut(&mut Canvas)) {
         {
             let bg_packed = self.pack_bg();
-            for p in &mut self.backbuffer {
-                *p = bg_packed;
-            }
+            self.backbuffer.fill(bg_packed);
             // Hand the painter a canvas that knows this window is
             // translucent, so its `fill_rect`/`fill_round_rect` calls pack
             // for the premultiplied Argb8888 backbuffer instead of writing a

@@ -132,7 +132,10 @@ mod tests {
     #[test]
     fn a_double_dash_ends_option_parsing() {
         let options = OpenOptions::parse(Args::of(&["--", "-weird.txt"])).unwrap();
-        assert_eq!(options.command, Command::Open(vec!["-weird.txt".to_owned()]));
+        assert_eq!(
+            options.command,
+            Command::Open(vec!["-weird.txt".to_owned()])
+        );
     }
 
     /// After `--`, something that looks like a flag is still a target.

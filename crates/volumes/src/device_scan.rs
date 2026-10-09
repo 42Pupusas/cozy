@@ -72,7 +72,11 @@ impl DeviceScan {
             .filter(|(device, _)| !partitioned.contains(&device.name().to_owned()))
             .map(|(device, attached)| Self::locate(attached, &device, mounts))
             .collect();
-        devices.sort_by(|a, b| a.display_name().cmp(b.display_name()).then(a.name().cmp(b.name())));
+        devices.sort_by(|a, b| {
+            a.display_name()
+                .cmp(b.display_name())
+                .then(a.name().cmp(b.name()))
+        });
         Self { devices }
     }
 
@@ -103,9 +107,7 @@ impl DeviceScan {
     /// kernel names them: `sdb1` on `sdb`, `mmcblk0p1` on `mmcblk0`. The
     /// check requires a real prefix relationship rather than a substring, so
     /// `sdb1` never claims to be part of `sdc`.
-    fn disks_with_listed_partitions(
-        candidates: &[(BlockDevice, AttachedDevice)],
-    ) -> Vec<String> {
+    fn disks_with_listed_partitions(candidates: &[(BlockDevice, AttachedDevice)]) -> Vec<String> {
         let disks: Vec<&str> = candidates
             .iter()
             .filter(|(device, _)| !device.is_partition())
@@ -125,9 +127,13 @@ impl DeviceScan {
 
     /// Whether `partition` is a partition of `disk` by kernel naming.
     fn is_partition_of(partition: &str, disk: &str) -> bool {
-        partition
-            .strip_prefix(disk)
-            .is_some_and(|rest| !rest.is_empty() && rest.trim_start_matches('p').chars().all(|c| c.is_ascii_digit()))
+        partition.strip_prefix(disk).is_some_and(|rest| {
+            !rest.is_empty()
+                && rest
+                    .trim_start_matches('p')
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+        })
     }
 
     /// Attach the mount point, when the mount table knows this device.
@@ -136,7 +142,11 @@ impl DeviceScan {
     /// `/dev/disk/by-uuid/...` names no `/sys` node in the mount table, and
     /// a name comparison would call it unmounted and offer to mount it
     /// twice.
-    fn locate(attached: AttachedDevice, device: &BlockDevice, mounts: &MountTable) -> AttachedDevice {
+    fn locate(
+        attached: AttachedDevice,
+        device: &BlockDevice,
+        mounts: &MountTable,
+    ) -> AttachedDevice {
         let point = mounts
             .entries()
             .iter()
@@ -201,7 +211,7 @@ impl DeviceScan {
 mod tests {
     use super::DeviceScan;
     use crate::mount_table::MountTable;
-    use crate::test_support::{fixtures, TempDir};
+    use crate::test_support::{TempDir, fixtures};
     use std::path::Path;
 
     const USB_BUS: &str = "pci0000:00/0000:00:14.0/usb2/2-1/2-1:1.0/host6/target6:0:0/6:0:0:0";
@@ -306,10 +316,18 @@ mod tests {
         let tmp = TempDir::new("scan-two");
         tmp.block_disk(USB_BUS, "sdb", false);
         tmp.sized(USB_BUS, "sdb", None, 8, 16, 1_000);
-        tmp.udev_block(8, 16, "E:ID_FS_LABEL=ALPHA\nE:ID_FS_TYPE=vfat\nE:ID_FS_USAGE=filesystem\n");
+        tmp.udev_block(
+            8,
+            16,
+            "E:ID_FS_LABEL=ALPHA\nE:ID_FS_TYPE=vfat\nE:ID_FS_USAGE=filesystem\n",
+        );
         tmp.block_disk(USB_BUS, "sdc", false);
         tmp.sized(USB_BUS, "sdc", None, 8, 32, 1_000);
-        tmp.udev_block(8, 32, "E:ID_FS_LABEL=BETA\nE:ID_FS_TYPE=vfat\nE:ID_FS_USAGE=filesystem\n");
+        tmp.udev_block(
+            8,
+            32,
+            "E:ID_FS_LABEL=BETA\nE:ID_FS_TYPE=vfat\nE:ID_FS_USAGE=filesystem\n",
+        );
         let found = scan(&tmp, "");
         assert_eq!(found.len(), 2);
     }
@@ -361,7 +379,10 @@ mod tests {
         let tmp = TempDir::new("scan-diff");
         stick_with_partition(&tmp);
         let before = scan(&tmp, "");
-        let after = scan(&tmp, "40 25 8:17 / /run/media/user/EFI rw - vfat /dev/sdb1 rw");
+        let after = scan(
+            &tmp,
+            "40 25 8:17 / /run/media/user/EFI rw - vfat /dev/sdb1 rw",
+        );
         assert_eq!(before.len(), after.len());
         assert!(after.differs_from(&before), "the mount state changed");
     }
@@ -377,7 +398,11 @@ mod tests {
     /// and `sdb1` belongs to neither `sdc` nor `sd`.
     #[test]
     fn partition_ownership_follows_kernel_naming() {
-        for (partition, disk) in [("sdb1", "sdb"), ("mmcblk0p1", "mmcblk0"), ("nvme0n1p2", "nvme0n1")] {
+        for (partition, disk) in [
+            ("sdb1", "sdb"),
+            ("mmcblk0p1", "mmcblk0"),
+            ("nvme0n1p2", "nvme0n1"),
+        ] {
             assert!(
                 DeviceScan::is_partition_of(partition, disk),
                 "{partition} belongs to {disk}"

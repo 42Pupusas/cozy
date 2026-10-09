@@ -213,12 +213,7 @@ impl DragOffer {
     /// Handle one `wl_data_offer` event. `mime_type` is the string argument
     /// of an [`DataOfferEvent::Offer`], `action_bits` the first argument of
     /// an [`DataOfferEvent::Action`].
-    pub fn on_event(
-        &mut self,
-        event: DataOfferEvent,
-        mime_type: Option<String>,
-        action_bits: u32,
-    ) {
+    pub fn on_event(&mut self, event: DataOfferEvent, mime_type: Option<String>, action_bits: u32) {
         match event {
             DataOfferEvent::Offer => {
                 if let Some(m) = mime_type {

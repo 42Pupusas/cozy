@@ -97,9 +97,8 @@ mod tests {
     use std::path::Path;
 
     fn request() -> MountRequest {
-        let point =
-            MountPoint::under(Path::new("/run/media/bob"), Some("KINGSTON"), "/dev/sdb1")
-                .expect("an absolute root");
+        let point = MountPoint::under(Path::new("/run/media/bob"), Some("KINGSTON"), "/dev/sdb1")
+            .expect("an absolute root");
         MountRequest::new(
             String::from("/dev/sdb1"),
             String::from("vfat"),

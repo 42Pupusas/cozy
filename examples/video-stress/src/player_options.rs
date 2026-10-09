@@ -172,8 +172,17 @@ mod tests {
     #[test]
     fn parses_every_control() {
         let options = PlayerOptions::parse(
-            ["--pack", "a.mfp", "--fps", "60", "--frames", "100", "--seconds", "5"]
-                .map(str::to_owned),
+            [
+                "--pack",
+                "a.mfp",
+                "--fps",
+                "60",
+                "--frames",
+                "100",
+                "--seconds",
+                "5",
+            ]
+            .map(str::to_owned),
         )
         .unwrap();
         assert_eq!(options.fps, Some(60));
@@ -189,8 +198,7 @@ mod tests {
 
     #[test]
     fn an_override_replaces_the_pack_rate() {
-        let options =
-            PlayerOptions::parse(["--fps", "144"].map(str::to_owned)).unwrap();
+        let options = PlayerOptions::parse(["--fps", "144"].map(str::to_owned)).unwrap();
         assert_eq!(options.rate(30), 144);
     }
 

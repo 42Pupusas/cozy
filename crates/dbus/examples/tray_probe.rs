@@ -104,9 +104,7 @@ impl TrayProbe {
             .ok()
             .and_then(|r| r.values().first().and_then(Value::as_u64));
         let comm = pid.map(|p| ProcScan::read(&format!("/proc/{p}/comm")).trim().to_owned());
-        self.log(&format!(
-            "watcher owner: {owner} pid={pid:?} comm={comm:?}"
-        ));
+        self.log(&format!("watcher owner: {owner} pid={pid:?} comm={comm:?}"));
         pid
     }
 
@@ -151,9 +149,7 @@ impl TrayProbe {
                 Some(Value::Variant(Box::new(Value::Str(status.into()))))
             }
             "IconPixmap" => Some(Value::Variant(Box::new(Self::icon([0xff, 0xff, 0, 0])))),
-            "AttentionIconPixmap" => {
-                Some(Value::Variant(Box::new(Self::icon([0xff, 0, 0, 0xff]))))
-            }
+            "AttentionIconPixmap" => Some(Value::Variant(Box::new(Self::icon([0xff, 0, 0, 0xff])))),
             _ => None,
         }
     }
@@ -186,7 +182,9 @@ impl TrayProbe {
             .and_then(Value::as_display_string)
             .unwrap_or_default();
         let Some(value) = self.property_value(&property) else {
-            self.log(&format!("recv Get {property:?} -- answering UnknownProperty"));
+            self.log(&format!(
+                "recv Get {property:?} -- answering UnknownProperty"
+            ));
             let _ = self.conn.send_error(
                 &sender,
                 msg.serial,

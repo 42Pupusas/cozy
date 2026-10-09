@@ -76,12 +76,25 @@ impl CursorImage {
     /// Was a free `load_pointer(theme, want_size)` function.
     #[must_use]
     pub fn load(theme: &str, want_size: u32) -> Option<Self> {
+        Self::load_named(theme, POINTER_NAMES, want_size)
+    }
+
+    /// Load the first cursor in `names` that any theme in the inheritance
+    /// chain provides.
+    ///
+    /// Themes disagree about which alias they ship for a given shape (one
+    /// has `nwse-resize`, another only `bottom_right_corner`), so callers
+    /// pass every name they would accept, best first.
+    #[must_use]
+    pub fn load_named(theme: &str, names: &[&str], want_size: u32) -> Option<Self> {
         let dirs = Self::search_dirs();
         let chain = Self::resolve_theme_chain(theme, &dirs);
 
-        for theme_name in &chain {
-            for dir in &dirs {
-                for name in POINTER_NAMES {
+        // Name is the outer loop: a well-matched alias in a later theme
+        // beats a poorly-matched one in an earlier theme.
+        for name in names {
+            for theme_name in &chain {
+                for dir in &dirs {
                     let path = dir.join(theme_name).join("cursors").join(name);
                     if let Ok(bytes) = fs::read(&path)
                         && let Some(img) = Self::parse_best(&bytes, want_size)
@@ -92,6 +105,19 @@ impl CursorImage {
             }
         }
         None
+    }
+
+    /// Read `$XCURSOR_THEME`/`$XCURSOR_SIZE` and load the first of `names`
+    /// that resolves, at `scale`x density.
+    #[must_use]
+    pub fn load_system_named(names: &[&str], scale: i32) -> Option<Self> {
+        let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".to_string());
+        let base_size: u32 = std::env::var("XCURSOR_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(24);
+        let want_size = base_size.saturating_mul(scale.max(1).cast_unsigned());
+        Self::load_named(&theme, names, want_size)
     }
 
     /// Parse an Xcursor file and return the image whose nominal size (the
@@ -175,7 +201,7 @@ impl CursorImage {
         // -- exactly what wl_shm's Argb8888 format wants, so this is a
         // straight byte-to-u32 reinterpretation, no math needed.
         let mut pixels = Vec::with_capacity(npixels);
-        for chunk in pixel_bytes.chunks_exact(4) {
+        for chunk in pixel_bytes.as_chunks::<4>().0 {
             pixels.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
 

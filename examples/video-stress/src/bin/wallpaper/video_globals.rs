@@ -1,8 +1,8 @@
 //! The singleton globals a video background needs, plus the output list.
 
+use platform::PlatformError;
 use platform::Result;
 use platform::conn::Sender;
-use platform::PlatformError;
 use platform::id::{CompositorId, LayerShellId, OutputId, RegistryId, ShmId};
 use platform::protocol as proto;
 use platform::surface::{GlobalCollector, SurfaceBootstrap};

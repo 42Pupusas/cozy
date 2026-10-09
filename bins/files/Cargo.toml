@@ -24,6 +24,8 @@ statusbar = { path = "../../crates/statusbar" }
 # The `[files]` table, and the terminal palette its unset keys mirror.
 config   = { path = "../../crates/config" }
 waker    = { path = "../../crates/waker" }
+# The rings worker threads hand results to the event loop over.
+quetzalcoatl = { workspace = true }
 # Civil local time for the `modified` column, shared with the bar and the
 # trash implementation rather than reimplementing timezone handling here.
 localtime = { path = "../../crates/localtime" }

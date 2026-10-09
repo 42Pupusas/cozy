@@ -78,8 +78,14 @@ impl CapturedFrame {
     fn convert_row(params: &FrameParams, source: &[u8], dest: &mut [u8]) {
         let has_alpha = params.has_alpha();
         for (src, dst) in source
-            .chunks_exact(Self::BYTES_PER_PIXEL)
-            .zip(dest.chunks_exact_mut(Self::BYTES_PER_PIXEL))
+            .as_chunks::<{ Self::BYTES_PER_PIXEL }>()
+            .0
+            .iter()
+            .zip(
+                dest.as_chunks_mut::<{ Self::BYTES_PER_PIXEL }>()
+                    .0
+                    .iter_mut(),
+            )
         {
             // Little-endian byte order within the 32-bit word: the low byte of
             // `0xAARRGGBB` is blue.

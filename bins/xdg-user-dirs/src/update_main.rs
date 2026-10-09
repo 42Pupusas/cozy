@@ -38,11 +38,10 @@ impl Application {
     }
 
     fn program_name() -> String {
-        std::env::args_os()
-            .next()
-            .map_or_else(|| "xdg-user-dirs-update".to_owned(), |name| {
-                name.to_string_lossy().into_owned()
-            })
+        std::env::args_os().next().map_or_else(
+            || "xdg-user-dirs-update".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        )
     }
 
     fn exit_with_usage(error: &str) -> ! {

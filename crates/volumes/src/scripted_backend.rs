@@ -61,7 +61,10 @@ impl ScriptedBackend {
     /// The sequence a real first mount produces.
     #[must_use]
     pub fn prompting_once() -> Self {
-        Self::new(vec![MountOutcome::NeedsAuthorization, MountOutcome::Mounted])
+        Self::new(vec![
+            MountOutcome::NeedsAuthorization,
+            MountOutcome::Mounted,
+        ])
     }
 
     /// A backend that reports itself unusable, as on a machine with no

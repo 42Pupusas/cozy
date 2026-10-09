@@ -34,10 +34,13 @@ impl SectionMode {
             window.wait(16);
             report.sample_gpu();
         }
+        let (masks, mask_bytes) = window.tree().masks();
         let extra = format!(
-            "sections        {} surfaces, {} colour buffers",
+            "sections        {} surfaces, {} colour buffers, {} corner masks = {} kB",
             window.tree().sections(),
-            window.tree().colours()
+            window.tree().colours(),
+            masks,
+            mask_bytes / 1024
         );
         let _ = window.close();
         report.print(&extra);

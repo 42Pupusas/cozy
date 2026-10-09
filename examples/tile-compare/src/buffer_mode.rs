@@ -25,7 +25,7 @@ impl Painter for BufferMode {
     fn paint(&mut self, canvas: &mut Canvas<'_>, size: PhysicalSize) {
         let frame = self.scene.frame(size.width, size.height);
         for tile in &frame.rects {
-            canvas.fill_rect(tile.rect, tile.color);
+            canvas.fill_round_rect(tile.rect, tile.color, i32::from(tile.radius));
         }
         self.damage = match (&self.last, self.tracked) {
             (Some(last), true) => TileDiff::damage(last, &frame),

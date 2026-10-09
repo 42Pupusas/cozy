@@ -1,13 +1,13 @@
-//! [`SectionState`] -- what one solid section shows, and the minimal set of
+//! [`SectionState`] -- what one section shows, and the minimal set of
 //! requests that moves it from one state to the next.
 
 use super::logical_rect::LogicalRect;
+use super::section_fill::SectionFill;
 
-/// A solid section's placement and its premultiplied ARGB colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SectionState {
     pub rect: LogicalRect,
-    pub argb: u32,
+    pub fill: SectionFill,
 }
 
 /// The requests a section needs this frame. Each field is a separate request
@@ -16,7 +16,8 @@ pub struct SectionState {
 pub struct SectionChange {
     pub position: Option<(i32, i32)>,
     pub size: Option<(i32, i32)>,
-    pub color: Option<u32>,
+    pub fill: Option<SectionFill>,
+    pub transform: Option<i32>,
     pub hide: bool,
 }
 
@@ -25,7 +26,7 @@ impl SectionChange {
     /// belongs to the parent's state, so on its own it does not.
     #[must_use]
     pub const fn needs_commit(&self) -> bool {
-        self.size.is_some() || self.color.is_some() || self.hide
+        self.size.is_some() || self.fill.is_some() || self.transform.is_some() || self.hide
     }
 
     #[must_use]
@@ -37,7 +38,8 @@ impl SectionChange {
 impl SectionState {
     /// The change from `previous` (`None` for a section never shown) to
     /// `self`. A hidden section has no buffer, so showing it again must
-    /// re-attach the colour and re-send the size.
+    /// re-attach the fill and re-send the size. The transform survives
+    /// hiding, so it is compared with whatever was last sent.
     #[must_use]
     pub fn change_from(&self, previous: Option<&Self>) -> SectionChange {
         let shown_before = previous.filter(|p| p.rect.is_visible());
@@ -47,11 +49,14 @@ impl SectionState {
                 ..SectionChange::default()
             };
         }
+        let last_transform = previous.map_or(0, |p| p.fill.transform());
+        let transform = (self.fill.transform() != last_transform).then_some(self.fill.transform());
         let Some(prev) = shown_before else {
             return SectionChange {
                 position: Some((self.rect.x, self.rect.y)),
                 size: Some((self.rect.w, self.rect.h)),
-                color: Some(self.argb),
+                fill: Some(self.fill),
+                transform,
                 hide: false,
             };
         };
@@ -60,7 +65,8 @@ impl SectionState {
         SectionChange {
             position: moved.then_some((self.rect.x, self.rect.y)),
             size: resized.then_some((self.rect.w, self.rect.h)),
-            color: (prev.argb != self.argb).then_some(self.argb),
+            fill: (prev.fill != self.fill).then_some(self.fill),
+            transform,
             hide: false,
         }
     }
@@ -68,12 +74,29 @@ impl SectionState {
 
 #[cfg(test)]
 mod tests {
-    use super::{LogicalRect, SectionChange, SectionState};
+    use super::{LogicalRect, SectionChange, SectionFill, SectionState};
+    use crate::scene::quarter::Quarter;
 
     fn state(x: i32, y: i32, w: i32, h: i32, argb: u32) -> SectionState {
         SectionState {
             rect: LogicalRect { x, y, w, h },
-            argb,
+            fill: SectionFill::Solid(argb),
+        }
+    }
+
+    fn corner(quarter: Quarter) -> SectionState {
+        SectionState {
+            rect: LogicalRect {
+                x: 0,
+                y: 0,
+                w: 8,
+                h: 8,
+            },
+            fill: SectionFill::Corner {
+                argb: 7,
+                side: 8,
+                quarter,
+            },
         }
     }
 
@@ -85,7 +108,8 @@ mod tests {
             SectionChange {
                 position: Some((1, 2)),
                 size: Some((3, 4)),
-                color: Some(7),
+                fill: Some(SectionFill::Solid(7)),
+                transform: None,
                 hide: false,
             }
         );
@@ -105,12 +129,12 @@ mod tests {
     }
 
     #[test]
-    fn a_recolour_alone_sends_only_the_colour() {
+    fn a_recolour_alone_sends_only_the_fill() {
         let change = state(1, 2, 3, 4, 9).change_from(Some(&state(1, 2, 3, 4, 7)));
         assert_eq!(
             change,
             SectionChange {
-                color: Some(9),
+                fill: Some(SectionFill::Solid(9)),
                 ..SectionChange::default()
             }
         );
@@ -127,6 +151,28 @@ mod tests {
     #[test]
     fn showing_a_hidden_section_resends_everything() {
         let change = state(1, 2, 3, 4, 7).change_from(Some(&state(1, 2, 0, 0, 7)));
-        assert!(change.position.is_some() && change.size.is_some() && change.color.is_some());
+        assert!(change.position.is_some() && change.size.is_some() && change.fill.is_some());
+    }
+
+    #[test]
+    fn a_new_corner_other_than_top_left_sends_its_turn() {
+        assert_eq!(corner(Quarter::TopLeft).change_from(None).transform, None);
+        assert_eq!(
+            corner(Quarter::BottomLeft).change_from(None).transform,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn turning_a_corner_sends_the_transform_and_the_fill() {
+        let change = corner(Quarter::TopRight).change_from(Some(&corner(Quarter::TopLeft)));
+        assert_eq!(change.transform, Some(1));
+        assert!(change.fill.is_some());
+    }
+
+    #[test]
+    fn a_corner_slot_reused_for_a_solid_turns_back() {
+        let change = state(0, 0, 8, 8, 7).change_from(Some(&corner(Quarter::BottomRight)));
+        assert_eq!(change.transform, Some(0));
     }
 }

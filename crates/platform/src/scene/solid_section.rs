@@ -13,6 +13,7 @@ use crate::protocol::{
 };
 use crate::wire::MessageBuilder;
 
+use super::section_fill::SectionFill;
 use super::section_state::{SectionChange, SectionState};
 
 /// The factories and parent a new child section is created against.
@@ -84,12 +85,12 @@ impl SolidSection {
     }
 
     /// Send what changed since the last call. `buffer` is asked for only when
-    /// the colour changed. Returns how many requests went out.
+    /// the fill changed. Returns how many requests went out.
     pub fn apply(
         &mut self,
         window_tx: &WindowSender,
         next: SectionState,
-        buffer: impl FnOnce(u32) -> Option<BufferId>,
+        buffer: impl FnOnce(SectionFill) -> Option<BufferId>,
     ) -> usize {
         let change = next.change_from(self.shown.as_ref());
         self.shown = Some(next);
@@ -103,7 +104,7 @@ impl SolidSection {
         &self,
         window_tx: &WindowSender,
         change: SectionChange,
-        buffer: impl FnOnce(u32) -> Option<BufferId>,
+        buffer: impl FnOnce(SectionFill) -> Option<BufferId>,
     ) -> usize {
         let mut sent = 0;
         if let (Some((x, y)), Some(subsurface)) = (change.position, self.subsurface) {
@@ -131,7 +132,14 @@ impl SolidSection {
             );
             sent += 1;
         }
-        if let Some(buffer) = change.color.and_then(buffer) {
+        if let Some(transform) = change.transform {
+            window_tx.request(
+                MessageBuilder::new(self.surface, SurfaceRequest::SetBufferTransform)
+                    .i32(transform),
+            );
+            sent += 1;
+        }
+        if let Some(buffer) = change.fill.and_then(buffer) {
             window_tx.request(
                 MessageBuilder::new(self.surface, SurfaceRequest::Attach)
                     .object(buffer)

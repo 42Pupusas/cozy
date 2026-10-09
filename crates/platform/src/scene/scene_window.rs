@@ -215,12 +215,14 @@ impl SceneWindow {
             shell,
             tree,
             reader,
+            events,
             ..
         } = self;
         tree.destroy(&window_tx);
         shell.destroy(&window_tx);
         let _ = sender.drain_requests(&mut request_rx);
         let _ = sender.shutdown();
+        drop(events);
         let joined = reader.map_or(Ok(()), |handle| {
             handle.join().unwrap_or(Err(PlatformError::ReaderPanicked))
         });

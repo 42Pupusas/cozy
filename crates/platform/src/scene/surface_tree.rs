@@ -1,5 +1,6 @@
-//! [`SurfaceTree`] -- the window surface plus one child subsurface per solid
-//! rect, updated from a [`SolidFrame`] with only the requests that changed.
+//! [`SurfaceTree`] -- the window surface plus child subsurfaces for the
+//! solid rects (one per square rect, seven per rounded one), updated from a
+//! [`SolidFrame`] with only the requests that changed.
 
 use crate::conn::WindowSender;
 use crate::draw::Rect;
@@ -9,7 +10,10 @@ use crate::protocol::CompositorRequest;
 use crate::wire::MessageBuilder;
 
 use super::logical_rect::LogicalRect;
+use super::mask_pool::MaskPool;
+use super::rounded_sections::RoundedSections;
 use super::scene_globals::SceneGlobals;
+use super::section_fill::SectionFill;
 use super::section_state::SectionState;
 use super::solid_frame::SolidFrame;
 use super::solid_pool::SolidPool;
@@ -27,6 +31,8 @@ pub struct SurfaceTree {
     root: SolidSection,
     children: Vec<SolidSection>,
     pool: SolidPool,
+    masks: MaskPool,
+    states: Vec<SectionState>,
 }
 
 impl SurfaceTree {
@@ -38,7 +44,7 @@ impl SurfaceTree {
             w: 0,
             h: 0,
         },
-        argb: 0,
+        fill: SectionFill::Solid(0),
     };
 
     pub fn new(
@@ -63,6 +69,8 @@ impl SurfaceTree {
             root: SolidSection::root(window_tx, globals.viewporter, surface),
             children: Vec::new(),
             pool: SolidPool::new(window_tx, globals.shm, globals.single_pixel)?,
+            masks: MaskPool::new(window_tx, globals.shm)?,
+            states: Vec::new(),
         })
     }
 
@@ -79,43 +87,61 @@ impl SurfaceTree {
         let mut update = TreeUpdate::default();
         let background = SectionState {
             rect: LogicalRect::from_physical(whole, scale),
-            argb: SolidFrame::argb(frame.background),
+            fill: SectionFill::Solid(SolidFrame::argb(frame.background)),
         };
+        let mut pools = (&mut self.pool, &mut self.masks);
         update.add(Self::apply_one(
-            &mut self.pool,
+            &mut pools,
             window_tx,
             &mut self.root,
             background,
         )?);
-        while self.children.len() < frame.rects.len() {
+        Self::expand(frame, scale, &mut self.states);
+        while self.children.len() < self.states.len() {
             self.children
                 .push(SolidSection::child(window_tx, self.factory));
         }
         for (index, child) in self.children.iter_mut().enumerate() {
-            let state = frame
-                .rects
-                .get(index)
-                .map_or(Self::HIDDEN, |solid| SectionState {
-                    rect: LogicalRect::from_physical(solid.rect, scale),
-                    argb: SolidFrame::argb(solid.color),
-                });
-            update.add(Self::apply_one(&mut self.pool, window_tx, child, state)?);
+            let state = self.states.get(index).copied().unwrap_or(Self::HIDDEN);
+            update.add(Self::apply_one(&mut pools, window_tx, child, state)?);
         }
         Ok(update)
     }
 
+    fn expand(frame: &SolidFrame, scale: i32, states: &mut Vec<SectionState>) {
+        states.clear();
+        for solid in &frame.rects {
+            let scale_div = scale.max(1);
+            RoundedSections::expand(
+                LogicalRect::from_physical(solid.rect, scale),
+                SolidFrame::argb(solid.color),
+                i32::from(solid.radius) / scale_div,
+                scale_div,
+                states,
+            );
+        }
+    }
+
     fn apply_one(
-        pool: &mut SolidPool,
+        (pool, masks): &mut (&mut SolidPool, &mut MaskPool),
         window_tx: &mut WindowSender,
         section: &mut SolidSection,
         state: SectionState,
     ) -> Result<usize> {
-        let buffer = if state.rect.is_visible() {
-            Some(pool.buffer_for(window_tx, state.argb)?)
-        } else {
-            None
+        let buffer = match (state.rect.is_visible(), state.fill) {
+            (false, _) => None,
+            (true, SectionFill::Solid(argb)) => Some(pool.buffer_for(window_tx, argb)?),
+            (true, SectionFill::Corner { argb, side, .. }) => {
+                Some(masks.buffer_for(window_tx, argb, side)?)
+            }
         };
         Ok(section.apply(window_tx, state, |_| buffer))
+    }
+
+    /// Corner masks the compositor holds, and their shm bytes.
+    #[must_use]
+    pub fn masks(&self) -> (usize, usize) {
+        (self.masks.masks(), self.masks.bytes())
     }
 
     /// Distinct colour buffers the compositor holds for this window.

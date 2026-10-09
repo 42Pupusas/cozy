@@ -25,6 +25,9 @@ requests! {
         SetOpaqueRegion = 4,
         SetInputRegion = 5,
         Commit = 6,
+        /// Rotate or flip how the buffer maps onto the surface; a
+        /// `wl_output.transform` value.
+        SetBufferTransform = 7,
         /// Set the buffer scale (integer, ≥1). 1 = 1:1, 2 = `HiDPI` @ 2x.
         SetBufferScale = 8,
         DamageBuffer = 9,
@@ -54,6 +57,7 @@ mod tests {
         assert_eq!(SurfaceRequest::SetOpaqueRegion.opcode(), 4);
         assert_eq!(SurfaceRequest::SetInputRegion.opcode(), 5);
         assert_eq!(SurfaceRequest::Commit.opcode(), 6);
+        assert_eq!(SurfaceRequest::SetBufferTransform.opcode(), 7);
         assert_eq!(SurfaceRequest::SetBufferScale.opcode(), 8);
         assert_eq!(SurfaceRequest::DamageBuffer.opcode(), 9);
     }

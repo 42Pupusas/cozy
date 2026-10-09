@@ -1,9 +1,9 @@
 //! Draws one tile scene several ways and reports what each costs, on the
 //! client, in the compositor and on the GPU.
 //!
-//!   cargo run --release -p tile-compare -- buffer   [seconds] [tiles] [period]
-//!   cargo run --release -p tile-compare -- damaged  [seconds] [tiles] [period]
-//!   cargo run --release -p tile-compare -- sections [seconds] [tiles] [period]
+//!   cargo run --release -p tile-compare -- buffer   [seconds] [tiles] [period] [radius]
+//!   cargo run --release -p tile-compare -- damaged  [seconds] [tiles] [period] [radius]
+//!   cargo run --release -p tile-compare -- sections [seconds] [tiles] [period] [radius]
 //!   cargo run --release -p tile-compare -- idle     [seconds]
 //!   cargo run --release -p tile-compare -- sweep    [seconds] [repeats]
 //!
@@ -43,6 +43,7 @@ struct Args {
     seconds: u64,
     tiles: usize,
     period: u64,
+    radius: u16,
     repeats: usize,
 }
 
@@ -67,12 +68,13 @@ impl Args {
             seconds: args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10),
             tiles: args.get(2).and_then(|s| s.parse().ok()).unwrap_or(40),
             period: args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4),
+            radius: args.get(4).and_then(|s| s.parse().ok()).unwrap_or(0),
             repeats: args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5),
         })
     }
 
     fn run(&self) {
-        let scene = tile_scene::TileScene::new(self.tiles, self.period);
+        let scene = tile_scene::TileScene::new(self.tiles, self.period, self.radius);
         match self.mode {
             Mode::Buffer => buffer_mode::BufferMode::run(Self::SIZE, scene, self.seconds, false),
             Mode::Damaged => buffer_mode::BufferMode::run(Self::SIZE, scene, self.seconds, true),

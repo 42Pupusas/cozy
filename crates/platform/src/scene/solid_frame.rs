@@ -8,6 +8,8 @@ use crate::draw::{Color, Rect};
 pub struct SolidRect {
     pub rect: Rect,
     pub color: Color,
+    /// Corner radius in physical pixels; 0 is square.
+    pub radius: u16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,7 +28,15 @@ impl SolidFrame {
     }
 
     pub fn push(&mut self, rect: Rect, color: Color) {
-        self.rects.push(SolidRect { rect, color });
+        self.push_rounded(rect, color, 0);
+    }
+
+    pub fn push_rounded(&mut self, rect: Rect, color: Color, radius: u16) {
+        self.rects.push(SolidRect {
+            rect,
+            color,
+            radius,
+        });
     }
 
     /// The premultiplied ARGB word a solid buffer of `color` holds.

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::compositor_probe::{CompositorProbe, CompositorSample};
 use crate::gpu_probe::GpuProbe;
 use crate::process_sample::ProcessSample;
+use crate::run_numbers::RunNumbers;
 
 pub struct RunReport {
     mode: &'static str,
@@ -75,6 +76,12 @@ impl RunReport {
         let cpu = end.cpu.saturating_sub(self.start.cpu);
         let frames = self.frames.max(1) as f64;
         let percent = |d: Duration| 100.0 * d.as_secs_f64() / wall.as_secs_f64();
+        let mut numbers = RunNumbers {
+            fps: self.frames as f64 / wall.as_secs_f64(),
+            client_cpu: percent(cpu),
+            work_us: self.frame_work.as_secs_f64() * 1e6 / frames,
+            ..RunNumbers::default()
+        };
         println!("mode            {}", self.mode);
         println!("wall            {:.1} s", wall.as_secs_f64());
         println!(
@@ -101,6 +108,10 @@ impl RunReport {
             let now = probe.sample();
             let cpu = now.process.cpu.saturating_sub(start.process.cpu);
             let gfx = now.drm.gfx.saturating_sub(start.drm.gfx);
+            numbers.compositor_cpu = percent(cpu);
+            numbers.compositor_gfx = percent(gfx);
+            numbers.compositor_gpu_mem_kb =
+                now.drm.memory_kb() as f64 - start.drm.memory_kb() as f64;
             println!(
                 "{:<15} {:.2} s ({:.1}% of one core), rss {} -> {} kB",
                 probe.name(),
@@ -126,10 +137,13 @@ impl RunReport {
             );
         }
         if let Some(gpu) = &self.gpu {
+            numbers.gpu_busy = gpu.busy_percent();
+            numbers.power_w = gpu.power_watts();
             println!("{}", gpu.summary());
         }
         if !extra.is_empty() {
             println!("{extra}");
         }
+        println!("{}", numbers.to_line());
     }
 }

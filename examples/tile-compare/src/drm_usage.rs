@@ -33,6 +33,11 @@ impl DrmUsage {
         usage
     }
 
+    #[must_use]
+    pub const fn memory_kb(&self) -> u64 {
+        self.vram_kb + self.gtt_kb
+    }
+
     fn add(&mut self, info: &str) {
         self.gfx += Duration::from_nanos(Self::field(info, "drm-engine-gfx").unwrap_or(0));
         self.vram_kb += Self::field(info, "drm-memory-vram").unwrap_or(0);

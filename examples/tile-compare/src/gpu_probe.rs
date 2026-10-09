@@ -44,15 +44,21 @@ impl GpuProbe {
 
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
+    pub fn busy_percent(&self) -> f64 {
+        self.busy_sum as f64 / self.samples.max(1) as f64
+    }
+
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn power_watts(&self) -> f64 {
+        self.power_sum_uw as f64 / self.samples.max(1) as f64 / 1e6
+    }
+
+    #[must_use]
     pub fn summary(&self) -> String {
-        let samples = self.samples.max(1) as f64;
-        let mut line = format!("gpu busy        {:.1}%", self.busy_sum as f64 / samples);
+        let mut line = format!("gpu busy        {:.1}%", self.busy_percent());
         if self.power.is_some() {
-            let _ = write!(
-                line,
-                "\npackage power   {:.2} W",
-                self.power_sum_uw as f64 / samples / 1e6
-            );
+            let _ = write!(line, "\npackage power   {:.2} W", self.power_watts());
         }
         line
     }

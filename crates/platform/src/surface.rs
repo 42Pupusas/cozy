@@ -326,6 +326,45 @@ impl SurfacePresenter {
         window_tx.request(MessageBuilder::new(surface, SurfaceRequest::Commit));
         present.finish_present(cb);
     }
+
+    /// Attach `slot`, damage the buffer-pixel rects in `damage` (the whole
+    /// `size` when it is full), request a frame callback, commit, and arm
+    /// `present` to await that callback.
+    pub fn commit_frame(
+        present: &mut crate::present::PresentState,
+        window_tx: &mut WindowSender,
+        surface: SurfaceId,
+        slot: usize,
+        size: crate::toplevel::PhysicalSize,
+        damage: &crate::draw::Damage,
+    ) {
+        let buffer = present.frame_buffer(slot);
+        window_tx.request(
+            MessageBuilder::new(surface, SurfaceRequest::Attach)
+                .object(buffer)
+                .i32(0)
+                .i32(0),
+        );
+        let whole = crate::draw::Rect::new(0, 0, size.width, size.height);
+        let rects = if damage.is_full() {
+            std::slice::from_ref(&whole)
+        } else {
+            damage.rects()
+        };
+        for rect in rects {
+            window_tx.request(
+                MessageBuilder::new(surface, SurfaceRequest::DamageBuffer)
+                    .i32(rect.x)
+                    .i32(rect.y)
+                    .i32(rect.w)
+                    .i32(rect.h),
+            );
+        }
+        let cb: CallbackId = window_tx.alloc_id();
+        window_tx.request(MessageBuilder::new(surface, SurfaceRequest::Frame).new_id(cb));
+        window_tx.request(MessageBuilder::new(surface, SurfaceRequest::Commit));
+        present.finish_present(cb);
+    }
 }
 
 impl SurfaceBootstrap {

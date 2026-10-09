@@ -9,7 +9,7 @@ use quetzalcoatl::mpsc;
 use quetzalcoatl::spsc::Consumer;
 
 use crate::conn::{Sender, WindowSender};
-use crate::draw::{Canvas, Color};
+use crate::draw::{Canvas, Color, Damage};
 use crate::error::{PlatformError, Result};
 use crate::event::RawEvent;
 use crate::id::{KeyboardId, PointerId, SeatId};
@@ -53,6 +53,12 @@ pub trait Painter {
     /// Background colour, used to clear the canvas before [`Self::paint`]
     /// and to fill newly exposed area during a resize.
     fn background(&self) -> Color;
+
+    /// The area the last [`Self::paint`] changed, reported to the compositor
+    /// so it re-uploads only that. Defaults to the whole surface.
+    fn damage(&self) -> Damage {
+        Damage::full()
+    }
 
     /// A key was pressed (or auto-repeated -- see [`KeyPress::repeat`]).
     ///
@@ -998,13 +1004,18 @@ impl Toplevel {
             painter.paint(&mut canvas, size);
         }
 
-        SurfacePresenter::commit_full_frame(
+        let damage = if self.present.take_full_damage() {
+            Damage::full()
+        } else {
+            painter.damage()
+        };
+        SurfacePresenter::commit_frame(
             &mut self.present,
             &mut self.window_tx,
             self.shell.surface,
             slot,
-            size.width,
-            size.height,
+            size,
+            &damage,
         );
     }
 

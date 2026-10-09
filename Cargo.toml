@@ -29,6 +29,18 @@ opt-level = 3
 [profile.dev.package.vt_parser]
 opt-level = 3
 
+[profile.dev.package.platform-draw]
+opt-level = 3
+
+[profile.dev.package.statusbar]
+opt-level = 3
+
+[profile.dev.package.font]
+opt-level = 3
+
+[profile.dev.package.text_layout]
+opt-level = 3
+
 [workspace.dependencies]
 # Needs MsgFlags::CMSG_CLOEXEC (since 0.15.1) for `crates/scm-rights`, and
 # must be the same 0.16 copy quetzal-uring 0.2.3 links, so `Inotify` and

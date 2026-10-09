@@ -28,8 +28,8 @@ impl Fade {
         }
     }
 
-    fn step(&mut self, elapsed_ms: u16) {
-        let delta = f32::from(elapsed_ms) / f32::from(DURATION_MS);
+    fn step(&mut self, elapsed_ms: u16, duration_ms: u16) {
+        let delta = f32::from(elapsed_ms) / f32::from(duration_ms);
         self.progress = if self.target > self.progress {
             (self.progress + delta).min(self.target)
         } else {
@@ -61,15 +61,29 @@ impl Fade {
 pub struct Fades<K> {
     entries: Vec<(K, Fade)>,
     clock: Option<u64>,
+    duration_ms: u16,
 }
 
 impl<K: Copy + PartialEq> Fades<K> {
     #[must_use]
     pub const fn new() -> Self {
+        Self::lasting(DURATION_MS)
+    }
+
+    /// Fades that take `duration_ms` to cross their whole range.
+    #[must_use]
+    pub const fn lasting(duration_ms: u16) -> Self {
         Self {
             entries: Vec::new(),
             clock: None,
+            duration_ms,
         }
+    }
+
+    /// Forget every fade at once, so each key starts again from zero.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.clock = None;
     }
 
     /// Make `wanted` the keys that rise and every other key fall.
@@ -96,7 +110,7 @@ impl<K: Copy + PartialEq> Fades<K> {
         let elapsed = u16::try_from(elapsed).unwrap_or(MAX_STEP_MS);
         self.clock = Some(now_ms.max(then));
         for (_, fade) in &mut self.entries {
-            fade.step(elapsed);
+            fade.step(elapsed, self.duration_ms);
         }
         self.entries.retain(|(_, fade)| !fade.is_gone());
         if self.is_settled() {
@@ -224,6 +238,29 @@ mod tests {
             "one stalled frame must not finish the fade"
         );
         assert!(fades.is_animating());
+    }
+
+    #[test]
+    fn a_longer_fade_is_still_part_way_when_a_shorter_one_has_landed() {
+        let mut quick = Fades::new();
+        let mut slow = Fades::lasting(400);
+        quick.aim(&[1u8], 0);
+        slow.aim(&[1u8], 0);
+        quick.run(0, 12);
+        slow.run(0, 12);
+        assert_eq!(quick.level(&1), 255);
+        assert!(slow.level(&1) < 255);
+    }
+
+    #[test]
+    fn clearing_sends_every_key_back_to_zero_and_stops_the_clock() {
+        let mut fades = Fades::new();
+        fades.aim(&[1u8, 2], 0);
+        fades.run(0, 20);
+        fades.clear();
+        assert_eq!(fades.level(&1), 0);
+        assert_eq!(fades.level(&2), 0);
+        assert!(!fades.is_animating());
     }
 
     #[test]

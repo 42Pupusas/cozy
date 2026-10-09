@@ -17,6 +17,7 @@ use crate::spacing::Spacing;
 use crate::theme::Theme;
 use crate::tile_action::TileAction;
 use crate::tile_geometry::TileGeometry;
+use crate::tile_growth::TileGrowth;
 use crate::typography::Typography;
 
 /// What a tile stands for, as far as its colours are concerned.
@@ -39,6 +40,7 @@ pub struct PaintedTile {
     pub drop_target: bool,
     pub raise: u8,
     pub reveal: u8,
+    pub grown: u8,
     pub glow: [u8; TileAction::ALL.len()],
     pub press: [u8; TileAction::ALL.len()],
     pub tray: Option<PaintedTray>,
@@ -122,6 +124,10 @@ impl<'a> TilePainter<'a> {
         if resting.w <= 0 || resting.h <= 0 {
             return;
         }
+        if tile.grown < u8::MAX {
+            self.paint_growing(canvas, tile, &geometry);
+            return;
+        }
         let lift = Self::share(theme.spacing.tile_lift(), tile.raise);
         let rect = tile.tray.as_ref().map_or_else(
             || Rect::new(resting.x, resting.y - lift, resting.w, resting.h),
@@ -159,6 +165,59 @@ impl<'a> TilePainter<'a> {
         }
         self.paint_actions(canvas, tile, &geometry, surface);
         self.paint_rows(canvas, tile, lift, surface);
+    }
+
+    /// A tile still growing into its cell: the glass and border at the size
+    /// reached so far, and the text fading in once it is nearly full size.
+    fn paint_growing(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        tile: &PaintedTile,
+        geometry: &TileGeometry,
+    ) {
+        let theme = self.theme;
+        let rect = TileGrowth::cell(geometry.face, tile.grown);
+        if rect.w <= 0 || rect.h <= 0 {
+            return;
+        }
+        let radius = (theme.spacing.radius() * 2).min(rect.w / 2).min(rect.h / 2);
+        let surface = self.resting(tile);
+        canvas.fill_round_rect_glass(rect, surface, radius);
+        canvas.draw_round_rect(rect, theme.sidebar_border, radius);
+        let text = TileGrowth::text(tile.grown);
+        if text == 0 {
+            return;
+        }
+        let pad = theme.spacing.m();
+        let room = geometry.face.w - pad * 2;
+        let name_tier = if geometry.roomy {
+            &mut self.type_scale.title
+        } else {
+            &mut self.type_scale.body
+        };
+        let name = Self::fit(name_tier, &tile.name, room);
+        let ink = surface.blend_opaque_color(tile.name_color, text);
+        name_tier.draw_text(
+            canvas,
+            &name,
+            geometry.face.x + pad,
+            geometry.name_y,
+            ink,
+            surface,
+        );
+        if let Some(detail_y) = geometry.detail_y {
+            let detail_tier = &mut self.type_scale.detail;
+            let detail = Self::fit(detail_tier, &tile.detail, room);
+            let ink = surface.blend_opaque_color(theme.muted, text);
+            detail_tier.draw_text(
+                canvas,
+                &detail,
+                geometry.face.x + pad,
+                detail_y,
+                ink,
+                surface,
+            );
+        }
     }
 
     /// How far a tile has risen at `raise`.
@@ -483,6 +542,7 @@ mod tests {
                 drop_target: false,
                 raise: 0,
                 reveal: 0,
+                grown: u8::MAX,
                 glow: [0; TileAction::ALL.len()],
                 press: [0; TileAction::ALL.len()],
                 tray: None,

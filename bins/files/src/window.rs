@@ -38,6 +38,7 @@ use crate::theme::Theme;
 use crate::tile_action::TileAction;
 use crate::tile_field::{PlacedTile, TileField};
 use crate::tile_geometry::TileGeometry;
+use crate::tile_growth::{GrowthScene, TileGrowth};
 use crate::tile_motion::{TileKey, TileMotion};
 use crate::tile_painter::{
     PaintedMove, PaintedTile, PaintedTray, TileFace, TilePainter, TileRename,
@@ -152,6 +153,8 @@ pub struct FilesWindow {
     tiles: TileField,
     /// The glides tiles make as the pointer arrives and leaves.
     motion: TileMotion,
+    /// Tiles growing out of the spiral as a folder or page appears.
+    growth: TileGrowth,
     /// The tile button the left button is held down on. It fires on release,
     /// and only if the pointer is still on it.
     pressed_action: Option<(usize, TileAction)>,
@@ -177,6 +180,7 @@ impl FilesWindow {
             volumes: VolumeWatch::new(),
             tiles: TileField::new(wake.clone()),
             motion: TileMotion::new(),
+            growth: TileGrowth::new(),
             pressed_action: None,
             tray: None,
             pending_copy: None,
@@ -223,7 +227,8 @@ impl FilesWindow {
     /// time. The first frame of a glide is always its start, so aiming one
     /// pass behind the pointer is invisible.
     pub fn step_motion(&mut self, now_ms: u64) -> bool {
-        let was_moving = self.motion.is_animating();
+        let was_moving = self.motion.is_animating() || self.growth.is_animating();
+        self.step_growth(now_ms);
         let cursor = self.focused.then(|| self.browser.pane().cursor()).flatten();
         let tray = self.open_tray().map(|(row, _)| row);
         self.motion.aim(
@@ -239,14 +244,32 @@ impl FilesWindow {
             .filter(|&(row, action)| self.hover.spot() == Some(Spot::Action(row, action)));
         self.motion.press_on(held, now_ms);
         self.motion.advance(now_ms);
-        was_moving || self.motion.is_animating()
+        was_moving || self.motion.is_animating() || self.growth.is_animating()
+    }
+
+    fn step_growth(&mut self, now_ms: u64) {
+        self.sync_tiles();
+        let scene = GrowthScene {
+            path: self.browser.path().to_path_buf(),
+            depth: self.tiles.depth(),
+        };
+        let order: Vec<TileKey> = self
+            .tile_layout()
+            .iter()
+            .map(|placed| match placed.tile {
+                Tile::Item(row) => TileKey::Item(row),
+                Tile::More { .. } => TileKey::Overflow,
+            })
+            .collect();
+        self.growth.aim(&scene, &order, now_ms);
+        self.growth.advance(now_ms);
     }
 
     /// How long the loop may sleep before the next glide frame is due, or
     /// `None` when nothing is moving.
     #[must_use]
     pub fn motion_wait_ms(&self) -> Option<i32> {
-        self.motion.is_animating().then_some(FRAME_MS)
+        (self.motion.is_animating() || self.growth.is_animating()).then_some(FRAME_MS)
     }
 
     /// Take any drag the last pointer gesture started, for the event loop to
@@ -606,6 +629,7 @@ impl FilesWindow {
             drop_target: self.drop_hover_row == Some(row),
             raise: self.motion.raise(key),
             reveal: self.motion.reveal(key),
+            grown: self.growth.level(key),
             glow: TileAction::ALL.map(|action| self.motion.glow(row, action)),
             press: TileAction::ALL.map(|action| self.motion.press(row, action)),
             tray: self.painted_tray(row),
@@ -634,6 +658,7 @@ impl FilesWindow {
             drop_target: false,
             raise: self.motion.raise(TileKey::Overflow),
             reveal: 0,
+            grown: self.growth.level(TileKey::Overflow),
             glow: [0; TileAction::ALL.len()],
             press: [0; TileAction::ALL.len()],
             tray: None,
@@ -2239,19 +2264,21 @@ mod tests {
     #[test]
     fn hovering_a_row_changes_the_painted_frame_by_gliding() {
         let (mut painter, root, size) = painter_over_a_mixed_directory("hover-frame");
+        let arrived = glide(&mut painter, 0, 150);
+        assert!(!painter.growth.is_animating(), "the entrance has landed");
         let cold = paint_opaque(&mut painter, size);
 
         assert!(
             painter.hover.move_to(Some(Spot::Item(Pane::Tiles, 0))),
             "row 0 becomes hovered"
         );
-        painter.step_motion(1000);
+        painter.step_motion(arrived + 1000);
         assert_eq!(
             paint_opaque(&mut painter, size),
             cold,
             "the first frame of a glide has not moved yet"
         );
-        let started = glide(&mut painter, 1000, 3);
+        let started = glide(&mut painter, arrived + 1000, 3);
         let part_way = paint_opaque(&mut painter, size);
         assert_ne!(cold, part_way, "a few frames in, the tile is moving");
         let settled = glide(&mut painter, started, 20);
@@ -2270,6 +2297,23 @@ mod tests {
             cold,
             "leaving restores the frame exactly once the glide has run, at {end}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn tiles_grow_out_of_the_spiral_instead_of_snapping_in() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("grow-in");
+        let before = painter.step_motion(5000);
+        assert!(before, "the entrance asks for frames");
+        assert!(painter.motion_wait_ms().is_some());
+        let start = paint_opaque(&mut painter, size);
+        let started = glide(&mut painter, 5000, 4);
+        let part_way = paint_opaque(&mut painter, size);
+        assert!(start != part_way, "tiles are appearing");
+        glide(&mut painter, started, 150);
+        let landed = paint_opaque(&mut painter, size);
+        assert!(part_way != landed, "and they keep growing to full size");
+        assert_eq!(painter.motion_wait_ms(), None, "then the loop may sleep");
         let _ = std::fs::remove_dir_all(&root);
     }
 

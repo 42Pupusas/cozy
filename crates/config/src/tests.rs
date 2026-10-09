@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::{Action, Color, Config, ConfigError, CursorStyle};
+use crate::{Action, BarPosition, Color, Config, ConfigError, CursorStyle, PanelSide};
 
 /// Test-only helpers, kept as methods on `Config` rather than free functions
 /// since they only ever parse (or fail to parse) a `Config`.
@@ -366,6 +366,25 @@ fn bar_emoji_path_none_and_opacity_defaults_when_unconfigured() {
 }
 
 #[test]
+fn bar_position_defaults_to_top() {
+    assert_eq!(Config::parse("").bar_position(), BarPosition::Top);
+}
+
+#[test]
+fn bar_position_parses_both_edges() {
+    let bottom = Config::parse("[bar]\nposition = \"bottom\"\n");
+    assert_eq!(bottom.bar_position(), BarPosition::Bottom);
+    let top = Config::parse("[bar]\nposition = \"top\"\n");
+    assert_eq!(top.bar_position(), BarPosition::Top);
+}
+
+#[test]
+fn bar_position_unknown_value_rejected() {
+    let err = Config::fail("[bar]\nposition = \"left\"\n");
+    assert!(err.contains("bar.position"));
+}
+
+#[test]
 fn bar_opacity_out_of_range_rejected() {
     let err = Config::fail("[bar]\nopacity = 1.5\n");
     assert!(err.contains("bar.opacity"));
@@ -381,6 +400,40 @@ fn bar_icon_path_none_by_default() {
 fn bar_icon_path_set_from_bar_table() {
     let cfg = Config::parse("[bar]\nicon_path = \"/nerd.ttf\"\n");
     assert_eq!(cfg.bar_icon_path(), Some("/nerd.ttf"));
+}
+
+#[test]
+fn bar_click_commands_parse() {
+    let cfg = Config::from_bytes(
+        br#"
+[bar.click]
+wifi = "panel-wifi --at {x}"
+bluetooth = "panel-bluetooth --at {x}"
+volume_output = "panel-volume --at {x}"
+"#,
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.bar_clicks().wifi.as_deref(),
+        Some("panel-wifi --at {x}")
+    );
+    assert_eq!(
+        cfg.bar_clicks().bluetooth.as_deref(),
+        Some("panel-bluetooth --at {x}")
+    );
+    assert_eq!(
+        cfg.bar_clicks().volume_output.as_deref(),
+        Some("panel-volume --at {x}")
+    );
+    assert!(cfg.bar_clicks().battery.is_none());
+}
+
+#[test]
+fn bar_click_commands_are_empty_by_default() {
+    assert_eq!(
+        Config::default().bar_clicks(),
+        &crate::BarClickConfig::default()
+    );
 }
 
 #[test]
@@ -569,6 +622,87 @@ fn monitor_text_and_accent_colors_are_overridable() {
 fn monitor_bad_color_is_a_validation_error() {
     let err = Config::fail("[monitor]\nforeground = \"not-a-color\"\n");
     assert!(err.contains("monitor.foreground"));
+}
+
+#[test]
+fn panel_defaults_mirror_the_shared_surface() {
+    let cfg = Config::parse(
+        "[colors]\nbackground = \"#181616\"\nforeground = \"#c5c9c5\"\n[window]\nopacity = 0.80\n",
+    );
+    assert_eq!(cfg.panel_background(), Color::from_rgb(0x18, 0x16, 0x16));
+    assert_eq!(cfg.panel_foreground(), Color::from_rgb(0xc5, 0xc9, 0xc5));
+    assert_eq!(cfg.panel_dim(), cfg.palette.bright_black);
+    assert_eq!(cfg.panel_accent(), cfg.palette.blue);
+    assert!((cfg.panel_opacity() - 0.80).abs() < 1e-9);
+    assert_eq!(cfg.panel_gap(), 8);
+    assert_eq!(cfg.panel_side(), PanelSide::Auto);
+}
+
+#[test]
+fn panel_bar_overrides_flow_into_the_panels() {
+    // The bar is the panels' immediate mirror target -- a `[bar]` override
+    // must reach them without any `[panel]` table present.
+    let cfg =
+        Config::parse("[colors]\nbackground = \"#101010\"\n[bar]\nbackground = \"#1a1a2a\"\n");
+    assert_eq!(cfg.panel_background(), Color::from_rgb(0x1a, 0x1a, 0x2a));
+}
+
+#[test]
+fn panel_overrides_win_over_mirrored_bar() {
+    let cfg = Config::parse(
+        "[colors]\nbackground = \"#101010\"\n[panel]\nbackground = \"#0a0a0b\"\nforeground = \"#ffffff\"\ndim = \"#8a8a90\"\naccent = \"#8ba4b0\"\nhighlight = \"#252525\"\nborder = \"#444444\"\n",
+    );
+    assert_eq!(cfg.panel_background(), Color::from_rgb(0x0a, 0x0a, 0x0b));
+    assert_eq!(cfg.panel_foreground(), Color::from_rgb(0xff, 0xff, 0xff));
+    assert_eq!(cfg.panel_dim(), Color::from_rgb(0x8a, 0x8a, 0x90));
+    assert_eq!(cfg.panel_accent(), Color::from_rgb(0x8b, 0xa4, 0xb0));
+    assert_eq!(cfg.panel_highlight(), Color::from_rgb(0x25, 0x25, 0x25));
+    assert_eq!(cfg.panel_border(), Color::from_rgb(0x44, 0x44, 0x44));
+}
+
+#[test]
+fn derived_panel_shades_stay_between_their_endpoints() {
+    // The two derived roles must read as fills on the real dark palette
+    // (Kanagawa Dragon), not vanish into it or overshoot their sources.
+    let cfg = Config::parse(
+        "[colors]\nbackground = \"#181616\"\nforeground = \"#c5c9c5\"\nbright_black = \"#a6a69c\"\n",
+    );
+    let highlight = cfg.panel_highlight();
+    let border = cfg.panel_border();
+    let bg = cfg.panel_background();
+    let fg = cfg.panel_foreground();
+    assert!(highlight != bg, "the selected row must be visible");
+    assert!(border != bg, "the groove must be visible");
+    // Both derived fills must sit between background and foreground in
+    // brightness -- washed *in*, not stamped over.
+    let luma = |c: Color| i32::from(c.r) + i32::from(c.g) + i32::from(c.b);
+    assert!(luma(highlight) > luma(bg) && luma(highlight) < luma(fg));
+    assert!(luma(border) > luma(bg) && luma(border) < luma(fg));
+}
+
+#[test]
+fn panel_gap_and_side_are_parsed_and_validated() {
+    let cfg = Config::parse("[panel]\ngap = 12\nside = \"right\"\n");
+    assert_eq!(cfg.panel_gap(), 12);
+    assert_eq!(cfg.panel_side(), PanelSide::Right);
+    let cfg = Config::parse("[panel]\nside = \"left\"");
+    assert_eq!(cfg.panel_side(), PanelSide::Left);
+    let err = Config::fail("[panel]\nside = \"middle\"\n");
+    assert!(err.contains("panel.side"));
+    let err = Config::fail("[panel]\ngap = 500\n");
+    assert!(err.contains("panel.gap"));
+}
+
+#[test]
+fn panel_bad_color_is_a_validation_error() {
+    let err = Config::fail("[panel]\naccent = \"nope\"\n");
+    assert!(err.contains("panel.accent"));
+}
+
+#[test]
+fn panel_opacity_out_of_range_is_rejected() {
+    let err = Config::fail("[panel]\nopacity = 1.5\n");
+    assert!(err.contains("panel.opacity"));
 }
 
 #[test]
@@ -803,6 +937,44 @@ fn derived_chrome_stays_distinguishable_on_a_light_palette() {
 }
 
 #[test]
+fn the_four_tile_colours_default_to_four_distinct_shades() {
+    for doc in [
+        "",
+        "[colors]\nbackground = \"#ffffff\"\nforeground = \"#000000\"\n",
+    ] {
+        let cfg = Config::parse(doc);
+        let shades: Vec<Color> = (0..4).map(|slot| cfg.files_tile_color(slot)).collect();
+        for (i, a) in shades.iter().enumerate() {
+            for b in &shades[i + 1..] {
+                assert_ne!(a, b, "{doc:?}");
+            }
+            assert_ne!(*a, cfg.files_background(), "{doc:?}");
+        }
+    }
+}
+
+#[test]
+fn each_tile_colour_key_overrides_only_its_own_slot() {
+    let cfg = Config::parse("[files]\ntile_color_2 = \"#102030\"\ntile_color_4 = \"#405060\"\n");
+    let plain = Config::parse("");
+    assert_eq!(cfg.files_tile_color(1), Color::from_rgb(0x10, 0x20, 0x30));
+    assert_eq!(cfg.files_tile_color(3), Color::from_rgb(0x40, 0x50, 0x60));
+    assert_eq!(cfg.files_tile_color(0), plain.files_tile_color(0));
+    assert_eq!(cfg.files_tile_color(2), plain.files_tile_color(2));
+}
+
+#[test]
+fn tile_colour_slots_wrap_around() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.files_tile_color(5), cfg.files_tile_color(1));
+}
+
+#[test]
+fn a_malformed_tile_colour_is_reported() {
+    assert!(Config::from_bytes(b"[files]\ntile_color_3 = \"nope\"\n").is_err());
+}
+
+#[test]
 fn derived_chrome_stays_distinguishable_on_a_dark_palette() {
     let cfg = Config::parse("");
     assert_ne!(cfg.files_header_bg(), cfg.files_background());
@@ -947,6 +1119,72 @@ fn config_error_display_invalid_value() {
         reason: "must be > 0",
     };
     assert_eq!(e.to_string(), "invalid value for `font.size`: must be > 0");
+}
+
+// ── [canvas] ───────────────────────────────────────────────────────────────────
+
+#[test]
+fn canvas_colors_mirror_the_terminal_palette_by_default() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.canvas_background(), cfg.palette.background);
+    assert_eq!(cfg.canvas_text(), cfg.palette.foreground);
+    assert_eq!(cfg.canvas_selection(), cfg.palette.blue);
+    // The derived roles must differ from what they sit on, on both a dark
+    // and a light palette, or the cards and grid would be invisible.
+    assert_ne!(cfg.canvas_grid(), cfg.palette.background);
+    assert_ne!(cfg.canvas_surface(), cfg.palette.background);
+    assert_ne!(cfg.canvas_border(), cfg.canvas_surface());
+    let light = Config::parse("[colors]\nbackground = \"#ffffff\"\nforeground = \"#000000\"\n");
+    assert_ne!(light.canvas_grid(), light.palette.background);
+    assert_ne!(light.canvas_surface(), light.palette.background);
+    assert_ne!(light.canvas_border(), light.canvas_surface());
+}
+
+#[test]
+fn canvas_overrides_win_over_the_mirrored_palette() {
+    let cfg = Config::parse("[canvas]\nbackground = \"#101014\"\nselection = \"#ff8800\"\n");
+    assert_eq!(cfg.canvas_background(), Color::from_rgb(0x10, 0x10, 0x14));
+    assert_eq!(cfg.canvas_selection(), Color::from_rgb(0xff, 0x88, 0x00));
+    // Untouched keys still mirror.
+    assert_eq!(cfg.canvas_text(), cfg.palette.foreground);
+}
+
+#[test]
+fn the_canvas_caret_mirrors_yellow_and_is_overridable() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.canvas_caret(), cfg.palette.yellow);
+    // It must not be the selection colour: the caret sits on top of the
+    // note's own glyphs and needs to stand apart from the selection accent.
+    assert_ne!(cfg.canvas_caret(), cfg.canvas_selection());
+    assert_ne!(cfg.canvas_caret(), cfg.canvas_background());
+
+    let cfg = Config::parse("[canvas]\ncaret = \"#ff0000\"\n");
+    assert_eq!(cfg.canvas_caret(), Color::from_rgb(0xff, 0x00, 0x00));
+}
+
+#[test]
+fn canvas_metrics_default_and_override() {
+    let cfg = Config::parse("");
+    assert_eq!(cfg.canvas_stroke_width(), 2);
+    assert_eq!(cfg.canvas_grid_size(), 8);
+
+    let cfg = Config::parse("[canvas]\nstroke_width = 3\ngrid_size = 16\n");
+    assert_eq!(cfg.canvas_stroke_width(), 3);
+    assert_eq!(cfg.canvas_grid_size(), 16);
+}
+
+#[test]
+fn canvas_opacity_mirrors_and_overrides() {
+    let cfg = Config::parse("[window]\nopacity = 0.8\n");
+    assert!((cfg.canvas_opacity() - 0.8).abs() < f64::EPSILON);
+    let cfg = Config::parse("[window]\nopacity = 0.8\n[canvas]\nopacity = 1.0\n");
+    assert!((cfg.canvas_opacity() - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn canvas_bad_color_is_a_validation_error() {
+    let err = Config::fail("[canvas]\ngrid = \"not-a-color\"\n");
+    assert!(err.contains("canvas.grid"), "{err}");
 }
 
 #[test]

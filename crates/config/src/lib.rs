@@ -62,6 +62,7 @@
 //! background  = "#181818"          # defaults to [colors].background
 //! foreground  = "#d8d8d8"          # defaults to [colors].foreground
 //! height      = 28                 # bar thickness in logical pixels
+//! position    = "top"             # "top" or "bottom" screen edge
 //! font_path   = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf" # defaults to [font].path
 //! font_size   = 12                 # points; defaults to [font].size
 //! emoji_path  = "/path/to/emoji-font.ttf" # defaults to [font].emoji_path
@@ -72,6 +73,14 @@
 //!                                           # icon fallback, no icons drawn.
 //! opacity     = 1.0                # defaults to [window].opacity
 //!
+//! # Per-module click command overrides. `{x}` expands to the clicked
+//! # module's left edge and `{x1}` to its right edge (bar-relative
+//! # logical px), so a popup panel can open beside its module.
+//! [bar.click]
+//! wifi          = "panel-wifi --at {x} --at-right {x1}"
+//! bluetooth     = "panel-bluetooth --at {x} --at-right {x1}"
+//! volume_output = "panel-volume --at {x} --at-right {x1}"
+//! volume_input  = "panel-volume --at {x} --at-right {x1}"//!
 //! # Zero or more app windows to watch for niri's "urgent" (attention-
 //! # demanding) state -- e.g. an Electron chat app flashing its taskbar
 //! # icon on an unread mention. Each entry becomes its own bar segment:
@@ -130,6 +139,10 @@
 //! scrollbar_track = "#181825"     # defaults to header_bg
 //! scrollbar_thumb = "#585b70"     # defaults to a derived shade
 //! filter_bg       = "#313244"     # focused filter box; defaults to a derived shade
+//! tile_color_1    = "#222a3a"     # the four tile fills; no two bordering tiles share one.
+//! tile_color_2    = "#232d29"     # Each defaults to the chrome tinted toward
+//! tile_color_3    = "#2d2531"     # [colors] blue, green, magenta and yellow
+//! tile_color_4    = "#302d25"     # respectively
 //! row_height      = 20            # pixels, 4-512
 //! header_height   = 24            # pixels, 0-512 (0 hides the strip)
 //! status_height   = 20            # pixels, 0-512 (0 hides the strip)
@@ -158,6 +171,21 @@
 //! title_size         = 1.0         # card title size, as a multiple of font_size
 //! subtitle_size      = 0.90        # unit/metadata size, as a multiple of font_size
 //! normal_size        = 0.80        # detail-row/process-table size, as a multiple of font_size
+//!
+//! # The statusbar popup panels (wifi / bluetooth / volume). Unset colors
+//! # mirror the bar's resolved palette (which itself mirrors [colors]), so
+//! # a panel reads as part of the desktop, not a foreign window.
+//! [panel]
+//! background   = "#181616"  # defaults to bar_background()
+//! foreground   = "#c5c9c5"  # defaults to bar_foreground()
+//! dim          = "#a6a69c"  # secondary text; defaults to [colors].bright_black
+//! accent       = "#8ba4b0"  # toggles/slider fill/icon ink; defaults to [colors].blue
+//! highlight    = "#2a2a2a"  # selected-row fill; defaults to a derived shade
+//! border       = "#45475a"  # slider groove / idle toggle track; defaults to a derived shade
+//! opacity      = 0.80       # defaults to bar_opacity()
+//! gap          = 8          # px, floating gap to the bar and screen edges, 0-128
+//! side         = "auto"     # "left" | "right" | "auto"; auto flips to whichever
+//!                           # edge leaves the panel fully on-screen
 //! ```
 
 mod color;
@@ -480,6 +508,55 @@ pub struct MonitorConfig {
     pub network: Option<Color>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BarClickConfig {
+    pub wifi: Option<String>,
+    pub bluetooth: Option<String>,
+    pub battery: Option<String>,
+    pub brightness: Option<String>,
+    pub volume_output: Option<String>,
+    pub volume_input: Option<String>,
+}
+
+/// Which screen edge a panel floats toward, from `[panel].side`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PanelSide {
+    Left,
+    Right,
+    /// Open on whichever side leaves the panel fully on-screen.
+    #[default]
+    Auto,
+}
+
+/// Which screen edge the status bar docks to, from `[bar].position`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BarPosition {
+    #[default]
+    Top,
+    Bottom,
+}
+
+/// `[panel]` -- the statusbar popup panels' theme and placement.
+///
+/// Every field is `Option`; unset keys mirror the bar's resolved palette
+/// (same rule as `[monitor]`), so the panels track a re-themed desktop
+/// instead of carrying a stale palette of their own.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PanelConfig {
+    pub background: Option<Color>,
+    pub foreground: Option<Color>,
+    pub dim: Option<Color>,
+    pub accent: Option<Color>,
+    pub highlight: Option<Color>,
+    pub border: Option<Color>,
+    /// `0.0`-`1.0`; `None` mirrors [`Config::bar_opacity`].
+    pub opacity: Option<f64>,
+    /// Gap in logical px between the panel and the bar / screen edges.
+    /// `None` defaults to 8.
+    pub gap: Option<u32>,
+    pub side: Option<PanelSide>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BarConfig {
     /// Background color override. `None` mirrors `[colors].background`.
@@ -488,6 +565,8 @@ pub struct BarConfig {
     pub foreground: Option<Color>,
     /// Bar thickness in logical pixels. `None` defaults to 28.
     pub height: Option<u32>,
+    /// Screen edge the bar docks to. `None` defaults to the top.
+    pub position: Option<BarPosition>,
     /// Font file override. `None` mirrors `[font].path` (and, if that's also
     /// unset, the bar falls back to the embedded bitmap font same as the
     /// terminal does).
@@ -512,6 +591,9 @@ pub struct BarConfig {
     /// default: no notification segments render unless the user opts an
     /// app in. See [`NotificationRule`].
     pub notifications: Vec<NotificationRule>,
+    /// `[bar.click]` command overrides. Each command can contain `{x}`
+    /// (the clicked module's left edge) and `{x1}` (its right edge).
+    pub click: BarClickConfig,
 }
 
 /// App-launcher configuration.
@@ -606,6 +688,9 @@ pub struct FilesConfig {
     /// Focused filter-box fill. `None` uses a built-in derived from the
     /// palette.
     pub filter_bg: Option<Color>,
+    /// The four tile fills. `None` tints the chrome toward
+    /// `[colors].blue`, `green`, `magenta` and `yellow`.
+    pub tile_colors: [Option<Color>; Self::TILE_COLORS],
     /// Row height in pixels. `None` uses a built-in `20`.
     pub row_height: Option<u32>,
     /// Header strip height in pixels. `None` uses a built-in `24`.
@@ -619,6 +704,45 @@ pub struct FilesConfig {
     /// Mirrored rather than given its own default because a desktop where one
     /// window is opaque among translucent siblings reads as a rendering fault,
     /// not as a design choice -- the same reasoning as [`BarConfig::opacity`].
+    pub opacity: Option<f64>,
+}
+
+impl FilesConfig {
+    /// How many fills the tiles cycle through: the four-colour theorem's
+    /// bound for a planar tiling.
+    pub const TILE_COLORS: usize = 4;
+
+    /// How far a default tile fill leans from the chrome toward its hue.
+    const TILE_TINT: f32 = 0.18;
+}
+
+/// The infinite-canvas diagram tool's overrides.
+///
+/// Same mirror-the-palette shape as [`FilesConfig`]: every colour key is
+/// `Option` and resolves against `[colors]` when unset, so a re-themed
+/// terminal re-themes the canvas with it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CanvasConfig {
+    /// Background color override. `None` mirrors `[colors].background`.
+    pub background: Option<Color>,
+    /// Grid-dot color. `None` derives from the palette.
+    pub grid: Option<Color>,
+    /// Text and shape-stroke color. `None` mirrors `[colors].foreground`.
+    pub text: Option<Color>,
+    /// Note-card fill. `None` derives from the palette.
+    pub surface: Option<Color>,
+    /// Note-card border. `None` derives from the palette.
+    pub border: Option<Color>,
+    /// Selected-shape accent. `None` mirrors `[colors].blue`.
+    pub selection: Option<Color>,
+    /// Text caret. `None` mirrors `[colors].yellow`.
+    pub caret: Option<Color>,
+    /// Shape stroke width in pixels. `None` uses a built-in `2`.
+    pub stroke_width: Option<u32>,
+    /// Snap-to-grid size in pixels (0 disables snapping). `None` uses a
+    /// built-in `8`.
+    pub grid_size: Option<u32>,
+    /// Background opacity, `0.0`-`1.0`. `None` mirrors `[window].opacity`.
     pub opacity: Option<f64>,
 }
 
@@ -640,8 +764,10 @@ pub struct Config {
     pub keybinds: Vec<Keybind>,
     pub bar: BarConfig,
     pub monitor: MonitorConfig,
+    pub panel: PanelConfig,
     pub launcher: LauncherConfig,
     pub files: FilesConfig,
+    pub canvas: CanvasConfig,
 }
 
 impl Default for Config {
@@ -658,7 +784,9 @@ impl Default for Config {
             bar: BarConfig::default(),
             launcher: LauncherConfig::default(),
             monitor: MonitorConfig::default(),
+            panel: PanelConfig::default(),
             files: FilesConfig::default(),
+            canvas: CanvasConfig::default(),
         }
     }
 }
@@ -725,8 +853,10 @@ impl Config {
         cfg.apply_keybinds(&table);
         cfg.apply_bar(&table)?;
         cfg.apply_monitor(&table)?;
+        cfg.apply_panel(&table)?;
         cfg.apply_launcher(&table)?;
         cfg.apply_files(&table)?;
+        cfg.apply_canvas(&table)?;
         Ok(cfg)
     }
 
@@ -1005,6 +1135,18 @@ impl Config {
         {
             self.bar.height = Some(u32::try_from(n).unwrap_or(28));
         }
+        if let Some(position) = bar.get_str("position") {
+            self.bar.position = Some(match position {
+                "top" => BarPosition::Top,
+                "bottom" => BarPosition::Bottom,
+                _ => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "bar.position",
+                        reason: "must be one of \"top\", \"bottom\"",
+                    });
+                }
+            });
+        }
         if let Some(s) = bar.get_str("font_path") {
             self.bar.font_path = Some(s.to_owned());
         }
@@ -1033,7 +1175,20 @@ impl Config {
             self.bar.opacity = Some(n);
         }
         self.apply_bar_notifications(bar)?;
+        self.apply_bar_clicks(bar);
         Ok(())
+    }
+
+    fn apply_bar_clicks(&mut self, bar: &TomlTable<'_>) {
+        let Some(click) = bar.get_table("click") else {
+            return;
+        };
+        self.bar.click.wifi = click.get_str("wifi").map(str::to_owned);
+        self.bar.click.bluetooth = click.get_str("bluetooth").map(str::to_owned);
+        self.bar.click.battery = click.get_str("battery").map(str::to_owned);
+        self.bar.click.brightness = click.get_str("brightness").map(str::to_owned);
+        self.bar.click.volume_output = click.get_str("volume_output").map(str::to_owned);
+        self.bar.click.volume_input = click.get_str("volume_input").map(str::to_owned);
     }
 
     /// Apply `[[bar.notifications]]`, if present. Split out of
@@ -1061,6 +1216,60 @@ impl Config {
             self.bar
                 .notifications
                 .push(NotificationRule { app_id, icon });
+        }
+        Ok(())
+    }
+
+    /// Apply the `[panel]` table, if present -- the popup panels' theme
+    /// and placement. Same Shelby extraction shape as `apply_monitor`.
+    fn apply_panel(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(panel) = table.get_table("panel") else {
+            return Ok(());
+        };
+        if let Some(color) = panel.get_color("background", "panel.background")? {
+            self.panel.background = Some(color);
+        }
+        if let Some(color) = panel.get_color("foreground", "panel.foreground")? {
+            self.panel.foreground = Some(color);
+        }
+        if let Some(color) = panel.get_color("dim", "panel.dim")? {
+            self.panel.dim = Some(color);
+        }
+        if let Some(color) = panel.get_color("accent", "panel.accent")? {
+            self.panel.accent = Some(color);
+        }
+        if let Some(color) = panel.get_color("highlight", "panel.highlight")? {
+            self.panel.highlight = Some(color);
+        }
+        if let Some(color) = panel.get_color("border", "panel.border")? {
+            self.panel.border = Some(color);
+        }
+        if let Some(value) = panel.get_float_range(
+            "opacity",
+            "panel.opacity",
+            0.0,
+            1.0,
+            "must be between 0.0 and 1.0",
+        )? {
+            self.panel.opacity = Some(value);
+        }
+        if let Some(value) =
+            panel.get_int_range("gap", "panel.gap", 0, 128, "must be between 0 and 128")?
+        {
+            self.panel.gap = Some(u32::try_from(value).unwrap_or(8));
+        }
+        if let Some(side) = panel.get_str("side") {
+            self.panel.side = Some(match side {
+                "left" => PanelSide::Left,
+                "right" => PanelSide::Right,
+                "auto" => PanelSide::Auto,
+                _ => {
+                    return Err(ConfigError::InvalidValue {
+                        field: "panel.side",
+                        reason: "must be one of \"left\", \"right\", \"auto\"",
+                    });
+                }
+            });
         }
         Ok(())
     }
@@ -1143,7 +1352,8 @@ impl Config {
 
         // Paired with the field it fills so a mistyped error label is
         // visible on one line rather than six lines apart.
-        let colors: [(&str, &'static str, &mut Option<Color>); 15] = [
+        let [tile_1, tile_2, tile_3, tile_4] = &mut self.files.tile_colors;
+        let colors: [(&str, &'static str, &mut Option<Color>); 19] = [
             ("background", "files.background", &mut self.files.background),
             ("text", "files.text", &mut self.files.text),
             ("dir", "files.dir", &mut self.files.dir),
@@ -1167,6 +1377,10 @@ impl Config {
                 &mut self.files.scrollbar_thumb,
             ),
             ("filter_bg", "files.filter_bg", &mut self.files.filter_bg),
+            ("tile_color_1", "files.tile_color_1", tile_1),
+            ("tile_color_2", "files.tile_color_2", tile_2),
+            ("tile_color_3", "files.tile_color_3", tile_3),
+            ("tile_color_4", "files.tile_color_4", tile_4),
         ];
         for (key, field, slot) in colors {
             if let Some(c) = files.get_color(key, field)? {
@@ -1234,6 +1448,61 @@ impl Config {
         Ok(())
     }
 
+    /// Apply the `[canvas]` table, if present. Same shape as
+    /// [`Self::apply_files`]: colour keys mirror `[colors]` when unset,
+    /// metric keys carry built-in defaults.
+    fn apply_canvas(&mut self, table: &TomlTable<'_>) -> Result<(), ConfigError> {
+        let Some(canvas) = table.get_table("canvas") else {
+            return Ok(());
+        };
+        let colors: [(&str, &'static str, &mut Option<Color>); 7] = [
+            (
+                "background",
+                "canvas.background",
+                &mut self.canvas.background,
+            ),
+            ("grid", "canvas.grid", &mut self.canvas.grid),
+            ("text", "canvas.text", &mut self.canvas.text),
+            ("surface", "canvas.surface", &mut self.canvas.surface),
+            ("border", "canvas.border", &mut self.canvas.border),
+            ("selection", "canvas.selection", &mut self.canvas.selection),
+            ("caret", "canvas.caret", &mut self.canvas.caret),
+        ];
+        for (key, field, slot) in colors {
+            if let Some(c) = canvas.get_color(key, field)? {
+                *slot = Some(c);
+            }
+        }
+        if let Some(n) = canvas.get_int_range(
+            "stroke_width",
+            "canvas.stroke_width",
+            1,
+            16,
+            "must be between 1 and 16",
+        )? {
+            self.canvas.stroke_width = Some(u32::try_from(n).unwrap_or(2));
+        }
+        if let Some(n) = canvas.get_int_range(
+            "grid_size",
+            "canvas.grid_size",
+            0,
+            256,
+            "must be between 0 and 256",
+        )? {
+            self.canvas.grid_size = Some(u32::try_from(n).unwrap_or(8));
+        }
+        if let Some(n) = canvas.get_float_range(
+            "opacity",
+            "canvas.opacity",
+            0.0,
+            1.0,
+            "must be between 0.0 and 1.0",
+        )? {
+            self.canvas.opacity = Some(n);
+        }
+        Ok(())
+    }
+
     /// The status bar's background color: `[bar].background` if set,
     /// otherwise mirrors `[colors].background` (the terminal's own
     /// background) -- so a bare bar `[bar]` table with no keys, or no
@@ -1256,6 +1525,16 @@ impl Config {
     #[must_use]
     pub fn bar_height(&self) -> u32 {
         self.bar.height.unwrap_or(28)
+    }
+
+    /// The screen edge the status bar docks to: `[bar].position` if set,
+    /// otherwise the top.
+    #[must_use]
+    pub const fn bar_position(&self) -> BarPosition {
+        match self.bar.position {
+            Some(position) => position,
+            None => BarPosition::Top,
+        }
     }
 
     /// The status bar's font file: `[bar].font_path` if set, otherwise
@@ -1438,6 +1717,90 @@ impl Config {
     #[must_use]
     pub fn bar_notifications(&self) -> &[NotificationRule] {
         &self.bar.notifications
+    }
+
+    #[must_use]
+    pub const fn bar_clicks(&self) -> &BarClickConfig {
+        &self.bar.click
+    }
+
+    /// The panels' surface color: `[panel].background` if set, otherwise
+    /// mirrors [`Config::bar_background`] -- one shared surface across the
+    /// bar, the panels, and the terminal by default.
+    #[must_use]
+    pub fn panel_background(&self) -> Color {
+        self.panel
+            .background
+            .unwrap_or_else(|| self.bar_background())
+    }
+
+    /// The panels' text color: `[panel].foreground` if set, otherwise
+    /// mirrors [`Config::bar_foreground`].
+    #[must_use]
+    pub fn panel_foreground(&self) -> Color {
+        self.panel
+            .foreground
+            .unwrap_or_else(|| self.bar_foreground())
+    }
+
+    /// The panels' secondary text color (badges, detail text): `[panel].dim`
+    /// if set, otherwise mirrors `[colors].bright_black` -- the same role
+    /// `[files].muted` mirrors.
+    #[must_use]
+    pub fn panel_dim(&self) -> Color {
+        self.panel.dim.unwrap_or(self.palette.bright_black)
+    }
+
+    /// The panels' accent (slider fill, toggle knob track, icon ink):
+    /// `[panel].accent` if set, otherwise mirrors `[colors].blue`.
+    #[must_use]
+    pub fn panel_accent(&self) -> Color {
+        self.panel.accent.unwrap_or(self.palette.blue)
+    }
+
+    /// The panels' selected-row fill: `[panel].highlight` if set, otherwise
+    /// a shade derived by washing the foreground into the background -- the
+    /// same derivation `[files].selection` uses.
+    #[must_use]
+    pub fn panel_highlight(&self) -> Color {
+        self.panel
+            .highlight
+            .unwrap_or_else(|| self.bar_background().mix(self.palette.foreground, 0.14))
+    }
+
+    /// The panels' quiet-edge color (slider groove, idle toggle track):
+    /// `[panel].border` if set, otherwise a shade derived between the
+    /// background and `dim`, so it reads as a groove rather than a second
+    /// background.
+    #[must_use]
+    pub fn panel_border(&self) -> Color {
+        self.panel
+            .border
+            .unwrap_or_else(|| self.panel_dim().mix(self.bar_background(), 0.5))
+    }
+
+    /// The panels' surface opacity: `[panel].opacity` if set, otherwise
+    /// mirrors [`Config::bar_opacity`].
+    #[must_use]
+    pub fn panel_opacity(&self) -> f64 {
+        self.panel.opacity.unwrap_or_else(|| self.bar_opacity())
+    }
+
+    /// The gap in logical px between a panel and the bar / screen edges:
+    /// `[panel].gap` if set, otherwise 8.
+    #[must_use]
+    pub fn panel_gap(&self) -> u32 {
+        self.panel.gap.unwrap_or(8)
+    }
+
+    /// Which screen edge a panel floats toward: `[panel].side` if set,
+    /// otherwise `auto`.
+    #[must_use]
+    pub const fn panel_side(&self) -> PanelSide {
+        match self.panel.side {
+            Some(side) => side,
+            None => PanelSide::Auto,
+        }
     }
 
     /// The launcher's background color: `[launcher].background` if set,
@@ -1654,6 +2017,24 @@ impl Config {
             .unwrap_or_else(|| self.palette.background.mix(self.palette.foreground, 0.38))
     }
 
+    /// Tile fill number `slot` (taken modulo four): `[files].tile_color_N`
+    /// if set, otherwise the chrome tinted toward one palette hue per slot.
+    ///
+    /// Derived from the chrome rather than the hue itself so the default
+    /// fills stay dark enough to carry the palette's text colours.
+    #[must_use]
+    pub fn files_tile_color(&self, slot: usize) -> Color {
+        let slot = slot % FilesConfig::TILE_COLORS;
+        let hue = [
+            self.palette.blue,
+            self.palette.green,
+            self.palette.magenta,
+            self.palette.yellow,
+        ][slot];
+        self.files.tile_colors[slot]
+            .unwrap_or_else(|| self.files_header_bg().mix(hue, FilesConfig::TILE_TINT))
+    }
+
     /// The focused filter box: `[files].filter_bg` if set, otherwise a
     /// slightly lifted background -- enough to show focus, not enough to
     /// compete with the selection.
@@ -1674,6 +2055,85 @@ impl Config {
     #[must_use]
     pub fn files_opacity(&self) -> f64 {
         self.files.opacity.unwrap_or(self.window.opacity)
+    }
+
+    /// The canvas background: `[canvas].background` if set, otherwise
+    /// mirrors `[colors].background`.
+    #[must_use]
+    pub fn canvas_background(&self) -> Color {
+        self.canvas.background.unwrap_or(self.palette.background)
+    }
+
+    /// The canvas grid-dot colour: `[canvas].grid` if set, otherwise a
+    /// quiet derivation from the palette that stays visible without
+    /// competing with content.
+    #[must_use]
+    pub fn canvas_grid(&self) -> Color {
+        self.canvas
+            .grid
+            .unwrap_or_else(|| self.palette.background.mix(self.palette.foreground, 0.14))
+    }
+
+    /// The canvas text/stroke colour: `[canvas].text` if set, otherwise
+    /// mirrors `[colors].foreground`.
+    #[must_use]
+    pub fn canvas_text(&self) -> Color {
+        self.canvas.text.unwrap_or(self.palette.foreground)
+    }
+
+    /// The note-card fill: `[canvas].surface` if set, otherwise a surface
+    /// stepped slightly away from the background.
+    #[must_use]
+    pub fn canvas_surface(&self) -> Color {
+        self.canvas
+            .surface
+            .unwrap_or_else(|| self.palette.background.mix(self.palette.foreground, 0.07))
+    }
+
+    /// The note-card border: `[canvas].border` if set, otherwise a
+    /// mid-tone derivation.
+    #[must_use]
+    pub fn canvas_border(&self) -> Color {
+        self.canvas
+            .border
+            .unwrap_or_else(|| self.palette.background.mix(self.palette.foreground, 0.22))
+    }
+
+    /// The selection accent: `[canvas].selection` if set, otherwise mirrors
+    /// `[colors].blue`.
+    #[must_use]
+    pub fn canvas_selection(&self) -> Color {
+        self.canvas.selection.unwrap_or(self.palette.blue)
+    }
+
+    /// The text caret: `[canvas].caret` if set, otherwise mirrors
+    /// `[colors].yellow`, as `[files]` does -- a warm bar stays legible
+    /// against both the canvas background and the note's own glyphs, which
+    /// the selection blue does not.
+    #[must_use]
+    pub fn canvas_caret(&self) -> Color {
+        self.canvas.caret.unwrap_or(self.palette.yellow)
+    }
+
+    /// The shape stroke width in pixels: `[canvas].stroke_width` if set,
+    /// otherwise `2`.
+    #[must_use]
+    pub fn canvas_stroke_width(&self) -> u32 {
+        self.canvas.stroke_width.unwrap_or(2)
+    }
+
+    /// The snap-grid pitch in pixels: `[canvas].grid_size` if set,
+    /// otherwise `8`. `0` disables snapping.
+    #[must_use]
+    pub fn canvas_grid_size(&self) -> u32 {
+        self.canvas.grid_size.unwrap_or(8)
+    }
+
+    /// The canvas window's background opacity, `0.0`-`1.0`:
+    /// `[canvas].opacity` if set, otherwise mirrors `[window].opacity`.
+    #[must_use]
+    pub fn canvas_opacity(&self) -> f64 {
+        self.canvas.opacity.unwrap_or(self.window.opacity)
     }
 
     /// Row height in pixels: `[files].row_height` if set, otherwise `20`.

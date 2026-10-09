@@ -1,4 +1,4 @@
-//! [`SpiralCursor`] -- where a keyboard step lands on a page of tiles, in
+//! [`SpiralCursor`] -- where a keyboard step lands on the tiles in view, in
 //! rank order rather than listing order.
 
 use widget::{Direction, Edge, ListCommand};
@@ -8,32 +8,31 @@ use widget::{Direction, Edge, ListCommand};
 pub enum Landing {
     /// Move the cursor to this visible-entry index.
     At(usize),
-    /// Walk past the page's last entry, into the overflow page.
-    NextPage,
-    /// Walk back before the page's first entry, out of this overflow page.
-    PrevPage,
+    /// Scroll the field by this many tiles (positive brings in smaller
+    /// ones), then put the cursor on the view's edge in that direction.
+    Slide(i32),
     /// Nothing to move to.
     Stay,
 }
 
-/// One page of tiles, as the keyboard sees it.
+/// The tiles in view, as the keyboard sees them.
 #[derive(Debug, Clone, Copy)]
 pub struct SpiralCursor<'a> {
-    /// The page's entries, largest first.
+    /// The entries in view, largest first.
     page: &'a [usize],
-    /// Whether the page ends in an overflow tile.
-    has_more: bool,
-    /// Whether this page is itself an overflow page.
-    nested: bool,
+    /// Whether smaller entries lie past the view.
+    later: bool,
+    /// Whether larger entries lie before the view.
+    earlier: bool,
 }
 
 impl<'a> SpiralCursor<'a> {
     #[must_use]
-    pub const fn new(page: &'a [usize], has_more: bool, nested: bool) -> Self {
+    pub const fn new(page: &'a [usize], later: bool, earlier: bool) -> Self {
         Self {
             page,
-            has_more,
-            nested,
+            later,
+            earlier,
         }
     }
 
@@ -61,10 +60,14 @@ impl<'a> SpiralCursor<'a> {
             }
             ListCommand::Jump(Edge::Top) => Self::edge(self.page.first()),
             ListCommand::Jump(Edge::Bottom) => Self::edge(self.page.last()),
-            ListCommand::Page(Direction::Down) if self.has_more => Landing::NextPage,
-            ListCommand::Page(Direction::Up) if self.nested => Landing::PrevPage,
+            ListCommand::Page(Direction::Down) if self.later => Landing::Slide(self.span()),
+            ListCommand::Page(Direction::Up) if self.earlier => Landing::Slide(-self.span()),
             _ => Landing::Stay,
         }
+    }
+
+    fn span(&self) -> i32 {
+        i32::try_from(self.page.len().max(1)).unwrap_or(i32::MAX)
     }
 
     fn position(&self, cursor: Option<usize>) -> Option<usize> {
@@ -74,7 +77,7 @@ impl<'a> SpiralCursor<'a> {
     fn next(&self, cursor: Option<usize>) -> Landing {
         match self.position(cursor) {
             Some(i) if i + 1 < self.page.len() => Landing::At(self.page[i + 1]),
-            Some(_) if self.has_more => Landing::NextPage,
+            Some(_) if self.later => Landing::Slide(1),
             Some(_) => Landing::Stay,
             None => Self::edge(self.page.first()),
         }
@@ -83,7 +86,7 @@ impl<'a> SpiralCursor<'a> {
     fn prev(&self, cursor: Option<usize>) -> Landing {
         match self.position(cursor) {
             Some(i) if i > 0 => Landing::At(self.page[i - 1]),
-            Some(_) if self.nested => Landing::PrevPage,
+            Some(_) if self.earlier => Landing::Slide(-1),
             Some(_) => Landing::Stay,
             None => Self::edge(self.page.last()),
         }
@@ -120,14 +123,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_left_on_another_page_counts_as_none() {
+    fn a_cursor_out_of_view_counts_as_none() {
         let page = [4, 0];
         let cursor = SpiralCursor::new(&page, false, true);
         assert_eq!(cursor.land(Some(9), DOWN), Landing::At(4));
     }
 
     #[test]
-    fn the_ends_of_a_single_page_stay_put() {
+    fn the_ends_of_the_whole_ranking_stay_put() {
         let page = [1, 0];
         let cursor = SpiralCursor::new(&page, false, false);
         assert_eq!(cursor.land(Some(0), DOWN), Landing::Stay);
@@ -135,19 +138,19 @@ mod tests {
     }
 
     #[test]
-    fn walking_off_a_page_crosses_into_the_neighbouring_one() {
+    fn walking_off_the_view_slides_it_by_one_tile() {
         let page = [1, 0];
         let cursor = SpiralCursor::new(&page, true, true);
-        assert_eq!(cursor.land(Some(0), DOWN), Landing::NextPage);
-        assert_eq!(cursor.land(Some(1), UP), Landing::PrevPage);
+        assert_eq!(cursor.land(Some(0), DOWN), Landing::Slide(1));
+        assert_eq!(cursor.land(Some(1), UP), Landing::Slide(-1));
         assert_eq!(
             cursor.land(Some(0), ListCommand::Extend(Direction::Down)),
-            Landing::NextPage
+            Landing::Slide(1)
         );
     }
 
     #[test]
-    fn home_and_end_jump_to_the_page_ends() {
+    fn home_and_end_jump_to_the_ends_of_the_view() {
         let page = [3, 1, 2];
         let cursor = SpiralCursor::new(&page, true, false);
         assert_eq!(
@@ -161,8 +164,8 @@ mod tests {
     }
 
     #[test]
-    fn page_keys_open_and_close_overflow_pages_only_when_they_exist() {
-        let page = [0];
+    fn page_keys_slide_a_view_length_only_where_there_is_more() {
+        let page = [0, 1, 2];
         let flat = SpiralCursor::new(&page, false, false);
         assert_eq!(
             flat.land(None, ListCommand::Page(Direction::Down)),
@@ -175,16 +178,16 @@ mod tests {
         let deep = SpiralCursor::new(&page, true, true);
         assert_eq!(
             deep.land(None, ListCommand::Page(Direction::Down)),
-            Landing::NextPage
+            Landing::Slide(3)
         );
         assert_eq!(
             deep.land(None, ListCommand::Page(Direction::Up)),
-            Landing::PrevPage
+            Landing::Slide(-3)
         );
     }
 
     #[test]
-    fn an_empty_page_never_moves() {
+    fn an_empty_view_never_moves() {
         let cursor = SpiralCursor::new(&[], false, false);
         assert_eq!(cursor.land(None, DOWN), Landing::Stay);
         assert_eq!(

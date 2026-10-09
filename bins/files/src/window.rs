@@ -38,12 +38,10 @@ use crate::theme::Theme;
 use crate::tile_action::TileAction;
 use crate::tile_field::{PlacedTile, TileField};
 use crate::tile_geometry::TileGeometry;
-use crate::tile_growth::{GrowthScene, TileGrowth};
+use crate::tile_growth::{Destination, Shape, TileGrowth};
+use crate::tile_id::TileId;
 use crate::tile_motion::{TileKey, TileMotion};
-use crate::tile_painter::{
-    PaintedMove, PaintedTile, PaintedTray, TileFace, TilePainter, TileRename,
-};
-use crate::tile_rank::Tile;
+use crate::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
 use crate::toolbar::{Target, Toolbar};
 use crate::typography::Typography;
 
@@ -155,6 +153,9 @@ pub struct FilesWindow {
     motion: TileMotion,
     /// Tiles growing out of the spiral as a folder or page appears.
     growth: TileGrowth,
+    /// The time the glides were last carried to, for aiming them at a layout
+    /// that changed between two ticks.
+    motion_ms: u64,
     /// The tile button the left button is held down on. It fires on release,
     /// and only if the pointer is still on it.
     pressed_action: Option<(usize, TileAction)>,
@@ -181,6 +182,7 @@ impl FilesWindow {
             tiles: TileField::new(wake.clone()),
             motion: TileMotion::new(),
             growth: TileGrowth::new(),
+            motion_ms: 0,
             pressed_action: None,
             tray: None,
             pending_copy: None,
@@ -228,6 +230,7 @@ impl FilesWindow {
     /// pass behind the pointer is invisible.
     pub fn step_motion(&mut self, now_ms: u64) -> bool {
         let was_moving = self.motion.is_animating() || self.growth.is_animating();
+        self.motion_ms = now_ms;
         self.step_growth(now_ms);
         let cursor = self.focused.then(|| self.browser.pane().cursor()).flatten();
         let tray = self.open_tray().map(|(row, _)| row);
@@ -249,20 +252,30 @@ impl FilesWindow {
 
     fn step_growth(&mut self, now_ms: u64) {
         self.sync_tiles();
-        let scene = GrowthScene {
-            path: self.browser.path().to_path_buf(),
-            depth: self.tiles.depth(),
-        };
-        let order: Vec<TileKey> = self
-            .tile_layout()
-            .iter()
-            .map(|placed| match placed.tile {
-                Tile::Item(row) => TileKey::Item(row),
-                Tile::More { .. } => TileKey::Overflow,
-            })
-            .collect();
-        self.growth.aim(&scene, &order, now_ms);
+        self.aim_growth(now_ms);
         self.growth.advance(now_ms);
+    }
+
+    fn aim_growth(&mut self, now_ms: u64) {
+        let targets = self.growth_targets();
+        let bounds = self.frame().field();
+        self.growth
+            .aim(self.browser.path(), bounds, &targets, now_ms);
+    }
+
+    fn growth_targets(&self) -> Vec<Destination> {
+        self.tile_layout()
+            .iter()
+            .filter_map(|placed| {
+                let entry = self.browser.entry(placed.row)?;
+                Some(Destination {
+                    id: TileId::of(&entry.name),
+                    row: placed.row,
+                    rect: placed.rect,
+                    slot: placed.slot,
+                })
+            })
+            .collect()
     }
 
     /// How long the loop may sleep before the next glide frame is due, or
@@ -311,7 +324,7 @@ impl FilesWindow {
 
     /// The entry whose tile lies under window position `at`.
     fn entry_at(&self, at: (i32, i32)) -> Option<usize> {
-        self.tile_at(Point::new(at.0, at.1)).and_then(Tile::item)
+        self.tile_at(Point::new(at.0, at.1))
     }
 
     /// The field the spiral fills and the room the card needs in it, so
@@ -337,7 +350,7 @@ impl FilesWindow {
             .layout(spiral, self.theme.spacing.tile_floor(), tail)
     }
 
-    fn tile_at(&self, at: Point) -> Option<Tile> {
+    fn tile_at(&self, at: Point) -> Option<usize> {
         let (spiral, tail) = self.flow_parts();
         self.tiles
             .hit(spiral, self.theme.spacing.tile_floor(), tail, at)
@@ -387,64 +400,55 @@ impl FilesWindow {
         arrived
     }
 
-    /// Whether the up control has somewhere to go: out of an overflow page,
-    /// or to the parent directory.
+    /// Whether the up control has somewhere to go.
     fn can_step_out(&self) -> bool {
-        self.tiles.depth() > 0 || self.browser.can_go_up()
+        self.browser.can_go_up()
     }
 
-    /// Close the innermost overflow page if one is open, else go up a
-    /// directory.
     fn step_out(&mut self) -> Outcome {
-        if self.tiles.close_page() {
-            return Outcome::Redraw;
-        }
         self.browser.act(crate::keymap::Action::GoUp)
     }
 
     /// A movement key in the tile view: walk the spiral in rank order,
-    /// crossing into and out of overflow pages at their edges.
+    /// scrolling the field when the walk leaves the tiles in view.
     fn steer_tiles(&mut self, command: widget::ListCommand) -> Outcome {
         let (spiral, tail) = self.flow_parts();
-        let (page, more) = self
+        let page = self
             .tiles
             .page(spiral, self.theme.spacing.tile_floor(), tail);
         let cursor = self.browser.pane().cursor();
-        let landing =
-            SpiralCursor::new(&page, more.is_some(), self.tiles.depth() > 0).land(cursor, command);
+        let landing = SpiralCursor::new(&page.rows, page.later, page.earlier).land(cursor, command);
         let extend = matches!(command, widget::ListCommand::Extend(_));
         match landing {
             Landing::At(row) => self.browser.steer_to(row, extend),
-            Landing::NextPage => {
-                let Some(from) = more else {
-                    return Outcome::Ignored;
-                };
-                self.tiles.open_more(from);
-                self.steer_to_page_edge(true, extend)
-            }
-            Landing::PrevPage => {
-                self.tiles.close_page();
-                self.steer_to_page_edge(false, extend)
+            Landing::Slide(steps) => {
+                self.tiles
+                    .slide(spiral, self.theme.spacing.tile_floor(), tail, steps);
+                self.steer_to_view_edge(steps, extend)
             }
             Landing::Stay => Outcome::Ignored,
         }
     }
 
-    /// After a page change, put the cursor on the new page's first entry
-    /// when walking forward, or its last when walking back.
-    fn steer_to_page_edge(&mut self, first: bool, extend: bool) -> Outcome {
+    /// After the field scrolled by `steps`, put the cursor on the tile that
+    /// came in: the smallest in view when scrolling on one tile at a time,
+    /// the largest after a longer jump, and the mirror of each going back.
+    fn steer_to_view_edge(&mut self, steps: i32, extend: bool) -> Outcome {
         let (spiral, tail) = self.flow_parts();
-        let (page, _) = self
+        let page = self
             .tiles
             .page(spiral, self.theme.spacing.tile_floor(), tail);
-        let edge = if first { page.first() } else { page.last() };
-        match edge {
-            Some(&row) => {
-                let _ = self.browser.steer_to(row, extend);
-                Outcome::Redraw
-            }
-            None => Outcome::Redraw,
+        let forward = steps > 0;
+        let single = steps.abs() == 1;
+        let edge = if forward == single {
+            page.rows.last()
+        } else {
+            page.rows.first()
+        };
+        if let Some(&row) = edge {
+            let _ = self.browser.steer_to(row, extend);
         }
+        Outcome::Redraw
     }
 
     /// A left press anywhere in the window.
@@ -478,7 +482,7 @@ impl FilesWindow {
         let placed = self
             .tile_layout()
             .into_iter()
-            .find(|placed| placed.tile == Tile::Item(open.row))?;
+            .find(|placed| placed.row == open.row)?;
         let spacing = self.theme.spacing;
         let geometry = TileGeometry::of(placed.rect, spacing, self.type_scale.tile_lines());
         let tray = ActionTray::fit(
@@ -507,7 +511,7 @@ impl FilesWindow {
     fn placed_item(&self, row: usize) -> Option<PlacedTile> {
         self.tile_layout()
             .into_iter()
-            .find(|placed| placed.tile == Tile::Item(row))
+            .find(|placed| placed.row == row)
     }
 
     /// Deal with a left press while a tray is open. A press on the card never
@@ -538,7 +542,7 @@ impl FilesWindow {
         if over_card || self.toolbar_hit(at).is_some() {
             return;
         }
-        if let Some(Tile::Item(row)) = self.tile_at(point) {
+        if let Some(row) = self.tile_at(point) {
             let outcome = self.browser.pick(row, Mods::none());
             self.apply(outcome);
             self.tray = Some(TrayOpen {
@@ -565,11 +569,7 @@ impl FilesWindow {
                 let outcome = self.browser.clear_selection();
                 self.apply(outcome);
             }
-            Some(Tile::More { from, .. }) => {
-                self.tiles.open_more(from);
-                let _ = self.hover.clear();
-            }
-            Some(Tile::Item(row)) => {
+            Some(row) => {
                 if doubled && mods == Mods::none() {
                     let outcome = self.browser.activate_entry(row);
                     self.apply(outcome);
@@ -593,18 +593,29 @@ impl FilesWindow {
         }
     }
 
-    /// The tiles of the open page, gathered for painting.
+    /// The tiles in view, gathered for painting: those shrinking away first,
+    /// then the ones the layout holds, each drawn where its glide has got to.
     fn painted_tiles(&self, placed: &[PlacedTile]) -> Vec<PaintedTile> {
-        placed
-            .iter()
-            .filter_map(|placed| match placed.tile {
-                Tile::Item(row) => self.painted_entry_tile(placed, row),
-                Tile::More { from, count } => Some(self.painted_overflow_tile(placed, from, count)),
-            })
-            .collect()
+        let leaving = self
+            .growth
+            .leaving()
+            .into_iter()
+            .filter_map(|(id, row, shape)| {
+                let entry = self.browser.entry(row)?;
+                (TileId::of(&entry.name) == id).then(|| self.painted_entry_tile(row, shape))?
+            });
+        let held = placed.iter().filter_map(|placed| {
+            let entry = self.browser.entry(placed.row)?;
+            let shape = self
+                .growth
+                .shape(TileId::of(&entry.name))
+                .unwrap_or_else(|| Shape::resting(placed.rect, placed.slot));
+            self.painted_entry_tile(placed.row, shape)
+        });
+        leaving.chain(held).collect()
     }
 
-    fn painted_entry_tile(&self, placed: &PlacedTile, row: usize) -> Option<PaintedTile> {
+    fn painted_entry_tile(&self, row: usize, shape: Shape) -> Option<PaintedTile> {
         let entry = self.browser.entry(row)?;
         let key = TileKey::Item(row);
         let sizes = self.tiles.sizes();
@@ -615,9 +626,11 @@ impl FilesWindow {
         };
         let cut = self.browser.clipboard().is_cut(&entry.path);
         Some(PaintedTile {
-            rect: placed.rect,
-            slot: placed.slot,
-            face: TileFace::Item(RowKind::of(entry)),
+            rect: shape.rect,
+            slot: shape.slot,
+            from_slot: shape.from_slot,
+            mix: shape.mix,
+            kind: RowKind::of(entry),
             name: entry.name.clone(),
             detail,
             name_color: if cut {
@@ -629,47 +642,16 @@ impl FilesWindow {
             drop_target: self.drop_hover_row == Some(row),
             raise: self.motion.raise(key),
             reveal: self.motion.reveal(key),
-            grown: self.growth.level(key),
+            grown: shape.grown,
             glow: TileAction::ALL.map(|action| self.motion.glow(row, action)),
             press: TileAction::ALL.map(|action| self.motion.press(row, action)),
             tray: self.painted_tray(row),
         })
     }
 
-    fn painted_overflow_tile(&self, placed: &PlacedTile, from: usize, count: usize) -> PaintedTile {
-        let sizes = self.tiles.sizes();
-        let bytes: u64 = self
-            .tiles
-            .ranked()
-            .get(from..)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|&row| self.browser.entry(row))
-            .map(|entry| sizes.of(entry))
-            .sum();
-        PaintedTile {
-            rect: placed.rect,
-            slot: placed.slot,
-            face: TileFace::Overflow,
-            name: format!("{count} more…"),
-            detail: RowFormat::human_size(bytes),
-            name_color: self.theme.text,
-            chosen: 0,
-            drop_target: false,
-            raise: self.motion.raise(TileKey::Overflow),
-            reveal: 0,
-            grown: self.growth.level(TileKey::Overflow),
-            glow: [0; TileAction::ALL.len()],
-            press: [0; TileAction::ALL.len()],
-            tray: None,
-        }
-    }
-
     fn tile_rename(&self, placed: &[PlacedTile]) -> Option<TileRename> {
         let editing = self.painted_rename()?;
-        let tile = placed
-            .iter()
-            .find(|placed| placed.tile == Tile::Item(editing.row))?;
+        let tile = placed.iter().find(|placed| placed.row == editing.row)?;
         Some(TileRename {
             tile: tile.rect,
             text: editing.text,
@@ -680,6 +662,9 @@ impl FilesWindow {
     }
 
     fn paint_tiles(&mut self, canvas: &mut Canvas<'_>) {
+        if self.growth.is_primed() {
+            self.aim_growth(self.motion_ms);
+        }
         let placed = self.tile_layout();
         let tiles = self.painted_tiles(&placed);
         let rename = self.tile_rename(&placed);
@@ -1007,9 +992,7 @@ impl FilesWindow {
             return Some(Spot::Control(target));
         }
         let placed = self.placed_at(at)?;
-        let Tile::Item(row) = placed.tile else {
-            return Some(Spot::Overflow);
-        };
+        let row = placed.row;
         Some(
             self.action_at(&placed, row, at)
                 .map_or(Spot::Item(Pane::Tiles, row), |action| {
@@ -1073,9 +1056,7 @@ impl FilesWindow {
                 (self.placed_item(row)?, row)
             } else {
                 let placed = self.placed_at(at)?;
-                let Tile::Item(row) = placed.tile else {
-                    return None;
-                };
+                let row = placed.row;
                 (placed, row)
             };
         let action = self.action_at(&placed, row, at)?;
@@ -1700,8 +1681,10 @@ impl Painter for FilesWindow {
                 let (spiral, tail) = self.flow_parts();
                 if self
                     .tiles
-                    .wheel(spiral, self.theme.spacing.tile_floor(), tail, lines)
+                    .slide(spiral, self.theme.spacing.tile_floor(), tail, lines)
                 {
+                    self.tray = None;
+                    self.aim_growth(self.motion_ms);
                     let spot = self.spot_at(at);
                     let _ = self.hover.move_to(spot);
                 }
@@ -2727,10 +2710,9 @@ mod tests {
             .tile_layout()
             .into_iter()
             .find(|placed| {
-                placed
-                    .tile
-                    .item()
-                    .and_then(|row| painter.browser.entry(row))
+                painter
+                    .browser
+                    .entry(placed.row)
                     .is_some_and(|entry| entry.name == name)
             })
             .expect("the entry has a tile");
@@ -2919,10 +2901,9 @@ mod tests {
             .tile_layout()
             .into_iter()
             .find(|placed| {
-                placed
-                    .tile
-                    .item()
-                    .and_then(|row| painter.browser.entry(row))
+                painter
+                    .browser
+                    .entry(placed.row)
                     .is_some_and(|entry| entry.name == name)
             })
             .expect("the tile exists");
@@ -3413,20 +3394,16 @@ mod tests {
     #[test]
     fn a_tile_with_no_room_for_buttons_is_clicked_as_before() {
         let (mut painter, root) = crowded("tiles-narrow", 60);
-        let small = painter
-            .tile_layout()
-            .into_iter()
-            .filter(|placed| placed.tile.item().is_some())
-            .find(|placed| {
-                TileGeometry::of(
-                    placed.rect,
-                    painter.theme.spacing,
-                    painter.type_scale.tile_lines(),
-                )
-                .bar
-                .buttons()
-                .is_empty()
-            });
+        let small = painter.tile_layout().into_iter().find(|placed| {
+            TileGeometry::of(
+                placed.rect,
+                painter.theme.spacing,
+                painter.type_scale.tile_lines(),
+            )
+            .bar
+            .buttons()
+            .is_empty()
+        });
         if let Some(placed) = small {
             let at = super::Position {
                 x: placed.rect.x + placed.rect.w / 2,
@@ -3484,30 +3461,13 @@ mod tests {
         (painter, root)
     }
 
-    #[test]
-    fn the_overflow_tile_opens_a_page_and_up_closes_it() {
-        let (mut painter, root) = crowded("tiles-overflow", 60);
-        let more = painter
+    fn in_view(painter: &FilesWindow) -> Vec<String> {
+        painter
             .tile_layout()
-            .into_iter()
-            .find(|placed| placed.tile.item().is_none())
-            .expect("sixty files overflow a 900x600 window");
-        let at = super::Position {
-            x: more.rect.x + more.rect.w / 2,
-            y: more.rect.y + more.rect.h / 2,
-        };
-        left_press(&mut painter, at);
-        left_release(&mut painter, at);
-        assert_eq!(painter.tiles.depth(), 1);
-        assert!(painter.can_step_out());
-        click_control(&mut painter, Target::Up);
-        assert_eq!(painter.tiles.depth(), 0);
-        assert_eq!(
-            painter.browser.path(),
-            root,
-            "up closed the page, not the folder"
-        );
-        let _ = std::fs::remove_dir_all(&root);
+            .iter()
+            .filter_map(|placed| painter.browser.entry(placed.row))
+            .map(|entry| entry.name.clone())
+            .collect()
     }
 
     fn key(painter: &mut FilesWindow, key: platform::toplevel::Key, shift: bool) {
@@ -3568,22 +3528,31 @@ mod tests {
     }
 
     #[test]
-    fn walking_off_the_last_tile_opens_the_overflow_page() {
-        let (mut painter, root) = crowded("tiles-keys-overflow", 60);
+    fn walking_off_the_last_tile_scrolls_one_tile_on() {
+        let (mut painter, root) = crowded("tiles-keys-scroll", 60);
+        let before = in_view(&painter);
+        assert!(before.len() < 60, "sixty files overflow a 900x600 window");
         key(&mut painter, platform::toplevel::Key::End, false);
         let last = cursor_name(&painter);
+        assert_eq!(Some(&last), before.last());
         key(&mut painter, platform::toplevel::Key::Down, false);
-        assert_eq!(painter.tiles.depth(), 1);
-        assert_ne!(cursor_name(&painter), last);
+        let after = in_view(&painter);
+        assert_eq!(&after[..after.len() - 1], &before[1..]);
+        assert_eq!(
+            Some(cursor_name(&painter)).as_ref(),
+            after.last(),
+            "the cursor lands on the tile that came in"
+        );
         key(&mut painter, platform::toplevel::Key::Up, false);
-        assert_eq!(painter.tiles.depth(), 0);
         assert_eq!(
             cursor_name(&painter),
             last,
             "walking back lands where it left"
         );
-        key(&mut painter, platform::toplevel::Key::PageDown, false);
-        assert_eq!(painter.tiles.depth(), 1);
+        key(&mut painter, platform::toplevel::Key::Up, false);
+        key(&mut painter, platform::toplevel::Key::Home, false);
+        key(&mut painter, platform::toplevel::Key::Up, false);
+        assert_eq!(in_view(&painter)[0], before[0], "the top is where it began");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3600,14 +3569,23 @@ mod tests {
     }
 
     #[test]
-    fn the_wheel_turns_tile_pages() {
+    fn each_wheel_click_drops_one_tile_from_the_large_end_and_adds_one_small() {
         let (mut painter, root) = crowded("tiles-wheel", 60);
+        let before = in_view(&painter);
+        wheel(&mut painter, -1);
+        assert_eq!(in_view(&painter), before, "nothing lies above the top");
+        wheel(&mut painter, 1);
+        let one = in_view(&painter);
+        assert_eq!(&one[..one.len() - 1], &before[1..]);
+        wheel(&mut painter, 2);
+        let three = in_view(&painter);
+        assert_eq!(&three[..three.len() - 3], &before[3..before.len()]);
         wheel(&mut painter, -3);
-        assert_eq!(painter.tiles.depth(), 0);
-        wheel(&mut painter, 3);
-        assert_eq!(painter.tiles.depth(), 1);
-        wheel(&mut painter, -3);
-        assert_eq!(painter.tiles.depth(), 0);
+        assert_eq!(
+            in_view(&painter),
+            before,
+            "scrolling back restores the view"
+        );
         assert_eq!(
             painter.browser.path(),
             root,
@@ -3617,24 +3595,44 @@ mod tests {
     }
 
     #[test]
-    fn the_go_up_key_closes_an_overflow_page_first() {
-        let (mut painter, root) = crowded("tiles-overflow-key", 60);
-        let from = painter
-            .tile_layout()
-            .into_iter()
-            .find_map(|placed| match placed.tile {
-                crate::tile_rank::Tile::More { from, .. } => Some(from),
-                crate::tile_rank::Tile::Item(_) => None,
-            })
-            .expect("overflow");
-        painter.tiles.open_more(from);
-        painter.on_key(platform::toplevel::KeyPress {
-            key: platform::toplevel::Key::Backspace,
-            modifiers: platform::toplevel::ModifierState::default(),
-            repeat: false,
-        });
-        assert_eq!(painter.tiles.depth(), 0);
-        assert_eq!(painter.browser.path(), root);
+    fn the_wheel_stops_when_the_smallest_tile_is_in_view() {
+        let (mut painter, root) = crowded("tiles-wheel-end", 60);
+        wheel(&mut painter, 500);
+        let end = in_view(&painter);
+        assert_eq!(end.last().map(String::as_str), Some("f000"));
+        wheel(&mut painter, 1);
+        assert_eq!(in_view(&painter), end);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scrolling_makes_the_new_tile_grow_in_and_the_old_one_shrink_out() {
+        let (mut painter, root) = crowded("tiles-wheel-glide", 60);
+        let size = PhysicalSize {
+            width: 900,
+            height: 600,
+        };
+        let arrived = glide(&mut painter, 0, 150);
+        assert!(!painter.growth.is_animating());
+        let largest = in_view(&painter)[0].clone();
+        wheel(&mut painter, 1);
+        painter.step_motion(arrived + 16);
+        assert!(
+            painter.growth.is_animating(),
+            "the scroll is followed by a glide"
+        );
+        let shrinking: Vec<String> = painter
+            .growth
+            .leaving()
+            .iter()
+            .filter_map(|(_, row, _)| painter.browser.entry(*row))
+            .map(|entry| entry.name.clone())
+            .collect();
+        assert_eq!(shrinking, [largest]);
+        let mid = paint_opaque(&mut painter, size);
+        glide(&mut painter, arrived + 16, 150);
+        assert!(painter.growth.leaving().is_empty());
+        assert_ne!(mid, paint_opaque(&mut painter, size));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

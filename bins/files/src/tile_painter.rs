@@ -20,19 +20,14 @@ use crate::tile_geometry::TileGeometry;
 use crate::tile_growth::TileGrowth;
 use crate::typography::Typography;
 
-/// What a tile stands for, as far as its colours are concerned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TileFace {
-    Item(RowKind),
-    Overflow,
-}
-
 /// One tile's strings and states for a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaintedTile {
     pub rect: Rect,
     pub slot: usize,
-    pub face: TileFace,
+    pub from_slot: usize,
+    pub mix: u8,
+    pub kind: RowKind,
     pub name: String,
     pub detail: String,
     pub name_color: Color,
@@ -270,7 +265,7 @@ impl<'a> TilePainter<'a> {
         geometry: &TileGeometry,
         surface: Color,
     ) {
-        if tile.reveal == 0 || !matches!(tile.face, TileFace::Item(_)) {
+        if tile.reveal == 0 {
             return;
         }
         let slide = tile
@@ -398,16 +393,14 @@ impl<'a> TilePainter<'a> {
     /// drag would drop into keeps the selection colour.
     fn outline(&self, tile: &PaintedTile) -> Color {
         let theme = self.theme;
-        match tile.face {
-            TileFace::Item(kind) if tile.drop_target => kind.selection_fill(theme),
-            _ => {
-                let hovered = theme.sidebar_border.blend_opaque_color(
-                    theme.text,
-                    Self::scaled(Self::BORDER_BRIGHTENING, tile.raise),
-                );
-                hovered.blend_opaque_color(theme.text, tile.chosen)
-            }
+        if tile.drop_target {
+            return tile.kind.selection_fill(theme);
         }
+        let hovered = theme.sidebar_border.blend_opaque_color(
+            theme.text,
+            Self::scaled(Self::BORDER_BRIGHTENING, tile.raise),
+        );
+        hovered.blend_opaque_color(theme.text, tile.chosen)
     }
 
     /// A second ring just inside the border, so a selected tile's edge is
@@ -423,9 +416,13 @@ impl<'a> TilePainter<'a> {
         canvas.blend_round_outline(rect.inset(1), self.theme.text, radius - 1, alpha);
     }
 
-    /// The tile's resting glass: the theme fill its colouring slot names.
-    const fn resting(&self, tile: &PaintedTile) -> Color {
-        self.theme.tile_fills[tile.slot % self.theme.tile_fills.len()]
+    /// The tile's resting glass: the theme fill its colouring slot names,
+    /// blended from the previous slot's while the tile is moving.
+    fn resting(&self, tile: &PaintedTile) -> Color {
+        let fills = &self.theme.tile_fills;
+        let now = fills[tile.slot % fills.len()];
+        let before = fills[tile.from_slot % fills.len()];
+        before.blend_opaque_color(now, tile.mix)
     }
 
     /// `level` of `whole` pixels, rounded: how far a glide has carried.
@@ -504,7 +501,7 @@ impl<'a> TilePainter<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PaintedTile, PaintedTray, TileFace, TilePainter, TileRename};
+    use super::{PaintedTile, PaintedTray, TilePainter, TileRename};
     use crate::action_tray::ActionTray;
     use crate::row_kind::RowKind;
     use crate::theme::Theme;
@@ -534,7 +531,9 @@ mod tests {
             PaintedTile {
                 rect,
                 slot: 0,
-                face: TileFace::Item(RowKind::Leaf),
+                from_slot: 0,
+                mix: u8::MAX,
+                kind: RowKind::Leaf,
                 name: "report.pdf".to_owned(),
                 detail: "12 KiB".to_owned(),
                 name_color: Color::WHITE,
@@ -854,21 +853,23 @@ mod tests {
     }
 
     #[test]
-    fn the_overflow_tile_rises_but_never_shows_buttons() {
+    fn a_moving_tile_blends_between_its_old_and_new_fill() {
         let mut scene = Scene::new();
-        let cell = Rect::new(0, 0, 300, 200);
-        let mut more = Scene::tile(cell);
-        more.face = TileFace::Overflow;
-        let resting = scene.paint(&[more.clone()]);
-        more.raise = 255;
-        let raised = scene.paint(&[more.clone()]);
-        assert_ne!(raised, resting);
-        more.reveal = 255;
-        assert_eq!(
-            scene.paint(&[more]),
-            raised,
-            "an overflow tile has no actions"
-        );
+        let cell = Rect::new(100, 100, 150, 100);
+        let face = scene.geometry(cell).face;
+        let probe = (face.x + face.w - 6, face.y + face.h - 6);
+        let mut tile = Scene::tile(cell);
+        tile.from_slot = 0;
+        tile.slot = 1;
+        tile.mix = 0;
+        let before = Scene::pixel(&scene.paint(&[tile.clone()]), probe.0, probe.1);
+        tile.mix = 128;
+        let between = Scene::pixel(&scene.paint(&[tile.clone()]), probe.0, probe.1);
+        tile.mix = 255;
+        let after = Scene::pixel(&scene.paint(&[tile]), probe.0, probe.1);
+        assert_ne!(before, after, "the two slots differ in the default theme");
+        assert_ne!(between, before);
+        assert_ne!(between, after);
     }
 
     #[test]

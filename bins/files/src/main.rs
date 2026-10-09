@@ -61,6 +61,7 @@ mod tile_coloring;
 mod tile_field;
 mod tile_geometry;
 mod tile_growth;
+mod tile_id;
 mod tile_motion;
 mod tile_painter;
 mod tile_rank;

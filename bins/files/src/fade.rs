@@ -15,20 +15,31 @@ const MAX_STEP_MS: u16 = 64;
 /// Progress moves at a constant rate and is eased only when read, so a fade
 /// reversed half way turns around from where it is.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Fade {
+pub struct Fade {
     progress: f32,
     target: f32,
 }
 
 impl Fade {
-    const fn rising() -> Self {
+    pub const fn rising() -> Self {
         Self {
             progress: 0.0,
             target: 1.0,
         }
     }
 
-    fn step(&mut self, elapsed_ms: u16, duration_ms: u16) {
+    pub const fn full() -> Self {
+        Self {
+            progress: 1.0,
+            target: 1.0,
+        }
+    }
+
+    pub const fn aim(&mut self, up: bool) {
+        self.target = if up { 1.0 } else { 0.0 };
+    }
+
+    pub fn step(&mut self, elapsed_ms: u16, duration_ms: u16) {
         let delta = f32::from(elapsed_ms) / f32::from(duration_ms);
         self.progress = if self.target > self.progress {
             (self.progress + delta).min(self.target)
@@ -37,16 +48,16 @@ impl Fade {
         };
     }
 
-    fn is_settled(self) -> bool {
+    pub fn is_settled(self) -> bool {
         (self.progress - self.target).abs() < f32::EPSILON
     }
 
-    fn is_gone(self) -> bool {
+    pub fn is_gone(self) -> bool {
         self.progress <= 0.0 && self.target <= 0.0
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn level(self) -> u8 {
+    pub fn level(self) -> u8 {
         let t = self.progress.clamp(0.0, 1.0);
         let eased = t * t * 2.0f32.mul_add(-t, 3.0);
         (eased * 255.0).round() as u8
@@ -78,12 +89,6 @@ impl<K: Copy + PartialEq> Fades<K> {
             clock: None,
             duration_ms,
         }
-    }
-
-    /// Forget every fade at once, so each key starts again from zero.
-    pub fn clear(&mut self) {
-        self.entries.clear();
-        self.clock = None;
     }
 
     /// Make `wanted` the keys that rise and every other key fall.
@@ -250,17 +255,6 @@ mod tests {
         slow.run(0, 12);
         assert_eq!(quick.level(&1), 255);
         assert!(slow.level(&1) < 255);
-    }
-
-    #[test]
-    fn clearing_sends_every_key_back_to_zero_and_stops_the_clock() {
-        let mut fades = Fades::new();
-        fades.aim(&[1u8, 2], 0);
-        fades.run(0, 20);
-        fades.clear();
-        assert_eq!(fades.level(&1), 0);
-        assert_eq!(fades.level(&2), 0);
-        assert!(!fades.is_animating());
     }
 
     #[test]

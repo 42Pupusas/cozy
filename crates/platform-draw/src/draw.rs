@@ -746,6 +746,37 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// [`Self::draw_round_rect`] composited at `alpha/255` over what is
+    /// already there, so a ring can fade in without covering the surface.
+    pub fn blend_round_outline(&mut self, rect: Rect, color: Color, radius: i32, alpha: u8) {
+        let shape = RoundRect::new(rect, radius);
+        if shape.is_empty() || alpha == 0 {
+            return;
+        }
+        let scale = |coverage: u8| {
+            u8::try_from(u16::from(coverage) * u16::from(alpha) / 255).unwrap_or(u8::MAX)
+        };
+        let inner = RoundRect::new(rect.inset(1), (shape.radius() - 1).max(0));
+        for y in rect.y..rect.bottom() {
+            let Some(span) = shape.span_at(y) else {
+                continue;
+            };
+            match inner.span_at(y) {
+                Some(hole) if hole.x1 > hole.x0 => {
+                    self.blend_rect(Rect::new(span.x0, y, hole.x0 - span.x0, 1), color, alpha);
+                    self.blend_rect(Rect::new(hole.x1, y, span.x1 - hole.x1, 1), color, alpha);
+                }
+                _ => self.blend_rect(Rect::new(span.x0, y, span.x1 - span.x0, 1), color, alpha),
+            }
+            if span.left_alpha > 0 {
+                self.blend_pixel(span.x0 - 1, y, color, scale(span.left_alpha));
+            }
+            if span.right_alpha > 0 {
+                self.blend_pixel(span.x1, y, color, scale(span.right_alpha));
+            }
+        }
+    }
+
     /// Draw the 1px outline of `rect` (clipped) in `color`.
     pub fn draw_rect(&mut self, rect: Rect, color: Color) {
         if rect.w <= 0 || rect.h <= 0 {
@@ -1237,6 +1268,30 @@ mod tests {
         assert_eq!(buf[12 * 24], w, "the left edge is missing");
         assert_eq!(buf[12], w, "the top edge is missing");
         assert_eq!(buf[12 * 24 + 23], w, "the right edge is missing");
+    }
+
+    #[test]
+    fn a_blended_outline_stays_on_the_edge_and_is_weaker_than_a_solid_one() {
+        let mut solid = canvas_buf(24, 24);
+        Canvas::new(&mut solid, 24, 24).draw_round_rect(Rect::new(0, 0, 24, 24), Color::WHITE, 5);
+        let mut faint = canvas_buf(24, 24);
+        Canvas::new(&mut faint, 24, 24).blend_round_outline(
+            Rect::new(0, 0, 24, 24),
+            Color::WHITE,
+            5,
+            100,
+        );
+        assert_eq!(faint[12 * 24 + 12], 0, "the interior was filled");
+        assert_ne!(faint[12 * 24], 0, "the left edge is missing");
+        assert_ne!(faint[12 * 24], solid[12 * 24], "the ring is translucent");
+        let mut none = canvas_buf(24, 24);
+        Canvas::new(&mut none, 24, 24).blend_round_outline(
+            Rect::new(0, 0, 24, 24),
+            Color::WHITE,
+            5,
+            0,
+        );
+        assert!(none.iter().all(|&p| p == 0), "alpha 0 paints nothing");
     }
 
     #[test]

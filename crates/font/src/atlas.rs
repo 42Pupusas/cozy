@@ -34,10 +34,12 @@ pub struct GlyphEntry {
 }
 
 /// A 2-D glyph texture atlas (single 8-bit alpha channel).
+///
+/// `height` is the cap; `data` only holds the rows the shelves have reached.
 pub struct Atlas {
     pub width: u32,
     pub height: u32,
-    /// Row-major, 1 byte per pixel.
+    /// Row-major, 1 byte per pixel, `width` bytes per row.
     pub data: Vec<u8>,
 
     // Shelf packing state.
@@ -49,11 +51,11 @@ pub struct Atlas {
 impl Atlas {
     /// Create a new atlas with the given dimensions.
     #[must_use]
-    pub fn new(width: u32, height: u32) -> Self {
+    pub const fn new(width: u32, height: u32) -> Self {
         Self {
             width,
             height,
-            data: vec![0u8; (width * height) as usize],
+            data: Vec::new(),
             shelf_x: 0,
             shelf_y: 0,
             shelf_h: 0,
@@ -103,6 +105,7 @@ impl Atlas {
 
         let gx = self.shelf_x;
         let gy = self.shelf_y;
+        self.reach_row(gy + h);
 
         // Blit the bitmap into the atlas.
         for row in 0..h {
@@ -124,5 +127,60 @@ impl Atlas {
             bearing_y,
             advance,
         })
+    }
+
+    fn reach_row(&mut self, rows: u32) {
+        let needed = (rows * self.width) as usize;
+        if self.data.len() < needed {
+            self.data.resize(needed, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Atlas;
+    use crate::raster::Bitmap;
+
+    struct Glyph;
+
+    impl Glyph {
+        fn solid(width: u32, height: u32) -> Bitmap {
+            Bitmap {
+                width,
+                height,
+                data: vec![255; (width * height) as usize],
+            }
+        }
+    }
+
+    #[test]
+    fn new_atlas_holds_no_rows() {
+        assert!(Atlas::new(2048, 2048).data.is_empty());
+    }
+
+    #[test]
+    fn insert_grows_only_to_the_shelf_reached() {
+        let mut atlas = Atlas::new(64, 2048);
+        atlas.insert(&Glyph::solid(10, 12), 0, 0, 10).unwrap();
+        assert_eq!(atlas.data.len(), 64 * 12);
+    }
+
+    #[test]
+    fn new_shelf_extends_rows_below_the_previous_one() {
+        let mut atlas = Atlas::new(16, 64);
+        atlas.insert(&Glyph::solid(10, 5), 0, 0, 10).unwrap();
+        let entry = atlas.insert(&Glyph::solid(10, 7), 0, 0, 10).unwrap();
+        assert_eq!(entry.y, 6);
+        assert_eq!(atlas.data.len(), 16 * 13);
+        let base = (entry.y * atlas.width) as usize;
+        assert_eq!(&atlas.data[base..base + 10], &[255; 10]);
+    }
+
+    #[test]
+    fn insert_past_the_height_cap_is_refused() {
+        let mut atlas = Atlas::new(16, 8);
+        assert!(atlas.insert(&Glyph::solid(4, 9), 0, 0, 4).is_none());
+        assert!(atlas.data.is_empty());
     }
 }

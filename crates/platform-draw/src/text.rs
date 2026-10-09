@@ -157,8 +157,13 @@ mod tests {
         const COVERAGE: u8 = 100;
 
         fn atlas() -> Atlas {
-            let mut atlas = Atlas::new(1, 1);
-            atlas.data[0] = Self::COVERAGE;
+            let mut atlas = Atlas::new(2, 2);
+            let coverage = font::Bitmap {
+                width: 1,
+                height: 1,
+                data: vec![Self::COVERAGE],
+            };
+            atlas.insert(&coverage, 0, 0, 1);
             atlas
         }
 

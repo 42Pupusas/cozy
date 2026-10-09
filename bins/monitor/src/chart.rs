@@ -21,7 +21,7 @@ impl Chart {
     }
 
     pub fn draw(&self, canvas: &mut Canvas, values: &VecDeque<f32>, maximum: f32) {
-        canvas.fill_rect(self.bounds, self.panel);
+        canvas.fill_rect_glass(self.bounds, self.panel);
         if let Some(curve) = self.curve(values, maximum) {
             self.draw_area(canvas, &curve);
             self.draw_stroke(canvas, &curve, 1.35);

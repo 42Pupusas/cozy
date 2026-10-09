@@ -11,5 +11,4 @@ platform     = { path = "../platform" }
 statusbar    = { path = "../statusbar" }
 config       = { path = "../config" }
 waker        = { path = "../waker" }
-xkb          = { path = "../xkb" }
 quetzalcoatl = { workspace = true }

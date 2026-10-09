@@ -1113,6 +1113,7 @@ impl FilesWindow {
             // reach, so the button and the key cannot diverge.
             Target::Up => self.step_out(),
             Target::Home => self.go_home(),
+            Target::NewFolder => self.browser.create_folder(),
             Target::ToggleHidden => self.browser.act(crate::keymap::Action::ToggleHidden),
             Target::FilterBox => self.browser.focus_filter(),
         };
@@ -1222,6 +1223,7 @@ impl FilesWindow {
             ),
             (bar.up(), "\u{2191}", self.can_step_out(), Target::Up),
             (bar.home(), "~", self.can_go_home(), Target::Home),
+            (bar.new_folder(), "+", true, Target::NewFolder),
         ] {
             // Dropped for want of room: nothing to draw, and `Toolbar::hit`
             // will not report it either.
@@ -1943,6 +1945,7 @@ mod tests {
         let rect = match target {
             Target::Back => bar.back(),
             Target::Forward => bar.forward(),
+            Target::NewFolder => bar.new_folder(),
             Target::ToggleHidden => bar.hidden_toggle(),
             Target::FilterBox => bar.filter(),
             Target::Up => bar.up(),
@@ -2110,6 +2113,15 @@ mod tests {
 
         click_control(&mut painter, Target::Back);
         assert_eq!(painter.browser.path(), root);
+    }
+
+    #[test]
+    fn clicking_new_folder_creates_a_folder_and_a_second_click_a_distinct_one() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("toolbar-new-folder");
+        click_control(&mut painter, Target::NewFolder);
+        assert!(root.join("New folder").is_dir());
+        click_control(&mut painter, Target::NewFolder);
+        assert!(root.join("New folder (1)").is_dir());
     }
 
     /// A click on the filter box must focus it, so typing goes into the box

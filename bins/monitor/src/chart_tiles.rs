@@ -131,7 +131,7 @@ impl ChartTiles {
     ) {
         let palette = frame.palette;
         if !frame.full {
-            canvas.fill_rect(header, palette.surface);
+            canvas.fill_rect_glass(header, palette.surface);
         }
         let value = format!("{}{}", card.hero, card.unit);
         typography.title.draw_text(

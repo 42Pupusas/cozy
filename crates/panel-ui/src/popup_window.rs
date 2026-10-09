@@ -18,11 +18,12 @@ use platform::conn::{Sender, WindowSender};
 use platform::draw::{Canvas, Point};
 use platform::event::RawEvent;
 use platform::id::{CompositorId, KeyboardId, LayerShellId, OutputId, RegistryId, SeatId, ShmId};
+use platform::keyboard_decoder::{KeyInput, KeyboardDecoder, KeyboardUpdate};
 use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
-    self as proto, Anchor, Format, Key, KeyState, KeyboardEvent, KeyboardInteractivity, Layer,
-    LayerSurfaceEvent, SeatCapability, SeatEvent, SeatRequest,
+    self as proto, Anchor, Format, Key, KeyboardInteractivity, Layer, LayerSurfaceEvent,
+    SeatCapability, SeatEvent, SeatRequest,
 };
 use platform::toplevel::keysym::Key as DecodedKey;
 use platform::wire::MessageBuilder;
@@ -162,15 +163,13 @@ pub struct PopupWindow {
 
     seat: SeatId,
     keyboard: Option<KeyboardId>,
-    xkb: Option<xkb::Translator>,
-    awaiting_keymap_fd: Option<usize>,
+    keys: KeyboardDecoder,
     key_repeat: platform::key_repeat::KeyRepeatState,
     held_resolved: Option<PanelKey>,
 
     pointer: PopupPointerState,
 
     present: PresentState,
-    backbuffer: Vec<u32>,
     background: platform::draw::Color,
     bg_alpha: u8,
 
@@ -387,13 +386,11 @@ impl PopupWindow {
             height: px_h,
             seat,
             keyboard: None,
-            xkb: None,
-            awaiting_keymap_fd: None,
+            keys: KeyboardDecoder::new(),
             key_repeat: platform::key_repeat::KeyRepeatState::new(repeat_timer),
             held_resolved: None,
             pointer: PopupPointerState::default(),
             present: PresentState::new(frames, shm_mem, pool, Format::Argb8888, 1),
-            backbuffer: vec![0; usize::try_from(px_w * px_h).unwrap_or(0)],
             background: theme.bg,
             bg_alpha: theme.bg_alpha,
             pending_keys: Vec::new(),
@@ -539,16 +536,7 @@ impl PopupWindow {
     }
 
     fn handle_keymap_fd(&mut self, fds: &[std::os::fd::OwnedFd]) {
-        use std::os::fd::AsFd as _;
-        let Some(fd) = fds.first() else {
-            return;
-        };
-        if let Some(size) = self.awaiting_keymap_fd.take() {
-            match xkb::Translator::from_keymap_fd(fd.as_fd(), size) {
-                Ok(t) => self.xkb = Some(t),
-                Err(e) => eprintln!("panel: XKB keymap translation unavailable: {e}"),
-            }
-        }
+        self.keys.absorb_keymap_fd(fds);
     }
 
     fn handle_seat_capabilities(&mut self, ev: &RawEvent) {
@@ -568,31 +556,22 @@ impl PopupWindow {
     }
 
     fn dispatch_keyboard_event(&mut self, ev: &RawEvent) {
-        match ev.event::<KeyboardEvent>() {
-            Some(KeyboardEvent::Keymap) => {
-                self.awaiting_keymap_fd = Some(ev.arg(1) as usize);
+        match self.keys.observe(ev) {
+            KeyboardUpdate::Key(input) => self.handle_key(input),
+            KeyboardUpdate::Repeat(info) => {
+                self.key_repeat.set_repeat_info(info.rate, info.delay_ms);
             }
-            Some(KeyboardEvent::Key) => self.handle_key(ev),
-            Some(KeyboardEvent::RepeatInfo) => {
-                self.key_repeat.set_repeat_info(ev.arg(0), ev.arg(1));
-            }
-            Some(KeyboardEvent::Modifiers) => {
-                if let Some(xkb) = &mut self.xkb {
-                    let _ = xkb.update_mask(ev.arg(1), ev.arg(2), ev.arg(3), ev.arg(4));
-                }
-            }
-            Some(KeyboardEvent::Leave) => {
+            KeyboardUpdate::Left => {
                 self.held_resolved = None;
                 self.key_repeat.on_leave();
             }
-            _ => {}
+            KeyboardUpdate::Ignored | KeyboardUpdate::Entered | KeyboardUpdate::Modifiers(_) => {}
         }
     }
 
-    fn handle_key(&mut self, ev: &RawEvent) {
-        let evdev_code = ev.arg(2);
-        let state = KeyState::from_raw(ev.arg(3));
-        let Some(KeyState::Pressed) = state else {
+    fn handle_key(&mut self, input: KeyInput) {
+        let evdev_code = input.evdev;
+        if !input.is_press() {
             if let Some(k) = Key::from_code(evdev_code) {
                 if self.key_repeat.held_key() == Some(k) {
                     self.held_resolved = None;
@@ -600,9 +579,9 @@ impl PopupWindow {
                 self.key_repeat.on_key_release(k);
             }
             return;
-        };
+        }
 
-        let Some(resolved) = self.resolve_key(evdev_code) else {
+        let Some(resolved) = PanelKey::from_key(input.key) else {
             return;
         };
         self.pending_keys.push(resolved);
@@ -612,12 +591,6 @@ impl PopupWindow {
             self.held_resolved = Some(resolved);
             self.key_repeat.on_key_press(k);
         }
-    }
-
-    fn resolve_key(&self, evdev_code: u32) -> Option<PanelKey> {
-        let xkb = self.xkb.as_ref()?;
-        let sym = xkb.keysym(evdev_code);
-        PanelKey::from_key(DecodedKey::decode(sym, xkb.utf32(evdev_code)))
     }
 
     fn handle_key_repeat_tick(&mut self) {
@@ -640,16 +613,14 @@ impl PopupWindow {
     }
 
     fn do_present(&mut self, slot: usize, paint: &mut impl FnMut(&mut Canvas)) {
-        {
-            let bg_packed = self.pack_bg();
-            self.backbuffer.fill(bg_packed);
-            let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height)
-                .with_format(platform::SurfaceFormat::with_bg_alpha(self.bg_alpha));
-            paint(&mut canvas);
-        }
-
-        let (dst, _stale) = self.present.slot_pixels_and_stale(slot);
-        dst.copy_from_slice(&self.backbuffer);
+        let bg = self.pack_bg();
+        self.present.repaint_slot(
+            slot,
+            (self.width, self.height),
+            platform::SurfaceFormat::with_bg_alpha(self.bg_alpha),
+            bg,
+            paint,
+        );
 
         surface::SurfacePresenter::commit_full_frame(
             &mut self.present,

@@ -58,13 +58,31 @@ impl Frame {
         height: i32,
         format: Format,
     ) -> Result<([Self; 2], ShmBuffer, PoolId)> {
-        // Window dimensions are always non-negative in practice (validated
-        // config / compositor-reported sizes); clamp defensively rather
-        // than panic on a pathological value.
+        Self::create_set::<2>(sender, shm, width, height, format)
+    }
+
+    pub fn create_single(
+        sender: &mut Sender,
+        shm: ShmId,
+        width: i32,
+        height: i32,
+        format: Format,
+    ) -> Result<(Self, ShmBuffer, PoolId)> {
+        let ([frame], shm_mem, pool) = Self::create_set::<1>(sender, shm, width, height, format)?;
+        Ok((frame, shm_mem, pool))
+    }
+
+    fn create_set<const COUNT: usize>(
+        sender: &mut Sender,
+        shm: ShmId,
+        width: i32,
+        height: i32,
+        format: Format,
+    ) -> Result<([Self; COUNT], ShmBuffer, PoolId)> {
         let shm_mem = ShmBuffer::new(
             usize::try_from(width).unwrap_or(0),
             usize::try_from(height).unwrap_or(0),
-            2,
+            COUNT,
         )
         .map_err(|e| PlatformError::Conn(ConnError::Sys(e)))?;
         let stride = width * 4;
@@ -77,7 +95,7 @@ impl Frame {
         let mut frames = [Self {
             buffer: BufferId(0),
             free: true,
-        }; 2];
+        }; COUNT];
         for (i, slot) in frames.iter_mut().enumerate() {
             let buffer: BufferId = sender.alloc_id();
             sender.request(

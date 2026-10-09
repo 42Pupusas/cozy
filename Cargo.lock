@@ -323,7 +323,6 @@ dependencies = [
  "quetzalcoatl",
  "statusbar",
  "waker",
- "xkb",
 ]
 
 [[package]]
@@ -473,7 +472,6 @@ dependencies = [
  "quetzalcoatl",
  "statusbar",
  "waker",
- "xkb",
 ]
 
 [[package]]

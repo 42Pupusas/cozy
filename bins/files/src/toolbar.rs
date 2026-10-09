@@ -17,6 +17,7 @@ pub enum Target {
     Forward,
     Up,
     Home,
+    NewFolder,
     ToggleHidden,
     FilterBox,
 }
@@ -59,24 +60,30 @@ impl Toolbar {
         self.nav_button(3, 0)
     }
 
-    /// The dotfile toggle, set apart from the four navigation buttons by a
-    /// gap because it changes what is shown rather than where you are.
     #[must_use]
-    pub fn hidden_toggle(&self) -> Option<Rect> {
-        self.nav_button(4, self.spacing.s())
+    pub fn new_folder(&self) -> Option<Rect> {
+        self.nav_button(4, 0)
     }
 
-    /// The five buttons share the padded row equally, less the gap before the
+    /// The dotfile toggle, set apart from the navigation buttons by a gap
+    /// because it changes what is shown rather than where you are.
+    #[must_use]
+    pub fn hidden_toggle(&self) -> Option<Rect> {
+        self.nav_button(5, self.spacing.s())
+    }
+
+    /// The six buttons share the padded row equally, less the gap before the
     /// toggle; the toggle takes any rounding remainder so the row ends flush.
     fn nav_button(&self, index: i32, gap: i32) -> Option<Rect> {
-        const COUNT: i32 = 5;
+        const COUNT: i32 = 6;
         let row = self.card.nav();
         let inner = row.w - self.card.pad() * 2;
         let width = (inner - self.spacing.s()) / COUNT;
         if width < self.spacing.icon_button() {
             return None;
         }
-        let height = row.h - self.spacing.s();
+        let landscape = (width * 4 / 5).max(self.spacing.nav_button_height());
+        let height = (row.h - self.spacing.s()).min(landscape);
         if height < self.spacing.nav_button_height() {
             return None;
         }
@@ -131,6 +138,7 @@ impl Toolbar {
             (self.forward(), Target::Forward),
             (self.up(), Target::Up),
             (self.home(), Target::Home),
+            (self.new_folder(), Target::NewFolder),
             (self.hidden_toggle(), Target::ToggleHidden),
             (self.filter(), Target::FilterBox),
         ]
@@ -174,6 +182,7 @@ mod tests {
             (bar.forward(), Target::Forward),
             (bar.up(), Target::Up),
             (bar.home(), Target::Home),
+            (bar.new_folder(), Target::NewFolder),
             (bar.hidden_toggle(), Target::ToggleHidden),
             (bar.filter(), Target::FilterBox),
         ]
@@ -200,7 +209,7 @@ mod tests {
     #[test]
     fn a_guide_width_card_draws_every_control() {
         let bar = toolbar_of(Spacing::new(13.0, 1.0).card_width(), 1.0);
-        assert_eq!(all(&bar).len(), 6);
+        assert_eq!(all(&bar).len(), 7);
     }
 
     #[test]
@@ -221,6 +230,14 @@ mod tests {
         let home = bar.home().expect("home");
         assert_eq!(home.x, bar.up().expect("up").right());
         assert!(bar.hidden_toggle().expect("hidden").x > home.right());
+    }
+
+    #[test]
+    fn new_folder_follows_home_and_precedes_the_toggle() {
+        let bar = toolbar_of(256, 1.0);
+        let new_folder = bar.new_folder().expect("new folder");
+        assert_eq!(new_folder.x, bar.home().expect("home").right());
+        assert!(bar.hidden_toggle().expect("hidden").x > new_folder.right());
     }
 
     #[test]
@@ -289,6 +306,6 @@ mod tests {
         let bar = toolbar_of(Spacing::new(13.0, 2.0).card_width(), 2.0);
         let plain = toolbar_of(256, 1.0);
         assert!(bar.back().expect("back").w > plain.back().expect("back").w);
-        assert_eq!(all(&bar).len(), 6);
+        assert_eq!(all(&bar).len(), 7);
     }
 }

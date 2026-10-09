@@ -26,16 +26,18 @@ use crate::id::{
     CallbackId, CompositorId, DataDeviceManagerId, KeyboardId, OutputId, PointerId, RegistryId,
     SeatId, ShmId, WmBaseId,
 };
+use crate::keyboard_decoder::{KeyInput, KeyboardDecoder, KeyboardUpdate};
 use crate::keymap;
 use crate::protocol::Modifiers;
 use crate::protocol::{
     self as proto, ButtonState, DataDeviceEvent, DataOfferEvent, DataSourceEvent, Format, Key,
-    KeyState, KeyboardEvent, PointerButton, PointerEvent, PointerRequest, SeatCapability,
-    SeatEvent, SeatRequest, SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent,
-    XdgSurfaceEvent, XdgSurfaceRequest,
+    KeyState, PointerButton, PointerEvent, PointerRequest, SeatCapability, SeatEvent, SeatRequest,
+    SurfaceRequest, ToplevelEvent, ToplevelRequest, WmBaseEvent, XdgSurfaceEvent,
+    XdgSurfaceRequest,
 };
 use crate::render;
 use crate::toplevel::lifecycle::Lifecycle;
+use crate::toplevel::modifiers::ModifierState;
 use crate::toplevel::shell::ShellSurface;
 use crate::wire::MessageBuilder;
 
@@ -210,13 +212,7 @@ pub struct TermWindow {
     /// one place; see [`crate::key_repeat::KeyRepeatState`].
     key_repeat: crate::key_repeat::KeyRepeatState,
     modifiers: Modifiers,
-    /// Real XKB keymap translation, built from the compositor's
-    /// `wl_keyboard.keymap` blob (see `crates/xkb`). `None` until the first
-    /// `Keymap` event arrives, or permanently if `libxkbcommon` couldn't be
-    /// loaded / the keymap failed to compile -- callers fall back to the
-    /// physical-keycode path (`keymap::PhysicalKey::to_logical`) in either
-    /// case, so a missing library never blocks the terminal from starting.
-    xkb: Option<xkb::Translator>,
+    keyboard_decoder: KeyboardDecoder,
 
     cursor: Option<cursor::PointerCursor>,
 
@@ -238,11 +234,10 @@ pub struct TermWindow {
     /// struct so the swap-chain lifecycle lives (and is tested) in one
     /// place; see [`crate::present::PresentState`].
     present: crate::present::PresentState,
-    /// The persistent XRGB backbuffer plus the premultiplied-ARGB cache
-    /// custom painters read on present. Extracted from this struct so the
-    /// pixel-level buffer bookkeeping lives (and is tested) in one place;
-    /// see [`crate::pixel_buffers::PixelBuffers`].
-    pixels: crate::pixel_buffers::PixelBuffers,
+    /// The shm slot the current present paints into. Every paint helper
+    /// writes here; it holds the latest image once
+    /// [`crate::present::PresentState::catch_up`] has run.
+    paint_slot: usize,
     /// Glyph source (bitmap or loaded TTF/OTF face) + resolved color theme.
     renderer: render::Renderer,
     width: i32,
@@ -316,11 +311,6 @@ pub struct TermWindow {
     /// selection (rather than inside it) because click *timing* is a pointer
     /// concern; see [`crate::multi_click::MultiClickTracker`].
     multi_click: crate::multi_click::MultiClickTracker,
-    /// Set when a `wl_keyboard.keymap` event just arrived; the next
-    /// `RawEvent::Fd` is the keymap blob to `mmap` + compile via
-    /// `crate::xkb`. Carries the event's `size` argument (the fd itself has
-    /// no length of its own -- the wire event tells us how much to map).
-    awaiting_keymap_fd: Option<usize>,
     /// Viewport rows that carried a highlight on the previous frame. Repainted
     /// clean on the next frame before the (possibly moved/cleared) selection
     /// is re-tinted, so highlight never lingers after deselect or drag.
@@ -497,17 +487,10 @@ impl TermWindow {
         let clipboard =
             crate::clipboard::ClipboardState::new(data_device_manager, seat, &mut window_tx);
 
-        // `PixelBuffers::new` uses `bg_packed()`, not `bg_xrgb()`: a
-        // translucent window's initial backbuffer must carry the configured
-        // alpha from frame one, not flash fully opaque until the first real
-        // paint.
-        let pixels = crate::pixel_buffers::PixelBuffers::new(width, height, renderer.bg_packed());
-        // Both shm frames start as blank memory (freshly mmap'd), so every
-        // row is "stale" relative to the backbuffer until the first present
-        // copies it in -- `PresentState::new` seeds that.
-        let row_count = ((height + cell_h - 1) / cell_h).max(1) as usize;
-        let present =
+        let row_count = crate::row_band::RowBand::new(width, height, cell_h).rows();
+        let mut present =
             crate::present::PresentState::new(frames, shm_mem, pool, buf_format, row_count);
+        present.fill_all(renderer.bg_packed());
 
         Ok(Self {
             sender,
@@ -529,10 +512,10 @@ impl TermWindow {
             activations: crate::toplevel::activation_queue::ActivationQueue::new(),
             key_repeat: crate::key_repeat::KeyRepeatState::new(repeat_timer),
             modifiers: Modifiers::default(),
-            xkb: None,
+            keyboard_decoder: KeyboardDecoder::new(),
             cursor,
             present,
-            pixels,
+            paint_slot: 0,
             renderer,
             width,
             height,
@@ -551,7 +534,6 @@ impl TermWindow {
             clipboard,
             selection: crate::selection::SelectionTracker::new(),
             multi_click: crate::multi_click::MultiClickTracker::new(),
-            awaiting_keymap_fd: None,
             prev_selection_rows: Vec::new(),
             hover_link: None,
             prev_hover_row: None,
@@ -1118,12 +1100,6 @@ impl TermWindow {
 
     // ── private ───────────────────────────────────────────────────────────
 
-    /// Consume the fd batch that followed a clipboard `send`/`receive`, or a
-    /// `wl_keyboard.keymap` event. `send` → we write our `clipboard_text` to
-    /// the peer's pipe; `receive` (our paste request) → we read the peer's
-    /// clipboard from the pipe; `keymap` → we `mmap` + compile it via
-    /// `crate::xkb` so subsequent `Key` events resolve through the real XKB
-    /// state instead of the physical-keycode fallback.
     /// Resolve one `wl_keyboard.key` press to our logical [`Key`] enum.
     ///
     /// `protocol::Key` is a fixed per-physical-key enum (letters carry their
@@ -1139,38 +1115,26 @@ impl TermWindow {
     /// everything else -- letters, digits, punctuation -- we keep the
     /// physical (US-QWERTY) mapping: correct for the common case, and no
     /// worse than before XKB was wired in.
-    fn resolve_logical_key(&self, physical: Option<Key>, evdev_code: u32) -> Option<Key> {
-        if let Some(xkb) = &self.xkb {
-            let sym = xkb.keysym(evdev_code);
-            if sym != 0 {
-                if let Some(k) = keymap::XkbKeysym::from_raw(sym).map(keymap::XkbKeysym::to_key) {
-                    return Some(k);
-                }
-                // A real (non-NoSymbol) keysym came back but it's outside
-                // our navigation/modifier/functional table -- almost
-                // certainly a printable character. Fall through to the
-                // physical mapping rather than dropping the press.
+    fn resolve_logical_key(physical: Option<Key>, keysym: u32) -> Option<Key> {
+        if keysym != 0 {
+            if let Some(k) = keymap::XkbKeysym::from_raw(keysym).map(keymap::XkbKeysym::to_key) {
+                return Some(k);
             }
         }
         physical.map(keymap::PhysicalKey::to_logical)
     }
 
+    /// Consume the fd batch that followed a clipboard `send`/`receive`, or a
+    /// `wl_keyboard.keymap` event. `send` → we write our `clipboard_text` to
+    /// the peer's pipe; `receive` (our paste request) → we read the peer's
+    /// clipboard from the pipe; a pending keymap goes to the keyboard decoder.
     fn handle_clipboard_fds(&mut self, fds: Vec<std::os::fd::OwnedFd>) {
-        use std::os::fd::AsFd as _;
         let Some(fd) = fds.into_iter().next() else {
             return;
         };
-        if let Some(size) = self.awaiting_keymap_fd.take() {
-            match xkb::Translator::from_keymap_fd(fd.as_fd(), size) {
-                Ok(t) => self.xkb = Some(t),
-                Err(e) => {
-                    // Not fatal: `keymap::PhysicalKey::to_logical` (the
-                    // physical-keycode fallback) still works, just without
-                    // honoring the compositor's remap.
-                    eprintln!("platform: XKB keymap translation unavailable: {e}");
-                }
-            }
-            // `fd` (an mmap'd, now-unneeded fd) closes on scope exit.
+        if self.keyboard_decoder.is_awaiting_keymap_fd() {
+            self.keyboard_decoder
+                .absorb_keymap_fd(std::slice::from_ref(&fd));
             return;
         }
         if self.clipboard.is_awaiting_send_fd() {
@@ -1320,7 +1284,7 @@ impl TermWindow {
         if let Some(src) = self.clipboard.source_id() {
             if ev.is(src) {
                 if let Some(src_ev) = ev.event::<DataSourceEvent>() {
-                    self.clipboard.on_source_event(src_ev);
+                    self.clipboard.on_source_event(&mut self.window_tx, src_ev);
                 }
             }
         }
@@ -1346,14 +1310,15 @@ impl TermWindow {
     /// `handle_event`'s complexity for dispatch logic unrelated to every
     /// other protocol object it also routes.
     fn dispatch_keyboard_event(&mut self, ev: &RawEvent) {
-        match ev.event::<KeyboardEvent>() {
-            Some(KeyboardEvent::Keymap) => self.handle_keyboard_keymap(ev),
-            Some(KeyboardEvent::Enter) => self.handle_keyboard_enter(ev),
-            Some(KeyboardEvent::Key) => self.handle_keyboard_key(ev),
-            Some(KeyboardEvent::RepeatInfo) => self.handle_keyboard_repeat_info(ev),
-            Some(KeyboardEvent::Leave) => self.handle_keyboard_leave(),
-            Some(KeyboardEvent::Modifiers) => self.handle_keyboard_modifiers(ev),
-            _ => {}
+        match self.keyboard_decoder.observe(ev) {
+            KeyboardUpdate::Entered => self.handle_keyboard_enter(ev),
+            KeyboardUpdate::Left => self.handle_keyboard_leave(),
+            KeyboardUpdate::Modifiers(state) => self.handle_keyboard_modifiers(state),
+            KeyboardUpdate::Repeat(info) => {
+                self.key_repeat.set_repeat_info(info.rate, info.delay_ms);
+            }
+            KeyboardUpdate::Key(input) => self.handle_keyboard_key(ev.arg(0), input),
+            KeyboardUpdate::Ignored => {}
         }
     }
 
@@ -1642,13 +1607,6 @@ impl TermWindow {
         }
     }
 
-    /// `wl_keyboard.keymap`: stash the mapping's byte length; the fd itself
-    /// rides out-of-band as the very next `Fd` event (Wayland attaches fds to
-    /// a specific message, not as a standalone one).
-    const fn handle_keyboard_keymap(&mut self, ev: &RawEvent) {
-        self.awaiting_keymap_fd = Some(ev.arg(1) as usize);
-    }
-
     /// `wl_keyboard.enter`: keyboard focus gained. Remembers the serial
     /// `set_selection` needs to prove clipboard ownership, and makes the
     /// cursor solid (not mid-fade) before it resumes blinking.
@@ -1662,12 +1620,12 @@ impl TermWindow {
     /// `wl_keyboard.key`: resolves the physical keycode to a logical key,
     /// drives the repeat timer, lets Esc clear an active selection, and
     /// queues the key for the caller.
-    fn handle_keyboard_key(&mut self, ev: &RawEvent) {
-        let physical = Key::from_code(ev.arg(2));
-        let logical = self.resolve_logical_key(physical, ev.arg(2));
-        let state = KeyState::from_raw(ev.arg(3));
-        if matches!(state, Some(KeyState::Pressed)) {
-            self.input_serial.record_key_down(ev.arg(0));
+    fn handle_keyboard_key(&mut self, serial: u32, input: KeyInput) {
+        let physical = Key::from_code(input.evdev);
+        let logical = Self::resolve_logical_key(physical, input.keysym);
+        let state = Some(input.state);
+        if input.is_press() {
+            self.input_serial.record_key_down(serial);
         }
         // Start/stop repeat timer. Modifier keys never repeat.
         match (logical, state) {
@@ -1691,11 +1649,6 @@ impl TermWindow {
         });
     }
 
-    /// `wl_keyboard.repeat_info`: the compositor's preferred repeat rate/delay.
-    const fn handle_keyboard_repeat_info(&mut self, ev: &RawEvent) {
-        self.key_repeat.set_repeat_info(ev.arg(0), ev.arg(1));
-    }
-
     /// `wl_keyboard.leave`: focus lost. Freezes the cursor fully hidden so it
     /// stops blinking -- the classic "which window is focused" cue: only the
     /// focused window's cursor is ever visible.
@@ -1706,32 +1659,17 @@ impl TermWindow {
         self.input_queue.push_back(InputEvent::Focus(false));
     }
 
-    /// `wl_keyboard.modifiers`: updates the raw depressed/latched/locked/group
-    /// masks, feeds them to XKB (which alone knows what they mean for the
-    /// loaded keymap), and refreshes link-hover state since Ctrl toggling
-    /// while hovering a link must react immediately, not wait for motion.
-    fn handle_keyboard_modifiers(&mut self, ev: &RawEvent) {
+    /// `wl_keyboard.modifiers`: records the masks and refreshes link-hover
+    /// state, since Ctrl toggling while hovering a link must react
+    /// immediately, not wait for motion.
+    fn handle_keyboard_modifiers(&mut self, state: ModifierState) {
+        let (depressed, latched, locked, group) = state.raw();
         self.modifiers = Modifiers {
-            depressed: ev.arg(1),
-            latched: ev.arg(2),
-            locked: ev.arg(3),
-            group: ev.arg(4),
+            depressed,
+            latched,
+            locked,
+            group,
         };
-        if let Some(xkb) = &mut self.xkb {
-            // Feed the raw masks straight through -- XKB
-            // owns what depressed/latched/locked mean for
-            // whatever keymap is loaded, we don't decode
-            // them ourselves.
-            let _ = xkb.update_mask(
-                self.modifiers.depressed,
-                self.modifiers.latched,
-                self.modifiers.locked,
-                self.modifiers.group,
-            );
-        }
-        // Ctrl toggling while the pointer sits over a link
-        // must start/stop the hover-underline immediately,
-        // not wait for the next pointer motion.
         let (cc, cr) = self.pointer_cell();
         self.update_hover_link(cc, cr);
     }
@@ -1857,7 +1795,9 @@ impl TermWindow {
 
     fn repaint_rows(&mut self, rows: &[u16]) {
         let cols = (self.width / self.cell_w).max(1) as u16;
-        let mut canvas = self.pixels.canvas(self.width, self.height);
+        let mut canvas = self
+            .present
+            .slot_canvas(self.paint_slot, self.width, self.height);
         for &row in rows {
             let Some(content) = self.selection.row_content(row) else {
                 continue;
@@ -1921,7 +1861,7 @@ impl TermWindow {
             let py0 = usize::from(row) * self.cell_h as usize;
             let px0 = usize::from(c0) * self.cell_w as usize;
             let px1 = (usize::from(c1) + 1) * self.cell_w as usize;
-            let backbuffer = self.pixels.backbuffer_mut();
+            let backbuffer = self.present.slot_pixels(self.paint_slot);
             for py in py0..py0 + self.cell_h as usize {
                 let base = py * buf_w;
                 if base >= backbuffer.len() {
@@ -2000,7 +1940,7 @@ impl TermWindow {
             return;
         };
         let base = y * buf_w;
-        let backbuffer = self.pixels.backbuffer_mut();
+        let backbuffer = self.present.slot_pixels(self.paint_slot);
         for x in x0..x1 {
             let idx = base + x;
             if idx < backbuffer.len() {
@@ -2027,7 +1967,9 @@ impl TermWindow {
 
         let shape = self.cursor_anim.shape();
         {
-            let mut canvas = self.pixels.canvas(self.width, self.height);
+            let mut canvas = self
+                .present
+                .slot_canvas(self.paint_slot, self.width, self.height);
             if alpha > 0.0 {
                 self.renderer.draw_cursor(&mut canvas, vc, vr, shape, alpha);
             }
@@ -2214,78 +2156,24 @@ impl TermWindow {
         touched_rows.extend_from_slice(&new_fps_rows);
     }
 
-    /// Copy every row `slot` is stale for from its true source (the shared
-    /// backbuffer for a terminal-grid window, the persistent ARGB cache for a
-    /// custom-painter one) into that shm slot, clearing each row's stale bit
-    /// as it's caught up. Contiguous stale rows are coalesced into one
-    /// `(y_px, height_px)` damage rect each, so the common single-row case
-    /// (e.g. one line of typing) costs one Wayland `Damage` message instead
-    /// of one per row. Returns the damage rects for [`Self::submit_frame`].
-    fn copy_stale_rows_into_slot(&mut self, slot: usize, custom_painted: bool) -> Vec<(i32, i32)> {
-        let buf_w = self.width;
-        let cols_bytes = buf_w as usize;
-        let cell_h = self.cell_h as usize;
-        // The buffer height need not be an exact multiple of cell_h -- the
-        // compositor hands us whatever configure size it likes. `stale_rows`
-        // only tracks whole cell rows (`height / cell_h`, floored), so the
-        // `height - row_count*cell_h` leftover scanlines at the very bottom
-        // belong to no row's band. When a stale run reaches the last tracked
-        // row, extend its copy + damage down to the true buffer bottom so that
-        // partial strip is filled too -- otherwise the freshly-mmap'd (zeroed)
-        // shm bottom shows through as a blank line.
-        let buf_h = self.height as usize;
-        // Borrow the source before borrowing `present` mutably below. The
-        // caches and swap chain are disjoint state, but holding this narrow
-        // slice makes that separation explicit to both Rust and readers.
-        let (custom_source, custom_fill) = if custom_painted {
-            (self.pixels.backbuffer(), self.renderer.bg_packed())
-        } else {
-            // This slice is never read on the terminal-grid path. Supplying an
-            // empty one keeps the later copy loop branch-free with respect to
-            // the swap-chain borrow.
-            (&[] as &[u32], self.renderer.bg_packed())
-        };
-        let (dst, stale) = self.present.slot_pixels_and_stale(slot);
-        let last_row = stale.len().saturating_sub(1);
-        let mut damage_rects: Vec<(i32, i32)> = Vec::new(); // (y_px, height_px)
-        let mut row = 0usize;
-        while row < stale.len() {
-            if !stale[row] {
-                row += 1;
-                continue;
+    fn row_band(&self) -> crate::row_band::RowBand {
+        crate::row_band::RowBand::new(self.width, self.height, self.cell_h)
+    }
+
+    /// The `(y_px, height_px)` damage rects for this present: every
+    /// scanline on the first present after a (re)size, otherwise the rows
+    /// painted this frame, coalesced into runs.
+    fn damage_rects(&mut self, touched_rows: &[u16]) -> Vec<(i32, i32)> {
+        let band = self.row_band();
+        let mut painted = vec![self.present.take_full_damage(); band.rows()];
+        for &row in touched_rows {
+            if let Some(flag) = painted.get_mut(usize::from(row)) {
+                *flag = true;
             }
-            let run_start = row;
-            let mut reaches_bottom = false;
-            while row < stale.len() && stale[row] {
-                stale[row] = false;
-                if row == last_row {
-                    reaches_bottom = true;
-                }
-                row += 1;
-            }
-            let y0 = run_start * cell_h;
-            // The run's natural pixel end, stretched to the real buffer bottom
-            // when it includes the last row so the sub-cell remainder is caught.
-            let y1 = if reaches_bottom { buf_h } else { row * cell_h };
-            let src_off = y0 * cols_bytes;
-            let len = (y1 - y0) * cols_bytes;
-            if let Some(dst_slice) = dst.get_mut(src_off..src_off + len) {
-                if custom_painted {
-                    let available = custom_source.len().saturating_sub(src_off);
-                    let copy_len = available.min(dst_slice.len());
-                    dst_slice[..copy_len]
-                        .copy_from_slice(&custom_source[src_off..src_off + copy_len]);
-                    if copy_len < dst_slice.len() {
-                        dst_slice[copy_len..].fill(custom_fill);
-                    }
-                } else if let Some(src_slice) = self.pixels.backbuffer().get(src_off..src_off + len)
-                {
-                    dst_slice.copy_from_slice(src_slice);
-                }
-            }
-            damage_rects.push((y0 as i32, (y1 - y0) as i32));
         }
-        damage_rects
+        band.runs(&painted)
+            .map(|lines| (lines.start as i32, (lines.end - lines.start) as i32))
+            .collect()
     }
 
     /// Attach `slot`'s buffer, damage every rect the stale-row copy touched,
@@ -2347,10 +2235,14 @@ impl TermWindow {
         // here. See `FrameStats::record_busy`.
         let present_start = std::time::Instant::now();
 
-        // Blit pending dirty snapshots into the persistent backbuffer, which
-        // always holds the full image, then copy only the rows that actually
-        // changed into the free shm frame -- tracked in `touched_rows` and
-        // reconciled against `stale_rows` below.
+        // The claimed slot is one or more presents behind. Copying in the rows
+        // it lags from the latest image makes it the full current frame, so
+        // everything below paints incrementally into it as it would into a
+        // persistent backbuffer.
+        self.paint_slot = slot;
+        let band = self.row_band();
+        self.present.catch_up(slot, band);
+
         let pending = std::mem::take(&mut self.pending_dirty);
         let folded = Self::fold_dirty_snapshots(pending);
         let mut touched_rows: Vec<u16> = Vec::new();
@@ -2360,7 +2252,7 @@ impl TermWindow {
         // upward-only band), these are signed and cover the full screen, so
         // baked overlays (fps readout, a resting cursor/selection) get dragged
         // by the memmove and their row trackers must be remapped to match.
-        let mut canvas = self.pixels.canvas(self.width, self.height);
+        let mut canvas = self.present.slot_canvas(slot, self.width, self.height);
         let (viewport_shifts, painted_rows, painted_cells) = self.renderer.blit_folded_snapshots(
             &mut canvas,
             &folded,
@@ -2408,12 +2300,8 @@ impl TermWindow {
         }
         let t_overlay = present_start.elapsed();
 
-        // Every row touched this frame is now stale relative to *both* shm
-        // slots (whichever one isn't presented into this time still needs
-        // catching up next time it's used).
-        self.present.mark_rows_stale(touched_rows);
-
-        let damage_rects = self.copy_stale_rows_into_slot(slot, custom_painted);
+        self.present.publish_rows(slot, &touched_rows);
+        let damage_rects = self.damage_rects(&touched_rows);
         self.submit_frame(slot, damage_rects);
         let total = present_start.elapsed();
         // On a slow present (>5ms -- never the 60fps steady state, always the
@@ -2433,6 +2321,10 @@ impl TermWindow {
     }
 
     fn resize(&mut self, w: i32, h: i32) -> Result<()> {
+        // Taken before the pool is reshaped: a resize moves slot offsets and
+        // may remap the pool, so the old image must leave it first.
+        let carry = self.present.capture_latest(self.width, self.height);
+
         // Destroy only the old *buffers* — the pool itself is reused. The server
         // answers each Destroy with `wl_display.delete_id`, which recycles those
         // ids; without it every resize step would leak 2 buffer ids. (Before,
@@ -2458,24 +2350,7 @@ impl TermWindow {
         }
 
         self.present.recreate_buffers(&mut self.window_tx, w, h);
-        // Carry the old image into the new backbuffer (top-left aligned) instead
-        // of clearing to background, and rebuild the premultiplied custom-
-        // painter cache at the new size. The grid reflow + full snapshot
-        // arrives a round-trip later via the parser thread; until then we
-        // keep showing the previous content so the window doesn't flash
-        // blank mid-drag. See [`crate::pixel_buffers::PixelBuffers::resize`]
-        // for why `bg_packed()` (not `bg_xrgb()`) is used for the fill.
-        self.pixels
-            .resize(self.width, self.height, w, h, self.renderer.bg_packed());
-        // A configure can end between cell boundaries. The carried old image
-        // is useful for complete grid rows while the reflow snapshot is in
-        // flight, but no grid cell owns the remaining bottom scanlines. Clear
-        // them now so a cropped old glyph cannot become a permanently stuck
-        // partial line (dirty snapshots intentionally paint whole rows only).
-        self.pixels
-            .clear_partial_cell_row(w, h, self.cell_h, self.renderer.bg_packed());
 
-        // `self.present`'s pool is unchanged — we reuse it across resizes now.
         self.width = w;
         self.height = h;
         // Both shm buffers are brand-new (freshly created, uninitialized)
@@ -2487,8 +2362,18 @@ impl TermWindow {
         // force the next present to fire immediately (never leave the
         // surface showing a detached/blank buffer -- the cause of resize
         // flashing).
-        let row_count = ((h + self.cell_h - 1) / self.cell_h).max(1) as usize;
-        self.present.reset_after_resize(row_count);
+        let band = self.row_band();
+        self.present.reset_after_resize(band.rows());
+        // Keep showing the previous content, top-left aligned, until the grid
+        // reflow snapshot arrives a round-trip later, so a drag never flashes
+        // blank. `bg_packed()` so exposed area carries the window alpha.
+        let bg = self.renderer.bg_packed();
+        self.present.restore(&carry, w, h, bg);
+        drop(carry);
+        // No grid cell owns the scanlines below the last complete cell row,
+        // so a cropped old glyph left there would never be repainted.
+        let complete = (band.height() / band.row_h()) * band.row_h();
+        self.present.fill_lines_from(band, complete, bg);
         Ok(())
     }
 

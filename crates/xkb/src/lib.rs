@@ -214,8 +214,17 @@ impl Translator {
     /// the keymap text failing to compile.
     pub fn from_keymap_fd(fd: BorrowedFd<'_>, size: usize) -> Result<Self, XkbError> {
         let text = Self::mmap_keymap(fd, size)?;
+        Self::from_keymap_text(&text)
+    }
+
+    /// Compile keymap text that is already in memory.
+    ///
+    /// # Errors
+    /// See [`XkbError`] -- library missing or the keymap text failing to
+    /// compile.
+    pub fn from_keymap_text(text: &str) -> Result<Self, XkbError> {
         let ctx = Context::new()?;
-        let keymap = Keymap::compile(ctx, &text)?;
+        let keymap = Keymap::compile(ctx, text)?;
         let state = State::new(keymap)?;
         Ok(Self { state })
     }

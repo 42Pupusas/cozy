@@ -11,20 +11,20 @@
 //!   * **`KeyboardInteractivity::Exclusive`**: a bar never takes keyboard
 //!     focus; a launcher needs to grab it immediately so typing lands in
 //!     the search box with no click required.
-//!   * **real XKB keyboard input**: wired exactly like
-//!     `platform::TermWindow` (`crate::xkb::Translator` fed from
-//!     `wl_keyboard.keymap`/`modifiers`, `platform::key_repeat`-equivalent
-//!     auto-repeat) -- a bar has no keyboard at all.
+//!   * **real XKB keyboard input** through
+//!     `platform::keyboard_decoder::KeyboardDecoder`, plus
+//!     `platform::key_repeat` auto-repeat -- a bar has no keyboard at all.
 
 use platform::conn::{Sender, WindowSender};
 use platform::draw::Canvas;
 use platform::event::RawEvent;
 use platform::id::{CompositorId, KeyboardId, LayerShellId, OutputId, RegistryId, SeatId, ShmId};
+use platform::keyboard_decoder::{KeyInput, KeyboardDecoder, KeyboardUpdate};
 use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
-    self as proto, Format, Key, KeyState, KeyboardEvent, KeyboardInteractivity, Layer,
-    LayerSurfaceEvent, SeatCapability, SeatEvent, SeatRequest,
+    self as proto, Format, Key, KeyboardInteractivity, Layer, LayerSurfaceEvent, SeatCapability,
+    SeatEvent, SeatRequest,
 };
 // Two different notions of "key" meet in this file, so neither is left to
 // be inferred from context: `proto::Key` is a *physical* evdev key (what
@@ -104,8 +104,7 @@ pub struct LauncherWindow {
 
     seat: SeatId,
     keyboard: Option<KeyboardId>,
-    xkb: Option<xkb::Translator>,
-    awaiting_keymap_fd: Option<usize>,
+    keys: KeyboardDecoder,
     key_repeat: platform::key_repeat::KeyRepeatState,
     /// What the currently-held key resolved to, so auto-repeat can re-emit
     /// it verbatim instead of re-deriving it from the physical keycode.
@@ -113,7 +112,6 @@ pub struct LauncherWindow {
     held_resolved: Option<LauncherKey>,
 
     present: PresentState,
-    backbuffer: Vec<u32>,
     background: platform::draw::Color,
     /// Alpha applied to background pixels, `0-255` (`255` = opaque). Same
     /// role as `statusbar::BarWindow`'s `bg_alpha` -- fixed for the
@@ -300,12 +298,10 @@ impl LauncherWindow {
             height: px_h,
             seat,
             keyboard: None,
-            xkb: None,
-            awaiting_keymap_fd: None,
+            keys: KeyboardDecoder::new(),
             key_repeat: platform::key_repeat::KeyRepeatState::new(repeat_timer),
             held_resolved: None,
             present: PresentState::new(frames, shm_mem, pool, Format::Argb8888, 1),
-            backbuffer: vec![0; usize::try_from(px_w * px_h).unwrap_or(0)],
             background: platform::draw::Color::rgb(0x1e, 0x1e, 0x2e),
             bg_alpha,
             pending_keys: Vec::new(),
@@ -431,16 +427,7 @@ impl LauncherWindow {
     }
 
     fn handle_keymap_fd(&mut self, fds: &[std::os::fd::OwnedFd]) {
-        use std::os::fd::AsFd as _;
-        let Some(fd) = fds.first() else {
-            return;
-        };
-        if let Some(size) = self.awaiting_keymap_fd.take() {
-            match xkb::Translator::from_keymap_fd(fd.as_fd(), size) {
-                Ok(t) => self.xkb = Some(t),
-                Err(e) => eprintln!("launcher: XKB keymap translation unavailable: {e}"),
-            }
-        }
+        self.keys.absorb_keymap_fd(fds);
     }
 
     fn handle_seat_capabilities(&mut self, ev: &RawEvent) {
@@ -454,24 +441,16 @@ impl LauncherWindow {
     }
 
     fn dispatch_keyboard_event(&mut self, ev: &RawEvent) {
-        match ev.event::<KeyboardEvent>() {
-            Some(KeyboardEvent::Keymap) => {
-                self.awaiting_keymap_fd = Some(ev.arg(1) as usize);
+        match self.keys.observe(ev) {
+            KeyboardUpdate::Key(input) => self.handle_key(input),
+            KeyboardUpdate::Repeat(info) => {
+                self.key_repeat.set_repeat_info(info.rate, info.delay_ms);
             }
-            Some(KeyboardEvent::Key) => self.handle_key(ev),
-            Some(KeyboardEvent::RepeatInfo) => {
-                self.key_repeat.set_repeat_info(ev.arg(0), ev.arg(1));
-            }
-            Some(KeyboardEvent::Modifiers) => {
-                if let Some(xkb) = &mut self.xkb {
-                    let _ = xkb.update_mask(ev.arg(1), ev.arg(2), ev.arg(3), ev.arg(4));
-                }
-            }
-            Some(KeyboardEvent::Leave) => {
+            KeyboardUpdate::Left => {
                 self.held_resolved = None;
                 self.key_repeat.on_leave();
             }
-            _ => {}
+            KeyboardUpdate::Ignored | KeyboardUpdate::Entered | KeyboardUpdate::Modifiers(_) => {}
         }
     }
 
@@ -481,10 +460,9 @@ impl LauncherWindow {
     /// `utf32`. Falls back to nothing (no physical-keycode text fallback
     /// makes sense without XKB: a launcher's search box needs real text,
     /// not just US-QWERTY guesses) when XKB isn't available.
-    fn handle_key(&mut self, ev: &RawEvent) {
-        let evdev_code = ev.arg(2);
-        let state = KeyState::from_raw(ev.arg(3));
-        let Some(KeyState::Pressed) = state else {
+    fn handle_key(&mut self, input: KeyInput) {
+        let evdev_code = input.evdev;
+        if !input.is_press() {
             if let Some(k) = Key::from_code(evdev_code) {
                 // Clear the stashed resolution in lockstep with the timer,
                 // so a late tick cannot resurrect a released key.
@@ -494,9 +472,9 @@ impl LauncherWindow {
                 self.key_repeat.on_key_release(k);
             }
             return;
-        };
+        }
 
-        let Some(resolved) = self.resolve_key(evdev_code) else {
+        let Some(resolved) = Self::resolve_key(input) else {
             return;
         };
         self.pending_keys.push(resolved);
@@ -519,19 +497,14 @@ impl LauncherWindow {
     /// this file was one reordering away from: Return/Tab/Backspace/Escape
     /// each carry a legacy control codepoint, so a text-first decoder types
     /// a carriage return into the search box when you press Enter.
-    fn resolve_key(&self, evdev_code: u32) -> Option<LauncherKey> {
-        let xkb = self.xkb.as_ref()?;
-        let sym = xkb.keysym(evdev_code);
-
-        // Ctrl+digit is checked first: it is a chord this window binds to
-        // "launch the Nth result", so it must win over the digit's text.
-        if xkb.control_active()
-            && let Some(digit) = Self::digit_for_keysym(sym)
+    const fn resolve_key(input: KeyInput) -> Option<LauncherKey> {
+        if input.ctrl
+            && let Some(digit) = Self::digit_for_keysym(input.keysym)
         {
             return Some(LauncherKey::CtrlDigit(digit));
         }
 
-        LauncherKey::from_key(DecodedKey::decode(sym, xkb.utf32(evdev_code)))
+        LauncherKey::from_key(input.key)
     }
 
     /// Auto-repeat: re-emit whatever the *original* press resolved to.
@@ -591,20 +564,16 @@ impl LauncherWindow {
     }
 
     fn do_present(&mut self, slot: usize, paint: &mut impl FnMut(&mut Canvas)) {
-        {
-            let bg_packed = self.pack_bg();
-            self.backbuffer.fill(bg_packed);
-            // Hand the painter a canvas that knows this window is
-            // translucent, so its `fill_rect`/`fill_round_rect` calls pack
-            // for the premultiplied Argb8888 backbuffer instead of writing a
-            // zero alpha byte (an invisible fill).
-            let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height)
-                .with_format(platform::SurfaceFormat::with_bg_alpha(self.bg_alpha));
-            paint(&mut canvas);
-        }
-
-        let (dst, _stale) = self.present.slot_pixels_and_stale(slot);
-        dst.copy_from_slice(&self.backbuffer);
+        // A canvas that knows this window is translucent, so the painter's
+        // fills pack premultiplied Argb8888 instead of a zero alpha byte.
+        let bg = self.pack_bg();
+        self.present.repaint_slot(
+            slot,
+            (self.width, self.height),
+            platform::SurfaceFormat::with_bg_alpha(self.bg_alpha),
+            bg,
+            paint,
+        );
 
         surface::SurfacePresenter::commit_full_frame(
             &mut self.present,

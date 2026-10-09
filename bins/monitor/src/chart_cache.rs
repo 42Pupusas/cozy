@@ -150,7 +150,7 @@ impl ChartCache {
         self.width = bounds.w.max(0);
         self.height = bounds.h.max(0);
         let area = self.width.cast_unsigned() as usize * self.height.cast_unsigned() as usize;
-        self.pixels.resize(area, self.format.pack_paint(self.panel));
+        self.pixels.resize(area, self.format.pack_glass(self.panel));
         self.scroll_remainder = 0.0;
         self.seen_samples = sequence;
         let mut canvas =
@@ -206,7 +206,7 @@ impl ChartCache {
         let width = self.width.cast_unsigned() as usize;
         let columns = columns.cast_unsigned() as usize;
         if columns >= width {
-            self.pixels.fill(self.format.pack_paint(self.panel));
+            self.pixels.fill(self.format.pack_glass(self.panel));
             return;
         }
         for row in 0..self.height.cast_unsigned() as usize {
@@ -227,7 +227,7 @@ impl ChartCache {
         let start = (self.width - columns).max(0);
         let mut canvas =
             Canvas::new(&mut self.pixels, self.width, self.height).with_format(self.format);
-        canvas.fill_rect(Rect::new(start, 0, columns, self.height), self.panel);
+        canvas.fill_rect_glass(Rect::new(start, 0, columns, self.height), self.panel);
         for x in start..self.width {
             Self::draw_primary_column(
                 &mut canvas,

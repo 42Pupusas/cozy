@@ -135,7 +135,7 @@ impl TileScene {
                 let region = body.inset(metrics.pad);
                 if paint.text && region.w > 0 && region.h > 0 {
                     if !paint.full {
-                        canvas.fill_rect(region, palette.surface);
+                        canvas.fill_rect_glass(region, palette.surface);
                         damage.push(region);
                     }
                     InfoCard::new(palette, typography).paint(canvas, region, paint.report);
@@ -188,7 +188,7 @@ impl TileScene {
     }
 
     fn chrome(palette: &MonitorPalette, canvas: &mut Canvas<'_>, body: Rect, metrics: TileMetrics) {
-        canvas.fill_round_rect(body, palette.surface, metrics.radius);
+        canvas.fill_round_rect_glass(body, palette.surface, metrics.radius);
         canvas.draw_round_rect(body, palette.border, metrics.radius);
     }
 }
@@ -212,9 +212,11 @@ mod tests {
     use crate::palette::MonitorPalette;
     use crate::repaint::Repaint;
     use crate::typography::Typography;
+    use platform::SurfaceFormat;
     use platform::draw::Canvas;
     use sysmon::{MonitorSample, ProcessInfo};
 
+    const GLASS_ALPHA: u8 = 204;
     const W: i32 = 1300;
     const H: i32 = 820;
 
@@ -242,9 +244,17 @@ mod tests {
         history: History,
         sample: MonitorSample,
         buf: Vec<u32>,
+        format: SurfaceFormat,
     }
 
     impl Rig {
+        fn translucent() -> Self {
+            Self {
+                format: SurfaceFormat::with_bg_alpha(GLASS_ALPHA),
+                ..Self::new()
+            }
+        }
+
         fn new() -> Self {
             let sample = MonitorSample {
                 cpu: 30.0,
@@ -264,6 +274,7 @@ mod tests {
                 history,
                 sample,
                 buf: vec![0; (W * H) as usize],
+                format: SurfaceFormat::opaque(),
             }
         }
 
@@ -273,7 +284,7 @@ mod tests {
                 history: &self.history,
                 repaint,
             };
-            let mut canvas = Canvas::new(&mut self.buf, W, H);
+            let mut canvas = Canvas::new(&mut self.buf, W, H).with_format(self.format);
             let mut phases = ScenePhases::default();
             self.scene
                 .paint(&mut canvas, &mut self.typography, &frame, &mut phases)
@@ -315,6 +326,27 @@ mod tests {
         let incremental = rig.buf.clone();
         rig.paint(Repaint::new(true, true));
         assert!(rig.buf == incremental);
+    }
+
+    #[test]
+    fn text_stays_solid_on_a_translucent_window() {
+        let mut rig = Rig::translucent();
+        rig.paint(Repaint::new(true, true));
+        let alpha = |pixel: u32| (pixel >> 24) as u8;
+        let palette = MonitorPalette::builtin();
+        let solid_text = rig.format.pack_paint(palette.foreground);
+        assert!(
+            rig.buf.contains(&solid_text),
+            "the foreground ink must be packed fully opaque"
+        );
+        assert!(
+            rig.buf.contains(&rig.format.pack_glass(palette.background)),
+            "the window background keeps the configured opacity"
+        );
+        assert!(
+            rig.buf.iter().all(|&pixel| alpha(pixel) >= GLASS_ALPHA),
+            "no pixel may be more transparent than the window itself"
+        );
     }
 
     #[test]

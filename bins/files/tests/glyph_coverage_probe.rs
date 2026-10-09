@@ -64,11 +64,12 @@ struct ChromeGlyphs;
 
 impl ChromeGlyphs {
     /// `(what it draws, the string drawn)`.
-    const ALL: [(&'static str, &'static str); 7] = [
+    const ALL: [(&'static str, &'static str); 8] = [
         ("back chevron", "\u{2039}"),
         ("forward chevron", "\u{203a}"),
         ("up arrow", "\u{2191}"),
         ("home", "~"),
+        ("new folder", "+"),
         ("hidden toggle, on", "\u{25cf}"),
         ("hidden toggle, off", "\u{25cb}"),
         ("tile labels", "\u{2026}"),

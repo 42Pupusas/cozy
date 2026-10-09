@@ -86,7 +86,7 @@ impl<'a> ProcessTiles<'a> {
             return;
         }
         let palette = self.palette;
-        canvas.fill_round_rect(body, fill, self.metrics.radius);
+        canvas.fill_round_rect_glass(body, fill, self.metrics.radius);
         canvas.draw_round_rect(body, palette.border, self.metrics.radius);
         let ink = TileLook::ink(fill, palette.foreground, palette.background);
         let quiet = fill.blend_opaque_color(ink, Self::SECONDARY_BLEND);

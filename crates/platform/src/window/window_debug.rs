@@ -60,7 +60,7 @@ impl TermWindow {
     pub(super) fn debug_draw_overlay(&mut self) -> Vec<u16> {
         self.debug.record_present();
         let rows = self.debug.draw(
-            self.pixels.backbuffer_mut(),
+            self.present.slot_pixels(self.paint_slot),
             self.width,
             self.height,
             self.cell_w,

@@ -16,26 +16,20 @@ use platform::conn::Sender;
 use platform::draw::Canvas;
 use platform::event::RawEvent;
 use platform::id::{CompositorId, LayerShellId, OutputId, PoolId, ShmId};
+use platform::keyboard_decoder::{KeyboardDecoder, KeyboardUpdate};
 use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::protocol::{
-    Anchor, ButtonState, Format, KeyState, KeyboardEvent, KeyboardInteractivity, Layer,
-    LayerSurfaceEvent, PointerButton, PointerEvent, SurfaceRequest,
+    Anchor, ButtonState, Format, KeyboardInteractivity, Layer, LayerSurfaceEvent, PointerButton,
+    PointerEvent, SurfaceRequest,
 };
 use platform::protocol::{BufferEvent, BufferRequest, ShmPoolRequest};
 use platform::surface::Frame;
 use platform::sys::ShmBuffer;
+use platform::toplevel::Key;
 use platform::wire::MessageBuilder;
 use quetzalcoatl::spsc::Consumer;
 use screencopy::CaptureRegion;
 use std::time::{Duration, Instant};
-
-/// The evdev code for Escape, which cancels the selection.
-///
-/// Matched as a raw code rather than through an XKB translator on purpose:
-/// Escape sits at the same physical position in every layout, and a picker
-/// that needed a keymap round-trip before it could be dismissed would be a
-/// trap if that parse ever failed.
-const KEY_ESCAPE: u32 = 1;
 
 const APP_ID: &str = "shot";
 
@@ -70,6 +64,7 @@ pub struct SelectionOverlay {
     frames: Option<([Frame; 2], ShmBuffer, PoolId)>,
     selection: DragSelection,
     painter: SelectionPainter,
+    keyboard: KeyboardDecoder,
     /// Set when the compositor closes the surface out from under us.
     closed: bool,
     /// When the overlay was created, for the configure deadman switch.
@@ -139,6 +134,7 @@ impl SelectionOverlay {
             frames: None,
             selection: DragSelection::new(0, 0),
             painter: SelectionPainter::default(),
+            keyboard: KeyboardDecoder::new(),
             closed: false,
             created: now,
             last_input: now,
@@ -239,6 +235,10 @@ impl SelectionOverlay {
 
     /// Route one event to whichever object it belongs to.
     fn handle_event(&mut self, sender: &mut Sender, ev: &RawEvent) -> Result<()> {
+        if let RawEvent::Fd(fds) = ev {
+            self.keyboard.absorb_keymap_fd(fds);
+            return Ok(());
+        }
         if ev.is(self.layer.layer_surface) {
             return self.handle_layer_surface(sender, ev);
         }
@@ -349,12 +349,11 @@ impl SelectionOverlay {
         }
     }
 
-    /// Escape cancels. Key args: serial, time, key (evdev code), state.
     fn handle_keyboard(&mut self, ev: &RawEvent) {
-        if ev.event::<KeyboardEvent>() != Some(KeyboardEvent::Key) {
-            return;
-        }
-        if ev.arg(2) == KEY_ESCAPE && KeyState::from_raw(ev.arg(3)) == Some(KeyState::Pressed) {
+        if let KeyboardUpdate::Key(input) = self.keyboard.observe(ev)
+            && input.is_press()
+            && input.key == Some(Key::Escape)
+        {
             self.selection.cancel();
         }
     }

@@ -1,22 +1,22 @@
-//! Frame-presentation state for the terminal window.
+//! Frame-presentation state shared by every shm-backed window.
 //!
 //! The double-buffered `wl_shm` swap chain (two [`Frame`]s + the pool + pixel
-//! format backing them), the per-slot "needs re-copy from the backbuffer"
-//! bitmap, and the dirty/frame-ready/frame-callback bookkeeping that decides
-//! *when* a present may happen.
+//! format backing them), the per-slot bitmap of rows each slot lags behind
+//! the latest image, and the dirty/frame-ready/frame-callback bookkeeping
+//! that decides *when* a present may happen.
 //!
-//! Extracted from `TermWindow` because this is a genuinely self-contained
-//! subsystem — the shm pool lifecycle (create once, grow/shrink in place
-//! across resizes) and the vsync-paced dirty/ready handshake don't touch
-//! grid, selection, or cursor state, only pixels and wire messages. Content
-//! painting (blitting dirty snapshots, drawing overlays) stays on
-//! `TermWindow`, which owns the actual `backbuffer` pixels; this struct only
-//! tracks *which rows of which slot* need re-copying from it and *whether*
-//! a present is currently allowed to fire.
+//! Windows paint straight into the claimed slot; there is no backbuffer.
+//! A window that redraws every pixel uses [`PresentState::repaint_slot`]. A
+//! window that paints incrementally calls [`PresentState::catch_up`] first,
+//! which copies the rows the slot lags from the slot presented last, and
+//! [`PresentState::publish_rows`] after, so the other slot knows what it now
+//! lags.
 
 use crate::conn::WindowSender;
+use crate::frame_carry::FrameCarry;
 use crate::id::{BufferId, CallbackId, PoolId};
 use crate::protocol::{BufferRequest, Format, ShmPoolRequest};
+use crate::row_band::RowBand;
 use crate::surface::{Frame, Routed};
 use crate::sys::{ShmBuffer, SysError};
 use crate::wire::MessageBuilder;
@@ -70,6 +70,11 @@ pub struct PresentState {
     /// source of the resize/drag "diagonal tear". `None` before the first
     /// present, when either slot is equally safe.
     last_slot: Option<usize>,
+    /// The slot that held the latest image when the current present began,
+    /// i.e. `last_slot` before [`Self::begin_present`] moved it.
+    /// [`Self::catch_up`] copies from here.
+    source: Option<usize>,
+    full_damage: bool,
 }
 
 impl PresentState {
@@ -95,6 +100,8 @@ impl PresentState {
             frame_ready: true,
             frame_cb: None,
             last_slot: None,
+            source: None,
+            full_damage: true,
         }
     }
 
@@ -109,28 +116,12 @@ impl PresentState {
         self.dirty = true;
     }
 
-    /// Mark every row of both slots stale — used after a full repaint (theme
-    /// swap, palette change) where every visible cell needs re-copying into
-    /// whichever slot presents next, not just what changed content-wise.
+    /// Mark every row of both slots as lagging, so the next catch-up copies
+    /// the whole latest image.
     pub fn mark_all_stale(&mut self) {
         for slot in &mut self.stale_rows {
             for s in slot.iter_mut() {
                 *s = true;
-            }
-        }
-    }
-
-    /// Mark specific viewport rows as needing to be re-copied from the
-    /// backbuffer into *both* shm frame slots next time each is presented
-    /// into. Called whenever the backbuffer actually changes at those rows
-    /// (content blit, selection tint, cursor overlay, FPS overlay).
-    pub fn mark_rows_stale(&mut self, rows: impl IntoIterator<Item = u16>) {
-        for row in rows {
-            let r = usize::from(row);
-            for slot in &mut self.stale_rows {
-                if let Some(flag) = slot.get_mut(r) {
-                    *flag = true;
-                }
             }
         }
     }
@@ -180,17 +171,113 @@ impl PresentState {
             return PresentAttempt::NoFreeSlot;
         };
         self.frames[slot].free = false;
+        self.source = self.last_slot;
         self.last_slot = Some(slot);
         PresentAttempt::Ready(slot)
     }
 
-    /// Frame `slot`'s pixels (writable, the shm copy destination) and its
-    /// stale-row bitmap (read+cleared as runs are copied/damaged), borrowed
-    /// together. Split into one method rather than two, since `shm_mem` and
-    /// `stale_rows` are disjoint fields but two separate `&mut self` getters
-    /// can't be held live at once through the borrow checker.
-    pub fn slot_pixels_and_stale(&mut self, slot: usize) -> (&mut [u32], &mut Vec<bool>) {
-        (self.shm_mem.pixels(slot), &mut self.stale_rows[slot])
+    /// Slot `slot`'s shm pixels: the buffer the compositor reads once this
+    /// present commits. Windows paint here directly; there is no separate
+    /// backbuffer.
+    pub fn slot_pixels(&mut self, slot: usize) -> &mut [u32] {
+        self.shm_mem.pixels(slot)
+    }
+
+    /// Slot `slot`'s shm pixels as a `width` × `height` canvas.
+    pub fn slot_canvas(&mut self, slot: usize, width: i32, height: i32) -> crate::draw::Canvas<'_> {
+        crate::draw::Canvas::new(self.shm_mem.pixels(slot), width, height)
+    }
+
+    /// Clear `slot` to `bg` and run `paint` over it: the whole present for a
+    /// window that redraws every pixel each frame.
+    pub fn repaint_slot(
+        &mut self,
+        slot: usize,
+        size: (i32, i32),
+        format: crate::SurfaceFormat,
+        bg: u32,
+        paint: &mut impl FnMut(&mut crate::draw::Canvas<'_>),
+    ) {
+        let pixels = self.shm_mem.pixels(slot);
+        pixels.fill(bg);
+        let mut canvas = crate::draw::Canvas::new(pixels, size.0, size.1).with_format(format);
+        paint(&mut canvas);
+    }
+
+    /// Bring `slot` level with the latest presented image before an
+    /// incremental paint, by copying the rows it lags from the slot that was
+    /// presented last. Windows that repaint every pixel each present skip
+    /// this.
+    pub fn catch_up(&mut self, slot: usize, band: RowBand) {
+        let mut stale = std::mem::take(&mut self.stale_rows[slot]);
+        if let Some(source) = self.source.filter(|&s| s != slot) {
+            for lines in band.runs(&stale) {
+                self.shm_mem.copy_between(source, slot, band.pixels(&lines));
+            }
+        }
+        stale.fill(false);
+        self.stale_rows[slot] = stale;
+    }
+
+    /// Record the rows painted into `slot` this present: every other slot
+    /// now lags the latest image there.
+    pub fn publish_rows(&mut self, slot: usize, rows: &[u16]) {
+        for (index, stale) in self.stale_rows.iter_mut().enumerate() {
+            if index == slot {
+                continue;
+            }
+            for &row in rows {
+                if let Some(flag) = stale.get_mut(usize::from(row)) {
+                    *flag = true;
+                }
+            }
+        }
+    }
+
+    /// Whether this present must damage the whole surface: the first one, and
+    /// the first after a resize, have no previous frame to diff against.
+    pub const fn take_full_damage(&mut self) -> bool {
+        let full = self.full_damage;
+        self.full_damage = false;
+        full
+    }
+
+    /// Fill every slot with `value`, so a slot presented before it is
+    /// painted shows the background instead of zeroed memory.
+    pub fn fill_all(&mut self, value: u32) {
+        for slot in 0..self.frames.len() {
+            self.shm_mem.pixels(slot).fill(value);
+        }
+    }
+
+    /// Fill scanlines `line..` of every slot with `value`.
+    pub fn fill_lines_from(&mut self, band: RowBand, line: usize, value: u32) {
+        let pixels = band.pixels(&(line..band.height()));
+        for slot in 0..self.frames.len() {
+            if let Some(strip) = self.shm_mem.pixels(slot).get_mut(pixels.clone()) {
+                strip.fill(value);
+            }
+        }
+    }
+
+    /// A copy of the latest presented image, taken before a resize reshapes
+    /// the pool so it can be painted back into the new slots.
+    #[must_use]
+    pub fn capture_latest(&mut self, width: i32, height: i32) -> FrameCarry {
+        let slot = self.last_slot.unwrap_or(0);
+        FrameCarry::capture(self.shm_mem.pixels(slot), width, height)
+    }
+
+    /// Paint `carry` into every slot at the new `width` × `height`, filling
+    /// the uncovered area with `bg`. Every slot then holds the same image, so
+    /// none lags.
+    pub fn restore(&mut self, carry: &FrameCarry, width: i32, height: i32, bg: u32) {
+        for slot in 0..self.frames.len() {
+            carry.paint_onto(self.shm_mem.pixels(slot), width, height, bg);
+        }
+        for stale in &mut self.stale_rows {
+            stale.fill(false);
+        }
     }
 
     /// Read-only peek at slot `slot`'s stale-row bitmap, for tests that
@@ -273,6 +360,7 @@ impl PresentState {
     /// buffer — the cause of resize flashing).
     pub fn reset_after_resize(&mut self, row_count: usize) {
         self.dirty = true;
+        self.full_damage = true;
         self.stale_rows = [vec![true; row_count.max(1)], vec![true; row_count.max(1)]];
         self.frame_ready = true;
         self.frame_cb = None;
@@ -343,15 +431,14 @@ mod tests {
     }
 
     #[test]
-    fn mark_rows_stale_sets_both_slots() {
+    fn publish_rows_marks_only_the_other_slot() {
         let mut st = make_state();
-        // Clear everything first, then re-mark row 1.
-        st.stale_rows[0].iter_mut().for_each(|s| *s = false);
-        st.stale_rows[1].iter_mut().for_each(|s| *s = false);
-        st.mark_rows_stale([1u16]);
-        assert!(st.stale_rows_for_test(0)[1]);
+        st.stale_rows[0].fill(false);
+        st.stale_rows[1].fill(false);
+        st.publish_rows(0, &[1]);
+        assert!(!st.stale_rows_for_test(0)[1]);
         assert!(st.stale_rows_for_test(1)[1]);
-        assert!(!st.stale_rows_for_test(0)[0]);
+        assert!(!st.stale_rows_for_test(1)[0]);
     }
 
     #[test]
@@ -420,6 +507,87 @@ mod tests {
         st.mark_dirty();
         // Sibling (1) is busy, so we have no choice but to reuse slot 0.
         assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
+    }
+
+    fn release_and_ready(st: &mut PresentState, slot: usize) {
+        st.frames[slot].free = true;
+        st.finish_present(CallbackId(7));
+        st.frame_ready = true;
+        st.mark_dirty();
+    }
+
+    #[test]
+    fn catch_up_copies_the_rows_painted_into_the_other_slot() {
+        let mut st = make_state();
+        let band = RowBand::new(4, 4, 1);
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
+        st.catch_up(0, band);
+        st.slot_pixels(0)[4..8].fill(5);
+        st.publish_rows(0, &[1]);
+        release_and_ready(&mut st, 0);
+
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(1)));
+        st.catch_up(1, band);
+        assert_eq!(&st.slot_pixels(1)[4..8], &[5; 4]);
+        assert_eq!(&st.slot_pixels(1)[0..4], &[0; 4]);
+    }
+
+    #[test]
+    fn catch_up_only_copies_rows_the_slot_lags() {
+        let mut st = make_state();
+        let band = RowBand::new(4, 4, 1);
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
+        st.catch_up(0, band);
+        release_and_ready(&mut st, 0);
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(1)));
+        st.catch_up(1, band);
+        st.slot_pixels(1)[0..4].fill(9);
+        st.publish_rows(1, &[0]);
+        release_and_ready(&mut st, 1);
+
+        st.slot_pixels(0)[12..16].fill(3);
+        assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
+        st.catch_up(0, band);
+        assert_eq!(&st.slot_pixels(0)[0..4], &[9; 4]);
+        assert_eq!(&st.slot_pixels(0)[12..16], &[3; 4]);
+    }
+
+    #[test]
+    fn the_first_present_and_the_first_after_a_resize_damage_everything() {
+        let mut st = make_state();
+        assert!(st.take_full_damage());
+        assert!(!st.take_full_damage());
+        st.reset_after_resize(4);
+        assert!(st.take_full_damage());
+    }
+
+    #[test]
+    fn restore_paints_every_slot_and_clears_lag() {
+        let mut st = make_state();
+        st.slot_pixels(0).copy_from_slice(&[1; 16]);
+        let carry = st.capture_latest(4, 4);
+        st.restore(&carry, 4, 4, 0);
+        assert_eq!(st.slot_pixels(1), &[1; 16]);
+        assert!(st.stale_rows_for_test(0).iter().all(|&s| !s));
+        assert!(st.stale_rows_for_test(1).iter().all(|&s| !s));
+    }
+
+    #[test]
+    fn repaint_slot_clears_then_paints() {
+        let mut st = make_state();
+        st.slot_pixels(1).fill(8);
+        st.repaint_slot(
+            1,
+            (4, 4),
+            crate::SurfaceFormat::opaque(),
+            2,
+            &mut |canvas| {
+                canvas.pixels_mut()[0] = 6;
+            },
+        );
+        let pixels = st.slot_pixels(1);
+        assert_eq!(pixels[0], 6);
+        assert!(pixels[1..].iter().all(|&p| p == 2));
     }
 
     #[test]

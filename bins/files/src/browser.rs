@@ -376,6 +376,38 @@ impl Browser {
         }
     }
 
+    const NEW_FOLDER: &'static str = "New folder";
+
+    fn select_path_is(&self, row: usize, target: &Path) -> bool {
+        self.path_of(row).is_some_and(|p| p == target)
+    }
+
+    /// Create an empty folder in the open directory under a free name such
+    /// as `New folder (1)`, select it and open its rename box.
+    pub fn create_folder(&mut self) -> Outcome {
+        let plain = self.view.path().join(Self::NEW_FOLDER);
+        let target = if std::fs::symlink_metadata(&plain).is_err() {
+            plain
+        } else {
+            fileops::ConflictResolver::free_name(&plain)
+        };
+        match std::fs::create_dir(&target) {
+            Ok(()) => {
+                let outcome = self.refresh();
+                self.select_path(&target);
+                match self.pane.cursor() {
+                    Some(row) if self.select_path_is(row, &target) => self.rename_entry(row),
+                    _ => outcome,
+                }
+            }
+            Err(e) => {
+                eprintln!("files: could not create {}: {e}", target.display());
+                self.notice = Some(format!("could not create folder: {e}"));
+                Outcome::Redraw
+            }
+        }
+    }
+
     /// Open the "move to" box for the entry at `row`.
     pub fn move_entry(&mut self, row: usize) -> Outcome {
         let Some(path) = self.path_of(row) else {
@@ -1708,6 +1740,30 @@ mod tests {
         let browser = open(&dir);
         assert_eq!(browser.path_of(0), Some(a));
         assert_eq!(browser.path_of(9), None);
+    }
+
+    #[test]
+    fn creating_a_folder_selects_it_and_never_overwrites() {
+        let dir = TempDir::new("create_folder");
+        dir.create_file("a.txt", b"a");
+        let mut browser = open(&dir);
+        browser.create_folder();
+        assert!(dir.path().join("New folder").is_dir());
+        assert_eq!(
+            browser.cursor_entry().map(|e| e.name.clone()),
+            Some("New folder".to_owned())
+        );
+        assert!(
+            browser.rename().is_active(),
+            "the new folder is being named"
+        );
+        browser.rename.cancel();
+        browser.create_folder();
+        assert!(dir.path().join("New folder (1)").is_dir());
+        assert_eq!(
+            browser.cursor_entry().map(|e| e.name.clone()),
+            Some("New folder (1)".to_owned())
+        );
     }
 
     #[test]

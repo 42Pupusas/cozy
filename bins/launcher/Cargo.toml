@@ -16,7 +16,6 @@ statusbar = { path = "../../crates/statusbar" }
 platform  = { path = "../../crates/platform" }
 config    = { path = "../../crates/config" }
 waker        = { path = "../../crates/waker" }
-xkb          = { path = "../../crates/xkb" }
 quetzalcoatl = { workspace = true }
 # App-icon decoding only -- see `icon_cache.rs`'s doc for why this is the
 # one place this binary touches a PNG decoder at all.

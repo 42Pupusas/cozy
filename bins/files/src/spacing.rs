@@ -238,11 +238,11 @@ impl Spacing {
         (self.tile_min() * 2).max(self.card_nav_row())
     }
 
-    /// What the card's navigation row needs: five icon buttons, the gap that
+    /// What the card's navigation row needs: six icon buttons, the gap that
     /// sets the dotfile toggle apart, and padding on both sides.
     #[must_use]
     pub fn card_nav_row(self) -> i32 {
-        self.icon_button() * 5 + self.s() + self.sidebar_pad() * 2
+        self.icon_button() * 6 + self.s() + self.sidebar_pad() * 2
     }
 
     /// The narrowest a toolbar button may be drawn (guide: 30px).

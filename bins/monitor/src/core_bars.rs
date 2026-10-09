@@ -114,7 +114,7 @@ impl CoreBars {
                 // so clear the whole column and draw the full bar. This is the
                 // rare path -- geometry changes with core count anyway.
                 let column = Rect::new(bar_x, y, bar_width, h);
-                canvas.fill_rect(column, paint.background);
+                canvas.fill_rect_glass(column, paint.background);
                 canvas.fill_rect(Rect::new(bar_x, bar_y, bar_width, bar_height), color);
                 damage.push(column);
                 continue;
@@ -135,7 +135,7 @@ impl CoreBars {
             } else {
                 // Shrank: the vacated strip returns to the background colour.
                 let r = Rect::new(bar_x, old_top, bar_width, new_top - old_top);
-                canvas.fill_rect(r, paint.background);
+                canvas.fill_rect_glass(r, paint.background);
                 r
             };
             damage.push(strip);

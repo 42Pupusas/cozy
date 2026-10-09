@@ -27,7 +27,7 @@ pub struct BackgroundSurface {
     output: OutputId,
     shm: ShmId,
     layer: LayerSurfaceHandle,
-    frames: Option<([Frame; 2], ShmBuffer, PoolId)>,
+    frame: Option<(Frame, ShmBuffer, PoolId)>,
     dimensions: Option<(i32, i32)>,
     appearance: Appearance,
     wallpaper: Option<WallpaperPixels>,
@@ -74,7 +74,7 @@ impl BackgroundSurface {
             output,
             shm,
             layer,
-            frames: None,
+            frame: None,
             dimensions: None,
             appearance: appearance.clone(),
             wallpaper: None,
@@ -87,8 +87,8 @@ impl BackgroundSurface {
 
     /// Destroy the role and its plain surface before forgetting an output.
     pub fn destroy(&mut self, sender: &mut Sender) -> Result<()> {
-        if let Some(frames) = self.frames.take() {
-            Self::destroy_frames(sender, frames)?;
+        if let Some(frame) = self.frame.take() {
+            Self::destroy_frame(sender, frame)?;
         }
         self.layer.destroy(sender)?;
         Ok(())
@@ -102,16 +102,7 @@ impl BackgroundSurface {
 
     /// Apply the selected per-output appearance before its first configure.
     pub fn set_appearance(&mut self, sender: &mut Sender, appearance: Appearance) -> Result<()> {
-        self.wallpaper = match WallpaperPixels::from_appearance(&appearance) {
-            Ok(wallpaper) => wallpaper,
-            Err(error) => {
-                // A bad per-output file must not leave that output without a
-                // background. Keep running with its explicitly configured
-                // color while the diagnostic names the failed image.
-                eprintln!("wallpaper: {error}; using configured solid color instead");
-                None
-            }
-        };
+        self.wallpaper = WallpaperPixels::from_appearance(&appearance);
         self.appearance = appearance;
         // Name events usually precede layer configure, but protocol ordering
         // does not make that a contract. Repaint immediately when this output
@@ -149,68 +140,66 @@ impl BackgroundSurface {
         if width <= 0 || height <= 0 || self.dimensions == Some((width, height)) {
             return Ok(());
         }
-        let new_frames = self.render_frames(sender, width, height)?;
+        let new_frame = self.render_frame(sender, width, height)?;
         // A configure supersedes the old output geometry. Destroying client
         // buffer and pool objects is legal even if the compositor still uses
         // their contents: Wayland keeps the server-side resources alive until
         // its references are gone. This lets the mmap be released promptly.
-        if let Some(old_frames) = self.frames.replace(new_frames) {
-            Self::destroy_frames(sender, old_frames)?;
+        if let Some(old_frame) = self.frame.replace(new_frame) {
+            Self::destroy_frame(sender, old_frame)?;
         }
         self.dimensions = Some((width, height));
         self.commit_first_frame(sender, width, height)
     }
 
-    /// Allocate and fill a new two-buffer XRGB swap pair for one geometry.
-    fn render_frames(
+    /// Allocate and fill the one XRGB buffer for a geometry. The image is
+    /// static, so the compositor never needs a second buffer to swap to.
+    fn render_frame(
         &self,
         sender: &mut Sender,
         width: i32,
         height: i32,
-    ) -> Result<([Frame; 2], ShmBuffer, PoolId)> {
-        let (frames, mut memory, pool) =
-            Frame::create_pair(sender, self.shm, width, height, Format::Xrgb8888)?;
-        let width = width.cast_unsigned();
-        let height = height.cast_unsigned();
-        self.render_pixels_into(&mut memory, width, height);
-        // Both slots receive identical pixels. The second buffer may be used
-        // after a compositor release without asking the decoder to rerun.
-        let first = memory.pixels(0).to_owned();
-        memory.pixels(1).copy_from_slice(&first);
-        Ok((frames, memory, pool))
+    ) -> Result<(Frame, ShmBuffer, PoolId)> {
+        let (frame, mut memory, pool) =
+            Frame::create_single(sender, self.shm, width, height, Format::Xrgb8888)?;
+        self.render_pixels_into(&mut memory, width.cast_unsigned(), height.cast_unsigned());
+        Ok((frame, memory, pool))
     }
 
-    /// Render directly into the first shm slot, avoiding a temporary XRGB
-    /// vector in addition to the wallpaper decoder's reusable RGBA scratch.
+    /// Render directly into the shm buffer. A missing or undecodable image
+    /// falls back to the configured solid color, so a bad per-output file
+    /// never leaves that output without a background.
     fn render_pixels_into(&self, memory: &mut ShmBuffer, width: u32, height: u32) {
         let pad = self.appearance.color.rgba();
-        if let Some(wallpaper) = &self.wallpaper {
-            wallpaper.render_xrgb_into(width, height, pad, memory.pixels(0));
-        } else {
-            memory.pixels(0).fill(self.appearance.color.xrgb());
+        let solid = self.appearance.color.xrgb();
+        let Some(wallpaper) = &self.wallpaper else {
+            memory.pixels(0).fill(solid);
+            return;
+        };
+        if let Err(error) = wallpaper.render_xrgb_into(width, height, pad, memory.pixels(0)) {
+            eprintln!("wallpaper: {error}; using configured solid color instead");
+            memory.pixels(0).fill(solid);
         }
     }
 
     /// Dispose the protocol resources for an obsolete configured size.
-    fn destroy_frames(
+    fn destroy_frame(
         sender: &mut Sender,
-        (frames, _memory, pool): ([Frame; 2], ShmBuffer, PoolId),
+        (frame, _memory, pool): (Frame, ShmBuffer, PoolId),
     ) -> Result<()> {
-        for frame in frames {
-            sender.request(MessageBuilder::new(frame.buffer, BufferRequest::Destroy))?;
-        }
+        sender.request(MessageBuilder::new(frame.buffer, BufferRequest::Destroy))?;
         sender.request(MessageBuilder::new(pool, ShmPoolRequest::Destroy))?;
         Ok(())
     }
 
     /// Attach the freshly rendered first slot and commit the replacement size.
     fn commit_first_frame(&self, sender: &mut Sender, width: i32, height: i32) -> Result<()> {
-        let Some((frames, _, _)) = &self.frames else {
+        let Some((frame, _, _)) = &self.frame else {
             return Ok(());
         };
         sender.request(
             MessageBuilder::new(self.layer.surface, SurfaceRequest::Attach)
-                .object(frames[0].buffer)
+                .object(frame.buffer)
                 .i32(0)
                 .i32(0),
         )?;

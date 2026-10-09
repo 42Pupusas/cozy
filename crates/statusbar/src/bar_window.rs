@@ -112,7 +112,6 @@ pub struct BarWindow {
     /// created once, grown/shrunk in place across resizes, two frame slots.
     present: PresentState,
 
-    backbuffer: Vec<u32>,
     /// Background the canvas is cleared to before each frame's `paint`
     /// closure runs. Defaults to a dark slate; set via
     /// [`BarWindow::set_background`] (mirrors `[bar] background` / the
@@ -350,12 +349,6 @@ impl BarWindow {
             // so the per-row stale bitmap `PresentState` carries is unused;
             // `row_count: 1` just keeps that unused allocation tiny.
             present: PresentState::new(frames, shm_mem, pool, buf_format, 1),
-            // INITIAL_WIDTH and px_height (bar_height * output scale) are
-            // always positive by construction, so this cast can't lose sign.
-            backbuffer: vec![
-                Color::BLACK.to_xrgb8888();
-                usize::try_from(INITIAL_WIDTH * px_height).unwrap_or(0)
-            ],
             background: Color::rgb(0x1e, 0x1e, 0x2e),
             bg_alpha,
             configured: false,
@@ -565,12 +558,6 @@ impl BarWindow {
         // just matches the placeholder size `PresentState::new` was built
         // with; only `dirty`/`frame_ready` actually matter here.
         self.present.reset_after_resize(1);
-
-        // `width`/`self.height` are always positive by construction (both
-        // come from validated Wayland configure events), so this can't
-        // lose sign.
-        self.backbuffer =
-            vec![Color::BLACK.to_xrgb8888(); usize::try_from(width * self.height).unwrap_or(0)];
         Ok(())
     }
 
@@ -602,23 +589,18 @@ impl BarWindow {
     /// rather than `present` now that the swap-chain state itself lives in
     /// the `present: PresentState` field of the same name.
     fn do_present(&mut self, slot: usize, paint: &mut impl FnMut(&mut Canvas)) {
-        {
-            let bg_packed = self.pack_bg();
-            self.backbuffer.fill(bg_packed);
-            // The canvas carries this window's packing, so the painter's
-            // drawing calls (and `TextRenderer`'s glyph-edge blending, which
-            // reads the alpha back off the canvas) are correct without each
-            // one being handed `bg_alpha` separately.
-            let mut canvas = Canvas::new(&mut self.backbuffer, self.width, self.height)
-                .with_format(platform::SurfaceFormat::with_bg_alpha(self.bg_alpha));
-            paint(&mut canvas);
-        }
-
-        // A bar has no scrollback/selection-style partial repaint, so unlike
-        // `platform::TermWindow` it always re-copies the whole backbuffer
-        // rather than consulting `PresentState`'s per-row stale bitmap.
-        let (dst, _stale) = self.present.slot_pixels_and_stale(slot);
-        dst.copy_from_slice(&self.backbuffer);
+        // The canvas carries this window's packing, so the painter's drawing
+        // calls (and `TextRenderer`'s glyph-edge blending, which reads the
+        // alpha back off the canvas) are correct without each one being
+        // handed `bg_alpha` separately.
+        let bg = self.pack_bg();
+        self.present.repaint_slot(
+            slot,
+            (self.width, self.height),
+            platform::SurfaceFormat::with_bg_alpha(self.bg_alpha),
+            bg,
+            paint,
+        );
 
         surface::SurfacePresenter::commit_full_frame(
             &mut self.present,

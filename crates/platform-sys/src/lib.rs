@@ -130,6 +130,22 @@ unsafe extern "C" {
         old_value: *mut Itimerspec,
     ) -> i32;
     fn read(fd: RawFd, buf: *mut c_void, count: size_t) -> isize;
+    fn malloc_trim(pad: size_t) -> i32;
+}
+
+/// The process allocator, for clients that build a large transient buffer once
+/// and then sit idle.
+pub struct Heap;
+
+impl Heap {
+    /// Hand freed heap pages back to the kernel instead of letting the
+    /// allocator keep them resident.
+    pub fn release_free_memory() {
+        // SAFETY: `malloc_trim` takes no pointers and is safe to call at any time.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
 }
 
 // `timerfd_create` clock + the `struct itimerspec` it's (dis)armed with. A
@@ -321,6 +337,26 @@ impl ShmBuffer {
         }
     }
 
+    /// Copy pixels `range` of frame `src` into the same range of frame `dst`.
+    ///
+    /// Both frames live in one mapping, so two [`Self::pixels`] borrows can't
+    /// be held at once; this does the split borrow internally.
+    pub fn copy_between(&mut self, src: usize, dst: usize, range: std::ops::Range<usize>) {
+        assert!(src < self.frames && dst < self.frames);
+        let end = range.end.min(self.frame_pixels);
+        if src == dst || range.start >= end {
+            return;
+        }
+        // SAFETY: distinct frames occupy disjoint `frame_pixels` windows of
+        // the mapping and `range` is clamped inside one frame, so the two
+        // regions never overlap; `&mut self` makes this the only live borrow.
+        unsafe {
+            let from = self.ptr.add(src * self.frame_pixels + range.start);
+            let to = self.ptr.add(dst * self.frame_pixels + range.start);
+            std::ptr::copy_nonoverlapping(from, to, end - range.start);
+        }
+    }
+
     /// Frame `frame`'s contents as raw bytes.
     ///
     /// Rendering paths want [`Self::pixels`]: they compose whole 32-bit
@@ -416,6 +452,27 @@ impl ShmBuffer {
         self.ptr = ptr.cast::<u32>();
         self.capacity_bytes = new_cap;
         Ok(Some(new_cap))
+    }
+}
+
+#[cfg(test)]
+mod shm_buffer_tests {
+    use super::ShmBuffer;
+
+    #[test]
+    fn copy_between_moves_only_the_range() {
+        let mut shm = ShmBuffer::new(2, 2, 2).expect("alloc");
+        shm.pixels(0).copy_from_slice(&[1, 2, 3, 4]);
+        shm.copy_between(0, 1, 1..3);
+        assert_eq!(shm.pixels(1), &[0, 2, 3, 0]);
+    }
+
+    #[test]
+    fn copy_between_clamps_to_the_frame() {
+        let mut shm = ShmBuffer::new(2, 2, 2).expect("alloc");
+        shm.pixels(1).copy_from_slice(&[5, 6, 7, 8]);
+        shm.copy_between(1, 0, 2..99);
+        assert_eq!(shm.pixels(0), &[0, 0, 7, 8]);
     }
 }
 

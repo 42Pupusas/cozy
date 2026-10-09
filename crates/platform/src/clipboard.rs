@@ -15,9 +15,9 @@
 use crate::conn::WindowSender;
 use crate::id::{DataDeviceId, DataDeviceManagerId, DataOfferId, DataSourceId, ObjectId, SeatId};
 use crate::protocol::{
-    DataDeviceManagerRequest, DataDeviceRequest, DataOfferEvent, DataOfferRequest, DataSourceEvent,
-    DataSourceRequest,
+    DataDeviceManagerRequest, DataOfferEvent, DataOfferRequest, DataSourceEvent,
 };
+use crate::toplevel::text_selection::TextSelection;
 use crate::wire::MessageBuilder;
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc::{Consumer, Producer, RingBuffer};
@@ -31,15 +31,9 @@ pub struct ClipboardState {
     /// `(manager, per-seat device)` if the compositor supports
     /// `wl_data_device`. `None` disables copy/paste entirely.
     data_device: Option<(DataDeviceManagerId, DataDeviceId)>,
-    /// The live data source we publish while our selection is on the clipboard.
-    source: Option<DataSourceId>,
-    /// Text we last copied (served to other clients on `data_source.send`).
-    text: String,
+    selection: TextSelection,
     /// The clipboard offer from another client (for paste), with its MIME types.
     offer: Option<DataOfferId>,
-    /// Set when a `data_source.send` just arrived; the next `RawEvent::Fd` is the
-    /// pipe to write our clipboard text into.
-    awaiting_send_fd: bool,
     /// Paste channel: helper threads that read a paste pipe send the bytes
     /// here; the UI loop drains it in `tick`. Multiple paste helper threads
     /// may be in flight, so each holds its own clone of the producer.
@@ -78,10 +72,8 @@ impl ClipboardState {
         let (paste_tx, paste_rx) = RingBuffer::new(Capacity::exact(Self::PASTE_SLOTS)).split();
         Self {
             data_device,
-            source: None,
-            text: String::new(),
+            selection: TextSelection::new(),
             offer: None,
-            awaiting_send_fd: false,
             paste_tx,
             paste_rx,
             focus_serial: 0,
@@ -110,31 +102,15 @@ impl ClipboardState {
         if text.is_empty() {
             return;
         }
-        self.text = text;
-        let Some((mgr, dev)) = self.data_device else {
+        let Some(data_device) = self.data_device else {
             return;
         };
-        let serial = self.focus_serial;
-        if serial == 0 {
+        if self.focus_serial == 0 {
             eprintln!("platform: copy skipped — no keyboard focus serial yet");
             return;
         }
-        let src: DataSourceId = window_tx.alloc_id();
-        window_tx.request(
-            MessageBuilder::new(mgr, DataDeviceManagerRequest::CreateDataSource).new_id(src),
-        );
-        window_tx.request(MessageBuilder::new(src, DataSourceRequest::Offer).string("text/plain"));
-        // Wire arg order is (source, serial): libwayland marshals args in XML
-        // declaration order, and wl_data_device.set_selection declares
-        // `source` before `serial`. Sending (serial, source) makes the
-        // compositor read the source id as the serial and vice versa ->
-        // "invalid arguments" protocol error.
-        window_tx.request(
-            MessageBuilder::new(dev, DataDeviceRequest::SetSelection)
-                .object(src)
-                .u32(serial),
-        );
-        self.source = Some(src);
+        self.selection
+            .publish(window_tx, data_device, self.focus_serial, text);
     }
 
     /// Request a paste from the system clipboard: ask the current offer's
@@ -179,7 +155,7 @@ impl ClipboardState {
     /// Whether a `data_source.send` is in flight, i.e. the next
     /// `RawEvent::Fd` is the pipe we should write our clipboard text into.
     pub(crate) const fn is_awaiting_send_fd(&self) -> bool {
-        self.awaiting_send_fd
+        self.selection.is_awaiting_send_fd()
     }
 
     /// Write our current clipboard text into `fd` (a peer's pipe from a
@@ -188,9 +164,7 @@ impl ClipboardState {
     /// dropped, matching the original behavior (there's no good recovery for
     /// a peer that stopped reading).
     pub(crate) fn write_send_fd(&mut self, fd: std::os::fd::OwnedFd) {
-        use crate::sys::OwnedFdExt as _;
-        self.awaiting_send_fd = false;
-        fd.write_all_and_close(self.text.as_bytes());
+        self.selection.write_send_fd(fd);
     }
 
     /// Handle a `wl_data_device.selection` event: `raw` is the new
@@ -212,19 +186,15 @@ impl ClipboardState {
     /// The current outgoing source id, if any — for the window's event
     /// dispatch to route `wl_data_source.*` events here.
     pub(crate) const fn source_id(&self) -> Option<DataSourceId> {
-        self.source
+        self.selection.id()
     }
 
     /// Handle a `wl_data_source` event for our current source: `Send` arms
     /// the awaiting-fd flag (the fd itself arrives as the next
     /// `RawEvent::Fd`); `Cancelled` drops the source (a peer replaced our
     /// selection). Other events are ignored.
-    pub(crate) const fn on_source_event(&mut self, event: DataSourceEvent) {
-        match event {
-            DataSourceEvent::Send => self.awaiting_send_fd = true,
-            DataSourceEvent::Cancelled => self.source = None,
-            _ => {}
-        }
+    pub(crate) fn on_source_event(&mut self, window_tx: &mut WindowSender, event: DataSourceEvent) {
+        self.selection.on_event(window_tx, event);
     }
 
     /// A `wl_data_offer.offer` event arrived (a peer advertising one MIME
@@ -284,7 +254,7 @@ mod tests {
         let mut window_tx = test_sender();
         let mut cb = ClipboardState::new(None, SeatId(1), &mut window_tx);
         assert!(!cb.is_awaiting_send_fd());
-        cb.on_source_event(DataSourceEvent::Send);
+        cb.on_source_event(&mut window_tx, DataSourceEvent::Send);
         assert!(cb.is_awaiting_send_fd());
     }
 
@@ -295,8 +265,23 @@ mod tests {
         cb.set_focus_serial(7);
         cb.copy(&mut window_tx, "hello".to_string());
         assert!(cb.source_id().is_some());
-        cb.on_source_event(DataSourceEvent::Cancelled);
+        cb.on_source_event(&mut window_tx, DataSourceEvent::Cancelled);
         assert_eq!(cb.source_id(), None);
+    }
+
+    #[test]
+    fn a_send_request_is_served_the_copied_text() {
+        let mut window_tx = test_sender();
+        let mut cb = ClipboardState::new(Some(DataDeviceManagerId(1)), SeatId(1), &mut window_tx);
+        cb.set_focus_serial(7);
+        cb.copy(&mut window_tx, "hello".to_string());
+        cb.on_source_event(&mut window_tx, DataSourceEvent::Send);
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        cb.write_send_fd(writer.into());
+        assert!(!cb.is_awaiting_send_fd());
+        let mut served = String::new();
+        std::io::Read::read_to_string(&mut &reader, &mut served).expect("read");
+        assert_eq!(served, "hello");
     }
 
     #[test]

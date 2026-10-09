@@ -13,19 +13,18 @@ use crate::draw::{Canvas, Color};
 use crate::error::{PlatformError, Result};
 use crate::event::RawEvent;
 use crate::id::{KeyboardId, PointerId, SeatId};
+use crate::keyboard_decoder::{KeyInput, KeyboardUpdate};
 use crate::present::{PresentAttempt, PresentState};
 use crate::protocol::{
-    Format, KeyState, KeyboardEvent, PointerEvent, SeatCapability, SeatEvent, SeatRequest,
-    ToplevelEvent, WmBaseEvent, XdgSurfaceEvent,
+    Format, KeyState, PointerEvent, SeatCapability, SeatEvent, SeatRequest, ToplevelEvent,
+    WmBaseEvent, XdgSurfaceEvent,
 };
 use crate::surface::{Frame, RegistryDiscovery, Routed, SurfaceBootstrap, SurfacePresenter};
 use crate::surface_format::SurfaceFormat;
 use crate::toplevel::geometry::{Geometry, LogicalSize, PhysicalSize};
 use crate::toplevel::globals::{ToplevelGlobals, ToplevelGlobalsBuilder};
-use crate::toplevel::keyboard::{KeyPress, KeyboardState, RepeatInfo};
-use crate::toplevel::keysym::Key;
+use crate::toplevel::keyboard::{KeyPress, KeyboardState};
 use crate::toplevel::lifecycle::Lifecycle;
-use crate::toplevel::modifiers::ModifierState;
 use crate::toplevel::pointer::{PointerEventKind, PointerState};
 use crate::toplevel::shell::ShellSurface;
 use crate::wire::MessageBuilder;
@@ -105,11 +104,6 @@ pub struct Toplevel {
     lifecycle: Lifecycle,
     present: PresentState,
 
-    /// Persistent pixel buffer the painter draws into, copied into whichever
-    /// shm slot presents next. Kept separate from the shm slots so a paint
-    /// never races the compositor reading a buffer it still holds.
-    backbuffer: Vec<u32>,
-
     /// How this surface's pixels are packed, decided once at construction
     /// from the requested opacity and fixed for the window's lifetime (the
     /// `wl_shm` buffer format is negotiated at pool creation).
@@ -134,20 +128,7 @@ pub struct Toplevel {
     /// shape, so a window that never changes its cursor pays nothing.
     cursors: crate::toplevel::cursor_set::CursorSet,
 
-    /// The XKB translator, once the keymap fd has been received and parsed.
-    ///
-    /// `None` means no keymap yet (or `libxkbcommon` is unavailable), in
-    /// which case key events are dropped rather than guessed at: inventing a
-    /// US layout would type the wrong characters for everyone else.
-    xkb: Option<xkb::Translator>,
-
-    /// Size from the `wl_keyboard.keymap` event, held until the matching fd
-    /// arrives as the following `RawEvent::Fd`.
-    ///
-    /// The fd rides in ancillary data and is delivered as a *separate*
-    /// event correlated by arrival order, so the size has to be parked here
-    /// between the two.
-    awaiting_keymap_fd: Option<usize>,
+    keys: crate::keyboard_decoder::KeyboardDecoder,
 
     /// Drag-and-drop over the shared `wl_data_device` -- see
     /// [`crate::toplevel::drag::DragController`] for why this handles both
@@ -281,14 +262,8 @@ impl Toplevel {
         let drag =
             crate::toplevel::drag::DragController::bind(data_device_manager, seat, &mut window_tx);
 
-        let px = physical.pixel_count();
-        let present = PresentState::new(
-            frames,
-            shm_mem,
-            pool,
-            buf_format,
-            physical.height_usize().max(1),
-        );
+        let mut present = PresentState::new(frames, shm_mem, pool, buf_format, 1);
+        present.fill_all(format.pack_glass(background));
 
         let mut window = Self {
             sender,
@@ -304,10 +279,6 @@ impl Toplevel {
             geometry,
             lifecycle: Lifecycle::new(),
             present,
-            // Packed as glass: this is the window's background, so on a
-            // translucent surface it carries the window opacity rather than
-            // being solid paint.
-            backbuffer: vec![format.pack_glass(background); px],
             format,
             queue: std::collections::VecDeque::new(),
             pointer_id: None,
@@ -315,8 +286,7 @@ impl Toplevel {
             pointer: PointerState::new(),
             keyboard: KeyboardState::new(),
             cursors: crate::toplevel::cursor_set::CursorSet::new(shm, compositor, scale),
-            xkb: None,
-            awaiting_keymap_fd: None,
+            keys: crate::keyboard_decoder::KeyboardDecoder::new(),
             activations: crate::toplevel::activation_queue::ActivationQueue::new(),
             drag,
             selection: crate::toplevel::text_selection::TextSelection::new(),
@@ -552,7 +522,7 @@ impl Toplevel {
         {
             return Err(PlatformError::ReaderStopped);
         }
-        self.apply_resize(painter)?;
+        self.apply_resize()?;
         self.maybe_present(painter);
         self.sender.drain_requests(&mut self.request_rx)?;
         Ok(())
@@ -791,8 +761,9 @@ impl Toplevel {
     /// keymap case (mmap'd and never stored); consumed for the drag case.
     fn handle_fd_event(&mut self, fd: Option<&std::os::fd::OwnedFd>) {
         use std::os::fd::AsFd as _;
-        if self.awaiting_keymap_fd.is_some() {
-            self.take_keymap_fd(fd);
+        if self.keys.is_awaiting_keymap_fd() {
+            self.keys
+                .absorb_keymap_fd(fd.map(std::slice::from_ref).unwrap_or_default());
             return;
         }
         if self.drag.is_awaiting_send_fd()
@@ -857,22 +828,6 @@ impl Toplevel {
         }
     }
 
-    /// Parse the XKB keymap from the fd that followed a `keymap` event.
-    ///
-    /// A failure here is not fatal: the window keeps working, it just cannot
-    /// resolve keysyms, so key events are dropped rather than mistranslated.
-    fn take_keymap_fd(&mut self, fd: Option<&std::os::fd::OwnedFd>) {
-        use std::os::fd::AsFd as _;
-        let Some(size) = self.awaiting_keymap_fd.take() else {
-            return;
-        };
-        let Some(fd) = fd else { return };
-        match xkb::Translator::from_keymap_fd(fd.as_fd(), size) {
-            Ok(t) => self.xkb = Some(t),
-            Err(e) => eprintln!("platform: XKB keymap unavailable: {e}"),
-        }
-    }
-
     /// Route one `wl_pointer` event.
     fn handle_pointer_event(&mut self, ev: &RawEvent, painter: &mut impl Painter) {
         let mods = self.keyboard.modifiers();
@@ -906,51 +861,29 @@ impl Toplevel {
 
     /// Route one `wl_keyboard` event.
     fn handle_keyboard_event(&mut self, ev: &RawEvent, painter: &mut impl Painter) {
-        match ev.event::<KeyboardEvent>() {
-            Some(KeyboardEvent::Keymap) => {
-                // Park the size; the fd arrives as the next event. The size
-                // is arg 1, not arg 2: the fd travels in ancillary data and
-                // occupies no slot in the argument list, so `size` follows
-                // `format` directly.
-                self.awaiting_keymap_fd = Some(ev.arg(1) as usize);
-            }
-            Some(KeyboardEvent::Enter) => {
+        match self.keys.observe(ev) {
+            KeyboardUpdate::Entered => {
                 self.keyboard.enter();
                 painter.on_focus(true);
                 self.present.mark_dirty();
             }
-            Some(KeyboardEvent::Leave) => {
+            KeyboardUpdate::Left => {
                 self.keyboard.leave();
                 painter.on_focus(false);
                 self.present.mark_dirty();
             }
-            Some(KeyboardEvent::Modifiers) => {
-                let mods = ModifierState::from_wire(ev.arg(1), ev.arg(2), ev.arg(3), ev.arg(4));
-                self.keyboard.set_modifiers(mods);
-                // XKB owns what these masks mean for the live keymap, so
-                // they are fed through verbatim rather than reinterpreted.
-                if let Some(xkb) = &mut self.xkb {
-                    let (d, la, lo, g) = mods.raw();
-                    let _ = xkb.update_mask(d, la, lo, g);
-                }
-            }
-            Some(KeyboardEvent::RepeatInfo) => {
-                self.keyboard.set_repeat_info(RepeatInfo {
-                    rate: ev.arg(0),
-                    delay_ms: ev.arg(1),
-                });
-            }
-            Some(KeyboardEvent::Key) => self.handle_key(ev, painter),
-            None => {}
+            KeyboardUpdate::Modifiers(mods) => self.keyboard.set_modifiers(mods),
+            KeyboardUpdate::Repeat(info) => self.keyboard.set_repeat_info(info),
+            KeyboardUpdate::Key(input) => self.handle_key(input, painter),
+            KeyboardUpdate::Ignored => {}
         }
     }
 
-    /// Resolve and dispatch one `wl_keyboard.key`.
-    fn handle_key(&mut self, ev: &RawEvent, painter: &mut impl Painter) {
-        let evdev = ev.arg(2);
-        let key = self.resolve_key(evdev);
-        match KeyState::from_raw(ev.arg(3)) {
-            Some(KeyState::Pressed) => {
+    /// Dispatch one decoded `wl_keyboard.key`.
+    fn handle_key(&mut self, input: KeyInput, painter: &mut impl Painter) {
+        let key = input.key;
+        match input.state {
+            KeyState::Pressed => {
                 // Deliberately the local monotonic clock, not the event's
                 // `time` argument: `wl_keyboard.key` timestamps come from
                 // the compositor's own clock with an unspecified epoch, so
@@ -962,18 +895,8 @@ impl Toplevel {
                     self.present.mark_dirty();
                 }
             }
-            Some(KeyState::Released) => self.keyboard.release(key),
-            None => {}
+            KeyState::Released => self.keyboard.release(key),
         }
-    }
-
-    /// Translate an evdev code through the live keymap.
-    ///
-    /// Returns `None` without a keymap: guessing a layout would type the
-    /// wrong characters for every non-US user.
-    fn resolve_key(&self, evdev: u32) -> Option<Key> {
-        let xkb = self.xkb.as_ref()?;
-        Key::decode(xkb.keysym(evdev), xkb.utf32(evdev))
     }
 
     /// Emit any auto-repeat that has come due.
@@ -1021,9 +944,8 @@ impl Toplevel {
         i32::try_from(remaining).unwrap_or(i32::MAX).max(1)
     }
 
-    /// Apply a coalesced resize: grow the shm pool, resize the backbuffer,
-    /// and tell the owner.
-    fn apply_resize(&mut self, painter: &impl Painter) -> Result<()> {
+    /// Apply a coalesced resize: reshape the shm pool and tell the owner.
+    fn apply_resize(&mut self) -> Result<()> {
         let Some(size) = self.geometry.apply_pending() else {
             return Ok(());
         };
@@ -1049,18 +971,8 @@ impl Toplevel {
         self.present
             .recreate_buffers(&mut self.window_tx, size.width, size.height);
         // 4. Reset the swap-chain bookkeeping. One row: this window repaints
-        //    its whole backbuffer every present, so per-row stale tracking
-        //    has nothing to track.
+        //    every pixel each present, so it has no rows to track.
         self.present.reset_after_resize(1);
-        // Refill rather than merely resize: the newly exposed region would
-        // otherwise show whatever stale pixels the Vec's spare capacity
-        // happened to hold.
-        let px = size.pixel_count();
-        self.backbuffer.clear();
-        self.backbuffer
-            .resize(px, self.format.pack_glass(painter.background()));
-        self.present.mark_all_stale();
-        self.present.mark_dirty();
         self.queue.push_back(WindowEvent::Resized(size));
         Ok(())
     }
@@ -1078,17 +990,12 @@ impl Toplevel {
         let size = self.geometry.physical();
 
         {
-            let mut canvas =
-                Canvas::new(&mut self.backbuffer, size.width, size.height).with_format(self.format);
+            let mut canvas = self
+                .present
+                .slot_canvas(slot, size.width, size.height)
+                .with_format(self.format);
+            canvas.clear(painter.background());
             painter.paint(&mut canvas, size);
-        }
-
-        // Copy the finished image into the slot the compositor will read.
-        let (pixels, stale) = self.present.slot_pixels_and_stale(slot);
-        let n = pixels.len().min(self.backbuffer.len());
-        pixels[..n].copy_from_slice(&self.backbuffer[..n]);
-        for flag in stale.iter_mut() {
-            *flag = false;
         }
 
         SurfacePresenter::commit_full_frame(

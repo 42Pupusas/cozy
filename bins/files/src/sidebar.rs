@@ -35,9 +35,6 @@ pub enum SidebarRow {
         /// can mark it and the keymap can offer "remove bookmark".
         favorite: bool,
     },
-    /// Shown in place of an empty favorites list, so the section explains
-    /// itself instead of appearing broken.
-    Hint(&'static str),
     /// An attached removable volume.
     ///
     /// Distinct from [`Self::Place`] rather than reusing it with a flag: a
@@ -80,7 +77,7 @@ impl SidebarRow {
     pub fn path(&self) -> Option<&Path> {
         match self {
             Self::Place { path, .. } | Self::Device { path, .. } => Some(path.as_path()),
-            Self::Heading(_) | Self::Hint(_) | Self::Unmounted { .. } => None,
+            Self::Heading(_) | Self::Unmounted { .. } => None,
         }
     }
 
@@ -118,9 +115,11 @@ impl SidebarRow {
 
     /// The device's detail line, if this row carries one.
     #[must_use]
-    pub const fn detail(&self) -> Option<&str> {
+    pub fn detail(&self) -> Option<&str> {
         match self {
-            Self::Device { detail, .. } | Self::Unmounted { detail, .. } => Some(detail.as_str()),
+            Self::Device { detail, .. } | Self::Unmounted { detail, .. } => {
+                Some(detail.as_str()).filter(|detail| !detail.is_empty())
+            }
             _ => None,
         }
     }
@@ -140,18 +139,6 @@ impl Sidebar {
     const FAVORITES: &'static str = "Favorites";
     /// Heading for the removable storage section.
     const DEVICES: &'static str = "Devices";
-    /// Shown when nothing is bookmarked yet.
-    const EMPTY_HINT: &'static str = "Ctrl+D to bookmark";
-
-    /// The caption on a device that is plugged in but not mounted.
-    ///
-    /// A verb, not a state. "not mounted" describes the row and leaves the
-    /// user to guess what to do about it; "mount" says what clicking does.
-    /// It is also short enough to survive the caption's fit test, which a
-    /// longer phrase would fail on a narrow sidebar -- leaving the row
-    /// indistinguishable from a mounted one.
-    const MOUNT_HINT: &'static str = "mount";
-
     /// The directories this sidebar offers, in display order.
     ///
     /// A subset of the spec's eight, in the order people reach for them
@@ -223,10 +210,8 @@ impl Sidebar {
             });
         }
 
-        rows.push(SidebarRow::Heading(Self::FAVORITES));
-        if favorites.is_empty() {
-            rows.push(SidebarRow::Hint(Self::EMPTY_HINT));
-        } else {
+        if !favorites.is_empty() {
+            rows.push(SidebarRow::Heading(Self::FAVORITES));
             for path in favorites.paths() {
                 rows.push(SidebarRow::Place {
                     label: Favorites::label(path),
@@ -236,10 +221,8 @@ impl Sidebar {
             }
         }
 
-        // The whole section is omitted when nothing is attached, rather than
-        // showing an empty heading. Unlike Favorites -- where a hint teaches
-        // a keybinding -- there is nothing to teach here: the answer to "no
-        // devices" is to plug one in, which the user already knows.
+        // A section with nothing in it is omitted rather than shown as an
+        // empty heading.
         let unmounted = devices.mountable();
         if !volumes.is_empty() || !unmounted.is_empty() {
             rows.push(SidebarRow::Heading(Self::DEVICES));
@@ -259,7 +242,7 @@ impl Sidebar {
                 rows.push(SidebarRow::Unmounted {
                     label: device.display_name().to_owned(),
                     source: device.source().to_owned(),
-                    detail: Self::MOUNT_HINT.to_owned(),
+                    detail: String::new(),
                 });
             }
         }
@@ -397,6 +380,15 @@ mod tests {
         let tmp = TempDir::new("sidebar-sections");
         let (dirs, fav) = fixture(&tmp);
         let bar = Sidebar::new(&dirs, &fav);
+        assert_eq!(headings(&bar), ["Places"]);
+    }
+
+    #[test]
+    fn the_favorites_section_appears_once_something_is_bookmarked() {
+        let tmp = TempDir::new("sidebar-sections-fav");
+        let (dirs, mut fav) = fixture(&tmp);
+        fav.add(Path::new("/mnt/work"));
+        let bar = Sidebar::new(&dirs, &fav);
         assert_eq!(headings(&bar), ["Places", "Favorites"]);
     }
 
@@ -417,7 +409,7 @@ mod tests {
         let (dirs, fav) = fixture(&tmp);
         let volumes = VolumeSet::of(vec![stick("KINGSTON", false)]);
         let bar = Sidebar::with_volumes(&dirs, &fav, &volumes);
-        assert_eq!(headings(&bar), ["Places", "Favorites", "Devices"]);
+        assert_eq!(headings(&bar), ["Places", "Devices"]);
         let rows = bar.rows();
         let heading = rows
             .iter()
@@ -527,7 +519,7 @@ mod tests {
         let (dirs, fav) = fixture(&tmp);
         let devices = DeviceScan::of(vec![unmounted("KINGSTON")]);
         let bar = Sidebar::with_storage(&dirs, &fav, &VolumeSet::default(), &devices);
-        assert_eq!(headings(&bar), ["Places", "Favorites", "Devices"]);
+        assert_eq!(headings(&bar), ["Places", "Devices"]);
         let row = bar
             .rows()
             .iter()
@@ -592,11 +584,9 @@ mod tests {
         assert!(headings(&bar).contains(&"Devices"));
     }
 
-    /// The caption tells the user what clicking does, rather than restating
-    /// the state they can already see.
     #[test]
-    fn an_unmounted_device_says_what_clicking_it_does() {
-        let tmp = TempDir::new("sidebar-hintverb");
+    fn an_unmounted_device_carries_no_instruction_caption() {
+        let tmp = TempDir::new("sidebar-nocaption");
         let (dirs, fav) = fixture(&tmp);
         let devices = DeviceScan::of(vec![unmounted("KINGSTON")]);
         let bar = Sidebar::with_storage(&dirs, &fav, &VolumeSet::default(), &devices);
@@ -605,7 +595,7 @@ mod tests {
             .iter()
             .find(|r| r.mountable_source().is_some())
             .expect("the stick");
-        assert_eq!(row.detail(), Some("mount"));
+        assert_eq!(row.detail(), None);
     }
 
     /// Mounted devices keep their positions when an unmounted one appears.
@@ -662,11 +652,15 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_favorites_section_shows_a_hint_instead_of_nothing() {
-        let tmp = TempDir::new("sidebar-hint");
+    fn an_empty_favorites_section_is_omitted_with_no_instruction_in_its_place() {
+        let tmp = TempDir::new("sidebar-no-favorites");
         let (dirs, fav) = fixture(&tmp);
         let bar = Sidebar::new(&dirs, &fav);
-        assert!(bar.rows().iter().any(|r| matches!(r, SidebarRow::Hint(_))));
+        assert!(
+            !bar.rows()
+                .iter()
+                .any(|r| matches!(r, SidebarRow::Heading("Favorites")))
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub enum TileFace {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaintedTile {
     pub rect: Rect,
+    pub slot: usize,
     pub face: TileFace,
     pub name: String,
     pub detail: String,
@@ -61,12 +62,12 @@ impl<'a> TilePainter<'a> {
             return;
         }
         let radius = theme.spacing.radius() * 2;
-        let fill = self.fill(tile);
-        match fill {
+        let resting = self.resting(tile);
+        let surface = self.fill(tile).unwrap_or(resting);
+        match self.fill(tile) {
             Some(color) => canvas.fill_round_rect(rect, color, radius),
-            None => canvas.fill_round_rect_glass(rect, theme.sidebar_bg, radius),
+            None => canvas.fill_round_rect_glass(rect, resting, radius),
         }
-        let surface = fill.unwrap_or(theme.sidebar_bg);
         let outline = match tile.face {
             TileFace::Item(kind) if tile.drop_target => kind.selection_fill(theme),
             TileFace::Overflow if tile.hovered => theme.accent,
@@ -103,6 +104,11 @@ impl<'a> TilePainter<'a> {
             };
             detail_tier.draw_text(canvas, &detail, rect.x + pad, below, color, surface);
         }
+    }
+
+    /// The tile's resting glass: the theme fill its colouring slot names.
+    const fn resting(&self, tile: &PaintedTile) -> Color {
+        self.theme.tile_fills[tile.slot % self.theme.tile_fills.len()]
     }
 
     /// The solid fill for a tile's state, or `None` for the resting glass.
@@ -206,6 +212,7 @@ mod tests {
     fn tile(rect: Rect) -> PaintedTile {
         PaintedTile {
             rect,
+            slot: 0,
             face: TileFace::Item(RowKind::Leaf),
             name: "report.pdf".to_owned(),
             detail: "12 KiB".to_owned(),
@@ -241,6 +248,23 @@ mod tests {
         assert_eq!(pixel(&painted, 50, 50), pixel(&blank, 50, 50));
         assert_eq!(pixel(&painted, 260, 150), pixel(&blank, 260, 150));
         assert_ne!(painted, blank);
+    }
+
+    #[test]
+    fn each_slot_paints_its_own_fill() {
+        let cell = Rect::new(0, 0, 200, 150);
+        let centre = |slot: usize| {
+            let mut placed = tile(cell);
+            placed.slot = slot;
+            pixel(&paint(&[placed]), 100, 140)
+        };
+        let fills: Vec<u32> = (0..4).map(centre).collect();
+        for (i, a) in fills.iter().enumerate() {
+            for b in &fills[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(centre(4), centre(0), "slots wrap");
     }
 
     #[test]

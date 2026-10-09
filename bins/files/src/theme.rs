@@ -61,6 +61,9 @@ pub struct Theme {
     #[allow(dead_code)]
     pub status_bg: Color,
     pub error: Color,
+    /// `[files].scrollbar_track`. The storage meter that used it is gone;
+    /// kept so the documented config key still parses into a role.
+    #[allow(dead_code)]
     pub scrollbar_track: Color,
     /// `[files].scrollbar_thumb`. The tiles do not scroll; kept so the
     /// documented config key still parses into a role.
@@ -77,6 +80,23 @@ pub struct Theme {
     pub sidebar_border: Color,
     /// Fill behind the sidebar row for the directory currently open.
     pub sidebar_active: Color,
+
+    /// The card's surface where the disk is used: the same opacity as
+    /// [`Self::sidebar_bg`], a different tone, rising from the card's bottom
+    /// edge in proportion to how full the disk is.
+    pub card_fill: Color,
+    /// Hovered row on [`Self::card_fill`]; [`Self::hover`] is derived for the
+    /// plain surface and would nearly vanish on the filled one.
+    pub card_fill_hover: Color,
+    /// The open place's row on [`Self::card_fill`].
+    pub card_fill_active: Color,
+    /// The filter box's well on [`Self::card_fill`].
+    pub card_fill_input: Color,
+
+    /// The four resting tile fills, drawn at the card's opacity. Each tile
+    /// takes the one its place in the colouring assigns, so bordering tiles
+    /// differ.
+    pub tile_fills: [Color; 4],
 
     /// Fill under a hovered sidebar row or control (the filter box, a toolbar
     /// button).
@@ -213,6 +233,16 @@ impl Default for Theme {
             sidebar_bg: Color::rgb(0x18, 0x18, 0x25),
             sidebar_border: Color::rgb(0x31, 0x32, 0x44),
             sidebar_active: Color::rgb(0x31, 0x32, 0x44),
+            card_fill: Color::rgb(38, 43, 63),
+            card_fill_hover: Color::rgb(55, 60, 81),
+            card_fill_active: Color::rgb(65, 70, 92),
+            card_fill_input: Color::rgb(60, 65, 86),
+            tile_fills: [
+                Color::rgb(0x1d, 0x25, 0x36),
+                Color::rgb(0x1d, 0x2a, 0x2a),
+                Color::rgb(0x28, 0x22, 0x33),
+                Color::rgb(0x2b, 0x28, 0x25),
+            ],
 
             hover: Color::rgb(0x28, 0x28, 0x3c),
             // Washes of the type colours over the list background: the same
@@ -301,6 +331,19 @@ impl Theme {
     /// short of 1.0 so it never reads as a second active row.
     const SIDEBAR_HOVER_MIX: f32 = 0.6;
 
+    /// How far the used-space tone leans from the card surface toward the
+    /// accent. Enough to read as a different tone, little enough that the
+    /// filter box, whose own fill is derived from the same palette, still
+    /// stands off it on a full disk.
+    const CARD_FILL_MIX: f32 = 0.12;
+
+    /// Row washes over the used-space tone: ink mixed into the tone itself,
+    /// so the ordering plain < hover < active holds on whichever tone a row
+    /// happens to sit.
+    const CARD_FILL_HOVER_MIX: f32 = 0.10;
+    const CARD_FILL_ACTIVE_MIX: f32 = 0.16;
+    const CARD_FILL_INPUT_MIX: f32 = 0.14;
+
     /// Mix `ink` into `surface` by `t`, as a paint colour.
     ///
     /// Named rather than inlined because it is applied four times with two
@@ -333,6 +376,9 @@ impl Theme {
         // Metrics are validated to 0..=512 on the way in, so every one of
         // these conversions is trivially in range for i32.
         let px = |n: u32| i32::try_from(n).unwrap_or(0);
+        let card_fill = cfg
+            .files_header_bg()
+            .mix(cfg.files_cursor(), Self::CARD_FILL_MIX);
         Self {
             background: cfg.files_background().into(),
             selection: cfg.files_selection().into(),
@@ -356,6 +402,17 @@ impl Theme {
             sidebar_bg: cfg.files_header_bg().into(),
             sidebar_border: cfg.files_filter_bg().into(),
             sidebar_active: cfg.files_filter_bg().into(),
+            card_fill: card_fill.into(),
+            card_fill_hover: card_fill
+                .mix(cfg.files_text(), Self::CARD_FILL_HOVER_MIX)
+                .into(),
+            card_fill_active: card_fill
+                .mix(cfg.files_text(), Self::CARD_FILL_ACTIVE_MIX)
+                .into(),
+            card_fill_input: card_fill
+                .mix(cfg.files_text(), Self::CARD_FILL_INPUT_MIX)
+                .into(),
+            tile_fills: std::array::from_fn(|slot| cfg.files_tile_color(slot).into()),
 
             // Hover sits *between* the sidebar's own background and its active
             // fill, and is derived by mixing those two rather than by washing
@@ -531,14 +588,12 @@ impl Theme {
     /// because a shorter row would drop every button.
     #[must_use]
     pub fn card_metrics(&self) -> CardMetrics {
-        let button_row = self.spacing.icon_button() + self.spacing.s();
+        let button_row = self.spacing.nav_button_height() + self.spacing.s();
         CardMetrics {
             nav: self.header_height.max(button_row),
             crumbs: self.sidebar_row(),
             filter: self.control_height() + self.spacing.m(),
-            places_row: self.sidebar_row(),
             storage: self.spacing.storage_height(),
-            status: self.status_height,
         }
     }
 
@@ -739,6 +794,11 @@ background = "#181616"
             assert_ne!(t.sidebar_border, t.background, "the pane divider");
             assert_ne!(t.hover, t.background, "a hovered row");
             assert_ne!(t.sidebar_bg, t.background, "the chrome card");
+            assert_ne!(t.card_fill, t.sidebar_bg, "the used-space tone");
+            assert_ne!(
+                t.card_fill_input, t.card_fill,
+                "the filter box on a full disk"
+            );
             assert_ne!(t.control_border, t.sidebar_bg, "a control outline");
             assert_ne!(t.focus_ring, t.sidebar_bg, "the focus ring");
             assert_ne!(t.accent, t.background, "the accent");
@@ -767,7 +827,45 @@ background = "#181616"
     fn the_card_navigation_row_always_holds_its_buttons() {
         let cfg = config::Config::from_bytes(b"[files]\nheader_height = 10\n").expect("parse");
         let theme = Theme::from_config(&cfg).with_spacing(Spacing::new(13.0, 1.0));
-        assert!(theme.card_metrics().nav >= theme.spacing.icon_button());
+        assert!(theme.card_metrics().nav >= theme.spacing.nav_button_height());
+    }
+
+    #[test]
+    fn the_four_tile_fills_are_distinct_and_follow_config() {
+        let plain = Theme::from_config(&config::Config::default());
+        for (i, a) in plain.tile_fills.iter().enumerate() {
+            for b in &plain.tile_fills[i + 1..] {
+                assert_ne!(a, b);
+            }
+            assert_ne!(*a, plain.background, "a tile against the window");
+        }
+        let cfg =
+            config::Config::from_bytes(b"[files]\ntile_color_3 = \"#102030\"\n").expect("parse");
+        let themed = Theme::from_config(&cfg);
+        assert_eq!(themed.tile_fills[2], Color::rgb(0x10, 0x20, 0x30));
+        assert_eq!(themed.tile_fills[0], plain.tile_fills[0]);
+    }
+
+    #[test]
+    fn the_tile_hover_and_selection_fills_stand_off_every_resting_fill() {
+        let luma = |c: Color| config::Color::from_rgb(c.r, c.g, c.b).luma();
+        for toml in [
+            "",
+            "[colors]\nbackground = \"#181616\"\nforeground = \"#c5c9c5\"\n",
+        ] {
+            let cfg = config::Config::from_bytes(toml.as_bytes()).expect("parse");
+            let t = Theme::from_config(&cfg);
+            for fill in t.tile_fills {
+                for (state, name) in [(t.hover_file, "hover"), (t.selection_file, "selection")] {
+                    assert!(
+                        luma(state) > luma(fill),
+                        "{name} ({}) must be brighter than a resting tile ({}) for {toml:?}",
+                        luma(state),
+                        luma(fill)
+                    );
+                }
+            }
+        }
     }
 
     /// The sidebar's three row states must read in order: plain background,

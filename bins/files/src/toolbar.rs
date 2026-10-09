@@ -16,6 +16,7 @@ pub enum Target {
     Back,
     Forward,
     Up,
+    Home,
     ToggleHidden,
     FilterBox,
 }
@@ -53,18 +54,39 @@ impl Toolbar {
         self.nav_button(2, 0)
     }
 
-    /// The dotfile toggle, set apart from the three navigation buttons by a
+    #[must_use]
+    pub fn home(&self) -> Option<Rect> {
+        self.nav_button(3, 0)
+    }
+
+    /// The dotfile toggle, set apart from the four navigation buttons by a
     /// gap because it changes what is shown rather than where you are.
     #[must_use]
     pub fn hidden_toggle(&self) -> Option<Rect> {
-        self.nav_button(3, self.spacing.s())
+        self.nav_button(4, self.spacing.s())
     }
 
+    /// The five buttons share the padded row equally, less the gap before the
+    /// toggle; the toggle takes any rounding remainder so the row ends flush.
     fn nav_button(&self, index: i32, gap: i32) -> Option<Rect> {
+        const COUNT: i32 = 5;
         let row = self.card.nav();
-        let size = self.spacing.icon_button();
-        let x = row.x + self.card.pad() + size * index + gap;
-        let rect = Rect::new(x, Self::centered_y(row, size), size, size);
+        let inner = row.w - self.card.pad() * 2;
+        let width = (inner - self.spacing.s()) / COUNT;
+        if width < self.spacing.icon_button() {
+            return None;
+        }
+        let height = row.h - self.spacing.s();
+        if height < self.spacing.nav_button_height() {
+            return None;
+        }
+        let x = row.x + self.card.pad() + width * index + gap;
+        let w = if index == COUNT - 1 {
+            row.x + self.card.pad() + inner - x
+        } else {
+            width
+        };
+        let rect = Rect::new(x, Self::centered_y(row, height), w, height);
         self.fits_in_row(rect).then_some(rect)
     }
 
@@ -78,11 +100,12 @@ impl Toolbar {
     #[must_use]
     pub fn filter(&self) -> Option<Rect> {
         let row = self.card.filter_row();
+        let height = (row.h - self.spacing.m()).max(self.control_height);
         let rect = Rect::new(
             row.x + self.card.pad(),
-            Self::centered_y(row, self.control_height),
+            Self::centered_y(row, height),
             row.w - self.card.pad() * 2,
-            self.control_height,
+            height,
         );
         (rect.w > 0 && rect.y >= row.y && rect.bottom() <= row.bottom()).then_some(rect)
     }
@@ -107,6 +130,7 @@ impl Toolbar {
             (self.back(), Target::Back),
             (self.forward(), Target::Forward),
             (self.up(), Target::Up),
+            (self.home(), Target::Home),
             (self.hidden_toggle(), Target::ToggleHidden),
             (self.filter(), Target::FilterBox),
         ]
@@ -133,11 +157,10 @@ mod tests {
             nav: spacing.toolbar_height(),
             crumbs: spacing.sidebar_row(),
             filter: spacing.control_height() + spacing.m(),
-            places_row: spacing.sidebar_row(),
             storage: spacing.storage_height(),
-            status: spacing.status_height(),
         };
-        let card = PinnedCard::new(Rect::new(12, 12, width, 760), spacing, metrics);
+        let natural = metrics.nav + metrics.crumbs + metrics.filter + metrics.storage;
+        let card = PinnedCard::new(Rect::new(12, 12, width, natural), spacing, metrics);
         Toolbar::new(card, spacing, spacing.control_height())
     }
 
@@ -150,6 +173,7 @@ mod tests {
             (bar.back(), Target::Back),
             (bar.forward(), Target::Forward),
             (bar.up(), Target::Up),
+            (bar.home(), Target::Home),
             (bar.hidden_toggle(), Target::ToggleHidden),
             (bar.filter(), Target::FilterBox),
         ]
@@ -159,9 +183,24 @@ mod tests {
     }
 
     #[test]
+    fn the_navigation_row_ends_flush_with_the_padding() {
+        let bar = toolbar_of(Spacing::new(13.0, 1.0).card_width(), 1.0);
+        let toggle = bar.hidden_toggle().expect("toggle");
+        let card = bar.card.bounds();
+        assert_eq!(toggle.right(), card.right() - bar.card.pad());
+    }
+
+    #[test]
+    fn the_buttons_are_wider_than_they_are_tall() {
+        let bar = toolbar_of(Spacing::new(13.0, 1.0).card_width(), 1.0);
+        let back = bar.back().expect("back");
+        assert!(back.w > back.h, "{back:?}");
+    }
+
+    #[test]
     fn a_guide_width_card_draws_every_control() {
-        let bar = toolbar_of(Spacing::new(13.0, 1.0).tile_min(), 1.0);
-        assert_eq!(all(&bar).len(), 5);
+        let bar = toolbar_of(Spacing::new(13.0, 1.0).card_width(), 1.0);
+        assert_eq!(all(&bar).len(), 6);
     }
 
     #[test]
@@ -177,9 +216,11 @@ mod tests {
     }
 
     #[test]
-    fn the_hidden_toggle_is_set_apart_from_navigation() {
+    fn home_follows_up_and_the_hidden_toggle_is_set_apart() {
         let bar = toolbar_of(256, 1.0);
-        assert!(bar.hidden_toggle().expect("hidden").x > bar.up().expect("up").right());
+        let home = bar.home().expect("home");
+        assert_eq!(home.x, bar.up().expect("up").right());
+        assert!(bar.hidden_toggle().expect("hidden").x > home.right());
     }
 
     #[test]
@@ -196,11 +237,12 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_sits_between_the_crumbs_and_the_places() {
+    fn the_filter_sits_between_the_crumbs_and_the_footer() {
         let bar = toolbar_of(256, 1.0);
         let filter = bar.filter().expect("filter");
         assert!(filter.y >= bar.breadcrumbs().bottom());
-        assert!(filter.bottom() <= bar.card.places().y);
+        let footer = bar.card.storage().expect("footer");
+        assert!(filter.bottom() <= footer.y);
     }
 
     #[test]
@@ -244,9 +286,9 @@ mod tests {
 
     #[test]
     fn a_hidpi_card_keeps_every_control() {
-        let bar = toolbar_of(Spacing::new(13.0, 2.0).tile_min(), 2.0);
+        let bar = toolbar_of(Spacing::new(13.0, 2.0).card_width(), 2.0);
         let plain = toolbar_of(256, 1.0);
         assert!(bar.back().expect("back").w > plain.back().expect("back").w);
-        assert_eq!(all(&bar).len(), 5);
+        assert_eq!(all(&bar).len(), 6);
     }
 }

@@ -15,6 +15,7 @@ use widget::{DragArm, Mods};
 
 use crate::breadcrumb::Breadcrumb;
 use crate::browser::{Browser, Outcome};
+use crate::card_surface::{Backdrop, CardSurface};
 use crate::drag_badge::{BadgeStyle, DragBadge};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
@@ -52,21 +53,6 @@ const DOUBLE_CLICK_MS: u64 = 400;
 /// succession registers as a double-click on the second and opens a file the
 /// user never meant to open.
 const DOUBLE_CLICK_SLOP: i32 = 4;
-
-/// Where one sidebar entry sits, and in what state.
-///
-/// A struct rather than positional arguments: `x`, `y`, `width` and `row_h`
-/// are all `i32`, and `active` and `hovered` are both `bool`, so a transposed
-/// pair would compile and paint the wrong thing.
-#[derive(Clone, Copy)]
-struct SidebarEntry {
-    x: i32,
-    y: i32,
-    width: i32,
-    row_h: i32,
-    active: bool,
-    hovered: bool,
-}
 
 /// The inline rename box's contents for one frame.
 ///
@@ -144,6 +130,7 @@ pub struct FilesWindow {
     /// Held rather than re-derived at the moment of the action: the scan that
     /// produced it walks `/sys` and udev, and the sidebar row the user
     /// clicked is the thing that names it.
+    #[allow(dead_code)]
     mount_candidate: Option<AttachedDevice>,
     /// Watches the mount table so attached devices appear and disappear.
     ///
@@ -154,9 +141,6 @@ pub struct FilesWindow {
     volumes: VolumeWatch,
     /// The tile presentation: size ranking, overflow pages, armed folder.
     tiles: TileField,
-    /// How many places rows the sidebar's list is scrolled past. The compact
-    /// card shows a handful of rows; the wheel over the card moves this.
-    places_scroll: i32,
 }
 
 impl FilesWindow {
@@ -193,7 +177,6 @@ impl FilesWindow {
             pending_drag: None,
             drop_hover_row: None,
             drag_badge: DragBadge::new(),
-            places_scroll: 0,
         }
     }
 
@@ -252,20 +235,20 @@ impl FilesWindow {
         let need = frame.card_need()?;
         let cell =
             self.tiles
-                .card_cell(frame.field(), self.theme.spacing.tile_min(), Some(need))?;
+                .card_cell(frame.field(), self.theme.spacing.tile_floor(), Some(need))?;
         Some(frame.card_in(cell))
     }
 
     fn tile_layout(&self) -> Vec<PlacedTile> {
         let (spiral, tail) = self.flow_parts();
         self.tiles
-            .layout(spiral, self.theme.spacing.tile_min(), tail)
+            .layout(spiral, self.theme.spacing.tile_floor(), tail)
     }
 
     fn tile_at(&self, at: Point) -> Option<Tile> {
         let (spiral, tail) = self.flow_parts();
         self.tiles
-            .hit(spiral, self.theme.spacing.tile_min(), tail, at)
+            .hit(spiral, self.theme.spacing.tile_floor(), tail, at)
     }
 
     /// Bring the tile ranking up to date with the browser.
@@ -285,6 +268,23 @@ impl FilesWindow {
     #[must_use]
     pub fn watch_fd(&self) -> Option<RawFd> {
         self.browser.watch_fd()
+    }
+
+    /// The mount table descriptor, for the event loop to wait on.
+    #[must_use]
+    pub fn mounts_fd(&self) -> Option<RawFd> {
+        self.volumes.mounts_fd()
+    }
+
+    /// The udev block-record descriptor, for the event loop to wait on.
+    #[must_use]
+    pub fn udev_fd(&self) -> Option<RawFd> {
+        self.volumes.udev_fd()
+    }
+
+    /// Pass on which device descriptors the last wait found ready.
+    pub fn absorb_device_signals(&mut self, wakeup: crate::idle_wait::Wakeup) {
+        self.volumes.absorb(wakeup.mounts, wakeup.udev);
     }
 
     /// Fold in folder totals the size worker produced. Returns whether the
@@ -314,7 +314,9 @@ impl FilesWindow {
     /// crossing into and out of overflow pages at their edges.
     fn steer_tiles(&mut self, command: widget::ListCommand) -> Outcome {
         let (spiral, tail) = self.flow_parts();
-        let (page, more) = self.tiles.page(spiral, self.theme.spacing.tile_min(), tail);
+        let (page, more) = self
+            .tiles
+            .page(spiral, self.theme.spacing.tile_floor(), tail);
         let cursor = self.browser.pane().cursor();
         let landing =
             SpiralCursor::new(&page, more.is_some(), self.tiles.depth() > 0).land(cursor, command);
@@ -340,7 +342,9 @@ impl FilesWindow {
     /// when walking forward, or its last when walking back.
     fn steer_to_page_edge(&mut self, first: bool, extend: bool) -> Outcome {
         let (spiral, tail) = self.flow_parts();
-        let (page, _) = self.tiles.page(spiral, self.theme.spacing.tile_min(), tail);
+        let (page, _) = self
+            .tiles
+            .page(spiral, self.theme.spacing.tile_floor(), tail);
         let edge = if first { page.first() } else { page.last() };
         match edge {
             Some(&row) => {
@@ -353,9 +357,9 @@ impl FilesWindow {
 
     /// A left press anywhere in the window.
     ///
-    /// The card's controls are checked before anything else, and a click in
-    /// the places list goes no further, so neither can fall through to an
-    /// entry lying under it.
+    /// The card's controls are checked before anything else, and a click on
+    /// the card goes no further, so it cannot fall through to an entry lying
+    /// under it.
     fn press_left(&mut self, at: Position, mods: Mods) {
         if self.tiles.swallows(Self::now_ms(), DOUBLE_CLICK_MS) {
             self.last_click = None;
@@ -365,42 +369,11 @@ impl FilesWindow {
             self.activate_control(target);
             return;
         }
-        if self.in_sidebar(at) {
-            self.press_sidebar(at);
-            return;
-        }
         let over_card = self
             .card()
             .is_some_and(|card| card.bounds().contains(Point::new(at.x, at.y)));
         if !over_card && self.frame().field().contains(Point::new(at.x, at.y)) {
             self.press_tile(at, mods);
-        }
-    }
-
-    /// A left press on the places list: attach an unmounted device, or go to
-    /// the place.
-    ///
-    /// The device check comes first and consumes the click: a device row has
-    /// no path, so falling through would find nothing to navigate to and the
-    /// row would appear dead.
-    fn press_sidebar(&mut self, at: Position) {
-        let Some(index) = self.sidebar_row_at(at) else {
-            return;
-        };
-        if self.mount_from_sidebar(index) {
-            return;
-        }
-        if let Some(path) = self
-            .sidebar
-            .rows()
-            .get(index)
-            .and_then(SidebarRow::path)
-            .map(std::path::Path::to_path_buf)
-        {
-            let outcome = self.browser.go_to(&path);
-            self.apply(outcome);
-            // A new directory may live on a different filesystem.
-            self.refresh_storage();
         }
     }
 
@@ -453,15 +426,13 @@ impl FilesWindow {
         placed
             .iter()
             .filter_map(|placed| match placed.tile {
-                Tile::Item(row) => self.painted_entry_tile(placed.rect, row),
-                Tile::More { from, count } => {
-                    Some(self.painted_overflow_tile(placed.rect, from, count))
-                }
+                Tile::Item(row) => self.painted_entry_tile(placed, row),
+                Tile::More { from, count } => Some(self.painted_overflow_tile(placed, from, count)),
             })
             .collect()
     }
 
-    fn painted_entry_tile(&self, rect: Rect, row: usize) -> Option<PaintedTile> {
+    fn painted_entry_tile(&self, placed: &PlacedTile, row: usize) -> Option<PaintedTile> {
         let entry = self.browser.entry(row)?;
         let sizes = self.tiles.sizes();
         let detail = if sizes.is_pending(entry) {
@@ -472,7 +443,8 @@ impl FilesWindow {
         let pane = self.browser.pane();
         let cut = self.browser.clipboard().is_cut(&entry.path);
         Some(PaintedTile {
-            rect,
+            rect: placed.rect,
+            slot: placed.slot,
             face: TileFace::Item(RowKind::of(entry)),
             name: entry.name.clone(),
             detail,
@@ -488,7 +460,7 @@ impl FilesWindow {
         })
     }
 
-    fn painted_overflow_tile(&self, rect: Rect, from: usize, count: usize) -> PaintedTile {
+    fn painted_overflow_tile(&self, placed: &PlacedTile, from: usize, count: usize) -> PaintedTile {
         let sizes = self.tiles.sizes();
         let bytes: u64 = self
             .tiles
@@ -500,7 +472,8 @@ impl FilesWindow {
             .map(|entry| sizes.of(entry))
             .sum();
         PaintedTile {
-            rect,
+            rect: placed.rect,
+            slot: placed.slot,
             face: TileFace::Overflow,
             name: format!("{count} more…"),
             detail: RowFormat::human_size(bytes),
@@ -541,20 +514,7 @@ impl FilesWindow {
     /// mount is the only thing that can change which filesystem is being
     /// reported, and the fill level moves far slower than the frame rate.
     fn refresh_storage(&mut self) {
-        let path = self.browser.path().to_path_buf();
-        // A device the user has navigated into is named by its label rather
-        // than by its mount point: "KINGSTON" is what is written on the
-        // stick, while `/run/media/user/KINGSTON` is where this machine
-        // happened to attach it.
-        let named = self
-            .volumes
-            .volumes()
-            .containing(&path)
-            .map(|volume| volume.label().to_owned());
-        self.storage = Storage::of(&path).map(|storage| match named {
-            Some(label) => storage.named(label),
-            None => storage,
-        });
+        self.storage = Storage::of(self.browser.path());
     }
 
     /// Poll for attached or removed devices, rebuilding the sidebar on a
@@ -564,7 +524,7 @@ impl FilesWindow {
     /// consequence of a change, and a poll inside it would read the mount
     /// table on every frame of a scroll.
     pub fn poll_volumes(&mut self) -> bool {
-        if !self.volumes.poll_if_due().needs_redraw() {
+        if !self.volumes.poll_signalled().needs_redraw() {
             return false;
         }
         self.rebuild_sidebar();
@@ -580,6 +540,7 @@ impl FilesWindow {
     /// "it is now safe to unplug", which is meaningless for `/home` and
     /// alarming for `/`. Returns whether a flush was attempted, so a click
     /// on an ordinary place can fall through to navigation.
+    #[allow(dead_code)]
     fn flush_device(&self, index: usize) -> bool {
         let Some(row) = self.sidebar.rows().get(index) else {
             return false;
@@ -687,6 +648,7 @@ impl FilesWindow {
     /// Silent when the row is not an unmounted device: the action is offered
     /// from a sidebar row, and a Mount that acted on whatever happened to be
     /// selected would attach a device the user never pointed at.
+    #[allow(dead_code)]
     fn begin_mount(&mut self) {
         let Some(device) = self.mount_candidate.clone() else {
             return;
@@ -708,6 +670,7 @@ impl FilesWindow {
     /// mounting needs the filesystem type and the device numbers. Rebuilding
     /// a device from what the sidebar happens to display would be inventing
     /// facts about hardware.
+    #[allow(dead_code)]
     fn aim_mount(&mut self, index: usize) -> bool {
         let Some(source) = self
             .sidebar
@@ -730,6 +693,7 @@ impl FilesWindow {
     /// Aim at, and immediately attach, the device sidebar row `index` names.
     ///
     /// Returns whether the click was consumed.
+    #[allow(dead_code)]
     fn mount_from_sidebar(&mut self, index: usize) -> bool {
         if !self.aim_mount(index) {
             return false;
@@ -802,37 +766,12 @@ impl FilesWindow {
         })
     }
 
-    /// Scroll the places list by wheel `lines`, clamped to its content.
-    /// No-op without a card; the pointer event itself dirties the frame.
-    fn scroll_places(&mut self, lines: i32) {
-        let Some(card) = self.card() else {
-            return;
-        };
-        let row_h = self.theme.sidebar_row();
-        if row_h <= 0 {
-            return;
-        }
-        let rows = i32::try_from(self.sidebar.rows().len()).unwrap_or(0);
-        let visible_rows = (card.places().h / row_h).max(1);
-        let max = (rows - visible_rows).max(0);
-        self.places_scroll = (self.places_scroll + lines).clamp(0, max);
-    }
-
-    /// Whether `at` falls inside the card's places list. The storage footer
-    /// is a readout, not a control, so it is excluded.
-    fn in_sidebar(&self, at: Position) -> bool {
-        self.card().is_some_and(|card| {
-            card.places()
-                .contains(platform::draw::Point::new(at.x, at.y))
-        })
-    }
-
     /// Which card control is under `at`, if any.
     fn toolbar_hit(&self, at: Position) -> Option<Target> {
         self.toolbar().and_then(|bar| bar.hit(at.x, at.y))
     }
 
-    /// What the pointer at `at` is over: a control, or a row in one of the panes.
+    /// What the pointer at `at` is over: a control, or a tile.
     ///
     /// The regions are tested in the same order the press handler tests them,
     /// and only one can win, so the highlight cannot appear in two places at
@@ -841,15 +780,26 @@ impl FilesWindow {
         if let Some(target) = self.toolbar_hit(at) {
             return Some(Spot::Control(target));
         }
-        if self.in_sidebar(at) {
-            return self
-                .sidebar_row_at(at)
-                .map(|i| Spot::Item(Pane::Sidebar, i));
-        }
         self.tile_at(Point::new(at.x, at.y)).map(|tile| {
             tile.item()
                 .map_or(Spot::Overflow, |i| Spot::Item(Pane::Tiles, i))
         })
+    }
+
+    fn home_dir() -> Option<std::path::PathBuf> {
+        std::env::var_os("HOME").map(std::path::PathBuf::from)
+    }
+
+    /// Whether Home would go anywhere: `$HOME` is set and is not already open.
+    fn can_go_home(&self) -> bool {
+        Self::home_dir().is_some_and(|home| home != self.browser.path())
+    }
+
+    fn go_home(&mut self) -> Outcome {
+        match Self::home_dir() {
+            Some(home) => self.browser.go_to(&home),
+            None => Outcome::Ignored,
+        }
     }
 
     /// Act on a click on toolbar control `target`.
@@ -860,24 +810,19 @@ impl FilesWindow {
             // The same action the keyboard's Left and Backspace already
             // reach, so the button and the key cannot diverge.
             Target::Up => self.step_out(),
+            Target::Home => self.go_home(),
             Target::ToggleHidden => self.browser.act(crate::keymap::Action::ToggleHidden),
             Target::FilterBox => self.browser.focus_filter(),
         };
         self.apply(outcome);
         // Every navigation can cross a filesystem boundary, exactly as a
         // sidebar jump can, so the storage footer must be re-read.
-        if matches!(target, Target::Back | Target::Forward | Target::Up) {
+        if matches!(
+            target,
+            Target::Back | Target::Forward | Target::Up | Target::Home
+        ) {
             self.refresh_storage();
         }
-    }
-
-    /// Which sidebar row a pointer position falls on. Shared by the press
-    /// handler, the hover tracker and the painter, so all three agree.
-    fn sidebar_row_at(&self, at: Position) -> Option<usize> {
-        let card = self.card()?;
-        let row_h = self.theme.sidebar_row();
-        let y = at.y - card.places().y + self.places_scroll * row_h;
-        self.sidebar.row_index_at(y, row_h)
     }
 
     /// Whether this click, at `now`, continues a double-click gesture.
@@ -911,17 +856,25 @@ impl FilesWindow {
         let Some(card) = self.card() else {
             return;
         };
-        let theme = self.theme;
-        let radius = theme.spacing.radius() * 2;
-        canvas.fill_round_rect_glass(card.bounds(), theme.sidebar_bg, radius);
-        canvas.draw_round_rect(card.bounds(), theme.sidebar_border, radius);
+        self.card_surface(&card).paint(canvas, &self.theme);
         self.paint_nav_buttons(canvas);
         self.paint_hidden_toggle(canvas);
         self.paint_breadcrumb(canvas);
         self.paint_filter_control(canvas);
-        self.paint_sidebar(canvas);
         self.paint_storage(canvas);
-        self.paint_status(canvas);
+    }
+
+    fn card_surface(&self, card: &PinnedCard) -> CardSurface {
+        CardSurface::new(card.bounds(), self.storage.as_ref().map(Storage::usage))
+    }
+
+    /// The colours behind a control occupying `band`: the used-space tone
+    /// below the fill level, the plain surface above it.
+    fn backdrop(&self, band: Rect) -> Backdrop {
+        self.card().map_or_else(
+            || Backdrop::plain(&self.theme),
+            |card| self.card_surface(&card).backdrop_for(band, &self.theme),
+        )
     }
 
     /// The card's control geometry, shared by the painter and the pointer
@@ -966,6 +919,7 @@ impl FilesWindow {
                 Target::Forward,
             ),
             (bar.up(), "\u{2191}", self.can_step_out(), Target::Up),
+            (bar.home(), "~", self.can_go_home(), Target::Home),
         ] {
             // Dropped for want of room: nothing to draw, and `Toolbar::hit`
             // will not report it either.
@@ -973,11 +927,12 @@ impl FilesWindow {
             // Only a button that would do something lights up under the
             // pointer, so the highlight is a promise rather than decoration.
             let hovered = enabled && self.hover.control() == Some(target);
+            let backdrop = self.backdrop(rect);
             let bg = if hovered {
-                canvas.fill_round_rect(rect, theme.hover, theme.spacing.radius_small());
-                theme.hover
+                canvas.fill_round_rect(rect, backdrop.hover, theme.spacing.radius_small());
+                backdrop.hover
             } else {
-                theme.sidebar_bg
+                backdrop.surface
             };
             let color = if enabled { theme.text } else { theme.disabled };
             let tier = &mut self.type_scale.title;
@@ -1016,14 +971,15 @@ impl FilesWindow {
         let on = self.browser.shows_hidden();
         let hovered = self.hover.control() == Some(Target::ToggleHidden);
         let radius = theme.spacing.radius_small();
+        let backdrop = self.backdrop(rect);
         let bg = if on {
-            canvas.fill_round_rect(rect, theme.accent_surface, radius);
-            theme.accent_surface
+            canvas.fill_round_rect(rect, backdrop.active, radius);
+            backdrop.active
         } else if hovered {
-            canvas.fill_round_rect(rect, theme.hover, radius);
-            theme.hover
+            canvas.fill_round_rect(rect, backdrop.hover, radius);
+            backdrop.hover
         } else {
-            theme.sidebar_bg
+            backdrop.surface
         };
         let color = if on { theme.accent } else { theme.text };
         let glyph = if on { "\u{25cf}" } else { "\u{25cb}" };
@@ -1052,19 +1008,13 @@ impl FilesWindow {
             return;
         };
         let mut x = bar.x;
+        let surface = self.backdrop(bar).surface;
 
         let (shown, elided) = crumbs.tail(self.crumb_budget(bar.w));
         if elided {
             let label = &mut self.type_scale.label;
             let y = label.baseline_y(bar.h) + bar.y;
-            x = label.draw_text(
-                canvas,
-                Breadcrumb::ELLIPSIS,
-                x,
-                y,
-                theme.muted,
-                theme.sidebar_bg,
-            );
+            x = label.draw_text(canvas, Breadcrumb::ELLIPSIS, x, y, theme.muted, surface);
             x += theme.spacing.xs();
         }
 
@@ -1074,7 +1024,7 @@ impl FilesWindow {
             if i > 0 || elided {
                 let label = &mut self.type_scale.label;
                 let y = label.baseline_y(bar.h) + bar.y;
-                x = label.draw_text(canvas, "/", x, y, theme.muted, theme.sidebar_bg);
+                x = label.draw_text(canvas, "/", x, y, theme.muted, surface);
                 x += theme.spacing.xs();
             }
             let (color, tier) = if crumb.current {
@@ -1083,7 +1033,7 @@ impl FilesWindow {
                 (theme.muted, &mut self.type_scale.body)
             };
             let y = tier.baseline_y(bar.h) + bar.y;
-            x = tier.draw_text(canvas, &crumb.label, x, y, color, theme.sidebar_bg);
+            x = tier.draw_text(canvas, &crumb.label, x, y, color, surface);
             x += theme.spacing.xs();
         }
     }
@@ -1127,7 +1077,8 @@ impl FilesWindow {
         };
         let (x, y, height) = (rect.x, rect.y, rect.h);
         let radius = theme.spacing.radius();
-        canvas.fill_round_rect(rect, theme.filter_bg, radius);
+        let well = self.backdrop(rect).input;
+        canvas.fill_round_rect(rect, well, radius);
         canvas.draw_round_rect(
             rect,
             if filtering {
@@ -1148,7 +1099,7 @@ impl FilesWindow {
             let query = self.browser.filter().text().to_owned();
             let before = self.browser.filter().before_caret().to_owned();
             let detail = &mut self.type_scale.detail;
-            detail.draw_text(canvas, &query, inner_x, text_y, theme.text, theme.filter_bg);
+            detail.draw_text(canvas, &query, inner_x, text_y, theme.text, well);
             // Measured, not counted: with a proportional face the caret's
             // pixel offset is the width of the text before it.
             let caret_x = inner_x + detail.measure(&before);
@@ -1156,297 +1107,51 @@ impl FilesWindow {
                 Rect::new(caret_x, text_y, theme.spacing.rule(), detail.line_height()),
                 theme.caret,
             );
-        } else {
-            detail.draw_text(
-                canvas,
-                "filter...",
-                inner_x,
-                text_y,
-                theme.muted,
-                theme.filter_bg,
-            );
         }
     }
 
-    /// Draw the places sidebar: section headings, places, bookmarks, and the
-    /// storage footer pinned to the bottom.
-    ///
-    /// The column runs the *full* height of the window -- past the toolbar's
-    /// top and the status strip's bottom -- because in the guide's shell
-    /// those bands belong to the right column alone.
-    fn paint_sidebar(&mut self, canvas: &mut Canvas<'_>) {
-        let Some(card) = self.card() else {
-            return;
-        };
-        let theme = self.theme;
-        let body = card.places();
-        let top = body.y;
-        let left = body.x;
-        let width = body.w;
-        let active = self.sidebar.index_of(self.browser.path());
-        let row_h = theme.sidebar_row();
-        let rows: Vec<SidebarRow> = self.sidebar.rows().to_vec();
-        // Clamp here as well as at the wheel: rows can disappear (a device
-        // unplugged) while the offset is stale, and painting must slice
-        // rather than trust it.
-        let visible = (body.h / row_h).max(1);
-        let max = rows
-            .len()
-            .saturating_sub(usize::try_from(visible).unwrap_or(1));
-        let start = usize::try_from(self.places_scroll).unwrap_or(0).min(max);
-        for (i, row) in rows.iter().enumerate().skip(start) {
-            let y =
-                top + (i32::try_from(i).unwrap_or(0) - i32::try_from(start).unwrap_or(0)) * row_h;
-            // Stop at the storage footer rather than painting through it.
-            if y + row_h > body.y + body.h {
-                break;
-            }
-            match row {
-                SidebarRow::Heading(text) => {
-                    // Headings sit in the small label tier and the muted
-                    // colour, so they read as structure rather than as
-                    // another place you could click. Their inset matches the
-                    // row labels below them, so the section title and its
-                    // entries share a left edge.
-                    let label = &mut self.type_scale.label;
-                    let ty = y + (row_h - label.line_height()) / 2;
-                    label.draw_text(
-                        canvas,
-                        text,
-                        left + Self::sidebar_text_x(&theme),
-                        ty,
-                        theme.muted,
-                        theme.sidebar_bg,
-                    );
-                }
-                SidebarRow::Hint(text) => {
-                    let detail = &mut self.type_scale.detail;
-                    let ty = y + (row_h - detail.line_height()) / 2;
-                    detail.draw_text(
-                        canvas,
-                        text,
-                        left + Self::sidebar_text_x(&theme),
-                        ty,
-                        theme.muted,
-                        theme.sidebar_bg,
-                    );
-                }
-                SidebarRow::Place { label, .. }
-                | SidebarRow::Device { label, .. }
-                | SidebarRow::Unmounted { label, .. } => {
-                    self.paint_sidebar_entry(
-                        canvas,
-                        row,
-                        label,
-                        SidebarEntry {
-                            x: left,
-                            y,
-                            width,
-                            row_h,
-                            active: active == Some(i),
-                            hovered: self.hover.is(Pane::Sidebar, i),
-                        },
-                    );
-                }
-            }
-        }
-    }
-
-    /// Draw one navigable sidebar row: its highlight, its name, and -- for a
-    /// device -- the filesystem caption at the right edge.
-    ///
-    /// Split from [`Self::paint_sidebar`] when the device caption pushed that
-    /// function past readable length. Headings and hints stay there because
-    /// they are two lines each; this is the part with real branching.
-    fn paint_sidebar_entry(
-        &mut self,
-        canvas: &mut Canvas<'_>,
-        row: &SidebarRow,
-        label: &str,
-        at: SidebarEntry,
-    ) {
-        let theme = self.theme;
-        let pad = theme.spacing.sidebar_pad();
-        // Active outranks hover: the row marking where you *are* must not
-        // lose its treatment just because the pointer happens to be resting
-        // on it. Hover is a preview of a place you could go, so it says
-        // nothing on the place you already went.
-        let fill = match (at.active, at.hovered) {
-            (true, _) => Some(theme.sidebar_active),
-            (false, true) => Some(theme.hover),
-            (false, false) => None,
-        };
-        let bg = fill.map_or(theme.sidebar_bg, |fill| {
-            // The highlight is inset from both column edges and rounded, so
-            // it reads as a pill behind the row rather than as a stripe
-            // bleeding into the divider. Hover shares the geometry exactly,
-            // so the fill appears to change colour under the pointer rather
-            // than to also change shape.
-            let pill = Rect::new(at.x + pad, at.y, (at.width - pad * 2).max(0), at.row_h);
-            canvas.fill_round_rect(pill, fill, theme.spacing.radius());
-            if at.active {
-                // The guide's 2px accent rule on the leading edge, which is
-                // what makes the active place readable at a glance even when
-                // the fill is subtle. Kept inside the pill's straight middle
-                // section so it does not poke out of the rounded corners.
-                //
-                // Deliberately not drawn for hover: the rule is the marker
-                // for "you are here", and lending it to a transient pointer
-                // position would make the pane appear to have two active
-                // places.
-                let r = theme.spacing.radius();
-                canvas.fill_rect(
-                    Rect::new(
-                        at.x + pad,
-                        at.y + r,
-                        theme.spacing.rule(),
-                        (at.row_h - r * 2).max(1),
-                    ),
-                    theme.accent,
-                );
-            }
-            fill
-        });
-        // The open directory is drawn in the accent; the rest in ordinary
-        // text, so exactly one row draws the eye. An unmounted device is
-        // dimmed: it is a place that does not exist yet, and drawing it as
-        // live as a browsable one invites a click that cannot navigate.
-        let color = match (at.active, row.mountable_source().is_some()) {
-            (true, _) => theme.accent,
-            (false, true) => theme.disabled,
-            (false, false) => theme.text,
-        };
-        let inset = at.x + Self::sidebar_text_x(&theme);
-        let mut room = at.width - Self::sidebar_text_x(&theme) - pad;
-        // A device's filesystem sits at the row's right edge in the muted
-        // caption tier, so "vfat" or "read-only" is available without
-        // competing with the name. The name is measured against what is left,
-        // so the detail truncates the label rather than overprinting it.
-        if let Some(detail) = row.detail() {
-            let tier = &mut self.type_scale.detail;
-            let detail_w = tier.measure(detail);
-            // Only shown when the name keeps the larger share: below that the
-            // row reads as two competing labels, and the name is the part
-            // that identifies the disk.
-            if detail_w * 2 < room {
-                let ty = at.y + (at.row_h - tier.line_height()) / 2;
-                tier.draw_text(canvas, detail, inset + room - detail_w, ty, theme.muted, bg);
-                room -= detail_w + theme.spacing.s();
-            }
-        }
-        let tier = &mut self.type_scale.body;
-        let ty = at.y + (at.row_h - tier.line_height()) / 2;
-        let shown = RowFormat::truncate(label, Self::columns_for(tier, room));
-        tier.draw_text(canvas, &shown, inset, ty, color, bg);
-    }
-
-    /// Where text in the sidebar begins: the column's own padding plus the
-    /// row's internal padding.
-    ///
-    /// Both are needed, and separately: the row highlight is inset by the
-    /// column padding, and the label sits inside *that*. Collapsing the two
-    /// into one number is what made the labels sit flush against the pane's
-    /// edge.
+    /// Where the footer text begins: the card's padding plus the row's
+    /// internal padding.
     fn sidebar_text_x(theme: &Theme) -> i32 {
         theme.spacing.sidebar_pad() + theme.spacing.sidebar_row_pad()
     }
 
-    /// Draw the sidebar's storage footer: the filesystem, how full it is, and
-    /// a meter.
-    ///
-    /// Ambient information, which sets its whole treatment: the smallest type
-    /// tier, muted colour, and a 2px bar rather than a chunky progress
-    /// widget. When there is nothing meaningful to report -- a pseudo-
-    /// filesystem, an unreadable path -- the footer is simply absent rather
-    /// than showing a zeroed meter, which would look like a full disk's
-    /// opposite rather than like "no data".
+    /// What the footer says: a current error or operation result, which
+    /// explains why the listing is not what the user expected, otherwise the
+    /// used and total space.
+    fn footer_line(&self) -> Option<(String, Color)> {
+        if let Some(error) = self.browser.error() {
+            return Some((error.message(), self.theme.error));
+        }
+        if let Some(notice) = self.browser.notice() {
+            return Some((notice.to_owned(), self.theme.muted));
+        }
+        self.storage
+            .as_ref()
+            .map(|storage| (storage.usage().figures(), self.theme.muted))
+    }
+
+    /// Draw the footer as one small line aligned with the place labels. The
+    /// disk's fullness itself is the card's background fill.
     fn paint_storage(&mut self, canvas: &mut Canvas<'_>) {
         let theme = self.theme;
         let Some(area) = self.card().and_then(|card| card.storage()) else {
             return;
         };
-        let Some(storage) = self.storage.clone() else {
+        let Some((line, color)) = self.footer_line() else {
             return;
         };
-        // A rule above the footer separates it from the places it sits under,
-        // mirroring the guide's `border-top`.
-        canvas.fill_rect(
-            Rect::new(area.x, area.y, area.w, theme.spacing.hairline()),
-            theme.sidebar_border,
-        );
-
-        // The footer's own padding matches the rows above it, so the device
-        // name lines up with the place labels rather than sitting proud of
-        // them.
-        let inset = Self::sidebar_text_x(&theme);
-        let usage = storage.usage();
-        // "61% of 128g" when there is room for it; the bare percentage when
-        // the sidebar is too narrow. The percentage is the part that must
-        // survive, so it is what the fallback keeps.
-        let percent = usage.summary();
-        let top = area.y + theme.spacing.m();
-        let room = area.w - inset * 2;
-        if room <= 0 {
-            return;
-        }
-
-        // The percentage is placed first and the device name gets what is
-        // left: a long mount path may be truncated, but the number -- the
-        // reason to look here at all -- is never the thing that is lost.
+        let surface = self.backdrop(area).surface;
         let detail = &mut self.type_scale.detail;
-        // Half the footer is the most the readout may claim before the device
-        // name it shares the line with becomes unreadable.
-        let percent = if detail.measure(&percent) * 2 > room {
-            usage.percent_label()
-        } else {
-            percent
-        };
-        let percent_w = detail.measure(&percent);
+        let y = area.y + (area.h - detail.line_height()) / 2;
         detail.draw_text(
             canvas,
-            &percent,
-            area.x + area.w - inset - percent_w,
-            top,
-            theme.muted,
-            theme.sidebar_bg,
+            &line,
+            area.x + Self::sidebar_text_x(&theme),
+            y,
+            color,
+            surface,
         );
-        let name_room = room - percent_w - theme.spacing.s();
-        let shown = RowFormat::truncate(storage.device(), Self::columns_for(detail, name_room));
-        detail.draw_text(
-            canvas,
-            &shown,
-            area.x + inset,
-            top,
-            theme.muted,
-            theme.sidebar_bg,
-        );
-
-        // The meter: a full-width track with the used portion in the accent,
-        // so "how full" is legible without reading the number.
-        let track_h = theme.spacing.meter_height();
-        let track_y = top + self.type_scale.detail.line_height() + theme.spacing.s();
-        // Only drawn if it actually fits inside the footer -- a bar clipped by
-        // the window's bottom edge would misreport the fill level.
-        if track_y + track_h > area.bottom() {
-            return;
-        }
-        // Rounded to its own half-height, so a 2px meter reads as a soft rule
-        // rather than a hard tick. `RoundRect` clamps the radius, so this stays
-        // correct if the meter ever grows.
-        let cap = track_h / 2;
-        canvas.fill_round_rect(
-            Rect::new(area.x + inset, track_y, room, track_h),
-            theme.scrollbar_track,
-            cap,
-        );
-        let filled = usage.meter_width(room);
-        if filled > 0 {
-            canvas.fill_round_rect(
-                Rect::new(area.x + inset, track_y, filled, track_h),
-                theme.accent,
-                cap,
-            );
-        }
     }
 
     /// How many characters of `text` fit in `width` pixels for a given tier.
@@ -1454,6 +1159,7 @@ impl FilesWindow {
     /// The bitmap font was fixed-width, so the old code could divide by a
     /// constant glyph width. A real face cannot: this measures the tier's own
     /// average advance instead of assuming one.
+    #[allow(dead_code)]
     fn columns_for(tier: &mut statusbar::TextRenderer, width: i32) -> usize {
         if width <= 0 {
             return 0;
@@ -1549,115 +1255,6 @@ impl FilesWindow {
             },
         );
     }
-
-    /// Draw the status line: the filter box, or a summary.
-    fn paint_status(&mut self, canvas: &mut Canvas<'_>) {
-        let theme = self.theme;
-        let Some(band) = self.card().map(|card| card.status()) else {
-            return;
-        };
-        if band.h == 0 {
-            return;
-        }
-        let y = band.y;
-        let background = theme.sidebar_bg;
-        canvas.fill_rect(
-            Rect::new(band.x, y, band.w, theme.spacing.hairline()),
-            theme.sidebar_border,
-        );
-
-        // An error outranks everything else: it explains why the list is not
-        // what the user expected, and hiding it behind a file count would
-        // leave them staring at a stale listing wondering what happened.
-        if let Some(error) = self.browser.error() {
-            let message = error.message();
-            let detail = &mut self.type_scale.detail;
-            let text_y = y + (band.h - detail.line_height()) / 2;
-            detail.draw_text(
-                canvas,
-                &message,
-                band.x + theme.spacing.m(),
-                text_y,
-                theme.error,
-                background,
-            );
-            return;
-        }
-
-        // The guide's status line reports the entry count or the selection.
-        // The filter query itself now lives in the toolbar control, so the
-        // strip stays a summary rather than duplicating it.
-        //
-        // A file operation's result outranks the count while it is current:
-        // "3 items copied" is what the user just did, and the entry count is
-        // still there beneath it on the next action.
-        let shown = self.browser.len();
-        let total = self.browser.total();
-        let summary = self.browser.notice().map_or_else(
-            || {
-                if shown == total {
-                    format!("{total} entries")
-                } else {
-                    format!("{shown} of {total} entries")
-                }
-            },
-            ToOwned::to_owned,
-        );
-        let label = &mut self.type_scale.label;
-        let text_y = y + (band.h - label.line_height()) / 2;
-        label.draw_text(
-            canvas,
-            &summary,
-            band.x + theme.spacing.m(),
-            text_y,
-            theme.muted,
-            background,
-        );
-
-        self.paint_status_hint(canvas, band, background);
-    }
-
-    /// Draw the keyboard hint at the status line's right end.
-    ///
-    /// The guide gives the hint a minimal keycap: an outlined box around the
-    /// chord with its description beside it in muted text.
-    fn paint_status_hint(&mut self, canvas: &mut Canvas<'_>, band: Rect, background: Color) {
-        let y = band.y;
-        let theme = self.theme;
-        // Which hint earns the space depends on what the user can do next:
-        // while filtering, escaping is what they will want.
-        let (description, chord) = if self.browser.is_filtering() {
-            ("clear filter", "esc")
-        } else {
-            ("select all", "ctrl+a")
-        };
-
-        let label = &mut self.type_scale.label;
-        let pad = theme.spacing.xs();
-        let chord_w = label.measure(chord) + pad * 2;
-        let cap_h = label.line_height() + pad;
-        let gap = theme.spacing.s();
-        let total = label.measure(description) + gap + chord_w;
-        let start = band.right() - theme.spacing.m() - total;
-        // A column too narrow for the hint drops it rather than overlapping
-        // the entry count, which is the more useful of the two.
-        let count_end = band.x + theme.spacing.m() + label.measure("9999 of 9999 entries");
-        if start < count_end {
-            return;
-        }
-
-        let text_y = y + (band.h - label.line_height()) / 2;
-        let after = label.draw_text(canvas, description, start, text_y, theme.muted, background);
-        let cap_x = after + gap;
-        let cap_y = y + (band.h - cap_h) / 2;
-        canvas.draw_round_rect(
-            Rect::new(cap_x, cap_y, chord_w, cap_h),
-            theme.control_border,
-            theme.spacing.radius_small(),
-        );
-        let label = &mut self.type_scale.label;
-        label.draw_text(canvas, chord, cap_x + pad, text_y, theme.muted, background);
-    }
 }
 
 impl Painter for FilesWindow {
@@ -1729,22 +1326,6 @@ impl Painter for FilesWindow {
                     shift: modifiers.shift(),
                 },
             ),
-            // A secondary click on a device flushes it. The one honest
-            // removal step available without privileges: `umount(2)` needs
-            // CAP_SYS_ADMIN, so "eject" is not ours to offer, but pushing
-            // pending writes to the hardware is, and it is the part that
-            // actually protects the user's data.
-            PointerEventKind::Press {
-                button: PointerButton::Right,
-                at,
-                ..
-            } => {
-                if self.in_sidebar(at)
-                    && let Some(index) = self.sidebar_row_at(at)
-                {
-                    self.flush_device(index);
-                }
-            }
             PointerEventKind::Release { .. } => {
                 self.drag_arm.cancel();
                 self.drag_row = None;
@@ -1779,14 +1360,10 @@ impl Painter for FilesWindow {
                 let _ = self.hover.move_to(spot);
             }
             PointerEventKind::Scroll { lines, at, .. } => {
-                if self.in_sidebar(at) {
-                    self.scroll_places(lines);
-                    return;
-                }
                 let (spiral, tail) = self.flow_parts();
                 if self
                     .tiles
-                    .wheel(spiral, self.theme.spacing.tile_min(), tail, lines)
+                    .wheel(spiral, self.theme.spacing.tile_floor(), tail, lines)
                 {
                     let spot = self.spot_at(at);
                     let _ = self.hover.move_to(spot);
@@ -2058,6 +1635,7 @@ mod tests {
             Target::ToggleHidden => bar.hidden_toggle(),
             Target::FilterBox => bar.filter(),
             Target::Up => bar.up(),
+            Target::Home => bar.home(),
         }
         .expect("the control must be drawn at this window size");
         super::Position {
@@ -2075,128 +1653,6 @@ mod tests {
             at,
             modifiers: platform::toplevel::ModifierState::default(),
         });
-    }
-
-    /// Give `painter` a sidebar with `volumes` attached, as the poller does
-    /// when a device appears.
-    fn attach_devices(painter: &mut FilesWindow, volumes: &volumes::VolumeSet) {
-        let dirs = user_dirs::UserDirs::load();
-        painter.sidebar = crate::sidebar::Sidebar::with_volumes(&dirs, &painter.favorites, volumes);
-        painter.scroll_places(i32::MAX / 2);
-    }
-
-    /// A USB stick attached at `/run/media/user/<label>`.
-    fn attached_stick(label: &str) -> volumes::VolumeSet {
-        volumes::VolumeSet::of(vec![volumes::Volume::new(
-            label,
-            format!("/run/media/user/{label}"),
-            "/dev/sdb1",
-            "vfat",
-            volumes::DeviceClass::Removable,
-            false,
-        )])
-    }
-
-    /// The centre of sidebar row `index`, as a pointer position.
-    fn sidebar_row_centre(painter: &FilesWindow, index: usize) -> super::Position {
-        let places = painter.card().expect("the card is shown").places();
-        let row_h = painter.theme.sidebar_row();
-        super::Position {
-            x: places.x + places.w / 2,
-            y: places.y
-                + (i32::try_from(index).expect("a small index") - painter.places_scroll) * row_h
-                + row_h / 2,
-        }
-    }
-
-    /// A device row must actually reach the canvas, not merely exist in the
-    /// model. The section is drawn below the existing rows, so a painter that
-    /// stopped at the old row count would leave it invisible.
-    #[test]
-    fn an_attached_device_changes_the_painted_sidebar() {
-        let (mut painter, _root, size) = painter_over_a_mixed_directory("dev-paint");
-        let before = paint_opaque(&mut painter, size);
-        attach_devices(&mut painter, &attached_stick("KINGSTON"));
-        let after = paint_opaque(&mut painter, size);
-        assert_ne!(
-            before, after,
-            "the Devices section must be visible once a stick is attached"
-        );
-    }
-
-    /// Clicking a device row navigates to its mount point like any place.
-    #[test]
-    fn clicking_a_device_row_navigates_to_its_mount_point() {
-        let (mut painter, root, _size) = painter_over_a_mixed_directory("dev-click");
-        // A real directory standing in for a mount point, so the navigation
-        // can succeed -- this machine has no removable media to point at.
-        let mount = root.join("a_directory");
-        attach_devices(
-            &mut painter,
-            &volumes::VolumeSet::of(vec![volumes::Volume::new(
-                "KINGSTON",
-                mount.clone(),
-                "/dev/sdb1",
-                "vfat",
-                volumes::DeviceClass::Removable,
-                false,
-            )]),
-        );
-        let index = painter
-            .sidebar
-            .rows()
-            .iter()
-            .position(crate::sidebar::SidebarRow::is_device)
-            .expect("the stick");
-        let at = sidebar_row_centre(&painter, index);
-        painter.on_pointer(PointerEventKind::Press {
-            button: PointerButton::Left,
-            at,
-            modifiers: platform::toplevel::ModifierState::default(),
-        });
-        assert_eq!(painter.browser.path(), mount.as_path());
-    }
-
-    /// The guard that matters: a secondary click on an ordinary place must
-    /// not be treated as a device, or the flush would act on the user's home
-    /// directory or the root filesystem.
-    #[test]
-    fn a_secondary_click_on_a_plain_place_flushes_nothing() {
-        let (painter, _root, _size) = painter_over_a_mixed_directory("dev-guard");
-        for (index, row) in painter.sidebar.rows().iter().enumerate() {
-            if !row.is_device() {
-                assert!(
-                    !painter.flush_device(index),
-                    "{:?} is not a device and must not be flushed",
-                    row.path()
-                );
-            }
-        }
-    }
-
-    /// And the positive case: a device row does flush. The mount point is a
-    /// real directory, so `syncfs` succeeds and the call reports it acted.
-    #[test]
-    fn a_secondary_click_on_a_device_flushes_it() {
-        let (mut painter, root, _size) = painter_over_a_mixed_directory("dev-flush");
-        attach_devices(
-            &mut painter,
-            &volumes::VolumeSet::of(vec![volumes::Volume::new(
-                "KINGSTON",
-                root.join("a_directory"),
-                "/dev/sdb1",
-                "vfat",
-                volumes::DeviceClass::Removable,
-                false,
-            )]),
-        );
-        let index = painter
-            .sidebar
-            .rows()
-            .iter()
-            .position(crate::sidebar::SidebarRow::is_device)
-            .expect("the stick");
-        assert!(painter.flush_device(index), "a device row flushes");
     }
 
     /// Polling on a machine with no removable media must report no change,
@@ -2329,6 +1785,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clicking_home_opens_the_home_directory_and_back_returns() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("toolbar-home");
+        let Some(home) = FilesWindow::home_dir() else {
+            return;
+        };
+        assert!(painter.can_go_home(), "away from home the button is live");
+
+        click_control(&mut painter, Target::Home);
+        assert_eq!(painter.browser.path(), home);
+        assert!(!painter.can_go_home(), "at home the button is dead");
+
+        click_control(&mut painter, Target::Back);
+        assert_eq!(painter.browser.path(), root);
+    }
+
     /// A click on the filter box must focus it, so typing goes into the box
     /// rather than being treated as list shortcuts.
     #[test]
@@ -2451,92 +1923,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The sidebar's places must track the pointer too, not just the list.
-    ///
-    /// Whole-frame comparison for the same reason as the list version: the
-    /// pill's position falls out of the frame geometry, so a hardcoded
-    /// coordinate would break on every layout tweak.
     #[test]
-    fn hovering_a_sidebar_place_changes_the_painted_frame() {
-        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-sidebar");
-        // Row 0 is the "Places" heading; row 1 is the first real place.
-        let place = painter
-            .sidebar
-            .rows()
-            .iter()
-            .position(crate::sidebar::SidebarRow::selectable)
-            .expect("the sidebar always offers at least Home");
+    fn hovering_the_home_button_changes_the_painted_frame() {
+        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-home");
+        if !painter.can_go_home() {
+            return;
+        }
         let cold = paint_opaque(&mut painter, size);
-
-        assert!(
-            painter
-                .hover
-                .move_to(Some(Spot::Item(Pane::Sidebar, place)))
-        );
+        assert!(painter.hover.move_to(Some(Spot::Control(Target::Home))));
         let hot = paint_opaque(&mut painter, size);
-        assert_ne!(cold, hot, "a hovered place must be visibly highlighted");
-
-        assert!(painter.hover.clear());
-        let cleared = paint_opaque(&mut painter, size);
-        assert_eq!(cold, cleared, "clearing hover must restore the frame");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A heading is not a destination, so it must not light up either --
-    /// otherwise the pane appears to offer somewhere to go that does nothing
-    /// when clicked.
-    #[test]
-    fn hovering_a_sidebar_heading_highlights_nothing() {
-        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-heading");
-        let heading = painter
-            .sidebar
-            .rows()
-            .iter()
-            .position(|r| !r.selectable())
-            .expect("the pane opens with a Places heading");
-        let cold = paint_opaque(&mut painter, size);
-
-        // The hover tracker refuses the row outright, so the frame cannot
-        // change: `row_index_at` filters unselectable rows for both paths.
-        let at = sidebar_row_centre(&painter, heading);
-        assert_eq!(
-            painter.sidebar_row_at(at),
-            None,
-            "a heading resolves to no row"
-        );
-        let hot = paint_opaque(&mut painter, size);
-        assert_eq!(cold, hot, "a heading must not paint a highlight");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The row marking where you *are* must keep its own treatment while the
-    /// pointer rests on it: hover is a preview of somewhere you could go, so it
-    /// has nothing to say about the place you already went.
-    #[test]
-    fn the_active_place_outranks_its_own_hover() {
-        let (mut painter, root, size) = painter_over_a_mixed_directory("hover-active");
-        // Navigate to a place the sidebar actually lists, so one row is active.
-        let (index, path) = painter
-            .sidebar
-            .rows()
-            .iter()
-            .enumerate()
-            .find_map(|(i, r)| r.path().map(|p| (i, p.to_path_buf())))
-            .expect("a listed place");
-        let outcome = painter.browser.go_to(&path);
-        painter.apply(outcome);
-
-        let resting = paint_opaque(&mut painter, size);
-        assert!(
-            painter
-                .hover
-                .move_to(Some(Spot::Item(Pane::Sidebar, index)))
-        );
-        let hovered = paint_opaque(&mut painter, size);
-        assert_eq!(
-            resting, hovered,
-            "hovering the active place must not restyle it"
-        );
+        assert_ne!(cold, hot, "a live Home button must light under the pointer");
         let _ = std::fs::remove_dir_all(&root);
     }
 

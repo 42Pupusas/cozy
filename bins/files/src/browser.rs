@@ -286,12 +286,6 @@ impl Browser {
         self.view.visible_len()
     }
 
-    /// How many entries the directory holds before filtering.
-    #[must_use]
-    pub const fn total(&self) -> usize {
-        self.view.total()
-    }
-
     /// The entry at visible index `row`.
     #[must_use]
     pub fn entry(&self, row: usize) -> Option<&Entry> {

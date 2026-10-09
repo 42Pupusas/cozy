@@ -1,6 +1,6 @@
 //! [`PinnedCard`] -- the vertical sections of the always-present corner card
-//! that holds every piece of chrome: navigation, path, filter, places,
-//! storage and status.
+//! that holds every piece of chrome: navigation, path, filter, and the
+//! disk-usage footer.
 
 use platform::draw::Rect;
 
@@ -12,27 +12,21 @@ pub struct CardMetrics {
     pub nav: i32,
     pub crumbs: i32,
     pub filter: i32,
-    pub places_row: i32,
     pub storage: i32,
-    pub status: i32,
 }
 
-/// The card's sections, top to bottom: nav, crumbs, filter, places, storage,
-/// status.
+/// The card's sections, top to bottom: nav, crumbs, filter, storage.
 ///
 /// A window too short for every section drops them in priority order: nav,
-/// crumbs and filter are kept first, then status, and storage only when the
-/// places list still keeps at least one row.
+/// crumbs, filter, then storage, which is kept only whole.
 #[derive(Debug, Clone, Copy)]
 pub struct PinnedCard {
     bounds: Rect,
     pad: i32,
-    gap: i32,
     nav: i32,
     crumbs: i32,
     filter: i32,
     storage: i32,
-    status: i32,
 }
 
 impl PinnedCard {
@@ -43,8 +37,7 @@ impl PinnedCard {
         let nav = Self::take(&mut left, metrics.nav);
         let crumbs = Self::take(&mut left, metrics.crumbs);
         let filter = Self::take(&mut left, metrics.filter);
-        let status = Self::take(&mut left, metrics.status);
-        let storage = if left - metrics.storage >= metrics.places_row {
+        let storage = if left >= metrics.storage {
             Self::take(&mut left, metrics.storage)
         } else {
             0
@@ -52,12 +45,10 @@ impl PinnedCard {
         Self {
             bounds,
             pad: spacing.sidebar_pad(),
-            gap: spacing.s(),
             nav,
             crumbs,
             filter,
             storage,
-            status,
         }
     }
 
@@ -107,19 +98,6 @@ impl PinnedCard {
         )
     }
 
-    /// The places list, between the filter row and the storage footer.
-    #[must_use]
-    pub const fn places(&self) -> Rect {
-        let top = self.bounds.y + self.nav + self.crumbs + self.filter + self.gap;
-        let bottom = self.bounds.bottom() - self.status - self.storage;
-        Rect::new(
-            self.bounds.x,
-            top,
-            self.bounds.w,
-            if bottom > top { bottom - top } else { 0 },
-        )
-    }
-
     /// The disk-usage footer, or `None` when it was dropped for space.
     #[must_use]
     pub const fn storage(&self) -> Option<Rect> {
@@ -128,21 +106,10 @@ impl PinnedCard {
         }
         Some(Rect::new(
             self.bounds.x,
-            self.bounds.bottom() - self.status - self.storage,
+            self.bounds.bottom() - self.storage,
             self.bounds.w,
             self.storage,
         ))
-    }
-
-    /// The status line along the card's bottom edge.
-    #[must_use]
-    pub const fn status(&self) -> Rect {
-        Rect::new(
-            self.bounds.x,
-            self.bounds.bottom() - self.status,
-            self.bounds.w,
-            self.status,
-        )
     }
 }
 
@@ -156,9 +123,7 @@ mod tests {
         nav: 58,
         crumbs: 34,
         filter: 43,
-        places_row: 34,
         storage: 42,
-        status: 35,
     };
 
     fn card(height: i32) -> PinnedCard {
@@ -170,9 +135,8 @@ mod tests {
     }
 
     fn sections(card: &PinnedCard) -> Vec<Rect> {
-        let mut out = vec![card.nav(), card.crumbs(), card.filter_row(), card.places()];
+        let mut out = vec![card.nav(), card.crumbs(), card.filter_row()];
         out.extend(card.storage());
-        out.push(card.status());
         out
     }
 
@@ -189,7 +153,11 @@ mod tests {
             );
         }
         assert_eq!(c.nav().y, c.bounds().y);
-        assert_eq!(c.status().bottom(), c.bounds().bottom());
+        assert_eq!(
+            c.storage().map(|s| s.bottom()),
+            Some(c.bounds().bottom()),
+            "the footer is the card's last section"
+        );
     }
 
     #[test]
@@ -208,19 +176,10 @@ mod tests {
     }
 
     #[test]
-    fn the_places_list_takes_the_spare_height() {
-        let c = card(760);
-        let fixed =
-            METRICS.nav + METRICS.crumbs + METRICS.filter + METRICS.storage + METRICS.status;
-        assert!(c.places().h > 760 - fixed - 20);
-    }
-
-    #[test]
-    fn storage_is_dropped_before_the_places_lose_their_last_row() {
-        let tight = METRICS.nav + METRICS.crumbs + METRICS.filter + METRICS.status + 40;
-        let c = card(tight);
-        assert!(c.storage().is_none());
-        assert_eq!(c.status().h, METRICS.status);
+    fn storage_is_dropped_when_it_cannot_fit_whole() {
+        let tight = METRICS.nav + METRICS.crumbs + METRICS.filter + METRICS.storage - 1;
+        assert!(card(tight).storage().is_none());
+        assert!(card(tight + 1).storage().is_some());
     }
 
     #[test]
@@ -229,8 +188,6 @@ mod tests {
         assert_eq!(c.nav().h, METRICS.nav);
         assert_eq!(c.crumbs().h, 10);
         assert_eq!(c.filter_row().h, 0);
-        assert_eq!(c.status().h, 0);
-        assert_eq!(c.places().h, 0);
     }
 
     #[test]

@@ -112,20 +112,6 @@ impl Spacing {
         self.at(Self::XL)
     }
 
-    /// A one-device-pixel hairline, never scaled away to nothing.
-    ///
-    /// Deliberately *not* scaled: the guide's dividers are 1px rules, and a
-    /// 2px border at scale 2 reads as a heavy line rather than a hairline.
-    /// It still hangs off `Spacing` rather than being a free constant so the
-    /// call sites read as one vocabulary -- `spacing.hairline()` next to
-    /// `spacing.m()` -- and so it can start scaling later without touching
-    /// them.
-    #[must_use]
-    #[allow(clippy::unused_self)]
-    pub const fn hairline(self) -> i32 {
-        1
-    }
-
     /// Corner radius for controls -- buttons, the filter box, row highlights
     /// (guide: 6px).
     ///
@@ -219,17 +205,6 @@ impl Spacing {
         self.at(42.0)
     }
 
-    /// Thickness of the storage meter's bar (guide: 2px).
-    ///
-    /// Numerically the same as [`Self::rule`] today, but named separately
-    /// because they are different things: one is a selection marker, the
-    /// other a data display. Collapsing them would couple a restyle of the
-    /// active-row rule to the thickness of a progress bar.
-    #[must_use]
-    pub fn meter_height(self) -> i32 {
-        self.at(2.0)
-    }
-
     /// Sidebar width (guide: 210px).
     #[must_use]
     pub fn sidebar_width(self) -> i32 {
@@ -247,10 +222,38 @@ impl Spacing {
         toolbar.max(self.at(72.0))
     }
 
-    /// Width of a toolbar icon button (guide: 30px square).
+    /// The shortest side a spiral tile may have. Smaller than the card's
+    /// width so more tiles fit while the card keeps its room.
+    #[must_use]
+    pub fn tile_floor(self) -> i32 {
+        self.at(112.0)
+    }
+
+    /// Width the pinned card asks of its spiral cell: two tiles' worth, so
+    /// the card is a landscape strip and its buttons are wide.
+    #[must_use]
+    pub fn card_width(self) -> i32 {
+        (self.tile_min() * 2).max(self.card_nav_row())
+    }
+
+    /// What the card's navigation row needs: five icon buttons, the gap that
+    /// sets the dotfile toggle apart, and padding on both sides.
+    #[must_use]
+    pub fn card_nav_row(self) -> i32 {
+        self.icon_button() * 5 + self.s() + self.sidebar_pad() * 2
+    }
+
+    /// The narrowest a toolbar button may be drawn (guide: 30px).
     #[must_use]
     pub fn icon_button(self) -> i32 {
         self.at(30.0)
+    }
+
+    /// Height of a toolbar button, which stretches to the card's width but
+    /// stays this tall.
+    #[must_use]
+    pub fn nav_button_height(self) -> i32 {
+        self.at(36.0)
     }
 }
 
@@ -276,8 +279,10 @@ mod tests {
         assert_eq!(s.status_height(), 35);
         assert_eq!(s.sidebar_width(), 210);
         assert_eq!(s.tile_min(), 152);
+        assert_eq!(s.tile_floor(), 112);
+        assert_eq!(s.card_width(), 304);
+        assert_eq!(s.nav_button_height(), 36);
         assert_eq!(s.storage_height(), 42);
-        assert_eq!(s.meter_height(), 2);
         assert_eq!(s.radius(), 6);
         assert_eq!(s.radius_small(), 3);
         assert_eq!(s.sidebar_pad(), 12);
@@ -340,14 +345,6 @@ mod tests {
         assert_eq!(two.xl(), one.xl() * 2);
     }
 
-    /// Hairlines stay one device pixel regardless of scale -- a scaled-up
-    /// divider reads as a heavy border, not a hairline.
-    #[test]
-    fn a_hairline_is_always_one_pixel() {
-        assert_eq!(Spacing::new(13.0, 1.0).hairline(), 1);
-        assert_eq!(Spacing::new(40.0, 3.0).hairline(), 1);
-    }
-
     /// A degenerate font size or scale must not collapse the layout to zero;
     /// an invisible window is worse than an ugly one.
     #[test]
@@ -388,14 +385,16 @@ mod tests {
         }
     }
 
-    /// The card's navigation row must hold four buttons and the gap after
-    /// the chevrons without dropping any.
+    /// The card's navigation row must hold five buttons and the gap before
+    /// the dotfile toggle without dropping any.
     #[test]
     fn the_card_fits_its_navigation_row() {
         for font in [8.0, 13.0, 20.0] {
             let s = Spacing::new(font, 1.0);
-            let row = s.sidebar_pad() * 2 + s.icon_button() * 4 + s.s();
-            assert!(row <= s.tile_min(), "the nav row overflows at {font}");
+            assert!(
+                s.card_nav_row() <= s.card_width(),
+                "the nav row overflows at {font}"
+            );
         }
     }
 }

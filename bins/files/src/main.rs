@@ -17,19 +17,24 @@
 
 mod breadcrumb;
 mod browser;
+mod card_surface;
 mod clipboard;
 mod density;
 mod dir_sizes;
 mod dirs_watch;
 mod drag_badge;
 mod favorites;
+mod file_launcher;
 mod frame;
 mod headless;
 mod history;
 mod hover;
+mod idle_wait;
 mod keymap;
 mod metric_overrides;
+#[allow(dead_code)]
 mod mount_service;
+#[allow(dead_code)]
 mod mount_session;
 mod options;
 mod password_modal;
@@ -39,6 +44,7 @@ mod rename;
 mod row_format;
 mod row_kind;
 mod secret_input;
+#[allow(dead_code)]
 mod sidebar;
 mod spacing;
 mod spiral;
@@ -46,6 +52,7 @@ mod spiral_cursor;
 mod storage;
 mod test_support;
 mod theme;
+mod tile_coloring;
 mod tile_field;
 mod tile_painter;
 mod tile_rank;
@@ -54,8 +61,8 @@ mod typography;
 mod window;
 
 use browser::Browser;
+use file_launcher::FileLauncher;
 use options::Options;
-use platform::toplevel::activation_report::ActivationReport;
 use platform::toplevel::{LogicalSize, Toplevel, WindowEvent};
 use theme::Theme;
 use window::FilesWindow;
@@ -67,14 +74,6 @@ use window::FilesWindow;
 struct App;
 
 impl App {
-    /// How long to sleep when nothing is happening.
-    ///
-    /// The window is entirely event-driven -- it repaints only when something
-    /// changed -- so this timeout exists purely as a safety net against a
-    /// missed wakeup, not as a frame clock. A file browser that spun at 60fps
-    /// showing a static list would be a laptop-battery bug.
-    const IDLE_TIMEOUT_MS: i32 = 250;
-
     fn run() -> Result<(), Box<dyn std::error::Error>> {
         let options = Options::parse(std::env::args().skip(1))?;
         // A broken config should not stop the browser opening -- report it
@@ -155,11 +154,7 @@ impl App {
         // Adopt the true physical size before the first paint.
         painter.resize(window.size());
 
-        // Loaded once, before the loop: the glob and association databases
-        // are a few thousand lines between them, and re-reading disk on
-        // every Enter would put that latency directly in the user's way.
-        let mut opener = opener::Opener::load();
-        let activation_report = ActivationReport::from_env("files");
+        let mut launcher = FileLauncher::load();
 
         let mut title = painter.title();
         loop {
@@ -178,19 +173,9 @@ impl App {
             if let Some(path) = painter.take_pending_open() {
                 // Deliberately outside the paint callback: spawning a process
                 // mid-frame would run it while the framebuffer is borrowed.
-                //
-                // The token is minted here, per open, because it is spent by
-                // the launch it authorises: it carries the serial of the
-                // click that asked for this file, so the compositor lets the
-                // handler's window come to the user rather than treating it
-                // as focus stealing.
-                let token = window.activation_token(None);
-                activation_report.record(token.as_ref(), window.supports_activation());
-                opener.set_activation(
-                    token.map(|token| opener::ActivationToken::new(token.into_string())),
-                );
-                opener.open(&path);
+                launcher.request(&mut window, path);
             }
+            launcher.open_answered(&mut window);
 
             // Same reasoning as `take_pending_open`: starting a drag talks
             // to the `Toplevel`, which `Painter::on_pointer` cannot reach.
@@ -226,35 +211,7 @@ impl App {
                 return Self::finish(window);
             }
 
-            Self::idle_wait(&window, &painter);
-        }
-    }
-
-    /// Sleep until the compositor, the directory watcher, or the idle
-    /// timeout wakes the loop.
-    ///
-    /// [`Toplevel::wait`] can only sleep on its own eventfd; with a live
-    /// directory watch the loop must also wake when files change, so both
-    /// fds go through the same `poll(2)` primitive the portal loop uses to
-    /// multiplex its bus socket. The waker is drained here, exactly as
-    /// [`Toplevel::wait`] drains it, so an armed counter cannot turn every
-    /// later wait into an instant return; the counter semantics still
-    /// preserve any signal that raced in during the pass.
-    fn idle_wait(window: &Toplevel, painter: &FilesWindow) {
-        let timeout = window.wait_timeout_ms(Self::IDLE_TIMEOUT_MS);
-        match painter.watch_fd() {
-            Some(watch_fd) => {
-                let (waker_ready, _) =
-                    waker::Poller::two(window.waker().raw_fd(), watch_fd).poll_two(timeout);
-                if waker_ready {
-                    window.waker().drain();
-                }
-                // The watcher side is read by `poll_storage` on the next
-                // pass; nothing to do with the readiness bit here.
-            }
-            None => {
-                window.wait(timeout);
-            }
+            idle_wait::IdleWait::sleep(&window, &mut painter);
         }
     }
 
@@ -264,8 +221,8 @@ impl App {
     ///
     /// Each is pulled once per pass, and none is a response to an event:
     ///
-    /// * Devices attach and detach on their own. That poll is interval-gated
-    ///   inside, so an ordinary pass costs a clock read.
+    /// * Devices attach and detach on their own. That poll acts only on a
+    ///   signal from the kernel, so an ordinary pass costs a flag test.
     /// * A mount runs on a worker thread, and its password prompt **blocks
     ///   that thread** until this call collects it. A skipped pass is a
     ///   worker left waiting and a modal that never appears, so this is the

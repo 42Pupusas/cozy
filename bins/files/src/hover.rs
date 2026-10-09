@@ -42,6 +42,7 @@ pub enum Pane {
     /// The tile field.
     Tiles,
     /// The places sidebar.
+    #[allow(dead_code)]
     Sidebar,
 }
 

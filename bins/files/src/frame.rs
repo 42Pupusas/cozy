@@ -44,13 +44,8 @@ impl Frame {
         );
         let gutters = spacing.gutter() * 2;
         let need = card_visible.then(|| MinCell {
-            w: spacing.tile_min() + gutters,
-            h: metrics.nav
-                + metrics.crumbs
-                + metrics.filter
-                + metrics.status
-                + metrics.places_row
-                + gutters,
+            w: spacing.card_width() + gutters,
+            h: metrics.nav + metrics.crumbs + metrics.filter + metrics.storage + gutters,
         });
         Self {
             size: Rect::new(0, 0, width, height),
@@ -106,9 +101,7 @@ mod tests {
         nav: 58,
         crumbs: 34,
         filter: 43,
-        places_row: 34,
         storage: 42,
-        status: 35,
     };
 
     fn spacing() -> Spacing {
@@ -146,11 +139,11 @@ mod tests {
     }
 
     #[test]
-    fn the_card_needs_one_tile_width_and_its_chrome_plus_a_place() {
+    fn the_card_needs_its_width_and_the_height_of_its_chrome_and_footer() {
         let need = frame(1280, 790).card_need().expect("shown");
         let gutters = spacing().gutter() * 2;
-        assert_eq!(need.w, spacing().tile_min() + gutters);
-        assert_eq!(need.h, 58 + 34 + 43 + 35 + 34 + gutters);
+        assert_eq!(need.w, spacing().card_width() + gutters);
+        assert_eq!(need.h, 58 + 34 + 43 + 42 + gutters);
     }
 
     #[test]

@@ -6,13 +6,16 @@ use platform::draw::{Point, Rect};
 use crate::browser::Browser;
 use crate::dir_sizes::DirSizes;
 use crate::spiral::{MinCell, SpiralLayout};
+use crate::tile_coloring::TileColoring;
 use crate::tile_rank::{Tile, TileRank};
 
-/// A tile and the cell it occupies.
+/// A tile, the cell it occupies, and which of the theme's tile fills it
+/// takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlacedTile {
     pub tile: Tile,
     pub rect: Rect,
+    pub slot: usize,
 }
 
 /// The tiles of the open page, and the innermost cell kept for the card.
@@ -117,6 +120,7 @@ impl TileField {
                 card: None,
             };
         };
+        let spiral = spiral.with_prominent_last().with_last_height(need.h);
         let cells = if rest == 0 {
             1
         } else {
@@ -132,10 +136,12 @@ impl TileField {
     }
 
     fn place(tiles: Vec<Tile>, cells: Vec<Rect>) -> Vec<PlacedTile> {
+        let slots = TileColoring::of(&cells).slots();
         tiles
             .into_iter()
             .zip(cells)
-            .map(|(tile, rect)| PlacedTile { tile, rect })
+            .zip(slots)
+            .map(|((tile, rect), slot)| PlacedTile { tile, rect, slot })
             .collect()
     }
 
@@ -266,6 +272,7 @@ mod tests {
     use crate::browser::Browser;
     use crate::spiral::MinCell;
     use crate::test_support::TempDir;
+    use crate::tile_coloring::TileColoring;
     use crate::tile_rank::Tile;
     use platform::draw::{Point, Rect};
 
@@ -477,22 +484,38 @@ mod tests {
     }
 
     #[test]
-    fn the_card_takes_the_innermost_cell() {
+    fn the_card_takes_the_innermost_cell_and_outgrows_the_small_tiles() {
         let (field, _browser, _dir) = crowded_field("tile_field_card_last");
         let arranged = field.arrange(AREA, 120, Some(NEED));
         let card = arranged.card.expect("a reserved card gets a cell");
         assert!(card.w >= NEED.w && card.h >= NEED.h, "{card:?}");
-        let smallest_tile = arranged
+        let areas: Vec<i64> = arranged
             .tiles
             .iter()
             .map(|p| i64::from(p.rect.w) * i64::from(p.rect.h))
-            .min()
-            .expect("tiles");
-        assert!(
-            i64::from(card.w) * i64::from(card.h) <= smallest_tile * 2,
-            "the card is the end of the spiral, not its lead"
-        );
+            .collect();
+        let card_area = i64::from(card.w) * i64::from(card.h);
+        let smallest = areas.iter().min().copied().expect("tiles");
+        let largest = areas.iter().max().copied().expect("tiles");
+        assert!(card_area > smallest, "the card outgrows the smallest tile");
+        assert!(card_area < largest, "the card does not lead the field");
         assert!(arranged.tiles.iter().all(|p| p.rect != card));
+    }
+
+    #[test]
+    fn bordering_tiles_never_share_a_fill_slot() {
+        for reserve in [None, Some(NEED)] {
+            let (field, _browser, _dir) = crowded_field("tile_field_slots");
+            let placed = field.arrange(AREA, 120, reserve).tiles;
+            assert!(placed.len() > 4, "enough tiles to need several slots");
+            for (i, a) in placed.iter().enumerate() {
+                for b in &placed[i + 1..] {
+                    if TileColoring::borders(a.rect, b.rect) {
+                        assert_ne!(a.slot, b.slot, "{:?} borders {:?}", a.rect, b.rect);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -12,11 +12,10 @@ use crate::tile_scene::TileScene;
 pub struct SectionMode;
 
 impl SectionMode {
-    pub fn run(size: LogicalSize, tiles: usize, seconds: u64) {
+    pub fn run(size: LogicalSize, mut scene: TileScene, seconds: u64) {
         let wake = waker::Waker::new().expect("create waker");
         let mut window = SceneWindow::new("tile-compare: sections", "tile-compare", size, wake)
             .expect("open window");
-        let mut scene = TileScene::new(tiles);
         let mut report = RunReport::begin("sections");
         while report.elapsed() < Duration::from_secs(seconds) && !window.is_closing() {
             window.request_redraw();
@@ -33,6 +32,7 @@ impl SectionMode {
                 }
             }
             window.wait(16);
+            report.sample_gpu();
         }
         let extra = format!(
             "sections        {} surfaces, {} colour buffers",

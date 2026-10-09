@@ -31,7 +31,7 @@ impl Painter for BufferMode {
 }
 
 impl BufferMode {
-    pub fn run(size: LogicalSize, tiles: usize, seconds: u64) {
+    pub fn run(size: LogicalSize, scene: TileScene, seconds: u64) {
         let wake = waker::Waker::new().expect("create waker");
         let mut window = Toplevel::new(
             "tile-compare: buffer",
@@ -42,7 +42,7 @@ impl BufferMode {
         )
         .expect("open window");
         let mut mode = Self {
-            scene: TileScene::new(tiles),
+            scene,
             paint_time: Duration::ZERO,
             painted: false,
         };
@@ -58,6 +58,7 @@ impl BufferMode {
                 mode.scene.advance();
             }
             window.wait(16);
+            report.sample_gpu();
         }
         let size = window.size();
         let _ = window.close();

@@ -1,5 +1,5 @@
-//! [`TileScene`] -- a spiral of tiles that shrink by rank, a quarter of
-//! which change colour each frame.
+//! [`TileScene`] -- a spiral of tiles that shrink by rank, one in `period`
+//! of which change colour each frame.
 
 use monitor::weighted_spiral::WeightedSpiral;
 use platform::draw::{Color, Rect};
@@ -7,6 +7,7 @@ use platform::scene::SolidFrame;
 
 pub struct TileScene {
     tiles: usize,
+    period: u64,
     frame: u64,
 }
 
@@ -25,8 +26,12 @@ impl TileScene {
     ];
 
     #[must_use]
-    pub const fn new(tiles: usize) -> Self {
-        Self { tiles, frame: 0 }
+    pub const fn new(tiles: usize, period: u64) -> Self {
+        Self {
+            tiles,
+            period: if period == 0 { 1 } else { period },
+            frame: 0,
+        }
     }
 
     pub const fn advance(&mut self) {
@@ -63,12 +68,12 @@ impl TileScene {
         frame
     }
 
-    /// Tile `index` steps its brightness on every fourth frame, offset by its
-    /// index, so a quarter of the tiles change on any frame.
+    /// Tile `index` steps its brightness once every `period` frames, offset
+    /// by its index, so one tile in `period` changes on any frame.
     fn color(&self, index: usize) -> Color {
         let base = Self::HUES[index % Self::HUES.len()];
         let index = index as u64;
-        let step = (self.frame + index) / 4 + index * 7;
+        let step = (self.frame + index) / self.period + index * 7;
         let level = step % (2 * Self::LEVELS);
         let level = if level >= Self::LEVELS {
             2 * Self::LEVELS - 1 - level
@@ -87,7 +92,7 @@ mod tests {
 
     #[test]
     fn every_tile_lands_inside_the_window() {
-        let frame = TileScene::new(40).frame(1200, 800);
+        let frame = TileScene::new(40, 4).frame(1200, 800);
         assert_eq!(frame.rects.len(), 40);
         for tile in &frame.rects {
             assert!(tile.rect.x >= 0 && tile.rect.right() <= 1200);
@@ -97,7 +102,7 @@ mod tests {
 
     #[test]
     fn about_a_quarter_of_the_tiles_change_per_frame() {
-        let mut scene = TileScene::new(40);
+        let mut scene = TileScene::new(40, 4);
         let before = scene.frame(1200, 800);
         scene.advance();
         let after = scene.frame(1200, 800);
@@ -111,8 +116,23 @@ mod tests {
     }
 
     #[test]
+    fn every_tile_changes_each_frame_at_period_one() {
+        let mut scene = TileScene::new(40, 1);
+        let before = scene.frame(1200, 800);
+        scene.advance();
+        let after = scene.frame(1200, 800);
+        let changed = before
+            .rects
+            .iter()
+            .zip(&after.rects)
+            .filter(|(a, b)| a.color != b.color)
+            .count();
+        assert!(changed >= 36, "{changed} of 40 changed");
+    }
+
+    #[test]
     fn the_palette_stays_small_enough_to_share_buffers() {
-        let mut scene = TileScene::new(40);
+        let mut scene = TileScene::new(40, 4);
         let mut seen = std::collections::HashSet::new();
         for _ in 0..2_000 {
             for tile in scene.frame(1200, 800).rects {

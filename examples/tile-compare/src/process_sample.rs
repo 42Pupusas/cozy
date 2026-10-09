@@ -1,5 +1,5 @@
-//! [`ProcessSample`] -- this process's CPU time and resident memory, read
-//! from `/proc/self`.
+//! [`ProcessSample`] -- a process's CPU time and resident memory, read from
+//! `/proc/<pid>`.
 
 use std::time::Duration;
 
@@ -15,8 +15,18 @@ impl ProcessSample {
 
     #[must_use]
     pub fn now() -> Self {
-        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
-        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        Self::read("self")
+    }
+
+    #[must_use]
+    pub fn of(pid: u32) -> Self {
+        Self::read(&pid.to_string())
+    }
+
+    fn read(proc_entry: &str) -> Self {
+        let stat = std::fs::read_to_string(format!("/proc/{proc_entry}/stat")).unwrap_or_default();
+        let status =
+            std::fs::read_to_string(format!("/proc/{proc_entry}/status")).unwrap_or_default();
         Self {
             cpu: Self::parse_cpu(&stat),
             rss_kb: Self::parse_rss(&status),
@@ -68,5 +78,10 @@ mod tests {
     #[test]
     fn this_process_reports_some_memory() {
         assert!(ProcessSample::now().rss_kb > 0);
+    }
+
+    #[test]
+    fn this_process_by_pid_matches_self() {
+        assert!(ProcessSample::of(std::process::id()).rss_kb > 0);
     }
 }

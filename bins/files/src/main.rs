@@ -16,6 +16,7 @@
 //! needing a compositor and a pair of eyes.
 
 mod action_icon;
+mod action_tray;
 mod breadcrumb;
 mod browser;
 mod card_surface;
@@ -38,6 +39,7 @@ mod metric_overrides;
 mod mount_service;
 #[allow(dead_code)]
 mod mount_session;
+mod move_prompt;
 mod options;
 mod password_modal;
 mod password_panel;

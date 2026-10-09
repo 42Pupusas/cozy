@@ -18,6 +18,8 @@ pub struct TileMotion {
     reveal: Fades<TileKey>,
     glow: Fades<(usize, TileAction)>,
     press: Fades<(usize, TileAction)>,
+    chosen: Fades<usize>,
+    tray: Fades<usize>,
 }
 
 impl TileMotion {
@@ -30,6 +32,8 @@ impl TileMotion {
             reveal: Fades::new(),
             glow: Fades::new(),
             press: Fades::new(),
+            chosen: Fades::new(),
+            tray: Fades::new(),
         }
     }
 
@@ -39,13 +43,22 @@ impl TileMotion {
         self.press.aim(&held, now_ms);
     }
 
-    /// Point the glides at what is under the pointer and at the keyboard
-    /// cursor's tile.
+    /// Point the glides at what is under the pointer, at the keyboard
+    /// cursor's tile and at the selected tiles.
     ///
-    /// A tile rises for either, but only a pointer brings the buttons, since
-    /// a key cannot press them. `actions` is false while a name is being
-    /// edited, when the buttons would sit over the box.
-    pub fn aim(&mut self, spot: Option<Spot>, cursor: Option<usize>, actions: bool, now_ms: u64) {
+    /// A tile rises for any of them, and for the tray open under it, but
+    /// only a pointer brings the buttons, since a key cannot press them. A
+    /// selected tile also takes the strong border. `actions` is false while a
+    /// name is being edited, when the buttons would sit over the box.
+    pub fn aim(
+        &mut self,
+        spot: Option<Spot>,
+        cursor: Option<usize>,
+        selected: &[usize],
+        tray: Option<usize>,
+        actions: bool,
+        now_ms: u64,
+    ) {
         let pointed = match spot {
             Some(Spot::Item(Pane::Tiles, row) | Spot::Action(row, _)) => Some(TileKey::Item(row)),
             Some(Spot::Overflow) => Some(TileKey::Overflow),
@@ -54,12 +67,18 @@ impl TileMotion {
         let raised: Vec<TileKey> = pointed
             .into_iter()
             .chain(cursor.map(TileKey::Item))
+            .chain(selected.iter().copied().map(TileKey::Item))
+            .chain(tray.map(TileKey::Item))
             .collect();
         self.raise.aim(&raised, now_ms);
+        self.chosen.aim(selected, now_ms);
+        let open: Vec<usize> = tray.into_iter().collect();
+        self.tray.aim(&open, now_ms);
 
         let shown: Vec<TileKey> = pointed
-            .filter(|key| actions && matches!(key, TileKey::Item(_)))
             .into_iter()
+            .chain(tray.map(TileKey::Item))
+            .filter(|key| actions && matches!(key, TileKey::Item(_)))
             .collect();
         self.reveal.aim(&shown, now_ms);
 
@@ -75,6 +94,25 @@ impl TileMotion {
         self.reveal.advance(now_ms);
         self.glow.advance(now_ms);
         self.press.advance(now_ms);
+        self.chosen.advance(now_ms);
+        self.tray.advance(now_ms);
+    }
+
+    /// How far the tray under the tile at `row` has opened.
+    #[must_use]
+    pub fn tray(&self, row: usize) -> u8 {
+        self.tray.level(&row)
+    }
+
+    /// Whether the tray at `row` is open enough to be pressed.
+    #[must_use]
+    pub fn tray_is_live(&self, row: usize) -> bool {
+        self.tray(row) >= Self::LIVE_FROM
+    }
+
+    #[must_use]
+    pub fn chosen(&self, row: usize) -> u8 {
+        self.chosen.level(&row)
     }
 
     #[must_use]
@@ -112,6 +150,8 @@ impl TileMotion {
             || self.reveal.is_animating()
             || self.glow.is_animating()
             || self.press.is_animating()
+            || self.chosen.is_animating()
+            || self.tray.is_animating()
     }
 }
 
@@ -149,7 +189,7 @@ mod tests {
     #[test]
     fn a_hovered_tile_rises_and_shows_its_buttons_but_lights_none() {
         let mut motion = TileMotion::new();
-        motion.aim(Some(over(2)), None, true, 0);
+        motion.aim(Some(over(2)), None, &[], None, true, 0);
         motion.run(0, 20);
         assert_eq!(motion.raise(TileKey::Item(2)), 255);
         assert_eq!(motion.reveal(TileKey::Item(2)), 255);
@@ -161,7 +201,7 @@ mod tests {
     #[test]
     fn nothing_moves_on_the_first_frame_and_then_it_does() {
         let mut motion = TileMotion::new();
-        motion.aim(Some(over(0)), None, true, 1000);
+        motion.aim(Some(over(0)), None, &[], None, true, 1000);
         assert!(motion.is_animating());
         assert_eq!(motion.raise(TileKey::Item(0)), 0);
         motion.advance(1032);
@@ -171,7 +211,14 @@ mod tests {
     #[test]
     fn a_button_under_the_pointer_lights_while_its_tile_stays_raised() {
         let mut motion = TileMotion::new();
-        motion.aim(Some(Spot::Action(1, TileAction::Copy)), None, true, 0);
+        motion.aim(
+            Some(Spot::Action(1, TileAction::Copy)),
+            None,
+            &[],
+            None,
+            true,
+            0,
+        );
         motion.run(0, 20);
         assert_eq!(motion.glow(1, TileAction::Copy), 255);
         assert_eq!(motion.glow(1, TileAction::Cut), 0);
@@ -203,7 +250,7 @@ mod tests {
     #[test]
     fn the_keyboard_cursor_raises_its_tile_without_buttons() {
         let mut motion = TileMotion::new();
-        motion.aim(None, Some(4), true, 0);
+        motion.aim(None, Some(4), &[], None, true, 0);
         motion.run(0, 20);
         assert_eq!(motion.raise(TileKey::Item(4)), 255);
         assert_eq!(motion.reveal(TileKey::Item(4)), 0);
@@ -212,7 +259,7 @@ mod tests {
     #[test]
     fn buttons_become_pressable_only_once_mostly_visible() {
         let mut motion = TileMotion::new();
-        motion.aim(Some(over(0)), None, true, 0);
+        motion.aim(Some(over(0)), None, &[], None, true, 0);
         assert!(!motion.buttons_are_live(0), "not at the first frame");
         motion.run(0, 20);
         assert!(motion.buttons_are_live(0));
@@ -222,7 +269,7 @@ mod tests {
     #[test]
     fn the_overflow_tile_rises_but_has_no_buttons() {
         let mut motion = TileMotion::new();
-        motion.aim(Some(Spot::Overflow), None, true, 0);
+        motion.aim(Some(Spot::Overflow), None, &[], None, true, 0);
         motion.run(0, 20);
         assert_eq!(motion.raise(TileKey::Overflow), 255);
         assert_eq!(motion.reveal(TileKey::Overflow), 0);
@@ -231,7 +278,14 @@ mod tests {
     #[test]
     fn buttons_stay_hidden_while_a_name_is_being_edited() {
         let mut motion = TileMotion::new();
-        motion.aim(Some(Spot::Action(0, TileAction::Rename)), None, false, 0);
+        motion.aim(
+            Some(Spot::Action(0, TileAction::Rename)),
+            None,
+            &[],
+            None,
+            false,
+            0,
+        );
         motion.run(0, 20);
         assert_eq!(motion.reveal(TileKey::Item(0)), 0);
         assert_eq!(motion.glow(0, TileAction::Rename), 0);
@@ -241,9 +295,16 @@ mod tests {
     #[test]
     fn moving_off_lets_everything_fall_and_settle() {
         let mut motion = TileMotion::new();
-        motion.aim(Some(Spot::Action(0, TileAction::Copy)), None, true, 0);
+        motion.aim(
+            Some(Spot::Action(0, TileAction::Copy)),
+            None,
+            &[],
+            None,
+            true,
+            0,
+        );
         motion.run(0, 20);
-        motion.aim(None, None, true, 400);
+        motion.aim(None, None, &[], None, true, 400);
         motion.run(400, 20);
         assert_eq!(motion.raise(TileKey::Item(0)), 0);
         assert_eq!(motion.reveal(TileKey::Item(0)), 0);
@@ -254,16 +315,16 @@ mod tests {
     #[test]
     fn a_control_in_the_card_raises_no_tile() {
         let mut motion = TileMotion::new();
-        motion.aim(Some(Spot::Control(Target::Home)), None, true, 0);
+        motion.aim(Some(Spot::Control(Target::Home)), None, &[], None, true, 0);
         assert!(!motion.is_animating());
     }
 
     #[test]
     fn crossing_to_a_neighbour_hands_the_rise_over() {
         let mut motion = TileMotion::new();
-        motion.aim(Some(over(0)), None, true, 0);
+        motion.aim(Some(over(0)), None, &[], None, true, 0);
         motion.run(0, 20);
-        motion.aim(Some(over(1)), None, true, 400);
+        motion.aim(Some(over(1)), None, &[], None, true, 400);
         motion.run(400, 3);
         let left = motion.raise(TileKey::Item(0));
         let entered = motion.raise(TileKey::Item(1));

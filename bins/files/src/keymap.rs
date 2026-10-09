@@ -38,6 +38,9 @@ pub enum Focus {
     /// from under an open rename box would leave it editing a row the user
     /// is no longer looking at.
     Rename,
+    /// The "move to" path box. It takes keys exactly as the rename box
+    /// does, for the same reason: the list must not move under it.
+    Move,
     /// The password prompt. Letters type, and it is the most exclusive mode
     /// of the four: a key that is not part of the reply is *swallowed*
     /// rather than passed to the list. A password prompt that let Delete
@@ -96,6 +99,10 @@ pub enum Action {
     CommitRename,
     /// Abandon the rename, keeping the original name.
     CancelRename,
+    /// Move the entries to the folder typed in the "move to" box.
+    CommitMove,
+    /// Abandon the "move to" box.
+    CancelMove,
     /// Close the window.
     Quit,
 }
@@ -161,6 +168,12 @@ impl Keymap {
         matches!(self.focus, Focus::Rename)
     }
 
+    /// Whether the "move to" box is active.
+    #[must_use]
+    pub const fn is_moving(self) -> bool {
+        matches!(self.focus, Focus::Move)
+    }
+
     /// Whether the password prompt is active.
     ///
     /// The window asks this to decide whether to draw the modal and to stop
@@ -182,6 +195,7 @@ impl Keymap {
             Focus::List => Self::in_list(press),
             Focus::Filter => Self::in_filter(press),
             Focus::Rename => Self::in_rename(press),
+            Focus::Move => Self::in_move(press),
             Focus::Password => Self::in_password(press),
         }
     }
@@ -318,6 +332,16 @@ impl Keymap {
             Key::End => Some(Action::Edit(EditAction::End)),
             Key::Char(c) => Some(Action::Insert(c)),
             _ => None,
+        }
+    }
+
+    /// Bindings while the "move to" box has focus: the rename box's, with
+    /// Enter and Escape ending the move instead.
+    const fn in_move(press: KeyPress) -> Option<Action> {
+        match Self::in_rename(press) {
+            Some(Action::CommitRename) => Some(Action::CommitMove),
+            Some(Action::CancelRename) => Some(Action::CancelMove),
+            other => other,
         }
     }
 
@@ -764,6 +788,39 @@ mod tests {
             map.translate(press(Key::Escape)),
             Some(Action::CancelRename)
         );
+    }
+
+    fn move_map() -> Keymap {
+        let mut map = Keymap::new();
+        map.set_focus(Focus::Move);
+        map
+    }
+
+    #[test]
+    fn the_move_box_ends_on_enter_and_escape() {
+        let map = move_map();
+        assert!(map.is_moving());
+        assert_eq!(map.translate(press(Key::Enter)), Some(Action::CommitMove));
+        assert_eq!(map.translate(press(Key::Escape)), Some(Action::CancelMove));
+    }
+
+    #[test]
+    fn the_move_box_types_and_edits_like_the_rename_box_and_frees_no_list_key() {
+        let map = move_map();
+        assert_eq!(
+            map.translate(press(Key::Char('z'))),
+            Some(Action::Insert('z'))
+        );
+        assert_eq!(
+            map.translate(press(Key::Left)),
+            Some(Action::Edit(EditAction::Left))
+        );
+        assert_eq!(map.translate(press(Key::Down)), None);
+        assert_eq!(
+            map.translate(press(Key::Delete)),
+            Some(Action::Edit(EditAction::Delete))
+        );
+        assert_eq!(map.translate(with_mods(Key::Char('x'), CTRL)), None);
     }
 
     #[test]

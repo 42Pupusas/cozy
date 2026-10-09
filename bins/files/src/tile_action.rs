@@ -1,5 +1,6 @@
 //! [`TileAction`] and [`ActionBar`] -- the buttons a hovered tile offers, and
-//! where they sit on it.
+//! where they sit on it. The rest of the actions live on the tray a right
+//! click opens, laid out by [`crate::action_tray::ActionTray`].
 
 use platform::draw::{Point, Rect};
 
@@ -12,10 +13,52 @@ pub enum TileAction {
     Copy,
     Cut,
     Rename,
+    MoveTo,
+    Open,
+    Duplicate,
+    CopyName,
+    Trash,
 }
 
 impl TileAction {
-    pub const ALL: [Self; 4] = [Self::CopyPath, Self::Copy, Self::Cut, Self::Rename];
+    /// The buttons a hovered tile shows.
+    pub const PRIMARY: [Self; 3] = [Self::CopyPath, Self::Copy, Self::Cut];
+    /// The buttons a right click opens, in reading order: two rows of three.
+    pub const MENU: [Self; 6] = [
+        Self::Rename,
+        Self::MoveTo,
+        Self::Open,
+        Self::Duplicate,
+        Self::CopyName,
+        Self::Trash,
+    ];
+    pub const ALL: [Self; 9] = [
+        Self::CopyPath,
+        Self::Copy,
+        Self::Cut,
+        Self::Rename,
+        Self::MoveTo,
+        Self::Open,
+        Self::Duplicate,
+        Self::CopyName,
+        Self::Trash,
+    ];
+
+    /// What the action is called, for the tray's caption.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CopyPath => "Copy path",
+            Self::Copy => "Copy",
+            Self::Cut => "Cut",
+            Self::Rename => "Rename",
+            Self::MoveTo => "Move to",
+            Self::Open => "Open",
+            Self::Duplicate => "Duplicate",
+            Self::CopyName => "Copy name",
+            Self::Trash => "Trash",
+        }
+    }
 
     /// Position in [`Self::ALL`], for arrays indexed by action.
     #[must_use]
@@ -25,6 +68,11 @@ impl TileAction {
             Self::Copy => 1,
             Self::Cut => 2,
             Self::Rename => 3,
+            Self::MoveTo => 4,
+            Self::Open => 5,
+            Self::Duplicate => 6,
+            Self::CopyName => 7,
+            Self::Trash => 8,
         }
     }
 }
@@ -44,7 +92,7 @@ impl ActionBar {
     /// set varies.
     #[must_use]
     pub fn fit(face: Rect, text_bottom: i32, spacing: Spacing) -> Self {
-        let count = i32::try_from(TileAction::ALL.len()).unwrap_or(1);
+        let count = i32::try_from(TileAction::PRIMARY.len()).unwrap_or(1);
         let gap = spacing.xs();
         let margin = spacing.s();
         let across = (face.w - margin * 2 - gap * (count - 1)) / count;
@@ -59,7 +107,7 @@ impl ActionBar {
         let top = centred
             .max(text_bottom + gap)
             .min(face.bottom() - margin - side);
-        let buttons = TileAction::ALL
+        let buttons = TileAction::PRIMARY
             .into_iter()
             .zip(0..)
             .map(|(action, i)| (action, Rect::new(left + i * (side + gap), top, side, side)))
@@ -103,10 +151,29 @@ mod tests {
     }
 
     #[test]
-    fn a_roomy_face_gets_every_action_in_order() {
+    fn all_is_the_hover_buttons_then_the_menu() {
+        let joined: Vec<TileAction> = TileAction::PRIMARY
+            .into_iter()
+            .chain(TileAction::MENU)
+            .collect();
+        assert_eq!(joined, TileAction::ALL);
+    }
+
+    #[test]
+    fn every_action_has_its_own_label() {
+        for (i, a) in TileAction::ALL.iter().enumerate() {
+            assert!(!a.label().is_empty());
+            for b in &TileAction::ALL[i + 1..] {
+                assert_ne!(a.label(), b.label());
+            }
+        }
+    }
+
+    #[test]
+    fn a_roomy_face_gets_the_three_hover_buttons_in_order() {
         let bar = ActionBar::fit(roomy(), 40, spacing());
         let order: Vec<TileAction> = bar.buttons().iter().map(|(a, _)| *a).collect();
-        assert_eq!(order, TileAction::ALL);
+        assert_eq!(order, TileAction::PRIMARY);
     }
 
     #[test]

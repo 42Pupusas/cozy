@@ -36,6 +36,7 @@ use crate::clipboard::{FileClipboard, Transfer};
 use crate::dirs_watch::DirsWatch;
 use crate::history::{History, Trail};
 use crate::keymap::{Action, EditAction, Focus, Keymap};
+use crate::move_prompt::MovePrompt;
 use crate::password_modal::PasswordModal;
 use crate::rename::Rename;
 
@@ -100,6 +101,8 @@ pub struct Browser {
     trash: Option<fileops::Trash>,
     /// The inline rename box, when F2 has opened one.
     rename: Rename,
+    /// The "move to" path box, when a tile's action has opened one.
+    move_prompt: MovePrompt,
     /// The password prompt, when a mount has provoked one.
     password: PasswordModal,
     /// The outcome of the last file operation, shown in the status line.
@@ -137,6 +140,7 @@ impl Browser {
             clipboard: FileClipboard::new(),
             trash: None,
             rename: Rename::new(),
+            move_prompt: MovePrompt::new(),
             password: PasswordModal::new(),
             notice: None,
             listing: 0,
@@ -330,6 +334,155 @@ impl Browser {
         Outcome::Redraw
     }
 
+    /// The name of the entry at `row`.
+    #[must_use]
+    pub fn name_of(&self, row: usize) -> Option<String> {
+        self.entry(row).map(|e| e.name.clone())
+    }
+
+    /// Move the entry at `row` to the trash.
+    pub fn trash_entry(&mut self, row: usize) -> Outcome {
+        let Some(path) = self.path_of(row) else {
+            return Outcome::Ignored;
+        };
+        self.trash_paths(&[path])
+    }
+
+    /// Copy the entry at `row` beside itself, under a free name such as
+    /// `report (1).pdf`, and put the cursor on the copy.
+    pub fn duplicate_entry(&mut self, row: usize) -> Outcome {
+        let Some(path) = self.path_of(row) else {
+            return Outcome::Ignored;
+        };
+        let Some(parent) = path.parent() else {
+            return Outcome::Ignored;
+        };
+        let transfer = fileops::Transfer::new(
+            fileops::ConflictResolver::new(fileops::ConflictPolicy::Rename),
+            fileops::Progress::new(),
+        );
+        match transfer.copy_into(&path, parent) {
+            Ok(done) => {
+                self.notice = Some(Self::describe(1, "duplicated"));
+                let outcome = self.refresh();
+                self.select_path(&done.dest);
+                outcome
+            }
+            Err(e) => {
+                eprintln!("files: could not duplicate {}: {e}", path.display());
+                self.notice = Some(format!("could not duplicate: {e}"));
+                Outcome::Redraw
+            }
+        }
+    }
+
+    /// Open the "move to" box for the entry at `row`.
+    pub fn move_entry(&mut self, row: usize) -> Outcome {
+        let Some(path) = self.path_of(row) else {
+            return Outcome::Ignored;
+        };
+        if self.rename.is_active() {
+            self.rename.cancel();
+        }
+        self.move_prompt.begin(vec![path], self.view.path());
+        if !self.move_prompt.is_active() {
+            return Outcome::Ignored;
+        }
+        self.keymap.set_focus(Focus::Move);
+        Outcome::Redraw
+    }
+
+    /// The "move to" box, for the window to paint.
+    #[must_use]
+    pub const fn move_prompt(&self) -> &MovePrompt {
+        &self.move_prompt
+    }
+
+    /// Whether the "move to" box has the keyboard.
+    #[must_use]
+    pub const fn is_moving(&self) -> bool {
+        self.keymap.is_moving()
+    }
+
+    /// Whether the typed destination is an existing folder.
+    #[must_use]
+    pub fn move_target_is_valid(&self) -> bool {
+        self.move_prompt
+            .destination(self.view.path(), Self::home().as_deref())
+            .is_some_and(|dir| dir.is_dir())
+    }
+
+    fn home() -> Option<PathBuf> {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
+
+    /// Move what the box was opened for into the typed folder. A folder that
+    /// does not exist leaves the box open to be corrected.
+    fn commit_move(&mut self) -> Outcome {
+        let Some(target) = self
+            .move_prompt
+            .destination(self.view.path(), Self::home().as_deref())
+        else {
+            return Outcome::Ignored;
+        };
+        if !target.is_dir() {
+            self.notice = Some(format!("{} is not a folder", target.display()));
+            return Outcome::Redraw;
+        }
+        let sources = self.move_prompt.finish();
+        self.keymap.set_focus(Focus::List);
+        let transfer = fileops::Transfer::new(
+            fileops::ConflictResolver::new(fileops::ConflictPolicy::Rename),
+            fileops::Progress::new(),
+        );
+        let mut done = 0usize;
+        let mut failed = 0usize;
+        for source in sources
+            .iter()
+            .filter(|s| s.parent() != Some(target.as_path()))
+        {
+            match transfer.move_into(source, &target) {
+                Ok(_) => done += 1,
+                Err(e) => {
+                    failed += 1;
+                    eprintln!("files: could not move {}: {e}", source.display());
+                }
+            }
+        }
+        if done == 0 && failed == 0 {
+            self.notice = Some(String::from("already in that folder"));
+            return Outcome::Redraw;
+        }
+        self.after_removal(done, failed, "moved")
+    }
+
+    fn cancel_move(&mut self) -> Outcome {
+        let was_active = self.move_prompt.is_active();
+        self.move_prompt.cancel();
+        self.keymap.set_focus(Focus::List);
+        Outcome::redraw_if(was_active)
+    }
+
+    /// Apply an edit to the "move to" box, reporting whether it changed.
+    fn edit_move(&mut self, edit: EditAction) -> bool {
+        let Some(input) = self.move_prompt.input_mut() else {
+            return false;
+        };
+        match edit {
+            EditAction::Backspace => input.backspace(),
+            EditAction::Delete => input.delete(),
+            EditAction::Left => input.move_left(),
+            EditAction::Right => input.move_right(),
+            EditAction::WordLeft => input.move_word_left(),
+            EditAction::WordRight => input.move_word_right(),
+            EditAction::Home => input.move_home(),
+            EditAction::End => input.move_end(),
+            EditAction::KillToEnd => input.delete_to_end(),
+            EditAction::KillToStart => input.delete_to_start(),
+            EditAction::DeleteWordLeft => input.delete_word_left(),
+        }
+    }
+
     /// The paths a drag started from `row` would carry.
     ///
     /// If `row` is part of the active selection, every selected path is
@@ -382,6 +535,7 @@ impl Browser {
         if self.rename.is_active() {
             self.commit_rename();
         }
+        self.move_prompt.cancel();
         self.keymap.set_focus(Focus::List);
         Outcome::redraw_if(self.pane.pick(row, mods).needs_redraw())
     }
@@ -403,6 +557,7 @@ impl Browser {
 
     /// Drop the selection, as a click on empty space does.
     pub fn clear_selection(&mut self) -> Outcome {
+        self.move_prompt.cancel();
         self.keymap.set_focus(Focus::List);
         self.list_command(ListCommand::ClearSelection)
     }
@@ -424,6 +579,11 @@ impl Browser {
                 if let Some(input) = self.rename.input_mut() {
                     return Outcome::redraw_if(input.insert(c));
                 }
+                if self.keymap.is_moving()
+                    && let Some(input) = self.move_prompt.input_mut()
+                {
+                    return Outcome::redraw_if(input.insert(c));
+                }
                 // Typing on the list implicitly opens the filter, which is
                 // what makes search-as-you-type work with no prefix key.
                 self.keymap.set_focus(Focus::Filter);
@@ -441,6 +601,9 @@ impl Browser {
                 }
                 if self.rename.is_active() {
                     return Outcome::redraw_if(self.edit_rename(edit));
+                }
+                if self.keymap.is_moving() {
+                    return Outcome::redraw_if(self.edit_move(edit));
                 }
                 let changed = self.edit(edit);
                 if changed {
@@ -488,6 +651,8 @@ impl Browser {
             Action::BeginRename => self.begin_rename(),
             Action::CommitRename => self.commit_rename(),
             Action::CancelRename => self.cancel_rename(),
+            Action::CommitMove => self.commit_move(),
+            Action::CancelMove => self.cancel_move(),
             Action::SubmitPassword => self.submit_password(),
             Action::DismissPassword => self.dismiss_password(),
             Action::ClearPassword => Outcome::redraw_if(self.password.clear()),
@@ -628,6 +793,10 @@ impl Browser {
     /// turn a recoverable action into an unrecoverable one.
     fn trash_selection(&mut self) -> Outcome {
         let paths = self.selected_paths();
+        self.trash_paths(&paths)
+    }
+
+    fn trash_paths(&mut self, paths: &[PathBuf]) -> Outcome {
         if paths.is_empty() {
             return Outcome::Ignored;
         }
@@ -640,7 +809,7 @@ impl Browser {
         };
         let mut done = 0usize;
         let mut failed = 0usize;
-        for path in &paths {
+        for path in paths {
             match trash.trash(path) {
                 Ok(_) => done += 1,
                 Err(e) => {
@@ -972,6 +1141,7 @@ impl Browser {
                 // longer exists in the new listing; keeping the session would
                 // leave the box floating over an unrelated file.
                 self.rename.cancel();
+                self.move_prompt.cancel();
                 self.notice = None;
                 self.keymap.set_focus(Focus::List);
                 self.listing += 1;

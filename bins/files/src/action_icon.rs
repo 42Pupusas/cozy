@@ -32,6 +32,11 @@ impl ActionIcon {
             TileAction::Copy => self.paint_pages(canvas),
             TileAction::Cut => self.paint_scissors(canvas),
             TileAction::Rename => self.paint_pencil(canvas),
+            TileAction::MoveTo => self.paint_move(canvas),
+            TileAction::Open => self.paint_open(canvas),
+            TileAction::Duplicate => self.paint_duplicate(canvas),
+            TileAction::CopyName => self.paint_name(canvas),
+            TileAction::Trash => self.paint_bin(canvas),
         }
     }
 
@@ -107,6 +112,106 @@ impl ActionIcon {
             Point::new(art.x, bottom),
             Point::new(art.x + art.w / 2, bottom),
         );
+    }
+
+    /// An arrow running into a wall.
+    fn paint_move(&self, canvas: &mut Canvas<'_>) {
+        let art = self.art();
+        let middle = art.y + art.h / 2;
+        let wall = art.x + art.w - 1;
+        let tip = wall - 2;
+        let head = (art.w / 3).max(2);
+        self.line(canvas, Point::new(art.x, middle), Point::new(tip, middle));
+        self.line(
+            canvas,
+            Point::new(tip, middle),
+            Point::new(tip - head, middle - head),
+        );
+        self.line(
+            canvas,
+            Point::new(tip, middle),
+            Point::new(tip - head, middle + head),
+        );
+        self.line(
+            canvas,
+            Point::new(wall, art.y),
+            Point::new(wall, art.y + art.h - 1),
+        );
+    }
+
+    /// A box with an arrow leaving its top right corner.
+    fn paint_open(&self, canvas: &mut Canvas<'_>) {
+        let art = self.art();
+        let side = (art.w * 3 / 4).max(3);
+        let radius = (art.w / 8).max(1);
+        canvas.draw_round_rect(
+            Rect::new(art.x, art.y + art.h - side, side, side),
+            self.ink,
+            radius,
+        );
+        let corner = Point::new(art.x + art.w - 1, art.y);
+        let head = (art.w / 3).max(2);
+        self.line(
+            canvas,
+            Point::new(art.x + art.w / 2, art.y + art.h / 2),
+            corner,
+        );
+        self.line(canvas, corner, Point::new(corner.x - head, corner.y));
+        self.line(canvas, corner, Point::new(corner.x, corner.y + head));
+    }
+
+    /// A page with a plus on it.
+    fn paint_duplicate(&self, canvas: &mut Canvas<'_>) {
+        let art = self.art();
+        canvas.draw_round_rect(art, self.ink, (art.w / 8).max(1));
+        let (x, y) = (art.x + art.w / 2, art.y + art.h / 2);
+        let arm = (art.w / 4).max(2);
+        self.line(canvas, Point::new(x - arm, y), Point::new(x + arm, y));
+        self.line(canvas, Point::new(x, y - arm), Point::new(x, y + arm));
+    }
+
+    /// A label with a capital T on it.
+    fn paint_name(&self, canvas: &mut Canvas<'_>) {
+        let art = self.art();
+        canvas.draw_round_rect(art, self.ink, (art.w / 8).max(1));
+        let (x, top) = (art.x + art.w / 2, art.y + art.h / 4);
+        let reach = (art.w / 4).max(2);
+        self.line(
+            canvas,
+            Point::new(x - reach, top),
+            Point::new(x + reach, top),
+        );
+        self.line(
+            canvas,
+            Point::new(x, top),
+            Point::new(x, art.y + art.h * 3 / 4),
+        );
+    }
+
+    /// A lidded bin with two slats.
+    fn paint_bin(&self, canvas: &mut Canvas<'_>) {
+        let art = self.art();
+        let lid = art.y + art.h / 5;
+        self.line(
+            canvas,
+            Point::new(art.x, lid),
+            Point::new(art.x + art.w - 1, lid),
+        );
+        let handle = (art.w / 5).max(1);
+        let middle = art.x + art.w / 2;
+        self.line(
+            canvas,
+            Point::new(middle - handle, art.y),
+            Point::new(middle + handle, art.y),
+        );
+        let inset = (art.w / 8).max(1);
+        let body = Rect::new(art.x + inset, lid, art.w - inset * 2, art.y + art.h - lid);
+        canvas.draw_round_rect(body, self.ink, (art.w / 10).max(1));
+        let slat_top = lid + body.h / 4;
+        let slat_bottom = lid + body.h * 3 / 4;
+        for x in [middle - art.w / 5, middle + art.w / 5] {
+            self.line(canvas, Point::new(x, slat_top), Point::new(x, slat_bottom));
+        }
     }
 
     /// Two chain links, side by side, with a join between them.

@@ -39,12 +39,6 @@ pub struct TileField {
     /// Rank offsets of the overflow pages opened so far, innermost last.
     pages: Vec<usize>,
     synced: Option<Synced>,
-    /// A folder tile pressed without modifiers, entered on release unless
-    /// the press turns into a drag.
-    armed: Option<usize>,
-    /// When a release last entered a folder, so the second half of a
-    /// habitual double-click does not land on a tile inside it.
-    entered_ms: Option<u64>,
 }
 
 impl TileField {
@@ -55,8 +49,6 @@ impl TileField {
             rank: TileRank::default(),
             pages: Vec::new(),
             synced: None,
-            armed: None,
-            entered_ms: None,
         }
     }
 
@@ -88,7 +80,6 @@ impl TileField {
         }
         if previous.is_none_or(|seen| seen.listing != listing) {
             self.pages.clear();
-            self.armed = None;
         }
         let now = Synced {
             listing,
@@ -234,35 +225,10 @@ impl TileField {
         self.pages.last().copied().unwrap_or(0)
     }
 
-    pub const fn arm(&mut self, row: usize) {
-        self.armed = Some(row);
-    }
-
-    pub const fn disarm(&mut self) {
-        self.armed = None;
-    }
-
-    /// The armed folder, consumed.
-    pub const fn take_armed(&mut self) -> Option<usize> {
-        self.armed.take()
-    }
-
     /// Visible-entry indices, largest first.
     #[must_use]
     pub fn ranked(&self) -> &[usize] {
         self.rank.order()
-    }
-
-    pub const fn entered(&mut self, now_ms: u64) {
-        self.entered_ms = Some(now_ms);
-    }
-
-    /// Whether a press at `now_ms` follows a folder entry closely enough to
-    /// be the rest of a double-click. Asking consumes the entry.
-    pub fn swallows(&mut self, now_ms: u64, within_ms: u64) -> bool {
-        self.entered_ms
-            .take()
-            .is_some_and(|then| now_ms.saturating_sub(then) <= within_ms)
     }
 }
 
@@ -412,11 +378,9 @@ mod tests {
             panic!("expected overflow");
         };
         field.open_more(from);
-        field.arm(0);
         browser.go_to(&dir.path().join("sub"));
         field.sync(&browser);
         assert_eq!(field.depth(), 0);
-        assert_eq!(field.take_armed(), None);
     }
 
     #[test]
@@ -429,17 +393,6 @@ mod tests {
         field.open_more(0);
         field.open_more(7);
         assert_eq!(field.depth(), 0);
-    }
-
-    #[test]
-    fn a_press_soon_after_entering_is_swallowed_once() {
-        let (mut field, _wake) = field();
-        assert!(!field.swallows(1000, 400));
-        field.entered(1000);
-        assert!(field.swallows(1300, 400));
-        assert!(!field.swallows(1310, 400));
-        field.entered(1000);
-        assert!(!field.swallows(1500, 400));
     }
 
     #[test]

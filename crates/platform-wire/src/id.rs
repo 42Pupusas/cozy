@@ -109,6 +109,18 @@ object_ids! {
     ActivationId,
     /// `xdg_activation_token_v1` — one in-flight token request.
     ActivationTokenId,
+    /// `wl_region` — a set of rectangles (input and opaque regions).
+    RegionId,
+    /// `wl_subcompositor` — gives surfaces the subsurface role.
+    SubcompositorId,
+    /// `wl_subsurface` — a child surface positioned inside its parent.
+    SubsurfaceId,
+    /// `wp_viewporter` — the viewport factory global.
+    ViewporterId,
+    /// `wp_viewport` — per-surface crop and scale.
+    ViewportId,
+    /// `wp_single_pixel_buffer_manager_v1` — one-colour buffer factory.
+    SinglePixelBufferManagerId,
 }
 
 /// An event serial — echoed back in acks/pongs. Distinct from an object id so

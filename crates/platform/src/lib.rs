@@ -63,6 +63,7 @@ pub use platform_draw::surface_format;
 pub use platform_draw::text;
 
 mod render;
+pub mod scene;
 pub mod selection;
 pub mod surface;
 pub mod toplevel;

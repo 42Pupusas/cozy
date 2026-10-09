@@ -838,6 +838,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tile-compare"
+version = "0.1.0"
+dependencies = [
+ "monitor",
+ "platform",
+ "waker",
+]
+
+[[package]]
 name = "tlog"
 version = "0.1.0"
 

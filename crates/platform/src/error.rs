@@ -32,6 +32,7 @@ pub enum PlatformError {
     ReaderStopped,
     ReaderPanicked,
     ReaderSpawn(io::Error),
+    MissingGlobal(&'static str),
 }
 
 impl fmt::Display for PlatformError {
@@ -51,6 +52,7 @@ impl fmt::Display for PlatformError {
             Self::ReaderStopped => write!(f, "reader thread stopped unexpectedly"),
             Self::ReaderPanicked => write!(f, "reader thread panicked"),
             Self::ReaderSpawn(e) => write!(f, "failed to spawn reader thread: {e}"),
+            Self::MissingGlobal(name) => write!(f, "compositor does not offer {name}"),
         }
     }
 }
@@ -99,6 +101,14 @@ mod tests {
         assert_eq!(
             PlatformError::ReaderPanicked.to_string(),
             "reader thread panicked"
+        );
+    }
+
+    #[test]
+    fn display_missing_global_names_the_interface() {
+        assert_eq!(
+            PlatformError::MissingGlobal("wp_viewporter").to_string(),
+            "compositor does not offer wp_viewporter"
         );
     }
 

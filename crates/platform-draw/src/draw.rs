@@ -14,6 +14,7 @@
 //! **clipped** to the buffer bounds, so drawing partly (or wholly) off-screen
 //! paints only the visible part and never panics.
 
+use crate::clip::Clip;
 use crate::font;
 use crate::round_rect::RoundRect;
 use crate::surface_format::SurfaceFormat;
@@ -568,7 +569,14 @@ impl<'a> Canvas<'a> {
     /// with a configurable corner radius need no branch of their own.
     pub fn fill_round_rect(&mut self, rect: Rect, color: Color, radius: i32) {
         let packed = self.format.pack_paint(color);
-        self.fill_round_rect_packed(rect, color, radius, packed, u8::MAX);
+        self.fill_round_rect_packed(
+            rect,
+            color,
+            radius,
+            packed,
+            u8::MAX,
+            Clip::rows(rect.y, rect.bottom()),
+        );
     }
 
     /// [`Self::fill_round_rect`] for *background*: the rounded counterpart of
@@ -578,9 +586,47 @@ impl<'a> Canvas<'a> {
     /// the window's own alpha, so the arc fades into the desktop rather than
     /// leaving an opaque fringe around a translucent card.
     pub fn fill_round_rect_glass(&mut self, rect: Rect, color: Color, radius: i32) {
+        self.fill_round_rect_glass_rows(rect, color, radius, rect.y, rect.bottom());
+    }
+
+    /// [`Self::fill_round_rect_glass`] limited to the scanlines `top..bottom`.
+    ///
+    /// The shape is the whole rectangle's, so two calls with adjacent row
+    /// ranges tile the rounded surface exactly: every pixel, corner arcs
+    /// included, is written once, in the tone of the range that owns its row.
+    pub fn fill_round_rect_glass_rows(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        radius: i32,
+        top: i32,
+        bottom: i32,
+    ) {
         let packed = self.format.pack_glass(color);
         let edge = self.format.bg_alpha();
-        self.fill_round_rect_packed(rect, color, radius, packed, edge);
+        self.fill_round_rect_packed(rect, color, radius, packed, edge, Clip::rows(top, bottom));
+    }
+
+    /// [`Self::fill_round_rect_glass`] limited to the pixel columns
+    /// `left..right`, the horizontal twin of [`Self::fill_round_rect_glass_rows`].
+    pub fn fill_round_rect_glass_cols(
+        &mut self,
+        rect: Rect,
+        color: Color,
+        radius: i32,
+        left: i32,
+        right: i32,
+    ) {
+        let packed = self.format.pack_glass(color);
+        let edge = self.format.bg_alpha();
+        self.fill_round_rect_packed(
+            rect,
+            color,
+            radius,
+            packed,
+            edge,
+            Clip::cols(rect.y, rect.bottom(), left, right),
+        );
     }
 
     fn fill_round_rect_packed(
@@ -590,27 +636,40 @@ impl<'a> Canvas<'a> {
         radius: i32,
         packed: u32,
         edge_alpha: u8,
+        clip: Clip,
     ) {
+        let Clip { rows, cols } = clip;
         let shape = RoundRect::new(rect, radius);
         if shape.is_empty() {
             return;
         }
+        let first = rows.start.max(rect.y);
+        let last = rows.end.min(rect.bottom());
         if shape.radius() == 0 {
-            self.fill_rect_packed(rect, packed);
+            let from = rect.x.max(cols.start);
+            let to = rect.right().min(cols.end);
+            self.fill_rect_packed(
+                Rect::new(from, first, (to - from).max(0), (last - first).max(0)),
+                packed,
+            );
             return;
         }
         let scale = |coverage: u8| {
             u8::try_from(u16::from(coverage) * u16::from(edge_alpha) / 255).unwrap_or(u8::MAX)
         };
-        for y in rect.y..rect.bottom() {
+        for y in first..last {
             let Some(span) = shape.span_at(y) else {
                 continue;
             };
-            self.fill_rect_packed(Rect::new(span.x0, y, span.x1 - span.x0, 1), packed);
-            if span.left_alpha > 0 {
+            let from = span.x0.max(cols.start);
+            let to = span.x1.min(cols.end);
+            if to > from {
+                self.fill_rect_packed(Rect::new(from, y, to - from, 1), packed);
+            }
+            if span.left_alpha > 0 && cols.contains(&(span.x0 - 1)) {
                 self.blend_pixel(span.x0 - 1, y, color, scale(span.left_alpha));
             }
-            if span.right_alpha > 0 {
+            if span.right_alpha > 0 && cols.contains(&span.x1) {
                 self.blend_pixel(span.x1, y, color, scale(span.right_alpha));
             }
         }
@@ -993,6 +1052,61 @@ mod tests {
         Canvas::new(&mut painted, 20, 20).fill_round_rect(rect, Color::WHITE, 5);
         Canvas::new(&mut glass, 20, 20).fill_round_rect_glass(rect, Color::WHITE, 5);
         assert_eq!(painted, glass);
+    }
+
+    #[test]
+    fn adjacent_glass_row_ranges_tile_the_shape_like_one_fill() {
+        let rect = Rect::new(0, 0, 20, 20);
+        let mut whole = canvas_buf(20, 20);
+        let mut halves = canvas_buf(20, 20);
+        Canvas::new(&mut whole, 20, 20).fill_round_rect_glass(rect, Color::WHITE, 6);
+        let mut c = Canvas::new(&mut halves, 20, 20);
+        c.fill_round_rect_glass_rows(rect, Color::WHITE, 6, 0, 13);
+        c.fill_round_rect_glass_rows(rect, Color::WHITE, 6, 13, 20);
+        assert_eq!(whole, halves);
+    }
+
+    #[test]
+    fn adjacent_glass_column_ranges_tile_the_shape_like_one_fill() {
+        let rect = Rect::new(0, 0, 20, 20);
+        let mut whole = canvas_buf(20, 20);
+        let mut halves = canvas_buf(20, 20);
+        Canvas::new(&mut whole, 20, 20).fill_round_rect_glass(rect, Color::WHITE, 6);
+        let mut c = Canvas::new(&mut halves, 20, 20);
+        c.fill_round_rect_glass_cols(rect, Color::WHITE, 6, 0, 13);
+        c.fill_round_rect_glass_cols(rect, Color::WHITE, 6, 13, 20);
+        assert_eq!(whole, halves);
+    }
+
+    #[test]
+    fn a_glass_column_range_paints_only_its_own_columns() {
+        let rect = Rect::new(0, 0, 20, 20);
+        let mut buf = canvas_buf(20, 20);
+        Canvas::new(&mut buf, 20, 20).fill_round_rect_glass_cols(rect, Color::WHITE, 4, 5, 8);
+        assert_ne!(buf[10 * 20 + 6], 0);
+        assert_eq!(buf[10 * 20 + 4], 0, "left of the range");
+        assert_eq!(buf[10 * 20 + 8], 0, "right of the range");
+    }
+
+    #[test]
+    fn a_glass_row_range_paints_only_its_own_rows() {
+        let rect = Rect::new(0, 0, 20, 20);
+        let mut buf = canvas_buf(20, 20);
+        Canvas::new(&mut buf, 20, 20).fill_round_rect_glass_rows(rect, Color::WHITE, 4, 5, 8);
+        assert_ne!(buf[6 * 20 + 10], 0);
+        assert_eq!(buf[4 * 20 + 10], 0, "above the range");
+        assert_eq!(buf[8 * 20 + 10], 0, "below the range");
+    }
+
+    #[test]
+    fn a_glass_row_range_on_a_square_rect_is_clipped_to_the_rect() {
+        let rect = Rect::new(0, 5, 20, 10);
+        let mut buf = canvas_buf(20, 20);
+        Canvas::new(&mut buf, 20, 20).fill_round_rect_glass_rows(rect, Color::WHITE, 0, 0, 20);
+        assert_eq!(buf[4 * 20 + 3], 0);
+        assert_ne!(buf[5 * 20 + 3], 0);
+        assert_ne!(buf[14 * 20 + 3], 0);
+        assert_eq!(buf[15 * 20 + 3], 0);
     }
 
     #[test]

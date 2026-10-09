@@ -26,6 +26,7 @@
 //! `platform::font`, `platform::GlyphBlit`), so the split is invisible from
 //! the outside.
 
+pub mod clip;
 pub mod draw;
 pub mod ellipse;
 pub mod font;

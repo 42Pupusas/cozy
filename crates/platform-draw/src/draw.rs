@@ -396,8 +396,27 @@ impl<'a> Canvas<'a> {
     /// top afterwards is solid paint (see [`Self::fill_rect`]).
     pub fn clear(&mut self, color: Color) {
         let v = self.format.pack_glass(color);
-        for p in self.pixels.iter_mut() {
-            *p = v;
+        Self::fill_run(self.pixels, v);
+    }
+
+    /// Set every pixel of `run` to `value`.
+    ///
+    /// Seeds one pixel and doubles the filled prefix with `copy_within`, so
+    /// the bulk of a long run is moved by `memmove` rather than stored one
+    /// pixel at a time -- the per-pixel loop is what an unoptimised build
+    /// spends most of a frame in.
+    fn fill_run(run: &mut [u32], value: u32) {
+        const SHORT_RUN: usize = 32;
+        if run.len() < SHORT_RUN {
+            run.fill(value);
+            return;
+        }
+        run[0] = value;
+        let mut filled = 1;
+        while filled < run.len() {
+            let copy = filled.min(run.len() - filled);
+            run.copy_within(0..copy, filled);
+            filled += copy;
         }
     }
 
@@ -519,9 +538,7 @@ impl<'a> Canvas<'a> {
             let row = (y.cast_unsigned() as usize) * w;
             let start = row + x0.cast_unsigned() as usize;
             let end = row + x1.cast_unsigned() as usize;
-            for px in &mut self.pixels[start..end] {
-                *px = v;
-            }
+            Self::fill_run(&mut self.pixels[start..end], v);
         }
     }
 
@@ -1018,6 +1035,26 @@ mod tests {
         assert_eq!(Color::rgb(0xff, 0x5c, 0x57).to_xrgb8888(), 0x00_ff_5c_57);
         assert_eq!(Color::BLACK.to_xrgb8888(), 0);
         assert_eq!(Color::WHITE.to_xrgb8888(), 0x00_ff_ff_ff);
+    }
+
+    #[test]
+    fn a_run_of_any_length_is_filled_completely() {
+        for len in (0..200).chain([255, 256, 257, 1023, 1024, 1025]) {
+            let mut run = vec![0u32; len];
+            Canvas::fill_run(&mut run, 0xdead_beef);
+            assert!(run.iter().all(|&px| px == 0xdead_beef), "length {len}");
+        }
+    }
+
+    #[test]
+    fn filling_a_wide_rect_leaves_its_neighbours_alone() {
+        let mut buf = canvas_buf(100, 3);
+        let mut c = Canvas::new(&mut buf, 100, 3);
+        c.fill_rect(Rect::new(10, 1, 80, 1), Color::WHITE);
+        let w = Color::WHITE.to_xrgb8888();
+        assert!(buf[..110].iter().all(|&px| px == 0));
+        assert!(buf[110..190].iter().all(|&px| px == w));
+        assert!(buf[190..].iter().all(|&px| px == 0));
     }
 
     #[test]

@@ -78,7 +78,7 @@ impl Body {
     }
 
     fn rect(&self) -> Rect {
-        let level = i32::from(self.travel.level());
+        let level = i32::from(self.travel.braking_level());
         let lerp =
             |from: i32, to: i32| from + ((to - from) * level + 127 * (to - from).signum()) / 255;
         Rect::new(
@@ -95,7 +95,7 @@ impl Body {
             rect: self.rect(),
             slot: self.to_slot,
             from_slot: self.from_slot,
-            mix: self.travel.level(),
+            mix: self.travel.braking_level(),
             grown,
         }
     }
@@ -107,7 +107,7 @@ impl Body {
             self.grown.aim(true);
         }
         if self.to != dest.rect || self.to_slot != dest.slot {
-            self.from_slot = if self.travel.level() >= 128 {
+            self.from_slot = if self.travel.braking_level() >= 128 {
                 self.to_slot
             } else {
                 self.from_slot
@@ -156,7 +156,7 @@ pub struct TileGrowth {
 
 impl TileGrowth {
     const GROW_MS: u16 = 280;
-    const MOVE_MS: u16 = 320;
+    const MOVE_MS: u16 = 260;
     const MAX_STEP_MS: u64 = 64;
     const STAGGER_MS: u64 = 55;
     const LONGEST_STAGGER_MS: u64 = 500;
@@ -454,6 +454,27 @@ mod tests {
             Rect::new(500, 300, 100, 100)
         );
         assert!(!growth.is_animating());
+    }
+
+    #[test]
+    fn a_glide_covers_a_tenth_of_the_way_in_its_first_frame_after_the_clock_runs() {
+        let (mut growth, mut clock, mut targets) = landed(2);
+        targets[0].rect = Rect::new(1000, 0, 100, 100);
+        clock.run(&mut growth, &targets, 2);
+        let moved = growth.shape(id(0)).expect("followed").rect.x;
+        assert!(moved >= 100, "only {moved} of 1000 after one running frame");
+    }
+
+    #[test]
+    fn repeated_retargets_keep_a_tile_moving_at_speed() {
+        let (mut growth, mut clock, mut targets) = landed(2);
+        let start = growth.shape(id(0)).expect("followed").rect.x;
+        for step in 1..=6 {
+            targets[0].rect = Rect::new(start + step * 100, 0, 100, 100);
+            clock.run(&mut growth, &targets, 3);
+        }
+        let reached = growth.shape(id(0)).expect("followed").rect.x - start;
+        assert!(reached >= 400, "covered {reached} of 600 in 288 ms");
     }
 
     #[test]

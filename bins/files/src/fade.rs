@@ -62,6 +62,13 @@ impl Fade {
         let eased = t * t * 2.0f32.mul_add(-t, 3.0);
         (eased * 255.0).round() as u8
     }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn braking_level(self) -> u8 {
+        let left = 1.0 - self.progress.clamp(0.0, 1.0);
+        let eased = (left * left).mul_add(-left, 1.0);
+        (eased * 255.0).round() as u8
+    }
 }
 
 /// A set of fades keyed by what they belong to.

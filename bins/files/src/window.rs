@@ -36,7 +36,7 @@ use crate::password_panel::{PanelStyle, PanelText, PasswordPanel};
 use crate::storage::Storage;
 use crate::theme::Theme;
 use crate::tile_action::TileAction;
-use crate::tile_field::{PlacedTile, TileField};
+use crate::tile_field::{PlacedMore, PlacedTile, TileField};
 use crate::tile_geometry::TileGeometry;
 use crate::tile_growth::{Destination, Shape, TileGrowth};
 use crate::tile_id::TileId;
@@ -264,6 +264,12 @@ impl FilesWindow {
     }
 
     fn growth_targets(&self) -> Vec<Destination> {
+        let more = self.tile_more().map(|more| Destination {
+            id: TileId::More,
+            row: 0,
+            rect: more.rect,
+            slot: more.slot,
+        });
         self.tile_layout()
             .iter()
             .filter_map(|placed| {
@@ -275,6 +281,7 @@ impl FilesWindow {
                     slot: placed.slot,
                 })
             })
+            .chain(more)
             .collect()
     }
 
@@ -348,6 +355,17 @@ impl FilesWindow {
         let (spiral, tail) = self.flow_parts();
         self.tiles
             .layout(spiral, self.theme.spacing.tile_floor(), tail)
+    }
+
+    fn tile_more(&self) -> Option<PlacedMore> {
+        let (spiral, tail) = self.flow_parts();
+        self.tiles
+            .more(spiral, self.theme.spacing.tile_floor(), tail)
+    }
+
+    fn more_at(&self, at: Position) -> bool {
+        self.tile_more()
+            .is_some_and(|more| more.rect.contains(Point::new(at.x, at.y)))
     }
 
     fn tile_at(&self, at: Point) -> Option<usize> {
@@ -562,6 +580,10 @@ impl FilesWindow {
             self.pressed_action = Some(held);
             return;
         }
+        if self.more_at(at) {
+            self.show_next_tiles(at);
+            return;
+        }
         let now = Self::now_ms();
         let doubled = self.is_double_click(now, at);
         match self.tile_at(Point::new(at.x, at.y)) {
@@ -581,6 +603,25 @@ impl FilesWindow {
                 self.drag_arm.press((at.x, at.y));
             }
         }
+    }
+
+    fn show_next_tiles(&mut self, at: Position) {
+        let shown = i32::try_from(self.tile_layout().len()).unwrap_or(i32::MAX);
+        self.slide_tiles(shown.max(1), at);
+    }
+
+    fn slide_tiles(&mut self, steps: i32, at: Position) -> bool {
+        let (spiral, tail) = self.flow_parts();
+        let moved = self
+            .tiles
+            .slide(spiral, self.theme.spacing.tile_floor(), tail, steps);
+        if moved {
+            self.tray = None;
+            self.aim_growth(self.motion_ms);
+            let spot = self.spot_at(at);
+            let _ = self.hover.move_to(spot);
+        }
+        moved
     }
 
     /// Run the tile button a press began on, if the pointer is still on it.
@@ -612,7 +653,35 @@ impl FilesWindow {
                 .unwrap_or_else(|| Shape::resting(placed.rect, placed.slot));
             self.painted_entry_tile(placed.row, shape)
         });
-        leaving.chain(held).collect()
+        let more = self.tile_more().map(|more| {
+            let shape = self
+                .growth
+                .shape(TileId::More)
+                .unwrap_or_else(|| Shape::resting(more.rect, more.slot));
+            self.painted_more_tile(&more, shape)
+        });
+        leaving.chain(held).chain(more).collect()
+    }
+
+    fn painted_more_tile(&self, more: &PlacedMore, shape: Shape) -> PaintedTile {
+        PaintedTile {
+            rect: shape.rect,
+            slot: shape.slot,
+            from_slot: shape.from_slot,
+            mix: shape.mix,
+            kind: RowKind::Leaf,
+            name: format!("{} more…", more.hidden),
+            detail: RowFormat::human_size(more.bytes),
+            name_color: self.theme.text,
+            chosen: 0,
+            drop_target: false,
+            raise: self.motion.raise(TileKey::More),
+            reveal: 0,
+            grown: shape.grown,
+            glow: [0; TileAction::ALL.len()],
+            press: [0; TileAction::ALL.len()],
+            tray: None,
+        }
     }
 
     fn painted_entry_tile(&self, row: usize, shape: Shape) -> Option<PaintedTile> {
@@ -991,7 +1060,9 @@ impl FilesWindow {
         if let Some(target) = self.toolbar_hit(at) {
             return Some(Spot::Control(target));
         }
-        let placed = self.placed_at(at)?;
+        let Some(placed) = self.placed_at(at) else {
+            return self.more_at(at).then_some(Spot::More);
+        };
         let row = placed.row;
         Some(
             self.action_at(&placed, row, at)
@@ -1678,16 +1749,7 @@ impl Painter for FilesWindow {
                 let _ = self.hover.move_to(spot);
             }
             PointerEventKind::Scroll { lines, at, .. } => {
-                let (spiral, tail) = self.flow_parts();
-                if self
-                    .tiles
-                    .slide(spiral, self.theme.spacing.tile_floor(), tail, lines)
-                {
-                    self.tray = None;
-                    self.aim_growth(self.motion_ms);
-                    let spot = self.spot_at(at);
-                    let _ = self.hover.move_to(spot);
-                }
+                self.slide_tiles(lines, at);
             }
             // The pointer left the surface, so the highlight must go with it;
             // otherwise a row stays lit while the pointer is in another window.
@@ -3591,6 +3653,75 @@ mod tests {
             root,
             "the wheel never leaves the folder"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn centre_of(rect: platform::draw::Rect) -> super::Position {
+        super::Position {
+            x: rect.x + rect.w / 2,
+            y: rect.y + rect.h / 2,
+        }
+    }
+
+    #[test]
+    fn a_crowded_folder_shows_a_more_tile_counting_what_is_out_of_view() {
+        let (painter, root) = crowded("tiles-more", 60);
+        let more = painter.tile_more().expect("sixty files do not fit");
+        assert_eq!(more.hidden, 60 - in_view(&painter).len());
+        let tiles = painter.painted_tiles(&painter.tile_layout());
+        let drawn = tiles.last().expect("tiles");
+        assert_eq!(drawn.name, format!("{} more…", more.hidden));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_folder_that_fits_has_no_more_tile() {
+        let (painter, root) = crowded("tiles-no-more", 3);
+        assert!(painter.tile_more().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pressing_the_more_tile_shows_the_next_tiles() {
+        let (mut painter, root) = crowded("tiles-more-press", 60);
+        let before = in_view(&painter);
+        let at = centre_of(painter.tile_more().expect("more").rect);
+        left_press(&mut painter, at);
+        left_release(&mut painter, at);
+        let after = in_view(&painter);
+        assert_ne!(after, before);
+        assert!(!before.contains(&after[0]), "a whole page on, not one tile");
+        assert_eq!(painter.browser.path(), root, "the folder is unchanged");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_more_tile_is_gone_once_the_smallest_tile_is_in_view() {
+        let (mut painter, root) = crowded("tiles-more-end", 60);
+        wheel(&mut painter, 500);
+        assert!(painter.tile_more().is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn hovering_the_more_tile_lights_it_and_nothing_else() {
+        let (painter, root) = crowded("tiles-more-hover", 60);
+        let at = centre_of(painter.tile_more().expect("more").rect);
+        assert_eq!(painter.spot_at(at), Some(Spot::More));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_more_tile_has_no_action_buttons() {
+        let (mut painter, root) = crowded("tiles-more-buttons", 60);
+        let at = centre_of(painter.tile_more().expect("more").rect);
+        assert_eq!(painter.live_action_at(at), None);
+        painter.on_pointer(PointerEventKind::Press {
+            button: PointerButton::Right,
+            at,
+            modifiers: platform::toplevel::ModifierState::default(),
+        });
+        assert!(painter.tray.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
 

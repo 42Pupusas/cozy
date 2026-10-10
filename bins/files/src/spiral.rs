@@ -28,11 +28,11 @@ pub struct SpiralLayout {
 impl SpiralLayout {
     /// Beyond this many cells the smallest is far under a pixel of any real
     /// window, so no screen could show it legibly.
-    pub const MAX_CELLS: usize = 24;
+    pub const MAX_CELLS: usize = 40;
 
     /// How much of its predecessor's area each cell keeps, in thousandths.
     /// The golden spiral keeps 618.
-    const DECAY_PERMILLE: i32 = 850;
+    const DECAY_PERMILLE: i32 = 875;
 
     const LAST_PERMILLE: i32 = 600;
 
@@ -350,7 +350,7 @@ mod tests {
         let cells = layout.cells(10);
         let last = area_of(&cells[9..]);
         assert!(last > area_of(&cells[6..7]), "{cells:?}");
-        assert!(last > area_of(&cells[8..9]) * 2, "{cells:?}");
+        assert!(last * 2 > area_of(&cells[8..9]) * 3, "{cells:?}");
     }
 
     #[test]

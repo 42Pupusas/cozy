@@ -10,6 +10,7 @@ use crate::tile_action::TileAction;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TileKey {
     Item(usize),
+    More,
 }
 
 pub struct TileMotion {
@@ -60,6 +61,7 @@ impl TileMotion {
     ) {
         let pointed = match spot {
             Some(Spot::Item(Pane::Tiles, row) | Spot::Action(row, _)) => Some(TileKey::Item(row)),
+            Some(Spot::More) => Some(TileKey::More),
             _ => None,
         };
         let raised: Vec<TileKey> = pointed
@@ -262,6 +264,15 @@ mod tests {
         motion.run(0, 20);
         assert!(motion.buttons_are_live(0));
         assert!(!motion.buttons_are_live(1), "another tile's are not");
+    }
+
+    #[test]
+    fn the_more_tile_rises_but_has_no_buttons() {
+        let mut motion = TileMotion::new();
+        motion.aim(Some(Spot::More), None, &[], None, true, 0);
+        motion.run(0, 20);
+        assert_eq!(motion.raise(TileKey::More), 255);
+        assert_eq!(motion.reveal(TileKey::More), 0);
     }
 
     #[test]

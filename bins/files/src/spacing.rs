@@ -228,7 +228,7 @@ impl Spacing {
     /// width so more tiles fit while the card keeps its room.
     #[must_use]
     pub fn tile_floor(self) -> i32 {
-        self.at(112.0)
+        self.at(88.0)
     }
 
     /// Width the pinned card asks of its spiral cell: two tiles' worth, so
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(s.status_height(), 35);
         assert_eq!(s.sidebar_width(), 210);
         assert_eq!(s.tile_min(), 152);
-        assert_eq!(s.tile_floor(), 112);
+        assert_eq!(s.tile_floor(), 88);
         assert_eq!(s.card_width(), 304);
         assert_eq!(s.nav_button_height(), 36);
         assert_eq!(s.tile_lift(), 3);

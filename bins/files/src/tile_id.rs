@@ -2,19 +2,23 @@
 //!
 //! A row number names a position in the current listing, so it changes for
 //! every entry after one that is created or removed. The name is what the
-//! user recognises a tile by, and it is unique within a folder.
+//! user recognises a tile by, and it is unique within a folder. The tile that
+//! stands for the entries out of view has no name, so it has an id of its own.
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TileId(u64);
+pub enum TileId {
+    Entry(u64),
+    More,
+}
 
 impl TileId {
     #[must_use]
     pub fn of(name: &str) -> Self {
         let mut hasher = DefaultHasher::new();
         name.hash(&mut hasher);
-        Self(hasher.finish())
+        Self::Entry(hasher.finish())
     }
 }
 
@@ -31,5 +35,11 @@ mod tests {
     fn different_names_give_different_ids() {
         assert_ne!(TileId::of("notes.md"), TileId::of("notes.txt"));
         assert_ne!(TileId::of("a"), TileId::of("A"));
+    }
+
+    #[test]
+    fn the_more_tile_is_no_entry() {
+        assert_ne!(TileId::of("more"), TileId::More);
+        assert_ne!(TileId::of(""), TileId::More);
     }
 }

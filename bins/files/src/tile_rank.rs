@@ -4,6 +4,7 @@
 pub struct TileRank {
     /// Visible-entry indices, largest first; ties keep visible order.
     order: Vec<usize>,
+    unseen: Vec<u64>,
 }
 
 impl TileRank {
@@ -11,7 +12,11 @@ impl TileRank {
     pub fn new(sizes: &[u64]) -> Self {
         let mut order: Vec<usize> = (0..sizes.len()).collect();
         order.sort_by(|&a, &b| sizes[b].cmp(&sizes[a]));
-        Self { order }
+        let mut unseen = vec![0u64; order.len() + 1];
+        for (rank, &row) in order.iter().enumerate().rev() {
+            unseen[rank] = unseen[rank + 1].saturating_add(sizes[row]);
+        }
+        Self { order, unseen }
     }
 
     #[must_use]
@@ -24,6 +29,12 @@ impl TileRank {
     pub fn window(&self, from: usize, capacity: usize) -> &[usize] {
         let rest = self.order.get(from..).unwrap_or_default();
         &rest[..capacity.min(rest.len())]
+    }
+
+    #[must_use]
+    pub fn beyond(&self, from: usize) -> (usize, u64) {
+        let bytes = self.unseen.get(from).copied().unwrap_or(0);
+        (self.order.len().saturating_sub(from), bytes)
     }
 }
 
@@ -74,6 +85,15 @@ mod tests {
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen, (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn what_lies_beyond_a_rank_is_counted_and_summed() {
+        let rank = TileRank::new(&[6, 5, 4, 3, 2, 1]);
+        assert_eq!(rank.beyond(0), (6, 21));
+        assert_eq!(rank.beyond(2), (4, 10));
+        assert_eq!(rank.beyond(6), (0, 0));
+        assert_eq!(rank.beyond(99), (0, 0));
     }
 
     #[test]

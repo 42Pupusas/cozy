@@ -20,11 +20,21 @@ pub struct PlacedTile {
     pub slot: usize,
 }
 
-/// The tiles in view, the innermost cell kept for the card, and whether
-/// scrolling could bring in more at either end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacedMore {
+    pub rect: Rect,
+    pub slot: usize,
+    pub hidden: usize,
+    pub bytes: u64,
+}
+
+/// The tiles in view, the cell for the entries not in view, the innermost
+/// cell kept for the card, and whether scrolling could bring in more at
+/// either end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arrangement {
     pub tiles: Vec<PlacedTile>,
+    pub more: Option<PlacedMore>,
     pub card: Option<Rect>,
     pub later: bool,
     pub earlier: bool,
@@ -120,50 +130,69 @@ impl TileField {
         let spiral = SpiralLayout::new(area, min_side);
         let rest = self.rank.len().saturating_sub(from);
         let Some(need) = reserve else {
-            let rows = self.rank.window(from, spiral.capacity(rest));
-            let cells = spiral.cells(rows.len());
-            return self.arrangement(from, rows, cells, None);
+            let (shown, more) = Self::split(rest, spiral.capacity(rest));
+            let cells = spiral.cells(shown + usize::from(more));
+            return self.arrangement(from, shown, more, &cells, None);
         };
         let spiral = spiral.with_prominent_last().with_last_height(need.h);
-        let cells = if rest == 0 {
-            1
-        } else {
-            spiral.capacity_ending_in(rest + 1, need).max(2)
-        };
-        let rows = self.rank.window(from, cells - 1);
-        let mut cells = spiral.cells(rows.len() + 1);
+        let room = spiral.capacity_ending_in(rest + 1, need).max(2) - 1;
+        let (shown, more) = Self::split(rest, room);
+        let mut cells = spiral.cells(shown + usize::from(more) + 1);
         let card = cells.pop();
-        self.arrangement(from, rows, cells, card)
+        self.arrangement(from, shown, more, &cells, card)
+    }
+
+    fn split(rest: usize, room: usize) -> (usize, bool) {
+        if rest <= room {
+            (rest, false)
+        } else {
+            (room.saturating_sub(1).max(1), true)
+        }
     }
 
     fn arrangement(
         &self,
         from: usize,
-        rows: &[usize],
-        cells: Vec<Rect>,
+        shown: usize,
+        more: bool,
+        cells: &[Rect],
         card: Option<Rect>,
     ) -> Arrangement {
+        let rows = self.rank.window(from, shown);
+        let slots = TileColoring::of(cells).slots();
+        let tiles = rows
+            .iter()
+            .zip(cells)
+            .zip(&slots)
+            .map(|((&row, &rect), &slot)| PlacedTile { row, rect, slot })
+            .collect();
+        let more = more.then(|| {
+            let (hidden, bytes) = self.rank.beyond(from + rows.len());
+            PlacedMore {
+                rect: cells[rows.len()],
+                slot: slots[rows.len()],
+                hidden,
+                bytes,
+            }
+        });
         Arrangement {
-            tiles: Self::place(rows, cells),
+            tiles,
+            later: more.is_some(),
+            more,
             card,
-            later: from + rows.len() < self.rank.len(),
             earlier: from > 0,
         }
-    }
-
-    fn place(rows: &[usize], cells: Vec<Rect>) -> Vec<PlacedTile> {
-        let slots = TileColoring::of(&cells).slots();
-        rows.iter()
-            .zip(cells)
-            .zip(slots)
-            .map(|((&row, rect), slot)| PlacedTile { row, rect, slot })
-            .collect()
     }
 
     /// The tiles in view and their cells.
     #[must_use]
     pub fn layout(&self, area: Rect, min_side: i32, reserve: Option<MinCell>) -> Vec<PlacedTile> {
         self.arrange(area, min_side, reserve).tiles
+    }
+
+    #[must_use]
+    pub fn more(&self, area: Rect, min_side: i32, reserve: Option<MinCell>) -> Option<PlacedMore> {
+        self.arrange(area, min_side, reserve).more
     }
 
     /// The cell the pinned card occupies, when one is reserved.
@@ -470,6 +499,89 @@ mod tests {
         assert_eq!(arranged.tiles.len(), 1);
         assert!(arranged.card.is_some());
         assert!(!arranged.later && !arranged.earlier);
+    }
+
+    fn folder_of(tag: &str, files: usize) -> (TileField, TempDir) {
+        let dir = TempDir::new(tag);
+        for i in 0..files {
+            dir.create_file(&format!("f{i:03}"), &vec![0; 10 + i]);
+        }
+        let browser = Browser::open(dir.path(), 800, 600, 28).expect("open");
+        let (mut field, _wake) = field();
+        field.sync(&browser);
+        (field, dir)
+    }
+
+    #[test]
+    fn a_crowded_folder_ends_its_view_with_a_tile_for_the_rest() {
+        for reserve in [None, Some(NEED)] {
+            let (field, _browser, _dir) = crowded();
+            let arranged = field.arrange(AREA, 120, reserve);
+            let more = arranged.more.expect("forty files do not fit");
+            assert_eq!(more.hidden, 40 - arranged.tiles.len());
+            assert!(arranged.later);
+            let cells = arranged.tiles.iter().map(|p| p.rect);
+            for cell in cells.chain(arranged.card) {
+                let apart = more.rect.right() <= cell.x
+                    || cell.right() <= more.rect.x
+                    || more.rect.bottom() <= cell.y
+                    || cell.bottom() <= more.rect.y;
+                assert!(apart, "{:?} overlaps {cell:?}", more.rect);
+            }
+        }
+    }
+
+    #[test]
+    fn the_tile_for_the_rest_totals_what_is_out_of_view() {
+        let (field, _browser, _dir) = crowded();
+        let arranged = field.arrange(AREA, 120, None);
+        let more = arranged.more.expect("forty files do not fit");
+        let smallest: u64 = (0..more.hidden as u64).map(|i| 100 + i).sum();
+        assert_eq!(more.bytes, smallest);
+    }
+
+    #[test]
+    fn a_folder_that_fits_has_no_tile_for_the_rest() {
+        for reserve in [None, Some(NEED)] {
+            let (field, _dir) = folder_of("tile_field_fits", 3);
+            let arranged = field.arrange(AREA, 120, reserve);
+            assert_eq!(arranged.tiles.len(), 3);
+            assert!(arranged.more.is_none() && !arranged.later);
+        }
+    }
+
+    #[test]
+    fn one_entry_over_the_fit_brings_the_tile_for_the_rest() {
+        use crate::spiral::SpiralLayout;
+        let room = SpiralLayout::new(AREA, 120).capacity(40);
+        let (exact, _a) = folder_of("tile_field_exact", room);
+        let arranged = exact.arrange(AREA, 120, None);
+        assert_eq!(arranged.tiles.len(), room);
+        assert!(arranged.more.is_none());
+        let (over, _b) = folder_of("tile_field_over", room + 1);
+        let arranged = over.arrange(AREA, 120, None);
+        assert_eq!(arranged.tiles.len(), room - 1);
+        assert_eq!(arranged.more.expect("one too many").hidden, 2);
+    }
+
+    #[test]
+    fn scrolled_to_the_end_the_tile_for_the_rest_goes() {
+        for reserve in [None, Some(NEED)] {
+            let (mut field, _browser, _dir) = crowded();
+            assert!(field.arrange(AREA, 120, reserve).more.is_some());
+            field.slide(AREA, 120, reserve, 500);
+            let arranged = field.arrange(AREA, 120, reserve);
+            assert!(arranged.more.is_none() && !arranged.later);
+            assert_eq!(arranged.tiles.last().map(|p| p.row), Some(0));
+        }
+    }
+
+    #[test]
+    fn a_window_too_small_for_two_cells_still_shows_an_entry_beside_the_tile() {
+        let (field, _dir) = folder_of("tile_field_tiny", 5);
+        let arranged = field.arrange(Rect::new(0, 0, 40, 40), 120, None);
+        assert_eq!(arranged.tiles.len(), 1);
+        assert_eq!(arranged.more.expect("four are out of view").hidden, 4);
     }
 
     #[test]

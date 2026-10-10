@@ -23,6 +23,7 @@ pub enum Spot {
     Item(Pane, usize),
     /// A control in the toolbar.
     Control(Target),
+    More,
     /// An action button on the tile of the entry at this row. The tile itself
     /// is hovered too.
     Action(usize, TileAction),

@@ -7,5 +7,7 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+fsmodel        = { path = "../fsmodel" }
+widget         = { path = "../widget" }
 inotify-events = { path = "../inotify-events" }
 ququmatz       = { workspace = true }

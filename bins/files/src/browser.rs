@@ -25,13 +25,12 @@
 //! * **View rules carry across directories.** A user who turned on hidden
 //!   files means it until they turn it off, not until they open a folder.
 
-use browse::{DirsWatch, History, Trail};
-use fsmodel::DirectoryView;
+use browse::{DirectoryBrowser, Reaction};
 use fsmodel::entry::Entry;
 use fsmodel::reader::ReadError;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
-use widget::{ListCommand, ListPane, Mods, PaneResponse, TextInput};
+use widget::{ListCommand, ListPane, Mods, TextInput};
 
 use crate::clipboard::{FileClipboard, Transfer};
 use crate::keymap::{Action, EditAction, Focus, Keymap};
@@ -77,18 +76,8 @@ impl Outcome {
 
 /// The file browser's whole state.
 pub struct Browser {
-    view: DirectoryView,
-    pane: ListPane,
-    filter: TextInput,
+    nav: DirectoryBrowser,
     keymap: Keymap,
-    /// Where the user has been, for the toolbar's chevrons.
-    history: History,
-    /// The most recent read error, shown in the status line.
-    ///
-    /// Kept rather than propagated: failing to enter one unreadable
-    /// directory must not tear down the window, it must say so and leave the
-    /// user where they were.
-    error: Option<ReadError>,
     /// Paths a Ctrl-C or Ctrl-X put aside, awaiting a paste.
     clipboard: FileClipboard,
     /// An explicit trash directory, overriding the user's home trash.
@@ -111,40 +100,21 @@ pub struct Browser {
     /// listing, and a successful one must not be silent -- moving twelve
     /// files with no acknowledgement leaves the user unsure it happened.
     notice: Option<String>,
-    /// Bumped whenever the visible entries may have changed.
-    listing: u64,
-    /// Bumped whenever the open directory is re-read from disk.
-    refreshes: u64,
-    /// inotify eyes on the open directory, so files other processes
-    /// create, rename or delete appear without a navigate-out-and-back.
-    /// Headless like everything else here: an fd, not a window object.
-    watch: DirsWatch,
 }
 
 impl Browser {
     /// Open `path` in a pane of `width` x `height` pixels with `row_height`
     /// pixel rows.
     pub fn open(path: &Path, width: i32, height: i32, row_height: i32) -> Result<Self, ReadError> {
-        let view = DirectoryView::open(path)?;
-        let pane = ListPane::new(width, height, row_height, view.visible_len());
-        let mut watch = DirsWatch::new();
-        watch.follow(path);
         Ok(Self {
-            view,
-            pane,
-            filter: TextInput::new(),
+            nav: DirectoryBrowser::open(path, width, height, row_height)?,
             keymap: Keymap::new(),
-            history: History::new(),
-            error: None,
             clipboard: FileClipboard::new(),
             trash: None,
             rename: Rename::new(),
             move_prompt: MovePrompt::new(),
             password: PasswordModal::new(),
             notice: None,
-            listing: 0,
-            refreshes: 0,
-            watch,
         })
     }
 
@@ -155,11 +125,7 @@ impl Browser {
     /// A successful read re-arms the watch on the directory now shown,
     /// which is also how navigation moves the watch along.
     pub fn poll_listing(&mut self) -> bool {
-        if !self.watch.poll() {
-            return false;
-        }
-        self.refresh();
-        true
+        self.nav.poll_listing()
     }
 
     /// The watched inotify fd, for the event loop's `poll(2)`. `None` when
@@ -167,37 +133,37 @@ impl Browser {
     /// than waiting on a descriptor that can never fire.
     #[must_use]
     pub fn watch_fd(&self) -> Option<RawFd> {
-        self.watch.fd()
+        self.nav.watch_fd()
     }
 
     /// Changes whenever the visible entries may have changed.
     #[must_use]
     pub const fn listing_revision(&self) -> u64 {
-        self.listing
+        self.nav.listing_revision()
     }
 
     /// Changes whenever the open directory is re-read from disk.
     #[must_use]
     pub const fn refresh_count(&self) -> u64 {
-        self.refreshes
+        self.nav.refresh_count()
     }
 
     /// The directory being shown.
     #[must_use]
     pub fn path(&self) -> &Path {
-        self.view.path()
+        self.nav.path()
     }
 
     /// The list pane, for list painting.
     #[must_use]
     pub const fn pane(&self) -> &ListPane {
-        &self.pane
+        self.nav.pane()
     }
 
     /// The filter box, for painting.
     #[must_use]
     pub const fn filter(&self) -> &TextInput {
-        &self.filter
+        self.nav.filter()
     }
 
     /// Whether the filter box has focus (and so should draw a caret).
@@ -223,19 +189,19 @@ impl Browser {
     /// do nothing every second press.
     #[must_use]
     pub const fn shows_hidden(&self) -> bool {
-        self.view.filter().show_hidden
+        self.nav.shows_hidden()
     }
 
     /// Whether the back chevron should be live.
     #[must_use]
     pub const fn can_go_back(&self) -> bool {
-        self.history.can_go_back()
+        self.nav.can_go_back()
     }
 
     /// Whether the forward chevron should be live.
     #[must_use]
     pub const fn can_go_forward(&self) -> bool {
-        self.history.can_go_forward()
+        self.nav.can_go_forward()
     }
 
     /// Whether the up arrow should be live.
@@ -245,66 +211,50 @@ impl Browser {
     /// navigation the action would then refuse.
     #[must_use]
     pub fn can_go_up(&self) -> bool {
-        self.view.parent().is_some()
+        self.nav.can_go_up()
     }
 
     /// Step back to the previously visited directory.
     pub fn go_back(&mut self) -> Outcome {
-        let Some(target) = self.history.peek_back().map(Path::to_path_buf) else {
-            return Outcome::Ignored;
-        };
-        let here = self.view.path().to_path_buf();
-        let outcome = self.navigate(&target, None, Trail::Replay);
-        // Committed only on success. A directory that has been unmounted since
-        // it was visited must not silently consume a history step: the button
-        // would appear to do nothing while quietly eating the user's trail.
-        if self.error.is_none() {
-            self.history.commit_back(&here);
-        }
-        outcome
+        let reaction = self.nav.go_back();
+        self.absorb(reaction)
     }
 
     /// Step forward to a directory a previous back left behind.
     pub fn go_forward(&mut self) -> Outcome {
-        let Some(target) = self.history.peek_forward().map(Path::to_path_buf) else {
-            return Outcome::Ignored;
-        };
-        let here = self.view.path().to_path_buf();
-        let outcome = self.navigate(&target, None, Trail::Replay);
-        if self.error.is_none() {
-            self.history.commit_forward(&here);
-        }
-        outcome
+        let reaction = self.nav.go_forward();
+        self.absorb(reaction)
     }
 
     /// The most recent read error, if any.
     #[must_use]
     pub const fn error(&self) -> Option<&ReadError> {
-        self.error.as_ref()
+        self.nav.error()
     }
 
     /// How many entries are visible.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.view.visible_len()
+        self.nav.len()
     }
 
     /// The entry at visible index `row`.
     #[must_use]
     pub fn entry(&self, row: usize) -> Option<&Entry> {
-        self.view.visible_at(row)
+        self.nav.entry(row)
     }
 
     /// The entry under the cursor.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cursor_entry(&self) -> Option<&Entry> {
-        self.pane.cursor().and_then(|row| self.entry(row))
+        self.nav.cursor_entry()
     }
 
     /// The path of the entry at `row`.
     #[must_use]
     pub fn path_of(&self, row: usize) -> Option<PathBuf> {
-        self.entry(row).map(|e| e.path.clone())
+        self.nav.path_of(row)
     }
 
     /// Put the entry at `row` on the file clipboard, to be pasted as a copy
@@ -336,7 +286,7 @@ impl Browser {
     /// The name of the entry at `row`.
     #[must_use]
     pub fn name_of(&self, row: usize) -> Option<String> {
-        self.entry(row).map(|e| e.name.clone())
+        self.nav.name_of(row)
     }
 
     /// Move the entry at `row` to the trash.
@@ -384,7 +334,7 @@ impl Browser {
     /// Create an empty folder in the open directory under a free name such
     /// as `New folder (1)`, select it and open its rename box.
     pub fn create_folder(&mut self) -> Outcome {
-        let plain = self.view.path().join(Self::NEW_FOLDER);
+        let plain = self.nav.path().join(Self::NEW_FOLDER);
         let target = if std::fs::symlink_metadata(&plain).is_err() {
             plain
         } else {
@@ -394,7 +344,7 @@ impl Browser {
             Ok(()) => {
                 let outcome = self.refresh();
                 self.select_path(&target);
-                match self.pane.cursor() {
+                match self.nav.pane().cursor() {
                     Some(row) if self.select_path_is(row, &target) => self.rename_entry(row),
                     _ => outcome,
                 }
@@ -415,7 +365,7 @@ impl Browser {
         if self.rename.is_active() {
             self.rename.cancel();
         }
-        self.move_prompt.begin(vec![path], self.view.path());
+        self.move_prompt.begin(vec![path], self.nav.path());
         if !self.move_prompt.is_active() {
             return Outcome::Ignored;
         }
@@ -439,7 +389,7 @@ impl Browser {
     #[must_use]
     pub fn move_target_is_valid(&self) -> bool {
         self.move_prompt
-            .destination(self.view.path(), Self::home().as_deref())
+            .destination(self.nav.path(), Self::home().as_deref())
             .is_some_and(|dir| dir.is_dir())
     }
 
@@ -452,7 +402,7 @@ impl Browser {
     fn commit_move(&mut self) -> Outcome {
         let Some(target) = self
             .move_prompt
-            .destination(self.view.path(), Self::home().as_deref())
+            .destination(self.nav.path(), Self::home().as_deref())
         else {
             return Outcome::Ignored;
         };
@@ -527,27 +477,14 @@ impl Browser {
     /// before calling this.
     #[must_use]
     pub fn drag_paths(&self, row: usize) -> Vec<PathBuf> {
-        let selected = self.pane.selection().selected();
-        if selected.contains(&row) {
-            selected
-                .iter()
-                .filter_map(|&r| self.entry(r))
-                .map(|e| e.path.clone())
-                .collect()
-        } else {
-            self.entry(row)
-                .map(|e| vec![e.path.clone()])
-                .into_iter()
-                .flatten()
-                .collect()
-        }
+        self.nav.drag_paths(row)
     }
 
     /// `row`, if it names an entry a drop could land in: a directory, or a
     /// symlink to one. Dropping onto a plain file has no defined meaning.
     #[must_use]
     pub fn navigable_row(&self, row: Option<usize>) -> Option<usize> {
-        row.filter(|&row| self.entry(row).is_some_and(Entry::is_navigable))
+        self.nav.navigable_row(row)
     }
 
     /// The directory a drop onto `row` lands in: that row's folder, or the
@@ -555,9 +492,7 @@ impl Browser {
     /// into empty space is dropping into the folder currently shown.
     #[must_use]
     pub fn drop_dir(&self, row: Option<usize>) -> PathBuf {
-        self.navigable_row(row)
-            .and_then(|row| self.entry(row))
-            .map_or_else(|| self.view.path().to_path_buf(), |e| e.path.clone())
+        self.nav.drop_dir(row)
     }
 
     /// Select entry `row` as a click with `mods` would, for a presentation
@@ -568,22 +503,21 @@ impl Browser {
         }
         self.move_prompt.cancel();
         self.keymap.set_focus(Focus::List);
-        Outcome::redraw_if(self.pane.pick(row, mods).needs_redraw())
+        let reaction = self.nav.pick(row, mods);
+        self.absorb(reaction)
     }
 
     /// Move the keyboard cursor to entry `row`, extending the selection from
     /// the anchor when `extend` is set, as Shift-arrow does.
     pub fn steer_to(&mut self, row: usize, extend: bool) -> Outcome {
-        let mods = if extend { Mods::shift() } else { Mods::none() };
-        Outcome::redraw_if(self.pane.pick(row, mods).needs_redraw())
+        let reaction = self.nav.steer_to(row, extend);
+        self.absorb(reaction)
     }
 
     /// Select entry `row` and act on it: enter a folder, or open a file.
     pub fn activate_entry(&mut self, row: usize) -> Outcome {
-        if self.pane.pick(row, Mods::none()) == PaneResponse::Ignored {
-            return Outcome::Ignored;
-        }
-        self.activate(row)
+        let reaction = self.nav.activate_entry(row);
+        self.absorb(reaction)
     }
 
     /// Drop the selection, as a click on empty space does.
@@ -618,7 +552,7 @@ impl Browser {
                 // Typing on the list implicitly opens the filter, which is
                 // what makes search-as-you-type work with no prefix key.
                 self.keymap.set_focus(Focus::Filter);
-                Outcome::redraw_if(self.filter.insert(c) && self.apply_query())
+                Outcome::redraw_if(self.nav.edit_filter(|input| input.insert(c)))
                     .or_redraw(self.keymap.is_filtering())
             }
             Action::Edit(edit) => {
@@ -636,11 +570,7 @@ impl Browser {
                 if self.keymap.is_moving() {
                     return Outcome::redraw_if(self.edit_move(edit));
                 }
-                let changed = self.edit(edit);
-                if changed {
-                    self.apply_query();
-                }
-                Outcome::redraw_if(changed)
+                Outcome::redraw_if(self.nav.edit_filter(|input| edit.apply(input)))
             }
             Action::BeginFilter => {
                 let changed = !self.keymap.is_filtering();
@@ -656,21 +586,16 @@ impl Browser {
                 // Escape both leaves the box *and* discards the query -- a
                 // cancel that kept the filter would leave the list mysteriously
                 // truncated with no visible box explaining why.
-                let had_query = !self.filter.is_empty();
                 let was_filtering = self.keymap.is_filtering();
-                self.filter.clear();
+                let had_query = self.nav.clear_filter();
                 self.keymap.set_focus(Focus::List);
-                if had_query {
-                    self.apply_query();
-                }
                 Outcome::redraw_if(had_query || was_filtering)
             }
             Action::GoUp => self.go_up(),
             Action::Refresh => self.refresh(),
             Action::ToggleHidden => {
-                self.view.toggle_hidden();
-                self.set_len(self.view.visible_len());
-                Outcome::Redraw
+                let reaction = self.nav.toggle_hidden();
+                self.absorb(reaction)
             }
             Action::ToggleFavorite => Outcome::ToggleFavorite,
             Action::ToggleSidebar => Outcome::ToggleSidebar,
@@ -699,18 +624,7 @@ impl Browser {
     /// click or a Space to formally select it.
     #[must_use]
     pub fn selected_paths(&self) -> Vec<PathBuf> {
-        let selected = self.pane.selection().selected();
-        if selected.is_empty() {
-            return self
-                .cursor_entry()
-                .map(|e| vec![e.path.clone()])
-                .unwrap_or_default();
-        }
-        selected
-            .iter()
-            .filter_map(|&row| self.entry(row))
-            .map(|e| e.path.clone())
-            .collect()
+        self.nav.selected_paths()
     }
 
     /// The file clipboard, for painting cut entries dimmed.
@@ -779,7 +693,7 @@ impl Browser {
         let Some(pending) = self.clipboard.take_for_paste() else {
             return Outcome::Ignored;
         };
-        let target = self.view.path().to_path_buf();
+        let target = self.nav.path().to_path_buf();
         let transfer = fileops::Transfer::new(
             fileops::ConflictResolver::new(fileops::ConflictPolicy::Rename),
             fileops::Progress::new(),
@@ -909,7 +823,7 @@ impl Browser {
 
     /// The cursor's row index and path together, for opening a rename.
     fn cursor_row_and_path(&self) -> Option<(usize, PathBuf)> {
-        let row = self.pane.cursor()?;
+        let row = self.nav.pane().cursor()?;
         Some((row, self.entry(row)?.path.clone()))
     }
 
@@ -1065,65 +979,38 @@ impl Browser {
         }
     }
 
-    /// Apply an edit to the filter box, reporting whether it changed.
-    fn edit(&mut self, edit: EditAction) -> bool {
-        match edit {
-            EditAction::Backspace => self.filter.backspace(),
-            EditAction::Delete => self.filter.delete(),
-            EditAction::Left => self.filter.move_left(),
-            EditAction::Right => self.filter.move_right(),
-            EditAction::WordLeft => self.filter.move_word_left(),
-            EditAction::WordRight => self.filter.move_word_right(),
-            EditAction::Home => self.filter.move_home(),
-            EditAction::End => self.filter.move_end(),
-            EditAction::KillToEnd => self.filter.delete_to_end(),
-            EditAction::KillToStart => self.filter.delete_to_start(),
-            EditAction::DeleteWordLeft => self.filter.delete_word_left(),
-        }
-    }
-
-    /// Push the filter box's text into the model and re-length the pane.
-    ///
-    /// The re-length is the load-bearing half: the visible count changes on
-    /// every keystroke, and a pane still holding the old length would let the
-    /// selection index past the end of the list.
-    fn apply_query(&mut self) -> bool {
-        self.view.set_query(self.filter.text());
-        self.set_len(self.view.visible_len());
-        true
-    }
-
     /// Run a list command, resolving an activation against the model.
     fn list_command(&mut self, cmd: ListCommand) -> Outcome {
-        match self.pane.command(cmd) {
-            PaneResponse::Ignored => Outcome::Ignored,
-            PaneResponse::Redraw => Outcome::Redraw,
-            PaneResponse::Activate(row) => self.activate(row),
-        }
+        let reaction = self.nav.list_command(cmd);
+        self.absorb(reaction)
     }
 
-    /// Act on the entry at `row`: descend into it, or report it for opening.
-    fn activate(&mut self, row: usize) -> Outcome {
-        let Some(entry) = self.view.visible_at(row) else {
-            return Outcome::Redraw;
-        };
-        if entry.is_navigable() {
-            let target = entry.path.clone();
-            self.navigate(&target, None, Trail::Record)
-        } else {
-            Outcome::Open(entry.path.clone())
+    /// Translate what the shared browser did into this application's
+    /// outcome, resetting the state that is scoped to one directory when the
+    /// browser moved.
+    ///
+    /// A rename is scoped to the row it opened over, which no longer exists
+    /// in the new listing; keeping the session would leave the box floating
+    /// over an unrelated file.
+    fn absorb(&mut self, reaction: Reaction) -> Outcome {
+        match reaction {
+            Reaction::Ignored => Outcome::Ignored,
+            Reaction::Redraw => Outcome::Redraw,
+            Reaction::Open(path) => Outcome::Open(path),
+            Reaction::Moved => {
+                self.rename.cancel();
+                self.move_prompt.cancel();
+                self.notice = None;
+                self.keymap.set_focus(Focus::List);
+                Outcome::Redraw
+            }
         }
     }
 
     /// Navigate to the parent directory, landing on the child just left.
     fn go_up(&mut self) -> Outcome {
-        let Some(parent) = self.view.parent() else {
-            // Already at the filesystem root: nothing above, and this must
-            // not be reported as a change or the window repaints for nothing.
-            return Outcome::Ignored;
-        };
-        let leaving = self.view.path().to_path_buf();
-        self.navigate(&parent, Some(&leaving), Trail::Record)
+        let reaction = self.nav.go_up();
+        self.absorb(reaction)
     }
 
     /// Jump straight to `path`, as the sidebar's places do.
@@ -1133,75 +1020,13 @@ impl Browser {
     /// are must not be reported as a change or the window repaints for
     /// nothing.
     pub fn go_to(&mut self, path: &Path) -> Outcome {
-        if path == self.view.path() {
-            return Outcome::Ignored;
-        }
-        self.navigate(path, None, Trail::Record)
-    }
-
-    /// Read `path` and point the browser at it.
-    ///
-    /// `select` names an entry to land the cursor on -- how going up returns
-    /// you to the directory you just left instead of the top of the list.
-    ///
-    /// View rules (hidden files, sort) are carried across deliberately: they
-    /// are a property of how the user wants to browse, not of one directory.
-    fn navigate(&mut self, path: &Path, select: Option<&Path>, trail: Trail) -> Outcome {
-        let filter = self.view.filter().clone();
-        let sort = self.view.sort_policy();
-        // Captured before the move, since `self.view` is about to be replaced.
-        let leaving = self.view.path().to_path_buf();
-        match DirectoryView::open_with(path, filter, sort) {
-            Ok(view) => {
-                self.view = view;
-                self.error = None;
-                self.watch.follow(path);
-                // Recorded only on success, and only for a genuinely new move:
-                // a back/forward step has already accounted for itself, and
-                // recording it here would make the chevrons toggle between two
-                // directories instead of walking the trail.
-                if trail == Trail::Record {
-                    self.history.visit(&leaving);
-                }
-                // A query is scoped to the directory it was typed in: carrying
-                // "report" into a folder with no matches would show an empty
-                // window and look like a failed read.
-                self.filter.clear();
-                self.view.set_query("");
-                // A rename is scoped to the row it opened over, which no
-                // longer exists in the new listing; keeping the session would
-                // leave the box floating over an unrelated file.
-                self.rename.cancel();
-                self.move_prompt.cancel();
-                self.notice = None;
-                self.keymap.set_focus(Focus::List);
-                self.listing += 1;
-                self.pane.reset(self.view.visible_len());
-                if let Some(target) = select {
-                    self.select_path(target);
-                }
-                Outcome::Redraw
-            }
-            Err(e) => {
-                // Stay put and say so, rather than tearing the window down
-                // over one unreadable directory.
-                self.error = Some(e);
-                Outcome::Redraw
-            }
-        }
+        let reaction = self.nav.go_to(path);
+        self.absorb(reaction)
     }
 
     /// Put the cursor on the entry whose path is `target`, if it is visible.
     fn select_path(&mut self, target: &Path) -> bool {
-        let Some(row) = (0..self.view.visible_len())
-            .find(|&i| self.view.visible_at(i).is_some_and(|e| e.path == target))
-        else {
-            return false;
-        };
-        // Through the active presentation rather than a bare selection, so
-        // the target is also scrolled into view -- landing on an off-screen
-        // cursor would look exactly like landing at the top.
-        self.pane.select_row(row)
+        self.nav.select_path(target)
     }
 
     /// Move `paths` into `target_dir` (a real filesystem mutation via
@@ -1243,33 +1068,8 @@ impl Browser {
 
     /// Re-read the current directory, preserving the cursor where possible.
     fn refresh(&mut self) -> Outcome {
-        // Captured before the read, since the row index may well name a
-        // different file afterwards.
-        let cursor_path = self.cursor_entry().map(|e| e.path.clone());
-        match self.view.refresh() {
-            Ok(()) => {
-                self.refreshes += 1;
-                self.error = None;
-                // Re-armed even though the path is unchanged: a directory
-                // deleted and recreated while unwatched is a different
-                // inode, and only a fresh `add_watch` follows it again.
-                self.watch.follow(self.view.path());
-                self.set_len(self.view.visible_len());
-                if let Some(path) = cursor_path {
-                    self.select_path(&path);
-                }
-                Outcome::Redraw
-            }
-            Err(e) => {
-                self.error = Some(e);
-                Outcome::Redraw
-            }
-        }
-    }
-
-    fn set_len(&mut self, len: usize) {
-        self.listing += 1;
-        self.pane.set_len(len);
+        let reaction = self.nav.refresh();
+        self.absorb(reaction)
     }
 }
 

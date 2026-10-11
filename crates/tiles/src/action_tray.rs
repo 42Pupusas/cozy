@@ -1,12 +1,13 @@
-//! [`ActionTray`] -- the extra rows a right click adds to a tile: the menu
-//! actions in two rows of three, directly under the hover buttons and in the
-//! same columns, with a caption naming the one pointed at. They belong to the
-//! tile: its card grows to hold them.
+//! [`ActionTray`]: the extra rows a right click adds to a tile.
+//!
+//! The menu actions sit in two rows of three, directly under the hover
+//! buttons and in the same columns, with a caption naming the one pointed at.
+//! They belong to the tile: its card grows to hold them.
 
 use platform::draw::{Point, Rect};
 
-use tiles::spacing::Spacing;
-use tiles::tile_action::{ActionBar, TileAction};
+use crate::spacing::Spacing;
+use crate::tile_action::{ActionBar, TileAction};
 
 const ACROSS: usize = 3;
 
@@ -147,8 +148,8 @@ impl ActionTray {
 #[cfg(test)]
 mod tests {
     use super::ActionTray;
-    use tiles::spacing::Spacing;
-    use tiles::tile_action::{ActionBar, TileAction};
+    use crate::spacing::Spacing;
+    use crate::tile_action::{ActionBar, TileAction};
     use platform::draw::{Point, Rect};
 
     const FIELD: Rect = Rect::new(0, 0, 1000, 700);

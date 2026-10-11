@@ -13,14 +13,14 @@ use platform::toplevel::{Key, KeyPress, Painter, PhysicalSize, PointerEventKind,
 use std::os::fd::RawFd;
 use widget::{DragArm, Mods};
 
-use crate::action_tray::{ActionTray, TrayOpen};
+use tiles::action_tray::{ActionTray, TrayOpen};
 use crate::breadcrumb::Breadcrumb;
 use crate::browser::{Browser, Outcome};
 use crate::card_surface::{Backdrop, CardSurface};
 use crate::drag_badge::{BadgeStyle, DragBadge};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
-use crate::hover::{Hover, Pane, Spot};
+use tiles::hover::{Hover, Pane, Spot};
 use tiles::pinned_card::PinnedCard;
 use crate::row_format::RowFormat;
 use tiles::row_kind::RowKind;
@@ -40,9 +40,9 @@ use tiles::tile_field::{PlacedMore, PlacedTile, TileField};
 use tiles::tile_geometry::TileGeometry;
 use tiles::tile_growth::{Destination, Shape, TileGrowth};
 use tiles::tile_id::TileId;
-use crate::tile_motion::{TileKey, TileMotion};
-use crate::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
-use crate::toolbar::{Target, Toolbar};
+use tiles::tile_motion::{TileKey, TileMotion};
+use tiles::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
+use tiles::toolbar::{Target, Toolbar};
 use tiles::typography::Typography;
 
 /// Milliseconds within which a second click counts as a double-click.
@@ -1812,7 +1812,7 @@ mod tests {
     use super::{
         FilesWindow, KeyPress, Painter, PointerEventKind, Target, TileAction, TileGeometry, TileKey,
     };
-    use crate::hover::{Pane, Spot};
+    use tiles::hover::{Pane, Spot};
     use platform::SurfaceFormat;
     use platform::draw::Canvas;
     use platform::protocol::PointerButton;

@@ -2,9 +2,9 @@
 //! rises, its action buttons appear, the button under the pointer grows and
 //! lights, and a button held down takes the press colour.
 
-use tiles::fade::Fades;
+use crate::fade::Fades;
 use crate::hover::{Pane, Spot};
-use tiles::tile_action::TileAction;
+use crate::tile_action::TileAction;
 
 /// Which tile a glide belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,7 +165,7 @@ impl Default for TileMotion {
 mod tests {
     use super::{TileKey, TileMotion};
     use crate::hover::{Pane, Spot};
-    use tiles::tile_action::TileAction;
+    use crate::tile_action::TileAction;
     use crate::toolbar::Target;
 
     const FRAME_MS: u64 = 16;

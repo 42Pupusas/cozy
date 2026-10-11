@@ -15,8 +15,6 @@
 //! where you came from -- has unit tests that run in microseconds instead of
 //! needing a compositor and a pair of eyes.
 
-mod action_icon;
-mod action_tray;
 mod breadcrumb;
 mod browser;
 mod card_surface;
@@ -26,7 +24,6 @@ mod favorites;
 mod file_launcher;
 mod frame;
 mod headless;
-mod hover;
 mod idle_wait;
 mod keymap;
 #[allow(dead_code)]
@@ -44,9 +41,6 @@ mod secret_input;
 mod sidebar;
 mod storage;
 mod test_support;
-mod tile_motion;
-mod tile_painter;
-mod toolbar;
 mod window;
 
 use browser::Browser;

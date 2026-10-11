@@ -6,7 +6,7 @@
 
 use platform::draw::{Canvas, Color, Point, Rect};
 
-use tiles::tile_action::TileAction;
+use crate::tile_action::TileAction;
 
 /// One icon, sized to the button it sits on.
 pub struct ActionIcon {
@@ -239,7 +239,7 @@ impl ActionIcon {
 #[cfg(test)]
 mod tests {
     use super::ActionIcon;
-    use tiles::tile_action::TileAction;
+    use crate::tile_action::TileAction;
     use platform::draw::{Canvas, Color, Rect};
 
     const SIDE: i32 = 40;

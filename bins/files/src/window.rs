@@ -11,7 +11,7 @@ use platform::draw::{Canvas, Color, Point, Rect};
 use platform::protocol::PointerButton;
 use platform::toplevel::{Key, KeyPress, Painter, PhysicalSize, PointerEventKind, Position};
 use std::os::fd::RawFd;
-use widget::{DragArm, Mods};
+use widget::{DoubleClick, DragArm, Mods, MonotonicClock};
 
 use tiles::action_tray::{ActionTray, TrayOpen};
 use crate::breadcrumb::Breadcrumb;
@@ -41,23 +41,6 @@ use tiles::tile_motion::TileKey;
 use tiles::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
 use tiles::toolbar::{Target, Toolbar};
 use tiles::typography::Typography;
-
-/// Milliseconds within which a second click counts as a double-click.
-///
-/// 400ms is the long-standing X11/GTK default. Worth stating rather than
-/// tuning: a threshold that is too short makes double-clicking feel broken
-/// for anyone who does not click quickly, which includes most people.
-const DOUBLE_CLICK_MS: u64 = 400;
-
-/// Pixels the pointer may move between two clicks and still double-click.
-///
-/// Without a distance check, clicking two *different* rows in quick
-/// succession registers as a double-click on the second and opens a file the
-/// user never meant to open.
-const DOUBLE_CLICK_SLOP: i32 = 4;
-
-/// The interval between frames while a tile is gliding, about sixty a second.
-const FRAME_MS: i32 = 16;
 
 /// The inline rename box's contents for one frame.
 ///
@@ -92,8 +75,7 @@ pub struct FilesWindow {
     /// Queued rather than spawned here: launching a process from inside a
     /// paint callback would run it while the window is mid-frame.
     pending_open: Option<std::path::PathBuf>,
-    /// When and where the last left-click landed, for double-click detection.
-    last_click: Option<(u64, Position)>,
+    clicks: DoubleClick,
     /// Disk usage for the open directory's filesystem, shown in the
     /// sidebar's footer.
     ///
@@ -184,7 +166,7 @@ impl FilesWindow {
             hover: Hover::none(),
             quit: false,
             pending_open: None,
-            last_click: None,
+            clicks: DoubleClick::new(),
             // Left empty so `new` can stay const; the first paint fills it.
             storage: None,
             drag_arm: DragArm::new(),
@@ -203,7 +185,7 @@ impl FilesWindow {
 
     /// [`Self::step_motion`] at the current time, for the event loop.
     pub fn advance_motion(&mut self) -> bool {
-        self.step_motion(Self::now_ms())
+        self.step_motion(MonotonicClock::now_ms())
     }
 
     /// Carry the tile glides on to `now_ms` and point them at what is under
@@ -232,7 +214,7 @@ impl FilesWindow {
     /// `None` when nothing is moving.
     #[must_use]
     pub fn motion_wait_ms(&self) -> Option<i32> {
-        self.scene.is_animating().then_some(FRAME_MS)
+        self.scene.frame_wait_ms()
     }
 
     /// Take any drag the last pointer gesture started, for the event loop to
@@ -496,8 +478,7 @@ impl FilesWindow {
             self.show_next_tiles(at);
             return;
         }
-        let now = Self::now_ms();
-        let doubled = self.is_double_click(now, at);
+        let doubled = self.clicks.register(MonotonicClock::now_ms(), (at.x, at.y));
         match self.tile_at(Point::new(at.x, at.y)) {
             None => {
                 let outcome = self.browser.clear_selection();
@@ -1043,31 +1024,6 @@ impl FilesWindow {
         ) {
             self.refresh_storage();
         }
-    }
-
-    /// Whether this click, at `now`, continues a double-click gesture.
-    fn is_double_click(&mut self, now: u64, at: Position) -> bool {
-        let doubled = self.last_click.is_some_and(|(then, prev)| {
-            now.saturating_sub(then) <= DOUBLE_CLICK_MS
-                && (prev.x - at.x).abs() <= DOUBLE_CLICK_SLOP
-                && (prev.y - at.y).abs() <= DOUBLE_CLICK_SLOP
-        });
-        // A completed double-click resets the timer: without this, a third
-        // click would pair with the second and open the file again.
-        self.last_click = if doubled { None } else { Some((now, at)) };
-        doubled
-    }
-
-    /// Milliseconds from a monotonic clock, for click timing.
-    ///
-    /// Monotonic rather than wall-clock so an NTP step cannot make two
-    /// clicks appear an hour apart -- the same reasoning as the key-repeat
-    /// clock in `platform`.
-    fn now_ms() -> u64 {
-        use std::sync::OnceLock;
-        static START: OnceLock<std::time::Instant> = OnceLock::new();
-        let start = START.get_or_init(std::time::Instant::now);
-        u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Draw the pinned card: its glass surface and outline, then every piece
@@ -2687,7 +2643,7 @@ mod tests {
         left_press(&mut painter, at);
         left_release(&mut painter, at);
         std::thread::sleep(std::time::Duration::from_millis(
-            super::DOUBLE_CLICK_MS + 50,
+            widget::DoubleClick::WINDOW_MS + 50,
         ));
         left_press(&mut painter, at);
         left_release(&mut painter, at);

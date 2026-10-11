@@ -49,6 +49,8 @@ pub struct TileScene {
 }
 
 impl TileScene {
+    pub const FRAME_MS: i32 = 16;
+
     #[must_use]
     pub fn new(wake: waker::Waker) -> Self {
         Self {
@@ -249,6 +251,11 @@ impl TileScene {
     pub fn is_animating(&self) -> bool {
         self.motion.is_animating() || self.growth.is_animating()
     }
+
+    #[must_use]
+    pub fn frame_wait_ms(&self) -> Option<i32> {
+        self.is_animating().then_some(Self::FRAME_MS)
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +313,16 @@ mod tests {
     #[test]
     fn a_fresh_scene_owes_no_frame() {
         assert!(!scene().is_animating());
+        assert_eq!(scene().frame_wait_ms(), None);
+    }
+
+    #[test]
+    fn a_gliding_scene_asks_to_be_woken_each_frame() {
+        let (nav, _dir) = folder("scene_wait", 5);
+        let flow = flow(1);
+        let mut scene = scene();
+        scene.step(&flow, &nav, &idle(), 0);
+        assert_eq!(scene.frame_wait_ms(), Some(TileScene::FRAME_MS));
     }
 
     #[test]

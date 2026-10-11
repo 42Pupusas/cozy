@@ -19,6 +19,7 @@ dbus        = { path = "../../crates/dbus" }
 dbus-server = { path = "../../crates/dbus-server" }
 portal-core = { path = "../../crates/portal-core" }
 config      = { path = "../../crates/config" }
+opener      = { path = "../../crates/opener" }
 waker        = { path = "../../crates/waker" }
 ququmatz     = { workspace = true }
 quetzalcoatl = { workspace = true }

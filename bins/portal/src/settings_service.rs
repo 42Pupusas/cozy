@@ -62,6 +62,14 @@ impl SettingsService {
     pub fn dispatcher(state: SettingsState) -> Dispatcher {
         let mut dispatcher = Dispatcher::new();
         dispatcher.register_object(Self::PATH, [Self::IFACE]);
+        Self::install(&mut dispatcher, state);
+        dispatcher
+    }
+
+    /// Register this interface's descriptor, property and handlers on an
+    /// existing `dispatcher`. The caller registers the object at
+    /// [`Self::PATH`] with [`Self::IFACE`] among its interfaces.
+    pub fn install(dispatcher: &mut Dispatcher, state: SettingsState) {
         dispatcher.register_interface(Self::interface_descriptor());
         dispatcher.set_property(
             Self::PATH,
@@ -89,8 +97,6 @@ impl SettingsService {
                 .map(|value| vec![Value::Variant(Box::new(value))])
                 .ok_or_else(|| format!("No such key '{key}' in namespace '{namespace}'"))
         });
-
-        dispatcher
     }
 
     /// This interface's full shape for `Introspect`: both methods (with

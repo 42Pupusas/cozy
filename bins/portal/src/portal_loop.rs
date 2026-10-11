@@ -15,6 +15,7 @@ use dbus_server::Dispatcher;
 use portal_core::SettingChangedSignal;
 
 use crate::config_watcher::ConfigWatcher;
+use crate::portal_dispatcher::PortalDispatcher;
 use crate::settings_service::SettingsService;
 use crate::settings_state::SettingsState;
 
@@ -45,7 +46,7 @@ impl PortalLoop {
     /// agree on one global `$XDG_CONFIG_HOME`.
     #[must_use]
     pub fn with_watcher(conn: DbusConn, state: SettingsState, watcher: ConfigWatcher) -> Self {
-        let dispatcher: Dispatcher = SettingsService::dispatcher(state.clone());
+        let dispatcher: Dispatcher = PortalDispatcher::build(state.clone());
         Self {
             server: dbus_server::ServerLoop::new(conn, dispatcher),
             watcher,

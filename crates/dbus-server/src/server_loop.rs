@@ -59,6 +59,12 @@ impl ServerLoop {
         &mut self.conn
     }
 
+    /// Both halves at once, for code that answers calls from the
+    /// connection while also changing the registered objects.
+    pub const fn parts_mut(&mut self) -> (&mut DbusConn, &mut Dispatcher) {
+        (&mut self.conn, &mut self.dispatcher)
+    }
+
     /// Block for exactly one incoming message. If it's a well-formed
     /// method call, dispatch it and send the reply; anything else
     /// (malformed method call missing a routing field, non-`MethodCall`

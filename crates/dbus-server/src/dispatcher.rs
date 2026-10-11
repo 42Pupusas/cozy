@@ -76,6 +76,12 @@ impl Dispatcher {
         self.registry.register(path, interfaces);
     }
 
+    /// Whether an object is published at `path`.
+    #[must_use]
+    pub fn has_object(&self, path: &str) -> bool {
+        self.registry.contains(path)
+    }
+
     /// Remove `path`. See [`ObjectRegistry::unregister`].
     pub fn unregister_object(&mut self, path: &str) -> bool {
         self.registry.unregister(path)
@@ -501,6 +507,16 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.reply_signature, "a{sa{sv}}");
+    }
+
+    #[test]
+    fn has_object_follows_registration() {
+        let mut dispatcher = Dispatcher::new();
+        assert!(!dispatcher.has_object(SETTINGS_PATH));
+        dispatcher.register_object(SETTINGS_PATH, [SETTINGS_IFACE]);
+        assert!(dispatcher.has_object(SETTINGS_PATH));
+        dispatcher.unregister_object(SETTINGS_PATH);
+        assert!(!dispatcher.has_object(SETTINGS_PATH));
     }
 
     #[test]

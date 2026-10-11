@@ -1,0 +1,12 @@
+[package]
+name    = "portal-ui"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+platform    = { path = "../platform" }
+portal-core = { path = "../portal-core" }
+waker       = { path = "../waker" }

@@ -16,7 +16,8 @@
 //! "ship a real `.portal` file and route it" half.
 
 use dbus::conn::DbusConn;
-use portal_bin::{PortalLoop, SettingsService, SettingsState};
+use portal_bin::{ConfigWatcher, PortalLoop, SettingsService, SettingsState};
+use portal_ui::WindowDialogs;
 
 fn main() {
     let cfg = config::Config::load().unwrap_or_else(|e| {
@@ -33,7 +34,8 @@ fn main() {
         }
     };
 
-    let mut portal_loop = PortalLoop::new(conn, state);
+    let mut portal_loop =
+        PortalLoop::with_dialogs(conn, state, ConfigWatcher::new(), Box::new(WindowDialogs));
     match portal_loop.conn_mut().request_name(SettingsService::NAME) {
         Ok(true) => {}
         Ok(false) => {

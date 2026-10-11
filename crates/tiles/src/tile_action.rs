@@ -1,6 +1,6 @@
-//! [`TileAction`] and [`ActionBar`] -- the buttons a hovered tile offers, and
-//! where they sit on it. The rest of the actions live on the tray a right
-//! click opens, laid out by [`crate::action_tray::ActionTray`].
+//! [`TileAction`] and [`ActionBar`]: the buttons a hovered tile offers.
+//!
+//! The remaining actions live on the tray a right click opens.
 
 use platform::draw::{Point, Rect};
 

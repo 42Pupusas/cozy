@@ -21,7 +21,6 @@ mod breadcrumb;
 mod browser;
 mod card_surface;
 mod clipboard;
-mod density;
 mod drag_badge;
 mod favorites;
 mod file_launcher;
@@ -30,7 +29,6 @@ mod headless;
 mod hover;
 mod idle_wait;
 mod keymap;
-mod metric_overrides;
 #[allow(dead_code)]
 mod mount_service;
 #[allow(dead_code)]
@@ -39,30 +37,23 @@ mod move_prompt;
 mod options;
 mod password_modal;
 mod password_panel;
-mod pinned_card;
 mod rename;
 mod row_format;
-mod row_kind;
 mod secret_input;
 #[allow(dead_code)]
 mod sidebar;
-mod spacing;
 mod storage;
 mod test_support;
-mod theme;
-mod tile_action;
-mod tile_geometry;
 mod tile_motion;
 mod tile_painter;
 mod toolbar;
-mod typography;
 mod window;
 
 use browser::Browser;
 use file_launcher::FileLauncher;
 use options::Options;
 use platform::toplevel::{LogicalSize, Toplevel, WindowEvent};
-use theme::Theme;
+use tiles::theme::Theme;
 use window::FilesWindow;
 
 /// Runs the browser: owns the window, the event loop, and the exit path.
@@ -85,7 +76,7 @@ impl App {
         // larger configured font grows the chrome instead of clipping it.
         // Scale 1.0 here; the compositor's real output scale is applied when
         // the window reports its physical size below.
-        let type_scale = typography::Typography::load(&cfg, 1.0);
+        let type_scale = tiles::typography::Typography::load(&cfg, 1.0);
         // Three sources, in priority order: an explicit `[files]` key, then
         // the guide's geometry scaled to the configured font, then a floor
         // from the loaded type scale so no band is shorter than the glyphs it
@@ -93,7 +84,7 @@ impl App {
         // heights the guide also sizes the controls against; `with_metrics`
         // then only raises a band that would clip, and never lowers one.
         let theme = Theme::from_config(&cfg)
-            .with_spacing(spacing::Spacing::new(cfg.font.px_size(), 1.0))
+            .with_spacing(tiles::spacing::Spacing::new(cfg.font.px_size(), 1.0))
             .with_metrics(
                 type_scale.natural_row_height(),
                 type_scale.natural_header_height(),

@@ -9,8 +9,8 @@
 
 use platform::draw::Rect;
 
-use crate::pinned_card::{CardMetrics, PinnedCard};
-use crate::spacing::Spacing;
+use tiles::pinned_card::{CardMetrics, PinnedCard};
+use tiles::spacing::Spacing;
 use tiles::spiral::MinCell;
 
 /// The window's resolved layout.
@@ -93,8 +93,8 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::Frame;
-    use crate::pinned_card::CardMetrics;
-    use crate::spacing::Spacing;
+    use tiles::pinned_card::CardMetrics;
+    use tiles::spacing::Spacing;
     use platform::draw::Rect;
 
     const METRICS: CardMetrics = CardMetrics {

@@ -8,7 +8,7 @@
 //! per pixel of pointer travel) or not repainting at all and leaving a stale
 //! state behind.
 
-use crate::tile_action::TileAction;
+use tiles::tile_action::TileAction;
 use crate::toolbar::Target;
 
 /// Whatever the pointer is over: a tile, a button on one, or a control.
@@ -97,7 +97,7 @@ impl Hover {
 #[cfg(test)]
 mod tests {
     use super::{Hover, Pane, Spot};
-    use crate::tile_action::TileAction;
+    use tiles::tile_action::TileAction;
     use crate::toolbar::Target;
 
     /// Trait rather than a free function, so the tests read as `hover.to_row(..)`

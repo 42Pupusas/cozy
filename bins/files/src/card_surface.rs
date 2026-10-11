@@ -7,7 +7,7 @@
 use platform::draw::{Canvas, Color, Rect};
 
 use crate::storage::Usage;
-use crate::theme::Theme;
+use tiles::theme::Theme;
 
 /// The colours that sit behind a control, for one tone of the card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +93,7 @@ impl CardSurface {
 mod tests {
     use super::CardSurface;
     use crate::storage::Usage;
-    use crate::theme::Theme;
+    use tiles::theme::Theme;
     use platform::draw::{Canvas, Color, Rect};
 
     const BOUNDS: Rect = Rect::new(10, 10, 100, 60);

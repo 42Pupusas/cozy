@@ -30,7 +30,7 @@ use platform::draw::{Canvas, Color, Rect};
 use statusbar::TextRenderer;
 
 use crate::password_modal::PasswordModal;
-use crate::spacing::Spacing;
+use tiles::spacing::Spacing;
 
 /// The colours and rhythm the modal draws itself with.
 ///
@@ -291,9 +291,9 @@ impl PasswordPanel {
 mod tests {
     use super::{PanelStyle, PanelText, PasswordPanel};
     use crate::password_modal::PasswordModal;
-    use crate::spacing::Spacing;
-    use crate::theme::Theme;
-    use crate::typography::Typography;
+    use tiles::spacing::Spacing;
+    use tiles::theme::Theme;
+    use tiles::typography::Typography;
     use platform::draw::Rect;
 
     fn style() -> PanelStyle {

@@ -21,9 +21,9 @@ use crate::drag_badge::{BadgeStyle, DragBadge};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
 use crate::hover::{Hover, Pane, Spot};
-use crate::pinned_card::PinnedCard;
+use tiles::pinned_card::PinnedCard;
 use crate::row_format::RowFormat;
-use crate::row_kind::RowKind;
+use tiles::row_kind::RowKind;
 use crate::sidebar::{Sidebar, SidebarRow};
 use tiles::spiral::MinCell;
 use tiles::spiral_cursor::{Landing, SpiralCursor};
@@ -34,16 +34,16 @@ use crate::mount_service::MountProgress;
 use crate::mount_session::{MountIdentity, MountSession};
 use crate::password_panel::{PanelStyle, PanelText, PasswordPanel};
 use crate::storage::Storage;
-use crate::theme::Theme;
-use crate::tile_action::TileAction;
+use tiles::theme::Theme;
+use tiles::tile_action::TileAction;
 use tiles::tile_field::{PlacedMore, PlacedTile, TileField};
-use crate::tile_geometry::TileGeometry;
+use tiles::tile_geometry::TileGeometry;
 use tiles::tile_growth::{Destination, Shape, TileGrowth};
 use tiles::tile_id::TileId;
 use crate::tile_motion::{TileKey, TileMotion};
 use crate::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
 use crate::toolbar::{Target, Toolbar};
-use crate::typography::Typography;
+use tiles::typography::Typography;
 
 /// Milliseconds within which a second click counts as a double-click.
 ///
@@ -1828,8 +1828,8 @@ mod tests {
             height: 600,
         };
         let cfg = config::Config::default();
-        let theme = crate::theme::Theme::from_config(&cfg);
-        let type_scale = crate::typography::Typography::load(&cfg, 1.0);
+        let theme = tiles::theme::Theme::from_config(&cfg);
+        let type_scale = tiles::typography::Typography::load(&cfg, 1.0);
         let favorites = crate::favorites::Favorites::default();
         let user_dirs = user_dirs::UserDirs::load();
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
@@ -1919,8 +1919,8 @@ mod tests {
             height: 600,
         };
         let cfg = config::Config::default();
-        let theme = crate::theme::Theme::from_config(&cfg);
-        let type_scale = crate::typography::Typography::load(&cfg, 1.0);
+        let theme = tiles::theme::Theme::from_config(&cfg);
+        let type_scale = tiles::typography::Typography::load(&cfg, 1.0);
         let favorites = crate::favorites::Favorites::default();
         let user_dirs = user_dirs::UserDirs::load();
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
@@ -1979,8 +1979,8 @@ mod tests {
         std::fs::write(root.join(".a_dotfile"), b"x").expect("create a dotfile");
 
         let cfg = config::Config::default();
-        let theme = crate::theme::Theme::from_config(&cfg);
-        let type_scale = crate::typography::Typography::load(&cfg, 1.0);
+        let theme = tiles::theme::Theme::from_config(&cfg);
+        let type_scale = tiles::typography::Typography::load(&cfg, 1.0);
         let favorites = crate::favorites::Favorites::default();
         let user_dirs = user_dirs::UserDirs::load();
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs, &favorites);
@@ -3509,8 +3509,8 @@ mod tests {
         let sidebar = crate::sidebar::Sidebar::new(&user_dirs::UserDirs::load(), &favorites);
         let mut painter = FilesWindow::new(
             crate::browser::Browser::open(&root, 700, 400, 28).expect("listable"),
-            crate::theme::Theme::from_config(&cfg),
-            crate::typography::Typography::load(&cfg, 1.0),
+            tiles::theme::Theme::from_config(&cfg),
+            tiles::typography::Typography::load(&cfg, 1.0),
             sidebar,
             favorites,
             PhysicalSize {

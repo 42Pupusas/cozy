@@ -7,7 +7,9 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-browse   = { path = "../browse" }
+browse    = { path = "../browse" }
+config    = { path = "../config" }
+statusbar = { path = "../statusbar" }
 fsmodel  = { path = "../fsmodel" }
 platform = { path = "../platform" }
 waker    = { path = "../waker" }

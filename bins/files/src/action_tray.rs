@@ -5,8 +5,8 @@
 
 use platform::draw::{Point, Rect};
 
-use crate::spacing::Spacing;
-use crate::tile_action::{ActionBar, TileAction};
+use tiles::spacing::Spacing;
+use tiles::tile_action::{ActionBar, TileAction};
 
 const ACROSS: usize = 3;
 
@@ -147,8 +147,8 @@ impl ActionTray {
 #[cfg(test)]
 mod tests {
     use super::ActionTray;
-    use crate::spacing::Spacing;
-    use crate::tile_action::{ActionBar, TileAction};
+    use tiles::spacing::Spacing;
+    use tiles::tile_action::{ActionBar, TileAction};
     use platform::draw::{Point, Rect};
 
     const FIELD: Rect = Rect::new(0, 0, 1000, 700);

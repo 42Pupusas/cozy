@@ -24,7 +24,7 @@
 use platform::draw::{Canvas, Color, Rect};
 use statusbar::TextRenderer;
 
-use crate::spacing::Spacing;
+use tiles::spacing::Spacing;
 
 /// The colours and rhythm the badge draws itself with.
 ///

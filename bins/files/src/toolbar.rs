@@ -7,8 +7,8 @@
 
 use platform::draw::Rect;
 
-use crate::pinned_card::PinnedCard;
-use crate::spacing::Spacing;
+use tiles::pinned_card::PinnedCard;
+use tiles::spacing::Spacing;
 
 /// A control in the card, as identified by a pointer position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,8 +155,8 @@ impl Toolbar {
 #[cfg(test)]
 mod tests {
     use super::{Target, Toolbar};
-    use crate::pinned_card::{CardMetrics, PinnedCard};
-    use crate::spacing::Spacing;
+    use tiles::pinned_card::{CardMetrics, PinnedCard};
+    use tiles::spacing::Spacing;
     use platform::draw::Rect;
 
     fn toolbar_of(width: i32, scale: f32) -> Toolbar {

@@ -12,13 +12,13 @@ use statusbar::TextRenderer;
 
 use crate::action_icon::ActionIcon;
 use crate::action_tray::ActionTray;
-use crate::row_kind::RowKind;
-use crate::spacing::Spacing;
-use crate::theme::Theme;
-use crate::tile_action::TileAction;
-use crate::tile_geometry::TileGeometry;
+use tiles::row_kind::RowKind;
+use tiles::spacing::Spacing;
+use tiles::theme::Theme;
+use tiles::tile_action::TileAction;
+use tiles::tile_geometry::TileGeometry;
 use tiles::tile_growth::TileGrowth;
-use crate::typography::Typography;
+use tiles::typography::Typography;
 
 /// One tile's strings and states for a frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -503,11 +503,11 @@ impl<'a> TilePainter<'a> {
 mod tests {
     use super::{PaintedTile, PaintedTray, TilePainter, TileRename};
     use crate::action_tray::ActionTray;
-    use crate::row_kind::RowKind;
-    use crate::theme::Theme;
-    use crate::tile_action::TileAction;
-    use crate::tile_geometry::TileGeometry;
-    use crate::typography::Typography;
+    use tiles::row_kind::RowKind;
+    use tiles::theme::Theme;
+    use tiles::tile_action::TileAction;
+    use tiles::tile_geometry::TileGeometry;
+    use tiles::typography::Typography;
     use platform::draw::{Canvas, Color, Rect};
 
     const WIDTH: i32 = 400;

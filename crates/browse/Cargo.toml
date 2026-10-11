@@ -9,5 +9,6 @@ workspace = true
 [dependencies]
 fsmodel        = { path = "../fsmodel" }
 widget         = { path = "../widget" }
+platform       = { path = "../platform" }
 inotify-events = { path = "../inotify-events" }
 ququmatz       = { workspace = true }

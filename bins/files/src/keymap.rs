@@ -21,8 +21,10 @@
 //! every branch in a single readable place instead of scattering
 //! `if self.filtering` through a forty-arm match.
 
+pub use browse::EditAction;
+use browse::{BrowseAction, BrowseKeys};
 use platform::toplevel::{Key, KeyPress};
-use widget::{Direction, Edge, ListCommand, TextInput};
+use widget::ListCommand;
 
 /// Which surface has the keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,40 +109,19 @@ pub enum Action {
     Quit,
 }
 
-/// A non-inserting edit in the filter box.
-///
-/// A separate enum from [`Action`] so the window's filter handling is one
-/// exhaustive match over edits, and adding an edit cannot accidentally be
-/// forgotten in the list-focus path where it has no meaning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditAction {
-    Backspace,
-    Delete,
-    Left,
-    Right,
-    WordLeft,
-    WordRight,
-    Home,
-    End,
-    KillToEnd,
-    KillToStart,
-    DeleteWordLeft,
-}
-
-impl EditAction {
-    pub fn apply(self, input: &mut TextInput) -> bool {
-        match self {
-            Self::Backspace => input.backspace(),
-            Self::Delete => input.delete(),
-            Self::Left => input.move_left(),
-            Self::Right => input.move_right(),
-            Self::WordLeft => input.move_word_left(),
-            Self::WordRight => input.move_word_right(),
-            Self::Home => input.move_home(),
-            Self::End => input.move_end(),
-            Self::KillToEnd => input.delete_to_end(),
-            Self::KillToStart => input.delete_to_start(),
-            Self::DeleteWordLeft => input.delete_word_left(),
+impl Action {
+    const fn from_browse(action: Option<BrowseAction>) -> Option<Self> {
+        match action {
+            Some(BrowseAction::List(command)) => Some(Self::List(command)),
+            Some(BrowseAction::Insert(c)) => Some(Self::Insert(c)),
+            Some(BrowseAction::Edit(edit)) => Some(Self::Edit(edit)),
+            Some(BrowseAction::BeginFilter) => Some(Self::BeginFilter),
+            Some(BrowseAction::EndFilter) => Some(Self::EndFilter),
+            Some(BrowseAction::CancelFilter) => Some(Self::CancelFilter),
+            Some(BrowseAction::GoUp) => Some(Self::GoUp),
+            Some(BrowseAction::Refresh) => Some(Self::Refresh),
+            Some(BrowseAction::ToggleHidden) => Some(Self::ToggleHidden),
+            None => None,
         }
     }
 }
@@ -261,19 +242,15 @@ impl Keymap {
         // make Ctrl-H toggle hidden files *and* match a bare `h`.
         if ctrl {
             return match press.key {
-                Key::Char('a' | 'A') => Some(Action::List(ListCommand::SelectAll)),
-                Key::Char('h' | 'H') => Some(Action::ToggleHidden),
                 // D for bookmark, B for the pane -- matching the convention
                 // every browser and file manager already trained people on.
                 Key::Char('d' | 'D') => Some(Action::ToggleFavorite),
                 Key::Char('b' | 'B') => Some(Action::ToggleSidebar),
-                Key::Char('r' | 'R') => Some(Action::Refresh),
-                Key::Char('l' | 'L') => Some(Action::BeginFilter),
                 Key::Char('c' | 'C') => Some(Action::Copy),
                 Key::Char('x' | 'X') => Some(Action::Cut),
                 Key::Char('v' | 'V') => Some(Action::Paste),
                 Key::Char('q' | 'Q') => Some(Action::Quit),
-                _ => None,
+                _ => Action::from_browse(BrowseKeys::list(press)),
             };
         }
 
@@ -284,26 +261,7 @@ impl Keymap {
             Key::Delete if shift => Some(Action::DeletePermanently),
             Key::Delete => Some(Action::Trash),
             Key::Function(2) => Some(Action::BeginRename),
-            Key::Up if shift => Some(Action::List(ListCommand::Extend(Direction::Up))),
-            Key::Down if shift => Some(Action::List(ListCommand::Extend(Direction::Down))),
-            Key::Up => Some(Action::List(ListCommand::Move(Direction::Up))),
-            Key::Down => Some(Action::List(ListCommand::Move(Direction::Down))),
-            Key::PageUp => Some(Action::List(ListCommand::Page(Direction::Up))),
-            Key::PageDown => Some(Action::List(ListCommand::Page(Direction::Down))),
-            Key::Home => Some(Action::List(ListCommand::Jump(Edge::Top))),
-            Key::End => Some(Action::List(ListCommand::Jump(Edge::Bottom))),
-            // Right descends, mirroring Left's ascent -- both are how a
-            // keyboard-only user moves through a tree.
-            Key::Enter | Key::Right => Some(Action::List(ListCommand::Activate)),
-            Key::Left | Key::Backspace => Some(Action::GoUp),
-            Key::Escape => Some(Action::List(ListCommand::ClearSelection)),
-            Key::Function(5) => Some(Action::Refresh),
-            // Typing a printable character opens the filter and types into
-            // it, so search-as-you-type needs no prefix key. Space is
-            // excluded: it is a selection gesture in every file manager, and
-            // a leading space in a filter is invisible and baffling.
-            Key::Char(c) if c != ' ' => Some(Action::Insert(c)),
-            _ => None,
+            _ => Action::from_browse(BrowseKeys::list(press)),
         }
     }
 
@@ -312,45 +270,10 @@ impl Keymap {
     /// Navigation keys still reach the *list*: filtering as you type is only
     /// useful if you can arrow down to a result without leaving the box.
     const fn in_filter(press: KeyPress) -> Option<Action> {
-        let ctrl = press.modifiers.ctrl();
-        let shift = press.modifiers.shift();
-
-        if ctrl {
-            return match press.key {
-                Key::Char('a' | 'A') => Some(Action::Edit(EditAction::Home)),
-                Key::Char('e' | 'E') => Some(Action::Edit(EditAction::End)),
-                Key::Char('k' | 'K') => Some(Action::Edit(EditAction::KillToEnd)),
-                Key::Char('u' | 'U') => Some(Action::Edit(EditAction::KillToStart)),
-                Key::Char('w' | 'W') => Some(Action::Edit(EditAction::DeleteWordLeft)),
-                Key::Char('q' | 'Q') => Some(Action::Quit),
-                Key::Left => Some(Action::Edit(EditAction::WordLeft)),
-                Key::Right => Some(Action::Edit(EditAction::WordRight)),
-                _ => None,
-            };
+        if press.modifiers.ctrl() && matches!(press.key, Key::Char('q' | 'Q')) {
+            return Some(Action::Quit);
         }
-
-        match press.key {
-            // The list keeps the vertical keys so results can be walked
-            // without dropping out of the box.
-            Key::Up if shift => Some(Action::List(ListCommand::Extend(Direction::Up))),
-            Key::Down if shift => Some(Action::List(ListCommand::Extend(Direction::Down))),
-            Key::Up => Some(Action::List(ListCommand::Move(Direction::Up))),
-            Key::Down => Some(Action::List(ListCommand::Move(Direction::Down))),
-            Key::PageUp => Some(Action::List(ListCommand::Page(Direction::Up))),
-            Key::PageDown => Some(Action::List(ListCommand::Page(Direction::Down))),
-            // Enter commits: act on the highlighted result and leave the box.
-            Key::Enter => Some(Action::List(ListCommand::Activate)),
-            Key::Escape => Some(Action::CancelFilter),
-            Key::Tab => Some(Action::EndFilter),
-            Key::Backspace => Some(Action::Edit(EditAction::Backspace)),
-            Key::Delete => Some(Action::Edit(EditAction::Delete)),
-            Key::Left => Some(Action::Edit(EditAction::Left)),
-            Key::Right => Some(Action::Edit(EditAction::Right)),
-            Key::Home => Some(Action::Edit(EditAction::Home)),
-            Key::End => Some(Action::Edit(EditAction::End)),
-            Key::Char(c) => Some(Action::Insert(c)),
-            _ => None,
-        }
+        Action::from_browse(BrowseKeys::filter(press))
     }
 
     /// Bindings while the "move to" box has focus: the rename box's, with
@@ -372,30 +295,10 @@ impl Keymap {
     /// perform, so they are deliberately inert rather than silently
     /// operating on the file selection behind the box.
     const fn in_rename(press: KeyPress) -> Option<Action> {
-        if press.modifiers.ctrl() {
-            return match press.key {
-                Key::Char('a' | 'A') => Some(Action::Edit(EditAction::Home)),
-                Key::Char('e' | 'E') => Some(Action::Edit(EditAction::End)),
-                Key::Char('k' | 'K') => Some(Action::Edit(EditAction::KillToEnd)),
-                Key::Char('u' | 'U') => Some(Action::Edit(EditAction::KillToStart)),
-                Key::Char('w' | 'W') => Some(Action::Edit(EditAction::DeleteWordLeft)),
-                Key::Left => Some(Action::Edit(EditAction::WordLeft)),
-                Key::Right => Some(Action::Edit(EditAction::WordRight)),
-                _ => None,
-            };
-        }
-
         match press.key {
-            Key::Enter => Some(Action::CommitRename),
-            Key::Escape => Some(Action::CancelRename),
-            Key::Backspace => Some(Action::Edit(EditAction::Backspace)),
-            Key::Delete => Some(Action::Edit(EditAction::Delete)),
-            Key::Left => Some(Action::Edit(EditAction::Left)),
-            Key::Right => Some(Action::Edit(EditAction::Right)),
-            Key::Home => Some(Action::Edit(EditAction::Home)),
-            Key::End => Some(Action::Edit(EditAction::End)),
-            Key::Char(c) => Some(Action::Insert(c)),
-            _ => None,
+            Key::Enter if !press.modifiers.ctrl() => Some(Action::CommitRename),
+            Key::Escape if !press.modifiers.ctrl() => Some(Action::CancelRename),
+            _ => Action::from_browse(BrowseKeys::text(press)),
         }
     }
 }

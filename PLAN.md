@@ -15,6 +15,8 @@ Sibling documents:
 - `docs/portal-scoping.md` — the portal backend's own delivery plan. It stays
   authoritative for portal internals.
 - `docs/filebrowser-scoping.md` — the file browser's scoping note.
+- `docs/screencast-roadmap.md` — native ScreenCast, with a pure-Rust PipeWire
+  client. Roadmap only.
 - `DESIGN_GUIDE.md` — visual language.
 
 ---
@@ -37,7 +39,8 @@ Two constraints bound the goal:
 
 | Area | Reason |
 |---|---|
-| `ScreenCast`, `RemoteDesktop`, `Camera` | These need PipeWire. |
+| `RemoteDesktop`, `Camera` | These need PipeWire. |
+| `ScreenCast` | Roadmap only, not scheduled. See `docs/screencast-roadmap.md`. |
 | `Secret` | A secret store is security-sensitive work with no portal payoff. |
 | `Documents` | This needs a FUSE filesystem. It only helps sandboxed apps. |
 | GPU rendering | The software renderer is fast enough. See section 6. |

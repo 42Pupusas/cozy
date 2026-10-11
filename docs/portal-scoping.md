@@ -23,8 +23,9 @@ than a general-purpose, Flatpak-complete portal implementation.
 
 **Explicit non-goals for this project:**
 
-- `ScreenCast`, `RemoteDesktop`, and `Camera`: keep the existing backend (or
-  compositor implementation) because they require PipeWire protocol support.
+- `ScreenCast`, `RemoteDesktop`, and `Camera`: out of scope for this plan
+  because they require PipeWire protocol support. `ScreenCast` has its own
+  roadmap in `docs/screencast-roadmap.md`.
 - `Secret`: keep gnome-keyring; a secret store is security-sensitive work with
   no portal payoff.
 - `Documents`: do not implement unless Flatpak is actively used. It requires a

@@ -57,7 +57,7 @@ impl BluetoothModel {
 }
 
 /// What the main loop asks the worker to do.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BluetoothCommand {
     SetPowered { on: bool },
     SetScanning { on: bool },

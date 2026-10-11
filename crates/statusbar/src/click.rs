@@ -1,4 +1,4 @@
-//! Statusbar click command selection and `{x}` expansion.
+//! `[bar.click]` command selection and `{x}` / `{x1}` expansion.
 
 use crate::colors::ModuleKind;
 
@@ -6,10 +6,10 @@ use crate::colors::ModuleKind;
 pub struct ClickAction {
     pub program: String,
     pub args: Vec<String>,
-    pub fallback: Option<(String, Vec<String>)>,
 }
 
 impl ClickAction {
+    /// The command configured for `kind`, with its placeholders expanded.
     #[must_use]
     pub fn for_module(
         kind: ModuleKind,
@@ -17,15 +17,7 @@ impl ClickAction {
         x0: i32,
         x1: i32,
     ) -> Option<Self> {
-        if let Some(command) = Self::configured(kind, clicks) {
-            return Self::parse(command, x0, x1);
-        }
-        let page = kind.settings_page()?;
-        Some(Self {
-            program: "cosmic-popup".into(),
-            args: vec![page.into()],
-            fallback: Some(("cosmic-settings".into(), vec![page.into()])),
-        })
+        Self::parse(Self::configured(kind, clicks)?, x0, x1)
     }
 
     fn configured(kind: ModuleKind, clicks: &config::BarClickConfig) -> Option<&str> {
@@ -53,31 +45,7 @@ impl ClickAction {
         let args = words
             .map(|word| word.replace(RIGHT_TOKEN, &right).replace(LEFT_TOKEN, &left))
             .collect();
-        Some(Self {
-            program,
-            args,
-            fallback: None,
-        })
-    }
-}
-
-impl ModuleKind {
-    #[must_use]
-    pub const fn settings_page(self) -> Option<&'static str> {
-        match self {
-            Self::Wifi => Some("network"),
-            Self::Bluetooth => Some("bluetooth"),
-            Self::Battery => Some("power"),
-            Self::Brightness => Some("displays"),
-            Self::VolOut | Self::VolIn => Some("sound"),
-            Self::Clock
-            | Self::Date
-            | Self::Temp
-            | Self::Cpu
-            | Self::Mem
-            | Self::Notification
-            | Self::SystemTray => None,
-        }
+        Some(Self { program, args })
     }
 }
 
@@ -86,39 +54,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn configured_panel_expands_position() {
+    fn configured_command_expands_position() {
         let clicks = config::BarClickConfig {
-            wifi: Some("panel-wifi --at {x} --at-right {x1}".into()),
+            wifi: Some("nm-applet --at {x} --at-right {x1}".into()),
             ..config::BarClickConfig::default()
         };
         let action = ClickAction::for_module(ModuleKind::Wifi, &clicks, 300, 317).unwrap();
-        assert_eq!(action.program, "panel-wifi");
+        assert_eq!(action.program, "nm-applet");
         assert_eq!(action.args, ["--at", "300", "--at-right", "317"]);
-        assert!(action.fallback.is_none());
     }
 
     #[test]
-    fn missing_override_keeps_cosmic_default() {
-        let action = ClickAction::for_module(
+    fn an_unconfigured_module_has_no_command() {
+        let defaults = config::BarClickConfig::default();
+        for kind in [
+            ModuleKind::Wifi,
             ModuleKind::Bluetooth,
-            &config::BarClickConfig::default(),
-            100,
-            120,
-        )
-        .unwrap();
-        assert_eq!(action.program, "cosmic-popup");
-        assert_eq!(action.args, ["bluetooth"]);
-        assert_eq!(
-            action.fallback,
-            Some(("cosmic-settings".into(), vec!["bluetooth".into()]))
-        );
+            ModuleKind::VolOut,
+            ModuleKind::Battery,
+            ModuleKind::Clock,
+        ] {
+            assert!(ClickAction::for_module(kind, &defaults, 0, 10).is_none());
+        }
     }
 
     #[test]
-    fn unmapped_module_has_no_action() {
-        assert!(
-            ClickAction::for_module(ModuleKind::Clock, &config::BarClickConfig::default(), 0, 10)
-                .is_none()
-        );
+    fn configured_command_covers_module_without_panel() {
+        let clicks = config::BarClickConfig {
+            battery: Some("powerprofiles --at {x}".into()),
+            ..config::BarClickConfig::default()
+        };
+        let action = ClickAction::for_module(ModuleKind::Battery, &clicks, 40, 60).unwrap();
+        assert_eq!(action.program, "powerprofiles");
+        assert_eq!(action.args, ["--at", "40"]);
+    }
+
+    #[test]
+    fn an_empty_command_is_no_command() {
+        let clicks = config::BarClickConfig {
+            wifi: Some("   ".into()),
+            ..config::BarClickConfig::default()
+        };
+        assert!(ClickAction::for_module(ModuleKind::Wifi, &clicks, 0, 0).is_none());
     }
 }

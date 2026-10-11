@@ -1,0 +1,15 @@
+[package]
+name    = "panel-wifi"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+panel-ui     = { path = "../panel-ui" }
+dbus         = { path = "../dbus" }
+platform     = { path = "../platform" }
+statusbar    = { path = "../statusbar" }
+waker        = { path = "../waker" }
+quetzalcoatl = { workspace = true }

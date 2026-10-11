@@ -10,7 +10,7 @@
 
 use platform::draw::Point;
 use platform::event::RawEvent;
-use platform::id::PointerId;
+use platform::id::{PointerId, SurfaceId};
 use platform::protocol::{ButtonState, PointerButton, PointerEvent};
 
 /// Tracks the bar's `wl_pointer` object (once the seat advertises one) plus
@@ -44,9 +44,14 @@ pub struct PointerState {
     /// drag, so this never needs to track motion, just press/release
     /// pairing.
     left_pressed: bool,
-    /// Set true on a qualifying left-click release, drained by
+    /// The surface a qualifying left-click landed on, drained by
     /// [`PointerState::take_click`] once per `tick`.
-    pending_click: bool,
+    pending_click: Option<SurfaceId>,
+    /// The bar and an open panel popup share this pointer; positions are
+    /// local to whichever surface it is over.
+    focus: Option<SurfaceId>,
+    /// Serial of the latest left press, the one a popup grab must cite.
+    press_serial: Option<u32>,
 }
 
 impl PointerState {
@@ -82,9 +87,19 @@ impl PointerState {
     }
 
     /// Consume a pending left-click (press + matching release since the
-    /// last call), if any -- `true` at most once per genuine click.
-    pub fn take_click(&mut self) -> bool {
-        std::mem::take(&mut self.pending_click)
+    /// last call), reporting the surface it landed on.
+    pub const fn take_click(&mut self) -> Option<SurfaceId> {
+        self.pending_click.take()
+    }
+
+    #[must_use]
+    pub const fn focus(&self) -> Option<SurfaceId> {
+        self.focus
+    }
+
+    #[must_use]
+    pub const fn press_serial(&self) -> Option<u32> {
+        self.press_serial
     }
 
     /// Handle one `wl_pointer` event (already confirmed to be
@@ -94,7 +109,12 @@ impl PointerState {
     pub fn on_event(&mut self, ev: &RawEvent) {
         match ev.event::<PointerEvent>() {
             Some(PointerEvent::Enter) => {
+                self.focus = Some(SurfaceId(ev.arg(1)));
                 self.pos = ev.point(2, 3);
+            }
+            Some(PointerEvent::Leave) => {
+                self.focus = None;
+                self.left_pressed = false;
             }
             Some(PointerEvent::Motion) => {
                 self.pos = ev.point(1, 2);
@@ -112,6 +132,12 @@ impl PointerState {
     const fn on_button(&mut self, ev: &RawEvent) {
         let button = PointerButton::from_code(ev.arg(2));
         let state = ButtonState::from_raw(ev.arg(3));
+        if matches!(
+            (button, state),
+            (Some(PointerButton::Left), Some(ButtonState::Pressed))
+        ) {
+            self.press_serial = Some(ev.arg(0));
+        }
         self.apply_button(button, state);
     }
 
@@ -125,7 +151,7 @@ impl PointerState {
             }
             (Some(PointerButton::Left), Some(ButtonState::Released)) => {
                 if self.left_pressed {
-                    self.pending_click = true;
+                    self.pending_click = self.focus;
                 }
                 self.left_pressed = false;
             }
@@ -196,28 +222,83 @@ mod tests {
         assert!(p.take_scroll().is_empty());
     }
 
+    const BAR: SurfaceId = SurfaceId(7);
+    const POPUP: SurfaceId = SurfaceId(9);
+
+    fn wire(opcode: PointerEvent, args: [u32; 4]) -> RawEvent {
+        RawEvent::Wire {
+            object_id: TEST_POINTER.0,
+            opcode: opcode as u16,
+            args,
+            nargs: 4,
+            bytes: Box::new([]),
+        }
+    }
+
+    fn enter(surface: SurfaceId) -> RawEvent {
+        wire(PointerEvent::Enter, [1, surface.0, 10 * 256, 20 * 256])
+    }
+
+    fn button(serial: u32, state: ButtonState) -> RawEvent {
+        wire(
+            PointerEvent::Button,
+            [serial, 0, PointerButton::Left as u32, state as u32],
+        )
+    }
+
     #[test]
     fn take_click_drains_and_resets() {
         let mut p = PointerState::new();
-        p.pending_click = true;
-        assert!(p.take_click());
-        assert!(!p.take_click());
+        p.pending_click = Some(BAR);
+        assert_eq!(p.take_click(), Some(BAR));
+        assert_eq!(p.take_click(), None);
+    }
+
+    #[test]
+    fn a_click_reports_the_surface_it_landed_on() {
+        let mut p = PointerState::new();
+        p.on_event(&enter(POPUP));
+        p.on_event(&button(4, ButtonState::Pressed));
+        p.on_event(&button(5, ButtonState::Released));
+        assert_eq!(p.take_click(), Some(POPUP));
+        assert_eq!(p.focus(), Some(POPUP));
+    }
+
+    #[test]
+    fn the_press_serial_is_kept_for_a_popup_grab() {
+        let mut p = PointerState::new();
+        p.on_event(&enter(BAR));
+        p.on_event(&button(41, ButtonState::Pressed));
+        p.on_event(&button(42, ButtonState::Released));
+        assert_eq!(p.press_serial(), Some(41));
+    }
+
+    #[test]
+    fn a_press_carried_across_surfaces_is_no_click() {
+        let mut p = PointerState::new();
+        p.on_event(&enter(BAR));
+        p.on_event(&button(1, ButtonState::Pressed));
+        p.on_event(&wire(PointerEvent::Leave, [2, BAR.0, 0, 0]));
+        p.on_event(&enter(POPUP));
+        p.on_event(&button(3, ButtonState::Released));
+        assert_eq!(p.take_click(), None);
     }
 
     #[test]
     fn button_press_then_release_yields_a_click() {
         let mut p = PointerState::new();
+        p.on_event(&enter(BAR));
         p.apply_button(Some(PointerButton::Left), Some(ButtonState::Pressed));
-        assert!(!p.take_click());
+        assert_eq!(p.take_click(), None);
         p.apply_button(Some(PointerButton::Left), Some(ButtonState::Released));
-        assert!(p.take_click());
+        assert_eq!(p.take_click(), Some(BAR));
     }
 
     #[test]
     fn release_without_press_is_not_a_click() {
         let mut p = PointerState::new();
         p.apply_button(Some(PointerButton::Left), Some(ButtonState::Released));
-        assert!(!p.take_click());
+        assert_eq!(p.take_click(), None);
     }
 
     #[test]
@@ -225,7 +306,7 @@ mod tests {
         let mut p = PointerState::new();
         p.apply_button(Some(PointerButton::Right), Some(ButtonState::Pressed));
         p.apply_button(Some(PointerButton::Right), Some(ButtonState::Released));
-        assert!(!p.take_click());
+        assert_eq!(p.take_click(), None);
     }
 
     #[test]

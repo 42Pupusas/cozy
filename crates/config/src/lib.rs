@@ -73,14 +73,13 @@
 //!                                           # icon fallback, no icons drawn.
 //! opacity     = 1.0                # defaults to [window].opacity
 //!
-//! # Per-module click command overrides. `{x}` expands to the clicked
-//! # module's left edge and `{x1}` to its right edge (bar-relative
-//! # logical px), so a popup panel can open beside its module.
+//! # Per-module click commands. Wi-Fi, Bluetooth and both volume modules
+//! # open a built-in panel when unset; a command set here replaces it.
+//! # `{x}` expands to the clicked module's left edge and `{x1}` to its
+//! # right edge (bar-relative logical px).
 //! [bar.click]
-//! wifi          = "panel-wifi --at {x} --at-right {x1}"
-//! bluetooth     = "panel-bluetooth --at {x} --at-right {x1}"
-//! volume_output = "panel-volume --at {x} --at-right {x1}"
-//! volume_input  = "panel-volume --at {x} --at-right {x1}"//!
+//! battery       = "powerprofiles --at {x}"
+//!
 //! # Zero or more app windows to watch for niri's "urgent" (attention-
 //! # demanding) state -- e.g. an Electron chat app flashing its taskbar
 //! # icon on an unread mention. Each entry becomes its own bar segment:

@@ -28,6 +28,7 @@ pub mod layer;
 pub mod link_scan;
 pub mod multi_click;
 pub mod output_probe;
+pub mod popup;
 pub mod premultiply;
 pub mod present;
 pub mod progress_guard;

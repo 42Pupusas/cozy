@@ -11,10 +11,13 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-statusbar    = { path = "../../crates/statusbar" }
-platform     = { path = "../../crates/platform" }
-config       = { path = "../../crates/config" }
-waker        = { path = "../../crates/waker" }
-panel-ui     = { path = "../../crates/panel-ui" }
-quetzalcoatl = { workspace = true }
+statusbar       = { path = "../../crates/statusbar" }
+platform        = { path = "../../crates/platform" }
+config          = { path = "../../crates/config" }
+waker           = { path = "../../crates/waker" }
+panel-ui        = { path = "../../crates/panel-ui" }
+panel-wifi      = { path = "../../crates/panel-wifi" }
+panel-volume    = { path = "../../crates/panel-volume" }
+panel-bluetooth = { path = "../../crates/panel-bluetooth" }
+quetzalcoatl    = { workspace = true }
 headless-stress = { path = "../../crates/headless-stress" }

@@ -13,6 +13,8 @@
 //!     plain string (or a few) the bar lays out left/center/right and draws
 //!     with the embedded bitmap font.
 
+mod bar_keyboard;
+mod bar_popup;
 pub mod bar_window;
 pub mod battery;
 pub mod bluetooth;
@@ -25,6 +27,10 @@ pub mod cpu;
 pub mod memory;
 pub mod notifications;
 mod pointer_state;
+pub mod pointer_target;
+pub mod popup_key;
+pub mod popup_placement;
+pub mod popup_surface;
 pub mod scroll;
 mod sys_file;
 pub mod temperature;
@@ -43,6 +49,10 @@ pub use colors::ModuleKind;
 pub use cpu::Cpu;
 pub use memory::Memory;
 pub use notifications::{NotificationSegment, Notifications};
+pub use pointer_target::PointerTarget;
+pub use popup_key::PanelKey;
+pub use popup_placement::{Anchored, ModuleAnchor};
+pub use popup_surface::PopupStyle;
 pub use scroll::ScrollAccumulator;
 pub use temperature::Temperature;
 pub use text::TextRenderer;

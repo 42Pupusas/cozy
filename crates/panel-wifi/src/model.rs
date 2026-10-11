@@ -214,7 +214,7 @@ impl WifiModel {
 }
 
 /// What the main loop asks the worker to do, in reply to input.
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WifiCommand {
     /// Activate this AP; the password is set for secured, unsaved
     /// networks.

@@ -1,21 +1,19 @@
-//! `panel-ui` — the shared popup backend for the statusbar's clickable
-//! widgets (Wi-Fi, Bluetooth, volume): a [`PopupWindow`] layer-shell
-//! surface opening below the clicked bar module, plus the widget set
-//! (rows, sliders, toggles) every panel paints it with.
+//! `panel-ui` — what the statusbar's panels (Wi-Fi, Bluetooth, volume)
+//! share: the [`Panel`] trait the bar hosts them through, the widget set
+//! (rows, sliders, toggles) they paint with, and the command channel to
+//! their worker threads.
 //!
 //! Pure presentation: this crate knows nothing about D-Bus,
-//! `NetworkManager`, bluez, or `pactl`. Each panel binary owns its model,
-//! drives a [`PopupWindow`] through the [`Panel`] trait, and paints with
-//! the widgets here.
+//! `NetworkManager`, bluez, or `pactl`, and nothing about Wayland surfaces;
+//! the bar owns the popup each panel paints into.
 
-pub mod args;
 pub mod command_channel;
-pub mod placement;
-pub mod popup_window;
+pub mod panel;
 pub mod widgets;
+pub mod worker_link;
 
-pub use args::{PanelArgs, ResolvedPanel};
 pub use command_channel::{CommandBatch, CommandChannel, CommandInbox, CommandSender};
-pub use placement::{Anchored, ModuleAnchor};
-pub use popup_window::{PanelKey, PopupWindow};
+pub use panel::{Panel, PanelFlow};
+pub use statusbar::PanelKey;
 pub use widgets::{Metrics, Row, RowContent, Slider, Theme, Toggle};
+pub use worker_link::WorkerLink;

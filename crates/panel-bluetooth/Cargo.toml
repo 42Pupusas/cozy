@@ -1,0 +1,16 @@
+[package]
+name    = "panel-bluetooth"
+version = "0.1.0"
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+panel-ui     = { path = "../panel-ui" }
+dbus         = { path = "../dbus" }
+dbus-server  = { path = "../dbus-server" }
+platform     = { path = "../platform" }
+statusbar    = { path = "../statusbar" }
+waker        = { path = "../waker" }
+quetzalcoatl = { workspace = true }

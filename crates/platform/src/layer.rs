@@ -180,6 +180,22 @@ impl LayerSurfaceHandle {
         );
     }
 
+    /// Change keyboard interactivity from inside event dispatch; takes
+    /// effect on the surface's next commit.
+    pub fn set_keyboard_interactivity_queued(
+        &self,
+        window_tx: &WindowSender,
+        mode: KeyboardInteractivity,
+    ) {
+        window_tx.request(
+            MessageBuilder::new(
+                self.layer_surface,
+                LayerSurfaceRequest::SetKeyboardInteractivity,
+            )
+            .u32(mode as u32),
+        );
+    }
+
     /// Tear the chain down in the reverse order it was built: the layer
     /// surface is a child role object of the plain surface, so destroying
     /// the surface first is a protocol error.

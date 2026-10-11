@@ -61,6 +61,50 @@ impl Frame {
         Self::create_set::<2>(sender, shm, width, height, format)
     }
 
+    /// [`Self::create_pair`] for a surface opened after the event loop has
+    /// taken the connection: the pool fd is duplicated onto the request ring.
+    pub fn create_pair_queued(
+        tx: &mut WindowSender,
+        shm: ShmId,
+        width: i32,
+        height: i32,
+        format: Format,
+    ) -> Result<([Self; 2], ShmBuffer, PoolId)> {
+        let shm_mem = ShmBuffer::new(
+            usize::try_from(width).unwrap_or(0),
+            usize::try_from(height).unwrap_or(0),
+            2,
+        )
+        .map_err(|e| PlatformError::Conn(ConnError::Sys(e)))?;
+        let pool_fd = shm_mem
+            .dup_fd()
+            .map_err(|e| PlatformError::Conn(ConnError::Io(e)))?;
+        let pool: PoolId = tx.alloc_id();
+        let msg = MessageBuilder::new(shm, ShmRequest::CreatePool)
+            .new_id(pool)
+            .i32(i32::try_from(shm_mem.size_bytes()).unwrap_or(i32::MAX))
+            .finish();
+        tx.send_with_fds(msg, vec![pool_fd]);
+        let mut frames = [Self {
+            buffer: BufferId(0),
+            free: true,
+        }; 2];
+        for (i, slot) in frames.iter_mut().enumerate() {
+            let buffer: BufferId = tx.alloc_id();
+            tx.request(
+                MessageBuilder::new(pool, ShmPoolRequest::CreateBuffer)
+                    .new_id(buffer)
+                    .i32(i32::try_from(shm_mem.frame_offset(i)).unwrap_or(i32::MAX))
+                    .i32(width)
+                    .i32(height)
+                    .i32(width * 4)
+                    .u32(format.code()),
+            );
+            slot.buffer = buffer;
+        }
+        Ok((frames, shm_mem, pool))
+    }
+
     pub fn create_single(
         sender: &mut Sender,
         shm: ShmId,

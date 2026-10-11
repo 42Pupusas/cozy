@@ -323,6 +323,15 @@ impl PresentState {
         )
     }
 
+    /// Release both buffers and the pool, for a surface that is going away
+    /// while the connection lives on.
+    pub fn destroy(&self, window_tx: &WindowSender) {
+        for frame in &self.frames {
+            window_tx.request(MessageBuilder::new(frame.buffer, BufferRequest::Destroy));
+        }
+        window_tx.request(MessageBuilder::new(self.pool, ShmPoolRequest::Destroy));
+    }
+
     /// Tell the compositor the pool grew, ahead of carving new buffers out
     /// of the extra space.
     pub fn grow_pool(&self, window_tx: &mut WindowSender, new_capacity: usize) {

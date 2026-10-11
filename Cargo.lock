@@ -450,10 +450,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "panel-bluetooth-bin"
+name = "panel-bluetooth"
 version = "0.1.0"
 dependencies = [
- "config",
  "dbus",
  "dbus-server",
  "panel-ui",
@@ -475,10 +474,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "panel-volume-bin"
+name = "panel-volume"
 version = "0.1.0"
 dependencies = [
- "config",
  "json-bourne",
  "panel-ui",
  "platform",
@@ -488,10 +486,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "panel-wifi-bin"
+name = "panel-wifi"
 version = "0.1.0"
 dependencies = [
- "config",
  "dbus",
  "panel-ui",
  "platform",
@@ -760,7 +757,10 @@ version = "0.1.0"
 dependencies = [
  "config",
  "headless-stress",
+ "panel-bluetooth",
  "panel-ui",
+ "panel-volume",
+ "panel-wifi",
  "platform",
  "quetzalcoatl",
  "statusbar",

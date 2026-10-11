@@ -28,13 +28,20 @@
 //! mercy of a subprocess's exec/IPC latency.
 
 mod headless;
+mod panel_host;
+mod panel_kind;
 mod worker;
 
+use panel_host::PanelHost;
+use panel_kind::PanelKind;
 use panel_ui::{CommandChannel, CommandSender};
 use platform::draw::{Canvas, Color};
 use quetzalcoatl::capacity::Capacity;
 use quetzalcoatl::mpsc::{Consumer, RingBuffer};
-use statusbar::{BarWindow, Edge, ModuleKind, TextRenderer, TraySnapshot, TrayWatcher};
+use statusbar::click::ClickAction;
+use statusbar::{
+    BarWindow, Edge, ModuleKind, PointerTarget, TextRenderer, TraySnapshot, TrayWatcher,
+};
 use worker::BarCommand;
 pub(crate) use worker::Snapshot;
 
@@ -197,6 +204,8 @@ struct BarApp {
     snapshot_rx: Consumer<Snapshot>,
     tray_rx: Consumer<TraySnapshot>,
     commands: CommandSender<BarCommand>,
+    panels: PanelHost,
+    clicks: config::BarClickConfig,
 }
 
 impl BarApp {
@@ -281,9 +290,8 @@ impl BarApp {
         let (snapshot_tx, snapshot_rx) =
             RingBuffer::new(Capacity::exact(Self::SNAPSHOT_SLOTS)).split();
         let (commands, inbox) = CommandChannel::open();
-        let notification_rules = cfg.bar_notifications().to_vec();
-        let click_config = cfg.bar_clicks().clone();
-        worker::Worker::spawn_thread(snapshot_tx, inbox, wake, notification_rules, click_config);
+        let state = worker::State::new(cfg.bar_notifications().to_vec(), cfg.bar_clicks().clone());
+        worker::Worker::spawn_thread(snapshot_tx, inbox, wake, state);
 
         let bar_height = window.height();
         let paint_style = PaintStyle {
@@ -302,6 +310,8 @@ impl BarApp {
             snapshot_rx,
             tray_rx,
             commands,
+            panels: PanelHost::new(&cfg),
+            clicks: cfg.bar_clicks().clone(),
         }
     }
 
@@ -318,11 +328,13 @@ impl BarApp {
                 paint_style,
                 segment_rects,
                 snapshot,
+                panels,
                 ..
             } = &mut self;
-            match window.tick(|canvas| {
-                Painter::paint(canvas, snapshot, text, paint_style, segment_rects);
-            }) {
+            match window.tick(
+                |canvas| Painter::paint(canvas, snapshot, text, paint_style, segment_rects),
+                |canvas| panels.paint(canvas),
+            ) {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
@@ -333,6 +345,7 @@ impl BarApp {
 
             self.handle_scroll();
             self.handle_click();
+            self.panels.pump(&mut self.window);
 
             self.window.wait(-1);
         }
@@ -383,6 +396,12 @@ impl BarApp {
         if scrolls.is_empty() {
             return;
         }
+        if self.window.pointer_target() == PointerTarget::Popup {
+            let at = self.window.pointer_pos();
+            self.panels
+                .scroll(&mut self.window, at, scrolls.iter().sum());
+            return;
+        }
         let px = self.window.pointer_pos().x;
         let Some((kind, ..)) = self
             .segment_rects
@@ -401,28 +420,44 @@ impl BarApp {
         }
     }
 
-    /// Left-click: open the module's panel/settings page (see
-    /// `statusbar::ModuleKind::settings_page`). Same hit-test as scroll,
-    /// forwarding the *segment's* x-span (not the pointer's x) so a
-    /// `--at {x} --at-right {x1}` panel opens beside the module no
-    /// matter which pixel of it was clicked. The actual spawn happens
-    /// on the worker thread so a slow launch never stalls the pump.
+    /// Left-click. On the popup it goes to the open panel. On the bar it
+    /// runs the module's `[bar.click]` command when one is configured
+    /// (spawned on the worker thread so a slow launch never stalls the
+    /// pump), and otherwise toggles the module's built-in panel. The
+    /// module's x-span, not the pointer's x, places the panel or fills
+    /// `{x}`/`{x1}`, so it lines up whichever pixel was clicked.
     fn handle_click(&mut self) {
-        if !self.window.take_click() {
+        let Some(target) = self.window.take_click() else {
+            return;
+        };
+        let at = self.window.pointer_pos();
+        match target {
+            PointerTarget::Popup => self.panels.click(&mut self.window, at),
+            PointerTarget::Elsewhere => {}
+            PointerTarget::Bar => {
+                let module = self
+                    .segment_rects
+                    .iter()
+                    .find(|(_, x0, x1)| at.x >= *x0 && at.x < *x1)
+                    .copied();
+                self.bar_clicked(module);
+            }
+        }
+    }
+
+    fn bar_clicked(&mut self, module: Option<(ModuleKind, i32, i32)>) {
+        if let Some((kind, x0, x1)) = module
+            && ClickAction::for_module(kind, &self.clicks, x0, x1).is_some()
+        {
+            self.panels.close(&mut self.window);
+            self.commands.send(BarCommand::Click { kind, x0, x1 });
             return;
         }
-        let px = self.window.pointer_pos().x;
-        if let Some((kind, x0, x1)) = self
-            .segment_rects
-            .iter()
-            .find(|(_, x0, x1)| px >= *x0 && px < *x1)
-        {
-            self.commands.send(BarCommand::Click {
-                kind: *kind,
-                x0: *x0,
-                x1: *x1,
-            });
-        }
+        let scale = self.paint_style.scale.max(1);
+        let panel = module.and_then(|(kind, x0, x1)| {
+            PanelKind::for_module(kind).map(|panel| (panel, x0 / scale, x1 / scale))
+        });
+        self.panels.bar_clicked(&mut self.window, panel);
     }
 }
 

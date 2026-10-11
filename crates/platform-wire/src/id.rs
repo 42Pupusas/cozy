@@ -71,6 +71,10 @@ object_ids! {
     XdgSurfaceId,
     /// `xdg_toplevel` — a top-level application window.
     ToplevelId,
+    /// `xdg_positioner` — placement rules for a popup.
+    PositionerId,
+    /// `xdg_popup` — a short-lived surface parented to another surface.
+    PopupId,
     /// `zwp_linux_dmabuf_v1` — the dmabuf factory global.
     DmabufId,
     /// `zwp_linux_buffer_params_v1` — temporary object for dmabuf buffer creation.

@@ -57,7 +57,8 @@ requests! {
         SetMargin = 3,
         /// Whether/how this layer surface can receive keyboard focus.
         SetKeyboardInteractivity = 4,
-        /// Create a popup parented to this layer surface (unused here).
+        /// Parent an `xdg_popup` (created with a null parent) to this layer
+        /// surface: `popup`. Must precede the popup surface's first commit.
         GetPopup = 5,
         /// Ack a `configure` event by its serial, same contract as
         /// `xdg_surface.ack_configure`.

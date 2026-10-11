@@ -35,17 +35,13 @@ const CONTROL_REFRESH_DEBOUNCE_MS: u64 = 150;
 /// Minimum spacing between actually spawning a `pactl`/sysfs-brightness
 /// *adjustment* while scrolling.
 const SCROLL_APPLY_DEBOUNCE_MS: u64 = 60;
-/// Minimum spacing between spawning `cosmic-settings` for a click, so a
-/// double-click (or two clicks landing in the same channel-drain batch)
-/// only opens one window instead of two racing to grab focus.
-const CLICK_DEBOUNCE_MS: u64 = 400;
 
 const DASH: &str = "—";
 
 /// Tracks "has at least `period` elapsed since the last time this fired."
 ///
 /// Every module-refresh timer (clock/fast/slow/notifications) and every
-/// debounce guard (control-refresh/scroll-apply/click-spawn) in this file is
+/// debounce guard (control-refresh/scroll-apply) in this file is
 /// the exact same shape: an `Instant` plus a fixed `Duration`, checked with
 /// hand-rolled `now.duration_since(last) >= PERIOD` arithmetic at each call
 /// site. Bundling that pattern here means each site becomes one
@@ -202,7 +198,7 @@ impl KnownPct {
     }
 }
 
-struct State {
+pub struct State {
     snap: Snapshot,
     clock: Cadence,
     fast: Cadence,
@@ -217,14 +213,17 @@ struct State {
     control_refresh: Cadence,
     pending_scroll: Option<(ModuleKind, ScrollAccumulator)>,
     scroll_apply: Cadence,
-    click_spawn: Cadence,
+    clicks: config::BarClickConfig,
     vol_out_known: Option<KnownPct>,
     vol_in_known: Option<KnownPct>,
     brightness_known: Option<KnownPct>,
 }
 
 impl State {
-    fn new(notification_rules: Vec<config::NotificationRule>) -> Self {
+    pub fn new(
+        notification_rules: Vec<config::NotificationRule>,
+        clicks: config::BarClickConfig,
+    ) -> Self {
         let now = Instant::now();
         // Every cadence starts "already due" so the very first `refresh`
         // call (right after the bar maps) populates every module
@@ -243,7 +242,7 @@ impl State {
             ),
             pending_scroll: None,
             scroll_apply: Cadence::due_now(Duration::from_millis(SCROLL_APPLY_DEBOUNCE_MS), now),
-            click_spawn: Cadence::due_now(Duration::from_millis(CLICK_DEBOUNCE_MS), now),
+            clicks,
             vol_out_known: None,
             vol_in_known: None,
             brightness_known: None,
@@ -276,11 +275,11 @@ impl State {
 
     /// Apply one command from the render thread; returns whether the
     /// snapshot changed.
-    fn execute(&mut self, command: BarCommand, clicks: &config::BarClickConfig) -> bool {
+    fn execute(&mut self, command: BarCommand) -> bool {
         match command {
             BarCommand::Scroll { kind, raw_px } => self.queue_scroll(kind, raw_px),
             BarCommand::Click { kind, x0, x1 } => {
-                self.handle_click(kind, x0, x1, clicks);
+                self.run_click_command(kind, x0, x1);
                 false
             }
         }
@@ -587,41 +586,20 @@ impl State {
         self.advance_known(kind, delta)
     }
 
-    /// Open the clicked module's panel (or COSMIC settings page, see
-    /// `ModuleKind::settings_page`), debounced so a double-click doesn't
-    /// race two instances for focus. Fire-and-forget, same posture as
-    /// the volume/brightness mutations: spawn and immediately let go,
-    /// never block the worker loop on it.
-    fn handle_click(
-        &mut self,
-        kind: ModuleKind,
-        x0: i32,
-        x1: i32,
-        clicks: &config::BarClickConfig,
-    ) {
-        let Some(action) = statusbar::click::ClickAction::for_module(kind, clicks, x0, x1) else {
+    /// Run the module's configured `[bar.click]` command. Fire-and-forget:
+    /// spawn and let go.
+    fn run_click_command(&self, kind: ModuleKind, x0: i32, x1: i32) {
+        let Some(action) = statusbar::click::ClickAction::for_module(kind, &self.clicks, x0, x1)
+        else {
             return;
         };
-        let now = Instant::now();
-        if !self.click_spawn.is_due(now) {
-            return;
-        }
-        self.click_spawn.mark(now);
         let spawned = std::process::Command::new(&action.program)
             .args(&action.args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
             .spawn();
-        if spawned.is_err()
-            && let Some((program, args)) = action.fallback
-        {
-            let _ = std::process::Command::new(program)
-                .args(args)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
+        if let Err(error) = spawned {
+            eprintln!("statusbar: cannot launch {}: {error}", action.program);
         }
     }
 }
@@ -641,20 +619,11 @@ impl Worker {
         snapshot_tx: Producer<Snapshot>,
         inbox: CommandInbox<BarCommand>,
         wake: waker::Waker,
-        notification_rules: Vec<config::NotificationRule>,
-        click_config: config::BarClickConfig,
+        state: State,
     ) {
         std::thread::Builder::new()
             .name("statusbar-worker".into())
-            .spawn(move || {
-                Self::run(
-                    &snapshot_tx,
-                    inbox,
-                    &wake,
-                    notification_rules,
-                    &click_config,
-                );
-            })
+            .spawn(move || Self::run(&snapshot_tx, inbox, &wake, state))
             .expect("spawn statusbar worker thread");
     }
 
@@ -671,15 +640,13 @@ impl Worker {
         snapshot_tx: &Producer<Snapshot>,
         mut inbox: CommandInbox<BarCommand>,
         wake: &waker::Waker,
-        notification_rules: Vec<config::NotificationRule>,
-        click_config: &config::BarClickConfig,
+        mut state: State,
     ) {
-        let mut state = State::new(notification_rules);
         loop {
             let mut changed = state.refresh();
             let batch = inbox.take();
             for command in batch.commands {
-                changed |= state.execute(command, click_config);
+                changed |= state.execute(command);
             }
             changed |= state.apply_pending_scroll();
 
@@ -712,7 +679,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn settled_state(now: Instant) -> State {
-        let mut state = State::new(Vec::new());
+        let mut state = State::new(Vec::new(), config::BarClickConfig::default());
         state.clock.mark(now);
         state.fast.mark(now);
         state.slow.mark(now);

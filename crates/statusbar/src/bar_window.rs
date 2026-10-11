@@ -16,11 +16,19 @@
 //! existing pool via `wl_shm_pool.resize` (grow-only, lazy-shrink) and only
 //! recreate the two `wl_buffer`s carved out of it.
 
+use crate::bar_keyboard::BarKeyboard;
+use crate::bar_popup::BarPopup;
 use crate::pointer_state::PointerState;
+use crate::pointer_target::PointerTarget;
+use crate::popup_key::PanelKey;
+use crate::popup_surface::PopupStyle;
 use platform::conn::{Sender, WindowSender};
 use platform::draw::{Canvas, Color, Point};
 use platform::event::RawEvent;
-use platform::id::{CompositorId, LayerShellId, OutputId, RegistryId, SeatId, ShmId};
+use platform::id::{
+    CompositorId, KeyboardId, LayerShellId, OutputId, RegistryId, SeatId, ShmId, WmBaseId,
+};
+use platform::popup::PopupPositioner;
 use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
@@ -35,6 +43,9 @@ use quetzalcoatl::spsc::Consumer;
 
 const EVENT_RING_CAP: usize = 256;
 const APP_ID: &str = "statusbar";
+/// Object ids available after startup. Popups allocate their whole chain
+/// at runtime, so this is sized well past one popup's worth.
+const RUNTIME_ID_BLOCK: u32 = 512;
 
 /// Placeholder width the pool is first sized at, before the compositor's
 /// initial `configure` tells us the real (output-width) size. Matches
@@ -103,6 +114,9 @@ pub struct BarWindow {
     /// [`PointerState`]'s module doc for why this is its own type rather
     /// than six loose fields.
     pointer: PointerState,
+    keyboard: BarKeyboard,
+    /// `None` when the compositor offers no `xdg_wm_base`: panels can't open.
+    popup: Option<BarPopup>,
 
     width: i32,
     /// The `wl_shm` double-buffered swap chain plus the dirty/ready/callback
@@ -142,6 +156,7 @@ struct Globals {
     layer_shell: LayerShellId,
     seat: SeatId,
     output: Option<OutputId>,
+    wm_base: Option<WmBaseId>,
 }
 
 /// Accumulates globals as `wl_registry.global` events arrive. Mirrors
@@ -157,6 +172,7 @@ struct GlobalsBuilder {
     layer_shell: Option<LayerShellId>,
     seat: Option<SeatId>,
     output: Option<OutputId>,
+    wm_base: Option<WmBaseId>,
 }
 
 impl surface::GlobalCollector for GlobalsBuilder {
@@ -230,6 +246,15 @@ impl surface::GlobalCollector for GlobalsBuilder {
                 version,
                 proto::WL_OUTPUT.version,
             ),
+            s if s == proto::XDG_WM_BASE.name => Self::bind_if_missing(
+                &mut self.wm_base,
+                sender,
+                registry,
+                name,
+                interface,
+                version,
+                proto::XDG_WM_BASE.version,
+            ),
             _ => Ok(()),
         }
     }
@@ -245,6 +270,7 @@ impl GlobalsBuilder {
             layer_shell: self.layer_shell.ok_or(PlatformError::ReaderStopped)?,
             seat: self.seat.ok_or(PlatformError::ReaderStopped)?,
             output: self.output,
+            wm_base: self.wm_base,
         })
     }
 }
@@ -258,10 +284,7 @@ impl BarWindow {
     /// `Xrgb8888`) is fixed for the window's whole lifetime from this value,
     /// matching `platform::TermWindow`'s `needs_alpha` split.
     pub fn new(edge: Edge, height: i32, opacity: f64, wake: waker::Waker) -> Result<Self> {
-        // Same reader-thread + event-ring bootstrap `platform::TermWindow`
-        // uses; the `_repeat_timer` is unused here (a bar has no keyboard) but
-        // kept alive so its fd stays valid for the reader's poll.
-        let (mut sender, _repeat_timer, mut events, reader_handle) =
+        let (mut sender, repeat_timer, mut events, reader_handle) =
             surface::SurfaceBootstrap::connect(EVENT_RING_CAP, "statusbar-wayland-reader", &wake)?;
 
         let Globals {
@@ -270,7 +293,11 @@ impl BarWindow {
             layer_shell,
             seat,
             output,
+            wm_base,
         } = Self::discover(&mut sender, &mut events)?;
+        if wm_base.is_none() {
+            eprintln!("statusbar: compositor offers no xdg_wm_base; panels are disabled");
+        }
 
         let scale = output.map_or(1, |o| Self::output_scale(&mut sender, &mut events, o));
 
@@ -318,7 +345,7 @@ impl BarWindow {
 
         let (req_tx, req_rx) =
             mpsc::RingBuffer::<platform::conn::WindowRequest>::new(Capacity::exact(64)).split();
-        let (id_start, id_end) = sender.alloc_id_block(64);
+        let (id_start, id_end) = sender.alloc_id_block(RUNTIME_ID_BLOCK);
         let window_tx = WindowSender {
             tx: req_tx,
             next_id: id_start,
@@ -326,7 +353,7 @@ impl BarWindow {
             free_ids: Vec::new(),
         };
 
-        Ok(Self {
+        let mut window = Self {
             sender,
             request_rx: req_rx,
             window_tx,
@@ -342,6 +369,8 @@ impl BarWindow {
             scale,
             seat,
             pointer: PointerState::new(),
+            keyboard: BarKeyboard::new(repeat_timer),
+            popup: wm_base.map(|wm_base| BarPopup::new(compositor, shm, wm_base, seat)),
             width: INITIAL_WIDTH,
             // A bar always re-copies its whole backbuffer into whichever
             // slot presents next (see `present`) rather than diffing rows --
@@ -353,7 +382,9 @@ impl BarWindow {
             bg_alpha,
             configured: false,
             closing: false,
-        })
+        };
+        window.bind_seat_devices(SeatCapability::Pointer.mask() | SeatCapability::Keyboard.mask());
+        Ok(window)
     }
 
     /// Physical cell height in pixels the bar was opened at (already scaled).
@@ -387,10 +418,78 @@ impl BarWindow {
         self.pointer.take_scroll()
     }
 
-    /// Consume a pending left-click (press + matching release since the
-    /// last call), if any -- `true` at most once per genuine click.
-    pub fn take_click(&mut self) -> bool {
-        self.pointer.take_click()
+    /// Consume a pending left-click, reporting which surface it landed on.
+    pub fn take_click(&mut self) -> Option<PointerTarget> {
+        let surface = self.pointer.take_click()?;
+        Some(self.classify(Some(surface)))
+    }
+
+    /// The surface the pointer is currently over.
+    #[must_use]
+    pub fn pointer_target(&self) -> PointerTarget {
+        self.classify(self.pointer.focus())
+    }
+
+    /// Keys typed into the open panel popup since the last call.
+    pub fn take_keys(&mut self) -> Vec<PanelKey> {
+        self.keyboard.take_keys()
+    }
+
+    /// The bar's width in logical pixels, the space popups are placed in.
+    #[must_use]
+    pub const fn logical_width(&self) -> i32 {
+        self.width / self.scale
+    }
+
+    /// Open a panel popup grabbed by the latest press, replacing any open
+    /// one. Returns `Ok(false)` when popups are unsupported or no press
+    /// has been seen to grab with.
+    pub fn open_popup(&mut self, positioner: &PopupPositioner, style: PopupStyle) -> Result<bool> {
+        let (Some(popup), Some(serial)) = (&mut self.popup, self.pointer.press_serial()) else {
+            return Ok(false);
+        };
+        self.keyboard.release_all();
+        popup.open(&mut self.window_tx, self.layer, serial, positioner, style)?;
+        self.wake.signal();
+        Ok(true)
+    }
+
+    /// Whether [`Self::open_popup`] can succeed: the compositor offers
+    /// `xdg_wm_base` and a press has been seen to grab with.
+    #[must_use]
+    pub const fn can_open_popup(&self) -> bool {
+        self.popup.is_some() && self.pointer.press_serial().is_some()
+    }
+
+    pub fn close_popup(&mut self) {
+        if let Some(popup) = &mut self.popup {
+            popup.close(&self.window_tx, self.layer);
+        }
+        self.keyboard.release_all();
+        self.wake.signal();
+    }
+
+    #[must_use]
+    pub fn popup_open(&self) -> bool {
+        self.popup.as_ref().is_some_and(BarPopup::is_open)
+    }
+
+    /// The compositor dismissed the popup; the caller should close it.
+    #[must_use]
+    pub fn popup_dismissed(&self) -> bool {
+        self.popup.as_ref().is_some_and(BarPopup::is_dismissed)
+    }
+
+    pub fn request_popup_redraw(&mut self) {
+        if let Some(popup) = &mut self.popup {
+            popup.request_redraw();
+        }
+        self.wake.signal();
+    }
+
+    fn classify(&self, focus: Option<platform::id::SurfaceId>) -> PointerTarget {
+        let popup = self.popup.as_ref().and_then(BarPopup::surface);
+        PointerTarget::classify(focus, self.layer.surface, popup)
     }
 
     /// Set the color the canvas is cleared to before each frame's `paint`
@@ -415,9 +514,14 @@ impl BarWindow {
         self.wake.drain();
     }
 
-    /// Process pending Wayland events (non-blocking) and present if dirty.
-    /// Returns `false` once the layer surface is destroyed / connection lost.
-    pub fn tick(&mut self, mut paint: impl FnMut(&mut Canvas)) -> Result<bool> {
+    /// Process pending Wayland events (non-blocking) and present the bar
+    /// and any open popup if dirty. Returns `false` once the layer surface
+    /// is destroyed / connection lost.
+    pub fn tick(
+        &mut self,
+        mut paint: impl FnMut(&mut Canvas),
+        mut paint_popup: impl FnMut(&mut Canvas),
+    ) -> Result<bool> {
         if self.closing {
             return Ok(false);
         }
@@ -449,10 +553,27 @@ impl BarWindow {
         {
             self.do_present(slot, &mut paint);
         }
+        if let Some(popup) = &mut self.popup {
+            popup.present(&mut self.window_tx, &mut paint_popup);
+        }
+        self.sender
+            .drain_requests(&mut self.request_rx)
+            .map_err(PlatformError::Conn)?;
         Ok(true)
     }
 
     fn handle_event(&mut self, ev: &RawEvent) -> Result<()> {
+        match ev {
+            RawEvent::Fd(fds) => {
+                self.keyboard.absorb_keymap_fd(fds);
+                return Ok(());
+            }
+            RawEvent::Repeat => {
+                self.keyboard.on_repeat_tick();
+                return Ok(());
+            }
+            RawEvent::Bytes(_) | RawEvent::Wire { .. } => {}
+        }
         // The `wl_display` error/delete_id routing, `wl_buffer.release`, and
         // frame callback are handled identically to `platform::TermWindow` via
         // the shared `surface::route_common`; only the bar-specific seat /
@@ -461,6 +582,19 @@ impl BarWindow {
             surface::Routed::Fatal(e) => return Err(e),
             surface::Routed::Handled => return Ok(()),
             surface::Routed::Passthrough => {}
+        }
+
+        if let Some(popup) = &mut self.popup
+            && popup.handle_event(ev, &mut self.window_tx)?
+        {
+            return Ok(());
+        }
+
+        if let Some(keyboard) = self.keyboard.id()
+            && ev.is(keyboard)
+        {
+            self.keyboard.on_event(ev);
+            return Ok(());
         }
 
         // wl_seat.capabilities
@@ -491,12 +625,28 @@ impl BarWindow {
     /// that doesn't need to share stack frame with the connection-level
     /// dispatch around it.
     fn handle_seat_capabilities(&mut self, ev: &RawEvent) {
-        let caps = ev.arg(0);
+        self.bind_seat_devices(ev.arg(0));
+    }
+
+    /// Startup discovery reads past the seat's one-shot `capabilities`
+    /// event, so `new` binds eagerly; a device that doesn't exist yields an
+    /// object that never sends events. Guarded so a repeated capabilities
+    /// event never binds a duplicate.
+    fn bind_seat_devices(&mut self, caps: u32) {
         if self.pointer.id().is_none() && SeatCapability::Pointer.in_mask(caps) {
             let pointer: platform::id::PointerId = self.window_tx.alloc_id();
             self.window_tx
                 .request(MessageBuilder::new(self.seat, SeatRequest::GetPointer).new_id(pointer));
             self.pointer.set_id(pointer);
+        }
+        if self.popup.is_some()
+            && self.keyboard.id().is_none()
+            && SeatCapability::Keyboard.in_mask(caps)
+        {
+            let keyboard: KeyboardId = self.window_tx.alloc_id();
+            self.window_tx
+                .request(MessageBuilder::new(self.seat, SeatRequest::GetKeyboard).new_id(keyboard));
+            self.keyboard.set_id(keyboard);
         }
     }
 
@@ -612,9 +762,12 @@ impl BarWindow {
         );
     }
 
+    /// `xdg_wm_base` is optional, so the burst is finished with a sync
+    /// round-trip to catch it when it is advertised after the required set.
     fn discover(sender: &mut Sender, events: &mut Consumer<RawEvent>) -> Result<Globals> {
         let mut globals = GlobalsBuilder::default();
-        surface::RegistryDiscovery::collect(sender, events, &mut globals)?;
+        let registry = surface::RegistryDiscovery::collect(sender, events, &mut globals)?;
+        surface::RegistryDiscovery::collect_through_sync(sender, events, registry, &mut globals)?;
         globals.finish()
     }
 

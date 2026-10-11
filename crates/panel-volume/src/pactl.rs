@@ -6,13 +6,30 @@ use std::process::{Command, Stdio};
 
 use json_bourne::{FromJson, parse_str};
 
-/// `volume.front-left` out of pactl's JSON — one channel's raw value and
-/// its percentage.
+/// `volume.front-left` out of pactl's JSON. Only the raw `value` is read:
+/// pactl prints `value_percent` as a display string (`"55%"`).
 #[derive(Debug, Default, Clone, FromJson)]
 #[bourne(deny_unknown_fields = false)]
 struct ChannelVolume {
     #[bourne(default)]
-    value_percent: u32,
+    value: u32,
+}
+
+impl ChannelVolume {
+    /// `PA_VOLUME_NORM`: the raw value pactl reports for 100%.
+    const NORM: u64 = 65_536;
+
+    fn percent(&self) -> u32 {
+        let rounded = (u64::from(self.value) * 100 + Self::NORM / 2) / Self::NORM;
+        u32::try_from(rounded).unwrap_or(u32::MAX)
+    }
+
+    fn from_percent(percent: u32) -> Self {
+        let raw = u64::from(percent) * Self::NORM / 100;
+        Self {
+            value: u32::try_from(raw).unwrap_or(u32::MAX),
+        }
+    }
 }
 
 /// The `volume` object: pactl reports per-channel entries with dashes in
@@ -79,16 +96,12 @@ pub struct PactlStream {
 impl PactlDevice {
     #[must_use]
     pub fn volume_percent(&self) -> u32 {
-        self.volume
-            .front_left
-            .as_ref()
-            .or(self.volume.mono.as_ref())
-            .map_or(0, |channel| channel.value_percent)
+        self.volume.percent()
     }
 
     /// Record a volume the user just asked for, before `pactl` has
     /// confirmed it.
-    pub const fn set_volume_percent(&mut self, percent: u32) {
+    pub fn set_volume_percent(&mut self, percent: u32) {
         self.volume.set_percent(percent);
     }
 
@@ -99,9 +112,7 @@ impl PactlDevice {
             description: description.into(),
             driver: "PipeWire".into(),
             volume: VolumeMap {
-                front_left: Some(ChannelVolume {
-                    value_percent: percent,
-                }),
+                front_left: Some(ChannelVolume::from_percent(percent)),
                 mono: None,
             },
             mute: false,
@@ -111,17 +122,23 @@ impl PactlDevice {
 }
 
 impl VolumeMap {
-    const fn set_percent(&mut self, percent: u32) {
-        if let Some(channel) = self.front_left.as_mut() {
-            channel.value_percent = percent;
+    fn percent(&self) -> u32 {
+        self.front_left
+            .as_ref()
+            .or(self.mono.as_ref())
+            .map_or(0, ChannelVolume::percent)
+    }
+
+    fn set_percent(&mut self, percent: u32) {
+        let channel = ChannelVolume::from_percent(percent);
+        if self.front_left.is_some() {
+            self.front_left = Some(channel.clone());
         }
-        if let Some(channel) = self.mono.as_mut() {
-            channel.value_percent = percent;
+        if self.mono.is_some() {
+            self.mono = Some(channel.clone());
         }
         if self.front_left.is_none() && self.mono.is_none() {
-            self.front_left = Some(ChannelVolume {
-                value_percent: percent,
-            });
+            self.front_left = Some(channel);
         }
     }
 }
@@ -129,16 +146,12 @@ impl VolumeMap {
 impl PactlStream {
     #[must_use]
     pub fn volume_percent(&self) -> u32 {
-        self.volume
-            .front_left
-            .as_ref()
-            .or(self.volume.mono.as_ref())
-            .map_or(0, |channel| channel.value_percent)
+        self.volume.percent()
     }
 
     /// Record a volume the user just asked for, before `pactl` has
     /// confirmed it.
-    pub const fn set_volume_percent(&mut self, percent: u32) {
+    pub fn set_volume_percent(&mut self, percent: u32) {
         self.volume.set_percent(percent);
     }
 
@@ -163,9 +176,7 @@ impl PactlStream {
                 media_name: String::new(),
             },
             volume: VolumeMap {
-                front_left: Some(ChannelVolume {
-                    value_percent: percent,
-                }),
+                front_left: Some(ChannelVolume::from_percent(percent)),
                 mono: None,
             },
             mute: false,
@@ -395,36 +406,28 @@ impl Pactl {
 mod tests {
     use super::*;
 
-    /// A trimmed but shape-accurate slice of real `pactl --format=json
-    /// list sinks` output.
+    /// Real `pactl --format=json list sinks` output (`PipeWire`), trimmed of
+    /// properties but keeping every field type pactl actually emits:
+    /// string percentages, float balance and latency, nested arrays.
     const SINKS_JSON: &str = r#"[
-        {
-            "index": 0,
-            "name": "alsa_output.pci-0000_00_1f.3.analog-stereo",
-            "driver": "PipeWire",
-            "description": "Built-in Audio Analog Stereo",
-            "sample_spec": {"format": "s16le", "rate": 48000, "channels": 2},
-            "state": "running",
-            "mute": false,
-            "properties": {"application.name": "Music Player", "media.name": "Song"},
-            "volume": {
-                "front-left": {"value": 39269, "value_percent": 60},
-                "front-right": {"value": 39269, "value_percent": 60}
-            },
-            "ports": [{"name": "analog-output-speaker"}]
-        },
-        {
-            "index": 1,
-            "name": "bluez_output.AA_BB_CC_DD_EE_FF.1",
-            "driver": "PipeWire",
-            "description": "WH-1000XM5",
-            "state": "suspended",
-            "mute": true,
-            "volume": {
-                "front-left": {"value": 32768, "value_percent": 50},
-                "front-right": {"value": 32768, "value_percent": 50}
-            }
-        }
+        {"index":58,"state":"RUNNING","name":"alsa_output.pci-0000_03_00.6.HiFi__Speaker__sink",
+         "description":"Ryzen HD Audio Controller Speaker","driver":"PipeWire",
+         "sample_specification":"s32le 2ch 48000Hz","channel_map":"front-left,front-right",
+         "owner_module":4294967295,"mute":false,
+         "volume":{"front-left":{"value":36030,"value_percent":"55%","db":"-15.59 dB"},
+                   "front-right":{"value":36030,"value_percent":"55%","db":"-15.59 dB"}},
+         "balance":0.00,
+         "base_volume":{"value":65536,"value_percent":"100%","db":"0.00 dB"},
+         "monitor_source":"alsa_output.pci-0000_03_00.6.HiFi__Speaker__sink.monitor",
+         "latency":{"actual":0.00,"configured":0.00},
+         "flags":["HARDWARE","HW_MUTE_CTRL"],
+         "properties":{"device.icon_name":"audio-speakers"},
+         "ports":[{"name":"[Out] Speaker","priority":100,"availability_group":""}],
+         "active_port":"[Out] Speaker","formats":["pcm"]},
+        {"index":61,"state":"SUSPENDED","name":"bluez_output.AA_BB_CC_DD_EE_FF.1",
+         "description":"WH-1000XM5","driver":"PipeWire","mute":true,
+         "volume":{"front-left":{"value":32768,"value_percent":"50%","db":"-18.06 dB"},
+                   "front-right":{"value":32768,"value_percent":"50%","db":"-18.06 dB"}}}
     ]"#;
 
     #[test]
@@ -433,7 +436,7 @@ mod tests {
             "index": 9,
             "name": "audio-stream",
             "properties": {"application.name": "Recorder"},
-            "volume": {"mono": {"value_percent": 44}},
+            "volume": {"mono": {"value": 28836, "value_percent": "44%"}},
             "mute": false
         }]"#;
         let streams: Vec<PactlStream> = parse_str(json).unwrap();
@@ -445,13 +448,21 @@ mod tests {
     fn sinks_parse_with_defaults_for_absent_fields() {
         let sinks: Vec<PactlDevice> = parse_str(SINKS_JSON).unwrap();
         assert_eq!(sinks.len(), 2);
-        assert_eq!(sinks[0].description, "Built-in Audio Analog Stereo");
+        assert_eq!(sinks[0].description, "Ryzen HD Audio Controller Speaker");
         assert_eq!(sinks[0].driver, "PipeWire");
-        assert_eq!(sinks[0].state, "running");
+        assert_eq!(sinks[0].state, "RUNNING");
         assert!(!sinks[0].mute);
-        assert_eq!(sinks[0].volume_percent(), 60);
+        assert_eq!(sinks[0].volume_percent(), 55);
         // The second sink has no description-level surprises but IS muted.
         assert_eq!(sinks[1].description, "WH-1000XM5");
         assert!(sinks[1].mute);
+        assert_eq!(sinks[1].volume_percent(), 50);
+    }
+
+    #[test]
+    fn percent_round_trips_through_the_raw_value() {
+        for percent in [0, 1, 33, 50, 55, 99, 100, 150] {
+            assert_eq!(ChannelVolume::from_percent(percent).percent(), percent);
+        }
     }
 }

@@ -3,9 +3,11 @@
 
 use browse::DirectoryBrowser;
 use platform::draw::{Point, Rect};
+use widget::ListCommand;
 
 use crate::hover::Spot;
 use crate::spiral::MinCell;
+use crate::spiral_cursor::{Landing, SpiralCursor};
 use crate::tile_action::TileAction;
 use crate::tile_field::{Page, PlacedMore, PlacedTile, TileField};
 use crate::tile_growth::{Destination, TileGrowth};
@@ -29,6 +31,14 @@ pub struct MotionAim<'a> {
     pub tray: Option<usize>,
     pub actions: bool,
     pub held: Option<(usize, TileAction)>,
+}
+
+/// Where a keyboard movement took the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Steering {
+    Stay,
+    Land(usize),
+    Scrolled(Option<usize>),
 }
 
 pub struct TileScene {
@@ -142,6 +152,35 @@ impl TileScene {
         self.field.slide(flow.area, flow.floor, flow.tail, steps)
     }
 
+    /// Resolve a movement key against the tiles in view, scrolling the field
+    /// when the walk leaves them. After a scroll the row to put the cursor on
+    /// is the tile that came in: the smallest in view when scrolling on one
+    /// tile at a time, the largest after a longer jump, and the mirror of
+    /// each going back.
+    pub fn steer(&mut self, flow: &Flow, cursor: Option<usize>, command: ListCommand) -> Steering {
+        let page = self.page(flow);
+        let landing = SpiralCursor::new(&page.rows, page.later, page.earlier).land(cursor, command);
+        match landing {
+            Landing::At(row) => Steering::Land(row),
+            Landing::Stay => Steering::Stay,
+            Landing::Slide(steps) => {
+                self.slide_quietly(flow, steps);
+                Steering::Scrolled(self.entered_row(flow, steps))
+            }
+        }
+    }
+
+    fn entered_row(&self, flow: &Flow, steps: i32) -> Option<usize> {
+        let page = self.page(flow);
+        let forward = steps > 0;
+        let single = steps.abs() == 1;
+        if forward == single {
+            page.rows.last().copied()
+        } else {
+            page.rows.first().copied()
+        }
+    }
+
     pub fn aim_growth(&mut self, flow: &Flow, nav: &DirectoryBrowser) {
         let targets = self.targets(flow, nav);
         self.growth.aim(nav.path(), flow.area, &targets, self.clock_ms);
@@ -214,7 +253,8 @@ impl TileScene {
 
 #[cfg(test)]
 mod tests {
-    use super::{Flow, MotionAim, TileScene};
+    use super::{Flow, MotionAim, Steering, TileScene};
+    use widget::{Direction, ListCommand};
     use crate::hover::{Pane, Spot};
     use crate::test_support::TempDir;
     use browse::DirectoryBrowser;
@@ -326,6 +366,44 @@ mod tests {
         assert!(scene.slide(&flow, &nav, 1));
         assert_ne!(scene.page(&flow).rows, before);
         assert!(scene.is_animating());
+    }
+
+    #[test]
+    fn stepping_down_inside_the_view_lands_on_the_next_tile_in_rank_order() {
+        let (nav, _dir) = folder("scene_steer_in", 5);
+        let flow = flow(1);
+        let mut scene = scene();
+        scene.sync(&nav);
+        let rows = scene.page(&flow).rows;
+        let down = ListCommand::Move(Direction::Down);
+        assert_eq!(scene.steer(&flow, Some(rows[0]), down), Steering::Land(rows[1]));
+    }
+
+    #[test]
+    fn stepping_past_the_last_tile_of_a_fitting_folder_stays() {
+        let (nav, _dir) = folder("scene_steer_stay", 5);
+        let flow = flow(1);
+        let mut scene = scene();
+        scene.sync(&nav);
+        let rows = scene.page(&flow).rows;
+        let down = ListCommand::Move(Direction::Down);
+        let last = *rows.last().expect("tiles");
+        assert_eq!(scene.steer(&flow, Some(last), down), Steering::Stay);
+    }
+
+    #[test]
+    fn stepping_off_the_end_of_a_crowded_view_scrolls_and_names_the_tile_that_came_in() {
+        let (nav, _dir) = folder("scene_steer_scroll", 40);
+        let flow = flow(120);
+        let mut scene = scene();
+        scene.sync(&nav);
+        let before = scene.page(&flow).rows;
+        let last = *before.last().expect("tiles");
+        let down = ListCommand::Move(Direction::Down);
+        let steered = scene.steer(&flow, Some(last), down);
+        let after = scene.page(&flow).rows;
+        assert_ne!(before, after);
+        assert_eq!(steered, Steering::Scrolled(after.last().copied()));
     }
 
     #[test]

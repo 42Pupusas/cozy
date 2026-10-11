@@ -23,7 +23,7 @@ use crate::frame::Frame;
 use tiles::hover::{Hover, Pane, Spot};
 use tiles::pinned_card::PinnedCard;
 use crate::sidebar::{Sidebar, SidebarRow};
-use tiles::spiral_cursor::{Landing, SpiralCursor};
+use tiles::spiral_cursor::SpiralCursor;
 use volumes::mount_backend::MountOutcome;
 use volumes::{AttachedDevice, VolumeFlush, VolumeWatch};
 
@@ -35,7 +35,7 @@ use tiles::theme::Theme;
 use tiles::tile_action::TileAction;
 use tiles::tile_field::{PlacedMore, PlacedTile};
 use tiles::tile_assembly::{TileAssembly, TileOverlay};
-use tiles::tile_scene::{Flow, MotionAim, TileScene};
+use tiles::tile_scene::{Flow, MotionAim, Steering, TileScene};
 use tiles::tile_geometry::TileGeometry;
 use tiles::tile_motion::TileKey;
 use tiles::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
@@ -368,36 +368,18 @@ impl FilesWindow {
     /// scrolling the field when the walk leaves the tiles in view.
     fn steer_tiles(&mut self, command: widget::ListCommand) -> Outcome {
         let flow = self.flow();
-        let page = self.scene.page(&flow);
         let cursor = self.browser.pane().cursor();
-        let landing = SpiralCursor::new(&page.rows, page.later, page.earlier).land(cursor, command);
         let extend = matches!(command, widget::ListCommand::Extend(_));
-        match landing {
-            Landing::At(row) => self.browser.steer_to(row, extend),
-            Landing::Slide(steps) => {
-                self.scene.slide_quietly(&flow, steps);
-                self.steer_to_view_edge(steps, extend)
+        match self.scene.steer(&flow, cursor, command) {
+            Steering::Land(row) => self.browser.steer_to(row, extend),
+            Steering::Scrolled(row) => {
+                if let Some(row) = row {
+                    let _ = self.browser.steer_to(row, extend);
+                }
+                Outcome::Redraw
             }
-            Landing::Stay => Outcome::Ignored,
+            Steering::Stay => Outcome::Ignored,
         }
-    }
-
-    /// After the field scrolled by `steps`, put the cursor on the tile that
-    /// came in: the smallest in view when scrolling on one tile at a time,
-    /// the largest after a longer jump, and the mirror of each going back.
-    fn steer_to_view_edge(&mut self, steps: i32, extend: bool) -> Outcome {
-        let page = self.scene.page(&self.flow());
-        let forward = steps > 0;
-        let single = steps.abs() == 1;
-        let edge = if forward == single {
-            page.rows.last()
-        } else {
-            page.rows.first()
-        };
-        if let Some(&row) = edge {
-            let _ = self.browser.steer_to(row, extend);
-        }
-        Outcome::Redraw
     }
 
     /// A left press anywhere in the window.

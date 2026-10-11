@@ -25,7 +25,6 @@ use tiles::pinned_card::PinnedCard;
 use crate::row_format::RowFormat;
 use tiles::row_kind::RowKind;
 use crate::sidebar::{Sidebar, SidebarRow};
-use tiles::spiral::MinCell;
 use tiles::spiral_cursor::{Landing, SpiralCursor};
 use volumes::mount_backend::MountOutcome;
 use volumes::{AttachedDevice, VolumeFlush, VolumeWatch};
@@ -36,11 +35,12 @@ use crate::password_panel::{PanelStyle, PanelText, PasswordPanel};
 use crate::storage::Storage;
 use tiles::theme::Theme;
 use tiles::tile_action::TileAction;
-use tiles::tile_field::{PlacedMore, PlacedTile, TileField};
+use tiles::tile_field::{PlacedMore, PlacedTile};
+use tiles::tile_scene::{Flow, MotionAim, TileScene};
 use tiles::tile_geometry::TileGeometry;
-use tiles::tile_growth::{Destination, Shape, TileGrowth};
+use tiles::tile_growth::Shape;
 use tiles::tile_id::TileId;
-use tiles::tile_motion::{TileKey, TileMotion};
+use tiles::tile_motion::TileKey;
 use tiles::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
 use tiles::toolbar::{Target, Toolbar};
 use tiles::typography::Typography;
@@ -147,15 +147,7 @@ pub struct FilesWindow {
     /// hand the new set across the same seam the loop already crosses for
     /// drags and opens.
     volumes: VolumeWatch,
-    /// The tile presentation: size ranking and overflow pages.
-    tiles: TileField,
-    /// The glides tiles make as the pointer arrives and leaves.
-    motion: TileMotion,
-    /// Tiles growing out of the spiral as a folder or page appears.
-    growth: TileGrowth,
-    /// The time the glides were last carried to, for aiming them at a layout
-    /// that changed between two ticks.
-    motion_ms: u64,
+    scene: TileScene,
     /// The tile button the left button is held down on. It fires on release,
     /// and only if the pointer is still on it.
     pressed_action: Option<(usize, TileAction)>,
@@ -179,10 +171,7 @@ impl FilesWindow {
     ) -> Self {
         Self {
             volumes: VolumeWatch::new(),
-            tiles: TileField::new(wake.clone()),
-            motion: TileMotion::new(),
-            growth: TileGrowth::new(),
-            motion_ms: 0,
+            scene: TileScene::new(wake.clone()),
             pressed_action: None,
             tray: None,
             pending_copy: None,
@@ -229,67 +218,24 @@ impl FilesWindow {
     /// time. The first frame of a glide is always its start, so aiming one
     /// pass behind the pointer is invisible.
     pub fn step_motion(&mut self, now_ms: u64) -> bool {
-        let was_moving = self.motion.is_animating() || self.growth.is_animating();
-        self.motion_ms = now_ms;
-        self.step_growth(now_ms);
-        let cursor = self.focused.then(|| self.browser.pane().cursor()).flatten();
-        let tray = self.open_tray().map(|(row, _)| row);
-        self.motion.aim(
-            self.hover.spot(),
-            cursor,
-            self.browser.pane().selection().selected(),
-            tray,
-            !self.browser.is_renaming() && !self.browser.is_moving(),
-            now_ms,
-        );
-        let held = self
-            .pressed_action
-            .filter(|&(row, action)| self.hover.spot() == Some(Spot::Action(row, action)));
-        self.motion.press_on(held, now_ms);
-        self.motion.advance(now_ms);
-        was_moving || self.motion.is_animating() || self.growth.is_animating()
-    }
-
-    fn step_growth(&mut self, now_ms: u64) {
-        self.sync_tiles();
-        self.aim_growth(now_ms);
-        self.growth.advance(now_ms);
-    }
-
-    fn aim_growth(&mut self, now_ms: u64) {
-        let targets = self.growth_targets();
-        let bounds = self.frame().field();
-        self.growth
-            .aim(self.browser.path(), bounds, &targets, now_ms);
-    }
-
-    fn growth_targets(&self) -> Vec<Destination> {
-        let more = self.tile_more().map(|more| Destination {
-            id: TileId::More,
-            row: 0,
-            rect: more.rect,
-            slot: more.slot,
-        });
-        self.tile_layout()
-            .iter()
-            .filter_map(|placed| {
-                let entry = self.browser.entry(placed.row)?;
-                Some(Destination {
-                    id: TileId::of(&entry.name),
-                    row: placed.row,
-                    rect: placed.rect,
-                    slot: placed.slot,
-                })
-            })
-            .chain(more)
-            .collect()
+        let flow = self.flow();
+        let aim = MotionAim {
+            spot: self.hover.spot(),
+            cursor: self.focused.then(|| self.browser.pane().cursor()).flatten(),
+            selected: self.browser.pane().selection().selected(),
+            tray: self.open_tray().map(|(row, _)| row),
+            actions: !self.browser.is_renaming() && !self.browser.is_moving(),
+            held: self.pressed_action,
+        };
+        self.scene
+            .step(&flow, self.browser.navigator(), &aim, now_ms)
     }
 
     /// How long the loop may sleep before the next glide frame is due, or
     /// `None` when nothing is moving.
     #[must_use]
     pub fn motion_wait_ms(&self) -> Option<i32> {
-        (self.motion.is_animating() || self.growth.is_animating()).then_some(FRAME_MS)
+        self.scene.is_animating().then_some(FRAME_MS)
     }
 
     /// Take any drag the last pointer gesture started, for the event loop to
@@ -336,47 +282,43 @@ impl FilesWindow {
 
     /// The field the spiral fills and the room the card needs in it, so
     /// every layout, hit-test and page query sees one shape.
-    fn flow_parts(&self) -> (Rect, Option<MinCell>) {
+    fn flow(&self) -> Flow {
         let frame = self.frame();
-        (frame.field(), frame.card_need())
+        Flow {
+            area: frame.field(),
+            floor: self.theme.spacing.tile_floor(),
+            tail: frame.card_need(),
+        }
     }
 
     /// The pinned card, fitted to the spiral's innermost cell.
     fn card(&self) -> Option<PinnedCard> {
         let frame = self.frame();
-        let need = frame.card_need()?;
-        let cell =
-            self.tiles
-                .card_cell(frame.field(), self.theme.spacing.tile_floor(), Some(need))?;
+        frame.card_need()?;
+        let cell = self.scene.card_cell(&self.flow())?;
         Some(frame.card_in(cell))
     }
 
     fn tile_layout(&self) -> Vec<PlacedTile> {
-        let (spiral, tail) = self.flow_parts();
-        self.tiles
-            .layout(spiral, self.theme.spacing.tile_floor(), tail)
+        self.scene.layout(&self.flow())
     }
 
     fn tile_more(&self) -> Option<PlacedMore> {
-        let (spiral, tail) = self.flow_parts();
-        self.tiles
-            .more(spiral, self.theme.spacing.tile_floor(), tail)
+        self.scene.more(&self.flow())
     }
 
     fn more_at(&self, at: Position) -> bool {
-        self.tile_more()
-            .is_some_and(|more| more.rect.contains(Point::new(at.x, at.y)))
+        self.scene
+            .more_at(&self.flow(), Point::new(at.x, at.y))
     }
 
     fn tile_at(&self, at: Point) -> Option<usize> {
-        let (spiral, tail) = self.flow_parts();
-        self.tiles
-            .hit(spiral, self.theme.spacing.tile_floor(), tail, at)
+        self.scene.hit(&self.flow(), at)
     }
 
     /// Bring the tile ranking up to date with the browser.
     fn sync_tiles(&mut self) {
-        self.tiles.sync(self.browser.navigator());
+        self.scene.sync(self.browser.navigator());
     }
 
     /// Drain the directory watcher through the browser, re-reading the open
@@ -413,9 +355,7 @@ impl FilesWindow {
     /// Fold in folder totals the size worker produced. Returns whether the
     /// tiles must be redrawn.
     pub fn poll_tiles(&mut self) -> bool {
-        let arrived = self.tiles.poll();
-        self.tiles.sync(self.browser.navigator());
-        arrived
+        self.scene.poll(self.browser.navigator())
     }
 
     /// Whether the up control has somewhere to go.
@@ -430,18 +370,15 @@ impl FilesWindow {
     /// A movement key in the tile view: walk the spiral in rank order,
     /// scrolling the field when the walk leaves the tiles in view.
     fn steer_tiles(&mut self, command: widget::ListCommand) -> Outcome {
-        let (spiral, tail) = self.flow_parts();
-        let page = self
-            .tiles
-            .page(spiral, self.theme.spacing.tile_floor(), tail);
+        let flow = self.flow();
+        let page = self.scene.page(&flow);
         let cursor = self.browser.pane().cursor();
         let landing = SpiralCursor::new(&page.rows, page.later, page.earlier).land(cursor, command);
         let extend = matches!(command, widget::ListCommand::Extend(_));
         match landing {
             Landing::At(row) => self.browser.steer_to(row, extend),
             Landing::Slide(steps) => {
-                self.tiles
-                    .slide(spiral, self.theme.spacing.tile_floor(), tail, steps);
+                self.scene.slide_quietly(&flow, steps);
                 self.steer_to_view_edge(steps, extend)
             }
             Landing::Stay => Outcome::Ignored,
@@ -452,10 +389,7 @@ impl FilesWindow {
     /// came in: the smallest in view when scrolling on one tile at a time,
     /// the largest after a longer jump, and the mirror of each going back.
     fn steer_to_view_edge(&mut self, steps: i32, extend: bool) -> Outcome {
-        let (spiral, tail) = self.flow_parts();
-        let page = self
-            .tiles
-            .page(spiral, self.theme.spacing.tile_floor(), tail);
+        let page = self.scene.page(&self.flow());
         let forward = steps > 0;
         let single = steps.abs() == 1;
         let edge = if forward == single {
@@ -515,8 +449,9 @@ impl FilesWindow {
 
     /// The card of the tile at `row` as drawn now, grown to hold `tray`.
     fn tray_card(&self, row: usize, tray: &ActionTray) -> Rect {
-        let lift = TilePainter::lift(self.theme.spacing, self.motion.raise(TileKey::Item(row)));
-        tray.card(lift, self.motion.tray(row))
+        let motion = self.scene.motion();
+        let lift = TilePainter::lift(self.theme.spacing, motion.raise(TileKey::Item(row)));
+        tray.card(lift, motion.tray(row))
     }
 
     /// Whether `at` is on the card of the tile with the tray open.
@@ -527,9 +462,7 @@ impl FilesWindow {
 
     /// The placed tile at `row`.
     fn placed_item(&self, row: usize) -> Option<PlacedTile> {
-        self.tile_layout()
-            .into_iter()
-            .find(|placed| placed.row == row)
+        self.scene.placed_item(&self.flow(), row)
     }
 
     /// Deal with a left press while a tray is open. A press on the card never
@@ -611,13 +544,12 @@ impl FilesWindow {
     }
 
     fn slide_tiles(&mut self, steps: i32, at: Position) -> bool {
-        let (spiral, tail) = self.flow_parts();
+        let flow = self.flow();
         let moved = self
-            .tiles
-            .slide(spiral, self.theme.spacing.tile_floor(), tail, steps);
+            .scene
+            .slide(&flow, self.browser.navigator(), steps);
         if moved {
             self.tray = None;
-            self.aim_growth(self.motion_ms);
             let spot = self.spot_at(at);
             let _ = self.hover.move_to(spot);
         }
@@ -637,8 +569,8 @@ impl FilesWindow {
     /// The tiles in view, gathered for painting: those shrinking away first,
     /// then the ones the layout holds, each drawn where its glide has got to.
     fn painted_tiles(&self, placed: &[PlacedTile]) -> Vec<PaintedTile> {
-        let leaving = self
-            .growth
+        let growth = self.scene.growth();
+        let leaving = growth
             .leaving()
             .into_iter()
             .filter_map(|(id, row, shape)| {
@@ -647,15 +579,13 @@ impl FilesWindow {
             });
         let held = placed.iter().filter_map(|placed| {
             let entry = self.browser.entry(placed.row)?;
-            let shape = self
-                .growth
+            let shape = growth
                 .shape(TileId::of(&entry.name))
                 .unwrap_or_else(|| Shape::resting(placed.rect, placed.slot));
             self.painted_entry_tile(placed.row, shape)
         });
         let more = self.tile_more().map(|more| {
-            let shape = self
-                .growth
+            let shape = growth
                 .shape(TileId::More)
                 .unwrap_or_else(|| Shape::resting(more.rect, more.slot));
             self.painted_more_tile(&more, shape)
@@ -675,7 +605,7 @@ impl FilesWindow {
             name_color: self.theme.text,
             chosen: 0,
             drop_target: false,
-            raise: self.motion.raise(TileKey::More),
+            raise: self.scene.motion().raise(TileKey::More),
             reveal: 0,
             grown: shape.grown,
             glow: [0; TileAction::ALL.len()],
@@ -687,7 +617,8 @@ impl FilesWindow {
     fn painted_entry_tile(&self, row: usize, shape: Shape) -> Option<PaintedTile> {
         let entry = self.browser.entry(row)?;
         let key = TileKey::Item(row);
-        let sizes = self.tiles.sizes();
+        let sizes = self.scene.field().sizes();
+        let motion = self.scene.motion();
         let detail = if sizes.is_pending(entry) {
             String::from("measuring…")
         } else {
@@ -707,13 +638,13 @@ impl FilesWindow {
             } else {
                 RowFormat::color(entry, &self.theme)
             },
-            chosen: self.motion.chosen(row),
+            chosen: motion.chosen(row),
             drop_target: self.drop_hover_row == Some(row),
-            raise: self.motion.raise(key),
-            reveal: self.motion.reveal(key),
+            raise: motion.raise(key),
+            reveal: motion.reveal(key),
             grown: shape.grown,
-            glow: TileAction::ALL.map(|action| self.motion.glow(row, action)),
-            press: TileAction::ALL.map(|action| self.motion.press(row, action)),
+            glow: TileAction::ALL.map(|action| motion.glow(row, action)),
+            press: TileAction::ALL.map(|action| motion.press(row, action)),
             tray: self.painted_tray(row),
         })
     }
@@ -726,14 +657,13 @@ impl FilesWindow {
             text: editing.text,
             before_caret: editing.before_caret,
             valid: editing.valid,
-            raise: self.motion.raise(TileKey::Item(editing.row)),
+            raise: self.scene.motion().raise(TileKey::Item(editing.row)),
         })
     }
 
     fn paint_tiles(&mut self, canvas: &mut Canvas<'_>) {
-        if self.growth.is_primed() {
-            self.aim_growth(self.motion_ms);
-        }
+        let flow = self.flow();
+        self.scene.reaim_if_primed(&flow, self.browser.navigator());
         let placed = self.tile_layout();
         let tiles = self.painted_tiles(&placed);
         let rename = self.tile_rename(&placed);
@@ -757,7 +687,7 @@ impl FilesWindow {
         };
         Some(PaintedTray {
             tray,
-            level: self.motion.tray(row),
+            level: self.scene.motion().tray(row),
             caption,
         })
     }
@@ -1101,14 +1031,15 @@ impl FilesWindow {
         }
         let spacing = self.theme.spacing;
         let key = TileKey::Item(row);
-        let raise = self.motion.raise(key);
-        let level = self.motion.tray(row);
+        let motion = self.scene.motion();
+        let raise = motion.raise(key);
+        let level = motion.tray(row);
         let tray = self
             .open_tray()
             .filter(|&(open, _)| open == row)
             .map(|(_, tray)| tray);
         let slide = tray.as_ref().map_or(0, |tray| tray.slide_at(level));
-        let shift = TilePainter::button_shift(spacing, raise, self.motion.reveal(key)) - slide;
+        let shift = TilePainter::button_shift(spacing, raise, motion.reveal(key)) - slide;
         let geometry = TileGeometry::of(placed.rect, spacing, self.type_scale.tile_lines());
         geometry
             .bar
@@ -1131,8 +1062,9 @@ impl FilesWindow {
                 (placed, row)
             };
         let action = self.action_at(&placed, row, at)?;
-        let live = self.motion.buttons_are_live(row)
-            && (!TileAction::MENU.contains(&action) || self.motion.tray_is_live(row));
+        let motion = self.scene.motion();
+        let live = motion.buttons_are_live(row)
+            && (!TileAction::MENU.contains(&action) || motion.tray_is_live(row));
         live.then_some((row, action))
     }
 
@@ -2310,7 +2242,7 @@ mod tests {
     fn hovering_a_row_changes_the_painted_frame_by_gliding() {
         let (mut painter, root, size) = painter_over_a_mixed_directory("hover-frame");
         let arrived = glide(&mut painter, 0, 150);
-        assert!(!painter.growth.is_animating(), "the entrance has landed");
+        assert!(!painter.scene.growth().is_animating(), "the entrance has landed");
         let cold = paint_opaque(&mut painter, size);
 
         assert!(
@@ -2330,7 +2262,7 @@ mod tests {
         let hot = paint_opaque(&mut painter, size);
         assert_ne!(part_way, hot, "and it keeps going to the end");
         assert!(
-            !painter.motion.is_animating(),
+            !painter.scene.motion().is_animating(),
             "then it stops asking for frames"
         );
 
@@ -2419,7 +2351,7 @@ mod tests {
         glide(&mut painter, 70_000, 20);
         let after = paint_opaque(&mut painter, size);
         assert!(before != after, "a selected tile must look selected");
-        assert!(!painter.motion.is_animating(), "and the glide settles");
+        assert!(!painter.scene.motion().is_animating(), "and the glide settles");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2999,9 +2931,9 @@ mod tests {
                     .is_some_and(|e| e.name == "b_file.txt")
             })
             .expect("the file is listed");
-        assert_eq!(painter.motion.raise(TileKey::Item(row)), 255);
-        assert_eq!(painter.motion.reveal(TileKey::Item(row)), 255);
-        assert!(painter.motion.buttons_are_live(row));
+        assert_eq!(painter.scene.motion().raise(TileKey::Item(row)), 255);
+        assert_eq!(painter.scene.motion().reveal(TileKey::Item(row)), 255);
+        assert!(painter.scene.motion().buttons_are_live(row));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3185,9 +3117,9 @@ mod tests {
             .expect("the tray holds the action");
         let lift = super::TilePainter::lift(
             painter.theme.spacing,
-            painter.motion.raise(TileKey::Item(row)),
+            painter.scene.motion().raise(TileKey::Item(row)),
         );
-        let offset = tray.offset(lift, painter.motion.tray(row));
+        let offset = tray.offset(lift, painter.scene.motion().tray(row));
         super::Position {
             x: rect.x + rect.w / 2,
             y: rect.y + rect.h / 2 + offset,
@@ -3211,7 +3143,7 @@ mod tests {
         let offered: Vec<TileAction> = tray.rows().iter().map(|(a, _)| *a).collect();
         assert_eq!(offered, TileAction::MENU);
         assert_eq!(painter.browser.selected_paths(), [root.join("b_file.txt")]);
-        assert_eq!(painter.motion.tray(row), 255, "and it has finished opening");
+        assert_eq!(painter.scene.motion().tray(row), 255, "and it has finished opening");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3422,7 +3354,7 @@ mod tests {
         }
         let lift = super::TilePainter::lift(
             painter.theme.spacing,
-            painter.motion.raise(TileKey::Item(row)),
+            painter.scene.motion().raise(TileKey::Item(row)),
         );
         let last = tray.rows()[5].1;
         let low = last.bottom() + tray.offset(lift, 255) - 2;
@@ -3493,7 +3425,7 @@ mod tests {
         painter.step_motion(40_000);
         glide(&mut painter, 40_000, 30);
         assert_eq!(paint_opaque(&mut painter, size), resting, "from {at:?}");
-        assert!(!painter.motion.is_animating());
+        assert!(!painter.scene.motion().is_animating());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3744,16 +3676,17 @@ mod tests {
             height: 600,
         };
         let arrived = glide(&mut painter, 0, 150);
-        assert!(!painter.growth.is_animating());
+        assert!(!painter.scene.growth().is_animating());
         let largest = in_view(&painter)[0].clone();
         wheel(&mut painter, 1);
         painter.step_motion(arrived + 16);
         assert!(
-            painter.growth.is_animating(),
+            painter.scene.growth().is_animating(),
             "the scroll is followed by a glide"
         );
         let shrinking: Vec<String> = painter
-            .growth
+            .scene
+            .growth()
             .leaving()
             .iter()
             .filter_map(|(_, row, _)| painter.browser.entry(*row))
@@ -3762,7 +3695,7 @@ mod tests {
         assert_eq!(shrinking, [largest]);
         let mid = paint_opaque(&mut painter, size);
         glide(&mut painter, arrived + 16, 150);
-        assert!(painter.growth.leaving().is_empty());
+        assert!(painter.scene.growth().leaving().is_empty());
         assert_ne!(mid, paint_opaque(&mut painter, size));
         let _ = std::fs::remove_dir_all(&root);
     }

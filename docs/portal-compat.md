@@ -54,6 +54,19 @@ file.
 `OpenURI` is a frontend interface with no backend. `crates/opener` already
 implements the launch side.
 
+## Scope
+
+The portal calls this desktop uses, as stated by the user: email, file
+chooser, open browser and open programs, and screen sharing in video calls.
+Everything else stays with gtk or with the frontend.
+
+| Need | Interface | State |
+| --- | --- | --- |
+| Open browser, open programs | `OpenURI` | works through the frontend; opening `https://example.com` launched the browser and the user confirmed it works. A command-line call carries no activation token, so only app-initiated calls can move focus. |
+| Email | `Email` | gtk; cozy backend not started |
+| Find files | `FileChooser` | gtk; cozy backend not started |
+| Screen sharing | `ScreenCast` | no provider installed; `xdg-desktop-portal-gnome` and `xdg-desktop-portal-wlr` are both absent |
+
 ## Frontend interfaces exposed on the bus
 
 From `busctl --user introspect org.freedesktop.portal.Desktop`, paired by the

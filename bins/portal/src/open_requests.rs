@@ -60,8 +60,18 @@ impl OpenRequests {
     pub fn wake_fds(&self) -> Vec<RawFd> {
         self.requests
             .values()
-            .map(|request| request.dialog.wake_fd())
+            .flat_map(|request| {
+                std::iter::once(request.dialog.wake_fd()).chain(request.dialog.watch_fds())
+            })
             .collect()
+    }
+
+    #[must_use]
+    pub fn wait_ms(&self) -> Option<i32> {
+        self.requests
+            .values()
+            .filter_map(|request| request.dialog.wait_ms())
+            .min()
     }
 
     /// Let every dialog handle its pending events and collect the ones that
@@ -131,6 +141,8 @@ pub mod test_support {
     pub struct FakeDialog {
         pub fd: RawFd,
         pub probe: Rc<RefCell<DialogProbe>>,
+        pub extra_fds: Vec<RawFd>,
+        pub deadline: Option<i32>,
     }
 
     impl FakeDialog {
@@ -141,15 +153,35 @@ pub mod test_support {
                 Box::new(Self {
                     fd,
                     probe: Rc::clone(&probe),
+                    extra_fds: Vec::new(),
+                    deadline: None,
                 }),
                 probe,
             )
+        }
+
+        #[must_use]
+        pub fn waiting(fd: RawFd, extra_fds: Vec<RawFd>, deadline: Option<i32>) -> Box<dyn ChooserDialog> {
+            Box::new(Self {
+                fd,
+                probe: Rc::new(RefCell::new(DialogProbe::default())),
+                extra_fds,
+                deadline,
+            })
         }
     }
 
     impl ChooserDialog for FakeDialog {
         fn wake_fd(&self) -> RawFd {
             self.fd
+        }
+
+        fn watch_fds(&self) -> Vec<RawFd> {
+            self.extra_fds.clone()
+        }
+
+        fn wait_ms(&self) -> Option<i32> {
+            self.deadline
         }
 
         fn advance(&mut self) -> Option<ChooserOutcome> {
@@ -269,5 +301,26 @@ mod tests {
         open.insert("/r/1", context(":1.1", 1), first);
         open.insert("/r/2", context(":1.2", 2), second);
         assert_eq!(open.wake_fds(), [5, 6]);
+    }
+
+    #[test]
+    fn a_dialogs_extra_descriptors_follow_its_wake_descriptor() {
+        let mut open = OpenRequests::new();
+        open.insert("/r/1", context(":1.1", 1), FakeDialog::waiting(5, vec![8, 9], None));
+        let (plain, _probe) = FakeDialog::boxed(6);
+        open.insert("/r/2", context(":1.2", 2), plain);
+        assert_eq!(open.wake_fds(), [5, 8, 9, 6]);
+    }
+
+    #[test]
+    fn the_loop_sleeps_only_as_long_as_the_soonest_dialog_allows() {
+        let mut open = OpenRequests::new();
+        assert_eq!(open.wait_ms(), None);
+        open.insert("/r/1", context(":1.1", 1), FakeDialog::waiting(5, vec![], Some(40)));
+        assert_eq!(open.wait_ms(), Some(40));
+        open.insert("/r/2", context(":1.2", 2), FakeDialog::waiting(6, vec![], Some(16)));
+        let (idle, _probe) = FakeDialog::boxed(7);
+        open.insert("/r/3", context(":1.3", 3), idle);
+        assert_eq!(open.wait_ms(), Some(16));
     }
 }

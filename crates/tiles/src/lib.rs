@@ -26,6 +26,7 @@ pub mod tile_motion;
 pub mod tile_painter;
 pub mod tile_rank;
 pub mod tile_scene;
+pub mod tile_style;
 pub mod toolbar;
 pub mod typography;
 

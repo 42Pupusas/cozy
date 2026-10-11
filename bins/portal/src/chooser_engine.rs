@@ -36,6 +36,11 @@ impl ChooserEngine {
         self.open.wake_fds()
     }
 
+    #[must_use]
+    pub fn wait_ms(&self) -> Option<i32> {
+        self.open.wait_ms()
+    }
+
     /// Start dialogs for queued calls, honour queued closes, and answer every
     /// dialog that has ended.
     pub fn pump<S: ReplySink>(&mut self, sink: &mut S, dispatcher: &mut Dispatcher) {

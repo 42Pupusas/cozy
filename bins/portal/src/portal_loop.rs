@@ -179,7 +179,7 @@ impl PortalLoop {
         for fd in self.chooser.wake_fds() {
             set.watch(fd, Interest::Readable);
         }
-        let _ = set.wait(-1);
+        let _ = set.wait(self.chooser.wait_ms().unwrap_or(-1));
         Readiness {
             bus: set.is_ready(bus_index),
             config: config_index.is_some_and(|index| set.is_ready(index)),

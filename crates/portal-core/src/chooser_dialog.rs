@@ -8,6 +8,18 @@ pub trait ChooserDialog {
     /// A descriptor that becomes readable when the dialog has work to do.
     fn wake_fd(&self) -> RawFd;
 
+    /// Further descriptors whose readiness means the dialog has work to do,
+    /// such as a watch on the folder it shows.
+    fn watch_fds(&self) -> Vec<RawFd> {
+        Vec::new()
+    }
+
+    /// How long the loop may sleep before the dialog next needs to run, or
+    /// `None` when it only needs waking by a descriptor.
+    fn wait_ms(&self) -> Option<i32> {
+        None
+    }
+
     /// Handle pending events without blocking and drain [`Self::wake_fd`].
     /// Returns the outcome once the dialog has ended.
     fn advance(&mut self) -> Option<ChooserOutcome>;
@@ -54,6 +66,26 @@ mod tests {
             choices: vec![],
             current_folder: None,
         }
+    }
+
+    struct Bare;
+
+    impl ChooserDialog for Bare {
+        fn wake_fd(&self) -> RawFd {
+            3
+        }
+
+        fn advance(&mut self) -> Option<ChooserOutcome> {
+            None
+        }
+
+        fn close(&mut self) {}
+    }
+
+    #[test]
+    fn a_dialog_needs_no_extra_descriptors_or_deadline_unless_it_says_so() {
+        assert!(Bare.watch_fds().is_empty());
+        assert_eq!(Bare.wait_ms(), None);
     }
 
     #[test]

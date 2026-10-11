@@ -46,7 +46,7 @@ use browser::Browser;
 use file_launcher::FileLauncher;
 use options::Options;
 use platform::toplevel::{LogicalSize, Toplevel, WindowEvent};
-use tiles::theme::Theme;
+use tiles::tile_style::TileStyle;
 use window::FilesWindow;
 
 /// Runs the browser: owns the window, the event loop, and the exit path.
@@ -69,20 +69,7 @@ impl App {
         // larger configured font grows the chrome instead of clipping it.
         // Scale 1.0 here; the compositor's real output scale is applied when
         // the window reports its physical size below.
-        let type_scale = tiles::typography::Typography::load(&cfg, 1.0);
-        // Three sources, in priority order: an explicit `[files]` key, then
-        // the guide's geometry scaled to the configured font, then a floor
-        // from the loaded type scale so no band is shorter than the glyphs it
-        // must hold. `with_spacing` runs first because it owns the chrome
-        // heights the guide also sizes the controls against; `with_metrics`
-        // then only raises a band that would clip, and never lowers one.
-        let theme = Theme::from_config(&cfg)
-            .with_spacing(tiles::spacing::Spacing::new(cfg.font.px_size(), 1.0))
-            .with_metrics(
-                type_scale.natural_row_height(),
-                type_scale.natural_header_height(),
-                type_scale.natural_status_height(),
-            );
+        let TileStyle { theme, type_scale } = TileStyle::from_config(&cfg);
         let favorites = favorites::Favorites::load();
         let user_dirs = user_dirs::UserDirs::load();
         let sidebar = sidebar::Sidebar::new(&user_dirs, &favorites);

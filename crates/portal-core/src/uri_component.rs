@@ -11,8 +11,15 @@ impl UriComponent {
     /// digit, one of `-._~`, or listed in `also_keep`.
     #[must_use]
     pub fn encode(text: &str, also_keep: &[u8]) -> String {
-        let mut encoded = String::with_capacity(text.len());
-        for byte in text.bytes() {
+        Self::encode_bytes(text.as_bytes(), also_keep)
+    }
+
+    /// Same as [`Self::encode`] for bytes that need not be UTF-8, such as a
+    /// Unix path.
+    #[must_use]
+    pub fn encode_bytes(bytes: &[u8], also_keep: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len());
+        for &byte in bytes {
             if byte.is_ascii_alphanumeric()
                 || Self::UNRESERVED_PUNCTUATION.contains(&byte)
                 || also_keep.contains(&byte)
@@ -66,6 +73,11 @@ mod tests {
     fn a_percent_sign_is_encoded_unless_kept() {
         assert_eq!(UriComponent::encode("100%", b""), "100%25");
         assert_eq!(UriComponent::encode("a%20b", b"%"), "a%20b");
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_encoded_individually() {
+        assert_eq!(UriComponent::encode_bytes(b"a\xff/b", b"/"), "a%FF/b");
     }
 
     #[test]

@@ -17,6 +17,14 @@
 //! actually contains; [`SettingChangedSignal`] builds the one signal this
 //! interface emits.
 //!
+//! # `impl.portal.FileChooser`
+//!
+//! [`ChooserRequest`] decodes an `OpenFile`, `SaveFile` or `SaveFiles` call.
+//! [`FileFilter`] and [`Choice`] are the two option lists the app can send.
+//! [`ChooserOutcome`] encodes what the dialog produced as a response code and
+//! a results vardict. [`VardictReader`] and [`VardictBuilder`] do the `a{sv}`
+//! plumbing.
+//!
 //! # `impl.portal.Email`
 //!
 //! [`EmailMessage`] reads a `ComposeEmail` options vardict and builds the
@@ -25,6 +33,9 @@
 pub mod accent_color;
 pub mod appearance_settings;
 pub mod caller_id;
+pub mod chooser_choice;
+pub mod chooser_outcome;
+pub mod chooser_request;
 pub mod color_scheme;
 pub mod email_message;
 pub mod file_filter;
@@ -39,6 +50,9 @@ pub mod vardict;
 pub use accent_color::AccentColor;
 pub use appearance_settings::AppearanceSettings;
 pub use caller_id::CallerId;
+pub use chooser_choice::{Choice, ChoiceOption, ChoiceSelection};
+pub use chooser_outcome::{ChooserOutcome, Selection};
+pub use chooser_request::{ChooserKind, ChooserMethod, ChooserRequest};
 pub use color_scheme::ColorScheme;
 pub use email_message::EmailMessage;
 pub use file_filter::{FileFilter, FilterRule};

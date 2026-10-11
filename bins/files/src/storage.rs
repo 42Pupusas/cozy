@@ -271,7 +271,7 @@ mod tests {
     fn the_footer_and_the_size_column_name_units_alike() {
         let g = 1024_u64.pow(3);
         let footer = Usage::new(128 * g, 0).capacity_label();
-        let column = crate::row_format::RowFormat::human_size(128 * g);
+        let column = tiles::row_format::RowFormat::human_size(128 * g);
         assert_eq!(footer, column, "one figure must have one name");
     }
 

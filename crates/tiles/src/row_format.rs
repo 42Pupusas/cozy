@@ -9,7 +9,7 @@ use fsmodel::entry::Entry;
 use fsmodel::kind::EntryKind;
 use platform::draw::Color;
 
-use tiles::theme::Theme;
+use crate::theme::Theme;
 
 /// Formats entries for display.
 #[derive(Debug, Clone, Copy, Default)]

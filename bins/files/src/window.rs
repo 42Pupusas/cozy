@@ -22,8 +22,6 @@ use crate::favorites::Favorites;
 use crate::frame::Frame;
 use tiles::hover::{Hover, Pane, Spot};
 use tiles::pinned_card::PinnedCard;
-use crate::row_format::RowFormat;
-use tiles::row_kind::RowKind;
 use crate::sidebar::{Sidebar, SidebarRow};
 use tiles::spiral_cursor::{Landing, SpiralCursor};
 use volumes::mount_backend::MountOutcome;
@@ -36,10 +34,9 @@ use crate::storage::Storage;
 use tiles::theme::Theme;
 use tiles::tile_action::TileAction;
 use tiles::tile_field::{PlacedMore, PlacedTile};
+use tiles::tile_assembly::{TileAssembly, TileOverlay};
 use tiles::tile_scene::{Flow, MotionAim, TileScene};
 use tiles::tile_geometry::TileGeometry;
-use tiles::tile_growth::Shape;
-use tiles::tile_id::TileId;
 use tiles::tile_motion::TileKey;
 use tiles::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
 use tiles::toolbar::{Target, Toolbar};
@@ -569,84 +566,13 @@ impl FilesWindow {
     /// The tiles in view, gathered for painting: those shrinking away first,
     /// then the ones the layout holds, each drawn where its glide has got to.
     fn painted_tiles(&self, placed: &[PlacedTile]) -> Vec<PaintedTile> {
-        let growth = self.scene.growth();
-        let leaving = growth
-            .leaving()
-            .into_iter()
-            .filter_map(|(id, row, shape)| {
-                let entry = self.browser.entry(row)?;
-                (TileId::of(&entry.name) == id).then(|| self.painted_entry_tile(row, shape))?
-            });
-        let held = placed.iter().filter_map(|placed| {
-            let entry = self.browser.entry(placed.row)?;
-            let shape = growth
-                .shape(TileId::of(&entry.name))
-                .unwrap_or_else(|| Shape::resting(placed.rect, placed.slot));
-            self.painted_entry_tile(placed.row, shape)
-        });
-        let more = self.tile_more().map(|more| {
-            let shape = growth
-                .shape(TileId::More)
-                .unwrap_or_else(|| Shape::resting(more.rect, more.slot));
-            self.painted_more_tile(&more, shape)
-        });
-        leaving.chain(held).chain(more).collect()
-    }
-
-    fn painted_more_tile(&self, more: &PlacedMore, shape: Shape) -> PaintedTile {
-        PaintedTile {
-            rect: shape.rect,
-            slot: shape.slot,
-            from_slot: shape.from_slot,
-            mix: shape.mix,
-            kind: RowKind::Leaf,
-            name: format!("{} more…", more.hidden),
-            detail: RowFormat::human_size(more.bytes),
-            name_color: self.theme.text,
-            chosen: 0,
-            drop_target: false,
-            raise: self.scene.motion().raise(TileKey::More),
-            reveal: 0,
-            grown: shape.grown,
-            glow: [0; TileAction::ALL.len()],
-            press: [0; TileAction::ALL.len()],
-            tray: None,
+        TileAssembly {
+            scene: &self.scene,
+            nav: self.browser.navigator(),
+            theme: &self.theme,
+            overlay: self,
         }
-    }
-
-    fn painted_entry_tile(&self, row: usize, shape: Shape) -> Option<PaintedTile> {
-        let entry = self.browser.entry(row)?;
-        let key = TileKey::Item(row);
-        let sizes = self.scene.field().sizes();
-        let motion = self.scene.motion();
-        let detail = if sizes.is_pending(entry) {
-            String::from("measuring…")
-        } else {
-            RowFormat::human_size(sizes.of(entry))
-        };
-        let cut = self.browser.clipboard().is_cut(&entry.path);
-        Some(PaintedTile {
-            rect: shape.rect,
-            slot: shape.slot,
-            from_slot: shape.from_slot,
-            mix: shape.mix,
-            kind: RowKind::of(entry),
-            name: entry.name.clone(),
-            detail,
-            name_color: if cut {
-                self.theme.muted
-            } else {
-                RowFormat::color(entry, &self.theme)
-            },
-            chosen: motion.chosen(row),
-            drop_target: self.drop_hover_row == Some(row),
-            raise: motion.raise(key),
-            reveal: motion.reveal(key),
-            grown: shape.grown,
-            glow: TileAction::ALL.map(|action| motion.glow(row, action)),
-            press: TileAction::ALL.map(|action| motion.press(row, action)),
-            tray: self.painted_tray(row),
-        })
+        .tiles(placed, self.tile_more())
     }
 
     fn tile_rename(&self, placed: &[PlacedTile]) -> Option<TileRename> {
@@ -1705,6 +1631,20 @@ impl Painter for FilesWindow {
         self.apply(outcome);
         self.drop_hover_row = None;
         self.drag_badge.end();
+    }
+}
+
+impl TileOverlay for FilesWindow {
+    fn is_cut(&self, path: &std::path::Path) -> bool {
+        self.browser.clipboard().is_cut(path)
+    }
+
+    fn is_drop_target(&self, row: usize) -> bool {
+        self.drop_hover_row == Some(row)
+    }
+
+    fn tray(&self, row: usize) -> Option<PaintedTray> {
+        self.painted_tray(row)
     }
 }
 

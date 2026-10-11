@@ -215,7 +215,7 @@ impl PasswordPanel {
         if let Some(prompt) = modal.prompt() {
             let room = self.card.w - self.inset * 2;
             let shown =
-                crate::row_format::RowFormat::truncate(prompt, Self::columns_for(text.body, room));
+                tiles::row_format::RowFormat::truncate(prompt, Self::columns_for(text.body, room));
             text.body.draw_text(
                 canvas,
                 &shown,
@@ -247,7 +247,7 @@ impl PasswordPanel {
         // consequence, not a caption.
         if let Some(notice) = modal.notice() {
             let room = self.card.w - self.inset * 2;
-            let shown = crate::row_format::RowFormat::truncate(
+            let shown = tiles::row_format::RowFormat::truncate(
                 notice,
                 Self::columns_for(text.detail, room),
             );

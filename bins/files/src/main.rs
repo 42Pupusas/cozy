@@ -35,7 +35,6 @@ mod options;
 mod password_modal;
 mod password_panel;
 mod rename;
-mod row_format;
 mod secret_input;
 #[allow(dead_code)]
 mod sidebar;

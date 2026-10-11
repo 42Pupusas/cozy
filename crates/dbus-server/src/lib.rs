@@ -22,6 +22,8 @@
 //! depend on `dbus-server` alone rather than adding `dbus` as a second,
 //! separately versioned dependency just to name a `Value`.
 
+pub mod call_context;
+pub mod call_queue;
 pub mod dispatcher;
 pub mod introspection;
 pub mod name_watcher;
@@ -34,6 +36,8 @@ pub mod server_loop;
 pub use dbus::marshal::Marshaller;
 pub use dbus::message::Reply;
 pub use dbus::value::{Unmarshaller, Value};
+pub use call_context::CallContext;
+pub use call_queue::{CallQueue, PendingCall};
 pub use dispatcher::Dispatcher;
 pub use introspection::{
     Argument, InterfaceDescriptor, MethodDescriptor, NodeIntrospection, PropertyAccess,
@@ -42,6 +46,6 @@ pub use introspection::{
 pub use name_watcher::NameWatcher;
 pub use properties::{PropertiesChangedSignal, PropertyTable};
 pub use registry::ObjectRegistry;
-pub use router::{DispatchError, DispatchOutcome, MethodCallRouter};
+pub use router::{CallOutcome, DispatchError, DispatchOutcome, MethodCallRouter};
 pub use serve::{IncomingCall, ReplySink};
 pub use server_loop::ServerLoop;

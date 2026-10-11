@@ -26,6 +26,7 @@
 use dbus::value::Value;
 use std::collections::HashMap;
 
+use crate::call_context::CallContext;
 use crate::registry::ObjectRegistry;
 
 /// The two interfaces every registered object answers implicitly, per
@@ -128,7 +129,25 @@ pub struct DispatchOutcome {
 struct MethodEntry {
     signature: String,
     reply_signature: String,
-    handler: Box<MethodHandler>,
+    handler: Handler,
+}
+
+/// A handler that accepts a call and answers it later, from outside the
+/// dispatcher. It sees who is calling; the reply is sent by whoever holds
+/// the connection.
+type DeferredHandler = dyn Fn(&CallContext, &[Value]) -> Result<(), String> + Send + Sync;
+
+enum Handler {
+    Immediate(Box<MethodHandler>),
+    Deferred(Box<DeferredHandler>),
+}
+
+/// What a routed call produced.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallOutcome {
+    Reply(DispatchOutcome),
+    /// The handler accepted the call. Its reply is sent later.
+    Deferred,
 }
 
 /// A registered method's implementation: given the object path a call
@@ -177,7 +196,29 @@ impl MethodCallRouter {
             MethodEntry {
                 signature: signature.into(),
                 reply_signature: reply_signature.into(),
-                handler: Box::new(handler),
+                handler: Handler::Immediate(Box::new(handler)),
+            },
+        );
+    }
+
+    /// Register a handler that answers later. `reply_signature` is the
+    /// signature of the reply the eventual sender must use.
+    pub fn register_deferred<F>(
+        &mut self,
+        interface: impl Into<String>,
+        member: impl Into<String>,
+        signature: impl Into<String>,
+        reply_signature: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(&CallContext, &[Value]) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.methods.insert(
+            (interface.into(), member.into()),
+            MethodEntry {
+                signature: signature.into(),
+                reply_signature: reply_signature.into(),
+                handler: Handler::Deferred(Box::new(handler)),
             },
         );
     }
@@ -201,6 +242,27 @@ impl MethodCallRouter {
         signature: &str,
         args: &[Value],
     ) -> Result<DispatchOutcome, DispatchError> {
+        let context = CallContext::anonymous(path);
+        match self.dispatch_call(registry, &context, interface, member, signature, args)? {
+            CallOutcome::Reply(outcome) => Ok(outcome),
+            CallOutcome::Deferred => Err(DispatchError::Failed(format!(
+                "{interface}.{member} replies later and needs a caller to answer"
+            ))),
+        }
+    }
+
+    /// Like [`Self::dispatch`], but hands the handler the caller's
+    /// [`CallContext`] and allows it to defer the reply.
+    pub fn dispatch_call(
+        &self,
+        registry: &ObjectRegistry,
+        context: &CallContext,
+        interface: &str,
+        member: &str,
+        signature: &str,
+        args: &[Value],
+    ) -> Result<CallOutcome, DispatchError> {
+        let path = context.path();
         if !registry.contains(path) {
             return Err(DispatchError::UnknownObject { path: path.into() });
         }
@@ -225,11 +287,19 @@ impl MethodCallRouter {
                 got: signature.into(),
             });
         }
-        let values = (entry.handler)(path, args).map_err(DispatchError::Failed)?;
-        Ok(DispatchOutcome {
-            reply_signature: entry.reply_signature.clone(),
-            values,
-        })
+        match &entry.handler {
+            Handler::Immediate(handler) => {
+                let values = handler(path, args).map_err(DispatchError::Failed)?;
+                Ok(CallOutcome::Reply(DispatchOutcome {
+                    reply_signature: entry.reply_signature.clone(),
+                    values,
+                }))
+            }
+            Handler::Deferred(handler) => {
+                handler(context, args).map_err(DispatchError::Failed)?;
+                Ok(CallOutcome::Deferred)
+            }
+        }
     }
 
     /// How many `(interface, member)` handlers are registered.
@@ -467,6 +537,112 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.values, vec![Value::Str("/session/2".into())]);
+    }
+
+    fn router_with_deferred_open(queue: crate::call_queue::CallQueue) -> MethodCallRouter {
+        let mut router = MethodCallRouter::new();
+        router.register_deferred(SETTINGS_IFACE, "Open", "s", "u", move |context, args| {
+            queue.push(crate::call_queue::PendingCall {
+                context: context.clone(),
+                args: args.to_vec(),
+            });
+            Ok(())
+        });
+        router
+    }
+
+    #[test]
+    fn a_deferred_call_is_reported_as_deferred_and_reaches_the_queue_with_its_caller() {
+        let registry = registry_with_settings_object();
+        let queue = crate::call_queue::CallQueue::new();
+        let router = router_with_deferred_open(queue.clone());
+        let context = CallContext::new(SETTINGS_PATH, ":1.7", 11);
+
+        let outcome = router
+            .dispatch_call(
+                &registry,
+                &context,
+                SETTINGS_IFACE,
+                "Open",
+                "s",
+                &[Value::Str("x".into())],
+            )
+            .unwrap();
+
+        assert_eq!(outcome, CallOutcome::Deferred);
+        let pending = queue.pop().expect("queued");
+        assert_eq!(pending.context, context);
+        assert_eq!(pending.args, vec![Value::Str("x".into())]);
+    }
+
+    #[test]
+    fn a_deferred_call_still_checks_its_signature_before_the_handler_runs() {
+        let registry = registry_with_settings_object();
+        let queue = crate::call_queue::CallQueue::new();
+        let router = router_with_deferred_open(queue.clone());
+        let context = CallContext::new(SETTINGS_PATH, ":1.7", 11);
+
+        let err = router
+            .dispatch_call(&registry, &context, SETTINGS_IFACE, "Open", "u", &[])
+            .unwrap_err();
+
+        assert!(matches!(err, DispatchError::InvalidArgs { .. }));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_deferred_handler_failure_becomes_a_failed_dispatch_error() {
+        let registry = registry_with_settings_object();
+        let mut router = MethodCallRouter::new();
+        router.register_deferred(SETTINGS_IFACE, "Open", "", "u", |_context, _args| {
+            Err("busy".to_string())
+        });
+        let context = CallContext::new(SETTINGS_PATH, ":1.7", 11);
+
+        let err = router
+            .dispatch_call(&registry, &context, SETTINGS_IFACE, "Open", "", &[])
+            .unwrap_err();
+
+        assert_eq!(err, DispatchError::Failed("busy".into()));
+    }
+
+    #[test]
+    fn plain_dispatch_of_a_deferred_method_is_refused_rather_than_answered_empty() {
+        let registry = registry_with_settings_object();
+        let router = router_with_deferred_open(crate::call_queue::CallQueue::new());
+
+        let err = router
+            .dispatch(
+                &registry,
+                SETTINGS_PATH,
+                SETTINGS_IFACE,
+                "Open",
+                "s",
+                &[Value::Str("x".into())],
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, DispatchError::Failed(_)));
+    }
+
+    #[test]
+    fn an_immediate_method_through_dispatch_call_replies() {
+        let registry = registry_with_settings_object();
+        let router = router_with_read_all();
+        let context = CallContext::new(SETTINGS_PATH, ":1.7", 11);
+
+        let outcome = router
+            .dispatch_call(
+                &registry,
+                &context,
+                SETTINGS_IFACE,
+                "ReadAll",
+                "as",
+                &[Value::Array(vec![])],
+            )
+            .unwrap();
+
+        assert!(matches!(outcome, CallOutcome::Reply(_)));
     }
 
     #[test]

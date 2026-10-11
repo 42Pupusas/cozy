@@ -30,10 +30,11 @@
 
 use dbus::value::Value;
 
+use crate::call_context::CallContext;
 use crate::introspection::{InterfaceDescriptor, NodeIntrospection};
 use crate::properties::PropertyTable;
 use crate::registry::ObjectRegistry;
-use crate::router::{DispatchError, DispatchOutcome, MethodCallRouter};
+use crate::router::{CallOutcome, DispatchError, DispatchOutcome, MethodCallRouter};
 
 const INTROSPECTABLE_IFACE: &str = "org.freedesktop.DBus.Introspectable";
 const PROPERTIES_IFACE: &str = "org.freedesktop.DBus.Properties";
@@ -108,6 +109,22 @@ impl Dispatcher {
             .register(interface, member, signature, reply_signature, handler);
     }
 
+    /// Register a handler that answers later. See
+    /// [`MethodCallRouter::register_deferred`].
+    pub fn register_deferred<F>(
+        &mut self,
+        interface: impl Into<String>,
+        member: impl Into<String>,
+        signature: impl Into<String>,
+        reply_signature: impl Into<String>,
+        handler: F,
+    ) where
+        F: Fn(&CallContext, &[Value]) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.router
+            .register_deferred(interface, member, signature, reply_signature, handler);
+    }
+
     /// Track `(path, interface)` with zero properties. See
     /// [`PropertyTable::ensure`].
     pub fn ensure_properties(&mut self, path: impl Into<String>, interface: impl Into<String>) {
@@ -153,6 +170,27 @@ impl Dispatcher {
         }
         self.router
             .dispatch(&self.registry, path, interface, member, signature, args)
+    }
+
+    /// Like [`Self::dispatch`], but gives deferred handlers the caller's
+    /// [`CallContext`] and reports a deferred call as such.
+    pub fn dispatch_call(
+        &self,
+        context: &CallContext,
+        interface: &str,
+        member: &str,
+        signature: &str,
+        args: &[Value],
+    ) -> Result<CallOutcome, DispatchError> {
+        let is_generic = (interface == INTROSPECTABLE_IFACE && member == "Introspect")
+            || (interface == PROPERTIES_IFACE && matches!(member, "Get" | "GetAll"));
+        if is_generic {
+            return self
+                .dispatch(context.path(), interface, member, signature, args)
+                .map(CallOutcome::Reply);
+        }
+        self.router
+            .dispatch_call(&self.registry, context, interface, member, signature, args)
     }
 
     fn dispatch_introspect(

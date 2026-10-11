@@ -22,7 +22,9 @@ use dbus::conn::{DbusConn, DbusError};
 use dbus::message::{MessageType, Reply};
 use dbus::value::{Unmarshaller, Value};
 
+use crate::call_context::CallContext;
 use crate::dispatcher::Dispatcher;
+use crate::router::CallOutcome;
 
 /// Everything [`Dispatcher::dispatch`] needs, extracted from one incoming
 /// `MethodCall` [`Reply`].
@@ -60,27 +62,37 @@ impl IncomingCall {
         })
     }
 
+    /// The caller and object this call arrived for.
+    #[must_use]
+    pub fn context(&self) -> CallContext {
+        CallContext::new(&self.path, &self.sender, self.serial)
+    }
+
     /// Run this call through `dispatcher` and send the resulting reply
     /// (a method return or an `Error`) via `sink`. This is the one
     /// function a server's receive loop calls per incoming `MethodCall`.
+    ///
+    /// A call a deferred handler accepted sends nothing here; whoever holds
+    /// the handler's queue answers it later through [`CallContext::reply`].
     pub fn serve<S: ReplySink>(
         &self,
         dispatcher: &Dispatcher,
         sink: &mut S,
     ) -> Result<(), S::Error> {
-        match dispatcher.dispatch(
-            &self.path,
+        match dispatcher.dispatch_call(
+            &self.context(),
             &self.interface,
             &self.member,
             &self.signature,
             &self.args,
         ) {
-            Ok(outcome) => sink.send_return(
+            Ok(CallOutcome::Reply(outcome)) => sink.send_return(
                 &self.sender,
                 self.serial,
                 &outcome.values,
                 &outcome.reply_signature,
             ),
+            Ok(CallOutcome::Deferred) => Ok(()),
             Err(err) => {
                 sink.send_error(&self.sender, self.serial, err.error_name(), &err.message())
             }
@@ -287,6 +299,64 @@ mod tests {
         assert_eq!(*serial, 3);
         assert_eq!(*values, vec![Value::Array(vec![])]);
         assert_eq!(signature, "a{sa{sv}}");
+    }
+
+    #[test]
+    fn serve_sends_nothing_for_a_deferred_call_and_queues_it_with_its_caller() {
+        let queue = crate::call_queue::CallQueue::new();
+        let producer = queue.clone();
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register_object(SETTINGS_PATH, [SETTINGS_IFACE]);
+        dispatcher.register_interface(InterfaceDescriptor::new(SETTINGS_IFACE));
+        dispatcher.register_deferred(SETTINGS_IFACE, "Open", "", "u", move |context, args| {
+            producer.push(crate::call_queue::PendingCall {
+                context: context.clone(),
+                args: args.to_vec(),
+            });
+            Ok(())
+        });
+        let reply = method_call_reply(SENDER, 9, SETTINGS_PATH, SETTINGS_IFACE, "Open", "", vec![]);
+        let call = IncomingCall::from_reply(&reply).unwrap();
+
+        let mut sink = RecordingSink::default();
+        call.serve(&dispatcher, &mut sink).unwrap();
+
+        assert!(sink.returns.is_empty());
+        assert!(sink.errors.is_empty());
+        let pending = queue.pop().expect("queued");
+        assert_eq!(pending.context.sender(), SENDER);
+        assert_eq!(pending.context.serial(), 9);
+        assert_eq!(pending.context.path(), SETTINGS_PATH);
+    }
+
+    #[test]
+    fn the_queued_call_can_be_answered_later_to_the_original_caller() {
+        let queue = crate::call_queue::CallQueue::new();
+        let producer = queue.clone();
+        let mut dispatcher = Dispatcher::new();
+        dispatcher.register_object(SETTINGS_PATH, [SETTINGS_IFACE]);
+        dispatcher.register_deferred(SETTINGS_IFACE, "Open", "", "u", move |context, args| {
+            producer.push(crate::call_queue::PendingCall {
+                context: context.clone(),
+                args: args.to_vec(),
+            });
+            Ok(())
+        });
+        let reply = method_call_reply(SENDER, 12, SETTINGS_PATH, SETTINGS_IFACE, "Open", "", vec![]);
+        let call = IncomingCall::from_reply(&reply).unwrap();
+        let mut sink = RecordingSink::default();
+        call.serve(&dispatcher, &mut sink).unwrap();
+
+        let pending = queue.pop().expect("queued");
+        pending
+            .context
+            .reply(&mut sink, &[Value::U32(0)], "u")
+            .unwrap();
+
+        assert_eq!(
+            sink.returns,
+            vec![(SENDER.to_owned(), 12, vec![Value::U32(0)], "u".to_owned())]
+        );
     }
 
     #[test]

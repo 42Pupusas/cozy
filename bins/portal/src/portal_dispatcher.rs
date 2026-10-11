@@ -4,6 +4,8 @@ use std::sync::Arc;
 
 use dbus_server::Dispatcher;
 
+use crate::chooser_inbox::ChooserInbox;
+use crate::chooser_service::ChooserService;
 use crate::email_service::EmailService;
 use crate::mail_launcher::{AssociatedMailClient, MailLauncher};
 use crate::settings_service::SettingsService;
@@ -21,10 +23,27 @@ impl PortalDispatcher {
 
     #[must_use]
     pub fn build_with(state: SettingsState, mail: Arc<dyn MailLauncher>) -> Dispatcher {
+        Self::assemble(state, mail, &ChooserInbox::new())
+    }
+
+    #[must_use]
+    pub fn assemble(
+        state: SettingsState,
+        mail: Arc<dyn MailLauncher>,
+        chooser: &ChooserInbox,
+    ) -> Dispatcher {
         let mut dispatcher = Dispatcher::new();
-        dispatcher.register_object(Self::PATH, [SettingsService::IFACE, EmailService::IFACE]);
+        dispatcher.register_object(
+            Self::PATH,
+            [
+                SettingsService::IFACE,
+                EmailService::IFACE,
+                ChooserService::IFACE,
+            ],
+        );
         SettingsService::install(&mut dispatcher, state);
         EmailService::install(&mut dispatcher, mail);
+        ChooserService::install(&mut dispatcher, chooser);
         dispatcher
     }
 }
@@ -75,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn introspection_lists_both_interfaces() {
+    fn introspection_lists_every_interface() {
         let outcome = dispatcher()
             .dispatch(
                 PortalDispatcher::PATH,
@@ -90,5 +109,30 @@ mod tests {
         };
         assert!(xml.contains(SettingsService::IFACE));
         assert!(xml.contains(EmailService::IFACE));
+        assert!(xml.contains(ChooserService::IFACE));
+    }
+
+    #[test]
+    fn a_chooser_call_is_queued_on_the_shared_inbox() {
+        let inbox = ChooserInbox::new();
+        let state = SettingsState::new(&config::Config::default());
+        let dispatcher = PortalDispatcher::assemble(state, Arc::new(NoMailClient), &inbox);
+        let outcome = dispatcher
+            .dispatch_call(
+                &dbus_server::CallContext::new(PortalDispatcher::PATH, ":1.4", 3),
+                ChooserService::IFACE,
+                "OpenFile",
+                "osssa{sv}",
+                &[
+                    Value::ObjectPath("/org/freedesktop/portal/desktop/request/1_4/t".into()),
+                    Value::Str("app".into()),
+                    Value::Str(String::new()),
+                    Value::Str("Open".into()),
+                    Value::Array(vec![]),
+                ],
+            )
+            .expect("accepted");
+        assert_eq!(outcome, dbus_server::CallOutcome::Deferred);
+        assert!(inbox.pop_call().is_some());
     }
 }

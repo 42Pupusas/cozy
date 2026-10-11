@@ -49,6 +49,10 @@ fn main() {
         }
     }
 
+    if let Err(e) = portal_loop.watch_caller_exits() {
+        eprintln!("portal: cannot watch for callers exiting: {e}");
+    }
+
     eprintln!(
         "portal: serving {} on {}",
         SettingsService::IFACE,

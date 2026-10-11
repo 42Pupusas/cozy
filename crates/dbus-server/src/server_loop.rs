@@ -23,9 +23,20 @@
 //! guarantees that whatever *is* a method call gets a reply.
 
 use dbus::conn::{DbusConn, DbusError};
+use dbus::message::{MessageType, Reply};
 
 use crate::dispatcher::Dispatcher;
 use crate::serve::IncomingCall;
+
+/// What one received message turned out to be.
+pub enum Received {
+    /// A method call, now answered or deferred.
+    Served,
+    /// A signal, left for the caller to interpret.
+    Signal(Box<Reply>),
+    /// Anything else, ignored.
+    Skipped,
+}
 
 /// A [`DbusConn`] paired with the [`Dispatcher`] that answers calls
 /// arriving on it.
@@ -86,9 +97,18 @@ impl ServerLoop {
     /// became a wire `Error` reply to the caller that sent it, not a
     /// reason to stop serving everyone else.
     pub fn serve_one(&mut self) -> Result<bool, DbusError> {
+        Ok(matches!(self.serve_message()?, Received::Served))
+    }
+
+    /// Like [`Self::serve_one`], but hands a received signal back instead of
+    /// discarding it.
+    pub fn serve_message(&mut self) -> Result<Received, DbusError> {
         let message = self.conn.recv_message()?;
+        if message.kind == MessageType::Signal {
+            return Ok(Received::Signal(Box::new(message)));
+        }
         let Some(call) = IncomingCall::from_reply(&message) else {
-            return Ok(false);
+            return Ok(Received::Skipped);
         };
         // A failed *send* (e.g. the caller already disconnected) is a
         // transport-layer detail about that one caller, not a reason to
@@ -96,7 +116,7 @@ impl ServerLoop {
         // existing `let _ = conn.send_method_return(..)` pattern for the
         // same situation.
         let _ = call.serve(&self.dispatcher, &mut self.conn);
-        Ok(true)
+        Ok(Received::Served)
     }
 
     /// Serve forever, stopping only on a transport-level error (the

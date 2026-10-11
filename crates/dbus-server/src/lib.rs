@@ -48,4 +48,4 @@ pub use properties::{PropertiesChangedSignal, PropertyTable};
 pub use registry::ObjectRegistry;
 pub use router::{CallOutcome, DispatchError, DispatchOutcome, MethodCallRouter};
 pub use serve::{IncomingCall, ReplySink};
-pub use server_loop::ServerLoop;
+pub use server_loop::{Received, ServerLoop};

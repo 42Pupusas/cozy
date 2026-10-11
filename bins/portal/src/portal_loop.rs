@@ -1,33 +1,48 @@
 //! Serves the portal's `Dispatcher` while also watching the config file
-//! for saves, emitting `SettingChanged` for whatever actually changed.
+//! for saves, running file chooser dialogs, and noticing callers that leave
+//! the bus.
 //!
 //! `dbus_server::ServerLoop::run_forever` alone cannot do this: it blocks
-//! forever inside one blocking `io_uring` recv on the bus socket, with no
-//! way to also notice an inotify event arriving on a completely different
-//! fd. This is the thin, portal-specific event pump `docs/portal-scoping.md`
-//! step 5 was missing -- poll both fds with a plain `poll(2)` (via
-//! `waker::Poller`, the same primitive `bins/terminal`'s own event loop
-//! multiplexes fds with), and only then block on whichever source is
-//! actually ready.
+//! forever inside one blocking `io_uring` recv on the bus socket. This is
+//! the portal-specific event pump -- poll the bus socket, the config watch
+//! and every open dialog's wake fd with one `poll(2)` (`waker::PollSet`),
+//! and only then act on whichever source is ready.
 
+use std::sync::Arc;
+
+use dbus::NameOwnerChanged;
 use dbus::conn::{DbusConn, DbusError};
-use dbus_server::Dispatcher;
-use portal_core::SettingChangedSignal;
+use dbus_server::Received;
+use portal_core::{DialogFactory, SettingChangedSignal, UnavailableDialogs};
+use waker::{Interest, PollSet};
 
+use crate::chooser_engine::ChooserEngine;
+use crate::chooser_inbox::ChooserInbox;
 use crate::config_watcher::ConfigWatcher;
+use crate::mail_launcher::{AssociatedMailClient, MailLauncher};
 use crate::portal_dispatcher::PortalDispatcher;
 use crate::settings_service::SettingsService;
 use crate::settings_state::SettingsState;
 
+/// Which sources had work when the last wait ended.
+struct Readiness {
+    bus: bool,
+    config: bool,
+}
+
 /// Owns the live connection, the dispatcher answering it, the config
-/// watch, and the shared settings state the two other pieces both touch.
+/// watch, the shared settings state, and the open file chooser dialogs.
 pub struct PortalLoop {
     server: dbus_server::ServerLoop,
     watcher: ConfigWatcher,
     state: SettingsState,
+    chooser: ChooserEngine,
 }
 
 impl PortalLoop {
+    const NAME_OWNER_RULE: &'static str = "type='signal',sender='org.freedesktop.DBus',\
+         interface='org.freedesktop.DBus',member='NameOwnerChanged'";
+
     /// Build the loop: `conn` must already have claimed
     /// [`SettingsService::NAME`] (or whatever real name a `.portal` file
     /// names, once routed) before being handed here -- this type doesn't
@@ -46,11 +61,38 @@ impl PortalLoop {
     /// agree on one global `$XDG_CONFIG_HOME`.
     #[must_use]
     pub fn with_watcher(conn: DbusConn, state: SettingsState, watcher: ConfigWatcher) -> Self {
-        let dispatcher: Dispatcher = PortalDispatcher::build(state.clone());
+        Self::with_dialogs(conn, state, watcher, Box::new(UnavailableDialogs))
+    }
+
+    /// Same as [`Self::with_watcher`], with the factory that opens file
+    /// chooser dialogs.
+    #[must_use]
+    pub fn with_dialogs(
+        conn: DbusConn,
+        state: SettingsState,
+        watcher: ConfigWatcher,
+        dialogs: Box<dyn DialogFactory>,
+    ) -> Self {
+        Self::assemble(conn, state, watcher, dialogs, Arc::new(AssociatedMailClient))
+    }
+
+    /// Every collaborator explicit, for tests that substitute the mail
+    /// client as well.
+    #[must_use]
+    pub fn assemble(
+        conn: DbusConn,
+        state: SettingsState,
+        watcher: ConfigWatcher,
+        dialogs: Box<dyn DialogFactory>,
+        mail: Arc<dyn MailLauncher>,
+    ) -> Self {
+        let inbox = ChooserInbox::new();
+        let dispatcher = PortalDispatcher::assemble(state.clone(), mail, &inbox);
         Self {
             server: dbus_server::ServerLoop::new(conn, dispatcher),
             watcher,
             state,
+            chooser: ChooserEngine::new(inbox, dialogs),
         }
     }
 
@@ -62,9 +104,25 @@ impl PortalLoop {
         self.server.conn_mut()
     }
 
-    /// Serve forever: block on whichever of (bus socket, config watch)
-    /// becomes ready first, and react accordingly. Returns only on a
-    /// transport-level failure (the bus connection closing) -- the same
+    /// Subscribe to the bus's announcements of connections going away, so a
+    /// dialog is dismissed when the application that asked for it exits.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the bus refuses the match rule.
+    pub fn watch_caller_exits(&mut self) -> Result<(), DbusError> {
+        self.server.conn_mut().add_match(Self::NAME_OWNER_RULE)
+    }
+
+    /// How many file chooser dialogs are open.
+    #[must_use]
+    pub fn open_dialogs(&self) -> usize {
+        self.chooser.open_count()
+    }
+
+    /// Serve forever: block on whichever of (bus socket, config watch,
+    /// dialogs) becomes ready first, and react accordingly. Returns only on
+    /// a transport-level failure (the bus connection closing) -- the same
     /// contract `dbus_server::ServerLoop::run_forever` has.
     pub fn run_forever(&mut self) -> DbusError {
         loop {
@@ -87,32 +145,62 @@ impl PortalLoop {
         Ok(())
     }
 
-    /// One iteration: wait for either fd, then drain whichever (or both)
-    /// fired. Kept separate from `run_forever` so a test can call it a
-    /// bounded number of times instead of looping forever.
+    /// One iteration: wait for any source, then drain whichever fired.
     fn pump_once(&mut self) -> Result<(), DbusError> {
-        let bus_fd = self.server.conn_mut().raw_fd();
-        match self.watcher.raw_fd() {
-            Some(config_fd) => {
-                let (bus_ready, config_ready) = waker::Poller::two(bus_fd, config_fd).poll_two(-1);
-                if config_ready {
-                    self.apply_pending_reload();
-                }
-                if bus_ready {
-                    self.server.serve_one()?;
-                }
-                // Neither ready is impossible with an infinite poll
-                // timeout short of a spurious wakeup; nothing to do in
-                // that case either way.
-            }
-            // No config watch available (see `ConfigWatcher::new`'s
-            // best-effort fallback) -- degrade to exactly
-            // `ServerLoop::run_forever`'s single-fd behavior.
-            None => {
-                self.server.serve_one()?;
-            }
+        self.serve_queued_messages()?;
+        let ready = self.wait_for_work();
+        if ready.config {
+            self.apply_pending_reload();
+        }
+        if ready.bus {
+            self.serve_bus_message()?;
+        }
+        self.run_dialogs();
+        Ok(())
+    }
+
+    /// Messages a nested `call` read ahead are no longer readable on the
+    /// socket, so they are served before waiting rather than counted as an
+    /// iteration of their own.
+    fn serve_queued_messages(&mut self) -> Result<(), DbusError> {
+        while self.server.conn_mut().has_pending() {
+            self.serve_bus_message()?;
         }
         Ok(())
+    }
+
+    fn wait_for_work(&mut self) -> Readiness {
+        let mut set = PollSet::new();
+        let bus_index = set.watch(self.server.conn_mut().raw_fd(), Interest::Readable);
+        let config_index = self
+            .watcher
+            .raw_fd()
+            .map(|fd| set.watch(fd, Interest::Readable));
+        for fd in self.chooser.wake_fds() {
+            set.watch(fd, Interest::Readable);
+        }
+        let _ = set.wait(-1);
+        Readiness {
+            bus: set.is_ready(bus_index),
+            config: config_index.is_some_and(|index| set.is_ready(index)),
+        }
+    }
+
+    fn serve_bus_message(&mut self) -> Result<(), DbusError> {
+        if let Received::Signal(signal) = self.server.serve_message()?
+            && signal.member.as_deref() == Some("NameOwnerChanged")
+            && let Some(changed) = NameOwnerChanged::from_body(&signal.values())
+            && let Some(owner) = changed.lost_owner()
+        {
+            let (_, dispatcher) = self.server.parts_mut();
+            self.chooser.owner_lost(owner, dispatcher);
+        }
+        Ok(())
+    }
+
+    fn run_dialogs(&mut self) {
+        let (conn, dispatcher) = self.server.parts_mut();
+        self.chooser.pump(conn, dispatcher);
     }
 
     /// If the config file was touched, reload it into `state` and emit
@@ -152,13 +240,8 @@ mod tests {
     use super::*;
     use dbus::value::Value;
 
-    /// `pump_once`'s bus-only branch (`ConfigWatcher::raw_fd() == None`,
-    /// the state this test forces by never creating the temp config
-    /// directory a real watch needs) must behave exactly like
-    /// `ServerLoop::serve_one` -- no different from before this loop
-    /// existed. Exercised indirectly here since constructing a real,
-    /// connected `PortalLoop` needs a live session bus (covered by
-    /// `tests/real_bus_probe.rs`); this test instead proves
+    /// Constructing a real, connected `PortalLoop` needs a live session bus
+    /// (covered by `tests/real_bus_probe.rs`); this test instead proves
     /// `apply_pending_reload`'s pure decision logic in isolation via
     /// `SettingsState`, which every environment can run without a bus.
     #[test]

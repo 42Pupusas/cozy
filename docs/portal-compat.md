@@ -54,6 +54,42 @@ file.
 `OpenURI` is a frontend interface with no backend. `crates/opener` already
 implements the launch side.
 
+## Frontend interfaces exposed on the bus
+
+From `busctl --user introspect org.freedesktop.portal.Desktop`, paired by the
+rule that a `.version` line belongs to the interface line above it.
+
+| Interface | Version | Needs a backend |
+| --- | --- | --- |
+| `Account` | 1 | yes, gtk |
+| `Camera` | 1 | no |
+| `DynamicLauncher` | 1 | yes, gtk |
+| `Email` | 4 | yes, gtk |
+| `FileChooser` | 4 | yes, gtk |
+| `GameMode` | 4 | no |
+| `Inhibit` | 3 | yes, gtk |
+| `Location` | 1 | no |
+| `MemoryMonitor` | 1 | no |
+| `NetworkMonitor` | 3 | no |
+| `Notification` | 1 | yes, gtk |
+| `OpenURI` | 5 | no |
+| `PowerProfileMonitor` | 1 | no |
+| `Print` | 4 | yes, gtk |
+| `ProxyResolver` | 1 | no |
+| `Realtime` | 1 | no |
+| `Settings` | 2 | yes, gtk and cozy |
+| `Trash` | 1 | no |
+
+One more `.version` line (value 1) came before `Account`. Its interface line
+does not start with `org.freedesktop.portal`, so the filter dropped it. It
+is probably `org.freedesktop.host.portal.Registry`, which is unconfirmed.
+
+These frontend interfaces are absent from the output: `Screenshot`,
+`ScreenCast`, `Wallpaper`, `Background`, `Secret`, `Clipboard`,
+`InputCapture`, `RemoteDesktop`, `GlobalShortcuts`, `Usb`. The `Screenshot`
+and `ScreenCast` absence agrees with the missing `wlr` backend. The reason
+for the others was not checked.
+
 ## Settings detail
 
 | Item | Value | Source |
@@ -74,12 +110,6 @@ implements the launch side.
 ## Unmeasured
 
 Run these and record the results in the tables above.
-
-Frontend interface versions:
-
-```
-busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop | grep -e '^org.freedesktop.portal' -e version
-```
 
 Applications that actually call a portal while in daily use:
 

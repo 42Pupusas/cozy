@@ -292,9 +292,9 @@ Owns documentation and the portal's data files. Writes no logic.
     followed cozy's config to `2` while gtk reported `1`.
 18. **The compatibility matrix.** Started in `docs/portal-compat.md`. The
     environment, routing, per-interface provider and Settings rows are
-    measured. Still open: the frontend interface versions and the real
-    caller of each interface, which need the `busctl` commands listed at the
-    end of that file. `Screenshot=wlr` and `ScreenCast=wlr` in `portals.conf`
+    measured, and so are the frontend interface versions. Still open: the real
+    caller of each interface, which needs the `busctl monitor` run listed at
+    the end of that file. `Screenshot=wlr` and `ScreenCast=wlr` in `portals.conf`
     name a backend that is not installed.
 19. **Route each new interface**, one at a time, as its track finishes.
 

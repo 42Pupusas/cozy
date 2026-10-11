@@ -288,12 +288,14 @@ Owns documentation and the portal's data files. Writes no logic.
     gtk's own answer. The frontend merges the Settings backends instead of
     choosing one. `ReadAll` returns gtk's namespaces plus cozy's
     `accent-color` and `reduced-motion`. gtk still supplies every
-    `org.gnome.*` namespace. Which backend wins for a key both report is
-    not yet tested.
-18. **The compatibility matrix.** Record, per interface: the advertised
-    version, the real caller that exercises it, the options it accepts, and
-    the fallback backend. `docs/portal-scoping.md` step 1 asked for this, and
-    it does not exist.
+    `org.gnome.*` namespace. cozy wins for a key both report: `color-scheme`
+    followed cozy's config to `2` while gtk reported `1`.
+18. **The compatibility matrix.** Started in `docs/portal-compat.md`. The
+    environment, routing, per-interface provider and Settings rows are
+    measured. Still open: the frontend interface versions and the real
+    caller of each interface, which need the `busctl` commands listed at the
+    end of that file. `Screenshot=wlr` and `ScreenCast=wlr` in `portals.conf`
+    name a backend that is not installed.
 19. **Route each new interface**, one at a time, as its track finishes.
 
 ### Track 7 — terminal

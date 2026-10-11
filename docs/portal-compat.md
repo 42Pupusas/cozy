@@ -1,0 +1,96 @@
+# Portal compatibility matrix
+
+Step 18 of `PLAN.md`. Status values: `measured` came from this machine,
+`spec` came from the installed interface XML, `unmeasured` still needs the
+commands in the last section.
+
+## Environment
+
+| Fact | Value | Source |
+| --- | --- | --- |
+| Compositor | niri (`XDG_CURRENT_DESKTOP=niri`) | measured |
+| Bus daemon | dbus-broker; a reload is needed after creating a new service directory | measured |
+| Flatpak | not installed (`/usr/bin/flatpak` absent) | measured |
+| Installed backend descriptors | `gtk.portal` only, `UseIn=gnome` | measured |
+| `xdg-desktop-portal-wlr` | not installed | measured |
+| `xdg-desktop-portal-gnome` | no descriptor installed | measured |
+| Distro routing file | `/usr/share/xdg-desktop-portal/niri-portals.conf`: `default=gnome;gtk;`, Access and Notification to gtk, Secret to gnome-keyring | measured |
+
+## Current routing
+
+`~/.config/xdg-desktop-portal/portals.conf`:
+
+```
+[preferred]
+default=gtk
+org.freedesktop.impl.portal.Settings=cozy
+org.freedesktop.impl.portal.Screenshot=wlr
+org.freedesktop.impl.portal.ScreenCast=wlr
+```
+
+`Screenshot=wlr` and `ScreenCast=wlr` name a backend that has no installed
+descriptor, so those two interfaces have no working provider through this
+file.
+
+## Backend interfaces
+
+| Interface | Provider today | cozy status | Fallback | Version cozy reports |
+| --- | --- | --- | --- | --- |
+| `Settings` | cozy, merged with gtk | routed | remove the `Settings=cozy` line | 2 |
+| `FileChooser` | gtk | not started | gtk | none |
+| `AppChooser` | gtk | not started | gtk | none |
+| `Access` | gtk | not started | gtk | none |
+| `Account` | gtk | not started | gtk | none |
+| `Email` | gtk | not started | gtk | none |
+| `Inhibit` | gtk | not started | gtk | none |
+| `Print` | gtk | not started | gtk | none |
+| `Notification` | gtk | not started | gtk | none |
+| `Lockdown` | gtk | not started | gtk | none |
+| `DynamicLauncher` | gtk | not started | gtk | none |
+| `Screenshot` | none installed | not started | none | none |
+| `ScreenCast` | none installed | not started | none | none |
+| `Secret` | gnome-keyring per distro file, overridden by `default=gtk` | not started | unmeasured | none |
+
+`OpenURI` is a frontend interface with no backend. `crates/opener` already
+implements the launch side.
+
+## Settings detail
+
+| Item | Value | Source |
+| --- | --- | --- |
+| Methods | `Read`, `ReadAll` | spec |
+| Signal | `SettingChanged` | spec |
+| Property | `version` (`u`) | spec |
+| Namespace served by cozy | `org.freedesktop.appearance` | measured |
+| Keys served by cozy | `color-scheme`, `accent-color`, `contrast`, `reduced-motion` | measured |
+| Namespaces served by gtk only | every `org.gnome.*` | measured |
+| Frontend behaviour | merges all Settings backends | measured |
+| Precedence on a shared key | cozy wins (`color-scheme` followed cozy to `2` while gtk reported `1`) | measured |
+| Live reload | config change reaches the frontend within about 1 second | measured |
+| Rollback | delete the route line, restart `xdg-desktop-portal.service`; gtk's 2-key answer returns | measured |
+| Real caller | `busctl` only; no GTK or Qt application has been checked | measured |
+| Options | none; `Read` and `ReadAll` take no option dictionary | spec |
+
+## Unmeasured
+
+Run these and record the results in the tables above.
+
+Frontend interface versions:
+
+```
+busctl --user introspect org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop | grep -e '^org.freedesktop.portal' -e version
+```
+
+Applications that actually call a portal while in daily use:
+
+```
+busctl --user monitor org.freedesktop.portal.Desktop --json=short
+```
+
+Leave the monitor running during normal use, then list the distinct
+interface and method names with their sender. Each interface that shows up
+needs a row with its real caller.
+
+Whether a toolkit reads cozy's values: start a GTK4 application, change
+`[colors].background` in the terminal config, and check that the application
+follows `color-scheme`.

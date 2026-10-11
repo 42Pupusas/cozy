@@ -70,6 +70,16 @@ impl ChooserModel {
         ChooserStep::redraw_if(self.nav.poll_listing())
     }
 
+    #[must_use]
+    pub const fn translate(&self, press: KeyPress) -> Option<ChooserAction> {
+        ChooserKeys::translate(self.filtering, press)
+    }
+
+    pub fn go_up(&mut self) -> ChooserStep {
+        let reaction = self.nav.go_up();
+        self.step_of(&reaction)
+    }
+
     pub fn key(&mut self, press: KeyPress) -> ChooserStep {
         ChooserKeys::translate(self.filtering, press)
             .map_or(ChooserStep::Ignored, |action| self.act(action))
@@ -98,6 +108,9 @@ impl ChooserModel {
     }
 
     pub fn activate_entry(&mut self, row: usize) -> ChooserStep {
+        if self.mode.wants_directories() && !self.is_folder(row) {
+            return ChooserStep::Ignored;
+        }
         let reaction = self.nav.activate_entry(row);
         self.step_of(&reaction)
     }
@@ -124,12 +137,22 @@ impl ChooserModel {
         }
     }
 
-    pub fn accept(&mut self) -> ChooserStep {
-        let paths = if self.mode.wants_directories() {
-            self.accepted_directories()
+    #[must_use]
+    pub fn can_accept(&self) -> bool {
+        !self.accepted_paths().is_empty()
+    }
+
+    #[must_use]
+    pub const fn accept_label(&self) -> &'static str {
+        if self.mode.wants_directories() {
+            "Select"
         } else {
-            self.accepted_files()
-        };
+            "Open"
+        }
+    }
+
+    pub fn accept(&mut self) -> ChooserStep {
+        let paths = self.accepted_paths();
         if paths.is_empty() {
             return ChooserStep::Ignored;
         }
@@ -137,6 +160,14 @@ impl ChooserModel {
             paths,
             ..Selection::default()
         })
+    }
+
+    fn accepted_paths(&self) -> Vec<PathBuf> {
+        if self.mode.wants_directories() {
+            self.accepted_directories()
+        } else {
+            self.accepted_files()
+        }
     }
 
     fn browse(&mut self, action: BrowseAction) -> ChooserStep {
@@ -468,6 +499,34 @@ mod tests {
     }
 
     #[test]
+    fn directory_mode_will_not_activate_a_file() {
+        let setup = Setup::new("dir_no_activate");
+        let mut model = setup.folders(false);
+        let step = model.activate_entry(Setup::row(&model, "alpha.txt"));
+        assert_eq!(step, ChooserStep::Ignored);
+        assert!(model.navigator().pane().selection().selected().is_empty());
+    }
+
+    #[test]
+    fn accepting_is_possible_exactly_when_something_would_be_returned() {
+        let setup = Setup::new("can_accept");
+        let mut files = setup.files(false);
+        assert!(!files.can_accept());
+        files.pick(Setup::row(&files, "alpha.txt"), Mods::none());
+        assert!(files.can_accept());
+        files.pick(Setup::row(&files, "sub"), Mods::none());
+        assert!(!files.can_accept());
+        assert!(setup.folders(false).can_accept());
+    }
+
+    #[test]
+    fn the_accept_label_names_what_is_being_chosen() {
+        let setup = Setup::new("accept_label");
+        assert_eq!(setup.files(false).accept_label(), "Open");
+        assert_eq!(setup.folders(false).accept_label(), "Select");
+    }
+
+    #[test]
     fn directory_mode_will_not_select_a_file() {
         let setup = Setup::new("dir_no_file");
         let mut model = setup.folders(false);
@@ -582,6 +641,26 @@ mod tests {
         model.activate_entry(Setup::row(&model, "sub"));
         assert_eq!(model.key(Setup::press(Key::Backspace)), ChooserStep::Moved);
         assert_eq!(model.navigator().path(), setup.dir.path());
+    }
+
+    #[test]
+    fn going_up_leaves_the_folder_and_reports_a_move() {
+        let setup = Setup::new("go_up");
+        let mut model = setup.files(false);
+        model.activate_entry(Setup::row(&model, "sub"));
+        assert_eq!(model.go_up(), ChooserStep::Moved);
+        assert_eq!(model.navigator().path(), setup.dir.path());
+    }
+
+    #[test]
+    fn translate_reports_the_action_a_key_means_without_acting() {
+        let setup = Setup::new("translate");
+        let model = setup.files(false);
+        assert_eq!(
+            model.translate(Setup::press(Key::Escape)),
+            Some(ChooserAction::Cancel)
+        );
+        assert_eq!(model.navigator().len(), 4);
     }
 
     #[test]

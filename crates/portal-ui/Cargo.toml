@@ -8,8 +8,10 @@ workspace = true
 
 [dependencies]
 browse      = { path = "../browse" }
+config      = { path = "../config" }
 fsmodel     = { path = "../fsmodel" }
 platform    = { path = "../platform" }
 portal-core = { path = "../portal-core" }
+tiles       = { path = "../tiles" }
 waker       = { path = "../waker" }
 widget      = { path = "../widget" }

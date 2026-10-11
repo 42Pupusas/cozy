@@ -11,6 +11,9 @@ impl ChooserKeys {
         if press.modifiers.ctrl() && matches!(press.key, Key::Enter) {
             return Some(ChooserAction::Accept);
         }
+        if press.repeat && matches!(press.key, Key::Escape) {
+            return None;
+        }
         if filtering {
             return Self::browse(BrowseKeys::filter(press));
         }
@@ -43,6 +46,13 @@ mod tests {
             Self::with(key, 0)
         }
 
+        fn repeating(key: Key) -> KeyPress {
+            KeyPress {
+                repeat: true,
+                ..Self::of(key)
+            }
+        }
+
         fn with(key: Key, mask: u32) -> KeyPress {
             KeyPress {
                 key,
@@ -69,6 +79,18 @@ mod tests {
         assert_eq!(
             ChooserKeys::translate(false, Press::of(Key::Escape)),
             Some(ChooserAction::Cancel)
+        );
+    }
+
+    #[test]
+    fn a_held_escape_does_not_cancel_twice() {
+        assert_eq!(
+            ChooserKeys::translate(false, Press::repeating(Key::Escape)),
+            None
+        );
+        assert_eq!(
+            ChooserKeys::translate(true, Press::repeating(Key::Escape)),
+            None
         );
     }
 

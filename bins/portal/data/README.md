@@ -31,18 +31,20 @@ should do silently.
 ## Routing it
 
 Neither file above makes `xdg-desktop-portal` actually *use* this backend
-for `Settings` -- by itself it just becomes one more installed, inactive
-option. Add (or extend) a `portals.conf`:
+for `Settings` or `Email` -- by itself it just becomes one more installed,
+inactive option. Add (or extend) a `portals.conf`:
 
 ```ini
 # ~/.config/xdg-desktop-portal/portals.conf
 [preferred]
 org.freedesktop.impl.portal.Settings=cozy
+org.freedesktop.impl.portal.Email=cozy
 ```
 
 This leaves every other interface (`FileChooser`, `Notification`, ...)
-routed exactly as before -- only `Settings` moves to `cozy`. Reverting
-is deleting that one line and restarting `xdg-desktop-portal.service`
+routed exactly as before -- only `Settings` and `Email` move to `cozy`.
+`Email` opens the `x-scheme-handler/mailto` application as a `mailto:` URL.
+Reverting is deleting a line and restarting `xdg-desktop-portal.service`
 (`systemctl --user restart xdg-desktop-portal.service`), no code changes
 or reinstall required, per the doc's own rollback contract.
 

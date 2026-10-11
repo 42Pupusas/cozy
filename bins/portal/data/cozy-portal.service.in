@@ -1,5 +1,5 @@
 [Unit]
-Description=cozy native portal backend (org.freedesktop.impl.portal.Settings)
+Description=cozy native portal backend (Settings, Email)
 PartOf=graphical-session.target
 After=graphical-session.target
 

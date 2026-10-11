@@ -41,7 +41,7 @@ file.
 | `AppChooser` | gtk | not started | gtk | none |
 | `Access` | gtk | not started | gtk | none |
 | `Account` | gtk | not started | gtk | none |
-| `Email` | gtk | not started | gtk | none |
+| `Email` | cozy (routed in `portals.conf`) | implemented, unmeasured against a real caller | remove the `Email=cozy` line | none |
 | `Inhibit` | gtk | not started | gtk | none |
 | `Print` | gtk | not started | gtk | none |
 | `Notification` | gtk | not started | gtk | none |
@@ -63,7 +63,7 @@ Everything else stays with gtk or with the frontend.
 | Need | Interface | State |
 | --- | --- | --- |
 | Open browser, open programs | `OpenURI` | works through the frontend; opening `https://example.com` launched the browser and the user confirmed it works. A command-line call carries no activation token, so only app-initiated calls can move focus. |
-| Email | `Email` | gtk; cozy backend not started |
+| Email | `Email` | cozy backend implemented: `ComposeEmail` builds a `mailto:` URL and opens it through `crates/opener`; response 0 on launch, 2 when no handler or the spawn fails. Unit tests and a real-bus test pass. Not yet confirmed with Thunderbird through the frontend. |
 | Find files | `FileChooser` | gtk; cozy backend not started |
 | Screen sharing | `ScreenCast` | no provider installed; `xdg-desktop-portal-gnome` and `xdg-desktop-portal-wlr` are both absent |
 
@@ -119,6 +119,26 @@ for the others was not checked.
 | Rollback | delete the route line, restart `xdg-desktop-portal.service`; gtk's 2-key answer returns | measured |
 | Real caller | `busctl` only; no GTK or Qt application has been checked | measured |
 | Options | none; `Read` and `ReadAll` take no option dictionary | spec |
+
+## Email detail
+
+| Item | Value | Source |
+| --- | --- | --- |
+| Method | `ComposeEmail(o, s, s, a{sv}) -> (u, a{sv})` | spec |
+| Option keys read | `address`, `addresses`, `cc`, `bcc`, `subject`, `body`, `attachments`, `activation_token` | spec |
+| Recipient order | `address` first, then `addresses` | gtk `email.c` |
+| Escaping | `subject`, `body` and each attachment percent-encoded; addresses keep `@` and `+` | cozy choice |
+| Empty `subject`/`body` | left out of the URL (gtk always emits them) | cozy choice |
+| Handler | `x-scheme-handler/mailto` from `mimeapps.list`, currently Thunderbird | measured |
+| Results | always an empty `a{sv}` | gtk `email.c` |
+| Rollback | delete the `Email=cozy` line, restart `xdg-desktop-portal.service` | measured |
+| Real caller | none yet | unmeasured |
+
+Verify with:
+
+```
+gdbus call --session --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop --method org.freedesktop.portal.Email.ComposeEmail "" "{'address': <'you@example.com'>, 'subject': <'test'>}"
+```
 
 ## Unmeasured
 

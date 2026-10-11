@@ -4,7 +4,7 @@
 //! emits, so an existing `fuzzel`/`dmenu` pipeline keeps working unchanged.
 //! The id is what `restore` takes, and a picker only has to split on the tab.
 
-use clipboard::HistoryEntry;
+use clipboard::IndexEntry;
 
 /// Longest preview text; beyond this a picker just truncates anyway.
 const MAX_PREVIEW: usize = 100;
@@ -15,29 +15,27 @@ pub struct EntryPreview;
 impl EntryPreview {
     /// `id<TAB>preview` for one entry.
     #[must_use]
-    pub fn line(entry: &HistoryEntry) -> String {
+    pub fn line(entry: &IndexEntry) -> String {
         format!("{}\t{}", entry.id(), Self::describe(entry))
     }
 
     /// A human summary of what the entry holds.
     #[must_use]
-    pub fn describe(entry: &HistoryEntry) -> String {
-        let payload = entry.payload();
+    pub fn describe(entry: &IndexEntry) -> String {
+        let summary = entry.summary();
         // Binary representations get a description rather than mojibake: a
         // picker rendering raw PNG bytes would fill the menu with garbage and
         // could even break the terminal it runs in.
-        if let Some(png) = payload.requested("image/png") {
-            return format!("[image/png {}]", Self::human_size(png.len()));
+        if let Some(len) = summary.size_of("image/png") {
+            return format!("[image/png {}]", Self::human_size(len));
         }
-        for mime in ["text/plain;charset=utf-8", "text/plain", "text/uri-list"] {
-            if let Some(bytes) = payload.requested(mime) {
-                return Self::summarise(bytes);
-            }
+        if let Some(head) = summary.text_head() {
+            return Self::summarise(head);
         }
-        payload
-            .mimes()
-            .next()
-            .map_or_else(|| "[empty]".to_string(), |mime| format!("[{mime}]"))
+        summary.mimes().first().map_or_else(
+            || "[empty]".to_string(),
+            |mime| format!("[{}]", mime.mime()),
+        )
     }
 
     /// Collapse text to one printable line.
@@ -69,9 +67,9 @@ impl EntryPreview {
     /// `usize` to `f64` is a documented precision loss the workspace lints
     /// against -- and there is no reason to introduce rounding into a string
     /// that is only ever read by a human.
-    fn human_size(bytes: usize) -> String {
-        const KIB: usize = 1024;
-        const MIB: usize = 1024 * KIB;
+    fn human_size(bytes: u64) -> String {
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * KIB;
         if bytes >= MIB {
             return Self::tenths(bytes, MIB, "MiB");
         }
@@ -82,7 +80,7 @@ impl EntryPreview {
     }
 
     /// `bytes / unit` to one decimal place, e.g. `2.0 KiB`.
-    fn tenths(bytes: usize, unit: usize, suffix: &str) -> String {
+    fn tenths(bytes: u64, unit: u64, suffix: &str) -> String {
         let whole = bytes / unit;
         // Scale before dividing so the first decimal digit survives integer
         // truncation.
@@ -94,15 +92,15 @@ impl EntryPreview {
 #[cfg(test)]
 mod tests {
     use super::EntryPreview;
-    use clipboard::{ClipboardOffer, ClipboardPayload, HistoryEntry};
+    use clipboard::{ClipboardOffer, ClipboardPayload, EntrySummary, IndexEntry, PayloadDigest};
 
     struct PreviewFixture;
 
     impl PreviewFixture {
-        fn entry(mime: &str, bytes: Vec<u8>) -> HistoryEntry {
+        fn entry(mime: &str, bytes: Vec<u8>) -> IndexEntry {
             let mut payload = ClipboardPayload::new();
             payload.offer(ClipboardOffer::new(mime, bytes));
-            HistoryEntry::new(7, payload)
+            IndexEntry::new(7, PayloadDigest::of(&payload), EntrySummary::of(&payload))
         }
     }
 

@@ -5,17 +5,29 @@
 //! and exact request lookup. The Wayland owner can remain a thin adapter while
 //! these rules stay headlessly testable.
 
-mod history;
+mod blob_store;
+mod byte_codec;
+mod entry_index;
+mod entry_summary;
+mod history_store;
 mod incoming;
+mod index_codec;
+mod legacy_history;
 mod offer_registry;
+mod payload_codec;
+mod payload_digest;
 mod pending_sends;
-mod storage;
+mod store_error;
 
-pub use history::{ClipboardHistory, HistoryEntry};
+pub use blob_store::BlobStore;
+pub use entry_index::{Admission, EntryIndex, IndexEntry};
+pub use entry_summary::{EntrySummary, MimeSize};
+pub use history_store::HistoryStore;
 pub use incoming::{IncomingClipboard, IncomingState};
 pub use offer_registry::OfferRegistry;
+pub use payload_digest::PayloadDigest;
 pub use pending_sends::PendingSends;
-pub use storage::{HistoryStore, HistoryStoreError};
+pub use store_error::HistoryStoreError;
 
 /// A byte payload advertised under one MIME type.
 #[derive(Clone, Debug, PartialEq, Eq)]

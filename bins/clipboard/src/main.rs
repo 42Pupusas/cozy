@@ -133,8 +133,12 @@ impl ClipboardApp {
     /// Every recorded selection is persisted immediately rather than on exit:
     /// a daemon is killed by logout or a crash far more often than it exits
     /// cleanly, and history lost that way is history the user thought they had.
+    /// Payload bytes go straight to disk; only the index stays in memory.
     fn watch(&mut self, store: &HistoryStore, capacity: usize) -> std::result::Result<(), String> {
-        let mut history = store.load(capacity).map_err(|e| e.to_string())?;
+        let mut index = store.load(capacity).map_err(|e| e.to_string())?;
+        if let Err(error) = store.sweep(&index) {
+            eprintln!("clipboard: could not remove stale entries: {error}");
+        }
         let mut watcher = SelectionWatcher::bind(
             &mut self.sender,
             self.globals.data_control,
@@ -156,14 +160,12 @@ impl ClipboardApp {
                 // nothing left to watch.
                 return Ok(());
             }
-            let mut dirty = false;
             for payload in captured {
-                dirty |= history.push(payload).is_some();
-            }
-            if dirty && let Err(error) = store.save(&history) {
-                // A failed save must not kill the daemon: the clipboard still
-                // works, and the next copy may well succeed.
-                eprintln!("clipboard: could not save history: {error}");
+                if let Err(error) = store.record(&mut index, &payload) {
+                    // A failed save must not kill the daemon: the clipboard
+                    // still works, and the next copy may well succeed.
+                    eprintln!("clipboard: could not save history: {error}");
+                }
             }
         }
     }
@@ -190,8 +192,8 @@ struct HistoryCommands;
 
 impl HistoryCommands {
     fn list(store: &HistoryStore, capacity: usize) -> std::result::Result<(), String> {
-        let history = store.load(capacity).map_err(|e| e.to_string())?;
-        for entry in history.entries() {
+        let index = store.load(capacity).map_err(|e| e.to_string())?;
+        for entry in index.entries() {
             println!("{}", EntryPreview::line(entry));
         }
         Ok(())
@@ -199,10 +201,7 @@ impl HistoryCommands {
 
     fn decode(store: &HistoryStore, capacity: usize, id: u64) -> std::result::Result<(), String> {
         use std::io::Write as _;
-        let history = store.load(capacity).map_err(|e| e.to_string())?;
-        let entry = history
-            .get(id)
-            .ok_or_else(|| format!("no history entry with id {id}"))?;
+        let payload = Self::payload(store, capacity, id)?;
         // Richest representation first, matching what a paste would receive.
         let bytes = [
             "image/png",
@@ -211,7 +210,7 @@ impl HistoryCommands {
             "text/plain",
         ]
         .into_iter()
-        .find_map(|mime| entry.payload().requested(mime))
+        .find_map(|mime| payload.requested(mime))
         .ok_or_else(|| format!("entry {id} has no decodable representation"))?;
         std::io::stdout()
             .write_all(bytes)
@@ -219,11 +218,21 @@ impl HistoryCommands {
     }
 
     fn clear(store: &HistoryStore) -> std::result::Result<(), String> {
-        match std::fs::remove_file(store.path()) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("could not clear history: {error}")),
-        }
+        store
+            .clear()
+            .map_err(|error| format!("could not clear history: {error}"))
+    }
+
+    fn payload(
+        store: &HistoryStore,
+        capacity: usize,
+        id: u64,
+    ) -> std::result::Result<ClipboardPayload, String> {
+        let index = store.load(capacity).map_err(|e| e.to_string())?;
+        let entry = index
+            .get(id)
+            .ok_or_else(|| format!("no history entry with id {id}"))?;
+        store.payload(entry).map_err(|e| e.to_string())
     }
 }
 
@@ -262,12 +271,7 @@ impl Application {
                 ClipboardApp::connect(&wake)?.watch(&store, options.capacity)
             }
             Command::Restore(id) => {
-                let history = store.load(options.capacity).map_err(|e| e.to_string())?;
-                let payload = history
-                    .get(id)
-                    .ok_or_else(|| format!("no history entry with id {id}"))?
-                    .payload()
-                    .clone();
+                let payload = HistoryCommands::payload(&store, options.capacity, id)?;
                 let wake = waker::Waker::new().map_err(|e| e.to_string())?;
                 ClipboardApp::connect(&wake)?.restore(&payload)
             }

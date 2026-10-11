@@ -6,7 +6,7 @@
 //! fsmodel::DirectoryView   read / filter / sort   (no UI at all)
 //! widget::ListPane         cursor / select        (no platform at all)
 //! browser::Browser         the state machine      (no pixels at all)
-//! tile_field::TileField    rank / spiral layout   (no pixels at all)
+//! tiles::tile_field::TileField  rank / spiral layout (no pixels at all)
 //! window::FilesWindow      paint + route input    (the only Wayland part)
 //! ```
 //!
@@ -22,9 +22,7 @@ mod browser;
 mod card_surface;
 mod clipboard;
 mod density;
-mod dir_sizes;
 mod drag_badge;
-mod fade;
 mod favorites;
 mod file_launcher;
 mod frame;
@@ -49,20 +47,13 @@ mod secret_input;
 #[allow(dead_code)]
 mod sidebar;
 mod spacing;
-mod spiral;
-mod spiral_cursor;
 mod storage;
 mod test_support;
 mod theme;
 mod tile_action;
-mod tile_coloring;
-mod tile_field;
 mod tile_geometry;
-mod tile_growth;
-mod tile_id;
 mod tile_motion;
 mod tile_painter;
-mod tile_rank;
 mod toolbar;
 mod typography;
 mod window;

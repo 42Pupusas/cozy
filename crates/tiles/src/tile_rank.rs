@@ -24,6 +24,11 @@ impl TileRank {
         self.order.len()
     }
 
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.order.is_empty()
+    }
+
     /// The `capacity` entries starting at rank `from`.
     #[must_use]
     pub fn window(&self, from: usize, capacity: usize) -> &[usize] {

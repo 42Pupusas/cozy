@@ -21,6 +21,7 @@ pub struct Fade {
 }
 
 impl Fade {
+    #[must_use]
     pub const fn rising() -> Self {
         Self {
             progress: 0.0,
@@ -28,6 +29,7 @@ impl Fade {
         }
     }
 
+    #[must_use]
     pub const fn full() -> Self {
         Self {
             progress: 1.0,
@@ -48,14 +50,17 @@ impl Fade {
         };
     }
 
+    #[must_use]
     pub fn is_settled(self) -> bool {
         (self.progress - self.target).abs() < f32::EPSILON
     }
 
+    #[must_use]
     pub fn is_gone(self) -> bool {
         self.progress <= 0.0 && self.target <= 0.0
     }
 
+    #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn level(self) -> u8 {
         let t = self.progress.clamp(0.0, 1.0);
@@ -63,6 +68,7 @@ impl Fade {
         (eased * 255.0).round() as u8
     }
 
+    #[must_use]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn braking_level(self) -> u8 {
         let left = 1.0 - self.progress.clamp(0.0, 1.0);

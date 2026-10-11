@@ -2,7 +2,7 @@
 //! rises, its action buttons appear, the button under the pointer grows and
 //! lights, and a button held down takes the press colour.
 
-use crate::fade::Fades;
+use tiles::fade::Fades;
 use crate::hover::{Pane, Spot};
 use crate::tile_action::TileAction;
 

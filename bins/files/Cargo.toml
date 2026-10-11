@@ -46,6 +46,9 @@ fileops  = { path = "../../crates/fileops" }
 # Navigation history and the directory watcher, shared with the portal's
 # file chooser so both browse the same way.
 browse   = { path = "../../crates/browse" }
+# The spiral tile layout, ranking, growth animation and folder sizes, shared
+# with the portal's file chooser so both draw a folder the same way.
+tiles    = { path = "../../crates/tiles" }
 # Removable storage for the sidebar's "Devices" section: which USB sticks and
 # cards are attached, read from the kernel's own tables rather than from a
 # UDisks2 daemon that is not installed on every machine.

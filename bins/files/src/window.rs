@@ -25,8 +25,8 @@ use crate::pinned_card::PinnedCard;
 use crate::row_format::RowFormat;
 use crate::row_kind::RowKind;
 use crate::sidebar::{Sidebar, SidebarRow};
-use crate::spiral::MinCell;
-use crate::spiral_cursor::{Landing, SpiralCursor};
+use tiles::spiral::MinCell;
+use tiles::spiral_cursor::{Landing, SpiralCursor};
 use volumes::mount_backend::MountOutcome;
 use volumes::{AttachedDevice, VolumeFlush, VolumeWatch};
 
@@ -36,10 +36,10 @@ use crate::password_panel::{PanelStyle, PanelText, PasswordPanel};
 use crate::storage::Storage;
 use crate::theme::Theme;
 use crate::tile_action::TileAction;
-use crate::tile_field::{PlacedMore, PlacedTile, TileField};
+use tiles::tile_field::{PlacedMore, PlacedTile, TileField};
 use crate::tile_geometry::TileGeometry;
-use crate::tile_growth::{Destination, Shape, TileGrowth};
-use crate::tile_id::TileId;
+use tiles::tile_growth::{Destination, Shape, TileGrowth};
+use tiles::tile_id::TileId;
 use crate::tile_motion::{TileKey, TileMotion};
 use crate::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
 use crate::toolbar::{Target, Toolbar};
@@ -376,7 +376,7 @@ impl FilesWindow {
 
     /// Bring the tile ranking up to date with the browser.
     fn sync_tiles(&mut self) {
-        self.tiles.sync(&self.browser);
+        self.tiles.sync(self.browser.navigator());
     }
 
     /// Drain the directory watcher through the browser, re-reading the open
@@ -414,7 +414,7 @@ impl FilesWindow {
     /// tiles must be redrawn.
     pub fn poll_tiles(&mut self) -> bool {
         let arrived = self.tiles.poll();
-        self.tiles.sync(&self.browser);
+        self.tiles.sync(self.browser.navigator());
         arrived
     }
 

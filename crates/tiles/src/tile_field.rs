@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use platform::draw::{Point, Rect};
 
-use crate::browser::Browser;
+use browse::DirectoryBrowser;
+
 use crate::dir_sizes::DirSizes;
 use crate::spiral::{MinCell, SpiralLayout};
 use crate::tile_coloring::TileColoring;
@@ -90,7 +91,7 @@ impl TileField {
     /// Re-rank after the browser's listing or the measured sizes changed.
     /// Another folder starts the field back at its largest entries and
     /// begins measuring its folders.
-    pub fn sync(&mut self, browser: &Browser) {
+    pub fn sync(&mut self, browser: &DirectoryBrowser) {
         let previous = self.synced;
         let refreshes = browser.refresh_count();
         let listing = browser.listing_revision();
@@ -263,7 +264,7 @@ impl TileField {
 #[cfg(test)]
 mod tests {
     use super::TileField;
-    use crate::browser::Browser;
+    use browse::DirectoryBrowser;
     use crate::spiral::MinCell;
     use crate::test_support::TempDir;
     use crate::tile_coloring::TileColoring;
@@ -276,7 +277,7 @@ mod tests {
         (TileField::new(wake.clone()), wake)
     }
 
-    fn names(field: &TileField, browser: &Browser, area: Rect, min: i32) -> Vec<String> {
+    fn names(field: &TileField, browser: &DirectoryBrowser, area: Rect, min: i32) -> Vec<String> {
         field
             .layout(area, min, None)
             .iter()
@@ -284,7 +285,7 @@ mod tests {
             .collect()
     }
 
-    fn settle(field: &mut TileField, wake: &waker::Waker, browser: &Browser) {
+    fn settle(field: &mut TileField, wake: &waker::Waker, browser: &DirectoryBrowser) {
         loop {
             field.sync(browser);
             let pending = (0..browser.len())
@@ -305,7 +306,7 @@ mod tests {
         dir.create_file("small", &[0; 10]);
         dir.create_file("large", &[0; 900]);
         dir.create_file("medium", &[0; 300]);
-        let browser = Browser::open(dir.path(), 800, 600, 28).expect("open");
+        let browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
         let (mut field, _wake) = field();
         field.sync(&browser);
         assert_eq!(
@@ -319,7 +320,7 @@ mod tests {
         let dir = TempDir::new("tile_field_folders");
         dir.create_file("file", &[0; 50]);
         dir.create_file("folder/inner", &[0; 5000]);
-        let browser = Browser::open(dir.path(), 800, 600, 28).expect("open");
+        let browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
         let (mut field, wake) = field();
         field.sync(&browser);
         assert_eq!(names(&field, &browser, AREA, 1)[0], "file");
@@ -327,12 +328,12 @@ mod tests {
         assert_eq!(names(&field, &browser, AREA, 1)[0], "folder");
     }
 
-    fn crowded() -> (TileField, Browser, TempDir) {
+    fn crowded() -> (TileField, DirectoryBrowser, TempDir) {
         let dir = TempDir::new("tile_field_crowded");
         for i in 0..40 {
             dir.create_file(&format!("f{i:02}"), &vec![0; 100 + i]);
         }
-        let browser = Browser::open(dir.path(), 800, 600, 28).expect("open");
+        let browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
         let (mut field, _wake) = field();
         field.sync(&browser);
         (field, browser, dir)
@@ -403,7 +404,7 @@ mod tests {
             dir.create_file(&format!("f{i:02}"), &[0; 10]);
         }
         dir.create_dir("sub");
-        let mut browser = Browser::open(dir.path(), 800, 600, 28).expect("open");
+        let mut browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
         let (mut field, _wake) = field();
         field.sync(&browser);
         field.slide(AREA, 120, None, 5);
@@ -480,7 +481,7 @@ mod tests {
     #[test]
     fn an_empty_directory_gives_the_card_the_whole_area() {
         let dir = TempDir::new("tile_field_card_empty");
-        let browser = Browser::open(dir.path(), 800, 600, 28).expect("open");
+        let browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
         let (mut field, _wake) = field();
         field.sync(&browser);
         let arranged = field.arrange(AREA, 120, Some(NEED));
@@ -492,7 +493,7 @@ mod tests {
     fn a_single_entry_leaves_the_card_the_rest() {
         let dir = TempDir::new("tile_field_card_one");
         dir.create_file("a", &[0; 10]);
-        let browser = Browser::open(dir.path(), 800, 600, 28).expect("open");
+        let browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
         let (mut field, _wake) = field();
         field.sync(&browser);
         let arranged = field.arrange(AREA, 120, Some(NEED));
@@ -506,7 +507,7 @@ mod tests {
         for i in 0..files {
             dir.create_file(&format!("f{i:03}"), &vec![0; 10 + i]);
         }
-        let browser = Browser::open(dir.path(), 800, 600, 28).expect("open");
+        let browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
         let (mut field, _wake) = field();
         field.sync(&browser);
         (field, dir)
@@ -594,7 +595,7 @@ mod tests {
     fn nothing_is_hit_outside_the_area() {
         let dir = TempDir::new("tile_field_miss");
         dir.create_file("a", &[0; 10]);
-        let browser = Browser::open(dir.path(), 800, 600, 28).expect("open");
+        let browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
         let (mut field, _wake) = field();
         field.sync(&browser);
         assert_eq!(field.hit(AREA, 1, None, Point::new(5000, 5)), None);

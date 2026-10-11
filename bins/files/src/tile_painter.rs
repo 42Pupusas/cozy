@@ -17,7 +17,7 @@ use crate::spacing::Spacing;
 use crate::theme::Theme;
 use crate::tile_action::TileAction;
 use crate::tile_geometry::TileGeometry;
-use crate::tile_growth::TileGrowth;
+use tiles::tile_growth::TileGrowth;
 use crate::typography::Typography;
 
 /// One tile's strings and states for a frame.

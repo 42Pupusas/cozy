@@ -144,6 +144,7 @@ impl Browser {
 
     /// Changes whenever the open directory is re-read from disk.
     #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub const fn refresh_count(&self) -> u64 {
         self.nav.refresh_count()
     }
@@ -236,6 +237,11 @@ impl Browser {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.nav.len()
+    }
+
+    #[must_use]
+    pub const fn navigator(&self) -> &DirectoryBrowser {
+        &self.nav
     }
 
     /// The entry at visible index `row`.

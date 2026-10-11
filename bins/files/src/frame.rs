@@ -11,7 +11,7 @@ use platform::draw::Rect;
 
 use crate::pinned_card::{CardMetrics, PinnedCard};
 use crate::spacing::Spacing;
-use crate::spiral::MinCell;
+use tiles::spiral::MinCell;
 
 /// The window's resolved layout.
 #[derive(Clone, Copy, Debug)]

@@ -83,7 +83,7 @@ These rules did not change. They still hold.
 | `clipboard` | `wl-paste --watch cliphist` | Daily use |
 | `files` | nautilus | Working |
 | `monitor` | htop | Working |
-| `portal` | xdg-desktop-portal-gtk | Settings interface only. Not routed |
+| `portal` | xdg-desktop-portal-gtk | Settings interface only. Routed, merged with gtk; cozy wins on shared keys (verified: color-scheme follows cozy config live) |
 
 ### 3.2 Library layers
 
@@ -282,11 +282,14 @@ Owns the write half of two read-only crates.
 
 Owns documentation and the portal's data files. Writes no logic.
 
-17. **Route `Settings`.** Add one line to `portals.conf`:
-    `org.freedesktop.impl.portal.Settings=cozy`. Restart the session
-    components. Prove the rollback once, by reverting that line.
-    The code, the tests, and the artifacts are done. Until this step happens,
-    none of that work carries load.
+17. ~~**Route `Settings`.**~~ Done. `portals.conf` carries
+    `org.freedesktop.impl.portal.Settings=cozy`. The rollback was proved:
+    deleting that line and restarting `xdg-desktop-portal.service` returns
+    gtk's own answer. The frontend merges the Settings backends instead of
+    choosing one. `ReadAll` returns gtk's namespaces plus cozy's
+    `accent-color` and `reduced-motion`. gtk still supplies every
+    `org.gnome.*` namespace. Which backend wins for a key both report is
+    not yet tested.
 18. **The compatibility matrix.** Record, per interface: the advertised
     version, the real caller that exercises it, the options it accepts, and
     the fallback backend. `docs/portal-scoping.md` step 1 asked for this, and

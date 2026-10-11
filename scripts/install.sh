@@ -23,8 +23,9 @@
 #   panel-wifi-bin -> panel-wifi -- the Wi-Fi popup             (bins/panel-wifi)
 #   panel-bluetooth-bin -> panel-bluetooth -- the Bluetooth popup (bins/panel-bluetooth)
 #   panel-volume-bin -> panel-volume -- the volume popup         (bins/panel-volume)
+#   portal-bin     -> portal    -- the native portal backend   (bins/portal)
 #
-# All eleven matter to a niri session: ~/.config/niri/config.kdl spawns
+# All twelve matter to a niri session: ~/.config/niri/config.kdl spawns
 # statusbar, wallpaper and clipboard at startup, and binds terminal, launcher,
 # monitor, shot and files to keys. Every one of those references the install
 # root by absolute path, so a binary missing from here is a silently broken
@@ -68,7 +69,7 @@ echo
 
 for pkg in bins/terminal bins/statusbar bins/monitor bins/launcher \
            bins/clipboard bins/wallpaper bins/shot bins/files bins/canvas \
-           bins/panel-wifi bins/panel-bluetooth bins/panel-volume; do
+           bins/panel-wifi bins/panel-bluetooth bins/panel-volume bins/portal; do
     echo ">> cargo install --path $pkg --force"
     cargo install --path "$pkg" --force --root "$install_root"
 done
@@ -118,7 +119,7 @@ fi
 echo
 echo "Installed into $bin_dir:"
 for bin in terminal statusbar monitor launcher clipboard wallpaper shot files \
-           canvas panel-wifi panel-bluetooth panel-volume; do
+           canvas panel-wifi panel-bluetooth panel-volume portal; do
     if [ -x "$bin_dir/$bin" ]; then
         echo "  ok      $bin"
     else

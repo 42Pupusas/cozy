@@ -25,6 +25,7 @@
 //! * **View rules carry across directories.** A user who turned on hidden
 //!   files means it until they turn it off, not until they open a folder.
 
+use browse::{DirsWatch, History, Trail};
 use fsmodel::DirectoryView;
 use fsmodel::entry::Entry;
 use fsmodel::reader::ReadError;
@@ -33,8 +34,6 @@ use std::path::{Path, PathBuf};
 use widget::{ListCommand, ListPane, Mods, PaneResponse, TextInput};
 
 use crate::clipboard::{FileClipboard, Transfer};
-use crate::dirs_watch::DirsWatch;
-use crate::history::{History, Trail};
 use crate::keymap::{Action, EditAction, Focus, Keymap};
 use crate::move_prompt::MovePrompt;
 use crate::password_modal::PasswordModal;

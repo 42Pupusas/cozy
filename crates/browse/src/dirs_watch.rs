@@ -30,6 +30,12 @@ pub struct DirsWatch {
     armed: Option<i32>,
 }
 
+impl Default for DirsWatch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DirsWatch {
     /// Events that mean "the listing or an entry in it may have changed".
     ///

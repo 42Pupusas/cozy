@@ -146,10 +146,7 @@ mod tests {
         let activate = Some(BrowseAction::List(ListCommand::Activate));
         assert_eq!(BrowseKeys::list(press(Key::Enter)), activate);
         assert_eq!(BrowseKeys::list(press(Key::Right)), activate);
-        assert_eq!(
-            BrowseKeys::list(press(Key::Left)),
-            Some(BrowseAction::GoUp)
-        );
+        assert_eq!(BrowseKeys::list(press(Key::Left)), Some(BrowseAction::GoUp));
         assert_eq!(
             BrowseKeys::list(press(Key::Backspace)),
             Some(BrowseAction::GoUp)

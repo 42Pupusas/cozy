@@ -4,6 +4,7 @@ use browse::DirectoryBrowser;
 
 use crate::row_format::RowFormat;
 use crate::row_kind::RowKind;
+use crate::size_ledger::Measure;
 use crate::theme::Theme;
 use crate::tile_action::TileAction;
 use crate::tile_field::{PlacedMore, PlacedTile};
@@ -52,13 +53,10 @@ impl TileAssembly<'_> {
     #[must_use]
     pub fn tiles(&self, placed: &[PlacedTile], more: Option<PlacedMore>) -> Vec<PaintedTile> {
         let growth = self.scene.growth();
-        let leaving = growth
-            .leaving()
-            .into_iter()
-            .filter_map(|(id, row, shape)| {
-                let entry = self.nav.entry(row)?;
-                (TileId::of(&entry.name) == id).then(|| self.entry_tile(row, shape))?
-            });
+        let leaving = growth.leaving().into_iter().filter_map(|(id, row, shape)| {
+            let entry = self.nav.entry(row)?;
+            (TileId::of(&entry.name) == id).then(|| self.entry_tile(row, shape))?
+        });
         let held = placed.iter().filter_map(|placed| {
             let entry = self.nav.entry(placed.row)?;
             let shape = growth
@@ -101,10 +99,12 @@ impl TileAssembly<'_> {
         let key = TileKey::Item(row);
         let sizes = self.scene.field().sizes();
         let motion = self.scene.motion();
-        let detail = if sizes.is_pending(entry) {
-            String::from("measuring…")
-        } else {
-            RowFormat::human_size(sizes.of(entry))
+        let detail = match sizes.measure(entry) {
+            Measure::Unknown => String::from("measuring…"),
+            Measure::Partial(bytes) | Measure::Stale(bytes) => {
+                format!("{}…", RowFormat::human_size(bytes))
+            }
+            Measure::Final(bytes) => RowFormat::human_size(bytes),
         };
         let name_color = if self.overlay.is_cut(&entry.path) {
             self.theme.muted
@@ -215,10 +215,7 @@ mod tests {
                 theme: &self.theme,
                 overlay,
             };
-            assembly.tiles(
-                &self.scene.layout(&self.flow),
-                self.scene.more(&self.flow),
-            )
+            assembly.tiles(&self.scene.layout(&self.flow), self.scene.more(&self.flow))
         }
     }
 
@@ -267,7 +264,12 @@ mod tests {
     fn only_the_row_the_overlay_names_is_a_drop_target() {
         let fixture = Fixture::new("assembly_drop", 2);
         let row = (0..3)
-            .find(|row| fixture.nav.entry(*row).is_some_and(|entry| entry.name == "sub"))
+            .find(|row| {
+                fixture
+                    .nav
+                    .entry(*row)
+                    .is_some_and(|entry| entry.name == "sub")
+            })
             .expect("sub row");
         let overlay = Marking {
             cut: String::new(),

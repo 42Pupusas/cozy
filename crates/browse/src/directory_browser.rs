@@ -6,8 +6,10 @@ use fsmodel::entry::Entry;
 use fsmodel::reader::ReadError;
 use widget::{ListCommand, ListPane, Mods, PaneResponse, TextInput};
 
+use crate::change_log::ChangeLog;
 use crate::dirs_watch::DirsWatch;
 use crate::history::{History, Trail};
+use crate::listing_change::ListingChange;
 use crate::reaction::Reaction;
 
 pub struct DirectoryBrowser {
@@ -18,6 +20,7 @@ pub struct DirectoryBrowser {
     error: Option<ReadError>,
     listing: u64,
     refreshes: u64,
+    changes: ChangeLog,
     watch: DirsWatch,
 }
 
@@ -35,16 +38,25 @@ impl DirectoryBrowser {
             error: None,
             listing: 0,
             refreshes: 0,
+            changes: ChangeLog::new(0),
             watch,
         })
     }
 
     pub fn poll_listing(&mut self) -> bool {
-        if !self.watch.poll() {
+        let change = self.watch.drain();
+        if change.is_empty() {
             return false;
         }
-        self.refresh();
+        self.reread(change);
         true
+    }
+
+    /// What changed in the open directory since refresh `seen`, as
+    /// [`refresh_count`](Self::refresh_count) reported it.
+    #[must_use]
+    pub fn changed_since(&self, seen: u64) -> ListingChange {
+        self.changes.since(seen)
     }
 
     #[must_use]
@@ -171,7 +183,10 @@ impl DirectoryBrowser {
     pub fn drop_dir(&self, row: Option<usize>) -> PathBuf {
         self.navigable_row(row)
             .and_then(|row| self.entry(row))
-            .map_or_else(|| self.view.path().to_path_buf(), |entry| entry.path.clone())
+            .map_or_else(
+                || self.view.path().to_path_buf(),
+                |entry| entry.path.clone(),
+            )
     }
 
     pub fn pick(&mut self, row: usize, mods: Mods) -> Reaction {
@@ -260,11 +275,17 @@ impl DirectoryBrowser {
         self.navigate(path, None, Trail::Record)
     }
 
+    /// Re-read the directory, treating everything in it as changed.
     pub fn refresh(&mut self) -> Reaction {
+        self.reread(ListingChange::Everything)
+    }
+
+    fn reread(&mut self, change: ListingChange) -> Reaction {
         let cursor_path = self.cursor_entry().map(|entry| entry.path.clone());
         match self.view.refresh() {
             Ok(()) => {
                 self.refreshes += 1;
+                self.changes.record(change);
                 self.error = None;
                 self.watch.follow(self.view.path());
                 self.set_len(self.view.visible_len());
@@ -278,9 +299,11 @@ impl DirectoryBrowser {
     }
 
     pub fn select_path(&mut self, target: &Path) -> bool {
-        let Some(row) = (0..self.view.visible_len())
-            .find(|&index| self.view.visible_at(index).is_some_and(|entry| entry.path == target))
-        else {
+        let Some(row) = (0..self.view.visible_len()).find(|&index| {
+            self.view
+                .visible_at(index)
+                .is_some_and(|entry| entry.path == target)
+        }) else {
             return false;
         };
         self.pane.select_row(row)
@@ -307,6 +330,7 @@ impl DirectoryBrowser {
                 self.view = view;
                 self.error = None;
                 self.watch.follow(path);
+                self.changes.reset(self.refreshes);
                 if trail == Trail::Record {
                     self.history.visit(&leaving);
                 }
@@ -490,7 +514,10 @@ mod tests {
         assert!(browser.selected_paths().is_empty());
         let row = Fixture::row_named(&browser, "beta.txt");
         browser.pick(row, Mods::none());
-        assert_eq!(browser.selected_paths(), vec![fixture.dir.path().join("beta.txt")]);
+        assert_eq!(
+            browser.selected_paths(),
+            vec![fixture.dir.path().join("beta.txt")]
+        );
     }
 
     #[test]
@@ -502,7 +529,10 @@ mod tests {
         fixture.dir.create_file("aaa.txt", b"new");
         browser.refresh();
         assert_eq!(browser.len(), 4);
-        assert_eq!(browser.cursor_entry().map(|e| e.name.as_str()), Some("beta.txt"));
+        assert_eq!(
+            browser.cursor_entry().map(|e| e.name.as_str()),
+            Some("beta.txt")
+        );
     }
 
     #[test]
@@ -516,12 +546,51 @@ mod tests {
     }
 
     #[test]
+    fn a_watched_change_is_logged_by_name() {
+        let fixture = Fixture::new("changed_names");
+        let mut browser = fixture.browser();
+        let seen = browser.refresh_count();
+        fixture.dir.create_file("sub/deeper.txt", b"x");
+        fixture.dir.create_file("late.txt", b"x");
+        assert!(browser.poll_listing());
+        assert_eq!(
+            browser.changed_since(seen),
+            ListingChange::Entries(vec!["late.txt".into()]),
+            "a file written inside a child is not seen by the open directory's watch"
+        );
+        assert!(browser.changed_since(browser.refresh_count()).is_empty());
+    }
+
+    #[test]
+    fn a_manual_refresh_changes_everything() {
+        let fixture = Fixture::new("changed_all");
+        let mut browser = fixture.browser();
+        let seen = browser.refresh_count();
+        browser.refresh();
+        assert_eq!(browser.changed_since(seen), ListingChange::Everything);
+    }
+
+    #[test]
+    fn moving_away_forgets_the_old_directory_s_changes() {
+        let fixture = Fixture::new("changed_moved");
+        let mut browser = fixture.browser();
+        browser.refresh();
+        let seen = browser.refresh_count();
+        browser.go_to(&fixture.dir.path().join("sub"));
+        assert!(browser.changed_since(seen).is_empty());
+        assert_eq!(browser.changed_since(seen - 1), ListingChange::Everything);
+    }
+
+    #[test]
     fn a_drop_lands_in_the_folder_row_or_else_the_open_directory() {
         let fixture = Fixture::new("drop");
         let browser = fixture.browser();
         let folder = Fixture::row_named(&browser, "sub");
         let file = Fixture::row_named(&browser, "alpha.txt");
-        assert_eq!(browser.drop_dir(Some(folder)), fixture.dir.path().join("sub"));
+        assert_eq!(
+            browser.drop_dir(Some(folder)),
+            fixture.dir.path().join("sub")
+        );
         assert_eq!(browser.drop_dir(Some(file)), fixture.dir.path());
         assert_eq!(browser.drop_dir(None), fixture.dir.path());
     }

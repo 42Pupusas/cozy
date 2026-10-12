@@ -19,6 +19,7 @@ wallpaper = { path = "../../crates/wallpaper" }
 widget = { path = "../../crates/widget" }
 dbus = { path = "../../crates/dbus" }
 waker = { path = "../../crates/waker" }
+quetzalcoatl = { workspace = true }
 divan = "0.1"
 
 [[bench]]
@@ -27,6 +28,11 @@ harness = false
 
 [[bench]]
 name = "filesystem"
+harness = false
+
+[[bench]]
+name = "dir_walk"
+path = "benches/dir_walk/main.rs"
 harness = false
 
 [[bench]]

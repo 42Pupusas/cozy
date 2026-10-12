@@ -12,10 +12,13 @@
 //! the same file, re-rank the tiles) is the browser's business, exactly as
 //! the manual F5 path already does it.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 use inotify_events::InotifyEvents;
+
+use crate::listing_change::ListingChange;
 
 /// The inotify instance, when the kernel gave us one, and the single watch
 /// currently armed on it.
@@ -125,39 +128,51 @@ impl DirsWatch {
     /// `true`: the caller refreshes once and that re-read sees the whole
     /// burst. Queue overflow is a change too -- it means events were
     /// *lost*, and a re-read is the only honest response.
+    pub fn poll(&mut self) -> bool {
+        !self.drain().is_empty()
+    }
+
+    /// As [`poll`](Self::poll), naming the entries the events touched. An
+    /// event without a name (overflow, the directory itself moving) makes
+    /// the change [`ListingChange::Everything`].
     ///
     /// The kernel's receipt for a removed watch (`IN_IGNORED`) is not a
     /// change; when it retires the armed watch -- the open directory was
     /// deleted out from under us -- the arm is dropped, so [`Self::fd`]
     /// stops reporting a descriptor that can never carry a real event
     /// again and the event loop falls back to its idle timeout.
-    pub fn poll(&mut self) -> bool {
+    pub fn drain(&mut self) -> ListingChange {
+        let mut change = ListingChange::none();
         let Some(ino) = self.ino.as_ref() else {
-            return false;
+            return change;
         };
         let Some(armed_wd) = self.armed else {
-            return false;
+            return change;
         };
-        let mut changed = false;
         let mut reaped = false;
         InotifyEvents::poll_events(ino, |touched| {
             if touched.mask & Self::IGNORED != 0 {
                 reaped |= touched.wd == armed_wd;
                 return;
             }
-            changed = true;
+            match touched.name {
+                Some(name) => change.add_name(OsStr::from_bytes(name)),
+                None => change = ListingChange::Everything,
+            }
         });
         if reaped {
             self.armed = None;
         }
-        changed
+        change
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::DirsWatch;
+    use crate::listing_change::ListingChange;
     use crate::test_support::TempDir;
+    use std::ffi::OsString;
 
     /// A file created after the watch was armed is reported exactly once:
     /// the drain must not re-report what it already handed over.
@@ -267,8 +282,30 @@ mod tests {
         assert!(!watch.poll());
     }
 
-    /// Queue overflow and kernel receipt events travel in the mask's high
-    /// bits: a receipt (`IN_IGNORED`) is not a change, overflow is.
+    #[test]
+    fn the_drained_change_names_each_touched_entry() {
+        let dir = TempDir::new("watch_names");
+        let mut watch = DirsWatch::new();
+        watch.follow(dir.path());
+        dir.create_file("one", b"x");
+        dir.create_file("two", b"x");
+        let ListingChange::Entries(mut names) = watch.drain() else {
+            panic!("named events give names");
+        };
+        names.sort();
+        assert_eq!(names, [OsString::from("one"), OsString::from("two")]);
+    }
+
+    #[test]
+    fn the_directory_itself_moving_changes_everything() {
+        let parent = TempDir::new("watch_names_self");
+        let child = parent.create_dir("child");
+        let mut watch = DirsWatch::new();
+        watch.follow(&child);
+        std::fs::rename(&child, parent.path().join("moved")).expect("rename");
+        assert_eq!(watch.drain(), ListingChange::Everything);
+    }
+
     #[test]
     fn a_renamed_directory_moves_the_watch_with_it() {
         // MOVE_SELF: the directory the user is looking at was renamed by

@@ -32,8 +32,9 @@ opt-level = 3
 [workspace.dependencies]
 # Needs MsgFlags::CMSG_CLOEXEC (since 0.15.1) for `crates/scm-rights`, and
 # must be the same 0.16 copy quetzal-uring 0.2.3 links, so `Inotify` and
-# `MsgFlags` are one type across the workspace.
-ququmatz      = "0.16.1"
+# `MsgFlags` are one type across the workspace. 0.16.2 adds `ququmatz::dir`
+# (getdents64/statx) for `crates/fsmodel`'s directory walk.
+ququmatz      = "0.16.2"
 # Must come from the registry, not a path: quetzal-uring's own ququmatz
 # dependency would otherwise resolve to a second, distinct copy of the crate.
 quetzal-uring = "0.2.3"

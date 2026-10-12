@@ -8,6 +8,7 @@ workspace = true
 
 [dependencies]
 quetzalcoatl = { workspace = true }
+ququmatz     = { workspace = true }
 # No path deps, by design. This crate is pure directory-model logic --
 # reading a directory into typed entries, then sorting/filtering them into a
 # view -- with zero Wayland/rendering knowledge, mirroring how `crates/launcher`

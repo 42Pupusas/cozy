@@ -140,9 +140,7 @@ impl TileScene {
     /// Scroll the field by `steps` tiles and aim the growth at the new view.
     /// Returns whether the view moved.
     pub fn slide(&mut self, flow: &Flow, nav: &DirectoryBrowser, steps: i32) -> bool {
-        let moved = self
-            .field
-            .slide(flow.area, flow.floor, flow.tail, steps);
+        let moved = self.field.slide(flow.area, flow.floor, flow.tail, steps);
         if moved {
             self.aim_growth(flow, nav);
         }
@@ -185,7 +183,8 @@ impl TileScene {
 
     pub fn aim_growth(&mut self, flow: &Flow, nav: &DirectoryBrowser) {
         let targets = self.targets(flow, nav);
-        self.growth.aim(nav.path(), flow.area, &targets, self.clock_ms);
+        self.growth
+            .aim(nav.path(), flow.area, &targets, self.clock_ms);
     }
 
     pub fn reaim_if_primed(&mut self, flow: &Flow, nav: &DirectoryBrowser) {
@@ -261,11 +260,11 @@ impl TileScene {
 #[cfg(test)]
 mod tests {
     use super::{Flow, MotionAim, Steering, TileScene};
-    use widget::{Direction, ListCommand};
     use crate::hover::{Pane, Spot};
     use crate::test_support::TempDir;
     use browse::DirectoryBrowser;
     use platform::draw::{Point, Rect};
+    use widget::{Direction, ListCommand};
 
     const AREA: Rect = Rect::new(0, 0, 1300, 800);
 
@@ -393,7 +392,10 @@ mod tests {
         scene.sync(&nav);
         let rows = scene.page(&flow).rows;
         let down = ListCommand::Move(Direction::Down);
-        assert_eq!(scene.steer(&flow, Some(rows[0]), down), Steering::Land(rows[1]));
+        assert_eq!(
+            scene.steer(&flow, Some(rows[0]), down),
+            Steering::Land(rows[1])
+        );
     }
 
     #[test]

@@ -95,8 +95,9 @@ impl TileField {
         let previous = self.synced;
         let refreshes = browser.refresh_count();
         let listing = browser.listing_revision();
-        if previous.is_some_and(|seen| seen.refreshes != refreshes) {
-            self.sizes.invalidate(browser.path());
+        if let Some(seen) = previous.filter(|seen| seen.refreshes != refreshes) {
+            let change = browser.changed_since(seen.refreshes);
+            self.sizes.invalidate(browser.path(), &change);
         }
         let entries = || (0..browser.len()).filter_map(|row| browser.entry(row));
         let relisted =
@@ -264,10 +265,10 @@ impl TileField {
 #[cfg(test)]
 mod tests {
     use super::TileField;
-    use browse::DirectoryBrowser;
     use crate::spiral::MinCell;
     use crate::test_support::TempDir;
     use crate::tile_coloring::TileColoring;
+    use browse::DirectoryBrowser;
     use platform::draw::{Point, Rect};
 
     const AREA: Rect = Rect::new(0, 0, 1300, 800);
@@ -326,6 +327,42 @@ mod tests {
         assert_eq!(names(&field, &browser, AREA, 1)[0], "file");
         settle(&mut field, &wake, &browser);
         assert_eq!(names(&field, &browser, AREA, 1)[0], "folder");
+    }
+
+    #[test]
+    fn a_new_file_beside_measured_folders_does_not_recount_them() {
+        let dir = TempDir::new("tile_field_watch_named");
+        dir.create_file("folder/inner", &[0; 500]);
+        let mut browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
+        let (mut field, wake) = field();
+        settle(&mut field, &wake, &browser);
+
+        dir.create_file("arrived", &[0; 9]);
+        assert!(browser.poll_listing());
+        field.sync(&browser);
+        let folder = (0..browser.len())
+            .filter_map(|row| browser.entry(row))
+            .find(|entry| entry.name == "folder")
+            .expect("folder");
+        assert!(!field.sizes().is_pending(folder));
+        assert_eq!(field.sizes().of(folder), 500);
+    }
+
+    #[test]
+    fn a_manual_refresh_recounts_folders_but_keeps_their_old_size_meanwhile() {
+        let dir = TempDir::new("tile_field_watch_all");
+        dir.create_file("folder/inner", &[0; 500]);
+        let mut browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
+        let (mut field, wake) = field();
+        settle(&mut field, &wake, &browser);
+
+        dir.create_file("folder/more", &[0; 100]);
+        browser.refresh();
+        field.sync(&browser);
+        assert_eq!(names(&field, &browser, AREA, 1)[0], "folder");
+        settle(&mut field, &wake, &browser);
+        let folder = browser.entry(0).expect("folder");
+        assert_eq!(field.sizes().of(folder), 600);
     }
 
     fn crowded() -> (TileField, DirectoryBrowser, TempDir) {

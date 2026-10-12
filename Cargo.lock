@@ -33,6 +33,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "browse"
+version = "0.1.0"
+dependencies = [
+ "fsmodel",
+ "inotify-events",
+ "platform",
+ "ququmatz",
+ "widget",
+]
+
+[[package]]
 name = "canvas-bin"
 version = "0.1.0"
 dependencies = [
@@ -138,6 +149,7 @@ dependencies = [
  "launcher",
  "localtime",
  "mime",
+ "quetzalcoatl",
  "waker",
  "wallpaper",
  "widget",
@@ -209,6 +221,7 @@ dependencies = [
 name = "files-bin"
 version = "0.1.0"
 dependencies = [
+ "browse",
  "config",
  "dbus",
  "diskstat",
@@ -216,7 +229,6 @@ dependencies = [
  "font",
  "fsmodel",
  "headless-stress",
- "inotify-events",
  "launcher",
  "localtime",
  "mime",
@@ -224,8 +236,8 @@ dependencies = [
  "opener",
  "platform",
  "quetzalcoatl",
- "ququmatz",
  "statusbar",
+ "tiles",
  "user-dirs",
  "volumes",
  "waker",
@@ -247,6 +259,7 @@ name = "fsmodel"
 version = "0.1.0"
 dependencies = [
  "quetzalcoatl",
+ "ququmatz",
 ]
 
 [[package]]
@@ -558,6 +571,7 @@ dependencies = [
  "inotify-events",
  "opener",
  "portal-core",
+ "portal-ui",
  "quetzalcoatl",
  "ququmatz",
  "waker",
@@ -569,6 +583,20 @@ version = "0.1.0"
 dependencies = [
  "config",
  "dbus",
+]
+
+[[package]]
+name = "portal-ui"
+version = "0.1.0"
+dependencies = [
+ "browse",
+ "config",
+ "fsmodel",
+ "platform",
+ "portal-core",
+ "tiles",
+ "waker",
+ "widget",
 ]
 
 [[package]]
@@ -620,9 +648,9 @@ dependencies = [
 
 [[package]]
 name = "ququmatz"
-version = "0.16.1"
+version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2db8fb915ead2e6983baf6a89b0115cafb6bc32364328ca438b0383a5b9350e"
+checksum = "2bdaa0b004e11b2f7fc896ac93258fea15b6801949ff968e347a8072311e39b3"
 
 [[package]]
 name = "regex-automata"
@@ -845,6 +873,19 @@ dependencies = [
  "monitor",
  "platform",
  "waker",
+]
+
+[[package]]
+name = "tiles"
+version = "0.1.0"
+dependencies = [
+ "browse",
+ "config",
+ "fsmodel",
+ "platform",
+ "statusbar",
+ "waker",
+ "widget",
 ]
 
 [[package]]

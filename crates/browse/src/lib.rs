@@ -2,10 +2,12 @@
 
 pub mod browse_action;
 pub mod browse_keys;
+pub mod change_log;
 pub mod directory_browser;
 pub mod dirs_watch;
 pub mod edit_action;
 pub mod history;
+pub mod listing_change;
 pub mod reaction;
 
 #[cfg(test)]
@@ -17,4 +19,5 @@ pub use directory_browser::DirectoryBrowser;
 pub use dirs_watch::DirsWatch;
 pub use edit_action::EditAction;
 pub use history::{History, Trail};
+pub use listing_change::ListingChange;
 pub use reaction::Reaction;

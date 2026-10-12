@@ -5,7 +5,7 @@
 //! conversion and PNG encoder. No Wayland connection or window is created.
 
 use headless_stress::StressOptions;
-use screencopy::{CapturedFrame, FrameParams};
+use screencopy::{CapturedFrame, FrameParams, FrameView};
 
 use crate::shot_writer::ShotWriter;
 
@@ -45,7 +45,8 @@ impl ShotStress {
             stride,
         )
         .expect("synthetic screenshot dimensions are valid");
-        CapturedFrame::from_shm(&params, 0, &pixels).expect("synthetic frame is valid")
+        let view = FrameView::new(params, 0, &pixels).expect("synthetic frame is valid");
+        view.to_rgba(view.whole())
     }
 }
 

@@ -24,13 +24,21 @@
 //!   above.
 
 mod capture_error;
+mod capture_region;
 mod captured_frame;
 mod frame_handshake;
 mod frame_params;
+mod frame_view;
+mod held_frame;
+mod pixel_window;
 mod screencopy_session;
 
 pub use capture_error::{Result, ScreencopyError};
+pub use capture_region::CaptureRegion;
 pub use captured_frame::{CaptureError, CapturedFrame};
 pub use frame_handshake::{FrameHandshake, HandshakeError, Step};
 pub use frame_params::{FrameParams, ParamsError};
-pub use screencopy_session::{CaptureRegion, ScreencopySession};
+pub use frame_view::FrameView;
+pub use held_frame::HeldFrame;
+pub use pixel_window::PixelWindow;
+pub use screencopy_session::ScreencopySession;

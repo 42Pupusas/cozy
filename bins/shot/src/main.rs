@@ -8,11 +8,17 @@
 
 use clipboard::ScreenshotPayload;
 use clipboard_wayland::ClipboardSession;
+mod backdrop_fit;
 mod drag_selection;
+mod frozen_backdrop;
 mod headless;
+mod keyboard_grab;
 mod niri_windows;
 mod output_registry;
+mod overlay_deadlines;
+mod overlay_globals;
 mod png_delivery;
+mod region_scale;
 mod seat_devices;
 mod selection_overlay;
 mod selection_painter;
@@ -24,15 +30,20 @@ mod window_selector;
 mod window_source;
 
 use output_registry::OutputRegistry;
+use overlay_globals::OverlayGlobals;
 use platform::conn::Sender;
 use platform::event::RawEvent;
-use platform::id::{CompositorId, LayerShellId, RegistryId, ScreencopyManagerId, ShmId};
+use platform::id::{
+    CompositorId, LayerShellId, RegistryId, ScreencopyManagerId, ShmId, SubcompositorId,
+    ViewporterId,
+};
 use platform::protocol as proto;
 use platform::surface::{GlobalCollector, RegistryDiscovery, SurfaceBootstrap};
 use platform::{PlatformError, Result};
 use png_delivery::PngDelivery;
 use quetzalcoatl::spsc::Consumer;
-use screencopy::{CaptureRegion, ScreencopySession};
+use region_scale::RegionScale;
+use screencopy::{CaptureRegion, CapturedFrame, ScreencopySession};
 use seat_devices::SeatDevices;
 use selection_overlay::SelectionOverlay;
 use shot_options::{CaptureTarget, ShotAction, ShotOptions};
@@ -58,6 +69,10 @@ struct Globals {
     /// gratuitous.
     compositor: Option<CompositorId>,
     layer_shell: Option<LayerShellId>,
+    /// Let the picker show the frozen screen beneath its dim; without them it
+    /// still picks, over the live desktop.
+    subcompositor: Option<SubcompositorId>,
+    viewporter: Option<ViewporterId>,
     /// The seat's registry coordinates rather than a bound object: the picker
     /// binds a *fresh* seat when it needs one, because `wl_seat.capabilities`
     /// fires once per object and discovery would have consumed it.
@@ -76,6 +91,8 @@ struct GlobalsBuilder {
     data_control: Option<(platform::id::DataControlManagerId, u32)>,
     compositor: Option<CompositorId>,
     layer_shell: Option<LayerShellId>,
+    subcompositor: Option<SubcompositorId>,
+    viewporter: Option<ViewporterId>,
     seat: Option<(u32, u32)>,
     outputs: OutputRegistry,
 }
@@ -103,6 +120,8 @@ impl GlobalsBuilder {
                 data_control: self.data_control,
                 compositor: self.compositor,
                 layer_shell: self.layer_shell,
+                subcompositor: self.subcompositor,
+                viewporter: self.viewporter,
                 seat: self.seat,
             },
             self.outputs,
@@ -164,6 +183,24 @@ impl GlobalCollector for GlobalsBuilder {
                     name,
                     interface,
                     proto::ZWLR_LAYER_SHELL_V1.version.min(version),
+                )?);
+            }
+            n if n == proto::WL_SUBCOMPOSITOR.name && self.subcompositor.is_none() => {
+                self.subcompositor = Some(SurfaceBootstrap::bind(
+                    sender,
+                    registry,
+                    name,
+                    interface,
+                    proto::WL_SUBCOMPOSITOR.version.min(version),
+                )?);
+            }
+            n if n == proto::WP_VIEWPORTER.name && self.viewporter.is_none() => {
+                self.viewporter = Some(SurfaceBootstrap::bind(
+                    sender,
+                    registry,
+                    name,
+                    interface,
+                    proto::WP_VIEWPORTER.version.min(version),
                 )?);
             }
             // Deliberately *not* bound here. Binding during discovery means
@@ -243,19 +280,9 @@ impl ShotApp {
     /// having written nothing, so a keybind that opens the picker and gets
     /// dismissed exits 0 and leaves no file behind.
     fn run(&mut self, options: &ShotOptions) -> std::result::Result<(), String> {
-        let Some((output, region)) = self.resolve_capture(&options.target)? else {
+        let Some(frame) = self.capture(options)? else {
             return Ok(());
         };
-        let frame = self
-            .session
-            .capture(
-                &mut self.sender,
-                &mut self.events,
-                output,
-                region,
-                options.overlay_cursor,
-            )
-            .map_err(|e| e.to_string())?;
         let png = ShotWriter::encode(&frame)?;
         let path = PngDelivery::new(&png, options).persist()?;
         if options.clipboard {
@@ -264,22 +291,31 @@ impl ShotApp {
         Ok(())
     }
 
-    /// Resolve what to capture, running the interactive picker when asked.
+    /// Capture what `options` asks for, running the interactive picker when
+    /// asked.
     ///
     /// `None` means the user cancelled and nothing should be captured.
-    fn resolve_capture(
+    fn capture(
         &mut self,
-        target: &CaptureTarget,
-    ) -> std::result::Result<Option<(platform::id::OutputId, Option<CaptureRegion>)>, String> {
-        if let CaptureTarget::Selection(name) = target {
+        options: &ShotOptions,
+    ) -> std::result::Result<Option<CapturedFrame>, String> {
+        if let CaptureTarget::Selection(name) = &options.target {
             let output = name
                 .as_deref()
                 .map_or_else(|| self.first_output(), |name| self.output_named(name))?;
-            return Ok(self
-                .select_region(output)?
-                .map(|region| (output, Some(region))));
+            return self.capture_selection(output, options.overlay_cursor);
         }
-        self.resolve_target(target).map(Some)
+        let (output, region) = self.resolve_target(&options.target)?;
+        self.session
+            .capture(
+                &mut self.sender,
+                &mut self.events,
+                output,
+                region,
+                options.overlay_cursor,
+            )
+            .map(Some)
+            .map_err(|e| e.to_string())
     }
 
     /// Publish the PNG and remain alive until another clipboard source replaces it.
@@ -316,11 +352,56 @@ impl ShotApp {
         Ok(())
     }
 
-    /// Show the overlay on `output` and wait for a region or a cancel.
-    fn select_region(
+    /// Freeze `output`, let the user pick a region over the frozen image, and
+    /// crop the pick out of that same capture.
+    ///
+    /// Capturing before the overlay maps is what keeps hover and focus state
+    /// in the image: the overlay takes the pointer, and the app under it
+    /// redraws without its hover before any later capture could run.
+    fn capture_selection(
         &mut self,
         output: platform::id::OutputId,
-    ) -> std::result::Result<Option<CaptureRegion>, String> {
+        overlay_cursor: bool,
+    ) -> std::result::Result<Option<CapturedFrame>, String> {
+        let (globals, (seat_name, seat_version)) = self.picker_globals()?;
+        let frozen = self
+            .session
+            .capture_held(&mut self.sender, &mut self.events, output, None, overlay_cursor)
+            .map_err(|e| e.to_string())?;
+        let devices = SeatDevices::bind(
+            &mut self.sender,
+            &mut self.events,
+            self.registry,
+            seat_name,
+            seat_version,
+        )
+        .map_err(|e| e.to_string())??;
+        let mut overlay =
+            SelectionOverlay::create(&mut self.sender, &globals, devices, output, frozen)
+                .map_err(|e| e.to_string())?;
+        let picked = overlay
+            .pick(&mut self.sender, &mut self.events, &self.wake)
+            .map_err(|e| e.to_string())?;
+        let (Some(region), Some(surface)) = (picked, overlay.surface_size()) else {
+            return Ok(None);
+        };
+        let view = frozen.view();
+        let params = view.params();
+        let buffer_region =
+            RegionScale::new(surface, (params.width, params.height)).to_buffer(region);
+        let window = view
+            .window(buffer_region)
+            .ok_or_else(|| "selection lies outside the captured output".to_string())?;
+        Ok(Some(view.to_rgba(window)))
+    }
+
+    /// The globals and seat coordinates the picker needs, checked before
+    /// anything is captured or shown.
+    ///
+    /// The seat is bound by the caller after the frozen capture: binding it
+    /// earlier lets the capture's event loop discard `wl_keyboard.keymap` and
+    /// its fd, leaving the overlay unable to decode Escape.
+    fn picker_globals(&self) -> std::result::Result<(OverlayGlobals, (u32, u32)), String> {
         let (Some(compositor), Some(layer_shell), Some((seat_name, seat_version))) = (
             self.globals.compositor,
             self.globals.layer_shell,
@@ -332,29 +413,14 @@ impl ShotApp {
                 proto::ZWLR_LAYER_SHELL_V1.name
             ));
         };
-        // Bind input *before* mapping the overlay. If this fails we must not
-        // put anything on screen: a fullscreen surface with no way to receive
-        // Escape or a click is a locked screen, not a broken feature.
-        let devices = SeatDevices::bind(
-            &mut self.sender,
-            &mut self.events,
-            self.registry,
-            seat_name,
-            seat_version,
-        )
-        .map_err(|e| e.to_string())??;
-        let mut overlay = SelectionOverlay::create(
-            &mut self.sender,
+        let globals = OverlayGlobals {
             compositor,
             layer_shell,
-            devices,
-            self.globals.shm,
-            output,
-        )
-        .map_err(|e| e.to_string())?;
-        overlay
-            .pick(&mut self.sender, &mut self.events, &self.wake)
-            .map_err(|e| e.to_string())
+            shm: self.globals.shm,
+            subcompositor: self.globals.subcompositor,
+            viewporter: self.globals.viewporter,
+        };
+        Ok((globals, (seat_name, seat_version)))
     }
 
     /// The first advertised output, which single-monitor setups make

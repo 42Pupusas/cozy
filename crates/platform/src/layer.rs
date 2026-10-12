@@ -180,6 +180,26 @@ impl LayerSurfaceHandle {
         );
     }
 
+    /// Change keyboard interactivity from the main connection; takes effect
+    /// on the surface's next commit.
+    ///
+    /// # Errors
+    ///
+    /// Propagates protocol/socket failures.
+    pub fn set_keyboard_interactivity(
+        &self,
+        sender: &mut Sender,
+        mode: KeyboardInteractivity,
+    ) -> Result<()> {
+        Ok(sender.request(
+            MessageBuilder::new(
+                self.layer_surface,
+                LayerSurfaceRequest::SetKeyboardInteractivity,
+            )
+            .u32(mode as u32),
+        )?)
+    }
+
     /// Change keyboard interactivity from inside event dispatch; takes
     /// effect on the surface's next commit.
     pub fn set_keyboard_interactivity_queued(

@@ -70,7 +70,7 @@ impl ShotWriter {
 mod tests {
     use super::ShotWriter;
     use ixiptla_core::Png;
-    use screencopy::{CapturedFrame, FrameParams};
+    use screencopy::{CapturedFrame, FrameParams, FrameView};
 
     /// Decompression bound for decoding our own tiny test images back; these
     /// are a few dozen bytes, so anything non-trivial is generous.
@@ -87,7 +87,8 @@ mod tests {
         ];
         let params = FrameParams::new(platform::protocol::Format::Xrgb8888.code(), 2, 2, 8)
             .expect("valid params");
-        CapturedFrame::from_shm(&params, 0, &source).expect("converts")
+        let view = FrameView::new(params, 0, &source).expect("converts");
+        view.to_rgba(view.whole())
     }
 
     #[test]

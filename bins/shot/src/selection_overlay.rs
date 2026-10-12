@@ -4,22 +4,27 @@
 //! This is the `slurp` half of the `slurp | grim -g -` pipe, in-process. It
 //! owns only the Wayland side -- surface, layer role, seat devices, shm
 //! frames, event loop -- and delegates every decision: what the drag means to
-//! [`DragSelection`], what it looks like to [`SelectionPainter`]. Keeping the
-//! logic out of here is what lets the interesting parts be tested without a
-//! compositor, since this module fundamentally cannot be.
+//! [`DragSelection`], what it looks like to [`SelectionPainter`], and showing
+//! the screen as it was before the overlay appeared to [`FrozenBackdrop`].
+//! Keeping the logic out of here is what lets the interesting parts be tested
+//! without a compositor, since this module fundamentally cannot be.
 
 use crate::drag_selection::{DragSelection, SelectionOutcome};
+use crate::frozen_backdrop::FrozenBackdrop;
+use crate::keyboard_grab::KeyboardGrab;
+use crate::overlay_deadlines::OverlayDeadlines;
+use crate::overlay_globals::OverlayGlobals;
 use crate::seat_devices::SeatDevices;
 use crate::selection_painter::SelectionPainter;
 use platform::Result;
 use platform::conn::Sender;
 use platform::draw::Canvas;
 use platform::event::RawEvent;
-use platform::id::{CompositorId, LayerShellId, OutputId, PoolId, ShmId};
+use platform::id::{OutputId, PoolId, ShmId};
 use platform::keyboard_decoder::{KeyboardDecoder, KeyboardUpdate};
 use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::protocol::{
-    Anchor, ButtonState, Format, KeyboardInteractivity, Layer, LayerSurfaceEvent, PointerButton,
+    Anchor, ButtonState, Format, Layer, LayerSurfaceEvent, PointerButton,
     PointerEvent, SurfaceRequest,
 };
 use platform::protocol::{BufferEvent, BufferRequest, ShmPoolRequest};
@@ -28,33 +33,19 @@ use platform::sys::ShmBuffer;
 use platform::toplevel::Key;
 use platform::wire::MessageBuilder;
 use quetzalcoatl::spsc::Consumer;
-use screencopy::CaptureRegion;
-use std::time::{Duration, Instant};
+use screencopy::{CaptureRegion, HeldFrame};
+use std::time::Instant;
 
 const APP_ID: &str = "shot";
 
-/// How long the picker may stay on screen without the compositor ever
-/// configuring it.
-///
-/// This is a deadman switch, not a UX timeout. A fullscreen `Overlay`-layer
-/// surface holding exclusive keyboard focus is indistinguishable from a
-/// locked screen if input never arrives, and the user's only recourse is a
-/// hard restart -- which is exactly what happened once. If the surface has
-/// not even been configured within this window, something is wrong enough
-/// that vanishing is strictly better than persisting.
-const CONFIGURE_DEADLINE: Duration = Duration::from_secs(5);
-
-/// How long the picker may stay mapped with no input event at all.
-///
-/// Generous, because a user genuinely may take their time aiming. It only
-/// fires when *nothing* arrives -- any pointer motion or key press resets it
-/// -- so a live picker never hits it, while a picker whose input is going
-/// somewhere else cannot outlive it.
-const IDLE_DEADLINE: Duration = Duration::from_mins(2);
-
 /// A fullscreen overlay on one output, driven until the user picks or cancels.
-pub struct SelectionOverlay {
+///
+/// Borrows the frozen capture for `'f`, so the shm pool the backdrop
+/// displays outlives the overlay.
+pub struct SelectionOverlay<'f> {
     layer: LayerSurfaceHandle,
+    frozen: HeldFrame<'f>,
+    backdrop: Option<FrozenBackdrop>,
     /// Devices bound *before* the surface was mapped, so Escape and clicks
     /// are guaranteed to have somewhere to arrive.
     devices: SeatDevices,
@@ -65,43 +56,31 @@ pub struct SelectionOverlay {
     selection: DragSelection,
     painter: SelectionPainter,
     keyboard: KeyboardDecoder,
+    grab: KeyboardGrab,
     /// Set when the compositor closes the surface out from under us.
     closed: bool,
-    /// When the overlay was created, for the configure deadman switch.
-    created: Instant,
-    /// Last time any input event arrived, for the idle deadman switch.
-    last_input: Instant,
+    deadlines: OverlayDeadlines,
 }
 
-impl SelectionOverlay {
-    /// Create the overlay surface, anchored to all four edges of `output`.
+impl<'f> SelectionOverlay<'f> {
+    /// Create the overlay surface, anchored to all four edges of `output`,
+    /// over a backdrop showing `frozen`.
     ///
     /// # Errors
     ///
     /// Propagates protocol/socket failures.
     pub fn create(
         sender: &mut Sender,
-        compositor: CompositorId,
-        layer_shell: LayerShellId,
+        globals: &OverlayGlobals,
         devices: SeatDevices,
-        shm: ShmId,
         output: OutputId,
+        frozen: HeldFrame<'f>,
     ) -> Result<Self> {
-        // Exclusive keyboard focus so Escape reaches us rather than whatever
-        // was focused underneath -- but *only* when a keyboard was actually
-        // bound. Taking exclusive focus without one is what makes an
-        // undismissable screen: the compositor dutifully routes every key to
-        // a client that has no keyboard object to receive them, so Escape
-        // reaches nothing and no other window can be focused either.
-        let interactivity = if devices.can_cancel_by_key() {
-            KeyboardInteractivity::Exclusive
-        } else {
-            KeyboardInteractivity::None
-        };
+        let grab = KeyboardGrab::new(devices.can_cancel_by_key());
         let layer = LayerSurfaceHandle::create(
             sender,
-            compositor,
-            layer_shell,
+            globals.compositor,
+            globals.layer_shell,
             &LayerSurfaceConfig {
                 // Overlay, not Top: the picker must float above every other
                 // layer-shell client (bars, notifications) or the user
@@ -122,22 +101,24 @@ impl SelectionOverlay {
                 // picker and the strip behind the bar could never be selected.
                 exclusive_zone: Some(-1),
                 margin: None,
-                keyboard_interactivity: interactivity,
+                keyboard_interactivity: KeyboardGrab::initial(),
             },
         )?;
-        let now = Instant::now();
+        let backdrop = FrozenBackdrop::create(sender, globals, layer.surface)?;
         Ok(Self {
             layer,
+            frozen,
+            backdrop,
             devices,
-            shm,
+            shm: globals.shm,
             size: None,
             frames: None,
             selection: DragSelection::new(0, 0),
             painter: SelectionPainter::default(),
             keyboard: KeyboardDecoder::new(),
+            grab,
             closed: false,
-            created: now,
-            last_input: now,
+            deadlines: OverlayDeadlines::starting_at(Instant::now()),
         })
     }
 
@@ -163,12 +144,10 @@ impl SelectionOverlay {
             if self.closed {
                 return Ok(None);
             }
-            if let Some(reason) = self.expired() {
-                // Tear down first, then report: leaving a surface up while
-                // printing a diagnostic is the failure we are guarding
-                // against.
+            let configured = self.size.is_some();
+            if let Some(expiry) = self.deadlines.expired(Instant::now(), configured) {
                 self.destroy(sender)?;
-                eprintln!("shot: {reason}");
+                eprintln!("shot: {}", expiry.message());
                 return Ok(None);
             }
             match self.selection.outcome() {
@@ -184,40 +163,15 @@ impl SelectionOverlay {
                 }
                 SelectionOutcome::Pending => {}
             }
-            let _ = wake.wait(self.deadman_wait_ms());
+            let _ = wake.wait(self.deadlines.wait_ms(Instant::now(), configured));
             wake.drain();
         }
     }
 
-    /// Milliseconds until the nearest deadman switch can trip, so the loop
-    /// sleeps exactly that long when no event arrives.
-    fn deadman_wait_ms(&self) -> i32 {
-        let mut remaining = IDLE_DEADLINE.saturating_sub(self.last_input.elapsed());
-        if self.size.is_none() {
-            remaining = remaining.min(CONFIGURE_DEADLINE.saturating_sub(self.created.elapsed()));
-        }
-        i32::try_from(remaining.as_millis())
-            .unwrap_or(i32::MAX)
-            .max(1)
-    }
-
-    /// Whether a deadman switch has tripped, and why.
-    ///
-    /// Split out so the two deadlines are stated in one place rather than
-    /// buried in the loop: this is the code that guarantees the picker cannot
-    /// become a permanent fixture on the user's screen.
-    fn expired(&self) -> Option<String> {
-        if self.size.is_none() && self.created.elapsed() >= CONFIGURE_DEADLINE {
-            return Some(
-                "the compositor never configured the selection overlay; giving up rather \
-                 than leaving an invisible surface covering the screen"
-                    .to_string(),
-            );
-        }
-        if self.last_input.elapsed() >= IDLE_DEADLINE {
-            return Some("selection timed out with no input; cancelled".to_string());
-        }
-        None
+    /// The overlay's logical size, the space a picked region is given in.
+    #[must_use]
+    pub const fn surface_size(&self) -> Option<(i32, i32)> {
+        self.size
     }
 
     /// Tear the overlay down and make sure the compositor has actually
@@ -229,6 +183,9 @@ impl SelectionOverlay {
             }
             sender.request(MessageBuilder::new(pool, ShmPoolRequest::Destroy))?;
         }
+        if let Some(backdrop) = self.backdrop.take() {
+            backdrop.destroy(sender)?;
+        }
         self.layer.destroy(sender)?;
         Ok(())
     }
@@ -236,23 +193,38 @@ impl SelectionOverlay {
     /// Route one event to whichever object it belongs to.
     fn handle_event(&mut self, sender: &mut Sender, ev: &RawEvent) -> Result<()> {
         if let RawEvent::Fd(fds) = ev {
-            self.keyboard.absorb_keymap_fd(fds);
+            if self.keyboard.absorb_keymap_fd(fds) {
+                self.grant_keyboard(sender)?;
+            }
             return Ok(());
         }
         if ev.is(self.layer.layer_surface) {
             return self.handle_layer_surface(sender, ev);
         }
         if self.devices.pointer().is_some_and(|p| ev.is(p)) {
-            self.last_input = Instant::now();
+            self.deadlines.input_at(Instant::now());
             self.handle_pointer(ev);
             return self.repaint(sender);
         }
         if self.devices.keyboard().is_some_and(|k| ev.is(k)) {
-            self.last_input = Instant::now();
+            self.deadlines.input_at(Instant::now());
             self.handle_keyboard(ev);
             return Ok(());
         }
         self.release_buffer(ev);
+        Ok(())
+    }
+
+    /// Take exclusive keyboard focus once Escape can actually be decoded.
+    fn grant_keyboard(&mut self, sender: &mut Sender) -> Result<()> {
+        let Some(mode) = self.grab.on_keymap(self.keyboard.has_keymap()) else {
+            return Ok(());
+        };
+        self.layer.set_keyboard_interactivity(sender, mode)?;
+        sender.request(MessageBuilder::new(
+            self.layer.surface,
+            SurfaceRequest::Commit,
+        ))?;
         Ok(())
     }
 
@@ -317,6 +289,9 @@ impl SelectionOverlay {
         )?);
         self.size = Some((width, height));
         self.selection = DragSelection::new(width, height);
+        if let Some(backdrop) = self.backdrop.as_mut() {
+            backdrop.show(sender, &self.frozen, (width, height))?;
+        }
         self.repaint(sender)
     }
 

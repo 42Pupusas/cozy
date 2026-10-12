@@ -30,22 +30,12 @@ use platform::wire::{MessageBuilder, WireEvent};
 use quetzalcoatl::spsc::Consumer;
 
 use crate::capture_error::{Result, ScreencopyError};
+use crate::capture_region::CaptureRegion;
 use crate::captured_frame::CapturedFrame;
 use crate::frame_handshake::{FrameHandshake, Step};
 use crate::frame_params::FrameParams;
-
-/// The rectangle to capture, in an output's logical coordinates.
-///
-/// Kept distinct from a bare tuple because `capture_output_region` takes the
-/// four numbers positionally, and transposing x/y or width/height there yields
-/// a plausible-looking screenshot of the wrong place.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct CaptureRegion {
-    pub x: i32,
-    pub y: i32,
-    pub width: i32,
-    pub height: i32,
-}
+use crate::frame_view::FrameView;
+use crate::held_frame::HeldFrame;
 
 /// Drives `zwlr_screencopy_manager_v1` to pull pixels off one output.
 ///
@@ -106,13 +96,33 @@ impl ScreencopySession {
         region: Option<CaptureRegion>,
         overlay_cursor: bool,
     ) -> Result<CapturedFrame> {
+        let held = self.capture_held(sender, events, output, region, overlay_cursor)?;
+        let view = held.view();
+        Ok(view.to_rgba(view.whole()))
+    }
+
+    /// Capture like [`Self::capture`], but leave the pixels in the session's
+    /// shm pool and lend them out instead of converting them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::capture`].
+    pub fn capture_held(
+        &mut self,
+        sender: &mut Sender,
+        events: &mut Consumer<RawEvent>,
+        output: OutputId,
+        region: Option<CaptureRegion>,
+        overlay_cursor: bool,
+    ) -> Result<HeldFrame<'_>> {
         let frame = self.request_frame(sender, output, region, overlay_cursor)?;
         let mut handshake = FrameHandshake::new(self.version);
         let result = self.run_handshake(sender, events, frame, &mut handshake);
         // A frame object is single-use and must be destroyed whether it
         // succeeded or failed, or the compositor leaks it for our lifetime.
         let _ = sender.request(MessageBuilder::new(frame, ScreencopyFrameRequest::Destroy));
-        result
+        let (params, flags) = result?;
+        self.hold(params, flags)
     }
 
     /// Ask the compositor for a frame covering `output` (or part of it).
@@ -153,7 +163,7 @@ impl ScreencopySession {
         events: &mut Consumer<RawEvent>,
         frame: ScreencopyFrameId,
         handshake: &mut FrameHandshake,
-    ) -> Result<CapturedFrame> {
+    ) -> Result<(FrameParams, u32)> {
         loop {
             let event = events.pop_block().ok_or(PlatformError::ReaderStopped)?;
             // `wl_display.error` is the one message that must never be
@@ -192,7 +202,7 @@ impl ScreencopySession {
                 }
                 Step::Done { flags } => {
                     let params = handshake.committed().ok_or(ScreencopyError::NoBuffer)?;
-                    return self.read_captured(params, flags);
+                    return Ok((params, flags));
                 }
                 Step::Failed(e) => return Err(e.into()),
             }
@@ -237,15 +247,13 @@ impl ScreencopySession {
         Ok(self.pool.as_ref().expect("just created").buffer)
     }
 
-    /// Convert the pool's bytes into an encoder-ready image.
-    fn read_captured(&mut self, params: FrameParams, flags: u32) -> Result<CapturedFrame> {
+    /// Lend out the pool's bytes as the capture just completed.
+    fn hold(&mut self, params: FrameParams, flags: u32) -> Result<HeldFrame<'_>> {
         // `Done` is only reachable after `SendCopy` built the pool.
         let pool = self.pool.as_mut().ok_or(ScreencopyError::NoBuffer)?;
-        Ok(CapturedFrame::from_shm(
-            &params,
-            flags,
-            pool.memory.bytes(0),
-        )?)
+        let buffer = pool.buffer;
+        let view = FrameView::new(params, flags, pool.memory.bytes(0))?;
+        Ok(HeldFrame::new(view, buffer))
     }
 }
 

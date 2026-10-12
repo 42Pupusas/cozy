@@ -48,6 +48,9 @@ struct Body {
 }
 
 impl Body {
+    const GROW_MS: u16 = 280;
+    const MOVE_MS: u16 = 260;
+
     fn arriving(dest: &Destination, start_ms: u64) -> Self {
         Self {
             key: dest.key.clone(),
@@ -99,9 +102,9 @@ impl Body {
 
     fn step(&mut self, now_ms: u64, elapsed_ms: u16) {
         if now_ms >= self.start_ms {
-            self.grown.step(elapsed_ms, TileGrowth::GROW_MS);
+            self.grown.step(elapsed_ms, Self::GROW_MS);
         }
-        self.travel.step(elapsed_ms, TileGrowth::MOVE_MS);
+        self.travel.step(elapsed_ms, Self::MOVE_MS);
     }
 
     const fn settle(&mut self) {
@@ -143,8 +146,6 @@ pub struct TileGrowth {
 }
 
 impl TileGrowth {
-    const GROW_MS: u16 = 280;
-    const MOVE_MS: u16 = 260;
     const MAX_STEP_MS: u64 = 64;
     const STAGGER_MS: u64 = 55;
     const LONGEST_STAGGER_MS: u64 = 500;

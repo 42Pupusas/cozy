@@ -71,6 +71,9 @@ pub enum Arrival {
 }
 
 impl Body {
+    const GROW_MS: u16 = 280;
+    const MOVE_MS: u16 = 260;
+
     const fn arriving(dest: &Destination, start_ms: u64, grown: Fade) -> Self {
         Self {
             id: dest.id,
@@ -136,9 +139,9 @@ impl Body {
 
     fn step(&mut self, now_ms: u64, elapsed_ms: u16) {
         if now_ms >= self.start_ms {
-            self.grown.step(elapsed_ms, TileGrowth::GROW_MS);
+            self.grown.step(elapsed_ms, Self::GROW_MS);
         }
-        self.travel.step(elapsed_ms, TileGrowth::MOVE_MS);
+        self.travel.step(elapsed_ms, Self::MOVE_MS);
     }
 
     const fn settle(&mut self) {
@@ -164,8 +167,6 @@ pub struct TileGrowth {
 }
 
 impl TileGrowth {
-    const GROW_MS: u16 = 280;
-    const MOVE_MS: u16 = 260;
     const MAX_STEP_MS: u64 = 64;
     const STAGGER_MS: u64 = 55;
     const LONGEST_STAGGER_MS: u64 = 500;
@@ -229,7 +230,8 @@ impl TileGrowth {
                 } else {
                     Fade::rising()
                 };
-                self.bodies.push(Body::arriving(dest, now_ms + delay, grown));
+                self.bodies
+                    .push(Body::arriving(dest, now_ms + delay, grown));
             }
         }
         if resized {
@@ -442,7 +444,13 @@ mod tests {
     #[test]
     fn another_folder_grows_again_from_nothing() {
         let (mut growth, clock, targets) = landed(4);
-        growth.aim(Path::new("/b"), BOUNDS, &targets, clock.0 + 100, Arrival::Grow);
+        growth.aim(
+            Path::new("/b"),
+            BOUNDS,
+            &targets,
+            clock.0 + 100,
+            Arrival::Grow,
+        );
         assert_eq!(growth.shape(id(0)).expect("followed").grown, 0);
         assert!(growth.is_animating());
     }
@@ -450,7 +458,13 @@ mod tests {
     #[test]
     fn a_folder_that_arrives_present_needs_no_growing() {
         let (mut growth, clock, targets) = landed(4);
-        growth.aim(Path::new("/b"), BOUNDS, &targets, clock.0 + 100, Arrival::Present);
+        growth.aim(
+            Path::new("/b"),
+            BOUNDS,
+            &targets,
+            clock.0 + 100,
+            Arrival::Present,
+        );
         assert_eq!(growth.shape(id(0)).expect("followed").grown, 255);
         assert!(!growth.is_animating());
     }

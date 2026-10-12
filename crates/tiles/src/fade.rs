@@ -37,7 +37,6 @@ impl Fade {
         }
     }
 
-    /// How far along the fade is, uneased, from 0 to 1.
     #[must_use]
     pub const fn progress(self) -> f32 {
         self.progress

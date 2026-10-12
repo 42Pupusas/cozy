@@ -282,6 +282,7 @@ impl Painter for ChooserView {
             overlay: &PlainTiles,
         }
         .tiles(&placed, more);
+        let tiles = self.scene.stage(&flow, self.model.navigator(), tiles);
         TilePainter::new(&self.theme, &mut self.type_scale).paint(canvas, &tiles);
         let layout = self.layout();
         let state = self.footer_state();

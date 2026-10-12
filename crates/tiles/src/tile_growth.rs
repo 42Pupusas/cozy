@@ -61,8 +61,17 @@ struct Body {
     start_ms: u64,
 }
 
+/// How a new folder's tiles appear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrival {
+    /// Each grows from the centre of its cell, one after another.
+    Grow,
+    /// All are there at full size at once.
+    Present,
+}
+
 impl Body {
-    const fn arriving(dest: &Destination, start_ms: u64) -> Self {
+    const fn arriving(dest: &Destination, start_ms: u64, grown: Fade) -> Self {
         Self {
             id: dest.id,
             row: dest.row,
@@ -71,7 +80,7 @@ impl Body {
             from_slot: dest.slot,
             to_slot: dest.slot,
             travel: Fade::full(),
-            grown: Fade::rising(),
+            grown,
             wanted: true,
             start_ms,
         }
@@ -182,8 +191,16 @@ impl TileGrowth {
     /// Point the tiles at `targets`, the field's tiles in spiral order, in
     /// the folder `scene` laid out inside `bounds`. A change of `bounds`
     /// (the window being resized) moves the tiles at once rather than
-    /// having them trail behind the edge being dragged.
-    pub fn aim(&mut self, scene: &Path, bounds: Rect, targets: &[Destination], now_ms: u64) {
+    /// having them trail behind the edge being dragged. `arrival` says how
+    /// the tiles of a folder not seen before appear.
+    pub fn aim(
+        &mut self,
+        scene: &Path,
+        bounds: Rect,
+        targets: &[Destination],
+        now_ms: u64,
+        arrival: Arrival,
+    ) {
         let entrance = self.scene.as_deref() != Some(scene);
         if entrance {
             self.bodies.clear();
@@ -207,7 +224,12 @@ impl TileGrowth {
                 } else {
                     0
                 };
-                self.bodies.push(Body::arriving(dest, now_ms + delay));
+                let grown = if entrance && arrival == Arrival::Present {
+                    Fade::full()
+                } else {
+                    Fade::rising()
+                };
+                self.bodies.push(Body::arriving(dest, now_ms + delay, grown));
             }
         }
         if resized {
@@ -308,7 +330,7 @@ impl Default for TileGrowth {
 
 #[cfg(test)]
 mod tests {
-    use super::{Destination, Shape, TileGrowth};
+    use super::{Arrival, Destination, Shape, TileGrowth};
     use crate::tile_id::TileId;
     use platform::draw::Rect;
     use std::path::Path;
@@ -341,7 +363,7 @@ mod tests {
         fn run(&mut self, growth: &mut TileGrowth, targets: &[Destination], frames: u64) {
             for _ in 0..frames {
                 self.0 += 16;
-                growth.aim(Path::new(HERE), BOUNDS, targets, self.0);
+                growth.aim(Path::new(HERE), BOUNDS, targets, self.0, Arrival::Grow);
                 growth.advance(self.0);
             }
         }
@@ -366,7 +388,7 @@ mod tests {
     #[test]
     fn a_new_scene_starts_with_nothing_grown() {
         let mut growth = TileGrowth::new();
-        growth.aim(Path::new(HERE), BOUNDS, &names(6), 1000);
+        growth.aim(Path::new(HERE), BOUNDS, &names(6), 1000, Arrival::Grow);
         assert_eq!(growth.shape(id(0)).expect("followed").grown, 0);
         assert_eq!(growth.shape(id(5)).expect("followed").grown, 0);
         assert!(growth.is_animating());
@@ -408,7 +430,7 @@ mod tests {
         let mut now = 0;
         loop {
             now += 16;
-            growth.aim(Path::new(HERE), BOUNDS, &targets, now);
+            growth.aim(Path::new(HERE), BOUNDS, &targets, now, Arrival::Grow);
             growth.advance(now);
             if !growth.is_animating() {
                 break;
@@ -420,9 +442,27 @@ mod tests {
     #[test]
     fn another_folder_grows_again_from_nothing() {
         let (mut growth, clock, targets) = landed(4);
-        growth.aim(Path::new("/b"), BOUNDS, &targets, clock.0 + 100);
+        growth.aim(Path::new("/b"), BOUNDS, &targets, clock.0 + 100, Arrival::Grow);
         assert_eq!(growth.shape(id(0)).expect("followed").grown, 0);
         assert!(growth.is_animating());
+    }
+
+    #[test]
+    fn a_folder_that_arrives_present_needs_no_growing() {
+        let (mut growth, clock, targets) = landed(4);
+        growth.aim(Path::new("/b"), BOUNDS, &targets, clock.0 + 100, Arrival::Present);
+        assert_eq!(growth.shape(id(0)).expect("followed").grown, 255);
+        assert!(!growth.is_animating());
+    }
+
+    #[test]
+    fn a_tile_found_later_in_a_present_folder_still_grows() {
+        let mut growth = TileGrowth::new();
+        let mut targets = names(2);
+        growth.aim(Path::new("/b"), BOUNDS, &targets, 0, Arrival::Present);
+        targets.push(dest("found", 300));
+        growth.aim(Path::new("/b"), BOUNDS, &targets, 16, Arrival::Present);
+        assert_eq!(growth.shape(TileId::of("found")).expect("new").grown, 0);
     }
 
     #[test]
@@ -556,6 +596,7 @@ mod tests {
             Rect::new(0, 0, 900, 1000),
             &targets,
             clock.0 + 16,
+            Arrival::Grow,
         );
         assert_eq!(
             growth.shape(id(0)).expect("followed").rect,
@@ -566,7 +607,7 @@ mod tests {
     #[test]
     fn a_stalled_frame_resumes_instead_of_skipping_to_the_end() {
         let mut growth = TileGrowth::new();
-        growth.aim(Path::new(HERE), BOUNDS, &names(1), 0);
+        growth.aim(Path::new(HERE), BOUNDS, &names(1), 0, Arrival::Grow);
         growth.advance(10_000);
         assert!(growth.shape(id(0)).expect("followed").grown < 255);
     }

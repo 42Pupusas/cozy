@@ -37,6 +37,12 @@ impl Fade {
         }
     }
 
+    /// How far along the fade is, uneased, from 0 to 1.
+    #[must_use]
+    pub const fn progress(self) -> f32 {
+        self.progress
+    }
+
     pub const fn aim(&mut self, up: bool) {
         self.target = if up { 1.0 } else { 0.0 };
     }
@@ -53,6 +59,11 @@ impl Fade {
     #[must_use]
     pub fn is_settled(self) -> bool {
         (self.progress - self.target).abs() < f32::EPSILON
+    }
+
+    #[must_use]
+    pub fn is_full(self) -> bool {
+        self.progress >= 1.0 && self.target >= 1.0
     }
 
     #[must_use]

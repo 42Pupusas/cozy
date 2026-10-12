@@ -75,6 +75,7 @@ impl TileAssembly<'_> {
 
     fn more_tile(&self, more: &PlacedMore, shape: Shape) -> PaintedTile {
         PaintedTile {
+            id: TileId::More,
             rect: shape.rect,
             slot: shape.slot,
             from_slot: shape.from_slot,
@@ -88,6 +89,8 @@ impl TileAssembly<'_> {
             raise: self.scene.motion().raise(TileKey::More),
             reveal: 0,
             grown: shape.grown,
+            veil: 0,
+            layer: 0,
             glow: [0; TileAction::ALL.len()],
             press: [0; TileAction::ALL.len()],
             tray: None,
@@ -112,6 +115,7 @@ impl TileAssembly<'_> {
             RowFormat::color(entry, self.theme)
         };
         Some(PaintedTile {
+            id: TileId::of(&entry.name),
             rect: shape.rect,
             slot: shape.slot,
             from_slot: shape.from_slot,
@@ -125,6 +129,8 @@ impl TileAssembly<'_> {
             raise: motion.raise(key),
             reveal: motion.reveal(key),
             grown: shape.grown,
+            veil: 0,
+            layer: 0,
             glow: TileAction::ALL.map(|action| motion.glow(row, action)),
             press: TileAction::ALL.map(|action| motion.press(row, action)),
             tray: self.overlay.tray(row),

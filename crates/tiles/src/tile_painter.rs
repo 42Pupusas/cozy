@@ -18,11 +18,15 @@ use crate::theme::Theme;
 use crate::tile_action::TileAction;
 use crate::tile_geometry::TileGeometry;
 use crate::tile_growth::TileGrowth;
+use crate::tile_id::TileId;
 use crate::typography::Typography;
 
-/// One tile's strings and states for a frame.
+/// One tile's strings and states for a frame. `veil` is how far the tile
+/// has faded into the background, and a higher `layer` is painted over a
+/// lower one whatever their rise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaintedTile {
+    pub id: TileId,
     pub rect: Rect,
     pub slot: usize,
     pub from_slot: usize,
@@ -36,9 +40,29 @@ pub struct PaintedTile {
     pub raise: u8,
     pub reveal: u8,
     pub grown: u8,
+    pub veil: u8,
+    pub layer: u8,
     pub glow: [u8; TileAction::ALL.len()],
     pub press: [u8; TileAction::ALL.len()],
     pub tray: Option<PaintedTray>,
+}
+
+impl PaintedTile {
+    /// The tile as it looks with nothing pointing at it, selecting it or
+    /// dropping onto it.
+    #[must_use]
+    pub fn at_rest(self) -> Self {
+        Self {
+            chosen: 0,
+            drop_target: false,
+            raise: 0,
+            reveal: 0,
+            glow: [0; TileAction::ALL.len()],
+            press: [0; TileAction::ALL.len()],
+            tray: None,
+            ..self
+        }
+    }
 }
 
 /// The extra rows a right click added to a tile, and how far they have opened.
@@ -106,7 +130,7 @@ impl<'a> TilePainter<'a> {
     /// land over its neighbours.
     pub fn paint(&mut self, canvas: &mut Canvas<'_>, tiles: &[PaintedTile]) {
         let mut order: Vec<&PaintedTile> = tiles.iter().collect();
-        order.sort_by_key(|tile| (tile.raise, tile.tray.is_some()));
+        order.sort_by_key(|tile| (tile.layer, tile.raise, tile.tray.is_some()));
         for tile in order {
             self.paint_tile(canvas, tile);
         }
@@ -119,7 +143,7 @@ impl<'a> TilePainter<'a> {
         if resting.w <= 0 || resting.h <= 0 {
             return;
         }
-        if tile.grown < u8::MAX {
+        if tile.grown < u8::MAX || tile.veil > 0 {
             self.paint_growing(canvas, tile, &geometry);
             return;
         }
@@ -162,8 +186,9 @@ impl<'a> TilePainter<'a> {
         self.paint_rows(canvas, tile, lift, surface);
     }
 
-    /// A tile still growing into its cell: the glass and border at the size
-    /// reached so far, and the text fading in once it is nearly full size.
+    /// A tile still growing into its cell, or fading into the background:
+    /// the glass and border at the size reached so far, and the text only
+    /// once it is nearly full size and still clear of the background.
     fn paint_growing(
         &mut self,
         canvas: &mut Canvas<'_>,
@@ -176,10 +201,15 @@ impl<'a> TilePainter<'a> {
             return;
         }
         let radius = (theme.spacing.radius() * 2).min(rect.w / 2).min(rect.h / 2);
-        let surface = self.resting(tile);
+        let surface = self
+            .resting(tile)
+            .blend_opaque_color(theme.background, tile.veil);
+        let border = theme
+            .sidebar_border
+            .blend_opaque_color(theme.background, tile.veil);
         canvas.fill_round_rect_glass(rect, surface, radius);
-        canvas.draw_round_rect(rect, theme.sidebar_border, radius);
-        let text = TileGrowth::text(tile.grown);
+        canvas.draw_round_rect(rect, border, radius);
+        let text = Self::scaled(u16::from(TileGrowth::text(tile.grown)), u8::MAX - tile.veil);
         if text == 0 {
             return;
         }
@@ -529,6 +559,7 @@ mod tests {
 
         fn tile(rect: Rect) -> PaintedTile {
             PaintedTile {
+                id: crate::tile_id::TileId::of("report.pdf"),
                 rect,
                 slot: 0,
                 from_slot: 0,
@@ -542,6 +573,8 @@ mod tests {
                 raise: 0,
                 reveal: 0,
                 grown: u8::MAX,
+                veil: 0,
+                layer: 0,
                 glow: [0; TileAction::ALL.len()],
                 press: [0; TileAction::ALL.len()],
                 tray: None,

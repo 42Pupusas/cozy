@@ -26,9 +26,13 @@ pub mod tile_growth;
 pub mod tile_id;
 pub mod tile_motion;
 pub mod tile_painter;
+pub mod tile_passage;
 pub mod tile_rank;
 pub mod tile_scene;
+pub mod tile_stage;
 pub mod tile_style;
+pub mod tile_transition;
+pub mod tile_zoom;
 pub mod toolbar;
 pub mod typography;
 

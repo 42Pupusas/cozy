@@ -555,6 +555,9 @@ impl FilesWindow {
         self.scene.reaim_if_primed(&flow, self.browser.navigator());
         let placed = self.tile_layout();
         let tiles = self.painted_tiles(&placed);
+        let tiles = self
+            .scene
+            .stage(&flow, self.browser.navigator(), tiles);
         let rename = self.tile_rename(&placed);
         let mut brush = TilePainter::new(&self.theme, &mut self.type_scale);
         brush.paint(canvas, &tiles);

@@ -10,9 +10,11 @@ use crate::spiral::MinCell;
 use crate::spiral_cursor::{Landing, SpiralCursor};
 use crate::tile_action::TileAction;
 use crate::tile_field::{Page, PlacedMore, PlacedTile, TileField};
-use crate::tile_growth::{Destination, TileGrowth};
+use crate::tile_growth::{Arrival, Destination, TileGrowth};
 use crate::tile_id::TileId;
 use crate::tile_motion::TileMotion;
+use crate::tile_painter::PaintedTile;
+use crate::tile_stage::TileStage;
 
 /// The room the spiral is laid out in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +47,7 @@ pub struct TileScene {
     field: TileField,
     motion: TileMotion,
     growth: TileGrowth,
+    stage: TileStage,
     clock_ms: u64,
 }
 
@@ -57,6 +60,7 @@ impl TileScene {
             field: TileField::new(wake),
             motion: TileMotion::new(),
             growth: TileGrowth::new(),
+            stage: TileStage::new(),
             clock_ms: 0,
         }
     }
@@ -183,8 +187,26 @@ impl TileScene {
 
     pub fn aim_growth(&mut self, flow: &Flow, nav: &DirectoryBrowser) {
         let targets = self.targets(flow, nav);
+        let arrival = if self.stage.notice(nav.path(), flow.area, self.clock_ms) {
+            Arrival::Present
+        } else {
+            Arrival::Grow
+        };
         self.growth
-            .aim(nav.path(), flow.area, &targets, self.clock_ms);
+            .aim(nav.path(), flow.area, &targets, self.clock_ms, arrival);
+    }
+
+    /// The tiles `shown` for the folder `nav` is in, as this frame draws
+    /// them: zooming into or out of the folder last drawn while that
+    /// transition runs.
+    pub fn stage(
+        &mut self,
+        flow: &Flow,
+        nav: &DirectoryBrowser,
+        shown: Vec<PaintedTile>,
+    ) -> Vec<PaintedTile> {
+        self.stage
+            .stage(nav.path(), flow.area, shown, self.clock_ms)
     }
 
     pub fn reaim_if_primed(&mut self, flow: &Flow, nav: &DirectoryBrowser) {
@@ -230,6 +252,7 @@ impl TileScene {
         self.field.sync(nav);
         self.aim_growth(flow, nav);
         self.growth.advance(now_ms);
+        self.stage.advance(now_ms);
         self.motion.aim(
             aim.spot,
             aim.cursor,
@@ -248,7 +271,7 @@ impl TileScene {
 
     #[must_use]
     pub fn is_animating(&self) -> bool {
-        self.motion.is_animating() || self.growth.is_animating()
+        self.motion.is_animating() || self.growth.is_animating() || self.stage.is_animating()
     }
 
     #[must_use]
@@ -455,6 +478,50 @@ mod tests {
         let mut scene = scene();
         scene.step(&flow(1), &nav, &idle(), 4242);
         assert_eq!(scene.clock_ms(), 4242);
+    }
+
+    fn painted(scene: &mut TileScene, flow: &Flow, nav: &DirectoryBrowser) -> Vec<String> {
+        let placed = scene.layout(flow);
+        let more = scene.more(flow);
+        let tiles = crate::tile_assembly::TileAssembly {
+            scene,
+            nav,
+            theme: &crate::theme::Theme::default(),
+            overlay: &crate::tile_assembly::PlainTiles,
+        }
+        .tiles(&placed, more);
+        scene
+            .stage(flow, nav, tiles)
+            .into_iter()
+            .map(|tile| tile.name)
+            .collect()
+    }
+
+    #[test]
+    fn entering_a_folder_zooms_through_its_tile_and_going_up_zooms_back() {
+        let (mut nav, dir) = folder("scene_zoom", 3);
+        dir.create_file("inner/a", &[0; 50]);
+        nav.refresh();
+        let flow = flow(1);
+        let mut scene = scene();
+        let now = settle(&mut scene, &flow, &nav);
+        assert_eq!(painted(&mut scene, &flow, &nav).len(), 4);
+
+        nav.go_to(&dir.path().join("inner"));
+        assert!(scene.step(&flow, &nav, &idle(), now + 16));
+        let mid = painted(&mut scene, &flow, &nav);
+        assert!(mid.contains(&"f00".to_owned()), "the old tiles stay in sight");
+        assert!(mid.contains(&"a".to_owned()));
+        let now = settle(&mut scene, &flow, &nav);
+        assert_eq!(painted(&mut scene, &flow, &nav), ["a"]);
+
+        nav.go_up();
+        assert!(scene.step(&flow, &nav, &idle(), now + 16));
+        assert!(!scene.growth().is_animating(), "the parent arrives grown");
+        let back = painted(&mut scene, &flow, &nav);
+        assert!(back.contains(&"a".to_owned()), "the inner tile shrinks away");
+        settle(&mut scene, &flow, &nav);
+        assert_eq!(painted(&mut scene, &flow, &nav).len(), 4);
     }
 
     #[test]

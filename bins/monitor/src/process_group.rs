@@ -64,13 +64,35 @@ impl ProcessGrouper {
             group.memory_kb += process.memory_kb;
         }
         let mut grouped: Vec<ProcessGroup> = groups.into_values().collect();
-        grouped.sort_by(|a, b| {
+        Self::rank(&mut grouped);
+        grouped
+    }
+
+    /// The processes of `family`, one entry each, named with their pid so
+    /// same-named members stay apart.
+    #[must_use]
+    pub fn members(processes: &[ProcessInfo], family: &str) -> Vec<ProcessGroup> {
+        let mut members: Vec<ProcessGroup> = processes
+            .iter()
+            .filter(|process| Self::family(&process.name) == family)
+            .map(|process| ProcessGroup {
+                name: format!("{} {}", process.name, process.pid),
+                count: 1,
+                cpu: process.cpu,
+                memory_kb: process.memory_kb,
+            })
+            .collect();
+        Self::rank(&mut members);
+        members
+    }
+
+    fn rank(groups: &mut [ProcessGroup]) {
+        groups.sort_by(|a, b| {
             b.memory_kb
                 .cmp(&a.memory_kb)
                 .then_with(|| b.cpu.total_cmp(&a.cpu))
                 .then_with(|| a.name.cmp(&b.name))
         });
-        grouped
     }
 }
 
@@ -145,6 +167,20 @@ mod tests {
         ]);
         let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
         assert_eq!(names, ["busy", "also-idle", "idle"]);
+    }
+
+    #[test]
+    fn members_are_the_family_one_per_process_largest_first() {
+        let processes = [
+            process(7, "kworker/0:1", 1.0, 10),
+            process(3, "firefox", 2.0, 100),
+            process(9, "kworker/u8:3", 4.0, 50),
+        ];
+        let members = ProcessGrouper::members(&processes, "kworker");
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["kworker/u8:3 9", "kworker/0:1 7"]);
+        assert!(members.iter().all(|m| m.count == 1));
+        assert!(ProcessGrouper::members(&processes, "nothing").is_empty());
     }
 
     #[test]

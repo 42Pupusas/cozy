@@ -11,16 +11,13 @@ pub struct FixedBand {
 
 impl FixedBand {
     const HEIGHT_DIVISOR: i32 = 5;
-    const FLOOR_NUMERATOR: i32 = 3;
-    const FLOOR_DENOMINATOR: i32 = 4;
     const UNITS: [i32; 5] = [2, 1, 1, 1, 1];
 
     /// A band across the top of `area`, a fifth of its height but never
-    /// shorter than three quarters of `min_side` nor taller than the area.
+    /// shorter than `floor` nor taller than the area.
     #[must_use]
-    pub fn new(area: Rect, min_side: i32) -> Self {
+    pub fn new(area: Rect, floor: i32) -> Self {
         let area = Self::clamped(area);
-        let floor = min_side * Self::FLOOR_NUMERATOR / Self::FLOOR_DENOMINATOR;
         let height = (area.h / Self::HEIGHT_DIVISOR).max(floor).min(area.h);
         Self { area, height }
     }
@@ -81,7 +78,7 @@ mod tests {
 
     #[test]
     fn the_band_and_the_rest_cover_the_area_exactly() {
-        let band = FixedBand::new(AREA, 112);
+        let band = FixedBand::new(AREA, 84);
         let rest = band.rest();
         let cells = band.cells();
         let across: i32 = cells.iter().map(|c| c.w).sum();
@@ -93,13 +90,13 @@ mod tests {
 
     #[test]
     fn the_band_is_a_fifth_of_a_tall_window() {
-        let band = FixedBand::new(AREA, 112);
+        let band = FixedBand::new(AREA, 84);
         assert_eq!(band.cells()[0].h, AREA.h / 5);
     }
 
     #[test]
     fn the_band_keeps_the_minimum_side_in_a_short_window() {
-        let band = FixedBand::new(Rect::new(0, 0, 900, 400), 112);
+        let band = FixedBand::new(Rect::new(0, 0, 900, 400), 84);
         assert_eq!(band.cells()[0].h, 84);
     }
 
@@ -112,14 +109,14 @@ mod tests {
 
     #[test]
     fn the_band_never_outgrows_the_area() {
-        let band = FixedBand::new(Rect::new(0, 0, 200, 50), 112);
+        let band = FixedBand::new(Rect::new(0, 0, 200, 50), 84);
         assert_eq!(band.cells()[0].h, 50);
         assert_eq!(band.rest().h, 0);
     }
 
     #[test]
     fn the_info_card_is_wider_than_a_chart() {
-        let cells = FixedBand::new(AREA, 112).cells();
+        let cells = FixedBand::new(AREA, 84).cells();
         assert!(cells[0].w > cells[1].w);
         assert!(
             cells[1..]

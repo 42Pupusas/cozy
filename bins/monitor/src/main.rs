@@ -35,12 +35,14 @@ struct App {
     history: History,
     rx: Consumer<Snapshot>,
     full_repaint: bool,
+    hover_changed: bool,
     has_received_snapshot: bool,
     profile: FrameProfile,
     display: SampleInterpolator,
     scene: TileScene,
     last_graph_sample: Instant,
     last_painted_display: DisplaySnapshot,
+    started: Instant,
 }
 
 impl App {
@@ -75,6 +77,7 @@ impl App {
             history: History::new(),
             rx: Self::spawn_worker(wake),
             full_repaint: true,
+            hover_changed: false,
             has_received_snapshot: false,
             profile: FrameProfile::new(),
             display: SampleInterpolator::new(),
@@ -83,6 +86,7 @@ impl App {
                 .checked_sub(GRAPH_INTERVAL)
                 .unwrap_or_else(Instant::now),
             last_painted_display: DisplaySnapshot::default(),
+            started: Instant::now(),
         }
     }
 
@@ -150,8 +154,11 @@ impl App {
             let new_graph_sample = self.record_graph_sample(now);
             let current_display = DisplaySnapshot::from_sample(&self.snapshot.sample);
             let display_changed = current_display != self.last_painted_display;
-            let should_paint =
-                RedrawGate::evaluate(self.full_repaint, new_graph_sample, display_changed);
+            let should_paint = RedrawGate::evaluate(
+                self.full_repaint || self.hover_changed || self.scene.is_animating(),
+                new_graph_sample,
+                display_changed,
+            );
             let alive = if should_paint {
                 self.paint_and_present(current_display, display_changed)
             } else {
@@ -182,10 +189,39 @@ impl App {
     }
 
     fn drain_input(&mut self) {
+        use platform::protocol::{Key, KeyState};
+        use platform::window::{MouseButton, MouseEventKind};
+        let mut moved = false;
         while let Some(event) = self.window.next_input() {
-            if matches!(event, platform::InputEvent::Resize { .. }) {
-                self.full_repaint = true;
+            match event {
+                platform::InputEvent::Resize { .. } => self.full_repaint = true,
+                platform::InputEvent::Mouse {
+                    button: MouseButton::Left,
+                    kind: MouseEventKind::Press,
+                    ..
+                } => moved |= self.scene.click(self.window.pointer_position()),
+                platform::InputEvent::Mouse {
+                    button: MouseButton::Right,
+                    kind: MouseEventKind::Press,
+                    ..
+                }
+                | platform::InputEvent::Key {
+                    key: Some(Key::Esc | Key::Backspace),
+                    state: Some(KeyState::Pressed),
+                    ..
+                } => moved |= self.scene.back(),
+                platform::InputEvent::Scroll { lines, .. } => moved |= self.scene.wheel(-lines),
+                _ => {}
             }
+        }
+        self.hover_changed |= self.scene.point(self.window.hovered_position());
+        if moved {
+            self.full_repaint = true;
+            let title = self
+                .scene
+                .heading()
+                .map_or_else(|| "monitor".to_owned(), |at| format!("monitor · {at}"));
+            self.window.set_title(&title);
         }
     }
 
@@ -196,6 +232,7 @@ impl App {
         let sample = &self.snapshot.sample;
         let history = &self.history;
         let repaint = Repaint::new(self.full_repaint, text_changed);
+        let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let mut scene_phases = ScenePhases::default();
         let mut paint_time = Duration::ZERO;
         let mut damage_rows = 0.0;
@@ -210,6 +247,7 @@ impl App {
                     sample,
                     history,
                     repaint,
+                    now_ms,
                 },
                 &mut scene_phases,
             );
@@ -238,6 +276,7 @@ impl App {
                         damage_rows,
                     );
                     self.full_repaint = false;
+                    self.hover_changed = false;
                     self.last_painted_display = current_display;
                 }
                 true
@@ -340,6 +379,7 @@ mod perf_harness {
                     sample: &sample,
                     history: &history,
                     repaint: Repaint::new(tick % 60 == 0, tick % 6 == 0),
+                    now_ms: u64::try_from(tick).unwrap_or(0) * 16,
                 },
                 &mut ScenePhases::default(),
             );

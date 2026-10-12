@@ -8,9 +8,12 @@
 
 use platform::draw::Rect;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use crate::tile_minimum::TileMinimum;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WeightedSpiral {
     area: Rect,
+    aspect: f64,
 }
 
 impl WeightedSpiral {
@@ -20,12 +23,54 @@ impl WeightedSpiral {
     pub fn new(area: Rect) -> Self {
         Self {
             area: Rect::new(area.x, area.y, area.w.max(0), area.h.max(0)),
+            aspect: 1.0,
         }
+    }
+
+    /// Aim for cells `aspect` times as wide as they are tall.
+    #[must_use]
+    pub fn shaped(self, aspect: f64) -> Self {
+        let aspect = if aspect.is_finite() && aspect > 0.0 {
+            aspect
+        } else {
+            1.0
+        };
+        Self { aspect, ..self }
     }
 
     /// One cell per weight, in order. Weights should fall as they go.
     #[must_use]
     pub fn cells(&self, weights: &[f64]) -> Vec<Rect> {
+        let tall = self.stretched_height();
+        if tall == self.area.h {
+            return Self::square_cells(weights, self.area);
+        }
+        let virtual_area = Rect::new(self.area.x, 0, self.area.w, tall);
+        Self::square_cells(weights, virtual_area)
+            .into_iter()
+            .map(|cell| {
+                let top = self.unstretch(cell.y, tall);
+                let bottom = self.unstretch(cell.bottom(), tall);
+                Rect::new(cell.x, top, cell.w, bottom - top)
+            })
+            .collect()
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn stretched_height(&self) -> i32 {
+        (f64::from(self.area.h) * self.aspect).round() as i32
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn unstretch(&self, y: i32, tall: i32) -> i32 {
+        if tall <= 0 {
+            return self.area.y;
+        }
+        let scaled = (f64::from(y) * f64::from(self.area.h) / f64::from(tall)).round() as i32;
+        self.area.y + scaled
+    }
+
+    fn square_cells(weights: &[f64], area: Rect) -> Vec<Rect> {
         let weights: Vec<f64> = weights
             .iter()
             .map(|&w| {
@@ -37,7 +82,7 @@ impl WeightedSpiral {
             })
             .collect();
         let mut cells = Vec::with_capacity(weights.len());
-        let mut rest = self.area;
+        let mut rest = area;
         let mut next = 0;
         let mut turn = 0;
         while next < weights.len() {
@@ -54,12 +99,10 @@ impl WeightedSpiral {
         cells
     }
 
-    /// Whether every cell for `weights` has both sides at least `min_side`.
+    /// Whether every cell for `weights` is at least `minimum`.
     #[must_use]
-    pub fn legible(&self, weights: &[f64], min_side: i32) -> bool {
-        self.cells(weights)
-            .iter()
-            .all(|c| c.w >= min_side && c.h >= min_side)
+    pub fn legible(&self, weights: &[f64], minimum: TileMinimum) -> bool {
+        self.cells(weights).iter().all(|c| minimum.admits(c.w, c.h))
     }
 
     fn strip_len(rest: Rect, weights: &[f64]) -> usize {
@@ -149,6 +192,7 @@ impl WeightedSpiral {
 #[cfg(test)]
 mod tests {
     use super::WeightedSpiral;
+    use crate::tile_minimum::TileMinimum;
     use platform::draw::Rect;
 
     fn area_of(cell: Rect) -> i64 {
@@ -219,8 +263,30 @@ mod tests {
     #[test]
     fn legibility_stops_at_the_smallest_side() {
         let spiral = WeightedSpiral::new(Rect::new(0, 0, 1000, 700));
-        assert!(spiral.legible(&falling(3, 0.7), 100));
-        assert!(!spiral.legible(&falling(24, 0.5), 100));
+        assert!(spiral.legible(&falling(3, 0.7), TileMinimum::square(100)));
+        assert!(!spiral.legible(&falling(24, 0.5), TileMinimum::square(100)));
+    }
+
+    #[test]
+    fn shaped_cells_are_wider_and_still_tile_the_area_exactly() {
+        let area = Rect::new(18, 200, 1300, 640);
+        let weights = falling(40, 0.98);
+        let square = WeightedSpiral::new(area).cells(&weights);
+        let wide = WeightedSpiral::new(area).shaped(1.5).cells(&weights);
+        let total: i64 = wide.iter().copied().map(area_of).sum();
+        assert_eq!(total, i64::from(area.w) * i64::from(area.h));
+        assert!(
+            wide.iter()
+                .all(|c| c.y >= area.y && c.bottom() <= area.bottom())
+        );
+        let mean_aspect = |cells: &[Rect]| {
+            cells
+                .iter()
+                .map(|c| f64::from(c.w) / f64::from(c.h))
+                .sum::<f64>()
+                / f64::from(u32::try_from(cells.len()).unwrap_or(1))
+        };
+        assert!(mean_aspect(&wide) > mean_aspect(&square) * 1.3);
     }
 
     #[test]

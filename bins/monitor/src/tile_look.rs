@@ -24,24 +24,20 @@ impl TileHeat {
 pub struct TileLook;
 
 impl TileLook {
-    /// An idle tile fills this share of its cell; a fully hot one fills all
-    /// of it.
-    const IDLE_SCALE_PERMILLE: i32 = 880;
-
     const FULL_BLEND: i32 = 200;
 
     const LIGHT_FILL_LUMINANCE: u32 = 140;
 
+    /// The tile's face: its cell less the gutter, and less one more gutter
+    /// when idle, shrinking by whole pixels so every gap stays the same width
+    /// whatever the tile's size.
     #[must_use]
     pub fn body(cell: Rect, gutter: i32, heat: u8) -> Rect {
-        let base = cell.inset(gutter);
-        let (width, height) = (base.w.max(0), base.h.max(0));
         let steps = i32::from(TileHeat::STEPS);
-        let heat = i32::from(heat).min(steps);
-        let permille =
-            Self::IDLE_SCALE_PERMILLE + (1000 - Self::IDLE_SCALE_PERMILLE) * heat / steps;
-        let (w, h) = (width * permille / 1000, height * permille / 1000);
-        Rect::new(base.x + (width - w) / 2, base.y + (height - h) / 2, w, h)
+        let cold = steps - i32::from(heat).min(steps);
+        let inset = gutter + (gutter * cold + steps / 2) / steps;
+        let base = cell.inset(inset);
+        Rect::new(base.x, base.y, base.w.max(0), base.h.max(0))
     }
 
     #[must_use]
@@ -94,19 +90,11 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_tile_is_most_of_a_hot_one_and_centred() {
-        let hot = TileLook::body(CELL, 6, TileHeat::STEPS);
-        let idle = TileLook::body(CELL, 6, 0);
-        assert!(
-            (idle.w * 1000 - hot.w * 880).abs() <= 1000,
-            "{idle:?} {hot:?}"
-        );
-        assert!(
-            (idle.h * 1000 - hot.h * 880).abs() <= 1000,
-            "{idle:?} {hot:?}"
-        );
-        assert!(((idle.x - hot.x) - (hot.right() - idle.right())).abs() <= 1);
-        assert!(((idle.y - hot.y) - (hot.bottom() - idle.bottom())).abs() <= 1);
+    fn an_idle_tile_loses_one_more_gutter_on_every_side_whatever_its_size() {
+        for cell in [CELL, Rect::new(0, 0, 900, 600)] {
+            let hot = TileLook::body(cell, 6, TileHeat::STEPS);
+            assert_eq!(TileLook::body(cell, 6, 0), hot.inset(6), "{cell:?}");
+        }
     }
 
     #[test]

@@ -1,12 +1,15 @@
-//! [`ProcessTiles`] -- paints the process-group tiles and the "more" tile.
+//! [`ProcessTiles`] -- paints the process-group tiles and the "more" tile:
+//! the name sized to the tile, and the numbers only while hovered.
 
 use platform::draw::{Canvas, Color, Rect};
 
 use crate::palette::MonitorPalette;
 use crate::size_label::SizeLabel;
 use crate::text_layout::TextLayout;
+use crate::tile_growth::TileGrowth;
 use crate::tile_look::TileLook;
 use crate::tile_metrics::TileMetrics;
+use crate::tile_text::TileText;
 use crate::typography::Typography;
 
 /// What a process tile shows, already smoothed.
@@ -17,6 +20,25 @@ pub struct ProcessFace<'a> {
     pub cpu: f64,
     pub count: usize,
     pub heat: u8,
+    pub hovered: bool,
+    pub grown: u8,
+}
+
+/// What the "more" tile shows.
+#[derive(Clone, Copy, Debug)]
+pub struct MoreFace {
+    pub groups: usize,
+    pub memory_kb: u64,
+    pub hovered: bool,
+    pub grown: u8,
+}
+
+struct Card<'a> {
+    body: Rect,
+    fill: Color,
+    name: &'a str,
+    details: &'a [String],
+    grown: u8,
 }
 
 pub struct ProcessTiles<'a> {
@@ -41,12 +63,19 @@ impl<'a> ProcessTiles<'a> {
     ) {
         let body = TileLook::body(cell, self.metrics.gutter, face.heat);
         let fill = TileLook::fill(self.palette.surface, self.palette.cpu, face.heat);
-        let lines = [
-            face.name.to_owned(),
-            SizeLabel::kb(face.memory_kb),
-            Self::activity(face),
-        ];
-        self.card(canvas, typography, body, fill, &lines);
+        let details = if face.hovered {
+            Self::details(face)
+        } else {
+            Vec::new()
+        };
+        let card = Card {
+            body,
+            fill,
+            name: face.name,
+            details: &details,
+            grown: face.grown,
+        };
+        self.card(canvas, typography, &card);
     }
 
     pub fn paint_more(
@@ -54,67 +83,83 @@ impl<'a> ProcessTiles<'a> {
         canvas: &mut Canvas<'_>,
         typography: &mut Typography,
         cell: Rect,
-        groups: usize,
-        memory_kb: u64,
+        face: &MoreFace,
     ) {
-        let body = cell.inset(self.metrics.gutter);
-        let lines = [
-            format!("+{groups} more"),
-            SizeLabel::kb(memory_kb),
-            String::new(),
-        ];
-        self.card(canvas, typography, body, self.palette.surface, &lines);
+        let details = if face.hovered {
+            vec![SizeLabel::kb(face.memory_kb)]
+        } else {
+            Vec::new()
+        };
+        let name = format!("+{} more", face.groups);
+        let card = Card {
+            body: cell.inset(self.metrics.gutter),
+            fill: self.palette.surface,
+            name: &name,
+            details: &details,
+            grown: face.grown,
+        };
+        self.card(canvas, typography, &card);
     }
 
-    fn activity(face: &ProcessFace<'_>) -> String {
-        if face.count > 1 {
+    fn details(face: &ProcessFace<'_>) -> Vec<String> {
+        let activity = if face.count > 1 {
             format!("{:.0}% cpu · {} procs", face.cpu, face.count)
         } else {
             format!("{:.0}% cpu", face.cpu)
-        }
+        };
+        vec![SizeLabel::kb(face.memory_kb), activity]
     }
 
-    fn card(
-        &self,
-        canvas: &mut Canvas<'_>,
-        typography: &mut Typography,
-        body: Rect,
-        fill: Color,
-        lines: &[String; 3],
-    ) {
-        if body.w <= 0 || body.h <= 0 {
+    /// The card at the size it has grown to, with its text sized for the
+    /// full card so the size does not change as it lands, and fading in once
+    /// the card is nearly full size.
+    fn card(&self, canvas: &mut Canvas<'_>, typography: &mut Typography, card: &Card<'_>) {
+        let whole = card.body;
+        let shown = TileGrowth::cell(whole, card.grown);
+        if shown.w <= 0 || shown.h <= 0 {
             return;
         }
         let palette = self.palette;
-        canvas.fill_round_rect_glass(body, fill, self.metrics.radius);
-        canvas.draw_round_rect(body, palette.border, self.metrics.radius);
-        let ink = TileLook::ink(fill, palette.foreground, palette.background);
-        let quiet = fill.blend_opaque_color(ink, Self::SECONDARY_BLEND);
-        let pad = self.metrics.pad;
-        let room = body.w - pad * 2;
-        let tall = body.h >= typography.title.line_height() * 4;
-        let mut y = body.y + pad;
-        let limit = body.bottom() - pad / 2;
-
-        let heading = if tall {
-            &mut typography.title
-        } else {
-            &mut typography.subtitle
-        };
-        if y + heading.line_height() > limit {
+        let fill = card.fill;
+        let radius = self.metrics.radius.min(shown.w / 2).min(shown.h / 2);
+        canvas.fill_round_rect_glass(shown, fill, radius);
+        canvas.draw_round_rect(shown, palette.border, radius);
+        let alpha = TileGrowth::text(card.grown);
+        if alpha == 0 {
             return;
         }
-        let name = TextLayout::truncate_prefix(&lines[0], heading, room);
-        heading.draw_text(canvas, &name, body.x + pad, y, ink, fill);
+        let ink = TileLook::ink(fill, palette.foreground, palette.background);
+        let quiet = fill.blend_opaque_color(ink, Self::SECONDARY_BLEND);
+        let ink = fill.blend_opaque_color(ink, alpha);
+        let quiet = fill.blend_opaque_color(quiet, alpha);
+        let pad = self.metrics.pad.min(whole.h / 6).min(whole.w / 6);
+        let ladder = &mut typography.ladder;
+        let text = TileText::fit(
+            ladder,
+            card.name,
+            whole.w - pad * 2,
+            whole.h - pad * 2,
+            card.details.len(),
+        );
+        let room = shown.w - pad * 2;
+        let mut y = shown.y + pad;
+        let limit = shown.bottom() - pad;
+
+        let heading = ladder.step(text.name_step);
+        if y + heading.line_height() > shown.bottom() {
+            return;
+        }
+        let fitted = TextLayout::truncate_prefix(card.name, heading, room);
+        heading.draw_text(canvas, &fitted, shown.x + pad, y, ink, fill);
         y += heading.line_height();
 
-        for text in &lines[1..] {
-            let tier = &mut typography.normal;
-            if text.is_empty() || y + tier.line_height() > limit {
+        let tier = ladder.step(text.detail_step);
+        for line in card.details {
+            if y + tier.line_height() > limit {
                 break;
             }
-            let fitted = TextLayout::truncate_prefix(text, tier, room);
-            tier.draw_text(canvas, &fitted, body.x + pad, y, quiet, fill);
+            let fitted = TextLayout::truncate_prefix(line, tier, room);
+            tier.draw_text(canvas, &fitted, shown.x + pad, y, quiet, fill);
             y += tier.line_height();
         }
     }
@@ -126,7 +171,7 @@ impl<'a> ProcessTiles<'a> {
     reason = "assert_eq on pixel buffers prints every pixel on failure"
 )]
 mod tests {
-    use super::{ProcessFace, ProcessTiles};
+    use super::{MoreFace, ProcessFace, ProcessTiles};
     use crate::palette::MonitorPalette;
     use crate::tile_look::TileHeat;
     use crate::tile_metrics::TileMetrics;
@@ -136,25 +181,50 @@ mod tests {
     const W: i32 = 500;
     const H: i32 = 400;
 
-    fn face(heat: u8) -> ProcessFace<'static> {
+    fn face(heat: u8, hovered: bool) -> ProcessFace<'static> {
         ProcessFace {
             name: "firefox-with-a-very-long-name-that-cannot-fit",
             memory_kb: 2_000_000,
             cpu: 41.0,
             count: 5,
             heat,
+            hovered,
+            grown: u8::MAX,
         }
     }
 
     fn paint(cell: Rect, heat: u8) -> Vec<u32> {
+        paint_face(cell, &face(heat, false))
+    }
+
+    fn paint_face(cell: Rect, face: &ProcessFace<'_>) -> Vec<u32> {
         let palette = MonitorPalette::builtin();
         let mut typography = Typography::embedded([32.0, 14.0, 13.0, 11.0]);
         let metrics = TileMetrics::new(typography.title.line_height());
         let mut buf = vec![0u32; (W * H) as usize];
         let mut canvas = Canvas::new(&mut buf, W, H);
         canvas.clear(palette.background);
-        ProcessTiles::new(&palette, metrics).paint(&mut canvas, &mut typography, cell, &face(heat));
+        ProcessTiles::new(&palette, metrics).paint(&mut canvas, &mut typography, cell, face);
         buf
+    }
+
+    fn lit_rows(buf: &[u32], cell: Rect) -> usize {
+        let inner = cell.inset(12);
+        (inner.y..inner.bottom())
+            .filter(|&y| {
+                let first = pixel(buf, inner.x, y);
+                (inner.x..inner.right()).any(|x| pixel(buf, x, y) != first)
+            })
+            .count()
+    }
+
+    #[test]
+    fn numbers_show_only_while_hovered() {
+        let cell = Rect::new(20, 20, 400, 300);
+        let quiet = paint_face(cell, &face(0, false));
+        let hovered = paint_face(cell, &face(0, true));
+        assert!(quiet != hovered);
+        assert!(lit_rows(&hovered, cell) > lit_rows(&quiet, cell));
     }
 
     fn blank() -> Vec<u32> {
@@ -196,8 +266,38 @@ mod tests {
     }
 
     #[test]
+    fn a_growing_tile_starts_as_nothing_and_stays_inside_its_full_card() {
+        let cell = Rect::new(100, 100, 240, 180);
+        let none = paint_face(
+            cell,
+            &ProcessFace {
+                grown: 0,
+                ..face(0, false)
+            },
+        );
+        assert!(none == blank());
+        let half = paint_face(
+            cell,
+            &ProcessFace {
+                grown: 128,
+                ..face(0, false)
+            },
+        );
+        let blank = blank();
+        let inner = Rect::new(150, 135, 140, 110);
+        for y in 0..H {
+            for x in 0..W {
+                if !inner.contains(platform::draw::Point::new(x, y)) {
+                    assert_eq!(pixel(&half, x, y), pixel(&blank, x, y), "({x},{y})");
+                }
+            }
+        }
+        assert!(half != blank);
+    }
+
+    #[test]
     fn a_degenerate_cell_draws_nothing() {
-        assert!(paint(Rect::new(10, 10, 5, 5), 8) == blank());
+        assert!(paint(Rect::new(10, 10, 2, 2), 8) == blank());
     }
 
     #[test]
@@ -213,8 +313,12 @@ mod tests {
             &mut canvas,
             &mut typography,
             cell,
-            12,
-            3_000_000,
+            &MoreFace {
+                groups: 12,
+                memory_kb: 3_000_000,
+                hovered: true,
+                grown: u8::MAX,
+            },
         );
         assert!(buf != blank());
         assert_eq!(pixel(&buf, 50, 50), pixel(&blank(), 50, 50));

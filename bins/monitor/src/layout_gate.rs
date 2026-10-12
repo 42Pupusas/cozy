@@ -1,27 +1,26 @@
-//! [`LayoutGate`] -- says when the ranking of the laid-out groups changed.
-//!
-//! Tile sizes follow rank alone, so memory drift that keeps the order never
-//! moves a tile.
+//! [`LayoutGate`] -- says when the laid-out groups changed enough to move
+//! tiles: a different order, a group gone, or a share that drifted by more
+//! than a quarter of itself.
 
 use crate::group_smoother::Share;
 
 #[derive(Default)]
 pub struct LayoutGate {
-    laid: Vec<String>,
+    laid: Vec<Share>,
 }
 
 impl LayoutGate {
+    const DRIFT: f64 = 0.25;
+
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn remember(&mut self, shares: &[Share]) {
-        self.laid = shares.iter().map(|share| share.name.clone()).collect();
+        self.laid = shares.to_vec();
     }
 
-    /// Whether the order of the laid-out groups changed or one of them went
-    /// away.
     #[must_use]
     pub fn stale(&self, shares: &[Share]) -> bool {
         shares.len() < self.laid.len()
@@ -29,7 +28,11 @@ impl LayoutGate {
                 .laid
                 .iter()
                 .zip(shares)
-                .any(|(old, new)| *old != new.name)
+                .any(|(old, new)| old.name != new.name || Self::drifted(old.share, new.share))
+    }
+
+    fn drifted(old: f64, new: f64) -> bool {
+        (new - old).abs() > old.abs() * Self::DRIFT
     }
 }
 
@@ -55,10 +58,16 @@ mod tests {
     }
 
     #[test]
-    fn drift_that_keeps_the_order_keeps_the_layout() {
+    fn small_drift_that_keeps_the_order_keeps_the_layout() {
         let gate = gate(&[("a", 0.4), ("b", 0.2)]);
         assert!(!gate.stale(&shares(&[("a", 0.43), ("b", 0.19)])));
-        assert!(!gate.stale(&shares(&[("a", 0.4), ("b", 0.39)])));
+    }
+
+    #[test]
+    fn a_share_that_moves_by_more_than_a_quarter_relays_out() {
+        let gate = gate(&[("a", 0.4), ("b", 0.2)]);
+        assert!(gate.stale(&shares(&[("a", 0.4), ("b", 0.39)])));
+        assert!(gate.stale(&shares(&[("a", 0.25), ("b", 0.2)])));
     }
 
     #[test]

@@ -1,13 +1,15 @@
 //! [`TileLayout`] -- decides which tiles the window shows and where.
 //!
 //! A short band across the top holds the info card and one tile per chart.
-//! Below it, a tile per process group sized by its share of memory, and one
-//! "more" tile standing for the groups that no longer fit.
+//! Below it, a tile per process group whose area grows with the square root
+//! of its memory, so a hundred times the memory is ten times the area, and
+//! one "more" tile standing for the groups that no longer fit.
 
 use platform::draw::{Point, Rect};
 
 use crate::fixed_band::FixedBand;
 use crate::group_smoother::Share;
+use crate::tile_minimum::TileMinimum;
 use crate::weighted_spiral::WeightedSpiral;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,36 +50,33 @@ impl Arrangement {
 #[derive(Clone, Copy, Debug)]
 pub struct TileLayout {
     area: Rect,
-    min_side: i32,
+    minimum: TileMinimum,
 }
 
 impl TileLayout {
-    const DECAY: f64 = 0.9;
-    const MAX_PROCESS_TILES: usize = 48;
+    const MAX_PROCESS_TILES: usize = 120;
 
     #[must_use]
-    pub const fn new(area: Rect, min_side: i32) -> Self {
-        Self { area, min_side }
+    pub const fn new(area: Rect, minimum: TileMinimum) -> Self {
+        Self { area, minimum }
     }
 
     /// The tiles for `shares` (largest first), showing as many groups as stay
-    /// legible and folding the rest into one "more" tile. Sizes follow rank
-    /// alone, each tile keeping a fixed fraction of its predecessor's area, so
-    /// one dominant group cannot take over the field.
+    /// legible and folding the rest into one "more" tile.
     #[must_use]
     pub fn arrange(&self, shares: &[Share]) -> Arrangement {
         let band = if shares.is_empty() {
             FixedBand::filling(self.area)
         } else {
-            FixedBand::new(self.area, self.min_side)
+            FixedBand::new(self.area, self.minimum.band)
         };
         let mut tiles = Self::band_tiles(&band);
-        let spiral = WeightedSpiral::new(band.rest());
+        let spiral = WeightedSpiral::new(band.rest()).shaped(self.minimum.aspect());
         let mut shown = shares.len().min(Self::MAX_PROCESS_TILES);
         loop {
             let kinds = Self::kinds(shares, shown);
-            let weights = Self::weights(kinds.len());
-            if shown == 0 || spiral.legible(&weights, self.min_side) {
+            let weights = Self::weights(shares, shown);
+            if shown == 0 || spiral.legible(&weights, self.minimum) {
                 tiles.extend(
                     kinds
                         .into_iter()
@@ -117,10 +116,21 @@ impl TileLayout {
         kinds
     }
 
-    fn weights(count: usize) -> Vec<f64> {
-        std::iter::successors(Some(1.0), |weight| Some(weight * Self::DECAY))
-            .take(count)
-            .collect()
+    fn weight(share: f64) -> f64 {
+        share.max(0.0).sqrt()
+    }
+
+    fn weights(shares: &[Share], shown: usize) -> Vec<f64> {
+        let mut weights: Vec<f64> = shares[..shown]
+            .iter()
+            .map(|share| Self::weight(share.share))
+            .collect();
+        if shown < shares.len() {
+            let tail: f64 = shares[shown..].iter().map(|share| share.share).sum();
+            let smallest = weights.last().copied().unwrap_or(f64::INFINITY);
+            weights.push(Self::weight(tail).min(smallest));
+        }
+        weights
     }
 }
 
@@ -128,6 +138,7 @@ impl TileLayout {
 mod tests {
     use super::{Arrangement, ChartKind, TileKind, TileLayout};
     use crate::group_smoother::Share;
+    use crate::tile_minimum::TileMinimum;
     use platform::draw::{Point, Rect};
 
     const AREA: Rect = Rect::new(18, 18, 1300, 800);
@@ -157,7 +168,7 @@ mod tests {
     #[test]
     fn the_info_card_and_every_chart_are_always_present() {
         for n in [0, 1, 8, 60] {
-            let arranged = TileLayout::new(AREA, 100).arrange(&shares(n));
+            let arranged = TileLayout::new(AREA, TileMinimum::square(100)).arrange(&shares(n));
             assert_eq!(count(&arranged, |k| *k == TileKind::Info), 1, "n={n}");
             for chart in [
                 ChartKind::Cpu,
@@ -172,7 +183,7 @@ mod tests {
 
     #[test]
     fn tiles_cover_the_area_exactly_without_overlap() {
-        let arranged = TileLayout::new(AREA, 100).arrange(&shares(12));
+        let arranged = TileLayout::new(AREA, TileMinimum::square(100)).arrange(&shares(12));
         let total: i64 = arranged
             .tiles
             .iter()
@@ -190,7 +201,7 @@ mod tests {
 
     #[test]
     fn a_heavier_group_gets_a_larger_tile() {
-        let arranged = TileLayout::new(AREA, 1).arrange(&shares(6));
+        let arranged = TileLayout::new(AREA, TileMinimum::square(1)).arrange(&shares(6));
         let area_of = |name: &str| {
             let tile = arranged
                 .tiles
@@ -206,7 +217,7 @@ mod tests {
     #[test]
     fn what_does_not_fit_collapses_into_one_more_tile() {
         let all = shares(60);
-        let arranged = TileLayout::new(AREA, 110).arrange(&all);
+        let arranged = TileLayout::new(AREA, TileMinimum::square(110)).arrange(&all);
         assert!(arranged.shown < all.len());
         let more: Vec<usize> = arranged
             .tiles
@@ -225,7 +236,7 @@ mod tests {
 
     #[test]
     fn the_more_tile_is_the_smallest_tile() {
-        let arranged = TileLayout::new(AREA, 60).arrange(&shares(60));
+        let arranged = TileLayout::new(AREA, TileMinimum::square(60)).arrange(&shares(200));
         let more = arranged
             .tiles
             .iter()
@@ -243,7 +254,7 @@ mod tests {
 
     #[test]
     fn every_tile_is_legible_when_anything_could_be_dropped() {
-        let arranged = TileLayout::new(AREA, 110).arrange(&shares(60));
+        let arranged = TileLayout::new(AREA, TileMinimum::square(110)).arrange(&shares(60));
         assert!(arranged.shown > 0);
         assert!(
             arranged
@@ -255,14 +266,15 @@ mod tests {
 
     #[test]
     fn a_roomy_window_shows_every_group_with_no_more_tile() {
-        let arranged = TileLayout::new(AREA, 60).arrange(&shares(3));
+        let arranged = TileLayout::new(AREA, TileMinimum::square(60)).arrange(&shares(3));
         assert_eq!(arranged.shown, 3);
         assert_eq!(count(&arranged, |k| matches!(k, TileKind::More { .. })), 0);
     }
 
     #[test]
     fn a_window_too_small_for_anything_still_shows_the_fixed_tiles() {
-        let arranged = TileLayout::new(Rect::new(0, 0, 200, 150), 120).arrange(&shares(10));
+        let arranged = TileLayout::new(Rect::new(0, 0, 200, 150), TileMinimum::square(120))
+            .arrange(&shares(10));
         assert_eq!(arranged.shown, 0);
         assert_eq!(count(&arranged, |k| *k == TileKind::Info), 1);
         assert_eq!(count(&arranged, |k| matches!(k, TileKind::More { .. })), 1);
@@ -270,13 +282,13 @@ mod tests {
 
     #[test]
     fn nothing_running_leaves_just_the_fixed_tiles() {
-        let arranged = TileLayout::new(AREA, 100).arrange(&[]);
+        let arranged = TileLayout::new(AREA, TileMinimum::square(100)).arrange(&[]);
         assert_eq!(arranged.tiles.len(), 5);
     }
 
     #[test]
     fn a_point_finds_the_tile_under_it() {
-        let arranged = TileLayout::new(AREA, 100).arrange(&shares(4));
+        let arranged = TileLayout::new(AREA, TileMinimum::square(100)).arrange(&shares(4));
         let first = &arranged.tiles[0];
         let inside = Point::new(first.rect.x + 1, first.rect.y + 1);
         assert_eq!(arranged.at(inside).map(|t| &t.kind), Some(&first.kind));
@@ -285,7 +297,7 @@ mod tests {
 
     #[test]
     fn the_fixed_tiles_sit_in_a_short_band_above_the_processes() {
-        let arranged = TileLayout::new(AREA, 110).arrange(&shares(12));
+        let arranged = TileLayout::new(AREA, TileMinimum::square(110)).arrange(&shares(12));
         let band_bottom = arranged.tiles[..5]
             .iter()
             .map(|t| t.rect.bottom())
@@ -296,8 +308,8 @@ mod tests {
     }
 
     #[test]
-    fn sizes_follow_rank_not_memory() {
-        let shares: Vec<Share> = [0.9, 0.05, 0.03, 0.02]
+    fn a_hundred_times_the_memory_is_ten_times_the_area() {
+        let shares: Vec<Share> = [0.5, 0.2, 0.1, 0.005]
             .into_iter()
             .enumerate()
             .map(|(i, share)| Share {
@@ -305,12 +317,31 @@ mod tests {
                 share,
             })
             .collect();
-        let arranged = TileLayout::new(AREA, 1).arrange(&shares);
-        let areas: Vec<i64> = arranged.tiles[5..]
+        let arranged = TileLayout::new(AREA, TileMinimum::square(1)).arrange(&shares);
+        let areas: Vec<f64> = arranged.tiles[5..]
             .iter()
-            .map(|t| i64::from(t.rect.w) * i64::from(t.rect.h))
+            .map(|t| f64::from(t.rect.w) * f64::from(t.rect.h))
             .collect();
-        assert!(areas[0] * 100 < areas.iter().sum::<i64>() * 40, "{areas:?}");
+        let ratio = areas[0] / areas[3];
+        assert!((9.0..11.0).contains(&ratio), "{areas:?}");
+    }
+
+    #[test]
+    fn the_more_tile_is_sized_by_what_it_holds_but_never_above_a_shown_tile() {
+        let arranged = TileLayout::new(AREA, TileMinimum::square(110)).arrange(&skewed(200));
+        let area = |t: &super::PlacedTile| i64::from(t.rect.w) * i64::from(t.rect.h);
+        let more = arranged
+            .tiles
+            .iter()
+            .find(|t| matches!(t.kind, TileKind::More { .. }))
+            .expect("more tile");
+        let smallest = arranged.tiles[5..]
+            .iter()
+            .filter(|t| matches!(t.kind, TileKind::Process(_)))
+            .map(area)
+            .min()
+            .expect("processes");
+        assert!(area(more) <= smallest + smallest / 20);
     }
 
     fn skewed(n: usize) -> Vec<Share> {
@@ -328,22 +359,37 @@ mod tests {
     }
 
     #[test]
-    fn a_dominant_group_stays_well_under_half_the_process_area() {
-        let arranged = TileLayout::new(AREA, 112).arrange(&skewed(40));
+    fn the_largest_group_clearly_dominates_a_skewed_system() {
+        let arranged = TileLayout::new(AREA, TileMinimum::square(60)).arrange(&skewed(40));
         let processes: Vec<i64> = arranged
             .tiles
             .iter()
             .filter(|t| matches!(t.kind, TileKind::Process(_)))
             .map(|t| i64::from(t.rect.w) * i64::from(t.rect.h))
             .collect();
-        let whole: i64 = processes.iter().sum();
-        let largest = processes.iter().copied().max().expect("processes");
-        assert!(largest * 100 < whole * 30, "{largest} of {whole}");
+        let smallest = processes.iter().copied().min().expect("processes");
+        assert!(processes[0] > smallest * 5, "{processes:?}");
     }
 
     #[test]
     fn a_skewed_system_shows_many_groups() {
-        let arranged = TileLayout::new(AREA, 112).arrange(&skewed(40));
-        assert!(arranged.shown >= 16, "{}", arranged.shown);
+        let arranged = TileLayout::new(AREA, TileMinimum::square(112)).arrange(&skewed(40));
+        assert!(arranged.shown >= 12, "{}", arranged.shown);
+    }
+
+    #[test]
+    fn compact_wide_tiles_fit_dozens_of_groups() {
+        let minimum = TileMinimum {
+            width: 104,
+            height: 74,
+            band: 90,
+        };
+        let arranged = TileLayout::new(AREA, minimum).arrange(&skewed(120));
+        assert!(arranged.shown >= 36, "{}", arranged.shown);
+        assert!(
+            arranged.tiles[5..]
+                .iter()
+                .all(|t| minimum.admits(t.rect.w, t.rect.h))
+        );
     }
 }

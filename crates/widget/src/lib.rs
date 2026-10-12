@@ -25,6 +25,8 @@
 //! compositor.
 
 mod command;
+mod cursor_request;
+mod cursor_shape;
 mod double_click;
 mod drag_arm;
 mod monotonic_clock;
@@ -35,6 +37,8 @@ mod text_input;
 mod viewport;
 
 pub use command::{Direction, Edge, ListCommand, Mods, PaneResponse};
+pub use cursor_request::CursorRequest;
+pub use cursor_shape::CursorShape;
 pub use double_click::DoubleClick;
 pub use drag_arm::DragArm;
 pub use monotonic_clock::MonotonicClock;

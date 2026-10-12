@@ -11,11 +11,14 @@ use platform::draw::{Canvas, Color, Point, Rect};
 use platform::protocol::PointerButton;
 use platform::toplevel::{Key, KeyPress, Painter, PhysicalSize, PointerEventKind, Position};
 use std::os::fd::RawFd;
-use widget::{DoubleClick, DragArm, Mods, MonotonicClock};
+use widget::{CursorRequest, CursorShape, DoubleClick, DragArm, Mods, MonotonicClock};
 
 use tiles::action_tray::{ActionTray, TrayOpen};
+use tiles::card_grip::CardGrip;
+use tiles::card_placement::CardPlacement;
 use crate::breadcrumb::Breadcrumb;
 use crate::browser::{Browser, Outcome};
+use crate::card_store::CardStore;
 use crate::card_surface::{Backdrop, CardSurface};
 use crate::drag_badge::{BadgeStyle, DragBadge};
 use crate::favorites::Favorites;
@@ -135,6 +138,11 @@ pub struct FilesWindow {
     /// Text queued for the system clipboard, for the loop to hand to the
     /// `Toplevel` that owns it.
     pending_copy: Option<String>,
+    /// Where the user put the card; the same in every folder.
+    placement: CardPlacement,
+    card_store: CardStore,
+    /// The pointer image to show, for the loop to hand to the `Toplevel`.
+    cursor: CursorRequest,
 }
 
 impl FilesWindow {
@@ -154,6 +162,9 @@ impl FilesWindow {
             pressed_action: None,
             tray: None,
             pending_copy: None,
+            placement: CardPlacement::new(),
+            card_store: CardStore::detached(),
+            cursor: CursorRequest::new(),
             mount: MountSession::new(wake, MountIdentity::current()),
             mount_candidate: None,
             browser,
@@ -177,10 +188,24 @@ impl FilesWindow {
         }
     }
 
+    /// Start the card at `placement` and save every move of it to `store`.
+    #[must_use]
+    pub fn with_card(mut self, placement: CardPlacement, store: CardStore) -> Self {
+        self.placement = placement;
+        self.card_store = store;
+        self
+    }
+
     /// Take any text a tile button queued for the system clipboard, for the
     /// event loop to hand to `Toplevel::copy_text`.
     pub const fn take_pending_copy(&mut self) -> Option<String> {
         self.pending_copy.take()
+    }
+
+    /// Take the pointer image, if it changed, for the event loop to hand to
+    /// `Toplevel::set_cursor`.
+    pub const fn take_cursor(&mut self) -> Option<CursorShape> {
+        self.cursor.take()
     }
 
     /// [`Self::step_motion`] at the current time, for the event loop.
@@ -259,23 +284,95 @@ impl FilesWindow {
         self.tile_at(Point::new(at.0, at.1))
     }
 
-    /// The field the spiral fills and the room the card needs in it, so
+    /// The field the spiral fills and the card's cell it winds around, so
     /// every layout, hit-test and page query sees one shape.
     fn flow(&self) -> Flow {
-        let frame = self.frame();
         Flow {
-            area: frame.field(),
+            area: self.frame().field(),
             floor: self.theme.spacing.tile_floor(),
-            tail: frame.card_need(),
+            source: self.card_cell(),
         }
     }
 
-    /// The pinned card, fitted to the spiral's innermost cell.
-    fn card(&self) -> Option<PinnedCard> {
+    /// The cell the user gave the card, or `None` while it is hidden.
+    fn card_cell(&self) -> Option<Rect> {
         let frame = self.frame();
-        frame.card_need()?;
-        let cell = self.scene.card_cell(&self.flow())?;
-        Some(frame.card_in(cell))
+        let floor = frame.card_floor()?;
+        Some(self.placement.cell(frame.field(), floor))
+    }
+
+    /// The pinned card, fitted to its cell.
+    fn card(&self) -> Option<PinnedCard> {
+        Some(self.frame().card_in(self.card_cell()?))
+    }
+
+    /// Which part of the card `at` grabs, when it is not on a control.
+    fn card_grip(&self, at: Position) -> Option<CardGrip> {
+        if self.toolbar_hit(at).is_some() {
+            return None;
+        }
+        let band = self.theme.spacing.gutter() + self.theme.spacing.s();
+        CardGrip::at(self.card_cell()?, Point::new(at.x, at.y), band)
+    }
+
+    fn grab_card(&mut self, at: Position) -> bool {
+        let (Some(grip), Some(cell)) = (self.card_grip(at), self.card_cell()) else {
+            return false;
+        };
+        self.placement.grab(grip, Point::new(at.x, at.y), cell);
+        true
+    }
+
+    /// Carry a card drag to `at`, letting the tiles flow around the new
+    /// cell. Returns whether a drag is under way.
+    fn pull_card(&mut self, at: Position) -> bool {
+        let frame = self.frame();
+        let (Some(_), Some(floor)) = (self.placement.held(), frame.card_floor()) else {
+            return false;
+        };
+        if self
+            .placement
+            .pull(Point::new(at.x, at.y), frame.field(), floor)
+        {
+            self.tray = None;
+            let flow = self.flow();
+            self.scene.aim_growth(&flow, self.browser.navigator());
+        }
+        true
+    }
+
+    /// Move the card to where the config file now puts it, when the file was
+    /// saved since the last call. Returns whether the card moved.
+    pub fn poll_card(&mut self) -> bool {
+        let Some(placement) = self.card_store.reload() else {
+            return false;
+        };
+        if self.placement.held().is_some() || placement.offset() == self.placement.offset() {
+            return false;
+        }
+        self.placement = placement;
+        self.tray = None;
+        let flow = self.flow();
+        self.scene.aim_growth(&flow, self.browser.navigator());
+        true
+    }
+
+    /// The config file's watched descriptor, for the event loop to wait on.
+    #[must_use]
+    pub fn card_fd(&self) -> Option<RawFd> {
+        self.card_store.watch_fd()
+    }
+
+    fn drop_card(&mut self) {
+        if let Some(offset) = self.placement.release(self.frame().field()) {
+            self.card_store.save(offset);
+        }
+    }
+
+    fn show_cursor_at(&mut self, at: Position) {
+        let grip = self.placement.held().or_else(|| self.card_grip(at));
+        self.cursor
+            .want(grip.map_or(CursorShape::Default, CardGrip::cursor));
     }
 
     fn tile_layout(&self) -> Vec<PlacedTile> {
@@ -377,10 +474,10 @@ impl FilesWindow {
             self.activate_control(target);
             return;
         }
-        let over_card = self
-            .card()
-            .is_some_and(|card| card.bounds().contains(Point::new(at.x, at.y)));
-        if !over_card && self.frame().field().contains(Point::new(at.x, at.y)) {
+        if self.grab_card(at) {
+            return;
+        }
+        if self.frame().field().contains(Point::new(at.x, at.y)) {
             self.press_tile(at, mods);
         }
     }
@@ -448,10 +545,7 @@ impl FilesWindow {
             return;
         }
         self.tray = None;
-        let over_card = self
-            .card()
-            .is_some_and(|card| card.bounds().contains(point));
-        if over_card || self.toolbar_hit(at).is_some() {
+        if self.card_grip(at).is_some() || self.toolbar_hit(at).is_some() {
             return;
         }
         if let Some(row) = self.tile_at(point) {
@@ -1518,9 +1612,15 @@ impl Painter for FilesWindow {
             PointerEventKind::Release { at, .. } => {
                 self.drag_arm.cancel();
                 self.drag_row = None;
+                self.drop_card();
                 self.release_action(at);
+                self.show_cursor_at(at);
             }
             PointerEventKind::Motion(at) => {
+                self.show_cursor_at(at);
+                if self.pull_card(at) {
+                    return;
+                }
                 // A drag is armed only while a row press hasn't yet crossed
                 // the threshold; once it fires this is a one-shot -- the
                 // compositor takes over pointer delivery for the rest of the
@@ -1554,6 +1654,7 @@ impl Painter for FilesWindow {
             // otherwise a row stays lit while the pointer is in another window.
             PointerEventKind::Leave => {
                 let _ = self.hover.clear();
+                self.drop_card();
                 self.pressed_action = None;
                 self.drag_arm.cancel();
                 self.drag_row = None;
@@ -1640,7 +1741,9 @@ mod tests {
             width: 900,
             height: 600,
         };
-        let cfg = config::Config::default();
+        let opacity = f64::from(bg_alpha) / 255.0;
+        let cfg = config::Config::from_bytes(format!("[window]\nopacity = {opacity}\n").as_bytes())
+            .expect("parse");
         let theme = tiles::theme::Theme::from_config(&cfg);
         let type_scale = tiles::typography::Typography::load(&cfg, 1.0);
         let favorites = crate::favorites::Favorites::default();
@@ -1930,6 +2033,199 @@ mod tests {
             sub,
             "and clicking forward must return to the child"
         );
+    }
+
+    fn press_at(painter: &mut FilesWindow, at: super::Position) {
+        painter.on_pointer(PointerEventKind::Press {
+            button: PointerButton::Left,
+            at,
+            modifiers: platform::toplevel::ModifierState::default(),
+        });
+    }
+
+    fn release_at(painter: &mut FilesWindow, at: super::Position) {
+        painter.on_pointer(PointerEventKind::Release {
+            button: PointerButton::Left,
+            at,
+            modifiers: platform::toplevel::ModifierState::default(),
+        });
+    }
+
+    /// A point on the card's body: below its controls, inside its edges.
+    fn card_body(painter: &FilesWindow) -> super::Position {
+        let bar = painter.toolbar().expect("shown");
+        let crumbs = bar.breadcrumbs();
+        super::Position {
+            x: crumbs.x + crumbs.w / 2,
+            y: crumbs.y + crumbs.h / 2,
+        }
+    }
+
+    fn drag(painter: &mut FilesWindow, from: super::Position, by: (i32, i32)) {
+        press_at(painter, from);
+        let to = super::Position {
+            x: from.x + by.0,
+            y: from.y + by.1,
+        };
+        painter.on_pointer(PointerEventKind::Motion(to));
+        release_at(painter, to);
+    }
+
+    fn apart(a: platform::draw::Rect, b: platform::draw::Rect) -> bool {
+        a.right() <= b.x || b.right() <= a.x || a.bottom() <= b.y || b.bottom() <= a.y
+    }
+
+    #[test]
+    fn the_card_stays_put_across_navigation() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("card-fixed");
+        let before = painter.card_cell().expect("shown");
+        let outcome = painter.browser.go_to(&root.join("a_directory"));
+        painter.apply(outcome);
+        painter.sync_tiles();
+        assert_eq!(painter.card_cell(), Some(before));
+        click_control(&mut painter, Target::Up);
+        painter.sync_tiles();
+        assert_eq!(painter.card_cell(), Some(before));
+    }
+
+    #[test]
+    fn dragging_the_card_body_moves_it_and_the_tiles_flow_around_it() {
+        let (mut painter, root, _size) = painter_over_a_mixed_directory("card-move");
+        let before = painter.card_cell().expect("shown");
+        let from = card_body(&painter);
+        drag(&mut painter, from, (-120, -80));
+        let after = painter.card_cell().expect("shown");
+        assert_eq!((after.x, after.y), (before.x - 120, before.y - 80));
+        assert_eq!((after.w, after.h), (before.w, before.h));
+        for placed in painter.tile_layout() {
+            assert!(apart(placed.rect, after), "{:?} overlaps the card", placed.rect);
+        }
+        let outcome = painter.browser.go_to(&root.join("a_directory"));
+        painter.apply(outcome);
+        assert_eq!(painter.card_cell(), Some(after), "the new place is kept");
+    }
+
+    #[test]
+    fn dragging_a_card_edge_resizes_it() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("card-resize");
+        let before = painter.card_cell().expect("shown");
+        let edge = super::Position {
+            x: before.right() - 2,
+            y: before.y + before.h / 2,
+        };
+        drag(&mut painter, edge, (60, 0));
+        let after = painter.card_cell().expect("shown");
+        assert_eq!(after.x, before.x);
+        assert_eq!(after.w, before.w + 60);
+    }
+
+    #[test]
+    fn a_moved_card_is_saved_to_the_config_and_restored_from_it() {
+        let (painter, root, size) = painter_over_a_mixed_directory("card-save");
+        let config = root.join("config.toml");
+        std::fs::write(&config, "[window]\nopacity = 0.5\n").expect("seed config");
+        let mut painter = painter.with_card(
+            tiles::card_placement::CardPlacement::new(),
+            crate::card_store::CardStore::at(config.clone()),
+        );
+        let from = card_body(&painter);
+        drag(&mut painter, from, (-120, -80));
+        let moved = painter.card_cell().expect("shown");
+
+        let cfg = config::Config::load_from(&config).expect("a valid config");
+        assert!(
+            (cfg.window.opacity - 0.5).abs() < f64::EPSILON,
+            "the rest is kept"
+        );
+        let (fresh, _root, _size) = painter_over_a_mixed_directory("card-restore");
+        let mut fresh = fresh.with_card(
+            crate::card_store::CardStore::placement(cfg.files.card),
+            crate::card_store::CardStore::detached(),
+        );
+        fresh.resize(size);
+        assert_eq!(fresh.card_cell(), Some(moved));
+    }
+
+    #[test]
+    fn editing_the_config_file_moves_the_open_card() {
+        let (painter, root, _size) = painter_over_a_mixed_directory("card-watch");
+        let config = root.join("config.toml");
+        let mut painter = painter.with_card(
+            tiles::card_placement::CardPlacement::new(),
+            crate::card_store::CardStore::at(config.clone()),
+        );
+        assert!(painter.card_fd().is_some());
+        assert!(!painter.poll_card());
+        let field = painter.frame().field();
+        std::fs::write(
+            &config,
+            "[files]\ncard_x = 0\ncard_y = 0\ncard_width = 200\ncard_height = 150\n",
+        )
+        .expect("edit");
+        assert!(painter.poll_card());
+        assert_eq!(
+            painter.card_cell(),
+            Some(platform::draw::Rect::new(field.x, field.y, 200, 150))
+        );
+        assert!(!painter.poll_card(), "seen once");
+    }
+
+    #[test]
+    fn a_card_saved_by_a_drag_stays_where_it_was_dropped() {
+        let (painter, root, _size) = painter_over_a_mixed_directory("card-own-save");
+        let config = root.join("config.toml");
+        let mut painter = painter.with_card(
+            tiles::card_placement::CardPlacement::new(),
+            crate::card_store::CardStore::at(config),
+        );
+        let from = card_body(&painter);
+        drag(&mut painter, from, (-60, -40));
+        let dropped = painter.card_cell();
+        assert!(!painter.poll_card(), "its own save does not move it");
+        assert_eq!(painter.card_cell(), dropped);
+    }
+
+    #[test]
+    fn a_click_on_the_card_writes_nothing() {
+        let (painter, root, _size) = painter_over_a_mixed_directory("card-click");
+        let config = root.join("config.toml");
+        let mut painter = painter.with_card(
+            tiles::card_placement::CardPlacement::new(),
+            crate::card_store::CardStore::at(config.clone()),
+        );
+        let at = card_body(&painter);
+        press_at(&mut painter, at);
+        release_at(&mut painter, at);
+        assert!(!config.exists());
+    }
+
+    #[test]
+    fn dragging_the_card_selects_nothing_and_arms_no_file_drag() {
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("card-no-select");
+        let from = card_body(&painter);
+        drag(&mut painter, from, (40, 40));
+        assert!(painter.browser.pane().selection().selected().is_empty());
+        assert!(painter.take_pending_drag().is_none());
+    }
+
+    #[test]
+    fn the_pointer_shows_where_the_card_can_be_grabbed() {
+        use widget::CursorShape;
+        let (mut painter, _root, _size) = painter_over_a_mixed_directory("card-cursor");
+        painter.take_cursor();
+        let cell = painter.card_cell().expect("shown");
+        let body = card_body(&painter);
+        painter.on_pointer(PointerEventKind::Motion(body));
+        assert_eq!(painter.take_cursor(), Some(CursorShape::Move));
+        let corner = super::Position {
+            x: cell.right() - 2,
+            y: cell.bottom() - 2,
+        };
+        painter.on_pointer(PointerEventKind::Motion(corner));
+        assert_eq!(painter.take_cursor(), Some(CursorShape::ResizeNwse));
+        let control = control_centre(&painter, Target::Home);
+        painter.on_pointer(PointerEventKind::Motion(control));
+        assert_eq!(painter.take_cursor(), Some(CursorShape::Default));
     }
 
     /// The up arrow must actually leave the directory, through the same

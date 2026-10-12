@@ -115,10 +115,18 @@ impl SurfaceFormat {
     /// opacity -- this is the "glass" the desktop shows through.
     #[must_use]
     pub fn pack_glass(&self, color: Color) -> u32 {
+        self.pack_glass_at(color, self.bg_alpha)
+    }
+
+    /// Pack a surface at its own `alpha` rather than the window's: glass
+    /// that is more or less see-through than the background around it.
+    /// An opaque surface ignores `alpha`, as it does the window's.
+    #[must_use]
+    pub fn pack_glass_at(&self, color: Color, alpha: u8) -> u32 {
         if self.bg_alpha == 255 {
             color.to_xrgb8888()
         } else {
-            color.premultiplied_argb8888(self.bg_alpha)
+            color.premultiplied_argb8888(alpha)
         }
     }
 
@@ -239,6 +247,16 @@ mod tests {
         assert_eq!((packed >> 16) & 0xff, (200 * 128) / 255);
         assert_eq!((packed >> 8) & 0xff, (100 * 128) / 255);
         assert_eq!(packed & 0xff, (50 * 128) / 255);
+    }
+
+    #[test]
+    fn glass_at_its_own_alpha_carries_that_alpha_only_when_translucent() {
+        let color = Color::rgb(200, 100, 50);
+        let glass = SurfaceFormat::with_bg_alpha(128);
+        assert_eq!(glass.pack_glass_at(color, 230) >> 24, 230);
+        assert_eq!(glass.pack_glass_at(color, 128), glass.pack_glass(color));
+        let opaque = SurfaceFormat::opaque();
+        assert_eq!(opaque.pack_glass_at(color, 40), color.to_xrgb8888());
     }
 
     /// Full opacity is the identity for premultiplication, so `with_bg_alpha(255)`

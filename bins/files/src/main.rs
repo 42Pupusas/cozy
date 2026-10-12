@@ -17,6 +17,7 @@
 
 mod breadcrumb;
 mod browser;
+mod card_store;
 mod card_surface;
 mod clipboard;
 mod drag_badge;
@@ -119,6 +120,10 @@ impl App {
                 height: size.height,
             },
             mount_wake,
+        )
+        .with_card(
+            card_store::CardStore::placement(cfg.files.card),
+            card_store::CardStore::at(config::Config::xdg_config_path()),
         );
         // Adopt the true physical size before the first paint.
         painter.resize(window.size());
@@ -153,6 +158,9 @@ impl App {
             // `Toplevel`, which a tile button's click cannot reach.
             if let Some(text) = painter.take_pending_copy() {
                 window.copy_text(text);
+            }
+            if let Some(shape) = painter.take_cursor() {
+                window.set_cursor(shape.key(), shape.theme_names());
             }
 
             // Same reasoning as `take_pending_open`: starting a drag talks
@@ -208,6 +216,7 @@ impl App {
     /// * The directory watcher reports files other processes created,
     ///   renamed or deleted; the re-read goes through the browser, so the
     ///   cursor follows the file rather than the row number.
+    /// * The config watcher reports edits to the file, which move the card.
     ///
     /// All are called unconditionally, and the results combined afterwards:
     /// `||` short-circuits, so a device change would skip the mount poll
@@ -217,7 +226,8 @@ impl App {
         let mount = painter.poll_mount();
         let sizes = painter.poll_tiles();
         let listing = painter.poll_listing();
-        if devices || mount || sizes || listing {
+        let card = painter.poll_card();
+        if devices || mount || sizes || listing || card {
             window.request_redraw();
         }
     }

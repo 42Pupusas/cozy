@@ -10,19 +10,12 @@
 
 use platform::draw::Rect;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MinCell {
-    pub w: i32,
-    pub h: i32,
-}
+use crate::squarify::Squarify;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpiralLayout {
     area: Rect,
     min_side: i32,
-    decay_permille: i32,
-    last_permille: Option<i32>,
-    last_height: Option<i32>,
 }
 
 impl SpiralLayout {
@@ -34,56 +27,26 @@ impl SpiralLayout {
     /// The golden spiral keeps 618.
     const DECAY_PERMILLE: i32 = 875;
 
-    const LAST_PERMILLE: i32 = 600;
-
     #[must_use]
     pub fn new(area: Rect, min_side: i32) -> Self {
         Self {
             area: Rect::new(area.x, area.y, area.w.max(0), area.h.max(0)),
             min_side: min_side.max(1),
-            decay_permille: Self::DECAY_PERMILLE,
-            last_permille: None,
-            last_height: None,
         }
-    }
-
-    /// Makes the innermost of two or more cells weigh `permille`/1000 of the
-    /// largest instead of continuing the decay, so the cell that holds the
-    /// pinned card stands out from the tiles.
-    #[must_use]
-    pub const fn with_prominent_last(mut self) -> Self {
-        self.last_permille = Some(Self::LAST_PERMILLE);
-        self
-    }
-
-    /// Caps the innermost cell's height at `height`. The final strip then
-    /// always holds at least two cells, with the innermost a bar along its
-    /// bottom edge, so the cell is short however the field divides.
-    #[must_use]
-    pub const fn with_last_height(mut self, height: i32) -> Self {
-        self.last_height = Some(height);
-        self
     }
 
     /// The `n` cells, largest first, tiling the area exactly.
     #[must_use]
     pub fn cells(&self, n: usize) -> Vec<Rect> {
-        let weights = self.weights(n.min(Self::MAX_CELLS));
+        let weights = Self::decayed(n.min(Self::MAX_CELLS));
         let mut cells = Vec::with_capacity(weights.len());
         let mut rest = self.area;
         let mut next = 0;
         let mut turn = 0;
         while next < weights.len() {
             let remaining = &weights[next..];
-            let mut take = Self::strip_len(rest, remaining);
-            if self.last_height.is_some() && remaining.len() - take == 1 {
-                take = remaining.len();
-            }
+            let take = Self::strip_len(rest, remaining);
             let last = take == remaining.len();
-            if let (true, true, Some(height)) = (last, take >= 2, self.last_height) {
-                cells.extend(Self::lay_bar_strip(rest, &remaining[..take], height));
-                break;
-            }
             let share = remaining[..take].iter().sum::<f64>() / remaining.iter().sum::<f64>();
             let (strip, after) = Self::lay_strip(rest, &remaining[..take], share, turn, last);
             cells.extend(strip);
@@ -94,64 +57,25 @@ impl SpiralLayout {
         cells
     }
 
-    /// The final strip when the innermost cell is height-capped: the last of
-    /// `weights` is a bar of `height` along the bottom of `rest`, and the
-    /// others share the area above it.
-    fn lay_bar_strip(rest: Rect, weights: &[f64], height: i32) -> Vec<Rect> {
-        let bar = height.min(rest.h);
-        let above = Rect::new(rest.x, rest.y, rest.w, rest.h - bar);
-        let (others, _) = weights.split_at(weights.len() - 1);
-        let (mut cells, _) = Self::lay_strip(above, others, 1.0, 0, true);
-        cells.push(Rect::new(rest.x, above.bottom(), rest.w, bar));
-        cells
-    }
-
-    fn weights(&self, n: usize) -> Vec<f64> {
-        let decay = f64::from(self.decay_permille) / 1000.0;
+    /// `n` weights, each [`Self::DECAY_PERMILLE`]/1000 of the one before.
+    #[must_use]
+    pub fn decayed(n: usize) -> Vec<f64> {
+        let decay = f64::from(Self::DECAY_PERMILLE) / 1000.0;
         let mut weight = 1.0;
-        let mut weights: Vec<f64> = (0..n)
+        (0..n)
             .map(|_| {
                 let current = weight;
                 weight *= decay;
                 current
             })
-            .collect();
-        if let (Some(permille), true) = (self.last_permille, n >= 2) {
-            weights[n - 1] = f64::from(permille) / 1000.0;
-        }
-        weights
+            .collect()
     }
 
-    /// How many of the leading `weights` the next strip takes: the count after
-    /// which adding another cell would make the worst aspect ratio worse.
     fn strip_len(rest: Rect, weights: &[f64]) -> usize {
         let short = f64::from(rest.w.min(rest.h));
         let total: f64 = weights.iter().sum();
-        if short <= 0.0 || total <= 0.0 {
-            return weights.len();
-        }
         let scale = f64::from(rest.w) * f64::from(rest.h) / total;
-        let mut sum = weights[0] * scale;
-        let mut worst = Self::worst_ratio(sum, weights[0] * scale, weights[0] * scale, short);
-        let mut taken = 1;
-        for weight in &weights[1..] {
-            let area = weight * scale;
-            let grown = sum + area;
-            let ratio = Self::worst_ratio(grown, weights[0] * scale, area, short);
-            if ratio > worst {
-                break;
-            }
-            sum = grown;
-            worst = ratio;
-            taken += 1;
-        }
-        taken
-    }
-
-    fn worst_ratio(sum: f64, largest: f64, smallest: f64, short: f64) -> f64 {
-        let side = short.powi(2);
-        let strip = sum.powi(2);
-        (side * largest / strip).max(strip / (side * smallest))
+        Squarify::new(short, scale).run(weights)
     }
 
     /// Lays `weights` as one strip along an edge of `rest`, returning its
@@ -215,36 +139,23 @@ impl SpiralLayout {
     /// tiny window still shows something to click.
     #[must_use]
     pub fn capacity(&self, n: usize) -> usize {
-        self.capacity_ending_in(n, MinCell { w: 0, h: 0 })
-    }
-
-    /// Like [`Self::capacity`], but the innermost of the `k` cells must also
-    /// be at least `last` -- the room the pinned card needs.
-    #[must_use]
-    pub fn capacity_ending_in(&self, n: usize, last: MinCell) -> usize {
         let mut k = n.min(Self::MAX_CELLS);
-        while k > 1 && !self.legible(k, last) {
+        while k > 1 && !self.legible(k) {
             k -= 1;
         }
         k
     }
 
-    fn legible(&self, k: usize, last: MinCell) -> bool {
-        let cells = self.cells(k);
-        let Some((innermost, outer)) = cells.split_last() else {
-            return true;
-        };
-        outer
+    fn legible(&self, k: usize) -> bool {
+        self.cells(k)
             .iter()
             .all(|c| c.w >= self.min_side && c.h >= self.min_side)
-            && innermost.w >= self.min_side.max(last.w)
-            && innermost.h >= self.min_side.max(last.h)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MinCell, SpiralLayout};
+    use super::SpiralLayout;
     use platform::draw::Rect;
 
     fn area_of(cells: &[Rect]) -> i64 {
@@ -255,21 +166,13 @@ mod tests {
     fn legible_layouts_stay_close_to_square() {
         for (w, h) in [(1280, 790), (1000, 700), (1900, 1000), (700, 1100)] {
             let layout = SpiralLayout::new(Rect::new(0, 0, w, h), 152);
-            let k = layout.capacity_ending_in(24, MinCell { w: 170, h: 185 });
-            for c in layout.cells(k) {
+            for c in layout.cells(layout.capacity(24)) {
                 assert!(
                     c.w.max(c.h) * 10 <= c.w.min(c.h) * 20,
                     "{w}x{h}: {c:?} is more than 2:1"
                 );
             }
         }
-    }
-
-    #[test]
-    fn a_default_window_holds_nine_tiles_and_the_card() {
-        let layout = SpiralLayout::new(Rect::new(0, 0, 1280, 790), 152);
-        let need = MinCell { w: 170, h: 185 };
-        assert!(layout.capacity_ending_in(24, need) >= 10);
     }
 
     #[test]
@@ -283,17 +186,6 @@ mod tests {
         let cells = SpiralLayout::new(Rect::new(0, 0, 1280, 790), 1).cells(10);
         let largest = cells.iter().map(|c| area_of(&[*c])).max().expect("cells");
         assert_eq!(area_of(&cells[..1]), largest, "{cells:?}");
-    }
-
-    #[test]
-    fn the_innermost_cell_keeps_the_room_it_was_promised() {
-        let layout = SpiralLayout::new(Rect::new(0, 0, 1280, 790), 64);
-        let need = MinCell { w: 150, h: 200 };
-        let k = layout.capacity_ending_in(100, need);
-        let cells = layout.cells(k);
-        let last = cells.last().expect("cells");
-        assert!(last.w >= 150 && last.h >= 200, "{last:?}");
-        assert!(k < layout.capacity(100), "the promise costs cells");
     }
 
     #[test]
@@ -345,61 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn a_prominent_last_cell_outgrows_the_tiles_before_it() {
-        let layout = SpiralLayout::new(Rect::new(0, 0, 1280, 790), 1).with_prominent_last();
-        let cells = layout.cells(10);
-        let last = area_of(&cells[9..]);
-        assert!(last > area_of(&cells[6..7]), "{cells:?}");
-        assert!(last * 2 > area_of(&cells[8..9]) * 3, "{cells:?}");
-    }
-
-    #[test]
-    fn a_capped_last_cell_is_short_and_the_cells_still_tile_exactly() {
-        for (w, h) in [(1280, 790), (1900, 1000), (1000, 700), (2400, 1300)] {
-            let area = Rect::new(0, 0, w, h);
-            let layout = SpiralLayout::new(area, 1)
-                .with_prominent_last()
-                .with_last_height(180);
-            for n in 2..=10 {
-                let cells = layout.cells(n);
-                assert_eq!(
-                    area_of(&cells),
-                    i64::from(w) * i64::from(h),
-                    "{w}x{h} n={n}"
-                );
-            }
-            let last = *layout.cells(10).last().expect("cells");
-            assert!(last.h <= 200, "{w}x{h}: {last:?}");
-            assert!(last.w > last.h, "{w}x{h}: {last:?}");
-        }
-    }
-
-    #[test]
-    fn the_capped_cell_is_never_taller_than_its_cap_in_any_window() {
-        let need = MinCell { w: 312, h: 140 };
-        for w in (800..=2600).step_by(100) {
-            for h in (500..=1500).step_by(100) {
-                let layout = SpiralLayout::new(Rect::new(0, 0, w, h), 112)
-                    .with_prominent_last()
-                    .with_last_height(need.h);
-                for rest in [1, 3, 9, 30] {
-                    let k = layout.capacity_ending_in(rest + 1, need).max(2);
-                    let cells = layout.cells(k);
-                    let last = *cells.last().expect("cells");
-                    assert!(last.h <= need.h, "{w}x{h} rest={rest} k={k}: {last:?}");
-                    assert_eq!(area_of(&cells), i64::from(w) * i64::from(h));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn a_prominent_last_cell_still_tiles_exactly() {
-        let area = Rect::new(3, 4, 1280, 790);
-        for n in 1..=SpiralLayout::MAX_CELLS {
-            let cells = SpiralLayout::new(area, 1).with_prominent_last().cells(n);
-            assert_eq!(area_of(&cells), 1280 * 790, "n={n}");
-        }
+    fn the_weights_decay_from_one() {
+        let weights = SpiralLayout::decayed(3);
+        assert!((weights[0] - 1.0).abs() < f64::EPSILON);
+        assert!(weights[1] < weights[0] && weights[2] < weights[1]);
     }
 
     #[test]

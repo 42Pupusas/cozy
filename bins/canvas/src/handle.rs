@@ -13,71 +13,7 @@
 //! and edges are grabbable along their whole length rather than only at
 //! their midpoints.
 
-/// The pointer image a region asks for. Names follow the CSS/Xcursor
-/// vocabulary so the window can map them onto theme cursor files.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CursorShape {
-    /// Nothing special: the plain arrow.
-    Default,
-    /// Over a movable body.
-    Move,
-    /// Over a text region.
-    Text,
-    /// Panning the canvas itself.
-    Grab,
-    /// Mid-pan, button held.
-    Grabbing,
-    /// Diagonal resize, top-left <-> bottom-right.
-    ResizeNwse,
-    /// Diagonal resize, top-right <-> bottom-left.
-    ResizeNesw,
-    /// Horizontal resize.
-    ResizeEw,
-    /// Vertical resize.
-    ResizeNs,
-    /// Crosshair, for drawing a new shape.
-    Crosshair,
-}
-
-impl CursorShape {
-    /// A stable identifier for this shape, used as the cursor cache key.
-    ///
-    /// Distinct from the theme names: those vary by theme, this never does.
-    #[must_use]
-    pub const fn key(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::Move => "move",
-            Self::Text => "text",
-            Self::Grab => "grab",
-            Self::Grabbing => "grabbing",
-            Self::ResizeNwse => "nwse",
-            Self::ResizeNesw => "nesw",
-            Self::ResizeEw => "ew",
-            Self::ResizeNs => "ns",
-            Self::Crosshair => "crosshair",
-        }
-    }
-
-    /// The Xcursor theme names this shape may be published under, in
-    /// preference order. Themes disagree about which alias they ship, so
-    /// the loader tries each in turn.
-    #[must_use]
-    pub const fn theme_names(self) -> &'static [&'static str] {
-        match self {
-            Self::Default => &["left_ptr", "default", "arrow"],
-            Self::Move => &["fleur", "move", "all-scroll"],
-            Self::Text => &["xterm", "text", "ibeam"],
-            Self::Grab => &["openhand", "grab", "hand1"],
-            Self::Grabbing => &["closedhand", "grabbing", "hand2"],
-            Self::ResizeNwse => &["nwse-resize", "size_fdiag", "bottom_right_corner"],
-            Self::ResizeNesw => &["nesw-resize", "size_bdiag", "bottom_left_corner"],
-            Self::ResizeEw => &["ew-resize", "sb_h_double_arrow", "right_side"],
-            Self::ResizeNs => &["ns-resize", "sb_v_double_arrow", "bottom_side"],
-            Self::Crosshair => &["crosshair", "cross", "tcross"],
-        }
-    }
-}
+pub use widget::CursorShape;
 
 /// Which part of a selected shape a point grabs.
 ///
@@ -332,48 +268,6 @@ mod tests {
         assert_eq!(Handle::TopLeft.cursor(), Handle::BottomRight.cursor());
         assert_eq!(Handle::TopRight.cursor(), Handle::BottomLeft.cursor());
         assert_ne!(Handle::TopLeft.cursor(), Handle::TopRight.cursor());
-    }
-
-    /// Every shape, for exhaustive checks.
-    const ALL_SHAPES: [CursorShape; 10] = [
-        CursorShape::Default,
-        CursorShape::Move,
-        CursorShape::Text,
-        CursorShape::Grab,
-        CursorShape::Grabbing,
-        CursorShape::ResizeNwse,
-        CursorShape::ResizeNesw,
-        CursorShape::ResizeEw,
-        CursorShape::ResizeNs,
-        CursorShape::Crosshair,
-    ];
-
-    #[test]
-    fn every_shape_has_a_distinct_cache_key() {
-        // A collision would make two shapes share one cached image.
-        let mut keys: Vec<&str> = ALL_SHAPES.iter().map(|s| s.key()).collect();
-        keys.sort_unstable();
-        let before = keys.len();
-        keys.dedup();
-        assert_eq!(keys.len(), before, "two cursor shapes share a cache key");
-    }
-
-    #[test]
-    fn every_cursor_shape_offers_at_least_one_theme_name() {
-        for shape in [
-            CursorShape::Default,
-            CursorShape::Move,
-            CursorShape::Text,
-            CursorShape::Grab,
-            CursorShape::Grabbing,
-            CursorShape::ResizeNwse,
-            CursorShape::ResizeNesw,
-            CursorShape::ResizeEw,
-            CursorShape::ResizeNs,
-            CursorShape::Crosshair,
-        ] {
-            assert!(!shape.theme_names().is_empty(), "{shape:?} has no names");
-        }
     }
 
     #[test]

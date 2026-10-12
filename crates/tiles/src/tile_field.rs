@@ -8,7 +8,8 @@ use platform::draw::{Point, Rect};
 use browse::DirectoryBrowser;
 
 use crate::dir_sizes::DirSizes;
-use crate::spiral::{MinCell, SpiralLayout};
+use crate::source_spiral::SourceSpiral;
+use crate::spiral::SpiralLayout;
 use crate::tile_coloring::TileColoring;
 use crate::tile_rank::TileRank;
 
@@ -29,9 +30,9 @@ pub struct PlacedMore {
     pub bytes: u64,
 }
 
-/// The tiles in view, the cell for the entries not in view, the innermost
-/// cell kept for the card, and whether scrolling could bring in more at
-/// either end.
+/// The tiles in view, the cell for the entries not in view, the source the
+/// spiral winds around, and whether scrolling could bring in more at either
+/// end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Arrangement {
     pub tiles: Vec<PlacedTile>,
@@ -121,27 +122,24 @@ impl TileField {
         self.synced = Some(now);
     }
 
-    /// The tiles in view and their cells, plus the card's cell.
+    /// The tiles in view and their cells.
     ///
-    /// `reserve`, when given, is the least room the pinned card needs. The
-    /// card then takes the spiral's innermost cell and the tiles share the
-    /// cells outside it.
+    /// `source`, when given, is held clear: the tiles wind around it from
+    /// the field's edge inward, and it is reported back as the card's cell.
     #[must_use]
-    pub fn arrange(&self, area: Rect, min_side: i32, reserve: Option<MinCell>) -> Arrangement {
+    pub fn arrange(&self, area: Rect, min_side: i32, source: Option<Rect>) -> Arrangement {
         let from = self.start();
-        let spiral = SpiralLayout::new(area, min_side);
         let rest = self.rank.len().saturating_sub(from);
-        let Some(need) = reserve else {
+        let Some(source) = source else {
+            let spiral = SpiralLayout::new(area, min_side);
             let (shown, more) = Self::split(rest, spiral.capacity(rest));
             let cells = spiral.cells(shown + usize::from(more));
             return self.arrangement(from, shown, more, &cells, None);
         };
-        let spiral = spiral.with_prominent_last().with_last_height(need.h);
-        let room = spiral.capacity_ending_in(rest + 1, need).max(2) - 1;
-        let (shown, more) = Self::split(rest, room);
-        let mut cells = spiral.cells(shown + usize::from(more) + 1);
-        let card = cells.pop();
-        self.arrangement(from, shown, more, &cells, card)
+        let spiral = SourceSpiral::new(area, source, min_side);
+        let (shown, more) = Self::split(rest, spiral.capacity(rest));
+        let cells = spiral.cells(shown + usize::from(more));
+        self.arrangement(from, shown, more, &cells, Some(source))
     }
 
     fn split(rest: usize, room: usize) -> (usize, bool) {
@@ -160,6 +158,8 @@ impl TileField {
         cells: &[Rect],
         card: Option<Rect>,
     ) -> Arrangement {
+        let shown = shown.min(cells.len());
+        let more = more && cells.len() > shown;
         let rows = self.rank.window(from, shown);
         let slots = TileColoring::of(cells).slots();
         let tiles = rows
@@ -188,26 +188,20 @@ impl TileField {
 
     /// The tiles in view and their cells.
     #[must_use]
-    pub fn layout(&self, area: Rect, min_side: i32, reserve: Option<MinCell>) -> Vec<PlacedTile> {
-        self.arrange(area, min_side, reserve).tiles
+    pub fn layout(&self, area: Rect, min_side: i32, source: Option<Rect>) -> Vec<PlacedTile> {
+        self.arrange(area, min_side, source).tiles
     }
 
     #[must_use]
-    pub fn more(&self, area: Rect, min_side: i32, reserve: Option<MinCell>) -> Option<PlacedMore> {
-        self.arrange(area, min_side, reserve).more
-    }
-
-    /// The cell the pinned card occupies, when one is reserved.
-    #[must_use]
-    pub fn card_cell(&self, area: Rect, min_side: i32, reserve: Option<MinCell>) -> Option<Rect> {
-        self.arrange(area, min_side, reserve).card
+    pub fn more(&self, area: Rect, min_side: i32, source: Option<Rect>) -> Option<PlacedMore> {
+        self.arrange(area, min_side, source).more
     }
 
     /// The entries in view in rank order, and whether more lie past either
     /// end.
     #[must_use]
-    pub fn page(&self, area: Rect, min_side: i32, reserve: Option<MinCell>) -> Page {
-        let arranged = self.arrange(area, min_side, reserve);
+    pub fn page(&self, area: Rect, min_side: i32, source: Option<Rect>) -> Page {
+        let arranged = self.arrange(area, min_side, source);
         Page {
             rows: arranged.tiles.iter().map(|placed| placed.row).collect(),
             later: arranged.later,
@@ -221,10 +215,10 @@ impl TileField {
         &self,
         area: Rect,
         min_side: i32,
-        reserve: Option<MinCell>,
+        source: Option<Rect>,
         at: Point,
     ) -> Option<usize> {
-        self.layout(area, min_side, reserve)
+        self.layout(area, min_side, source)
             .into_iter()
             .find(|placed| placed.rect.contains(at))
             .map(|placed| placed.row)
@@ -237,14 +231,14 @@ impl TileField {
         &mut self,
         area: Rect,
         min_side: i32,
-        reserve: Option<MinCell>,
+        source: Option<Rect>,
         steps: i32,
     ) -> bool {
         let before = self.start();
         self.offset = before;
         for _ in 0..steps.unsigned_abs() {
             if steps > 0 {
-                if !self.arrange(area, min_side, reserve).later {
+                if !self.arrange(area, min_side, source).later {
                     break;
                 }
                 self.offset += 1;
@@ -265,7 +259,6 @@ impl TileField {
 #[cfg(test)]
 mod tests {
     use super::TileField;
-    use crate::spiral::MinCell;
     use crate::test_support::TempDir;
     use crate::tile_coloring::TileColoring;
     use browse::DirectoryBrowser;
@@ -461,25 +454,14 @@ mod tests {
         assert_eq!(field.offset, 4);
     }
 
-    const NEED: MinCell = MinCell { w: 150, h: 200 };
+    const NEED: Rect = Rect::new(500, 300, 320, 220);
 
     #[test]
-    fn the_card_takes_the_innermost_cell_and_outgrows_the_small_tiles() {
-        let (field, _browser, _dir) = crowded();
-        let arranged = field.arrange(AREA, 120, Some(NEED));
-        let card = arranged.card.expect("a reserved card gets a cell");
-        assert!(card.w >= NEED.w && card.h >= NEED.h, "{card:?}");
-        let areas: Vec<i64> = arranged
-            .tiles
-            .iter()
-            .map(|p| i64::from(p.rect.w) * i64::from(p.rect.h))
-            .collect();
-        let card_area = i64::from(card.w) * i64::from(card.h);
-        let smallest = areas.iter().min().copied().expect("tiles");
-        let largest = areas.iter().max().copied().expect("tiles");
-        assert!(card_area > smallest, "the card outgrows the smallest tile");
-        assert!(card_area < largest, "the card does not lead the field");
-        assert!(arranged.tiles.iter().all(|p| p.rect != card));
+    fn the_card_keeps_the_source_it_was_given_whatever_the_folder() {
+        let (crowded, _browser, _dir) = crowded();
+        let (sparse, _sparse_dir) = folder_of("tile_field_card_sparse", 3);
+        assert_eq!(crowded.arrange(AREA, 120, Some(NEED)).card, Some(NEED));
+        assert_eq!(sparse.arrange(AREA, 120, Some(NEED)).card, Some(NEED));
     }
 
     #[test]
@@ -516,14 +498,22 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_directory_gives_the_card_the_whole_area() {
+    fn an_empty_directory_still_has_its_card_where_it_was() {
         let dir = TempDir::new("tile_field_card_empty");
         let browser = DirectoryBrowser::open(dir.path(), 800, 600, 28).expect("open");
         let (mut field, _wake) = field();
         field.sync(&browser);
         let arranged = field.arrange(AREA, 120, Some(NEED));
         assert!(arranged.tiles.is_empty());
-        assert_eq!(arranged.card, Some(AREA));
+        assert_eq!(arranged.card, Some(NEED));
+    }
+
+    #[test]
+    fn a_card_covering_the_field_leaves_no_tiles_and_no_more_tile() {
+        let (field, _browser, _dir) = crowded();
+        let arranged = field.arrange(AREA, 120, Some(AREA));
+        assert!(arranged.tiles.is_empty());
+        assert!(arranged.more.is_none());
     }
 
     #[test]
@@ -623,9 +613,9 @@ mod tests {
     }
 
     #[test]
-    fn no_reserve_means_no_card_cell() {
+    fn no_source_means_no_card_cell() {
         let (field, _browser, _dir) = crowded();
-        assert_eq!(field.card_cell(AREA, 120, None), None);
+        assert_eq!(field.arrange(AREA, 120, None).card, None);
     }
 
     #[test]

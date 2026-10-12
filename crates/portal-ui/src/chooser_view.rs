@@ -116,7 +116,7 @@ impl ChooserView {
         Flow {
             area: self.layout().field(),
             floor: self.theme.spacing.tile_floor(),
-            tail: None,
+            source: None,
         }
     }
 

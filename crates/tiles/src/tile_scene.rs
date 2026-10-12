@@ -6,7 +6,6 @@ use platform::draw::{Point, Rect};
 use widget::ListCommand;
 
 use crate::hover::Spot;
-use crate::spiral::MinCell;
 use crate::spiral_cursor::{Landing, SpiralCursor};
 use crate::tile_action::TileAction;
 use crate::tile_field::{Page, PlacedMore, PlacedTile, TileField};
@@ -16,12 +15,12 @@ use crate::tile_motion::TileMotion;
 use crate::tile_painter::PaintedTile;
 use crate::tile_stage::TileStage;
 
-/// The room the spiral is laid out in.
+/// The room the spiral is laid out in, and the source it winds around.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Flow {
     pub area: Rect,
     pub floor: i32,
-    pub tail: Option<MinCell>,
+    pub source: Option<Rect>,
 }
 
 /// What the glides are pointed at for one step.
@@ -99,27 +98,22 @@ impl TileScene {
 
     #[must_use]
     pub fn layout(&self, flow: &Flow) -> Vec<PlacedTile> {
-        self.field.layout(flow.area, flow.floor, flow.tail)
+        self.field.layout(flow.area, flow.floor, flow.source)
     }
 
     #[must_use]
     pub fn more(&self, flow: &Flow) -> Option<PlacedMore> {
-        self.field.more(flow.area, flow.floor, flow.tail)
-    }
-
-    #[must_use]
-    pub fn card_cell(&self, flow: &Flow) -> Option<Rect> {
-        self.field.card_cell(flow.area, flow.floor, flow.tail)
+        self.field.more(flow.area, flow.floor, flow.source)
     }
 
     #[must_use]
     pub fn page(&self, flow: &Flow) -> Page {
-        self.field.page(flow.area, flow.floor, flow.tail)
+        self.field.page(flow.area, flow.floor, flow.source)
     }
 
     #[must_use]
     pub fn hit(&self, flow: &Flow, at: Point) -> Option<usize> {
-        self.field.hit(flow.area, flow.floor, flow.tail, at)
+        self.field.hit(flow.area, flow.floor, flow.source, at)
     }
 
     #[must_use]
@@ -144,7 +138,7 @@ impl TileScene {
     /// Scroll the field by `steps` tiles and aim the growth at the new view.
     /// Returns whether the view moved.
     pub fn slide(&mut self, flow: &Flow, nav: &DirectoryBrowser, steps: i32) -> bool {
-        let moved = self.field.slide(flow.area, flow.floor, flow.tail, steps);
+        let moved = self.field.slide(flow.area, flow.floor, flow.source, steps);
         if moved {
             self.aim_growth(flow, nav);
         }
@@ -153,7 +147,7 @@ impl TileScene {
 
     /// Scroll without re-aiming the growth, for a steer the caller finishes.
     pub fn slide_quietly(&mut self, flow: &Flow, steps: i32) -> bool {
-        self.field.slide(flow.area, flow.floor, flow.tail, steps)
+        self.field.slide(flow.area, flow.floor, flow.source, steps)
     }
 
     /// Resolve a movement key against the tiles in view, scrolling the field
@@ -295,7 +289,7 @@ mod tests {
         Flow {
             area: AREA,
             floor,
-            tail: None,
+            source: None,
         }
     }
 

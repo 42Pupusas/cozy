@@ -917,6 +917,38 @@ fn retheming_the_terminal_moves_the_browser_with_it() {
 }
 
 #[test]
+fn the_card_is_unplaced_unless_configured() {
+    assert_eq!(Config::parse("").files.card, None);
+}
+
+#[test]
+fn the_card_bounds_are_read_from_files() {
+    let cfg =
+        Config::parse("[files]\ncard_x = 10\ncard_y = 20\ncard_width = 300\ncard_height = 200\n");
+    assert_eq!(
+        cfg.files.card,
+        Some(crate::CardBounds {
+            x: 10,
+            y: 20,
+            width: 300,
+            height: 200,
+        })
+    );
+}
+
+#[test]
+fn part_of_the_card_bounds_is_an_error() {
+    let err = Config::fail("[files]\ncard_x = 10\ncard_y = 20\n");
+    assert!(err.contains("set together"), "{err}");
+}
+
+#[test]
+fn a_zero_card_size_is_an_error() {
+    let err = Config::fail("[files]\ncard_x = 0\ncard_y = 0\ncard_width = 0\ncard_height = 200\n");
+    assert!(err.contains("files.card_width"), "{err}");
+}
+
+#[test]
 fn files_overrides_win_over_the_mirrored_palette() {
     let cfg = Config::parse("[files]\ndir = \"#ff0000\"\nmuted = \"#00ff00\"\n");
     assert_eq!(cfg.files_dir(), Color::from_rgb(0xff, 0x00, 0x00));

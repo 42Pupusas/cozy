@@ -146,6 +146,11 @@
 //! header_height   = 24            # pixels, 0-512 (0 hides the strip)
 //! status_height   = 20            # pixels, 0-512 (0 hides the strip)
 //! padding         = 8             # left/right padding inside a row, 0-512
+//! tile_opacity    = 0.9           # 0.0-1.0; defaults to halfway from opacity to 1.0
+//! card_x          = 40            # the card's place in the tile field, in pixels;
+//! card_y          = 30            # written by the browser when the card is moved
+//! card_width      = 320           # or resized. All four or none; unset centres
+//! card_height     = 240           # the card at its smallest size
 //!
 //! # Everything here is optional and defaults to *mirroring* the bar's own
 //! # resolved background/opacity (which itself mirrors the terminal's), or
@@ -187,10 +192,13 @@
 //!                           # edge leaves the panel fully on-screen
 //! ```
 
+mod card_bounds;
 mod color;
 mod extract;
+mod table_edit;
 mod tests;
 
+pub use card_bounds::CardBounds;
 pub use color::Color;
 
 use extract::TableExt;
@@ -704,6 +712,12 @@ pub struct FilesConfig {
     /// window is opaque among translucent siblings reads as a rendering fault,
     /// not as a design choice -- the same reasoning as [`BarConfig::opacity`].
     pub opacity: Option<f64>,
+    /// The tiles' opacity, `0.0`-`1.0`. `None` sits halfway between the
+    /// window's opacity and opaque.
+    pub tile_opacity: Option<f64>,
+    /// The card's place in the tile field. `None` centres it at its
+    /// smallest size.
+    pub card: Option<CardBounds>,
 }
 
 impl FilesConfig {
@@ -1444,7 +1458,47 @@ impl Config {
             self.files.opacity = Some(n);
         }
 
+        if let Some(n) = files.get_float_range(
+            "tile_opacity",
+            "files.tile_opacity",
+            0.0,
+            1.0,
+            "must be between 0.0 and 1.0",
+        )? {
+            self.files.tile_opacity = Some(n);
+        }
+
+        self.files.card = Self::card_bounds(files)?;
         Ok(())
+    }
+
+    fn card_bounds(files: &TomlTable<'_>) -> Result<Option<CardBounds>, ConfigError> {
+        let mut values = [0; 4];
+        let mut found = 0;
+        for (i, (key, field)) in CardBounds::KEYS
+            .into_iter()
+            .zip(CardBounds::FIELDS)
+            .enumerate()
+        {
+            if let Some(n) = files.get_int_range(
+                key,
+                field,
+                CardBounds::LOWEST[i],
+                CardBounds::LIMIT,
+                "must be between 0 and 65535, and the size at least 1",
+            )? {
+                values[i] = i32::try_from(n).unwrap_or(0);
+                found += 1;
+            }
+        }
+        match found {
+            0 => Ok(None),
+            4 => Ok(Some(CardBounds::from_values(values))),
+            _ => Err(ConfigError::InvalidValue {
+                field: "files.card_x",
+                reason: "card_x, card_y, card_width and card_height must be set together",
+            }),
+        }
     }
 
     /// Apply the `[canvas]` table, if present. Same shape as
@@ -2054,6 +2108,15 @@ impl Config {
     #[must_use]
     pub fn files_opacity(&self) -> f64 {
         self.files.opacity.unwrap_or(self.window.opacity)
+    }
+
+    /// The tiles' opacity: `[files].tile_opacity` if set, otherwise halfway
+    /// from [`Self::files_opacity`] to opaque.
+    #[must_use]
+    pub fn files_tile_opacity(&self) -> f64 {
+        self.files
+            .tile_opacity
+            .unwrap_or_else(|| f64::midpoint(self.files_opacity(), 1.0))
     }
 
     /// The canvas background: `[canvas].background` if set, otherwise

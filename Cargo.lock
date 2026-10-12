@@ -229,6 +229,7 @@ dependencies = [
  "font",
  "fsmodel",
  "headless-stress",
+ "inotify-events",
  "launcher",
  "localtime",
  "mime",

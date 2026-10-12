@@ -3,6 +3,8 @@
 
 pub mod action_icon;
 pub mod action_tray;
+pub mod card_grip;
+pub mod card_placement;
 pub mod density;
 pub mod dir_sizes;
 pub mod fade;
@@ -12,9 +14,12 @@ pub mod pinned_card;
 pub mod row_format;
 pub mod row_kind;
 pub mod size_ledger;
+pub mod source_spiral;
 pub mod spacing;
 pub mod spiral;
 pub mod spiral_cursor;
+pub mod spiral_side;
+pub mod squarify;
 pub mod tally_roster;
 pub mod theme;
 pub mod tile_action;

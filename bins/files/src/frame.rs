@@ -2,23 +2,22 @@
 //! and what the pinned chrome card needs from it.
 //!
 //! Pure arithmetic over a window size, so the whole layout is testable
-//! without a compositor. The card has no rectangle of its own here: it is the
-//! spiral's innermost cell, so its position follows from how many tiles the
-//! directory has. The frame supplies the field and the card's minimum size;
-//! [`Frame::card_in`] fits the card to whichever cell the spiral hands back.
+//! without a compositor. The card's cell is chosen by the user and kept by
+//! the window; the frame supplies the field, the smallest the card may be,
+//! and [`Frame::card_in`] to fit the card inside its cell.
 
 use platform::draw::Rect;
 
+use tiles::card_grip::CardFloor;
 use tiles::pinned_card::{CardMetrics, PinnedCard};
 use tiles::spacing::Spacing;
-use tiles::spiral::MinCell;
 
 /// The window's resolved layout.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame {
     size: Rect,
     field: Rect,
-    need: Option<MinCell>,
+    floor: Option<CardFloor>,
     spacing: Spacing,
     metrics: CardMetrics,
 }
@@ -43,14 +42,14 @@ impl Frame {
             (height - margin * 2).max(0),
         );
         let gutters = spacing.gutter() * 2;
-        let need = card_visible.then(|| MinCell {
+        let floor = card_visible.then(|| CardFloor {
             w: spacing.card_width() + gutters,
             h: metrics.nav + metrics.crumbs + metrics.filter + metrics.storage + gutters,
         });
         Self {
             size: Rect::new(0, 0, width, height),
             field,
-            need,
+            floor,
             spacing,
             metrics,
         }
@@ -69,10 +68,10 @@ impl Frame {
         self.field
     }
 
-    /// The least room the card needs, or `None` when the user hid it.
+    /// The smallest cell the card may have, or `None` when the user hid it.
     #[must_use]
-    pub const fn card_need(&self) -> Option<MinCell> {
-        self.need
+    pub const fn card_floor(&self) -> Option<CardFloor> {
+        self.floor
     }
 
     /// The card fitted to the spiral cell `cell`, inset by the same gutter
@@ -134,13 +133,13 @@ mod tests {
     #[test]
     fn hiding_the_card_keeps_the_field_and_drops_the_need() {
         let hidden = Frame::new(1280, 790, false, spacing(), METRICS);
-        assert!(hidden.card_need().is_none());
+        assert!(hidden.card_floor().is_none());
         assert_eq!(hidden.field(), frame(1280, 790).field());
     }
 
     #[test]
     fn the_card_needs_its_width_and_the_height_of_its_chrome_and_footer() {
-        let need = frame(1280, 790).card_need().expect("shown");
+        let need = frame(1280, 790).card_floor().expect("shown");
         let gutters = spacing().gutter() * 2;
         assert_eq!(need.w, spacing().card_width() + gutters);
         assert_eq!(need.h, 58 + 34 + 43 + 42 + gutters);

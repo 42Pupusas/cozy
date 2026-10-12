@@ -93,10 +93,11 @@ pub struct Theme {
     /// The filter box's well on [`Self::card_fill`].
     pub card_fill_input: Color,
 
-    /// The four resting tile fills, drawn at the card's opacity. Each tile
-    /// takes the one its place in the colouring assigns, so bordering tiles
-    /// differ.
+    /// The four resting tile fills. Each tile takes the one its place in the
+    /// colouring assigns, so bordering tiles differ.
     pub tile_fills: [Color; 4],
+    /// How opaque the tile fills are on a translucent window.
+    pub tile_alpha: u8,
 
     /// Fill under a hovered sidebar row or control (the filter box, a toolbar
     /// button). Tiles do not use it: they answer the pointer with motion.
@@ -227,6 +228,7 @@ impl Default for Theme {
                 Color::rgb(0x28, 0x22, 0x33),
                 Color::rgb(0x2b, 0x28, 0x25),
             ],
+            tile_alpha: u8::MAX,
 
             hover: Color::rgb(0x28, 0x28, 0x3c),
             // Washes of the type colours over the list background: the same
@@ -383,6 +385,7 @@ impl Theme {
                 .mix(cfg.files_text(), Self::CARD_FILL_INPUT_MIX)
                 .into(),
             tile_fills: std::array::from_fn(|slot| cfg.files_tile_color(slot).into()),
+            tile_alpha: platform::SurfaceFormat::from_opacity(cfg.files_tile_opacity()).bg_alpha(),
 
             // Hover sits *between* the sidebar's own background and its active
             // fill, and is derived by mixing those two rather than by washing
@@ -802,6 +805,16 @@ background = "#181616"
         let themed = Theme::from_config(&cfg);
         assert_eq!(themed.tile_fills[2], Color::rgb(0x10, 0x20, 0x30));
         assert_eq!(themed.tile_fills[0], plain.tile_fills[0]);
+    }
+
+    #[test]
+    fn tiles_are_more_opaque_than_the_window_unless_configured() {
+        let cfg = config::Config::from_bytes(b"[window]\nopacity = 0.5\n").expect("parse");
+        assert_eq!(Theme::from_config(&cfg).tile_alpha, 191);
+        let cfg =
+            config::Config::from_bytes(b"[window]\nopacity = 0.5\n[files]\ntile_opacity = 0.2\n")
+                .expect("parse");
+        assert_eq!(Theme::from_config(&cfg).tile_alpha, 51);
     }
 
     #[test]

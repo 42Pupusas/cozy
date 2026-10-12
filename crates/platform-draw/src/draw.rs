@@ -606,6 +606,25 @@ impl<'a> Canvas<'a> {
         self.fill_round_rect_glass_rows(rect, color, radius, rect.y, rect.bottom());
     }
 
+    /// [`Self::fill_round_rect_glass`] at its own `alpha` instead of the
+    /// window's, for a surface meant to be more solid than the background.
+    pub fn fill_round_rect_glass_at(&mut self, rect: Rect, color: Color, radius: i32, alpha: u8) {
+        let packed = self.format.pack_glass_at(color, alpha);
+        let edge = if self.format.needs_alpha() {
+            alpha
+        } else {
+            u8::MAX
+        };
+        self.fill_round_rect_packed(
+            rect,
+            color,
+            radius,
+            packed,
+            edge,
+            Clip::rows(rect.y, rect.bottom()),
+        );
+    }
+
     /// [`Self::fill_round_rect_glass`] limited to the scanlines `top..bottom`.
     ///
     /// The shape is the whole rectangle's, so two calls with adjacent row

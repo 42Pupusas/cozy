@@ -156,7 +156,7 @@ impl<'a> TilePainter<'a> {
         let radius = theme.spacing.radius() * 2;
         self.paint_shadow(canvas, rect, radius, tile.raise);
         let surface = self.resting(tile);
-        canvas.fill_round_rect_glass(rect, surface, radius);
+        canvas.fill_round_rect_glass_at(rect, surface, radius, theme.tile_alpha);
         canvas.draw_round_rect(rect, self.outline(tile), radius);
         self.paint_chosen_ring(canvas, tile, rect, radius);
 
@@ -207,7 +207,7 @@ impl<'a> TilePainter<'a> {
         let border = theme
             .sidebar_border
             .blend_opaque_color(theme.background, tile.veil);
-        canvas.fill_round_rect_glass(rect, surface, radius);
+        canvas.fill_round_rect_glass_at(rect, surface, radius, theme.tile_alpha);
         canvas.draw_round_rect(rect, border, radius);
         let text = Self::scaled(u16::from(TileGrowth::text(tile.grown)), u8::MAX - tile.veil);
         if text == 0 {

@@ -6,6 +6,7 @@
 //! * the toplevel's eventfd, signalled by the Wayland reader and by the
 //!   mount, folder-size and activation workers;
 //! * the open directory's inotify fd;
+//! * the config file's inotify fd, for edits that move the card;
 //! * the mount table (`POLLPRI`) and udev's block records, for devices.
 //!
 //! The deadlines are key auto-repeat, which is a real due time rather than
@@ -42,7 +43,10 @@ impl IdleWait {
     pub fn sleep(window: &Toplevel, painter: &mut FilesWindow) {
         let mut set = PollSet::new();
         let waker = set.watch(window.waker().raw_fd(), Interest::Readable);
-        if let Some(fd) = painter.watch_fd() {
+        for fd in [painter.watch_fd(), painter.card_fd()]
+            .into_iter()
+            .flatten()
+        {
             set.watch(fd, Interest::Readable);
         }
         let mounts = painter

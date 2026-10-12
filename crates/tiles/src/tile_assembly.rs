@@ -189,7 +189,7 @@ mod tests {
             let flow = Flow {
                 area: Rect::new(0, 0, 1300, 800),
                 floor: 120,
-                tail: None,
+                source: None,
             };
             let mut scene = TileScene::new(waker::Waker::new().expect("eventfd"));
             let aim = MotionAim {

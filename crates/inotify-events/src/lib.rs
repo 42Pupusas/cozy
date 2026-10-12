@@ -14,6 +14,10 @@
 //! here instead of keeping two `unsafe` blocks that could silently drift
 //! apart.
 
+mod file_watch;
+
+pub use file_watch::FileWatch;
+
 use ququmatz::InotifyEvent;
 
 /// A marker type (not a value with fields) grouping the shared inotify

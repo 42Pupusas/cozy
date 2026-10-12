@@ -58,3 +58,7 @@ harness = false
 [[bench]]
 name    = "premultiply"
 harness = false
+
+[[bench]]
+name    = "row_pitch"
+harness = false

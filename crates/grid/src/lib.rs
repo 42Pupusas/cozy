@@ -642,6 +642,7 @@ impl Grid {
             out.push(DirtyRow {
                 row,
                 content: DirtyRowContent::Cells(cells),
+                soft_wrap: self.primary.viewport_soft_wrap(row, cur),
             });
         }
         // Signed whole-screen pixel-shift for the common small wheel/page step.
@@ -907,6 +908,7 @@ impl Grid {
         while offset < bytes.len() {
             if self.pending_wrap {
                 self.active_screen_mut().set_wrapped(row, true);
+                self.dirty.mark_row(row);
                 col = 0;
                 self.cursor.col = 0;
                 self.cursor.row = row;
@@ -968,6 +970,7 @@ impl Grid {
         if self.pending_wrap {
             let row = self.cursor.row;
             self.active_screen_mut().set_wrapped(row, true);
+            self.dirty.mark_row(row);
             self.cursor.col = 0;
             self.cursor_down(1, true);
             self.pending_wrap = false;
@@ -2441,6 +2444,22 @@ mod tests {
         g.resize(10, 4);
         assert_eq!(g.screen().get_cell(0, 1).ch, 'N');
         assert_eq!(g.screen().get_cell(0, 0).ch, '0');
+    }
+
+    #[test]
+    fn snapshot_reports_a_wrap_realized_after_the_row_was_flushed() {
+        let mut g = Grid::new(10, 4);
+        apply_str(&mut g, b"0123456789");
+        let first = g.take_dirty();
+        assert_eq!(first.rows[0].soft_wrap, None);
+        apply_str(&mut g, b"X");
+        let second = g.take_dirty();
+        let row0 = second
+            .rows
+            .iter()
+            .find(|r| r.row == 0)
+            .expect("realizing the wrap re-dirties the wrapped row");
+        assert_eq!(row0.soft_wrap, Some(10));
     }
 
     #[test]

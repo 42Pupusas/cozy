@@ -26,6 +26,8 @@ pub mod keyboard_decoder;
 pub mod keymap;
 pub mod layer;
 pub mod link_scan;
+pub mod logical_line;
+pub mod mirrored_row;
 pub mod multi_click;
 pub mod output_probe;
 pub mod popup;
@@ -33,7 +35,8 @@ pub mod premultiply;
 pub mod present;
 pub mod progress_guard;
 pub mod reader_health;
-pub mod row_band;
+pub mod row_layout;
+pub mod stale_runs;
 pub mod xcursor;
 
 /// Raw syscalls and libc FFI live in their own zero-`crate::`-dependency

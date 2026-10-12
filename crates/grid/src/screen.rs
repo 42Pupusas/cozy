@@ -277,6 +277,34 @@ impl Screen {
         self.abs_cell(col, abs_row as usize)
     }
 
+    /// Content length of the row at absolute index `abs_row` when it
+    /// soft-wraps onto the next row; `None` for a hard line end. Reflow can
+    /// leave a wrapped row ragged (broken at a word and padded), so the
+    /// length tells a reader where the logical line really continues.
+    #[must_use]
+    pub fn abs_soft_wrap(&self, abs_row: usize) -> Option<u16> {
+        if abs_row >= self.scrollback_len + usize::from(self.rows) {
+            return None;
+        }
+        let phys = self.phys_row(abs_row);
+        self.wrapped[phys].then(|| self.row_len[phys])
+    }
+
+    /// [`Self::abs_soft_wrap`] for a visible row.
+    #[must_use]
+    pub fn visible_soft_wrap(&self, row: u16) -> Option<u16> {
+        self.abs_soft_wrap(self.scrollback_len + usize::from(row))
+    }
+
+    /// [`Self::abs_soft_wrap`] for viewport `row` seen through
+    /// `viewport_offset`. Rows above the top of history never wrap.
+    #[must_use]
+    pub fn viewport_soft_wrap(&self, row: u16, viewport_offset: usize) -> Option<u16> {
+        (self.scrollback_len + usize::from(row))
+            .checked_sub(viewport_offset)
+            .and_then(|abs_row| self.abs_soft_wrap(abs_row))
+    }
+
     /// Set the cell at `(col, row)` in the visible area.
     pub fn set_cell(&mut self, col: u16, row: u16, cell: Cell) {
         let phys = self.phys_row(self.scrollback_len + usize::from(row));

@@ -257,6 +257,7 @@ pub struct TermWindow {
     cell_h: i32,
 
     pointer_pos: Point,
+    pointer_inside: bool,
     /// The button currently held down, if any -- carried on `Motion` events
     /// so `ButtonMotion`/`AnyEvent` mouse reporting knows which button (if
     /// any) is down during a drag. `wl_pointer.motion` itself carries no
@@ -284,6 +285,9 @@ pub struct TermWindow {
     /// Latest window size proposed by `xdg_toplevel.configure`, applied once per
     /// frame so a drag's flood of configures collapses into one resize.
     pending_resize: Option<(i32, i32)>,
+    /// Set by a resize: row positions moved, so the next present redraws
+    /// every row from the mirror instead of trusting the carried pixels.
+    relayout: bool,
     /// The last cell-grid dimensions (cols, rows) we handed to the grid via an
     /// `InputEvent::Resize`. A window drag emits a flood of pixel-level
     /// configures whose sub-cell jitter leaves the *cell* count unchanged;
@@ -323,7 +327,7 @@ pub struct TermWindow {
     /// motion in `handle_pointer`; consumed by
     /// [`Self::apply_link_hover_underline`] in the present path.
     hover_link: Option<crate::link_scan::LinkTarget>,
-    prev_hover_row: Option<u16>,
+    prev_hover_rows: Vec<u16>,
     /// Viewport rows the cursor overlay touched on the previous frame.
     /// Repainted clean before drawing the cursor at its new (possibly
     /// mid-slide) position, the same idempotent scheme as
@@ -487,7 +491,7 @@ impl TermWindow {
         let clipboard =
             crate::clipboard::ClipboardState::new(data_device_manager, seat, &mut window_tx);
 
-        let row_count = crate::row_band::RowBand::new(width, height, cell_h).rows();
+        let row_count = crate::row_layout::RowLayout::new(width, height, cell_h).rows();
         let mut present =
             crate::present::PresentState::new(frames, shm_mem, pool, buf_format, row_count);
         present.fill_all(renderer.bg_packed());
@@ -523,11 +527,13 @@ impl TermWindow {
             cell_w,
             cell_h,
             pointer_pos: Point::new(0, 0),
+            pointer_inside: false,
             mouse_pressed: None,
             app_mouse: false,
             selection_bypass: false,
             lifecycle: Lifecycle::new(),
             pending_resize: None,
+            relayout: false,
             last_grid_size: (cols, rows),
             pending_dirty: Vec::new(),
             input_queue: std::collections::VecDeque::new(),
@@ -536,7 +542,7 @@ impl TermWindow {
             multi_click: crate::multi_click::MultiClickTracker::new(),
             prev_selection_rows: Vec::new(),
             hover_link: None,
-            prev_hover_row: None,
+            prev_hover_rows: Vec::new(),
             prev_cursor_rows: Vec::new(),
             cursor_anim: crate::cursor_anim::CursorAnimator::new(cursor_cfg),
             cursor_gate: crate::cursor_gate::CursorAnimGate::new(),
@@ -559,6 +565,26 @@ impl TermWindow {
     #[must_use]
     pub const fn scale(&self) -> i32 {
         self.scale
+    }
+
+    /// Where the pointer last was over the surface, in physical pixels, for
+    /// clients that hit-test their own canvas.
+    #[must_use]
+    pub const fn pointer_position(&self) -> Point {
+        Point::new(
+            self.pointer_pos.x * self.scale,
+            self.pointer_pos.y * self.scale,
+        )
+    }
+
+    /// [`Self::pointer_position`] while the pointer is over the surface.
+    #[must_use]
+    pub const fn hovered_position(&self) -> Option<Point> {
+        if self.pointer_inside {
+            Some(self.pointer_position())
+        } else {
+            None
+        }
     }
 
     /// Queue a dirty snapshot to be blitted on the next frame.
@@ -586,9 +612,10 @@ impl TermWindow {
     /// The grid cell under the pointer, in viewport coordinates, or `(0,0)`
     /// when the pointer is outside the content area.
     fn pointer_cell(&self) -> (u16, u16) {
-        let col = (self.pointer_pos.x / self.cell_w).clamp(0, self.width / self.cell_w - 1);
-        let row = (self.pointer_pos.y / self.cell_h).clamp(0, self.height / self.cell_h - 1);
-        (col as u16, row as u16)
+        let col = (self.pointer_pos.x / self.cell_w).clamp(0, (self.width / self.cell_w - 1).max(0));
+        let y = usize::try_from(self.pointer_pos.y).unwrap_or(0);
+        let row = self.layout().row_at(y);
+        (col as u16, u16::try_from(row).unwrap_or(u16::MAX))
     }
 
     /// Extract the currently selected text (viewport coords) from the cell
@@ -624,8 +651,44 @@ impl TermWindow {
         if id != 0 {
             return Some(crate::link_scan::LinkTarget::Real(id));
         }
-        let line = self.selection.row_content(row)?.materialize_cells();
-        crate::link_scan::UrlScanner::find_at(&line, col).map(crate::link_scan::LinkTarget::Url)
+        let line = self.selection.logical_line(row)?;
+        let at = line.index_of(col, row)?;
+        let found = crate::link_scan::UrlScanner::find_at(line.cells(), at)?;
+        Some(crate::link_scan::LinkTarget::Url(
+            crate::link_scan::UrlSpan {
+                segments: line.segments(found.start, found.end),
+                uri: found.uri,
+            },
+        ))
+    }
+
+    /// Per-row column runs the hovered link occupies: a real link's cells
+    /// sharing its id across the pointer's logical line, or a detected URL's
+    /// own segments.
+    fn hover_segments(&self) -> Vec<crate::logical_line::RowSpan> {
+        match &self.hover_link {
+            None => Vec::new(),
+            Some(crate::link_scan::LinkTarget::Url(span)) => span.segments.clone(),
+            Some(crate::link_scan::LinkTarget::Real(id)) => {
+                let (_, row) = self.pointer_cell();
+                let Some(line) = self.selection.logical_line(row) else {
+                    return Vec::new();
+                };
+                let mut segments = Vec::new();
+                let mut run: Option<(usize, usize)> = None;
+                for (index, cell) in line.cells().iter().enumerate() {
+                    if cell.link_id() == *id {
+                        run = Some(run.map_or((index, index), |(start, _)| (start, index)));
+                    } else if let Some((start, end)) = run.take() {
+                        segments.extend(line.segments(start, end));
+                    }
+                }
+                if let Some((start, end)) = run {
+                    segments.extend(line.segments(start, end));
+                }
+                segments
+            }
+        }
     }
 
     /// Recompute which link (if any) is under the pointer, and mark the
@@ -1298,6 +1361,7 @@ impl TermWindow {
     fn dispatch_pointer_event(&mut self, pointer: PointerId, ev: &RawEvent) {
         match ev.event::<PointerEvent>() {
             Some(PointerEvent::Enter) => self.handle_pointer_enter(pointer, ev),
+            Some(PointerEvent::Leave) => self.pointer_inside = false,
             Some(PointerEvent::Motion) => self.handle_pointer_motion(ev),
             Some(PointerEvent::Button) => self.handle_pointer_button(ev),
             Some(PointerEvent::Axis) => self.handle_pointer_axis(ev),
@@ -1402,6 +1466,7 @@ impl TermWindow {
     /// pointer leaves).
     fn handle_pointer_enter(&mut self, pointer: PointerId, ev: &RawEvent) {
         self.pointer_pos = ev.point(2, 3);
+        self.pointer_inside = true;
         if let Some(ref cursor) = self.cursor {
             self.window_tx.request(
                 MessageBuilder::new(pointer, PointerRequest::SetCursor)
@@ -1418,6 +1483,7 @@ impl TermWindow {
     /// a Shift+drag selection bypass is hiding the whole drag from the app).
     fn handle_pointer_motion(&mut self, ev: &RawEvent) {
         self.pointer_pos = ev.point(1, 2);
+        self.pointer_inside = true;
         // Extend the selection only while the left button is
         // held — releasing ends the drag.
         let (cc, cr) = self.pointer_cell();
@@ -1691,9 +1757,10 @@ impl TermWindow {
         // long-line wrapping judder. Only emit a grid Resize when the cell
         // count actually moves.
         let cols = (w / self.cell_w) as u16;
-        let rows = (h / self.cell_h) as u16;
+        let rows = u16::try_from(self.layout().rows()).unwrap_or(u16::MAX);
         if (cols, rows) != self.last_grid_size {
             self.last_grid_size = (cols, rows);
+            self.selection.truncate_rows(usize::from(rows));
             self.input_queue
                 .push_back(InputEvent::Resize { cols, rows });
         }
@@ -1795,10 +1862,14 @@ impl TermWindow {
 
     fn repaint_rows(&mut self, rows: &[u16]) {
         let cols = (self.width / self.cell_w).max(1) as u16;
+        let visible = self.layout().rows();
         let mut canvas = self
             .present
             .slot_canvas(self.paint_slot, self.width, self.height);
         for &row in rows {
+            if usize::from(row) >= visible {
+                continue;
+            }
             let Some(content) = self.selection.row_content(row) else {
                 continue;
             };
@@ -1816,7 +1887,7 @@ impl TermWindow {
     /// (selected text scrolled into scrollback); only the on-screen span is
     /// returned, since off-screen rows need no repaint.
     fn selection_rows(&self) -> Vec<u16> {
-        let rows = (self.height / self.cell_h).max(1);
+        let rows = i32::try_from(self.layout().rows()).unwrap_or(i32::MAX);
         self.selection.visible_rows(rows)
     }
 
@@ -1846,7 +1917,8 @@ impl TermWindow {
         };
 
         let cols = (self.width / self.cell_w).max(1) as u16;
-        let rows = (self.height / self.cell_h).max(1);
+        let layout = self.layout();
+        let rows = i32::try_from(layout.rows()).unwrap_or(i32::MAX);
         let buf_w = self.width as usize;
 
         // Clamp the signed selection span to the visible rows — off-screen
@@ -1858,11 +1930,13 @@ impl TermWindow {
             let c0 = if r == sr { sc } else { 0 };
             let c1 = if r == er { ec } else { cols - 1 };
             let c1 = c1.min(cols - 1);
-            let py0 = usize::from(row) * self.cell_h as usize;
+            let Some(lines) = layout.span(usize::from(row)) else {
+                continue;
+            };
             let px0 = usize::from(c0) * self.cell_w as usize;
             let px1 = (usize::from(c1) + 1) * self.cell_w as usize;
             let backbuffer = self.present.slot_pixels(self.paint_slot);
-            for py in py0..py0 + self.cell_h as usize {
+            for py in lines {
                 let base = py * buf_w;
                 if base >= backbuffer.len() {
                     break;
@@ -1886,12 +1960,12 @@ impl TermWindow {
         }
     }
 
-    /// Draw a one-pixel underline across the hovered link's row-span (either
-    /// the contiguous run of cells sharing a real OSC 8 link id, or a
-    /// detected plain-text URL's own span), so the user gets the familiar
+    /// Draw a one-pixel underline across every row the hovered link occupies
+    /// (cells sharing a real OSC 8 link id, or a detected plain-text URL's
+    /// segments, both following soft wraps), so the user gets the familiar
     /// "this is clickable" feedback before committing to the Ctrl+click.
     /// No-op when nothing is hovered -- the caller is responsible for
-    /// repainting `prev_hover_row` clean first (same pattern as the
+    /// repainting `prev_hover_rows` clean first (same pattern as the
     /// selection highlight).
     fn apply_link_hover_underline(&mut self) {
         // Light blue underline, preserving whatever alpha byte the pixel
@@ -1899,55 +1973,34 @@ impl TermWindow {
         // window -- see `Renderer::pack_bg`).
         const UNDERLINE_RGB: u32 = 0x00A0_C0FF;
 
-        let Some(target) = &self.hover_link else {
-            return;
-        };
-        let (_, row) = self.pointer_cell();
-        let Some(content) = self.selection.row_content(row) else {
-            return;
-        };
-        // Hover work is pointer-driven, not frame-driven. Expand locally so
-        // the retained selection model stays compact during ordinary output.
-        let line = content.materialize_cells();
-        // Find the span to underline: a real link's contiguous same-id run,
-        // or a detected URL's own pre-computed span.
-        let (lo, hi) = match target {
-            crate::link_scan::LinkTarget::Real(id) => {
-                let mut lo = None;
-                let mut hi = None;
-                for (col, cell) in line.iter().enumerate() {
-                    if cell.link_id() == *id {
-                        lo.get_or_insert(col);
-                        hi = Some(col);
-                    }
-                }
-                let (Some(lo), Some(hi)) = (lo, hi) else {
-                    return;
-                };
-                (lo, hi)
-            }
-            crate::link_scan::LinkTarget::Url(span) => {
-                (usize::from(span.start_col), usize::from(span.end_col))
-            }
-        };
-        let y = usize::from(row) * self.cell_h as usize + self.cell_h as usize - 1;
         let buf_w = self.width as usize;
-        if y >= self.height as usize {
-            return;
-        }
         let cols = (self.width / self.cell_w).max(1) as usize;
-        let Some((x0, x1)) = Self::underline_span(lo, hi, cols, self.cell_w as usize, buf_w) else {
-            return;
-        };
-        let base = y * buf_w;
-        let backbuffer = self.present.slot_pixels(self.paint_slot);
-        for x in x0..x1 {
-            let idx = base + x;
-            if idx < backbuffer.len() {
-                backbuffer[idx] = (backbuffer[idx] & 0xFF00_0000) | UNDERLINE_RGB;
+        for segment in self.hover_segments() {
+            let Some(top) = self.layout().top(usize::from(segment.row)) else {
+                continue;
+            };
+            let y = top + self.cell_h as usize - 1;
+            let Some((x0, x1)) = Self::underline_span(
+                usize::from(segment.start_col),
+                usize::from(segment.end_col),
+                cols,
+                self.cell_w as usize,
+                buf_w,
+            ) else {
+                continue;
+            };
+            let base = y * buf_w;
+            let backbuffer = self.present.slot_pixels(self.paint_slot);
+            for x in x0..x1 {
+                let idx = base + x;
+                if idx < backbuffer.len() {
+                    backbuffer[idx] = (backbuffer[idx] & 0xFF00_0000) | UNDERLINE_RGB;
+                }
+            }
+            if !self.prev_hover_rows.contains(&segment.row) {
+                self.prev_hover_rows.push(segment.row);
             }
         }
-        self.prev_hover_row = Some(row);
     }
 
     /// Draw the cursor overlay at its current animated (possibly
@@ -1966,28 +2019,24 @@ impl TermWindow {
         }
 
         let shape = self.cursor_anim.shape();
-        {
-            let mut canvas = self
-                .present
-                .slot_canvas(self.paint_slot, self.width, self.height);
-            if alpha > 0.0 {
-                self.renderer.draw_cursor(&mut canvas, vc, vr, shape, alpha);
-            }
-            if let Some(t) = pulse {
-                self.renderer.draw_cursor_pulse(&mut canvas, vc, vr, t);
+        let layout = self.layout();
+        let mut canvas = self
+            .present
+            .slot_canvas(self.paint_slot, self.width, self.height);
+        let block = self.renderer.draw_cursor(&mut canvas, vc, vr, shape, alpha);
+        let ring = pulse.map_or(0..0, |t| {
+            self.renderer.draw_cursor_pulse(&mut canvas, vc, vr, t)
+        });
+        let mut rows: Vec<u16> = Vec::new();
+        for lines in [block, ring] {
+            for row in layout.rows_in(&lines) {
+                let row = u16::try_from(row).unwrap_or(u16::MAX);
+                if !rows.contains(&row) {
+                    rows.push(row);
+                }
             }
         }
-
-        // The pulse ring extends past the cell's own bounds, so widen the
-        // repaint hint by one row on each side when it's active.
-        let row_top = vr.floor().max(0.0) as u16;
-        let row_bot = vr.ceil().max(0.0) as u16;
-        let (lo, hi) = if pulse.is_some() {
-            (row_top.saturating_sub(1), row_bot.saturating_add(1))
-        } else {
-            (row_top, row_bot)
-        };
-        (lo..=hi).collect()
+        rows
     }
 
     /// Coalesce a backlog of pending dirty snapshots into the fewest
@@ -2028,20 +2077,15 @@ impl TermWindow {
         damage: &crate::draw::Damage,
         touched_rows: &mut Vec<u16>,
     ) {
+        let layout = self.layout();
+        let to_row = |row: usize| u16::try_from(row).unwrap_or(u16::MAX);
         if damage.is_full() {
-            let rows = ((self.height + self.cell_h - 1) / self.cell_h).max(1);
-            touched_rows.extend((0..rows).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
+            touched_rows.extend((0..layout.rows()).map(to_row));
         } else {
             for rect in damage.rects() {
-                // Ceiling-expand the rect's pixel span to whole cell rows: the
-                // shm damage protocol is row-granular, and a partial final row
-                // is still real framebuffer memory that must be copied rather
-                // than left as transparent mmap-zero.
-                let top = (rect.y.max(0)) / self.cell_h;
-                let bottom = ((rect.bottom().max(0) + self.cell_h - 1) / self.cell_h)
-                    .min(((self.height + self.cell_h - 1) / self.cell_h).max(1));
-                touched_rows
-                    .extend((top..bottom).map(|row| u16::try_from(row).unwrap_or(u16::MAX)));
+                let lines = usize::try_from(rect.y.max(0)).unwrap_or(0)
+                    ..usize::try_from(rect.bottom().max(0)).unwrap_or(0);
+                touched_rows.extend(layout.rows_in(&lines).map(to_row));
             }
         }
     }
@@ -2074,7 +2118,7 @@ impl TermWindow {
         touched_rows: &mut Vec<u16>,
     ) {
         if !viewport_shifts.is_empty() {
-            let rows = (self.height / self.cell_h).max(1) as u16;
+            let rows = u16::try_from(self.layout().rows()).unwrap_or(u16::MAX);
             Self::shift_overlay_rows_signed(&mut self.prev_cursor_rows, viewport_shifts, rows);
             Self::shift_overlay_rows_signed(&mut self.prev_selection_rows, viewport_shifts, rows);
             self.debug_shift_prev_rows_signed(viewport_shifts, rows);
@@ -2096,7 +2140,7 @@ impl TermWindow {
     fn clear_terminal_overlays_for_custom_paint(&mut self) {
         self.prev_selection_rows.clear();
         self.prev_cursor_rows.clear();
-        self.prev_hover_row = None;
+        self.prev_hover_rows.clear();
         let _ = self.debug_take_prev_rows();
     }
 
@@ -2119,15 +2163,14 @@ impl TermWindow {
                 rows_to_repaint.push(r);
             }
         }
-        if let Some(r) = self.prev_hover_row.take()
-            && !rows_to_repaint.contains(&r)
-        {
-            rows_to_repaint.push(r);
+        for r in std::mem::take(&mut self.prev_hover_rows) {
+            if !rows_to_repaint.contains(&r) {
+                rows_to_repaint.push(r);
+            }
         }
-        if self.hover_link.is_some() {
-            let (_, row) = self.pointer_cell();
-            if !rows_to_repaint.contains(&row) {
-                rows_to_repaint.push(row);
+        for segment in self.hover_segments() {
+            if !rows_to_repaint.contains(&segment.row) {
+                rows_to_repaint.push(segment.row);
             }
         }
         for r in std::mem::take(&mut self.prev_cursor_rows) {
@@ -2146,9 +2189,7 @@ impl TermWindow {
         touched_rows.extend(self.selection_rows());
         self.prev_selection_rows = self.selection_rows();
         self.apply_link_hover_underline();
-        if let Some(r) = self.prev_hover_row {
-            touched_rows.push(r);
-        }
+        touched_rows.extend_from_slice(&self.prev_hover_rows);
         let new_cursor_rows = self.draw_cursor_overlay();
         touched_rows.extend_from_slice(&new_cursor_rows);
         self.prev_cursor_rows = new_cursor_rows;
@@ -2156,22 +2197,37 @@ impl TermWindow {
         touched_rows.extend_from_slice(&new_fps_rows);
     }
 
-    fn row_band(&self) -> crate::row_band::RowBand {
-        crate::row_band::RowBand::new(self.width, self.height, self.cell_h)
+    /// After a resize, every row may sit at a new scanline, so the carried
+    /// image is redrawn row by row from the mirror at the new positions.
+    fn repaint_after_relayout(&mut self, touched_rows: &mut Vec<u16>) {
+        if !std::mem::take(&mut self.relayout) {
+            return;
+        }
+        let bg = self.renderer.bg_packed();
+        self.present.slot_pixels(self.paint_slot).fill(bg);
+        let rows: Vec<u16> = (0..self.layout().rows())
+            .map(|row| u16::try_from(row).unwrap_or(u16::MAX))
+            .collect();
+        self.repaint_rows(&rows);
+        touched_rows.extend_from_slice(&rows);
+    }
+
+    fn layout(&self) -> crate::row_layout::RowLayout {
+        crate::row_layout::RowLayout::new(self.width, self.height, self.cell_h)
     }
 
     /// The `(y_px, height_px)` damage rects for this present: every
     /// scanline on the first present after a (re)size, otherwise the rows
     /// painted this frame, coalesced into runs.
     fn damage_rects(&mut self, touched_rows: &[u16]) -> Vec<(i32, i32)> {
-        let band = self.row_band();
+        let band = self.layout();
         let mut painted = vec![self.present.take_full_damage(); band.rows()];
         for &row in touched_rows {
             if let Some(flag) = painted.get_mut(usize::from(row)) {
                 *flag = true;
             }
         }
-        band.runs(&painted)
+        crate::stale_runs::StaleRuns::new(band, &painted)
             .map(|lines| (lines.start as i32, (lines.end - lines.start) as i32))
             .collect()
     }
@@ -2240,8 +2296,7 @@ impl TermWindow {
         // everything below paints incrementally into it as it would into a
         // persistent backbuffer.
         self.paint_slot = slot;
-        let band = self.row_band();
-        self.present.catch_up(slot, band);
+        self.present.catch_up(slot, self.layout());
 
         let pending = std::mem::take(&mut self.pending_dirty);
         let folded = Self::fold_dirty_snapshots(pending);
@@ -2294,8 +2349,10 @@ impl TermWindow {
             &mut touched_rows,
         );
         if custom_painted {
+            self.relayout = false;
             self.clear_terminal_overlays_for_custom_paint();
         } else {
+            self.repaint_after_relayout(&mut touched_rows);
             self.composite_terminal_overlays(&mut touched_rows);
         }
         let t_overlay = present_start.elapsed();
@@ -2362,18 +2419,14 @@ impl TermWindow {
         // force the next present to fire immediately (never leave the
         // surface showing a detached/blank buffer -- the cause of resize
         // flashing).
-        let band = self.row_band();
-        self.present.reset_after_resize(band.rows());
+        self.present.reset_after_resize(self.layout().rows());
         // Keep showing the previous content, top-left aligned, until the grid
         // reflow snapshot arrives a round-trip later, so a drag never flashes
         // blank. `bg_packed()` so exposed area carries the window alpha.
         let bg = self.renderer.bg_packed();
         self.present.restore(&carry, w, h, bg);
         drop(carry);
-        // No grid cell owns the scanlines below the last complete cell row,
-        // so a cropped old glyph left there would never be repainted.
-        let complete = (band.height() / band.row_h()) * band.row_h();
-        self.present.fill_lines_from(band, complete, bg);
+        self.relayout = true;
         Ok(())
     }
 

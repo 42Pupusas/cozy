@@ -13,13 +13,22 @@
 //! thing that decides what a hovered/clicked span *means*.
 use grid::Cell;
 
-/// One URL-shaped run found in a scanned line, in cell-column coordinates
-/// (inclusive on both ends, matching how [`crate::window::LinkTarget`]'s
-/// spans are expressed).
+use crate::logical_line::RowSpan;
+
+/// One URL-shaped run found in a scanned line, as flat cell indices into
+/// that line (inclusive on both ends).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlMatch {
+    pub start: usize,
+    pub end: usize,
+    pub uri: String,
+}
+
+/// A detected URL placed on screen: its text plus the per-row column runs it
+/// occupies (more than one when the URL soft-wraps across rows).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlSpan {
-    pub start_col: u16,
-    pub end_col: u16,
+    pub segments: Vec<RowSpan>,
     pub uri: String,
 }
 
@@ -56,7 +65,7 @@ impl UrlScanner {
     /// normal path, and re-detecting the same text as a *second*, competing
     /// synthetic link would just be redundant work for an identical result.
     #[must_use]
-    pub fn scan_line(line: &[Cell]) -> Vec<UrlSpan> {
+    pub fn scan_line(line: &[Cell]) -> Vec<UrlMatch> {
         let chars: Vec<char> = line.iter().map(|c| c.ch).collect();
         let mut spans = Vec::new();
         let mut i = 0;
@@ -79,10 +88,9 @@ impl UrlScanner {
             }
             if trimmed_end > start {
                 let uri: String = chars[start..trimmed_end].iter().collect();
-                // `end_col` is inclusive, so it's the last *kept* index.
-                spans.push(UrlSpan {
-                    start_col: Self::col(start),
-                    end_col: Self::col(trimmed_end - 1),
+                spans.push(UrlMatch {
+                    start,
+                    end: trimmed_end - 1,
                     uri,
                 });
             }
@@ -94,21 +102,12 @@ impl UrlScanner {
         spans
     }
 
-    /// The URL-shaped run covering `col` in `line`, if any -- the single-cell
-    /// version of [`Self::scan_line`] the window's per-pointer-position hot
-    /// path actually wants (it never needs every span on the line, just
-    /// "is the pointer sitting on one").
+    /// The URL-shaped run covering flat index `idx` in `line`, if any.
     #[must_use]
-    pub fn find_at(line: &[Cell], col: u16) -> Option<UrlSpan> {
+    pub fn find_at(line: &[Cell], idx: usize) -> Option<UrlMatch> {
         Self::scan_line(line)
             .into_iter()
-            .find(|span| span.start_col <= col && col <= span.end_col)
-    }
-
-    /// A column index always fits `u16` -- rows are bounded by the terminal's
-    /// own width, which is itself a `u16` throughout this codebase.
-    fn col(idx: usize) -> u16 {
-        u16::try_from(idx).unwrap_or(u16::MAX)
+            .find(|span| span.start <= idx && idx <= span.end)
     }
 
     /// Whether `s` begins with `http://` or `https://`.
@@ -157,7 +156,7 @@ mod tests {
         let spans = UrlScanner::scan_line(&line);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].uri, "http://127.0.0.1:8080/");
-        assert_eq!(spans[0].start_col, 13);
+        assert_eq!(spans[0].start, 13);
     }
 
     #[test]
@@ -189,6 +188,33 @@ mod tests {
         let hit = UrlScanner::find_at(&line, 10).expect("column sits inside the URL");
         assert_eq!(hit.uri, "http://example.com");
         assert!(UrlScanner::find_at(&line, 0).is_none());
+    }
+
+    #[test]
+    fn a_url_soft_wrapped_across_rows_is_found_whole() {
+        use crate::logical_line::LogicalLine;
+        use crate::mirrored_row::MirroredRow;
+        let rows: Vec<MirroredRow> = [
+            ("see https://exa", Some(15)),
+            ("mple.com/a/very", Some(15)),
+            ("/long/path ok  ", None),
+        ]
+        .into_iter()
+        .map(|(text, soft_wrap)| MirroredRow {
+            content: grid::DirtyRowContent::Cells(line_from(text)),
+            soft_wrap,
+        })
+        .collect();
+        let line = LogicalLine::gather(&rows, 2).expect("row is mirrored");
+        let at = line.index_of(3, 2).expect("cell is on the line");
+        let hit = UrlScanner::find_at(line.cells(), at).expect("pointer is on the URL");
+        assert_eq!(hit.uri, "https://example.com/a/very/long/path");
+        let rows_hit: Vec<u16> = line
+            .segments(hit.start, hit.end)
+            .iter()
+            .map(|s| s.row)
+            .collect();
+        assert_eq!(rows_hit, vec![0, 1, 2]);
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub struct SelectionTracker {
     /// Indexed by visible row. The selection and window ask row-level accessors
     /// for the few operations that need content; only those operations expand
     /// general cell data when that is truly required.
-    mirror: Vec<grid::DirtyRowContent>,
+    mirror: Vec<crate::mirrored_row::MirroredRow>,
     /// Rows that scrolled off the top of `mirror` while a selection was
     /// active, so `selected_text` can still recover them. Keyed by the same
     /// signed viewport row space as `range`'s endpoints (so a row that left
@@ -65,7 +65,7 @@ pub struct SelectionTracker {
     /// drawing only ever touches the clamped `visible_rows`, masking the
     /// loss until copy. Only populated while `range` is `Some`, so an idle
     /// terminal pays nothing for this.
-    history: std::collections::HashMap<i32, grid::DirtyRowContent>,
+    history: std::collections::HashMap<i32, crate::mirrored_row::MirroredRow>,
     /// Current viewport offset (lines scrolled into scrollback; 0 = live
     /// bottom). Tracked so a wheel-scroll shifts the selection with the text.
     view_offset: i32,
@@ -115,7 +115,21 @@ impl SelectionTracker {
     /// rows, never during every snapshot ingestion.
     #[must_use]
     pub fn row_content(&self, row: u16) -> Option<&grid::DirtyRowContent> {
-        self.mirror.get(usize::from(row))
+        self.mirror
+            .get(usize::from(row))
+            .map(|mirrored| &mirrored.content)
+    }
+
+    /// The soft-wrapped logical line that visible `row` belongs to.
+    #[must_use]
+    pub fn logical_line(&self, row: u16) -> Option<crate::logical_line::LogicalLine> {
+        crate::logical_line::LogicalLine::gather(&self.mirror, row)
+    }
+
+    /// Forget mirrored rows at or below `rows`, which a shrunken window no
+    /// longer shows.
+    pub fn truncate_rows(&mut self, rows: usize) {
+        self.mirror.truncate(rows);
     }
 
     /// The OSC-8 link id at a visible cell, or zero when absent/out of range.
@@ -220,14 +234,24 @@ impl SelectionTracker {
         let Ok(index) = u16::try_from(row) else {
             return false;
         };
-        let Some(content) = self.row_content(index) else {
+        let Some(line) = self.logical_line(index) else {
             return false;
         };
-        let line = content.materialize_cells();
-        let Some((start, end)) = crate::word_select::WordBoundary::at(&line, col) else {
+        let Some(at) = line.index_of(col, index) else {
             return false;
         };
-        self.range = Some(((start, row), (end, row)));
+        let Some((start, end)) = crate::word_select::WordBoundary::at(line.cells(), at) else {
+            return false;
+        };
+        let (Some((start_col, start_row)), Some((end_col, end_row))) =
+            (line.origin(start), line.origin(end))
+        else {
+            return false;
+        };
+        self.range = Some((
+            (start_col, i32::from(start_row)),
+            (end_col, i32::from(end_row)),
+        ));
         self.drag_moved = true;
         true
     }
@@ -356,7 +380,7 @@ impl SelectionTracker {
             let r = usize::from(row.row);
             if self.mirror.len() <= r {
                 self.mirror
-                    .resize_with(r + 1, || grid::DirtyRowContent::Cells(Vec::new()));
+                    .resize_with(r + 1, crate::mirrored_row::MirroredRow::blank);
             }
             // Clone the owned transport payload, not a materialized cell row.
             // This is the core ownership change: idle selection now carries
@@ -365,7 +389,7 @@ impl SelectionTracker {
             // row (the overwhelming common case -- the same rows redraw
             // frame after frame) reuse this slot's existing `Vec` allocation
             // instead of dropping it and allocating fresh every snapshot.
-            self.mirror[r].clone_from(&row.content);
+            self.mirror[r].assign(row);
         }
     }
 
@@ -426,14 +450,20 @@ impl SelectionTracker {
             let Some(line) = mirror_hit.or_else(|| self.history.get(&row)) else {
                 continue;
             };
+            let continues = row != er && line.continues();
             let c0 = if row == sr { usize::from(sc) } else { 0 };
             let c1 = if row == er {
                 usize::from(ec)
+            } else if continues {
+                line.line_len().saturating_sub(1)
             } else {
-                line.len().saturating_sub(1)
+                line.content.len().saturating_sub(1)
             };
-            Self::append_selected_columns(&mut out, line, c0, c1);
-            if row != er {
+            if continues && c0 >= line.line_len() {
+                continue;
+            }
+            Self::append_selected_columns(&mut out, &line.content, c0, c1, !continues);
+            if row != er && !continues {
                 out.push('\n');
             }
         }
@@ -448,6 +478,7 @@ impl SelectionTracker {
         content: &grid::DirtyRowContent,
         start: usize,
         end: usize,
+        trim: bool,
     ) {
         if content.is_empty() {
             return;
@@ -469,7 +500,7 @@ impl SelectionTracker {
                 }
             }
         }
-        output.push_str(text.trim_end());
+        output.push_str(if trim { text.trim_end() } else { &text });
     }
 }
 
@@ -489,7 +520,15 @@ mod tests {
         DirtyRow {
             row,
             content: DirtyRowContent::Cells(cells),
+            soft_wrap: None,
         }
+    }
+
+    /// A full-width row that soft-wraps onto the next one.
+    fn wrapped_row(row: u16, s: &str) -> DirtyRow {
+        let mut dirty = text_row(row, s);
+        dirty.soft_wrap = Some(u16::try_from(s.chars().count()).unwrap_or(u16::MAX));
+        dirty
     }
 
     /// A compact uniform text row, matching the common parser transport case.
@@ -501,6 +540,7 @@ mod tests {
                 attrs: grid::Attrs::default(),
                 link_id: 0,
             },
+            soft_wrap: None,
         }
     }
 
@@ -648,6 +688,39 @@ mod tests {
         sel.press_left((6, 0), false); // start at "world"
         sel.drag_to((6, 1)); // through "second"
         assert_eq!(sel.selected_text().as_deref(), Some("world\nsecond"));
+    }
+
+    #[test]
+    fn soft_wrapped_rows_copy_as_one_line() {
+        let mut sel = SelectionTracker::new();
+        sel.ingest_snapshot(&incremental(
+            vec![
+                wrapped_row(0, "ssh-ed25519 AAAA"),
+                wrapped_row(1, "BBBBCCCC DDDD   "),
+                text_row(2, "user@host"),
+                text_row(3, "next line"),
+            ],
+            0,
+        ));
+        sel.press_left((0, 0), false);
+        assert!(sel.drag_to((8, 3)));
+        assert_eq!(
+            sel.selected_text().as_deref(),
+            Some("ssh-ed25519 AAAABBBBCCCC DDDD   user@host\nnext line")
+        );
+    }
+
+    #[test]
+    fn double_click_selects_a_word_across_a_soft_wrap() {
+        let mut sel = SelectionTracker::new();
+        sel.ingest_snapshot(&incremental(
+            vec![wrapped_row(0, "key AAAAAAAA"), text_row(1, "BBBB end")],
+            0,
+        ));
+        sel.press_left((2, 1), false);
+        assert!(sel.select_word((2, 1)));
+        assert_eq!(sel.range(), Some(((4, 0), (3, 1))));
+        assert_eq!(sel.selected_text().as_deref(), Some("AAAAAAAABBBB"));
     }
 
     #[test]
@@ -830,6 +903,7 @@ mod tests {
             vec![DirtyRow {
                 row: 0,
                 content: DirtyRowContent::Cells(cells),
+                soft_wrap: None,
             }],
             0,
         ));

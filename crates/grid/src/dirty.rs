@@ -195,7 +195,11 @@ impl DirtyRegion {
                         // of identical default Cells merely for transport.
                         DirtyRowContent::uniform_spaces(usize::from(self.cols))
                     });
-                    rows.push(DirtyRow { row, content });
+                    rows.push(DirtyRow {
+                        row,
+                        content,
+                        soft_wrap: screen.visible_soft_wrap(row),
+                    });
                 }
                 bits &= bits - 1;
             }
@@ -344,6 +348,9 @@ pub struct DirtyRow {
     pub row: u16,
     /// Owned compact or general row payload.
     pub content: DirtyRowContent,
+    /// Content length when this row soft-wraps onto the next one (same
+    /// logical line); `None` for a hard line end.
+    pub soft_wrap: Option<u16>,
 }
 
 /// The cursor's position and visibility, carried on every [`DirtySnapshot`].
@@ -563,6 +570,7 @@ impl DirtySnapshot {
                             DirtyRow {
                                 row: nr,
                                 content: row.content,
+                                soft_wrap: row.soft_wrap,
                             },
                         );
                     }
@@ -678,6 +686,7 @@ mod tests {
                 .map(|&(r, ch)| DirtyRow {
                     row: r,
                     content: DirtyRowContent::Cells(vec![cell(ch)]),
+                    soft_wrap: None,
                 })
                 .collect(),
             cols,

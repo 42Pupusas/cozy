@@ -62,13 +62,12 @@ impl CharClass {
 pub struct WordBoundary;
 
 impl WordBoundary {
-    /// The inclusive `(start_col, end_col)` span of the word covering `col`,
+    /// The inclusive `(start, end)` index span of the word covering `idx`,
     /// or `None` when there is nothing worth selecting there (out of range,
     /// or blank space -- double-clicking the empty right-hand padding of a
     /// row should select nothing, not a screen-wide run of spaces).
     #[must_use]
-    pub fn at(line: &[Cell], col: u16) -> Option<(u16, u16)> {
-        let idx = usize::from(col);
+    pub fn at(line: &[Cell], idx: usize) -> Option<(usize, usize)> {
         if idx >= line.len() {
             return None;
         }
@@ -86,15 +85,7 @@ impl WordBoundary {
         while end + 1 < classes.len() && classes[end + 1] == target {
             end += 1;
         }
-
-        // Both indices are bounded by `line.len()`, a column count that came
-        // from a `u16` grid width, so these conversions cannot realistically
-        // fail; clamping (rather than panicking) keeps a corrupt row from
-        // taking the whole window down over a cosmetic selection.
-        Some((
-            u16::try_from(start).unwrap_or(u16::MAX),
-            u16::try_from(end).unwrap_or(u16::MAX),
-        ))
+        Some((start, end))
     }
 
     /// Per-column classes for a row, with the trailing halves of wide glyphs
@@ -130,15 +121,10 @@ mod tests {
     }
 
     /// The text of the span `at` reports, for readable assertions.
-    fn word_at(s: &str, col: u16) -> Option<String> {
+    fn word_at(s: &str, col: usize) -> Option<String> {
         let cells = row(s);
         let (a, b) = WordBoundary::at(&cells, col)?;
-        Some(
-            s.chars()
-                .skip(usize::from(a))
-                .take(usize::from(b - a) + 1)
-                .collect(),
-        )
+        Some(s.chars().skip(a).take(b - a + 1).collect())
     }
 
     #[test]

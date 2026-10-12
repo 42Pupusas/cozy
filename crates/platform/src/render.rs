@@ -18,6 +18,7 @@ use grid::{Attrs, Cell, Color, DirtyRow, DirtyRowContent, DirtySnapshot, ScrollB
 
 use crate::draw::{Canvas, Color as DrawColor};
 use crate::font::{FIRST, GLYPH_H, GLYPH_W, LAST};
+use crate::row_layout::RowLayout;
 use crate::text::GlyphBlit;
 
 pub use crate::font::FONT;
@@ -542,9 +543,32 @@ impl Renderer {
         crate::surface::SurfaceBootstrap::pack_bg(bg, bg_alpha)
     }
 
+    /// How rows of this renderer's cells tile `canvas`.
+    #[must_use]
+    pub fn layout(&self, canvas: &Canvas<'_>) -> RowLayout {
+        RowLayout::new(canvas.width(), canvas.height(), self.cell_h)
+    }
+
+    /// Pixel width of the whole columns that fit in `canvas`.
+    fn grid_width(&self, canvas: &Canvas<'_>) -> usize {
+        let cell_w = self.cell_w.max(1);
+        usize::try_from(canvas.width() / cell_w * cell_w).unwrap_or(0)
+    }
+
+    fn row_top(&self, canvas: &Canvas<'_>, cy: u16) -> Option<u32> {
+        self.layout(canvas)
+            .top(usize::from(cy))
+            .and_then(|y| u32::try_from(y).ok())
+    }
+
     /// Blit a single cell into the canvas at cell column/row `cx`/`cy`.
     pub fn blit_cell(&mut self, canvas: &mut Canvas<'_>, cx: u16, cy: u16, cell: &Cell) {
         self.blit_cell_inner(canvas, cx, cy, cell, true);
+        let cell_w = usize::try_from(self.cell_w).unwrap_or(0);
+        let x0 = usize::from(cx) * cell_w;
+        let x1 = x0 + cell_w * if cell.wide() { 2 } else { 1 };
+        let layout = self.layout(canvas);
+        layout.fill_pad_cols(canvas.pixels_mut(), usize::from(cy), x0..x1);
     }
 
     /// Core of [`Self::blit_cell`]. `fill_bg` controls whether the cell paints
@@ -601,17 +625,20 @@ impl Renderer {
         };
         let bg_px = Self::pack_bg(bg, self.bg_alpha);
         let ch = if cell.attrs.invisible() { ' ' } else { cell.ch };
+        let Some(py0) = self.row_top(canvas, cy) else {
+            return;
+        };
 
         match &mut self.glyphs {
             GlyphSource::Bitmap => {
-                Self::blit_cell_bitmap(canvas, cx, cy, cell.wide(), ch, fg_px, bg_px, fill_bg);
+                Self::blit_cell_bitmap(canvas, cx, py0, cell.wide(), ch, fg_px, bg_px, fill_bg);
             }
             GlyphSource::Face(cache) => {
                 Self::blit_cell_face(
                     canvas,
                     cache,
                     cx,
-                    cy,
+                    py0,
                     self.cell_w,
                     self.cell_h,
                     cell.wide(),
@@ -624,10 +651,10 @@ impl Renderer {
             }
         }
         if cell.attrs.underline() {
-            self.draw_underline(canvas, cx, cy, cell.attrs, fg);
+            self.draw_underline(canvas, cx, py0, cell.attrs, fg);
         }
         if cell.attrs.strikethrough() {
-            self.draw_strikethrough(canvas, cx, cy, cell.wide(), fg);
+            self.draw_strikethrough(canvas, cx, py0, cell.wide(), fg);
         }
     }
 
@@ -641,7 +668,7 @@ impl Renderer {
         &self,
         canvas: &mut Canvas<'_>,
         cx: u16,
-        cy: u16,
+        py0: u32,
         attrs: Attrs,
         fg: DrawColor,
     ) {
@@ -661,7 +688,7 @@ impl Renderer {
         let cell_w = self.cell_w.cast_unsigned();
         let cell_h = self.cell_h.cast_unsigned();
         let x0 = u32::from(cx) * cell_w;
-        let y_base = u32::from(cy) * cell_h + cell_h.saturating_sub(1);
+        let y_base = py0 + cell_h.saturating_sub(1);
         if x0 >= buf_w || y_base >= buf_h {
             return;
         }
@@ -705,7 +732,7 @@ impl Renderer {
         &self,
         canvas: &mut Canvas<'_>,
         cx: u16,
-        cy: u16,
+        py0: u32,
         wide: bool,
         fg: DrawColor,
     ) {
@@ -719,7 +746,7 @@ impl Renderer {
         let cell_w = self.cell_w.cast_unsigned() * if wide { 2 } else { 1 };
         let cell_h = self.cell_h.cast_unsigned();
         let x0 = u32::from(cx) * self.cell_w.cast_unsigned();
-        let y = u32::from(cy) * cell_h + cell_h / 2;
+        let y = py0 + cell_h / 2;
         if x0 >= buf_w || y >= buf_h {
             return;
         }
@@ -750,7 +777,11 @@ impl Renderer {
         let cell_w = self.cell_w.cast_unsigned();
         let cell_h = self.cell_h.cast_unsigned();
         let buf_width = canvas.width().cast_unsigned();
-        let py0 = u32::from(cy) * cell_h;
+        let Some(py0) = self.row_top(canvas, cy) else {
+            return;
+        };
+        let cols = self.grid_width(canvas) / cell_w.max(1) as usize;
+        let cells = &cells[..cells.len().min(cols)];
 
         if self.row_color_cache.len() < cells.len() {
             self.row_color_cache
@@ -832,6 +863,8 @@ impl Renderer {
                 bg,
             );
         }
+        let layout = self.layout(canvas);
+        layout.fill_pad(canvas.pixels_mut(), usize::from(cy));
     }
 
     /// Blit a transport row without forcing compact uniform content through a
@@ -864,7 +897,11 @@ impl Renderer {
         let cell_w = self.cell_w.cast_unsigned();
         let cell_h = self.cell_h.cast_unsigned();
         let width = canvas.width().cast_unsigned();
-        let py0 = u32::from(cy) * cell_h;
+        let Some(py0) = self.row_top(canvas, cy) else {
+            return;
+        };
+        let cols = self.grid_width(canvas) / cell_w.max(1) as usize;
+        let chars = &chars[..chars.len().min(cols)];
         let span = (u32::try_from(chars.len()).unwrap_or(u32::MAX) * cell_w).min(width);
         for scanline in 0..cell_h {
             let base = ((py0 + scanline) * width) as usize;
@@ -888,6 +925,8 @@ impl Renderer {
                 bg,
             );
         }
+        let layout = self.layout(canvas);
+        layout.fill_pad(canvas.pixels_mut(), usize::from(cy));
     }
 
     /// Bitmap-font path: 1-bit glyph, no AA.
@@ -908,7 +947,7 @@ impl Renderer {
     fn blit_cell_bitmap(
         canvas: &mut Canvas<'_>,
         cx: u16,
-        cy: u16,
+        py0: u32,
         wide: bool,
         ch: char,
         fg_px: u32,
@@ -917,7 +956,6 @@ impl Renderer {
     ) {
         let buf_width = canvas.width().cast_unsigned();
         let px0 = u32::from(cx) * GLYPH_W as u32;
-        let py0 = u32::from(cy) * GLYPH_H as u32;
         let cell_cols: u32 = if wide { 2 } else { 1 };
         let cell_px_w = GLYPH_W as u32 * cell_cols;
 
@@ -987,7 +1025,7 @@ impl Renderer {
         canvas: &mut Canvas<'_>,
         cache: &mut GlyphCache,
         cx: u16,
-        cy: u16,
+        py0: u32,
         cell_w: i32,
         cell_h: i32,
         wide: bool,
@@ -1000,7 +1038,6 @@ impl Renderer {
         let buf_width = canvas.width().cast_unsigned();
         let bg_px = Self::pack_bg(bg, bg_alpha);
         let px0 = u32::from(cx) * cell_w.cast_unsigned();
-        let py0 = u32::from(cy) * cell_h.cast_unsigned();
         let cell_cols: u32 = if wide { 2 } else { 1 };
 
         {
@@ -1077,11 +1114,8 @@ impl Renderer {
         // Rows of the glyph grid that fit in this buffer. A stale snapshot from a
         // taller geometry may carry rows past the bottom; clip them rather than let
         // them paint into the wrong pixels.
-        let buf_width = canvas.width().cast_unsigned();
-        // Backbuffer pixel counts are always far under `u32::MAX` (a real
-        // screen's pixel area), so this narrowing is infallible in practice.
-        let buf_pixels = u32::try_from(canvas.pixels_mut().len()).unwrap_or(u32::MAX);
-        let buf_rows = (buf_pixels / buf_width.max(1)) / self.cell_h.cast_unsigned();
+        let layout = self.layout(canvas);
+        let buf_rows = u32::try_from(layout.rows()).unwrap_or(u32::MAX);
 
         // Viewport (scrollback) pixel-scroll. See `blit_viewport_snapshot`'s
         // doc for the shift-vs-full-repaint decision this makes; overlay
@@ -1089,7 +1123,7 @@ impl Renderer {
         // `snap.viewport_shift()`), so this always returns `None` (no
         // *incremental* scroll band to report) rather than a `ScrollBand`.
         if snap.viewport_offset().is_some() {
-            self.blit_viewport_snapshot(canvas, snap, buf_width, buf_rows);
+            self.blit_viewport_snapshot(canvas, snap, &layout);
             return None;
         }
 
@@ -1111,14 +1145,9 @@ impl Renderer {
                 let bot = u32::from(band.bot);
                 let delta = u32::from(band.delta);
                 if delta > 0 && delta <= bot - top && bot < buf_rows {
-                    let row_scanlines = usize::try_from(self.cell_h).unwrap_or(0);
-                    let row_words = buf_width as usize * row_scanlines;
                     let keep_rows = (bot - top + 1 - delta) as usize;
                     let src_row = top as usize + delta as usize;
-                    let dst_off = top as usize * row_words;
-                    let src_off = src_row * row_words;
-                    let pixels = canvas.pixels_mut();
-                    pixels.copy_within(src_off..src_off + keep_rows * row_words, dst_off);
+                    layout.move_rows(canvas.pixels_mut(), src_row, top as usize, keep_rows);
                     scrolled = Some(band);
                 }
             }
@@ -1188,9 +1217,9 @@ impl Renderer {
         &mut self,
         canvas: &mut Canvas<'_>,
         snap: &DirtySnapshot,
-        buf_width: u32,
-        buf_rows: u32,
+        layout: &RowLayout,
     ) {
+        let buf_rows = u32::try_from(layout.rows()).unwrap_or(u32::MAX);
         let cur_offset =
             usize::from(snap.viewport_offset().expect(
                 "blit_viewport_snapshot is only called when snap.viewport_offset() is Some",
@@ -1224,20 +1253,16 @@ impl Renderer {
             // interior survives the memmove untouched. This is the fix for
             // the scroll-back fps cliff: the old path re-rasterized every
             // glyph on screen for each scroll frame.
-            let row_words = buf_width as usize * usize::try_from(self.cell_h).unwrap_or(0);
             let mag = s.unsigned_abs() as usize;
             let keep = buf_rows as usize - mag;
-            let pixels = canvas.pixels_mut();
             // s > 0: content moves up (view toward bottom) -- reveal at the
             // bottom, so lift rows [mag, buf_rows) to [0, keep).
             // s < 0: content moves down (view into history) -- reveal at the
             // top, so push rows [0, keep) down to [mag, buf_rows).
             if s > 0 {
-                let src_off = mag * row_words;
-                pixels.copy_within(src_off..src_off + keep * row_words, 0);
+                layout.move_rows(canvas.pixels_mut(), mag, 0, keep);
             } else {
-                let dst_off = mag * row_words;
-                pixels.copy_within(0..keep * row_words, dst_off);
+                layout.move_rows(canvas.pixels_mut(), 0, mag, keep);
             }
             // Rasterize only the revealed edge rows; the rest were shifted
             // into place by the memmove above.
@@ -1319,16 +1344,18 @@ impl Renderer {
         visual_row: f32,
         shape: grid::CursorShape,
         alpha: f32,
-    ) {
+    ) -> std::ops::Range<usize> {
         if alpha <= 0.0 {
-            return;
+            return 0..0;
         }
         let alpha = alpha.min(1.0);
         let (fg, _) = self.theme.effective(&Attrs::default());
         let buf_w = canvas.width();
         let buf_h = canvas.height();
         let px0 = visual_col * self.cell_w as f32;
-        let py0 = visual_row * self.cell_h as f32;
+        let Some(py0) = self.layout(canvas).y_at(visual_row) else {
+            return 0..0;
+        };
 
         let (rx0, ry0, rx1, ry1) = match shape {
             grid::CursorShape::Block => {
@@ -1358,26 +1385,16 @@ impl Renderer {
             }
         };
 
-        // Clamp to the grid-aligned content area, not the raw buffer, for the
-        // same reason `draw_cursor_pulse` does: a window's pixel size is rarely
-        // an exact multiple of the cell size, and the leftover sub-cell strip
-        // along the bottom/right belongs to no grid row. `repaint_rows` only
-        // ever repaints whole rows from the cell mirror, so nothing can erase
-        // ink stamped there -- it survives every subsequent frame as a stuck
-        // half-line under the live prompt. The cursor reaches that strip
-        // whenever its animated position is at or past the last row: mid-slide
-        // (a fractional `visual_row` puts the block's lower half below the last
-        // row's baseline) or after a shrink-resize, whose new smaller geometry
-        // reaches the animator a snapshot later than the buffer it draws into.
-        let grid_max_x = (buf_w / self.cell_w) * self.cell_w;
-        let grid_max_y = (buf_h / self.cell_h) * self.cell_h;
+        // The right-edge leftover strip belongs to no column, and nothing
+        // repaints it, so ink there would stay forever.
+        let grid_max_x = self.grid_width(canvas) as f32;
 
         let x0 = rx0.floor().max(0.0) as i32;
         let y0 = ry0.floor().max(0.0) as i32;
-        let x1 = rx1.ceil().min(buf_w as f32).min(grid_max_x as f32) as i32;
-        let y1 = ry1.ceil().min(buf_h as f32).min(grid_max_y as f32) as i32;
+        let x1 = rx1.ceil().min(grid_max_x) as i32;
+        let y1 = ry1.ceil().min(buf_h as f32) as i32;
         if x0 >= x1 || y0 >= y1 {
-            return;
+            return 0..0;
         }
 
         let pixels = canvas.pixels_mut();
@@ -1400,6 +1417,7 @@ impl Renderer {
                 *dst = (d & 0xff00_0000) | (nr << 16) | (ng << 8) | nb;
             }
         }
+        y0 as usize..y1 as usize
     }
 
     /// Draw the "landing pulse" ring: a thin outline centered on the cell
@@ -1421,12 +1439,15 @@ impl Renderer {
         visual_col: f32,
         visual_row: f32,
         t: f32,
-    ) {
+    ) -> std::ops::Range<usize> {
         const THICK: i32 = 2;
 
         if !(0.0..1.0).contains(&t) {
-            return;
+            return 0..0;
         }
+        let Some(row_y) = self.layout(canvas).y_at(visual_row) else {
+            return 0..0;
+        };
         let (fg, _) = self.theme.effective(&Attrs::default());
         let buf_w = canvas.width();
         let buf_h = canvas.height();
@@ -1436,28 +1457,20 @@ impl Renderer {
         let grow = t * (self.cell_w.min(self.cell_h) as f32) * 0.6;
         let alpha = 1.0 - t;
         let x0f = visual_col.mul_add(self.cell_w as f32, -grow);
-        let y0f = visual_row.mul_add(self.cell_h as f32, -grow);
+        let y0f = row_y - grow;
         let x1f = x0f + self.cell_w as f32 + grow * 2.0;
         let y1f = y0f + self.cell_h as f32 + grow * 2.0;
 
-        // Clamp to the grid-aligned content area, not just the raw buffer
-        // size. A window's pixel size is rarely an exact multiple of the
-        // cell size, leaving a thin dead strip along the bottom/right edge
-        // that `repaint_rows` never touches (it only repaints whole grid
-        // rows from the cell mirror). Letting the ring bleed into that strip
-        // stamps pixels there that nothing ever erases again -- stray white
-        // boxes stuck at the edge of the window forever. Clip to the last
-        // full cell's bounds instead so the ring never leaves the area the
-        // normal repaint path actually owns.
-        let grid_max_x = (buf_w / self.cell_w) * self.cell_w;
-        let grid_max_y = (buf_h / self.cell_h) * self.cell_h;
+        // The right-edge leftover strip belongs to no column, and nothing
+        // repaints it, so ink there would stay forever.
+        let grid_max_x = self.grid_width(canvas) as f32;
 
         let x0 = x0f.floor().max(0.0) as i32;
         let y0 = y0f.floor().max(0.0) as i32;
-        let x1 = x1f.ceil().min(buf_w as f32).min(grid_max_x as f32) as i32;
-        let y1 = y1f.ceil().min(buf_h as f32).min(grid_max_y as f32) as i32;
+        let x1 = x1f.ceil().min(grid_max_x) as i32;
+        let y1 = y1f.ceil().min(buf_h as f32) as i32;
         if x0 >= x1 || y0 >= y1 {
-            return;
+            return 0..0;
         }
         let pixels = canvas.pixels_mut();
         let fg_r = f32::from(fg.r);
@@ -1495,6 +1508,7 @@ impl Renderer {
                 }
             }
         }
+        y0 as usize..y1 as usize
     }
 }
 
@@ -1648,6 +1662,7 @@ mod tests {
             rows: vec![DirtyRow {
                 row: 0,
                 content: DirtyRowContent::Cells((0..5).map(|_| cell('M')).collect()),
+                soft_wrap: None,
             }],
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
@@ -1692,18 +1707,22 @@ mod tests {
                 DirtyRow {
                     row: 0,
                     content: DirtyRowContent::Cells(vec![cell('A')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 1,
                     content: DirtyRowContent::Cells(vec![cell('B')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 2,
                     content: DirtyRowContent::Cells(vec![cell('C')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 3,
                     content: DirtyRowContent::Cells(vec![cell('D')]),
+                    soft_wrap: None,
                 },
             ],
             cursor: grid::CursorInfo::default(),
@@ -1730,18 +1749,22 @@ mod tests {
                 DirtyRow {
                     row: 0,
                     content: DirtyRowContent::Cells(vec![cell('B')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 1,
                     content: DirtyRowContent::Cells(vec![cell('C')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 2,
                     content: DirtyRowContent::Cells(vec![cell('D')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 3,
                     content: DirtyRowContent::Cells(vec![cell('E')]),
+                    soft_wrap: None,
                 },
             ],
             cursor: grid::CursorInfo::default(),
@@ -1784,6 +1807,7 @@ mod tests {
                 DirtyRow {
                     row: r,
                     content: DirtyRowContent::Cells((0..cols).map(|_| cell(ch)).collect()),
+                    soft_wrap: None,
                 }
             })
             .collect();
@@ -1807,8 +1831,18 @@ mod tests {
         }
     }
 
+    /// Every leftover height from none to a full cell less one, so padded rows
+    /// land at every phase relative to a scroll.
+    const LEFTOVERS: std::ops::Range<u32> = 0..GLYPH_H as u32;
+
     #[test]
     fn fast_pixel_scroll_matches_full_reblit_across_composed_frames() {
+        for extra in LEFTOVERS {
+            fast_pixel_scroll_matches_full_reblit_with_leftover(extra);
+        }
+    }
+
+    fn fast_pixel_scroll_matches_full_reblit_with_leftover(extra: u32) {
         // The heart of the flood-jank question: after a sequence of scroll
         // snapshots (some composed into one present), the fast pixel-scroll
         // path must leave the backbuffer byte-identical to a from-scratch full
@@ -1818,7 +1852,7 @@ mod tests {
         let cols = 4u16;
         let rows = 8u16;
         let bw = u32::from(cols) * GLYPH_W as u32;
-        let bh = u32::from(rows) * GLYPH_H as u32;
+        let bh = u32::from(rows) * GLYPH_H as u32 + extra;
 
         // Reference renderer: full re-blit of the final state (delta forced 0
         // so it never takes the fast path).
@@ -1863,9 +1897,9 @@ mod tests {
             }
         }
 
-        assert_eq!(
-            fast, reference,
-            "fast pixel-scroll diverged from full re-blit of the same final content"
+        assert!(
+            fast == reference,
+            "fast pixel-scroll diverged from full re-blit with {extra} leftover scanlines"
         );
     }
 
@@ -1891,6 +1925,7 @@ mod tests {
                 DirtyRow {
                     row: r,
                     content: DirtyRowContent::Cells((0..cols).map(|_| cell(ch)).collect()),
+                    soft_wrap: None,
                 }
             })
             .collect();
@@ -1906,13 +1941,19 @@ mod tests {
 
     #[test]
     fn viewport_pixel_shift_up_into_history_matches_full_repaint() {
+        for extra in LEFTOVERS {
+            viewport_pixel_shift_up_with_leftover(extra);
+        }
+    }
+
+    fn viewport_pixel_shift_up_with_leftover(extra: u32) {
         // Scrolling up into history reveals rows at the TOP (shift < 0). The
         // fast signed copy_within + edge-row rasterization must be byte-
         // identical to a full repaint of the same revealed content.
         let cols = 4u16;
         let rows = 8u16;
         let bw = u32::from(cols) * GLYPH_W as u32;
-        let bh = u32::from(rows) * GLYPH_H as u32;
+        let bh = u32::from(rows) * GLYPH_H as u32 + extra;
 
         // Showing lines [50,57]; scroll up into history -> show [47,54].
         // View moves down on screen (reveal at top) => shift = -3. Scrolling up
@@ -1951,20 +1992,26 @@ mod tests {
             assert_eq!(r.blit_snapshot(&mut canvas, &snap), None);
         }
 
-        assert_eq!(
-            fast, reference,
-            "viewport up-scroll shift diverged from full repaint"
+        assert!(
+            fast == reference,
+            "viewport up-scroll diverged from full repaint with {extra} leftover scanlines"
         );
     }
 
     #[test]
     fn viewport_pixel_shift_down_toward_bottom_matches_full_repaint() {
+        for extra in LEFTOVERS {
+            viewport_pixel_shift_down_with_leftover(extra);
+        }
+    }
+
+    fn viewport_pixel_shift_down_with_leftover(extra: u32) {
         // Scrolling back toward the live bottom reveals rows at the BOTTOM
         // (shift > 0). Same byte-identity requirement, opposite direction.
         let cols = 4u16;
         let rows = 8u16;
         let bw = u32::from(cols) * GLYPH_W as u32;
-        let bh = u32::from(rows) * GLYPH_H as u32;
+        let bh = u32::from(rows) * GLYPH_H as u32 + extra;
 
         // Scrolling back toward the bottom LOWERS the offset, so the final
         // frame's offset is the seed's - 3 (renderer computes shift = +3).
@@ -2001,9 +2048,9 @@ mod tests {
             r.blit_snapshot(&mut canvas, &snap);
         }
 
-        assert_eq!(
-            fast, reference,
-            "viewport down-scroll shift diverged from full repaint"
+        assert!(
+            fast == reference,
+            "viewport down-scroll diverged from full repaint with {extra} leftover scanlines"
         );
     }
 
@@ -2043,18 +2090,22 @@ mod tests {
                 DirtyRow {
                     row: 0,
                     content: DirtyRowContent::Cells(vec![cell('A')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 1,
                     content: DirtyRowContent::Cells(vec![cell('B')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 2,
                     content: DirtyRowContent::Cells(vec![cell('C')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 3,
                     content: DirtyRowContent::Cells(vec![cell('D')]),
+                    soft_wrap: None,
                 },
             ],
             cursor: grid::CursorInfo::default(),
@@ -2074,18 +2125,22 @@ mod tests {
                 DirtyRow {
                     row: 0,
                     content: DirtyRowContent::Cells(vec![cell('B')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 1,
                     content: DirtyRowContent::Cells(vec![cell('C')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 2,
                     content: DirtyRowContent::Cells(vec![cell('D')]),
+                    soft_wrap: None,
                 },
                 DirtyRow {
                     row: 3,
                     content: DirtyRowContent::Cells(vec![cell('E')]),
+                    soft_wrap: None,
                 },
             ],
             cursor: grid::CursorInfo::default(),
@@ -2122,6 +2177,7 @@ mod tests {
             rows: vec![DirtyRow {
                 row: 3,
                 content: DirtyRowContent::Cells(vec![cell('M'), cell('M')]),
+                soft_wrap: None,
             }],
             cursor: grid::CursorInfo::default(),
             cursor_changed: false,
@@ -2228,38 +2284,44 @@ mod tests {
         assert_eq!(r.bg_packed(), r.bg_xrgb());
     }
 
-    // cols/rows are tiny test fixture values, nowhere near f32's precision limit.
-    #[allow(clippy::cast_precision_loss)]
-    #[test]
-    fn cursor_pulse_does_not_paint_past_the_grid_aligned_area() {
-        // A buffer size that is NOT an exact multiple of the cell size --
-        // the common case after a mouse resize -- leaving a dead strip along
-        // the bottom and right edges that `repaint_rows` never touches.
-        let cell_w = GLYPH_W as u32;
-        let cell_h = GLYPH_H as u32;
-        let extra_x = 5; // sub-cell leftover strip on the right
-        let extra_y = 5; // sub-cell leftover strip on the bottom
-        let cols = 4u32;
-        let rows = 4u32;
-        let bw = cols * cell_w + extra_x;
-        let bh = rows * cell_h + extra_y;
-        let mut pixels = vec![0u32; (bw * bh) as usize];
+    /// A 4×4-cell frame with 5 leftover pixels on each axis.
+    struct OverlayFrame {
+        width: u32,
+        height: u32,
+        grid_w: u32,
+    }
 
-        let renderer = Renderer::builtin(Theme::builtin());
-        let mut canvas = Canvas::new(&mut pixels, bw.cast_signed(), bh.cast_signed());
-        // Land the cursor at the bottom-right cell, mid-pulse (t is picked so
-        // `grow` is near its max -- the worst case for bleeding past the
-        // grid-aligned area).
-        renderer.draw_cursor_pulse(&mut canvas, (cols - 1) as f32, (rows - 1) as f32, 0.99);
+    impl OverlayFrame {
+        const COLS: u32 = 4;
+        const ROWS: u32 = 4;
 
-        // Nothing in the dead strip (past the last full cell) may have been
-        // touched -- those pixels are never repainted again by the normal
-        // row-based repaint path, so any stray ink there is permanent.
-        for y in 0..bh {
-            for x in 0..bw {
-                if x >= cols * cell_w || y >= rows * cell_h {
-                    let px = pixels[(y * bw + x) as usize];
-                    assert_eq!(px, 0, "dead-strip pixel ({x},{y}) was painted: {px:#x}");
+        const fn new() -> Self {
+            let grid_w = Self::COLS * GLYPH_W as u32;
+            Self {
+                width: grid_w + 5,
+                height: Self::ROWS * GLYPH_H as u32 + 5,
+                grid_w,
+            }
+        }
+
+        fn assert_contained(&self, pixels: &[u32], lines: &std::ops::Range<usize>, what: &str) {
+            let layout = RowLayout::new(
+                self.width.cast_signed(),
+                self.height.cast_signed(),
+                GLYPH_H,
+            );
+            assert!(layout.rows_in(lines).end <= layout.rows(), "{what}: rows past the grid");
+            for y in 0..self.height {
+                for x in 0..self.width {
+                    let px = pixels[(y * self.width + x) as usize];
+                    if px == 0 {
+                        continue;
+                    }
+                    assert!(x < self.grid_w, "{what}: painted ({x},{y}) right of the grid");
+                    assert!(
+                        lines.contains(&(y as usize)),
+                        "{what}: painted ({x},{y}) outside reported {lines:?}"
+                    );
                 }
             }
         }
@@ -2268,44 +2330,79 @@ mod tests {
     // cols/rows are tiny test fixture values, nowhere near f32's precision limit.
     #[allow(clippy::cast_precision_loss)]
     #[test]
-    fn cursor_does_not_paint_past_the_grid_aligned_area() {
-        // Same dead-strip setup as the pulse test: a buffer whose height is
-        // NOT a whole number of cells, so the bottom `extra_y` scanlines
-        // belong to no grid row and `repaint_rows` can never erase them.
-        let cell_w = GLYPH_W as u32;
-        let cell_h = GLYPH_H as u32;
-        let extra_x = 5;
-        let extra_y = 5;
-        let cols = 4u32;
-        let rows = 4u32;
-        let bw = cols * cell_w + extra_x;
-        let bh = rows * cell_h + extra_y;
+    fn cursor_pulse_paints_only_inside_the_rows_it_reports() {
+        let frame = OverlayFrame::new();
+        let renderer = Renderer::builtin(Theme::builtin());
+        let last = (OverlayFrame::COLS - 1) as f32;
+        for row in [0.0, 1.5, (OverlayFrame::ROWS - 1) as f32] {
+            let mut pixels = vec![0u32; (frame.width * frame.height) as usize];
+            let mut canvas = Canvas::new(
+                &mut pixels,
+                frame.width.cast_signed(),
+                frame.height.cast_signed(),
+            );
+            let lines = renderer.draw_cursor_pulse(&mut canvas, last, row, 0.99);
+            frame.assert_contained(&pixels, &lines, &format!("pulse at row {row}"));
+        }
+    }
 
-        // Every cursor shape, and both a mid-slide fractional row and a row
-        // past the last valid one (what a shrink-resize leaves in the
-        // animator until the next grid snapshot catches up).
+    // cols/rows are tiny test fixture values, nowhere near f32's precision limit.
+    #[allow(clippy::cast_precision_loss)]
+    #[test]
+    fn cursor_paints_only_inside_the_rows_it_reports() {
+        let frame = OverlayFrame::new();
+        let renderer = Renderer::builtin(Theme::builtin());
+        let rows = OverlayFrame::ROWS as f32;
+        let last = (OverlayFrame::COLS - 1) as f32;
         for shape in [
             grid::CursorShape::Block,
             grid::CursorShape::Bar,
             grid::CursorShape::Underline,
         ] {
-            for visual_row in [(rows - 1) as f32 + 0.5, rows as f32, (rows + 3) as f32] {
-                let mut pixels = vec![0u32; (bw * bh) as usize];
-                let renderer = Renderer::builtin(Theme::builtin());
-                let mut canvas = Canvas::new(&mut pixels, bw.cast_signed(), bh.cast_signed());
-                renderer.draw_cursor(&mut canvas, (cols - 1) as f32, visual_row, shape, 1.0);
-                for y in 0..bh {
-                    for x in 0..bw {
-                        if x >= cols * cell_w || y >= rows * cell_h {
-                            let px = pixels[(y * bw + x) as usize];
-                            assert_eq!(
-                                px, 0,
-                                "dead-strip pixel ({x},{y}) painted by {shape:?} \
-                                 at visual_row {visual_row}: {px:#x}"
-                            );
-                        }
-                    }
-                }
+            for row in [rows - 0.5, rows, rows + 3.0] {
+                let mut pixels = vec![0u32; (frame.width * frame.height) as usize];
+                let mut canvas = Canvas::new(
+                    &mut pixels,
+                    frame.width.cast_signed(),
+                    frame.height.cast_signed(),
+                );
+                let lines = renderer.draw_cursor(&mut canvas, last, row, shape, 1.0);
+                frame.assert_contained(&pixels, &lines, &format!("{shape:?} at row {row}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_painted_frame_leaves_no_scanline_unowned() {
+        let frame = OverlayFrame::new();
+        let mut pixels = vec![0u32; (frame.width * frame.height) as usize];
+        let rows = (0..u16::try_from(OverlayFrame::ROWS).unwrap_or(0))
+            .map(|row| DirtyRow {
+                row,
+                content: DirtyRowContent::Cells(vec![cell(' '); OverlayFrame::COLS as usize]),
+                soft_wrap: None,
+            })
+            .collect();
+        let snap = DirtySnapshot {
+            cols: u16::try_from(OverlayFrame::COLS).unwrap_or(0),
+            rows,
+            cursor: grid::CursorInfo::default(),
+            cursor_changed: false,
+            content_delta: 0,
+            kind: grid::SnapshotKind::Incremental { scroll_span: None },
+        };
+        let mut renderer = Renderer::builtin(Theme::builtin());
+        let bg = renderer.bg_packed();
+        let mut canvas = Canvas::new(
+            &mut pixels,
+            frame.width.cast_signed(),
+            frame.height.cast_signed(),
+        );
+        renderer.blit_snapshot(&mut canvas, &snap);
+        for y in 0..frame.height {
+            for x in 0..frame.grid_w {
+                let px = pixels[(y * frame.width + x) as usize];
+                assert_eq!(px, bg, "scanline {y} column {x} left unpainted");
             }
         }
     }

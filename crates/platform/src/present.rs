@@ -16,7 +16,8 @@ use crate::conn::WindowSender;
 use crate::frame_carry::FrameCarry;
 use crate::id::{BufferId, CallbackId, PoolId};
 use crate::protocol::{BufferRequest, Format, ShmPoolRequest};
-use crate::row_band::RowBand;
+use crate::row_layout::RowLayout;
+use crate::stale_runs::StaleRuns;
 use crate::surface::{Frame, Routed};
 use crate::sys::{ShmBuffer, SysError};
 use crate::wire::MessageBuilder;
@@ -208,11 +209,12 @@ impl PresentState {
     /// incremental paint, by copying the rows it lags from the slot that was
     /// presented last. Windows that repaint every pixel each present skip
     /// this.
-    pub fn catch_up(&mut self, slot: usize, band: RowBand) {
+    pub fn catch_up(&mut self, slot: usize, layout: RowLayout) {
         let mut stale = std::mem::take(&mut self.stale_rows[slot]);
         if let Some(source) = self.source.filter(|&s| s != slot) {
-            for lines in band.runs(&stale) {
-                self.shm_mem.copy_between(source, slot, band.pixels(&lines));
+            for lines in StaleRuns::new(layout, &stale) {
+                self.shm_mem
+                    .copy_between(source, slot, layout.pixels(&lines));
             }
         }
         stale.fill(false);
@@ -247,16 +249,6 @@ impl PresentState {
     pub fn fill_all(&mut self, value: u32) {
         for slot in 0..self.frames.len() {
             self.shm_mem.pixels(slot).fill(value);
-        }
-    }
-
-    /// Fill scanlines `line..` of every slot with `value`.
-    pub fn fill_lines_from(&mut self, band: RowBand, line: usize, value: u32) {
-        let pixels = band.pixels(&(line..band.height()));
-        for slot in 0..self.frames.len() {
-            if let Some(strip) = self.shm_mem.pixels(slot).get_mut(pixels.clone()) {
-                strip.fill(value);
-            }
         }
     }
 
@@ -528,7 +520,7 @@ mod tests {
     #[test]
     fn catch_up_copies_the_rows_painted_into_the_other_slot() {
         let mut st = make_state();
-        let band = RowBand::new(4, 4, 1);
+        let band = RowLayout::new(4, 4, 1);
         assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
         st.catch_up(0, band);
         st.slot_pixels(0)[4..8].fill(5);
@@ -544,7 +536,7 @@ mod tests {
     #[test]
     fn catch_up_only_copies_rows_the_slot_lags() {
         let mut st = make_state();
-        let band = RowBand::new(4, 4, 1);
+        let band = RowLayout::new(4, 4, 1);
         assert!(matches!(st.begin_present(), PresentAttempt::Ready(0)));
         st.catch_up(0, band);
         release_and_ready(&mut st, 0);

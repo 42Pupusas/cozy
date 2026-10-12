@@ -366,7 +366,13 @@ impl ShotApp {
         let (globals, (seat_name, seat_version)) = self.picker_globals()?;
         let frozen = self
             .session
-            .capture_held(&mut self.sender, &mut self.events, output, None, overlay_cursor)
+            .capture_held(
+                &mut self.sender,
+                &mut self.events,
+                output,
+                None,
+                overlay_cursor,
+            )
             .map_err(|e| e.to_string())?;
         let devices = SeatDevices::bind(
             &mut self.sender,

@@ -148,9 +148,7 @@ impl FileFilter {
 
     #[must_use]
     pub fn accepts(&self, file_name: &str, mime: Option<&str>) -> bool {
-        self.rules
-            .iter()
-            .any(|rule| rule.matches(file_name, mime))
+        self.rules.iter().any(|rule| rule.matches(file_name, mime))
     }
 
     /// `None` for a filter with no rules: an empty `a(us)` cannot carry its

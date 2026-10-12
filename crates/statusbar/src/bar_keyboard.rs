@@ -121,7 +121,10 @@ mod tests {
     #[test]
     fn a_press_queues_its_key_once() {
         let mut kb = keyboard();
-        kb.on_key(input(KeyState::Pressed, platform::toplevel::keysym::Key::Char('a')));
+        kb.on_key(input(
+            KeyState::Pressed,
+            platform::toplevel::keysym::Key::Char('a'),
+        ));
         assert_eq!(kb.take_keys(), [PanelKey::Char('a')]);
         assert!(kb.take_keys().is_empty());
     }
@@ -142,7 +145,10 @@ mod tests {
     #[test]
     fn release_all_drops_queued_and_held_keys() {
         let mut kb = keyboard();
-        kb.on_key(input(KeyState::Pressed, platform::toplevel::keysym::Key::Char('a')));
+        kb.on_key(input(
+            KeyState::Pressed,
+            platform::toplevel::keysym::Key::Char('a'),
+        ));
         kb.release_all();
         kb.on_repeat_tick();
         assert!(kb.take_keys().is_empty());

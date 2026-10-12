@@ -148,7 +148,8 @@ mod tests {
     fn a_launched_client_answers_success_with_empty_results() {
         let launcher = RecordingLauncher::replying(Ok(()));
         let fixture = Fixture::with(launcher.clone());
-        let (code, results) = fixture.compose(vec![("address", Value::Str("a@example.com".into()))]);
+        let (code, results) =
+            fixture.compose(vec![("address", Value::Str("a@example.com".into()))]);
         assert_eq!(code, 0);
         assert_eq!(results, Value::Array(vec![]));
         assert_eq!(

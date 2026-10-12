@@ -504,7 +504,10 @@ mod tests {
         nav.go_to(&dir.path().join("inner"));
         assert!(scene.step(&flow, &nav, &idle(), now + 16));
         let mid = painted(&mut scene, &flow, &nav);
-        assert!(mid.contains(&"f00".to_owned()), "the old tiles stay in sight");
+        assert!(
+            mid.contains(&"f00".to_owned()),
+            "the old tiles stay in sight"
+        );
         assert!(mid.contains(&"a".to_owned()));
         let now = settle(&mut scene, &flow, &nav);
         assert_eq!(painted(&mut scene, &flow, &nav), ["a"]);
@@ -513,7 +516,10 @@ mod tests {
         assert!(scene.step(&flow, &nav, &idle(), now + 16));
         assert!(!scene.growth().is_animating(), "the parent arrives grown");
         let back = painted(&mut scene, &flow, &nav);
-        assert!(back.contains(&"a".to_owned()), "the inner tile shrinks away");
+        assert!(
+            back.contains(&"a".to_owned()),
+            "the inner tile shrinks away"
+        );
         settle(&mut scene, &flow, &nav);
         assert_eq!(painted(&mut scene, &flow, &nav).len(), 4);
     }

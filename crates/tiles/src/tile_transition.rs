@@ -167,13 +167,15 @@ impl TileTransition {
     /// `ghosts` laid out in `field`. Any other passage ends a zoom under way.
     pub fn start(&mut self, passage: Passage, field: Rect, ghosts: Vec<PaintedTile>, now_ms: u64) {
         let direction = match passage {
-            Passage::Into(portal) => ghosts
-                .iter()
-                .find(|ghost| ghost.id == portal)
-                .map(|ghost| Direction::Into {
-                    portal,
-                    cell: ghost.rect,
-                }),
+            Passage::Into(portal) => {
+                ghosts
+                    .iter()
+                    .find(|ghost| ghost.id == portal)
+                    .map(|ghost| Direction::Into {
+                        portal,
+                        cell: ghost.rect,
+                    })
+            }
             Passage::OutOf(portal) => Some(Direction::OutOf { portal }),
             Passage::Elsewhere => None,
         };
@@ -347,7 +349,10 @@ mod tests {
         run(&mut transition, 12);
         let staged = transition.stage(inner());
         let portal = named(&staged, "dir");
-        assert!(portal.rect.x < RIGHT.x && portal.rect.w > RIGHT.w, "{portal:?}");
+        assert!(
+            portal.rect.x < RIGHT.x && portal.rect.w > RIGHT.w,
+            "{portal:?}"
+        );
         assert!(portal.veil > 0);
         let big = named(&staged, "big");
         assert_eq!(big.veil, 0);
@@ -372,7 +377,10 @@ mod tests {
         let portal = named(&staged, "dir");
         assert_eq!(portal.rect, FIELD);
         assert_eq!(portal.veil, u8::MAX);
-        assert!(named(&staged, "big").rect.right() <= FIELD.x, "off the edge");
+        assert!(
+            named(&staged, "big").rect.right() <= FIELD.x,
+            "off the edge"
+        );
         assert_eq!(staged[3].name, "in-b", "the old tiles are drawn last");
     }
 
@@ -382,7 +390,10 @@ mod tests {
         run(&mut transition, 10);
         let staged = transition.stage(pair());
         let portal = named(&staged, "dir");
-        assert!(portal.rect.w < FIELD.w && portal.rect.w > RIGHT.w, "{portal:?}");
+        assert!(
+            portal.rect.w < FIELD.w && portal.rect.w > RIGHT.w,
+            "{portal:?}"
+        );
         assert!(portal.veil < u8::MAX && portal.veil > 0);
         let (a, b) = (named(&staged, "in-a"), named(&staged, "in-b"));
         assert!(a.grown < b.grown, "{} then {}", a.grown, b.grown);

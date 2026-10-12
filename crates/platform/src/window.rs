@@ -612,7 +612,8 @@ impl TermWindow {
     /// The grid cell under the pointer, in viewport coordinates, or `(0,0)`
     /// when the pointer is outside the content area.
     fn pointer_cell(&self) -> (u16, u16) {
-        let col = (self.pointer_pos.x / self.cell_w).clamp(0, (self.width / self.cell_w - 1).max(0));
+        let col =
+            (self.pointer_pos.x / self.cell_w).clamp(0, (self.width / self.cell_w - 1).max(0));
         let y = usize::try_from(self.pointer_pos.y).unwrap_or(0);
         let row = self.layout().row_at(y);
         (col as u16, u16::try_from(row).unwrap_or(u16::MAX))

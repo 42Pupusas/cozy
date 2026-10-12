@@ -223,7 +223,11 @@ mod tests {
 
     #[test]
     fn capacity_keeps_every_cell_legible() {
-        for source in [SOURCE, Rect::new(10, 10, 300, 200), Rect::new(900, 500, 390, 300)] {
+        for source in [
+            SOURCE,
+            Rect::new(10, 10, 300, 200),
+            Rect::new(900, 500, 390, 300),
+        ] {
             let spiral = SourceSpiral::new(AREA, source, 120);
             let k = spiral.capacity(40);
             let cells = spiral.cells(k);
@@ -249,7 +253,10 @@ mod tests {
         let near = Rect::new(AREA.x + 30, AREA.y + 30, 400, 300);
         let cells = SourceSpiral::new(AREA, near, 80).cells(12);
         for c in &cells {
-            assert!(c.x >= near.right() || c.y >= near.bottom(), "{c:?} is in the thin gap");
+            assert!(
+                c.x >= near.right() || c.y >= near.bottom(),
+                "{c:?} is in the thin gap"
+            );
         }
     }
 

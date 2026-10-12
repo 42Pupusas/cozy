@@ -2,6 +2,7 @@
 //! `xdg_popup` chain, its own double-buffered shm swap chain, and the
 //! configure / `popup_done` handshake.
 
+use platform::Result;
 use platform::conn::WindowSender;
 use platform::draw::{Canvas, Color};
 use platform::event::RawEvent;
@@ -10,7 +11,6 @@ use platform::popup::{PopupHandle, PopupParent, PopupPositioner};
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{Format, PopupEvent, XdgSurfaceEvent};
 use platform::surface::{self, Frame, Routed};
-use platform::Result;
 
 /// What the popup is filled with before the panel paints.
 #[derive(Debug, Clone, Copy)]

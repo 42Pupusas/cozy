@@ -36,7 +36,9 @@ pub struct PopupPositioner {
 impl PopupPositioner {
     fn send(&self, tx: &mut WindowSender, wm_base: WmBaseId) -> PositionerId {
         let positioner: PositionerId = tx.alloc_id();
-        tx.request(MessageBuilder::new(wm_base, WmBaseRequest::CreatePositioner).new_id(positioner));
+        tx.request(
+            MessageBuilder::new(wm_base, WmBaseRequest::CreatePositioner).new_id(positioner),
+        );
         tx.request(
             MessageBuilder::new(positioner, PositionerRequest::SetSize)
                 .i32(self.size.0)
@@ -54,8 +56,7 @@ impl PopupPositioner {
             MessageBuilder::new(positioner, PositionerRequest::SetAnchor).u32(self.anchor as u32),
         );
         tx.request(
-            MessageBuilder::new(positioner, PositionerRequest::SetGravity)
-                .u32(self.gravity as u32),
+            MessageBuilder::new(positioner, PositionerRequest::SetGravity).u32(self.gravity as u32),
         );
         tx.request(
             MessageBuilder::new(positioner, PositionerRequest::SetConstraintAdjustment)
@@ -118,15 +119,17 @@ impl PopupHandle {
                 .object(positioner_id),
         );
         tx.request(
-            MessageBuilder::new(parent.layer_surface, LayerSurfaceRequest::GetPopup)
-                .object(popup),
+            MessageBuilder::new(parent.layer_surface, LayerSurfaceRequest::GetPopup).object(popup),
         );
         tx.request(
             MessageBuilder::new(popup, PopupRequest::Grab)
                 .object(parent.seat)
                 .u32(parent.grab_serial),
         );
-        tx.request(MessageBuilder::new(positioner_id, PositionerRequest::Destroy));
+        tx.request(MessageBuilder::new(
+            positioner_id,
+            PositionerRequest::Destroy,
+        ));
         tx.request(MessageBuilder::new(surface, SurfaceRequest::Commit));
 
         Self {
@@ -252,7 +255,9 @@ mod tests {
         let log = rec.drain();
 
         let created = position_of(&log, 3, WmBaseRequest::CreatePositioner);
-        let positioner_id = log[created].first_arg.expect("create_positioner names a new id");
+        let positioner_id = log[created]
+            .first_arg
+            .expect("create_positioner names a new id");
         let offset = position_of(&log, positioner_id, PositionerRequest::SetOffset);
         let get_popup = position_of(&log, handle.xdg_surface.0, XdgSurfaceRequest::GetPopup);
         let destroy = position_of(&log, positioner_id, PositionerRequest::Destroy);

@@ -118,17 +118,36 @@ mod tests {
 
     #[test]
     fn corners_and_edges_are_grabbed_just_inside() {
-        assert_eq!(CardGrip::at(CARD, Point::new(102, 104), 8), Some(CardGrip::TopLeft));
-        assert_eq!(CardGrip::at(CARD, Point::new(398, 296), 8), Some(CardGrip::BottomRight));
-        assert_eq!(CardGrip::at(CARD, Point::new(250, 103), 8), Some(CardGrip::Top));
-        assert_eq!(CardGrip::at(CARD, Point::new(395, 200), 8), Some(CardGrip::Right));
+        assert_eq!(
+            CardGrip::at(CARD, Point::new(102, 104), 8),
+            Some(CardGrip::TopLeft)
+        );
+        assert_eq!(
+            CardGrip::at(CARD, Point::new(398, 296), 8),
+            Some(CardGrip::BottomRight)
+        );
+        assert_eq!(
+            CardGrip::at(CARD, Point::new(250, 103), 8),
+            Some(CardGrip::Top)
+        );
+        assert_eq!(
+            CardGrip::at(CARD, Point::new(395, 200), 8),
+            Some(CardGrip::Right)
+        );
     }
 
     #[test]
     fn the_middle_is_the_centre_and_far_away_is_nothing() {
-        assert_eq!(CardGrip::at(CARD, Point::new(250, 200), 8), Some(CardGrip::Centre));
+        assert_eq!(
+            CardGrip::at(CARD, Point::new(250, 200), 8),
+            Some(CardGrip::Centre)
+        );
         assert_eq!(CardGrip::at(CARD, Point::new(600, 600), 8), None);
-        assert_eq!(CardGrip::at(CARD, Point::new(96, 150), 8), None, "outside is a neighbour's");
+        assert_eq!(
+            CardGrip::at(CARD, Point::new(96, 150), 8),
+            None,
+            "outside is a neighbour's"
+        );
     }
 
     #[test]
@@ -184,6 +203,9 @@ mod tests {
     #[test]
     fn a_resize_stops_at_the_field_edge() {
         let grown = CardGrip::BottomRight.drag(CARD, 5000, 5000, FIELD, FLOOR);
-        assert_eq!((grown.right(), grown.bottom()), (FIELD.right(), FIELD.bottom()));
+        assert_eq!(
+            (grown.right(), grown.bottom()),
+            (FIELD.right(), FIELD.bottom())
+        );
     }
 }

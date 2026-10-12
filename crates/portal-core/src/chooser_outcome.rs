@@ -105,7 +105,10 @@ mod tests {
     #[test]
     fn uris_keep_the_order_of_the_paths() {
         let results = results_of(picked(&["/b", "/a"]));
-        assert_eq!(VardictReaderProbe::uris(&results), vec!["file:///b", "file:///a"]);
+        assert_eq!(
+            VardictReaderProbe::uris(&results),
+            vec!["file:///b", "file:///a"]
+        );
     }
 
     #[test]
@@ -151,7 +154,10 @@ mod tests {
     #[test]
     fn the_chosen_filter_is_returned_when_it_has_rules() {
         let mut selection = picked(&["/a"]);
-        selection.current_filter = Some(FileFilter::new("Text", vec![FilterRule::Glob("*.txt".into())]));
+        selection.current_filter = Some(FileFilter::new(
+            "Text",
+            vec![FilterRule::Glob("*.txt".into())],
+        ));
         assert!(results_of(selection).dict_get("current_filter").is_some());
     }
 

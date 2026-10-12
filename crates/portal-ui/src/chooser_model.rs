@@ -37,13 +37,9 @@ impl ChooserModel {
     pub fn open_at(request: &ChooserRequest, start: &Path) -> Result<Self, String> {
         let mode = PickMode::from_kind(&request.kind)
             .ok_or_else(|| "only open requests are supported yet".to_owned())?;
-        let nav = DirectoryBrowser::open(
-            start,
-            Self::PANE_WIDTH,
-            Self::PANE_HEIGHT,
-            Self::ROW_HEIGHT,
-        )
-        .map_err(|error| format!("{}: {error}", start.display()))?;
+        let nav =
+            DirectoryBrowser::open(start, Self::PANE_WIDTH, Self::PANE_HEIGHT, Self::ROW_HEIGHT)
+                .map_err(|error| format!("{}: {error}", start.display()))?;
         Ok(Self {
             nav,
             mode,
@@ -391,7 +387,10 @@ mod tests {
         let mut model = setup.files(false);
         let row = Setup::row(&model, "alpha.txt");
         let step = model.activate_entry(row);
-        assert_eq!(Setup::paths(&step), vec![setup.dir.path().join("alpha.txt")]);
+        assert_eq!(
+            Setup::paths(&step),
+            vec![setup.dir.path().join("alpha.txt")]
+        );
     }
 
     #[test]

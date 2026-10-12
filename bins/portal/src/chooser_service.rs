@@ -53,9 +53,9 @@ impl ChooserService {
     }
 
     fn chooser_descriptor() -> InterfaceDescriptor {
-        Self::METHODS
-            .iter()
-            .fold(InterfaceDescriptor::new(Self::IFACE), |descriptor, method| {
+        Self::METHODS.iter().fold(
+            InterfaceDescriptor::new(Self::IFACE),
+            |descriptor, method| {
                 descriptor.method(MethodDescriptor::new(
                     method.member(),
                     vec![
@@ -70,7 +70,8 @@ impl ChooserService {
                         Argument::new("results", "a{sv}"),
                     ],
                 ))
-            })
+            },
+        )
     }
 
     fn request_descriptor() -> InterfaceDescriptor {
@@ -165,7 +166,13 @@ mod tests {
             .register_object(REQUEST_PATH, [ChooserService::REQUEST_IFACE]);
         let outcome = fixture
             .dispatcher
-            .dispatch(REQUEST_PATH, ChooserService::REQUEST_IFACE, "Close", "", &[])
+            .dispatch(
+                REQUEST_PATH,
+                ChooserService::REQUEST_IFACE,
+                "Close",
+                "",
+                &[],
+            )
             .expect("close");
         assert_eq!(outcome.reply_signature, "");
         assert_eq!(fixture.inbox.pop_close().as_deref(), Some(REQUEST_PATH));
@@ -176,7 +183,13 @@ mod tests {
         let fixture = Fixture::new();
         let error = fixture
             .dispatcher
-            .dispatch(REQUEST_PATH, ChooserService::REQUEST_IFACE, "Close", "", &[])
+            .dispatch(
+                REQUEST_PATH,
+                ChooserService::REQUEST_IFACE,
+                "Close",
+                "",
+                &[],
+            )
             .unwrap_err();
         assert!(matches!(
             error,

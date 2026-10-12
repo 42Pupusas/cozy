@@ -101,7 +101,10 @@ mod tests {
         let start = Instant::now();
         let deadlines = OverlayDeadlines::starting_at(start);
         let later = start + Duration::from_secs(5);
-        assert_eq!(deadlines.expired(later, false), Some(Expiry::NeverConfigured));
+        assert_eq!(
+            deadlines.expired(later, false),
+            Some(Expiry::NeverConfigured)
+        );
         assert_eq!(deadlines.expired(later, true), None);
     }
 
@@ -118,7 +121,10 @@ mod tests {
         let start = Instant::now();
         let mut deadlines = OverlayDeadlines::starting_at(start);
         deadlines.input_at(start + Duration::from_secs(25));
-        assert_eq!(deadlines.expired(start + Duration::from_secs(40), true), None);
+        assert_eq!(
+            deadlines.expired(start + Duration::from_secs(40), true),
+            None
+        );
     }
 
     #[test]
@@ -137,7 +143,10 @@ mod tests {
         assert_eq!(deadlines.wait_ms(start, false), 5_000);
         assert_eq!(deadlines.wait_ms(start, true), 30_000);
         deadlines.input_at(start + Duration::from_secs(50));
-        assert_eq!(deadlines.wait_ms(start + Duration::from_secs(50), true), 10_000);
+        assert_eq!(
+            deadlines.wait_ms(start + Duration::from_secs(50), true),
+            10_000
+        );
     }
 
     #[test]

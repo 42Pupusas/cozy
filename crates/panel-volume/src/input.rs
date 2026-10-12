@@ -88,7 +88,10 @@ mod tests {
             index: 0,
             rect: Rect::new(0, 0, 10, 10),
         }];
-        assert_eq!(VolumeInput::click(&mut model, &hits, Point::new(50, 50)), None);
+        assert_eq!(
+            VolumeInput::click(&mut model, &hits, Point::new(50, 50)),
+            None
+        );
     }
 
     #[test]

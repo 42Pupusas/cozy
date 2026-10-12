@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use platform::protocol::PointerButton;
-use platform::toplevel::{Key, KeyPress, ModifierState, Painter, PhysicalSize, PointerEventKind, Position};
+use platform::toplevel::{
+    Key, KeyPress, ModifierState, Painter, PhysicalSize, PointerEventKind, Position,
+};
 use portal_core::{ChooserKind, ChooserOutcome, ChooserRequest};
 use tiles::theme::Theme;
 use tiles::typography::Typography;
@@ -119,7 +121,10 @@ fn double_clicking_a_file_picks_it() {
     let at = view.tile_centre("alpha.txt");
     Rig::click(&mut view, at);
     Rig::click(&mut view, at);
-    assert_eq!(Rig::picked(&mut view), vec![rig.dir.path().join("alpha.txt")]);
+    assert_eq!(
+        Rig::picked(&mut view),
+        vec![rig.dir.path().join("alpha.txt")]
+    );
 }
 
 #[test]
@@ -141,7 +146,10 @@ fn the_accept_button_returns_the_selection() {
     Rig::click(&mut view, tile);
     let accept = view.button_centre(FooterTarget::Accept);
     Rig::click(&mut view, accept);
-    assert_eq!(Rig::picked(&mut view), vec![rig.dir.path().join("beta.txt")]);
+    assert_eq!(
+        Rig::picked(&mut view),
+        vec![rig.dir.path().join("beta.txt")]
+    );
 }
 
 #[test]
@@ -187,7 +195,11 @@ fn arrow_then_enter_picks_the_tile_the_arrow_reached() {
     let rig = Rig::new("view_arrow_enter");
     let mut view = rig.view(false, false);
     view.on_key(Rig::key(Key::Down));
-    let first = view.model().navigator().cursor_entry().map(|e| e.path.clone());
+    let first = view
+        .model()
+        .navigator()
+        .cursor_entry()
+        .map(|e| e.path.clone());
     view.on_key(Rig::key(Key::Enter));
     match (first, view.take_outcome()) {
         (Some(path), Some(ChooserOutcome::Picked(selection))) => {

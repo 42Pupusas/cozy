@@ -6,6 +6,7 @@
 //! `OnDemand` interactivity (committed before the grab is requested) and
 //! closing switches it back to `None`.
 
+use platform::Result;
 use platform::conn::WindowSender;
 use platform::draw::Canvas;
 use platform::event::RawEvent;
@@ -14,7 +15,6 @@ use platform::layer::LayerSurfaceHandle;
 use platform::popup::{PopupParent, PopupPositioner};
 use platform::protocol::{KeyboardInteractivity, SurfaceRequest, WmBaseEvent, WmBaseRequest};
 use platform::wire::MessageBuilder;
-use platform::Result;
 
 use crate::popup_surface::{PopupStyle, PopupSurface};
 
@@ -28,7 +28,12 @@ pub struct BarPopup {
 
 impl BarPopup {
     #[must_use]
-    pub const fn new(compositor: CompositorId, shm: ShmId, wm_base: WmBaseId, seat: SeatId) -> Self {
+    pub const fn new(
+        compositor: CompositorId,
+        shm: ShmId,
+        wm_base: WmBaseId,
+        seat: SeatId,
+    ) -> Self {
         Self {
             compositor,
             shm,
@@ -50,7 +55,9 @@ impl BarPopup {
 
     #[must_use]
     pub fn is_dismissed(&self) -> bool {
-        self.current.as_ref().is_some_and(PopupSurface::is_dismissed)
+        self.current
+            .as_ref()
+            .is_some_and(PopupSurface::is_dismissed)
     }
 
     pub const fn request_redraw(&mut self) {
@@ -78,7 +85,9 @@ impl BarPopup {
             seat: self.seat,
             grab_serial: serial,
         };
-        self.current = Some(PopupSurface::open(tx, self.shm, &parent, positioner, style)?);
+        self.current = Some(PopupSurface::open(
+            tx, self.shm, &parent, positioner, style,
+        )?);
         Ok(())
     }
 

@@ -73,7 +73,13 @@ impl PortalLoop {
         watcher: ConfigWatcher,
         dialogs: Box<dyn DialogFactory>,
     ) -> Self {
-        Self::assemble(conn, state, watcher, dialogs, Arc::new(AssociatedMailClient))
+        Self::assemble(
+            conn,
+            state,
+            watcher,
+            dialogs,
+            Arc::new(AssociatedMailClient),
+        )
     }
 
     /// Every collaborator explicit, for tests that substitute the mail

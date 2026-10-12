@@ -211,13 +211,7 @@ impl TileField {
 
     /// The entry whose tile is under `at`, if any.
     #[must_use]
-    pub fn hit(
-        &self,
-        area: Rect,
-        min_side: i32,
-        source: Option<Rect>,
-        at: Point,
-    ) -> Option<usize> {
+    pub fn hit(&self, area: Rect, min_side: i32, source: Option<Rect>, at: Point) -> Option<usize> {
         self.layout(area, min_side, source)
             .into_iter()
             .find(|placed| placed.rect.contains(at))
@@ -227,13 +221,7 @@ impl TileField {
     /// Scroll `steps` tiles: positive drops the largest tiles from view and
     /// brings in smaller ones, negative does the reverse. Stops at either
     /// end of the ranking. Returns whether the view moved.
-    pub fn slide(
-        &mut self,
-        area: Rect,
-        min_side: i32,
-        source: Option<Rect>,
-        steps: i32,
-    ) -> bool {
+    pub fn slide(&mut self, area: Rect, min_side: i32, source: Option<Rect>, steps: i32) -> bool {
         let before = self.start();
         self.offset = before;
         for _ in 0..steps.unsigned_abs() {

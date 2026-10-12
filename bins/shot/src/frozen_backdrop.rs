@@ -57,7 +57,10 @@ impl FrozenBackdrop {
         sender.request(
             MessageBuilder::new(subsurface, SubsurfaceRequest::PlaceBelow).object(parent),
         )?;
-        sender.request(MessageBuilder::new(subsurface, SubsurfaceRequest::SetDesync))?;
+        sender.request(MessageBuilder::new(
+            subsurface,
+            SubsurfaceRequest::SetDesync,
+        ))?;
         let viewport = match globals.viewporter {
             Some(viewporter) => {
                 let viewport: ViewportId = sender.alloc_id();

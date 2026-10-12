@@ -24,8 +24,8 @@ use platform::id::{OutputId, PoolId, ShmId};
 use platform::keyboard_decoder::{KeyboardDecoder, KeyboardUpdate};
 use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
 use platform::protocol::{
-    Anchor, ButtonState, Format, Layer, LayerSurfaceEvent, PointerButton,
-    PointerEvent, SurfaceRequest,
+    Anchor, ButtonState, Format, Layer, LayerSurfaceEvent, PointerButton, PointerEvent,
+    SurfaceRequest,
 };
 use platform::protocol::{BufferEvent, BufferRequest, ShmPoolRequest};
 use platform::surface::Frame;

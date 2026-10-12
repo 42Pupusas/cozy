@@ -2305,19 +2305,22 @@ mod tests {
         }
 
         fn assert_contained(&self, pixels: &[u32], lines: &std::ops::Range<usize>, what: &str) {
-            let layout = RowLayout::new(
-                self.width.cast_signed(),
-                self.height.cast_signed(),
-                GLYPH_H,
+            let layout =
+                RowLayout::new(self.width.cast_signed(), self.height.cast_signed(), GLYPH_H);
+            assert!(
+                layout.rows_in(lines).end <= layout.rows(),
+                "{what}: rows past the grid"
             );
-            assert!(layout.rows_in(lines).end <= layout.rows(), "{what}: rows past the grid");
             for y in 0..self.height {
                 for x in 0..self.width {
                     let px = pixels[(y * self.width + x) as usize];
                     if px == 0 {
                         continue;
                     }
-                    assert!(x < self.grid_w, "{what}: painted ({x},{y}) right of the grid");
+                    assert!(
+                        x < self.grid_w,
+                        "{what}: painted ({x},{y}) right of the grid"
+                    );
                     assert!(
                         lines.contains(&(y as usize)),
                         "{what}: painted ({x},{y}) outside reported {lines:?}"

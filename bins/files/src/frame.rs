@@ -92,9 +92,9 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::Frame;
+    use platform::draw::Rect;
     use tiles::pinned_card::CardMetrics;
     use tiles::spacing::Spacing;
-    use platform::draw::Rect;
 
     const METRICS: CardMetrics = CardMetrics {
         nav: 58,

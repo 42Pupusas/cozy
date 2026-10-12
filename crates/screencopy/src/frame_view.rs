@@ -37,7 +37,11 @@ impl<'a> FrameView<'a> {
     /// # Errors
     ///
     /// [`CaptureError::ShortBuffer`] when `bytes` cannot hold the frame.
-    pub const fn new(params: FrameParams, flags: u32, bytes: &'a [u8]) -> Result<Self, CaptureError> {
+    pub const fn new(
+        params: FrameParams,
+        flags: u32,
+        bytes: &'a [u8],
+    ) -> Result<Self, CaptureError> {
         let needed = params.buffer_len();
         if bytes.len() < needed {
             return Err(CaptureError::ShortBuffer {
@@ -172,7 +176,9 @@ mod tests {
         let frame = Whole::convert(Format::Xrgb8888, (2, 2, 16), 0, &source).expect("converts");
         assert_eq!(
             frame.rgba(),
-            &[1, 2, 3, 0xFF, 4, 5, 6, 0xFF, 7, 8, 9, 0xFF, 10, 11, 12, 0xFF]
+            &[
+                1, 2, 3, 0xFF, 4, 5, 6, 0xFF, 7, 8, 9, 0xFF, 10, 11, 12, 0xFF
+            ]
         );
     }
 

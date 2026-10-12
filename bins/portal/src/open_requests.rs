@@ -161,7 +161,11 @@ pub mod test_support {
         }
 
         #[must_use]
-        pub fn waiting(fd: RawFd, extra_fds: Vec<RawFd>, deadline: Option<i32>) -> Box<dyn ChooserDialog> {
+        pub fn waiting(
+            fd: RawFd,
+            extra_fds: Vec<RawFd>,
+            deadline: Option<i32>,
+        ) -> Box<dyn ChooserDialog> {
             Box::new(Self {
                 fd,
                 probe: Rc::new(RefCell::new(DialogProbe::default())),
@@ -306,7 +310,11 @@ mod tests {
     #[test]
     fn a_dialogs_extra_descriptors_follow_its_wake_descriptor() {
         let mut open = OpenRequests::new();
-        open.insert("/r/1", context(":1.1", 1), FakeDialog::waiting(5, vec![8, 9], None));
+        open.insert(
+            "/r/1",
+            context(":1.1", 1),
+            FakeDialog::waiting(5, vec![8, 9], None),
+        );
         let (plain, _probe) = FakeDialog::boxed(6);
         open.insert("/r/2", context(":1.2", 2), plain);
         assert_eq!(open.wake_fds(), [5, 8, 9, 6]);
@@ -316,9 +324,17 @@ mod tests {
     fn the_loop_sleeps_only_as_long_as_the_soonest_dialog_allows() {
         let mut open = OpenRequests::new();
         assert_eq!(open.wait_ms(), None);
-        open.insert("/r/1", context(":1.1", 1), FakeDialog::waiting(5, vec![], Some(40)));
+        open.insert(
+            "/r/1",
+            context(":1.1", 1),
+            FakeDialog::waiting(5, vec![], Some(40)),
+        );
         assert_eq!(open.wait_ms(), Some(40));
-        open.insert("/r/2", context(":1.2", 2), FakeDialog::waiting(6, vec![], Some(16)));
+        open.insert(
+            "/r/2",
+            context(":1.2", 2),
+            FakeDialog::waiting(6, vec![], Some(16)),
+        );
         let (idle, _probe) = FakeDialog::boxed(7);
         open.insert("/r/3", context(":1.3", 3), idle);
         assert_eq!(open.wait_ms(), Some(16));

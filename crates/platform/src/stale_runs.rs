@@ -59,13 +59,19 @@ mod tests {
     #[test]
     fn separate_runs_stay_separate() {
         let layout = RowLayout::new(4, 40, 10);
-        assert_eq!(runs(layout, &[true, false, false, true]), vec![0..10, 30..40]);
+        assert_eq!(
+            runs(layout, &[true, false, false, true]),
+            vec![0..10, 30..40]
+        );
     }
 
     #[test]
     fn a_run_through_the_last_row_reaches_the_frame_bottom() {
         let layout = RowLayout::new(4, 37, 10);
-        assert_eq!(runs(layout, &[false, false, true]), vec![layout.boundary(2)..37]);
+        assert_eq!(
+            runs(layout, &[false, false, true]),
+            vec![layout.boundary(2)..37]
+        );
     }
 
     #[test]

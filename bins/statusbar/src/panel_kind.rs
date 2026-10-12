@@ -56,7 +56,11 @@ mod tests {
 
     #[test]
     fn modules_without_a_panel_map_to_none() {
-        for kind in [ModuleKind::Clock, ModuleKind::Battery, ModuleKind::SystemTray] {
+        for kind in [
+            ModuleKind::Clock,
+            ModuleKind::Battery,
+            ModuleKind::SystemTray,
+        ] {
             assert_eq!(PanelKind::for_module(kind), None);
         }
     }

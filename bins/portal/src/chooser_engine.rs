@@ -84,7 +84,11 @@ impl ChooserEngine {
             return;
         };
         if dispatcher.has_object(path) {
-            let _ = context.fail(sink, INVALID_ARGS, "a request already exists at that handle");
+            let _ = context.fail(
+                sink,
+                INVALID_ARGS,
+                "a request already exists at that handle",
+            );
             return;
         }
         match self.factory.open(request) {
@@ -99,11 +103,7 @@ impl ChooserEngine {
         }
     }
 
-    fn answer<S: ReplySink>(
-        finished: FinishedRequest,
-        sink: &mut S,
-        dispatcher: &mut Dispatcher,
-    ) {
+    fn answer<S: ReplySink>(finished: FinishedRequest, sink: &mut S, dispatcher: &mut Dispatcher) {
         dispatcher.unregister_object(&finished.path);
         Self::send(&finished.context, finished.outcome, sink);
     }
@@ -269,7 +269,10 @@ mod tests {
 
         assert_eq!(fixture.engine.open_count(), 1);
         assert!(fixture.dispatcher.has_object(REQUEST));
-        assert!(fixture.sink.returns.is_empty(), "the reply waits for the dialog");
+        assert!(
+            fixture.sink.returns.is_empty(),
+            "the reply waits for the dialog"
+        );
         let log = fixture.log.borrow();
         assert_eq!(log.requests.len(), 1);
         assert_eq!(log.requests[0].app_id, "org.example.App");

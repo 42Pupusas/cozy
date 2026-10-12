@@ -28,9 +28,17 @@ impl ChooserMethod {
 /// What the dialog is being asked to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChooserKind {
-    Open { multiple: bool, directory: bool },
-    Save { name: Option<String>, file: Option<PathBuf> },
-    SaveMany { names: Vec<PathBuf> },
+    Open {
+        multiple: bool,
+        directory: bool,
+    },
+    Save {
+        name: Option<String>,
+        file: Option<PathBuf>,
+    },
+    SaveMany {
+        names: Vec<PathBuf>,
+    },
 }
 
 /// A decoded `FileChooser` call: the arguments every method shares, plus the
@@ -110,11 +118,9 @@ impl ChooserRequest {
             },
             ChooserMethod::SaveFiles => ChooserKind::SaveMany {
                 names: reader.value("files").map_or_else(Vec::new, |files| {
-                    files
-                        .as_items()
-                        .map_or_else(Vec::new, |items| {
-                            items.iter().filter_map(NulTerminatedPath::decode).collect()
-                        })
+                    files.as_items().map_or_else(Vec::new, |items| {
+                        items.iter().filter_map(NulTerminatedPath::decode).collect()
+                    })
                 }),
             },
         }
@@ -216,8 +222,7 @@ mod tests {
                 )
                 .build(),
         );
-        let request =
-            ChooserRequest::from_call(ChooserMethod::SaveFiles, &args).expect("request");
+        let request = ChooserRequest::from_call(ChooserMethod::SaveFiles, &args).expect("request");
         assert_eq!(
             request.kind,
             ChooserKind::SaveMany {

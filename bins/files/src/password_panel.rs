@@ -291,10 +291,10 @@ impl PasswordPanel {
 mod tests {
     use super::{PanelStyle, PanelText, PasswordPanel};
     use crate::password_modal::PasswordModal;
+    use platform::draw::Rect;
     use tiles::spacing::Spacing;
     use tiles::theme::Theme;
     use tiles::typography::Typography;
-    use platform::draw::Rect;
 
     fn style() -> PanelStyle {
         let theme = Theme::default().with_spacing(Spacing::new(13.0, 1.0));

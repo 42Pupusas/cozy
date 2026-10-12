@@ -102,7 +102,12 @@ impl Choice {
     #[must_use]
     pub fn starting_selection(&self) -> String {
         if self.is_checkbox() {
-            return if self.initial == "true" { "true" } else { "false" }.to_owned();
+            return if self.initial == "true" {
+                "true"
+            } else {
+                "false"
+            }
+            .to_owned();
         }
         if self.options.iter().any(|option| option.id == self.initial) {
             return self.initial.clone();
@@ -159,7 +164,12 @@ mod tests {
 
     #[test]
     fn a_combo_choice_is_read_with_its_options() {
-        let wire = Wire::choice("enc", "Encoding", &[("u8", "UTF-8"), ("l1", "Latin-1")], "l1");
+        let wire = Wire::choice(
+            "enc",
+            "Encoding",
+            &[("u8", "UTF-8"), ("l1", "Latin-1")],
+            "l1",
+        );
         let choice = Choice::from_value(&wire).expect("choice");
         assert_eq!(choice.id(), "enc");
         assert_eq!(choice.label(), "Encoding");
@@ -185,7 +195,12 @@ mod tests {
 
     #[test]
     fn an_initial_value_naming_no_option_falls_back_to_the_first() {
-        let wire = Wire::choice("enc", "Encoding", &[("u8", "UTF-8"), ("l1", "Latin-1")], "zz");
+        let wire = Wire::choice(
+            "enc",
+            "Encoding",
+            &[("u8", "UTF-8"), ("l1", "Latin-1")],
+            "zz",
+        );
         let choice = Choice::from_value(&wire).expect("choice");
         assert_eq!(choice.starting_selection(), "u8");
     }

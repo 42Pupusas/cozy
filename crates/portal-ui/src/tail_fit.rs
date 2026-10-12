@@ -43,14 +43,20 @@ mod tests {
 
     #[test]
     fn long_text_loses_its_head_and_keeps_its_tail() {
-        assert_eq!(TailFit::fit("/home/me/projects", 9, Cells::wide), "…projects");
+        assert_eq!(
+            TailFit::fit("/home/me/projects", 9, Cells::wide),
+            "…projects"
+        );
     }
 
     #[test]
     fn the_result_never_exceeds_the_width() {
         for width in 0..20 {
             let fitted = TailFit::fit("/home/me/projects/cozy", width, Cells::wide);
-            assert!(Cells::wide(&fitted) <= width.max(0), "{fitted:?} at {width}");
+            assert!(
+                Cells::wide(&fitted) <= width.max(0),
+                "{fitted:?} at {width}"
+            );
         }
     }
 

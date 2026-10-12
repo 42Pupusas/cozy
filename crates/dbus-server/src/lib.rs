@@ -33,11 +33,11 @@ pub mod router;
 pub mod serve;
 pub mod server_loop;
 
+pub use call_context::CallContext;
+pub use call_queue::{CallQueue, PendingCall};
 pub use dbus::marshal::Marshaller;
 pub use dbus::message::Reply;
 pub use dbus::value::{Unmarshaller, Value};
-pub use call_context::CallContext;
-pub use call_queue::{CallQueue, PendingCall};
 pub use dispatcher::Dispatcher;
 pub use introspection::{
     Argument, InterfaceDescriptor, MethodDescriptor, NodeIntrospection, PropertyAccess,

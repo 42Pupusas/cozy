@@ -58,8 +58,7 @@ impl EmailProbe {
         let handle = std::thread::spawn(move || {
             let conn = DbusConn::session().expect("session bus was reachable a moment ago");
             let state = SettingsState::new(&config::Config::default());
-            let mut server =
-                ServerLoop::new(conn, PortalDispatcher::build_with(state, launcher));
+            let mut server = ServerLoop::new(conn, PortalDispatcher::build_with(state, launcher));
             match server.conn_mut().request_name(name) {
                 Ok(true) => {}
                 Ok(false) => panic!("another connection already owns {name}"),

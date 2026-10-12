@@ -28,7 +28,10 @@ mod tests {
     fn surfaces_classify_by_identity() {
         let bar = SurfaceId(3);
         let popup = Some(SurfaceId(9));
-        assert_eq!(PointerTarget::classify(Some(bar), bar, popup), PointerTarget::Bar);
+        assert_eq!(
+            PointerTarget::classify(Some(bar), bar, popup),
+            PointerTarget::Bar
+        );
         assert_eq!(
             PointerTarget::classify(popup, bar, popup),
             PointerTarget::Popup
@@ -37,6 +40,9 @@ mod tests {
             PointerTarget::classify(Some(SurfaceId(9)), bar, None),
             PointerTarget::Elsewhere
         );
-        assert_eq!(PointerTarget::classify(None, bar, popup), PointerTarget::Elsewhere);
+        assert_eq!(
+            PointerTarget::classify(None, bar, popup),
+            PointerTarget::Elsewhere
+        );
     }
 }

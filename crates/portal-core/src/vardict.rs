@@ -224,7 +224,10 @@ mod tests {
     #[test]
     fn a_path_list_reads_each_element() {
         let dict = VardictBuilder::new()
-            .entry("files", Value::Array(vec![bytes(b"a.txt\0"), bytes(b"b\0")]))
+            .entry(
+                "files",
+                Value::Array(vec![bytes(b"a.txt\0"), bytes(b"b\0")]),
+            )
             .build();
         assert_eq!(
             VardictReader::new(&dict).path_list("files"),

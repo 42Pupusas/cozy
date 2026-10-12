@@ -13,9 +13,6 @@ use platform::toplevel::{Key, KeyPress, Painter, PhysicalSize, PointerEventKind,
 use std::os::fd::RawFd;
 use widget::{CursorRequest, CursorShape, DoubleClick, DragArm, Mods, MonotonicClock};
 
-use tiles::action_tray::{ActionTray, TrayOpen};
-use tiles::card_grip::CardGrip;
-use tiles::card_placement::CardPlacement;
 use crate::breadcrumb::Breadcrumb;
 use crate::browser::{Browser, Outcome};
 use crate::card_store::CardStore;
@@ -23,9 +20,12 @@ use crate::card_surface::{Backdrop, CardSurface};
 use crate::drag_badge::{BadgeStyle, DragBadge};
 use crate::favorites::Favorites;
 use crate::frame::Frame;
+use crate::sidebar::{Sidebar, SidebarRow};
+use tiles::action_tray::{ActionTray, TrayOpen};
+use tiles::card_grip::CardGrip;
+use tiles::card_placement::CardPlacement;
 use tiles::hover::{Hover, Pane, Spot};
 use tiles::pinned_card::PinnedCard;
-use crate::sidebar::{Sidebar, SidebarRow};
 use tiles::spiral_cursor::SpiralCursor;
 use volumes::mount_backend::MountOutcome;
 use volumes::{AttachedDevice, VolumeFlush, VolumeWatch};
@@ -36,12 +36,12 @@ use crate::password_panel::{PanelStyle, PanelText, PasswordPanel};
 use crate::storage::Storage;
 use tiles::theme::Theme;
 use tiles::tile_action::TileAction;
-use tiles::tile_field::{PlacedMore, PlacedTile};
 use tiles::tile_assembly::{TileAssembly, TileOverlay};
-use tiles::tile_scene::{Flow, MotionAim, Steering, TileScene};
+use tiles::tile_field::{PlacedMore, PlacedTile};
 use tiles::tile_geometry::TileGeometry;
 use tiles::tile_motion::TileKey;
 use tiles::tile_painter::{PaintedMove, PaintedTile, PaintedTray, TilePainter, TileRename};
+use tiles::tile_scene::{Flow, MotionAim, Steering, TileScene};
 use tiles::toolbar::{Target, Toolbar};
 use tiles::typography::Typography;
 
@@ -384,8 +384,7 @@ impl FilesWindow {
     }
 
     fn more_at(&self, at: Position) -> bool {
-        self.scene
-            .more_at(&self.flow(), Point::new(at.x, at.y))
+        self.scene.more_at(&self.flow(), Point::new(at.x, at.y))
     }
 
     fn tile_at(&self, at: Point) -> Option<usize> {
@@ -599,9 +598,7 @@ impl FilesWindow {
 
     fn slide_tiles(&mut self, steps: i32, at: Position) -> bool {
         let flow = self.flow();
-        let moved = self
-            .scene
-            .slide(&flow, self.browser.navigator(), steps);
+        let moved = self.scene.slide(&flow, self.browser.navigator(), steps);
         if moved {
             self.tray = None;
             let spot = self.spot_at(at);
@@ -649,9 +646,7 @@ impl FilesWindow {
         self.scene.reaim_if_primed(&flow, self.browser.navigator());
         let placed = self.tile_layout();
         let tiles = self.painted_tiles(&placed);
-        let tiles = self
-            .scene
-            .stage(&flow, self.browser.navigator(), tiles);
+        let tiles = self.scene.stage(&flow, self.browser.navigator(), tiles);
         let rename = self.tile_rename(&placed);
         let mut brush = TilePainter::new(&self.theme, &mut self.type_scale);
         brush.paint(canvas, &tiles);
@@ -1726,11 +1721,11 @@ mod tests {
     use super::{
         FilesWindow, KeyPress, Painter, PointerEventKind, Target, TileAction, TileGeometry, TileKey,
     };
-    use tiles::hover::{Pane, Spot};
     use platform::SurfaceFormat;
     use platform::draw::Canvas;
     use platform::protocol::PointerButton;
     use platform::toplevel::PhysicalSize;
+    use tiles::hover::{Pane, Spot};
 
     /// Paint a whole frame into a translucent canvas and hand back the pixels.
     ///
@@ -2098,7 +2093,11 @@ mod tests {
         assert_eq!((after.x, after.y), (before.x - 120, before.y - 80));
         assert_eq!((after.w, after.h), (before.w, before.h));
         for placed in painter.tile_layout() {
-            assert!(apart(placed.rect, after), "{:?} overlaps the card", placed.rect);
+            assert!(
+                apart(placed.rect, after),
+                "{:?} overlaps the card",
+                placed.rect
+            );
         }
         let outcome = painter.browser.go_to(&root.join("a_directory"));
         painter.apply(outcome);
@@ -2419,7 +2418,10 @@ mod tests {
     fn hovering_a_row_changes_the_painted_frame_by_gliding() {
         let (mut painter, root, size) = painter_over_a_mixed_directory("hover-frame");
         let arrived = glide(&mut painter, 0, 150);
-        assert!(!painter.scene.growth().is_animating(), "the entrance has landed");
+        assert!(
+            !painter.scene.growth().is_animating(),
+            "the entrance has landed"
+        );
         let cold = paint_opaque(&mut painter, size);
 
         assert!(
@@ -2528,7 +2530,10 @@ mod tests {
         glide(&mut painter, 70_000, 20);
         let after = paint_opaque(&mut painter, size);
         assert!(before != after, "a selected tile must look selected");
-        assert!(!painter.scene.motion().is_animating(), "and the glide settles");
+        assert!(
+            !painter.scene.motion().is_animating(),
+            "and the glide settles"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3320,7 +3325,11 @@ mod tests {
         let offered: Vec<TileAction> = tray.rows().iter().map(|(a, _)| *a).collect();
         assert_eq!(offered, TileAction::MENU);
         assert_eq!(painter.browser.selected_paths(), [root.join("b_file.txt")]);
-        assert_eq!(painter.scene.motion().tray(row), 255, "and it has finished opening");
+        assert_eq!(
+            painter.scene.motion().tray(row),
+            255,
+            "and it has finished opening"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -28,8 +28,8 @@ use platform::event::RawEvent;
 use platform::id::{
     CompositorId, KeyboardId, LayerShellId, OutputId, RegistryId, SeatId, ShmId, WmBaseId,
 };
-use platform::popup::PopupPositioner;
 use platform::layer::{LayerSurfaceConfig, LayerSurfaceHandle};
+use platform::popup::PopupPositioner;
 use platform::present::{PresentAttempt, PresentState};
 use platform::protocol::{
     self as proto, Anchor, Format, KeyboardInteractivity, Layer, LayerSurfaceEvent, SeatCapability,

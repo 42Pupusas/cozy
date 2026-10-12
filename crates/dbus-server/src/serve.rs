@@ -342,7 +342,15 @@ mod tests {
             });
             Ok(())
         });
-        let reply = method_call_reply(SENDER, 12, SETTINGS_PATH, SETTINGS_IFACE, "Open", "", vec![]);
+        let reply = method_call_reply(
+            SENDER,
+            12,
+            SETTINGS_PATH,
+            SETTINGS_IFACE,
+            "Open",
+            "",
+            vec![],
+        );
         let call = IncomingCall::from_reply(&reply).unwrap();
         let mut sink = RecordingSink::default();
         call.serve(&dispatcher, &mut sink).unwrap();

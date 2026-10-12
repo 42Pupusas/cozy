@@ -178,7 +178,10 @@ mod tests {
         assert_eq!(PositionerAnchor::BottomLeft as u32, 6);
         assert_eq!(PositionerGravity::BottomRight as u32, 8);
         assert_eq!(
-            ConstraintAdjustment::bits(&[ConstraintAdjustment::SlideX, ConstraintAdjustment::FlipY]),
+            ConstraintAdjustment::bits(&[
+                ConstraintAdjustment::SlideX,
+                ConstraintAdjustment::FlipY
+            ]),
             9
         );
     }

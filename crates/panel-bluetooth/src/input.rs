@@ -21,11 +21,13 @@ impl BluetoothInput {
             }
             PanelKey::Enter => Self::activate(model),
             PanelKey::Char('r') => Some(BluetoothCommand::SetScanning { on: true }),
-            PanelKey::Char('f') => model
-                .highlighted_device()
-                .map(|device| BluetoothCommand::Forget {
-                    path: device.path.clone(),
-                }),
+            PanelKey::Char('f') => {
+                model
+                    .highlighted_device()
+                    .map(|device| BluetoothCommand::Forget {
+                        path: device.path.clone(),
+                    })
+            }
             _ => None,
         };
         (command, PanelFlow::Stay)

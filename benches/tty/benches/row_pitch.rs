@@ -197,7 +197,10 @@ impl PitchLayout {
         self.scroll_up_rowwise(&mut expected, delta);
         let mut actual = self.frame(g);
         let stats = self.scroll_up_merged(&mut actual, delta);
-        assert!(actual == expected, "merged scroll diverges from rowwise scroll");
+        assert!(
+            actual == expected,
+            "merged scroll diverges from rowwise scroll"
+        );
         stats
     }
 }
@@ -264,7 +267,13 @@ fn interleaved_rowwise<const DELTA: usize>(bencher: divan::Bencher, g: &Geometry
 
 #[divan::bench(args = Geometry::ALL, consts = [Delta::ONE, Delta::HALF, Delta::HALF_MINUS_ONE])]
 fn interleaved_merged<const DELTA: usize>(bencher: divan::Bencher, g: &Geometry) {
-    Case::merged(bencher, *g, Spread::Interleaved, "interleaved", Delta::rows(DELTA, *g));
+    Case::merged(
+        bencher,
+        *g,
+        Spread::Interleaved,
+        "interleaved",
+        Delta::rows(DELTA, *g),
+    );
 }
 
 #[divan::bench(args = Geometry::ALL, consts = [Delta::ONE, Delta::HALF, Delta::HALF_MINUS_ONE])]

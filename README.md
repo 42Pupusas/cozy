@@ -22,7 +22,7 @@ on crates.io or GitHub. The plan and its rules are in [`PLAN.md`](PLAN.md).
 | `shot` | Screenshots through `zwlr_screencopy`; replaces `slurp \| grim` |
 | `clipboard` | Clipboard history through `zwlr_data_control` |
 | `files` | A file browser |
-| `monitor` | A system monitor drawn as tiles |
+| `monitor` | A system monitor |
 | `portal` | An `org.freedesktop.impl.portal.*` backend; today only the Settings interface |
 | `open` | An `xdg-open` replacement |
 | `canvas` | An infinite-canvas diagram tool |
@@ -34,7 +34,8 @@ on crates.io or GitHub. The plan and its rules are in [`PLAN.md`](PLAN.md).
 - A Wayland compositor. `statusbar`, `launcher`, `wallpaper`, `shot` and
   `clipboard` use wlroots protocols (layer shell, screencopy, data control),
   which niri provides. The author runs niri.
-- Rust 1.89 or newer.
+- Rust 1.89 or newer. The workspace uses edition 2024, and the `ixiptla`
+  dependency declares 1.89.
 
 ## Build and install
 

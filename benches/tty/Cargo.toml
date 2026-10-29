@@ -20,6 +20,8 @@ platform    = { path = "../../crates/platform" }
 text_layout = { path = "../../crates/text_layout" }
 input       = { path = "../../crates/input" }
 config      = { path = "../../crates/config" }
+pty         = { path = "../../crates/pty" }
+waker       = { path = "../../crates/waker" }
 quetzalcoatl = { workspace = true }
 divan       = "0.1"
 

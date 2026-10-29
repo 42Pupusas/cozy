@@ -20,7 +20,7 @@
 //!   - `present_cycle`  -- both together, one wheel step per iteration: the
 //!     honest end-to-end per-frame cost.
 //!
-//! `Grid::new` eagerly zero-fills a ~38 MB scrollback buffer, so it's built
+//! A grid allocates its scrollback (up to 10 MB) as output fills it, so it's built
 //! exactly once and reused; see `blit.rs`/`snapshot.rs` for the same
 //! rationale (a per-iteration rebuild buries the hot path under memset noise
 //! for a `perf` pass).

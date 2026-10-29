@@ -59,6 +59,40 @@ impl CellStore {
         self.chars.len()
     }
 
+    /// Bytes one row of `width` cells takes, not counting the heap behind
+    /// its style table and cluster pool, which are bounded per row.
+    pub(crate) const fn row_bytes(width: usize) -> usize {
+        width * (size_of::<u32>() + size_of::<u16>() + size_of::<u8>())
+            + size_of::<RowStyles>()
+            + size_of::<RowGraphemes>()
+    }
+
+    /// Append `rows` blank rows, allocating exactly that much more.
+    pub(crate) fn grow(&mut self, rows: usize) {
+        let cells = self.chars.len() + rows * self.width;
+        let row_count = self.row_styles.len() + rows;
+        self.chars.reserve_exact(rows * self.width);
+        self.chars.resize(cells, u32::from(' '));
+        self.style_ids.reserve_exact(rows * self.width);
+        self.style_ids.resize(cells, 0);
+        self.placement.reserve_exact(rows * self.width);
+        self.placement.resize(cells, Self::NARROW);
+        self.row_styles.reserve_exact(rows);
+        self.row_styles.resize_with(row_count, RowStyles::default);
+        self.row_graphemes.reserve_exact(rows);
+        self.row_graphemes.resize_with(row_count, RowGraphemes::default);
+    }
+
+    /// Rotate the store so row `rows` becomes row 0.
+    pub(crate) fn rotate_rows(&mut self, rows: usize) {
+        let cells = rows * self.width;
+        self.chars.rotate_left(cells);
+        self.style_ids.rotate_left(cells);
+        self.placement.rotate_left(cells);
+        self.row_styles.rotate_left(rows);
+        self.row_graphemes.rotate_left(rows);
+    }
+
     pub(crate) fn cell(&self, index: usize) -> Cell {
         let style = self.row_styles[index / self.width].get(self.style_ids[index]);
         let ch = self.cluster(index).map_or_else(

@@ -150,7 +150,7 @@ mod tests {
     use crate::Cell;
 
     fn screen_with(cols: u16, rows: u16, sb_max: usize, lines: &[&str]) -> Screen {
-        let mut s = Screen::new(cols, rows, sb_max);
+        let mut s = Screen::with_lines(cols, rows, sb_max);
         for (r, text) in lines.iter().enumerate() {
             for (c, ch) in text.chars().enumerate() {
                 // Test fixture lines are always short, well under u16::MAX.

@@ -547,6 +547,7 @@ impl<'cfg> App<'cfg> {
         let parser_handle = ParserWorker {
             cols: COLS,
             rows: ROWS,
+            scrollback_limit: self.cfg.scrollback_limit,
             default_fg: grid::Color::Rgb(
                 self.cfg.palette.foreground.r,
                 self.cfg.palette.foreground.g,
@@ -768,17 +769,17 @@ impl PtyWorker {
 /// The parser/grid thread's **spawn payload**: the ring endpoints, wakers and
 /// shared flags the coordinator wires up on the main thread and hands over,
 /// plus the startup geometry. Deliberately *not* the running state -- the
-/// grid and VT parser are born on the parser thread inside [`run`], because
-/// `Grid::new` eagerly allocates and zero-fills a ~38 MB scrollback buffer
-/// that must not land on the main thread's startup path. Once `run` moves
-/// this payload onto its thread it becomes a [`ParserSession`], which owns
-/// everything and drives the loop.
+/// grid and VT parser are born on the parser thread inside [`run`]. Once
+/// `run` moves this payload onto its thread it becomes a [`ParserSession`],
+/// which owns everything and drives the loop.
 ///
 /// Was a ten-argument free function (`parser_thread`) with a sibling free
 /// helper (`feed_parser`).
 struct ParserWorker {
     cols: u16,
     rows: u16,
+    /// `[general] scrollback_limit`, in bytes.
+    scrollback_limit: usize,
     /// Resolved theme fg/bg, seeded into the grid at construction so it can
     /// answer OSC 10/11 queries. See [`Grid::set_default_colors`].
     default_fg: grid::Color,
@@ -804,13 +805,12 @@ impl ParserWorker {
     }
 
     /// Bring the running state to life *on the parser thread* and drive the
-    /// loop to quit. The `Grid`/`Parser` allocation happens here, not in the
-    /// coordinator that built `self`, so the big scrollback buffer never
-    /// touches the main thread's startup path.
+    /// loop to quit.
     fn run(self) {
         let Self {
             cols,
             rows,
+            scrollback_limit,
             default_fg,
             default_bg,
             parser_rx,
@@ -826,7 +826,7 @@ impl ParserWorker {
         // Guarantees `quit` flips and the UI wakes even if this thread
         // panics below -- see `QuitGuard`'s doc.
         let _quit_guard = QuitGuard::new(&quit, &ui_wake);
-        let mut grid = Grid::new(cols, rows);
+        let mut grid = Grid::with_scrollback_limit(cols, rows, scrollback_limit);
         grid.set_default_colors(default_fg, default_bg);
         ParserSession {
             grid,

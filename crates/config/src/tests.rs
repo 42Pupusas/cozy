@@ -20,7 +20,7 @@ impl Config {
 fn empty_doc_gives_defaults() {
     let cfg = Config::parse("");
     assert_eq!(cfg.term, "xterm-256color");
-    assert_eq!(cfg.scrollback, 10_000);
+    assert_eq!(cfg.scrollback_limit, 10_000_000);
     assert_eq!(cfg.font.size, 14);
     assert_eq!(cfg.cursor.style, CursorStyle::Block);
     assert!(cfg.cursor.blink);
@@ -39,8 +39,14 @@ fn general_shell_and_term() {
 
 #[test]
 fn general_scrollback_zero() {
-    let cfg = Config::parse("[general]\nscrollback = 0\n");
-    assert_eq!(cfg.scrollback, 0);
+    let cfg = Config::parse("[general]\nscrollback_limit = 0\n");
+    assert_eq!(cfg.scrollback_limit, 0);
+}
+
+#[test]
+fn general_scrollback_limit_out_of_range() {
+    let msg = Config::fail("[general]\nscrollback_limit = -1\n");
+    assert!(msg.contains("general.scrollback_limit"), "{msg}");
 }
 
 // ── [font] ────────────────────────────────────────────────────────────────────
@@ -268,7 +274,7 @@ fn full_document() {
         "[general]\n",
         "shell      = \"/bin/fish\"\n",
         "term       = \"xterm-256color\"\n",
-        "scrollback = 50000\n",
+        "scrollback_limit = 50000000\n",
         "\n",
         "[font]\n",
         "path = \"/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf\"\n",
@@ -290,7 +296,7 @@ fn full_document() {
     ));
 
     assert_eq!(cfg.shell, "/bin/fish");
-    assert_eq!(cfg.scrollback, 50_000);
+    assert_eq!(cfg.scrollback_limit, 50_000_000);
     assert_eq!(cfg.font.size, 16);
     assert_eq!(cfg.cursor.style, CursorStyle::Beam);
     assert_eq!(cfg.cursor.blink_rate, 400);

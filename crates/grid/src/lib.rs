@@ -47,8 +47,8 @@ pub use stats::ScrollStats;
 use input::{KeyboardMode, MouseMode};
 use vt_parser::{C0, CsiAction, DcsCmd, OscCmd, SgrAttr, TermEvent, TerminalSink};
 
-/// Scrollback limit (lines above the visible area).
-pub const SCROLLBACK_MAX: usize = 10_000;
+/// Default scrollback limit, in bytes of history above the visible area.
+pub const SCROLLBACK_LIMIT: usize = 10_000_000;
 
 /// What kind of repaint the next [`Grid::take_dirty`] owes the renderer.
 ///
@@ -471,11 +471,19 @@ const COMPOSE_TABLE: &[(char, char, char)] = &[
 ];
 
 impl Grid {
-    /// Create a new grid with the given dimensions.
+    /// Create a new grid with the given dimensions and the default
+    /// scrollback limit.
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> Self {
+        Self::with_scrollback_limit(cols, rows, SCROLLBACK_LIMIT)
+    }
+
+    /// Create a new grid keeping up to `scrollback_limit` bytes of history.
+    /// History memory is allocated as it fills, not up front.
+    #[must_use]
+    pub fn with_scrollback_limit(cols: u16, rows: u16, scrollback_limit: usize) -> Self {
         Self {
-            primary: Screen::new(cols, rows, SCROLLBACK_MAX),
+            primary: Screen::new(cols, rows, scrollback_limit),
             alternate: Screen::new(cols, rows, 0),
             alt_active: false,
             bracketed_paste: false,
@@ -536,8 +544,6 @@ impl Grid {
         if self.alt_active {
             return;
         }
-        // scrollback_len/viewport_offset are bounded by SCROLLBACK_MAX (a
-        // small constant, far under i32::MAX), so these always fit.
         let max = i32::try_from(self.primary.scrollback_len()).unwrap_or(i32::MAX);
         let cur = i32::try_from(self.viewport_offset).unwrap_or(i32::MAX);
         let new = (cur + delta).clamp(0, max);
@@ -670,8 +676,6 @@ impl Grid {
         // offset, so `shift = prev - cur`.
         let shift = match self.rendered_offset {
             Some(prev) if self.content_delta == 0 => {
-                // viewport_offset is bounded by SCROLLBACK_MAX (a small
-                // constant, far under i64::MAX), so these always fit.
                 let prev = i64::try_from(prev).unwrap_or(i64::MAX);
                 let cur_i64 = i64::try_from(cur).unwrap_or(i64::MAX);
                 let s = prev - cur_i64;

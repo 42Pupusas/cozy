@@ -9,7 +9,7 @@
 //! [general]
 //! shell        = "/bin/bash"       # default: $SHELL or /bin/sh
 //! term         = "xterm-256color"  # $TERM value advertised to the pty
-//! scrollback   = 10000             # lines of scrollback; 0 = unlimited
+//! scrollback_limit = 10000000      # bytes of scrollback history; 0 = none
 //!
 //! [font]
 //! path = "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf"
@@ -768,8 +768,8 @@ pub struct Config {
     pub shell: String,
     /// `$TERM` value advertised to the PTY.
     pub term: String,
-    /// Lines of scrollback (`0` = unlimited).
-    pub scrollback: usize,
+    /// Bytes of scrollback history (`0` = none). Allocated as it fills.
+    pub scrollback_limit: usize,
     pub font: FontConfig,
     pub window: WindowConfig,
     pub cursor: CursorConfig,
@@ -788,7 +788,7 @@ impl Default for Config {
         Self {
             shell: Self::default_shell(),
             term: "xterm-256color".to_owned(),
-            scrollback: 10_000,
+            scrollback_limit: 10_000_000,
             font: FontConfig::default(),
             window: WindowConfig::default(),
             cursor: CursorConfig::default(),
@@ -888,15 +888,14 @@ impl Config {
         if let Some(s) = general.get_str("term") {
             s.clone_into(&mut self.term);
         }
-        // Scrollback fits comfortably in u32; clamp the validated range to usize.
         if let Some(n) = general.get_int_range(
-            "scrollback",
-            "general.scrollback",
+            "scrollback_limit",
+            "general.scrollback_limit",
             0,
-            1_000_000,
-            "must be between 0 and 1000000",
+            4_000_000_000,
+            "must be between 0 and 4000000000 bytes",
         )? {
-            self.scrollback = usize::try_from(n).unwrap_or(0);
+            self.scrollback_limit = usize::try_from(n).unwrap_or(0);
         }
         Ok(())
     }

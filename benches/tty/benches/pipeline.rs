@@ -9,9 +9,8 @@
 //! change one without the other.
 //!
 //! `Grid::new` is constructed ONCE per benchmarked corpus, outside the
-//! timed region, and reused across every iteration. `Grid::new` eagerly
-//! allocates and zero-fills a `2 * (rows + SCROLLBACK_MAX)`-row buffer
-//! (~38 MB at the default 10k-line scrollback), so reconstructing it per
+//! timed region, and reused across every iteration. A grid allocates its
+//! scrollback (up to 10 MB) as output fills it, so reconstructing it per
 //! iteration (as `with_inputs` would) buries the real `feed`+`apply` cost
 //! under page-fault noise. Harmless for divan's own timing (`with_inputs`
 //! cost isn't counted), but it makes a `perf stat`/`record` pass over this

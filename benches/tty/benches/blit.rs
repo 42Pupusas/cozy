@@ -6,7 +6,7 @@
 //! backbuffer is measured, matching `TermWindow::maybe_present`'s actual
 //! hot loop. Unlike an earlier version of this file, the snapshots and
 //! backbuffer are built exactly ONCE (not per-iteration via `with_inputs`):
-//! `Grid::new` eagerly zero-fills a ~38 MB scrollback buffer, so
+//! a grid allocates its scrollback (up to 10 MB) as output fills it, so
 //! reconstructing it every iteration buried the blit cost under page-fault
 //! noise under `perf stat`/`record` (divan's own numbers were unaffected,
 //! since `with_inputs` cost isn't counted -- but a whole-process profiler

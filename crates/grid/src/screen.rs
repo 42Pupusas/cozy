@@ -28,7 +28,8 @@ type ReflowRow = (Vec<Cell>, bool, u16, Vec<(usize, Vec<char>)>);
 /// single row is always one contiguous slice; only multi-row block moves
 /// (region scrolls) walk row-by-row through [`Self::copy_row`].
 pub struct Screen {
-    /// Backing store, `cap_rows(rows, scrollback_max)` rows tall. The live
+    /// Backing store. It starts `rows` tall and grows as history fills, up
+    /// to `rows + scrollback_max` ([`Self::reserve_window`]). The live
     /// window occupies the `scrollback_len + rows` physical rows starting at
     /// `head`, wrapping modulo the buffer height.
     buf: CellStore,
@@ -75,7 +76,9 @@ pub struct Screen {
     row_len: Vec<u16>,
     cols: u16,
     rows: u16,
-    /// Maximum scrollback lines (0 for alternate screen).
+    /// Bytes of history allowed (0 for the alternate screen).
+    scrollback_limit: usize,
+    /// Lines of history that fit in `scrollback_limit` at the current width.
     scrollback_max: usize,
     /// Current number of scrollback lines stored.
     scrollback_len: usize,
@@ -106,18 +109,45 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// Total rows to allocate: exactly the biggest possible window
-    /// (`rows + scrollback_max`). The buffer is a ring, so no slack region is
-    /// needed -- eviction advances `head` modulo this total and rows never
-    /// move. (The pre-ring design allocated 2x this so a floating head could
-    /// walk through slack between compactions; the ring removed both the
-    /// compactions and the extra half.)
-    ///
-    /// Was a free `cap_rows(rows, scrollback_max)` function -- moved onto
-    /// `Screen` as an associated function since it computes a `Screen`
-    /// sizing invariant, not a standalone calculation.
-    fn cap_rows(rows: usize, scrollback_max: usize) -> usize {
-        rows + scrollback_max
+    /// Bytes one row of `cols` cells takes, with its per-row flags.
+    fn row_bytes(cols: u16) -> usize {
+        CellStore::row_bytes(usize::from(cols.max(1)))
+            + size_of::<bool>() * 2
+            + size_of::<u16>()
+    }
+
+    /// Lines of history that fit in `limit` bytes at `cols` wide.
+    fn scrollback_lines(limit: usize, cols: u16) -> usize {
+        limit / Self::row_bytes(cols)
+    }
+
+    /// A screen keeping `lines` of history at its starting width.
+    #[cfg(test)]
+    pub(crate) fn with_lines(cols: u16, rows: u16, lines: usize) -> Self {
+        Self::new(cols, rows, lines * Self::row_bytes(cols))
+    }
+
+    /// Grow the ring so a window of `needed` rows fits. History grows by at
+    /// least doubling, so the copying is amortized O(1) per scrolled row,
+    /// and never past `rows + scrollback_max`. Growing re-anchors `head` at
+    /// row 0 so the new rows land after the window's end.
+    fn reserve_window(&mut self, needed: usize) {
+        let total = self.total_rows();
+        if needed <= total {
+            return;
+        }
+        let target = needed
+            .max(2 * total)
+            .min(usize::from(self.rows) + self.scrollback_max);
+        self.buf.rotate_rows(self.head);
+        self.wrapped.rotate_left(self.head);
+        self.blank_rows.rotate_left(self.head);
+        self.row_len.rotate_left(self.head);
+        self.head = 0;
+        self.buf.grow(target - total);
+        self.wrapped.resize(target, false);
+        self.blank_rows.resize(target, false);
+        self.row_len.resize(target, self.cols.max(1));
     }
 
     /// Total physical rows in the backing store (the ring's modulus).
@@ -138,8 +168,10 @@ impl Screen {
         if p >= total { p - total } else { p }
     }
 
-    pub fn new(cols: u16, rows: u16, scrollback_max: usize) -> Self {
-        let total = Self::cap_rows(usize::from(rows), scrollback_max);
+    /// A screen keeping up to `scrollback_limit` bytes of history. Only the
+    /// visible rows are allocated up front.
+    pub fn new(cols: u16, rows: u16, scrollback_limit: usize) -> Self {
+        let total = usize::from(rows);
         Self {
             buf: CellStore::new(usize::from(cols), total),
             wrapped: vec![false; total],
@@ -151,7 +183,8 @@ impl Screen {
             row_len: vec![cols.max(1); total],
             cols,
             rows,
-            scrollback_max,
+            scrollback_limit,
+            scrollback_max: Self::scrollback_lines(scrollback_limit, cols),
             scrollback_len: 0,
             head: 0,
             scroll_top: 0,
@@ -298,8 +331,6 @@ impl Screen {
         // Index into the linear [scrollback | visible] buffer by row.
         // `abs_row` is the absolute physical row: the view's row 0 sits at
         // absolute row `scrollback_len - viewport_offset`.
-        // scrollback_len/viewport_offset are bounded by SCROLLBACK_MAX (a
-        // small constant, far under i64::MAX), so these always fit.
         let sb = i64::try_from(self.scrollback_len).unwrap_or(i64::MAX);
         let viewport_offset = i64::try_from(viewport_offset).unwrap_or(i64::MAX);
         let abs_row = sb - viewport_offset + i64::from(row);
@@ -657,6 +688,7 @@ impl Screen {
             // ran off the buffer end, then paid an O(window) compaction
             // memmove -- measured at ~28x the input volume on a flood.)
             let new_base = (base + n).min(self.scrollback_max);
+            self.reserve_window(new_base + usize::from(self.rows));
             let drop_rows = (base + n) - new_base;
 
             self.head = self.phys_row(drop_rows);
@@ -1006,10 +1038,11 @@ impl Screen {
         //    into scrollback (capped, dropping the oldest beyond the cap).
         let m = rows_out.len();
         let overflow = m.saturating_sub(new_rows_u);
+        self.scrollback_max = Self::scrollback_lines(self.scrollback_limit, new_cols);
         let new_sb_len = overflow.min(self.scrollback_max);
         let dropped = overflow - new_sb_len;
 
-        let total = Self::cap_rows(new_rows_u, self.scrollback_max);
+        let total = new_rows_u + new_sb_len;
         let mut new_buf = CellStore::new(new_cols_u, total);
         let mut new_wrapped = vec![false; total];
         // Rows we never write below are untouched blanks: "all content".
@@ -1146,7 +1179,7 @@ mod tests {
     #[test]
     fn scroll_up_rotates_visible_window_over_scrollback() {
         // cols=2 rows=3, scrollback_max=4.
-        let mut s = Screen::new(2, 3, 4);
+        let mut s = Screen::with_lines(2, 3, 4);
         fill_row(&mut s, 0, 'a');
         fill_row(&mut s, 1, 'b');
         fill_row(&mut s, 2, 'c');
@@ -1172,13 +1205,66 @@ mod tests {
     }
 
     #[test]
+    fn history_is_allocated_as_it_fills_and_stops_at_the_limit() {
+        let mut s = Screen::with_lines(4, 3, 100);
+        assert_eq!(s.total_rows(), 3, "only the visible rows up front");
+        for i in 0..250u32 {
+            fill_row(&mut s, 0, char::from_u32(0x100 + i).unwrap());
+            s.scroll_up(1, 0, 2);
+            assert!(s.total_rows() <= 3 + 100);
+        }
+        assert_eq!(s.total_rows(), 103);
+        assert_eq!(s.scrollback_len(), 100);
+        for k in 0..100u32 {
+            let want = char::from_u32(0x100 + 150 + k).unwrap();
+            assert_eq!(s.abs_cell(0, k as usize).ch, want, "history row {k}");
+        }
+    }
+
+    #[test]
+    fn growing_after_the_ring_moved_keeps_rows_in_order() {
+        let mut s = Screen::with_lines(1, 2, 50);
+        for ch in ['a', 'b', 'c'] {
+            fill_row(&mut s, 0, ch);
+            s.scroll_up(1, 0, 1);
+        }
+        fill_row(&mut s, 0, 'v');
+        s.erase_scrollback();
+        for ch in ['d', 'e', 'f', 'g', 'h', 'i', 'j', 'k'] {
+            s.scroll_up(1, 0, 1);
+            fill_row(&mut s, 1, ch);
+        }
+        let history: String = (0..s.scrollback_len())
+            .map(|row| s.abs_cell(0, row).ch)
+            .collect();
+        assert_eq!(history, "v defghi");
+        assert_eq!(row_char(&s, 0), 'j');
+        assert_eq!(row_char(&s, 1), 'k');
+    }
+
+    #[test]
+    fn the_byte_limit_holds_fewer_lines_on_a_wider_screen() {
+        let mut s = Screen::with_lines(10, 2, 40);
+        for _ in 0..100 {
+            fill_row(&mut s, 0, 'x');
+            s.scroll_up(1, 0, 1);
+        }
+        assert_eq!(s.scrollback_len(), 40);
+        s.resize(30, 2, (0, 0));
+        let lines = Screen::scrollback_lines(40 * Screen::row_bytes(10), 30);
+        assert!(lines < 40);
+        assert_eq!(s.scrollback_len(), lines);
+        assert_eq!(s.total_rows(), lines + 2);
+    }
+
+    #[test]
     fn scroll_up_accumulates_history_up_to_scrollback_max() {
         // cols=1, rows=2, scrollback_max=3. Each single-line scroll pushes the
         // current top row into history until it saturates at scrollback_max.
         // Exercises the (common, still-growing) drop_rows==0 fast path of the
         // in-place rewrite -- which must copy nothing yet still land the same
         // [oldest..newest] history the old allocate-and-rebuild produced.
-        let mut s = Screen::new(1, 2, 3);
+        let mut s = Screen::with_lines(1, 2, 3);
         for ch in ['A', 'B', 'C'] {
             fill_row(&mut s, 0, ch);
             s.scroll_up(1, 0, 1);
@@ -1195,7 +1281,7 @@ mod tests {
         // multi-line scroll whose push exceeds the remaining cap, forcing the
         // oldest row to slide off the front. Guards the in-place copy_within +
         // blank arithmetic that replaced the allocate-and-rebuild.
-        let mut s = Screen::new(1, 3, 2);
+        let mut s = Screen::with_lines(1, 3, 2);
         // First push: history = [p]; visible becomes [q, r, blank].
         fill_row(&mut s, 0, 'p');
         fill_row(&mut s, 1, 'q');
@@ -1227,7 +1313,7 @@ mod tests {
         // jumped straight to the last screen). Each further scroll must keep
         // rotating: drop the oldest history row, append the newest.
         // cols=1, rows=2, scrollback_max=3.
-        let mut s = Screen::new(1, 2, 3);
+        let mut s = Screen::with_lines(1, 2, 3);
         // Push A,B,C,D,E,F one line at a time (six scrolls, well past the cap).
         for ch in ['A', 'B', 'C', 'D', 'E', 'F'] {
             fill_row(&mut s, 0, ch);
@@ -1249,9 +1335,9 @@ mod tests {
         // ring bookkeeping is transparent. This is the sustained-flood case
         // that must stay O(1)/line (no slide-to-front, no compaction)
         // AND lossless.
-        // cols=1, rows=2, scrollback_max=4 -> cap_rows = 2+4 = 6 physical
+        // cols=1, rows=2, scrollback_max=4 -> at most 2+4 = 6 physical
         // rows; 500 single-line scrolls wrap the ring ~80 times.
-        let mut s = Screen::new(1, 2, 4);
+        let mut s = Screen::with_lines(1, 2, 4);
         let n = 500u32;
         for i in 0..n {
             // Distinct glyph per line so misordering/loss is visible.

@@ -8,8 +8,7 @@
 //!     frame (last-writer-wins by row) before a present, ported straight
 //!     from `flood_bench`'s `coalesce` helper.
 //!
-//! `Grid::new` eagerly allocates and zero-fills a `2 * (rows +
-//! SCROLLBACK_MAX)`-row buffer (~38 MB at the default 10k-line scrollback),
+//! A grid allocates its scrollback (up to 10 MB) as output fills it,
 //! so both benches build exactly one `Grid` up front and reuse it/its
 //! output across iterations rather than reconstructing it per iteration --
 //! otherwise a `perf stat`/`record` pass over this binary measures mostly

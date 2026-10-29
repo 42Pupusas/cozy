@@ -7,15 +7,17 @@
 //!     perf record -g target/release/examples/grid_hotspots print bytes=16777216
 //!     perf report --stdio --sort=symbol
 //!
-//! Modes: `print` (parser + `Grid::apply`), `snapshot` (also `take_dirty`), and
-//! `scroll` (the screen's scrollback rotation without parser work).
+//! Modes: `print` (parser feeding the grid directly, as the terminal does),
+//! `snapshot` (also `take_dirty`),
+//! `unicode` (`print` over the `unicode` corpus), and `scroll` (the screen's
+//! scrollback rotation without parser work).
 
 #![allow(clippy::cast_precision_loss)]
 
 use std::time::Instant;
 
 use grid::Grid;
-use tty_benches::{COLS, ROWS};
+use tty_benches::{COLS, Corpora, ROWS};
 use vt_parser::Parser;
 
 const DEFAULT_BYTES: usize = 16 * 1024 * 1024;
@@ -30,6 +32,7 @@ struct GridHotspotWorkload {
 enum WorkloadMode {
     Print,
     Snapshot,
+    Unicode,
     Scroll,
 }
 
@@ -67,6 +70,7 @@ impl WorkloadMode {
     fn parse(value: &str) -> Self {
         match value {
             "snapshot" => Self::Snapshot,
+            "unicode" => Self::Unicode,
             "scroll" => Self::Scroll,
             _ => Self::Print,
         }
@@ -88,19 +92,28 @@ impl GridHotspotWorkload {
     fn run(&self) -> Measurement {
         match self.mode {
             WorkloadMode::Scroll => self.run_scroll(),
-            WorkloadMode::Print | WorkloadMode::Snapshot => self.run_stream(),
+            WorkloadMode::Print | WorkloadMode::Snapshot | WorkloadMode::Unicode => {
+                self.run_stream()
+            }
         }
     }
 
     fn run_stream(&self) -> Measurement {
+        let unicode;
+        let chunk = if matches!(self.mode, WorkloadMode::Unicode) {
+            unicode = Corpora::unicode(COLS, ROWS, 1);
+            unicode.as_slice()
+        } else {
+            LINE
+        };
         let mut parser = Parser::new();
         let mut grid = Grid::new(COLS, ROWS);
         let mut bytes = 0;
         let mut snapshots = 0;
         let start = Instant::now();
         while bytes < self.target_bytes {
-            let length = (self.target_bytes - bytes).min(LINE.len());
-            parser.feed(&LINE[..length], |event| grid.apply(&event));
+            parser.feed_to(chunk, &mut grid);
+            let length = chunk.len();
             bytes += length;
             if matches!(self.mode, WorkloadMode::Snapshot) && bytes.is_multiple_of(64 * 4096) {
                 let _ = grid.take_dirty();
@@ -149,6 +162,7 @@ impl GridHotspotWorkload {
             match self.mode {
                 WorkloadMode::Print => "print",
                 WorkloadMode::Snapshot => "snapshot",
+                WorkloadMode::Unicode => "unicode",
                 WorkloadMode::Scroll => "scroll",
             }
         );

@@ -57,6 +57,11 @@ pub const CORPORA: &[Corpus] = &[
         default_n: 800,
     },
     Corpus {
+        name: "unicode",
+        generate: Corpora::unicode,
+        default_n: 1,
+    },
+    Corpus {
         name: "alt_screen_thrash",
         generate: Corpora::alt_screen_thrash,
         default_n: 500,
@@ -158,6 +163,23 @@ impl Corpora {
             out.push_str(LINE);
             out.push('\n');
         }
+        out.into_bytes()
+    }
+
+    /// Every scalar from U+00A1 to U+D7FB on one wrapping line, then the
+    /// emoticon block, on the alternate screen: the shape of vtebench's
+    /// `unicode` benchmark. Mixes narrow, wide, zero-width and combining
+    /// characters, so it exercises width lookup and the cluster path.
+    #[must_use]
+    pub fn unicode(_cols: u16, _rows: u16, n: usize) -> Vec<u8> {
+        let mut out = String::from("\x1b[?1049h");
+        for _ in 0..n {
+            out.extend((0xA1..=0xD7FB).filter_map(char::from_u32));
+            out.push('\n');
+            out.extend((0x1F600..=0x1F64F).filter_map(char::from_u32));
+            out.push('\n');
+        }
+        out.push_str("\x1b[?1049l");
         out.into_bytes()
     }
 

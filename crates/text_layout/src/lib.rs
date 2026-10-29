@@ -33,5 +33,7 @@ mod codepoint;
 pub mod layout;
 pub mod line_break;
 pub mod measurement;
+mod width_table;
+mod width_table_data;
 
 pub use layout::{LayoutLine, LayoutParams, Layouter};

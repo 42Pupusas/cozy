@@ -5,11 +5,15 @@
 //! value. Ids index the owning row's [`RowStyles`] table, which is cleared
 //! with the row, so no style table is shared across rows or grows without
 //! bound.
+//!
+//! A cell holding a multi-codepoint grapheme cluster stores a tagged id into
+//! its row's [`RowGraphemes`] in the character plane instead of a scalar.
 
 use std::ops::Range;
 
+use crate::row_graphemes::RowGraphemes;
 use crate::row_styles::{RowStyles, Style};
-use crate::{Attrs, Cell, DirtyRowContent};
+use crate::{Attrs, Cell, Cluster, DirtyRowContent};
 
 /// Stores cells as structure-of-arrays planes.
 ///
@@ -25,6 +29,7 @@ pub(crate) struct CellStore {
     chars: Vec<u32>,
     style_ids: Vec<u16>,
     row_styles: Vec<RowStyles>,
+    row_graphemes: Vec<RowGraphemes>,
     placement: Vec<u8>,
     #[cfg(target_arch = "x86_64")]
     /// Probed once with the store, not once per short terminal-line write.
@@ -41,6 +46,9 @@ impl CellStore {
             row_styles: std::iter::repeat_with(RowStyles::default)
                 .take(rows)
                 .collect(),
+            row_graphemes: std::iter::repeat_with(RowGraphemes::default)
+                .take(rows)
+                .collect(),
             placement: vec![Self::NARROW; len],
             #[cfg(target_arch = "x86_64")]
             avx2: std::arch::is_x86_feature_detected!("avx2"),
@@ -53,7 +61,10 @@ impl CellStore {
 
     pub(crate) fn cell(&self, index: usize) -> Cell {
         let style = self.row_styles[index / self.width].get(self.style_ids[index]);
-        let ch = char::from_u32(self.chars[index]).unwrap_or('�');
+        let ch = self.cluster(index).map_or_else(
+            || char::from_u32(self.chars[index]).unwrap_or('�'),
+            |cluster| cluster[0],
+        );
         match self.placement[index] {
             Self::WIDE => Cell::wide_lead(ch, style.attrs, style.link_id),
             Self::SPACER => Cell::wide_spacer(style.attrs, style.link_id),
@@ -78,7 +89,7 @@ impl CellStore {
     /// row must be partially edited; normal full-width output avoids it.
     pub(crate) fn clear_range(&mut self, range: Range<usize>) {
         if range.len() == self.width {
-            self.row_styles[range.start / self.width].clear();
+            self.restart_row(range.start);
         }
         self.chars[range.clone()].fill(u32::from(' '));
         self.style_ids[range.clone()].fill(0);
@@ -89,6 +100,40 @@ impl CellStore {
     /// whose every cell is about to be cleared or overwritten.
     pub(crate) fn restart_row(&mut self, index: usize) {
         self.row_styles[index / self.width].clear();
+        self.row_graphemes[index / self.width].clear();
+    }
+
+    /// The codepoints of the cluster at `index`, when it holds more than one.
+    pub(crate) fn cluster(&self, index: usize) -> Option<&[char]> {
+        let raw = self.chars[index];
+        if !RowGraphemes::is_cluster(raw) {
+            return None;
+        }
+        self.row_graphemes[index / self.width].get(raw)
+    }
+
+    /// Add `ch` to the cluster at `index`, keeping its style and placement.
+    pub(crate) fn join(&mut self, index: usize, ch: char) {
+        let mut cluster = self
+            .cluster(index)
+            .map_or_else(|| vec![self.cell(index).ch], <[char]>::to_vec);
+        if cluster.len() < RowGraphemes::MAX_LEN {
+            cluster.push(ch);
+            self.set_cluster(index, &cluster);
+        }
+    }
+
+    /// Store `cluster` at `index`, whose style and placement are already
+    /// written.
+    pub(crate) fn set_cluster(&mut self, index: usize, cluster: &[char]) {
+        let cluster = &cluster[..cluster.len().min(RowGraphemes::MAX_LEN)];
+        let row = index / self.width;
+        let start = row * self.width;
+        self.row_graphemes[row].insert(
+            cluster,
+            &mut self.chars[start..start + self.width],
+            index - start,
+        );
     }
 
     /// Write a narrow ASCII run, the flood hot path: widen the bytes into
@@ -247,7 +292,7 @@ impl CellStore {
         self.placement.copy_within(src, dest);
     }
 
-    /// Copy row `src` over row `dst`, style table included.
+    /// Copy row `src` over row `dst`, style table and clusters included.
     pub(crate) fn copy_row(&mut self, src: usize, dst: usize) {
         let cells = src * self.width..(src + 1) * self.width;
         let target = dst * self.width;
@@ -262,9 +307,24 @@ impl CellStore {
             (&tail[0], &mut head[dst])
         };
         to.copy_from(from);
+        let (from, to) = if src < dst {
+            let (head, tail) = self.row_graphemes.split_at_mut(dst);
+            (&head[src], &mut tail[0])
+        } else {
+            let (head, tail) = self.row_graphemes.split_at_mut(src);
+            (&tail[0], &mut head[dst])
+        };
+        to.copy_from(from);
     }
 
     pub(crate) fn row_content(&self, range: Range<usize>) -> DirtyRowContent {
+        let clusters = self.clusters(range.clone());
+        if !clusters.is_empty() {
+            return DirtyRowContent::Clustered {
+                cells: range.map(|index| self.cell(index)).collect(),
+                clusters,
+            };
+        }
         let chars = &self.chars[range.clone()];
         let ids = &self.style_ids[range.clone()];
         let placement = &self.placement[range.clone()];
@@ -285,6 +345,21 @@ impl CellStore {
         }
 
         DirtyRowContent::Cells(range.map(|index| self.cell(index)).collect())
+    }
+
+    /// Every multi-codepoint cluster in `range`, columns relative to its start.
+    pub(crate) fn clusters(&self, range: Range<usize>) -> Vec<Cluster> {
+        if self.row_graphemes[range.start / self.width].is_empty() {
+            return Vec::new();
+        }
+        let start = range.start;
+        range
+            .filter_map(|index| {
+                let col = u16::try_from(index - start).unwrap_or(u16::MAX);
+                self.cluster(index)
+                    .map(|cluster| Cluster::new(col, cluster))
+            })
+            .collect()
     }
 
     pub(crate) fn row_cells(&self, range: Range<usize>) -> Vec<Cell> {
@@ -371,6 +446,24 @@ mod tests {
         store.restart_row(0);
         store.clear_range(0..4);
         assert_eq!(store.cell(5), Cell::new('b', attrs, 3));
+    }
+
+    #[test]
+    fn clusters_travel_with_copied_rows_and_clear_with_them() {
+        let mut store = CellStore::new(4, 2);
+        store.write_ascii(0, b"abcd", Attrs::default(), 0);
+        store.join(1, '\u{301}');
+        store.join(1, '\u{323}');
+        store.copy_row(0, 1);
+        store.clear_range(0..4);
+        assert_eq!(store.cluster(1), None);
+        assert_eq!(store.cluster(5), Some(&['b', '\u{301}', '\u{323}'][..]));
+        assert_eq!(store.cell(5).ch, 'b');
+        let row = store.row_content(4..8);
+        assert_eq!(
+            row.clusters(),
+            [crate::Cluster::new(1, &['b', '\u{301}', '\u{323}'])]
+        );
     }
 
     #[test]

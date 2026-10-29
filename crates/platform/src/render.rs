@@ -874,11 +874,64 @@ impl Renderer {
     fn blit_dirty_row(&mut self, canvas: &mut Canvas<'_>, row: &DirtyRow) {
         match &row.content {
             DirtyRowContent::Cells(cells) => self.blit_row(canvas, row.row, cells),
+            DirtyRowContent::Clustered { cells, clusters } => {
+                self.blit_row(canvas, row.row, cells);
+                self.blit_cluster_marks(canvas, row.row, cells, clusters);
+            }
             DirtyRowContent::Uniform {
                 chars,
                 attrs,
                 link_id,
             } => self.blit_uniform_row(canvas, row.row, chars, *attrs, *link_id),
+        }
+    }
+
+    /// Draw each cluster's combining marks over its already painted base
+    /// glyph. The bitmap font has no marks, so it shows the base alone.
+    pub fn blit_cluster_marks(
+        &mut self,
+        canvas: &mut Canvas<'_>,
+        cy: u16,
+        cells: &[Cell],
+        clusters: &[grid::Cluster],
+    ) {
+        let Some(py0) = self.row_top(canvas, cy) else {
+            return;
+        };
+        let GlyphSource::Face(cache) = &mut self.glyphs else {
+            return;
+        };
+        for cluster in clusters {
+            let Some(cell) = cells.get(usize::from(cluster.col)) else {
+                continue;
+            };
+            if cell.attrs.invisible() {
+                continue;
+            }
+            let (fg, bg) = self.theme.effective(&cell.attrs);
+            let cols = if cell.wide() { 2 } else { 1 };
+            let px0 = i32::from(cluster.col) * self.cell_w;
+            for mark in cluster.marks() {
+                let Some(entry) = cache.entry(u32::from(mark)) else {
+                    continue;
+                };
+                // Fonts draw a mark left of its origin, to sit on the glyph
+                // before it, or right of it, over its own advance.
+                let origin = if entry.bearing_x < 0 {
+                    px0 + self.cell_w * cols
+                } else {
+                    px0
+                };
+                canvas.blit_glyph(
+                    &cache.atlas,
+                    &entry,
+                    origin,
+                    py0.cast_signed(),
+                    fg,
+                    bg,
+                    self.bg_alpha,
+                );
+            }
         }
     }
 
@@ -1519,6 +1572,29 @@ mod tests {
 
     fn cell(ch: char) -> Cell {
         Cell::new(ch, Attrs::default(), 0)
+    }
+
+    #[test]
+    fn clustered_row_paints_its_base_glyphs_like_a_plain_row() {
+        let paint = |content: DirtyRowContent| {
+            let mut renderer = Renderer::new(Theme::builtin(), &config::FontConfig::default());
+            let (w, h) = (renderer.cell_w * 2, renderer.cell_h);
+            let mut buf = vec![0u32; usize::try_from(w * h).unwrap_or(0)];
+            let mut canvas = Canvas::new(&mut buf, w, h);
+            let row = DirtyRow {
+                row: 0,
+                content,
+                soft_wrap: None,
+            };
+            renderer.blit_dirty_row(&mut canvas, &row);
+            buf
+        };
+        let cells = vec![cell('e'), cell('x')];
+        let clustered = DirtyRowContent::Clustered {
+            cells: cells.clone(),
+            clusters: vec![grid::Cluster::new(0, &['e', '\u{323}'])],
+        };
+        assert_eq!(paint(clustered), paint(DirtyRowContent::Cells(cells)));
     }
 
     #[test]

@@ -513,14 +513,12 @@ fn combining_acute_accent_composes_onto_the_previous_letter() {
 }
 
 #[test]
-fn combining_mark_with_no_table_entry_is_dropped_not_corrupting() {
+fn combining_mark_with_no_table_entry_is_kept_as_a_cluster() {
     let mut g = Grid::new(20, 3);
     feed(&mut g, "z\u{323}".as_bytes()); // 'z' + COMBINING DOT BELOW (not in our table)
-    assert_eq!(
-        g.screen().get_cell(0, 0).ch,
-        'z',
-        "base letter left untouched"
-    );
+    assert_eq!(g.screen().get_cell(0, 0).ch, 'z', "base letter kept");
+    assert_eq!(g.screen().cluster(0, 0), Some(&['z', '\u{323}'][..]));
+    assert_eq!(g.cursor(), (1, 0));
 }
 
 #[test]

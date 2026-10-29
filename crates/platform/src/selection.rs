@@ -142,7 +142,7 @@ impl SelectionTracker {
             grid::DirtyRowContent::Uniform { chars, link_id, .. } => {
                 chars.get(usize::from(col)).map_or(0, |_| *link_id)
             }
-            grid::DirtyRowContent::Cells(cells) => {
+            grid::DirtyRowContent::Cells(cells) | grid::DirtyRowContent::Clustered { cells, .. } => {
                 cells.get(usize::from(col)).map_or(0, grid::Cell::link_id)
             }
         }
@@ -499,6 +499,19 @@ impl SelectionTracker {
                     }
                 }
             }
+            grid::DirtyRowContent::Clustered { cells, clusters } => {
+                let mut clusters = clusters.iter().peekable();
+                for (col, cell) in cells.iter().enumerate().take(end + 1) {
+                    let cluster = clusters.next_if(|c| usize::from(c.col) == col);
+                    if col < start || cell.spacer() {
+                        continue;
+                    }
+                    match cluster {
+                        Some(cluster) => text.push_str(&cluster.text),
+                        None => text.push(cell.ch),
+                    }
+                }
+            }
         }
         output.push_str(if trim { text.trim_end() } else { &text });
     }
@@ -618,6 +631,35 @@ mod tests {
         sel.press_left((0, 0), false);
         assert!(sel.drag_to((7, 0)));
         assert_eq!(sel.selected_text().as_deref(), Some("compact"));
+    }
+
+    #[test]
+    fn copied_text_keeps_whole_grapheme_clusters() {
+        let attrs = grid::Attrs::default();
+        let row = DirtyRow {
+            row: 0,
+            content: DirtyRowContent::Clustered {
+                cells: vec![
+                    Cell::new('e', attrs, 0),
+                    Cell::wide_lead('\u{1f468}', attrs, 0),
+                    Cell::wide_spacer(attrs, 0),
+                    Cell::new('x', attrs, 0),
+                ],
+                clusters: vec![
+                    grid::Cluster::new(0, &['e', '\u{301}']),
+                    grid::Cluster::new(1, &['\u{1f468}', '\u{200d}', '\u{1f469}']),
+                ],
+            },
+            soft_wrap: None,
+        };
+        let mut sel = SelectionTracker::new();
+        sel.ingest_snapshot(&incremental(vec![row], 0));
+        sel.press_left((0, 0), false);
+        assert!(sel.drag_to((4, 0)));
+        assert_eq!(
+            sel.selected_text().as_deref(),
+            Some("e\u{301}\u{1f468}\u{200d}\u{1f469}x")
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use crate::screen::Screen;
-use crate::{Attrs, Cell};
+use crate::{Attrs, Cell, Cluster};
 
 /// Tracks dirty (modified) rows since the last snapshot.
 pub struct DirtyRegion {
@@ -242,6 +242,13 @@ pub enum DirtyRowContent {
     },
     /// General row retaining per-cell styles and wide-glyph placement.
     Cells(Vec<Cell>),
+    /// A general row with multi-codepoint grapheme clusters. Each cluster's
+    /// cell holds its base codepoint; `clusters` holds the full text, in
+    /// column order.
+    Clustered {
+        cells: Vec<Cell>,
+        clusters: Vec<Cluster>,
+    },
 }
 
 impl Clone for DirtyRowContent {
@@ -257,6 +264,10 @@ impl Clone for DirtyRowContent {
                 link_id: *link_id,
             },
             Self::Cells(cells) => Self::Cells(cells.clone()),
+            Self::Clustered { cells, clusters } => Self::Clustered {
+                cells: cells.clone(),
+                clusters: clusters.clone(),
+            },
         }
     }
 
@@ -311,7 +322,7 @@ impl DirtyRowContent {
     pub const fn len(&self) -> usize {
         match self {
             Self::Uniform { chars, .. } => chars.len(),
-            Self::Cells(cells) => cells.len(),
+            Self::Cells(cells) | Self::Clustered { cells, .. } => cells.len(),
         }
     }
 
@@ -336,7 +347,16 @@ impl DirtyRowContent {
                     Cell::new(char::from_u32(codepoint).unwrap_or('�'), *attrs, *link_id)
                 })
                 .collect(),
-            Self::Cells(cells) => cells.clone(),
+            Self::Cells(cells) | Self::Clustered { cells, .. } => cells.clone(),
+        }
+    }
+
+    /// The grapheme clusters of this row, in column order.
+    #[must_use]
+    pub fn clusters(&self) -> &[Cluster] {
+        match self {
+            Self::Clustered { clusters, .. } => clusters,
+            _ => &[],
         }
     }
 }

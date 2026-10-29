@@ -1880,6 +1880,8 @@ impl TermWindow {
             for (col, cell) in cells.iter().enumerate().take(usize::from(cols)) {
                 self.renderer.blit_cell(&mut canvas, col as u16, row, cell);
             }
+            self.renderer
+                .blit_cluster_marks(&mut canvas, row, &cells, content.clusters());
         }
     }
 

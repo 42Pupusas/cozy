@@ -8,6 +8,10 @@
 
 use crate::{Cell, DirtyRowContent, cell_store::CellStore};
 
+/// One row built by reflow: cells, whether it soft-wraps, content length,
+/// and `(col, codepoints)` of its multi-codepoint clusters.
+type ReflowRow = (Vec<Cell>, bool, u16, Vec<(usize, Vec<char>)>);
+
 /// A rectangular grid of cells with optional scrollback.
 ///
 /// The buffer is a **ring at row granularity**: the logical
@@ -242,6 +246,36 @@ impl Screen {
         } else {
             Cell::default()
         }
+    }
+
+    /// The full cluster at `(col, abs_row)` when the cell holds more than one
+    /// codepoint; `abs_cell` carries only its base.
+    #[must_use]
+    pub fn abs_cluster(&self, col: u16, abs_row: usize) -> Option<&[char]> {
+        if abs_row >= self.scrollback_len + usize::from(self.rows) || col >= self.cols {
+            return None;
+        }
+        let phys = self.phys_row(abs_row);
+        if self.blank_rows[phys] {
+            return None;
+        }
+        self.buf
+            .cluster(phys * usize::from(self.cols) + usize::from(col))
+    }
+
+    /// [`Self::abs_cluster`] for a visible cell.
+    #[must_use]
+    pub fn cluster(&self, col: u16, row: u16) -> Option<&[char]> {
+        self.abs_cluster(col, self.scrollback_len + usize::from(row))
+    }
+
+    /// Append `ch` to the grapheme cluster in visible cell `(col, row)`.
+    pub(crate) fn join(&mut self, col: u16, row: u16, ch: char) {
+        let phys = self.phys_row(self.scrollback_len + usize::from(row));
+        self.materialize_row(phys);
+        self.buf
+            .join(phys * usize::from(self.cols) + usize::from(col), ch);
+        self.all_blank = false;
     }
 
     /// Whether the row at absolute index `abs_row` soft-wraps onto the next.
@@ -791,12 +825,16 @@ impl Screen {
         // 1. Stitch physical rows into logical lines via the wrapped flags,
         //    recording where the cursor falls.
         let mut lines: Vec<Vec<Cell>> = Vec::new();
+        // Per logical line: `(offset, codepoints)` of each multi-codepoint
+        // cluster, carried beside the cells it belongs to.
+        let mut line_clusters: Vec<Vec<(usize, Vec<char>)>> = Vec::new();
         let mut cursor_line = 0usize;
         let mut cursor_offset = 0usize;
         let mut r = 0usize;
         while r < total_old {
             let li = lines.len();
             let mut cells: Vec<Cell> = Vec::new();
+            let mut clusters: Vec<(usize, Vec<char>)> = Vec::new();
             loop {
                 // Ring-map each absolute row: the window may wrap mid-line.
                 let phys = self.phys_row(r);
@@ -806,6 +844,12 @@ impl Screen {
                     cursor_offset = cells.len() + cursor_col;
                 }
                 let cont = self.wrapped[phys];
+                for cluster in self.buf.clusters(base..base + old_cols) {
+                    let col = usize::from(cluster.col);
+                    if !cont || col < usize::from(self.row_len[phys]) {
+                        clusters.push((cells.len() + col, cluster.text.chars().collect()));
+                    }
+                }
                 if cont {
                     // A soft-wrapped (continuation) row that our own word-aware
                     // reflow produced may be RAGGED -- broken before the margin
@@ -843,6 +887,7 @@ impl Screen {
                 cells.pop();
             }
             lines.push(cells);
+            line_clusters.push(clusters);
         }
 
         // 2. Drop trailing empty logical lines, but never above the cursor line.
@@ -853,12 +898,14 @@ impl Screen {
             }
         }
         lines.truncate(last_keep + 1);
+        line_clusters.truncate(last_keep + 1);
 
         // 3. Re-break each logical line at the new width.
         // Each entry: the row's cells, whether it continues onto the next row,
         // and how many leading cells are real content (the rest is the padding
-        // this reflow added to reach full width) -- see `row_len`.
-        let mut rows_out: Vec<(Vec<Cell>, bool, u16)> = Vec::new();
+        // this reflow added to reach full width) -- see `row_len` -- and the
+        // row's multi-codepoint clusters by column.
+        let mut rows_out: Vec<ReflowRow> = Vec::new();
         let mut new_cursor_idx = 0usize;
         let mut new_cursor_col = 0usize;
         for (li, line) in lines.iter().enumerate() {
@@ -908,7 +955,13 @@ impl Screen {
                 // *after* the whitespace), so recording the length preserves
                 // that one space without re-synthesizing it.
                 let content_len = u16::try_from(end - start).unwrap_or(u16::MAX);
-                rows_out.push((row_cells, p + 1 < piece_count, content_len));
+                let clusters = line_clusters[li]
+                    .iter()
+                    .filter(|(offset, _)| (start..end).contains(offset))
+                    .map(|(offset, text)| (offset - start, text.clone()))
+                    .filter(|(col, _)| row_cells[*col] != Cell::default())
+                    .collect();
+                rows_out.push((row_cells, p + 1 < piece_count, content_len, clusters));
             }
             if li == cursor_line {
                 // Find the piece whose cell range contains the cursor offset.
@@ -941,7 +994,7 @@ impl Screen {
                         // offset sits past the content end (`last_end`), matching
                         // the old fixed-stride `cursor_offset mod new_cols_u`
                         // when the line length was a multiple of the width.
-                        rows_out.push((vec![Cell::default(); new_cols_u], false, 0));
+                        rows_out.push((vec![Cell::default(); new_cols_u], false, 0, Vec::new()));
                         new_cursor_idx = rows_out.len() - 1;
                         new_cursor_col = (cursor_offset - last_end).min(new_cols_u - 1);
                     }
@@ -955,7 +1008,6 @@ impl Screen {
         let overflow = m.saturating_sub(new_rows_u);
         let new_sb_len = overflow.min(self.scrollback_max);
         let dropped = overflow - new_sb_len;
-        let visible_count = m - overflow;
 
         let total = Self::cap_rows(new_rows_u, self.scrollback_max);
         let mut new_buf = CellStore::new(new_cols_u, total);
@@ -965,23 +1017,17 @@ impl Screen {
         // Freshly zeroed buffer: nothing is lazily blank (see `new`).
         let new_blank_rows = vec![false; total];
 
-        for i in 0..new_sb_len {
-            let (cells, w, len) = &rows_out[dropped + i];
+        // Scrollback rows then visible rows, packed from the front.
+        for (i, (cells, w, len, clusters)) in rows_out[dropped..].iter().enumerate() {
             let dst = i * new_cols_u;
             for (offset, cell) in cells.iter().copied().enumerate() {
                 new_buf.set_cell(dst + offset, cell);
             }
+            for (col, text) in clusters {
+                new_buf.set_cluster(dst + col, text);
+            }
             new_wrapped[i] = *w;
             new_row_len[i] = *len;
-        }
-        for i in 0..visible_count {
-            let (cells, w, len) = &rows_out[overflow + i];
-            let dst = (new_sb_len + i) * new_cols_u;
-            for (offset, cell) in cells.iter().copied().enumerate() {
-                new_buf.set_cell(dst + offset, cell);
-            }
-            new_wrapped[new_sb_len + i] = *w;
-            new_row_len[new_sb_len + i] = *len;
         }
 
         self.buf = new_buf;
@@ -1049,7 +1095,27 @@ impl Screen {
     /// explicitly rather than ever transporting stale ring-buffer storage.
     #[must_use]
     pub(crate) fn visible_row_content(&self, row: u16) -> Option<DirtyRowContent> {
-        let phys = self.phys_row(self.scrollback_len + usize::from(row));
+        self.abs_row_content(self.scrollback_len + usize::from(row))
+    }
+
+    /// [`Self::visible_row_content`] for viewport `row` seen through
+    /// `viewport_offset`. Rows above the top of history read as blank.
+    #[must_use]
+    pub(crate) fn viewport_row_content(
+        &self,
+        row: u16,
+        viewport_offset: usize,
+    ) -> Option<DirtyRowContent> {
+        (self.scrollback_len + usize::from(row))
+            .checked_sub(viewport_offset)
+            .and_then(|abs_row| self.abs_row_content(abs_row))
+    }
+
+    fn abs_row_content(&self, abs_row: usize) -> Option<DirtyRowContent> {
+        if abs_row >= self.scrollback_len + usize::from(self.rows) {
+            return None;
+        }
+        let phys = self.phys_row(abs_row);
         if self.blank_rows[phys] {
             return None;
         }

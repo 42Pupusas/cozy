@@ -22,16 +22,19 @@
 mod base64;
 mod cell;
 pub mod cell_store;
+mod cluster;
 mod cursor;
 mod dirty;
 mod line_wrap;
 mod palette;
+mod row_graphemes;
 mod row_styles;
 mod screen;
 mod selection;
 mod stats;
 
 pub use cell::{Attrs, Cell, Color, UnderlineStyle};
+pub use cluster::Cluster;
 pub use cursor::{Cursor, CursorShape};
 pub use dirty::{
     CursorInfo, DirtyRegion, DirtyRow, DirtyRowContent, DirtySnapshot, ScrollBand, SnapshotKind,
@@ -167,6 +170,11 @@ pub struct Grid {
     /// xterm: REP only repeats a character that was the *immediately*
     /// preceding thing printed.
     last_printed: Option<char>,
+    /// The last codepoint joined onto a cell was a zero width joiner, so the
+    /// next printed character joins that cell too. Cleared with
+    /// `last_printed`: only a character printed right after the joiner
+    /// continues the sequence.
+    zwj_pending: bool,
     /// The cursor info last handed out in a [`DirtySnapshot`] -- compared
     /// against the live cursor in [`Grid::take_dirty`] so a snapshot's
     /// `cursor_changed` flag is set whenever the cursor moved or toggled
@@ -482,6 +490,7 @@ impl Grid {
             replies: Vec::new(),
             pending_wrap: false,
             last_printed: None,
+            zwj_pending: false,
             last_cursor: CursorInfo::default(),
             force_cursor_changed: false,
             mouse_mode: MouseMode::Off,
@@ -637,12 +646,13 @@ impl Grid {
         // expensive part -- rasterizing the surviving interior rows' glyphs.
         let mut out = Vec::with_capacity(usize::from(rows));
         for row in 0..rows {
-            let cells: Vec<Cell> = (0..cols)
-                .map(|col| self.primary.get_viewport_cell(col, row, cur))
-                .collect();
+            let content = self
+                .primary
+                .viewport_row_content(row, cur)
+                .unwrap_or_else(|| DirtyRowContent::uniform_spaces(usize::from(cols)));
             out.push(DirtyRow {
                 row,
-                content: DirtyRowContent::Cells(cells),
+                content,
                 soft_wrap: self.primary.viewport_soft_wrap(row, cur),
             });
         }
@@ -930,6 +940,7 @@ impl Grid {
             debug_assert_eq!(written, count);
             self.dirty.mark_rows(row, row);
             self.last_printed = Some(char::from(bytes[offset + count - 1]));
+            self.zwj_pending = false;
             offset += count;
 
             if offset < bytes.len() {
@@ -963,10 +974,11 @@ impl Grid {
             use text_layout::measurement::CellWidth as _;
             ch.cell_width()
         };
-        if width == 0 {
+        if width == 0 || self.continues_cluster(ch) {
             self.combine_onto_previous(ch);
             return;
         }
+        self.zwj_pending = false;
 
         if self.pending_wrap {
             let row = self.cursor.row;
@@ -1025,39 +1037,73 @@ impl Grid {
         }
     }
 
-    /// A zero-width combining mark arrived (e.g. typed as base letter plus
-    /// U+0301 COMBINING ACUTE ACCENT, rather than a precomposed character).
-    /// `Cell` has no grapheme-cluster storage, so full general composition
-    /// isn't possible -- but the common case (a Latin base letter plus one
-    /// of the handful of combining diacritics real keyboards/IMEs actually
-    /// produce) is handled by rewriting the previous cell's glyph to its
-    /// precomposed NFC form via [`ComposeWithMark::compose_with`]. Anything outside
-    /// that table (emoji ZWJ sequences, combining marks over non-Latin base
-    /// characters, ...) is dropped as before -- silently ignored rather than
-    /// corrupting an unrelated cell, since we can't store the cluster.
-    fn combine_onto_previous(&mut self, mark: char) {
-        // Walk back over a wide glyph's spacer to find the actual base cell,
-        // and don't step left past column 0 (a combining mark at the very
-        // start of a line has nothing to combine with).
-        if self.cursor.col == 0 {
-            return;
-        }
-        let row = self.cursor.row;
-        let c = self.cursor.col - 1;
-        let screen = self.active_screen();
-        let base_col = if screen.get_cell(c, row).spacer() && c > 0 {
-            c - 1
+    /// The cell the next codepoint would join: the one just left of the
+    /// cursor, or under it while a wrap is pending, stepping back over a
+    /// wide glyph's spacer. `None` at the start of a line.
+    fn cluster_base(&self) -> Option<u16> {
+        let col = if self.pending_wrap {
+            self.cursor.col
         } else {
-            c
+            self.cursor.col.checked_sub(1)?
         };
-        let base = self.active_screen().get_cell(base_col, row);
-        let Some(composed) = base.ch.compose_with(mark) else {
+        let screen = self.active_screen();
+        if screen.get_cell(col, self.cursor.row).spacer() && col > 0 {
+            Some(col - 1)
+        } else {
+            Some(col)
+        }
+    }
+
+    /// Whether `ch`, which has width, still belongs to the previous cell's
+    /// cluster: the codepoint after a zero width joiner, the second regional
+    /// indicator of a flag, or a skin tone modifier after a wide glyph.
+    #[inline]
+    fn continues_cluster(&self, ch: char) -> bool {
+        use cluster::ClusterChar as _;
+        self.zwj_pending
+            || ((ch.is_regional_indicator() || ch.is_emoji_modifier()) && self.extends_emoji(ch))
+    }
+
+    /// Whether `ch`, a regional indicator or skin tone modifier, extends the
+    /// glyph in the previous cell.
+    #[inline(never)]
+    fn extends_emoji(&self, ch: char) -> bool {
+        use cluster::ClusterChar as _;
+        let Some(col) = self.cluster_base() else {
+            return false;
+        };
+        let screen = self.active_screen();
+        let row = self.cursor.row;
+        let base = screen.get_cell(col, row);
+        if ch.is_regional_indicator() {
+            base.ch.is_regional_indicator() && screen.cluster(col, row).is_none()
+        } else {
+            base.wide()
+        }
+    }
+
+    /// Add `ch` to the grapheme cluster of the previous cell. A combining
+    /// mark over a lone Latin letter becomes its precomposed form, which
+    /// every font draws; anything else is stored as a cluster. The cursor
+    /// does not move. At the start of a line there is nothing to join and
+    /// `ch` is dropped.
+    fn combine_onto_previous(&mut self, ch: char) {
+        let Some(col) = self.cluster_base() else {
             return;
         };
-        let mut cell = base;
-        cell.ch = composed;
-        self.active_screen_mut().set_cell(base_col, row, cell);
-        self.dirty.mark(base_col, row);
+        let row = self.cursor.row;
+        let base = self.active_screen().get_cell(col, row);
+        let lone = self.active_screen().cluster(col, row).is_none();
+        match base.ch.compose_with(ch) {
+            Some(composed) if lone => {
+                let mut cell = base;
+                cell.ch = composed;
+                self.active_screen_mut().set_cell(col, row, cell);
+            }
+            _ => self.active_screen_mut().join(col, row, ch),
+        }
+        self.zwj_pending = ch == cluster::ZWJ;
+        self.dirty.mark(col, row);
     }
 
     fn control(&mut self, c0: C0) {
@@ -1067,6 +1113,7 @@ impl Grid {
         // a character that was the very last thing printed.
         if !matches!(c0, C0::Bell | C0::Null | C0::Other(_)) {
             self.last_printed = None;
+            self.zwj_pending = false;
         }
         match c0 {
             C0::Bell => self.bell_pending = true,
@@ -1155,6 +1202,7 @@ impl Grid {
                 | CsiAction::DeviceAttributes(_)
         ) {
             self.last_printed = None;
+            self.zwj_pending = false;
         }
         match action {
             CsiAction::CursorUp(n) => {
@@ -2049,6 +2097,7 @@ impl Grid {
                 self.active_link_id = 0;
                 self.published_links = 0;
                 self.last_printed = None;
+                self.zwj_pending = false;
                 self.reset_all_palette_overrides();
             }
             // SCS — designate G0 charset (`ESC ( X`). `0` = DEC Special
@@ -3123,6 +3172,87 @@ mod tests {
         let s = "e\u{0301}"; // e + combining acute
         apply_str(&mut g, s.as_bytes());
         assert_eq!(g.cursor(), (1, 0));
+    }
+
+    fn cluster_at(g: &Grid, col: u16, row: u16) -> String {
+        g.screen().cluster(col, row).map_or_else(
+            || g.screen().get_cell(col, row).ch.to_string(),
+            |c| c.iter().collect(),
+        )
+    }
+
+    #[test]
+    fn zwj_sequence_is_one_wide_cell() {
+        let mut g = Grid::new(10, 3);
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        apply_str(&mut g, format!("{family}x").as_bytes());
+        assert_eq!(cluster_at(&g, 0, 0), family);
+        assert!(g.screen().get_cell(0, 0).wide());
+        assert_eq!(g.screen().get_cell(2, 0).ch, 'x');
+        assert_eq!(g.cursor(), (3, 0));
+    }
+
+    #[test]
+    fn flag_pairs_regional_indicators() {
+        let mut g = Grid::new(10, 3);
+        // Two flags: four regional indicators, two cells each.
+        apply_str(&mut g, "\u{1f1fa}\u{1f1f8}\u{1f1ef}\u{1f1f5}".as_bytes());
+        assert_eq!(cluster_at(&g, 0, 0), "\u{1f1fa}\u{1f1f8}");
+        assert_eq!(cluster_at(&g, 2, 0), "\u{1f1ef}\u{1f1f5}");
+        assert_eq!(g.cursor(), (4, 0));
+    }
+
+    #[test]
+    fn skin_tone_joins_the_emoji_before_it() {
+        let mut g = Grid::new(10, 3);
+        apply_str(&mut g, "\u{1f44b}\u{1f3fd}".as_bytes());
+        assert_eq!(cluster_at(&g, 0, 0), "\u{1f44b}\u{1f3fd}");
+        assert_eq!(g.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn combining_marks_beyond_the_compose_table_are_kept() {
+        let mut g = Grid::new(10, 3);
+        // Devanagari letter + vowel sign, and a Latin letter with two marks.
+        apply_str(&mut g, "\u{915}\u{941}e\u{301}\u{323}".as_bytes());
+        assert_eq!(cluster_at(&g, 0, 0), "\u{915}\u{941}");
+        assert_eq!(cluster_at(&g, 1, 0), "\u{e9}\u{323}");
+        assert_eq!(g.cursor(), (2, 0));
+    }
+
+    #[test]
+    fn mark_after_a_full_line_joins_the_last_cell() {
+        let mut g = Grid::new(3, 3);
+        apply_str(&mut g, "abc\u{330}".as_bytes());
+        assert_eq!(cluster_at(&g, 2, 0), "c\u{330}");
+        assert_eq!(g.screen().get_cell(1, 0).ch, 'b');
+    }
+
+    #[test]
+    fn overwriting_a_cluster_cell_replaces_it() {
+        let mut g = Grid::new(10, 3);
+        apply_str(&mut g, "\u{915}\u{941}\rx".as_bytes());
+        assert_eq!(cluster_at(&g, 0, 0), "x");
+    }
+
+    #[test]
+    fn clusters_survive_scrollback_resize_and_selection() {
+        let mut g = Grid::new(6, 2);
+        let family = "\u{1f468}\u{200d}\u{1f469}";
+        apply_str(
+            &mut g,
+            format!("a\u{915}\u{941}{family}\r\n\r\n\r\n").as_bytes(),
+        );
+        g.resize(4, 4);
+        let abs = (0..g.screen().scrollback_len() + 4)
+            .find(|&r| g.screen().abs_cell(0, r).ch == 'a')
+            .expect("line kept");
+        let mut sel = Selection::new(SelPoint { col: 0, row: abs });
+        sel.end = SelPoint { col: 3, row: abs };
+        assert_eq!(
+            g.screen().selected_text(&sel),
+            format!("a\u{915}\u{941}{family}")
+        );
     }
 
     #[test]

@@ -125,7 +125,10 @@ impl Screen {
                 if cell.spacer() {
                     continue;
                 }
-                line.push(cell.ch);
+                match self.abs_cluster(u16::try_from(col).unwrap_or(u16::MAX), abs_row) {
+                    Some(cluster) => line.extend(cluster),
+                    None => line.push(cell.ch),
+                }
             }
             let line = line.trim_end();
             out.push_str(line);

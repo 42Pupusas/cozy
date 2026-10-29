@@ -47,11 +47,6 @@ impl RowStyles {
         self.entries.clear();
     }
 
-    /// Become a copy of `other`, reusing this table's allocation.
-    pub fn copy_from(&mut self, other: &Self) {
-        self.entries.clone_from(&other.entries);
-    }
-
     /// The id of `style` in this row, adding it if new.
     ///
     /// `ids` is the row's id plane. `overwritten` holds the columns the

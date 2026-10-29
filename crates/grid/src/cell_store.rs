@@ -83,16 +83,6 @@ impl CellStore {
         self.row_graphemes.resize_with(row_count, RowGraphemes::default);
     }
 
-    /// Rotate the store so row `rows` becomes row 0.
-    pub(crate) fn rotate_rows(&mut self, rows: usize) {
-        let cells = rows * self.width;
-        self.chars.rotate_left(cells);
-        self.style_ids.rotate_left(cells);
-        self.placement.rotate_left(cells);
-        self.row_styles.rotate_left(rows);
-        self.row_graphemes.rotate_left(rows);
-    }
-
     pub(crate) fn cell(&self, index: usize) -> Cell {
         let style = self.row_styles[index / self.width].get(self.style_ids[index]);
         let ch = self.cluster(index).map_or_else(
@@ -326,31 +316,6 @@ impl CellStore {
         self.placement.copy_within(src, dest);
     }
 
-    /// Copy row `src` over row `dst`, style table and clusters included.
-    pub(crate) fn copy_row(&mut self, src: usize, dst: usize) {
-        let cells = src * self.width..(src + 1) * self.width;
-        let target = dst * self.width;
-        self.chars.copy_within(cells.clone(), target);
-        self.style_ids.copy_within(cells.clone(), target);
-        self.placement.copy_within(cells, target);
-        let (from, to) = if src < dst {
-            let (head, tail) = self.row_styles.split_at_mut(dst);
-            (&head[src], &mut tail[0])
-        } else {
-            let (head, tail) = self.row_styles.split_at_mut(src);
-            (&tail[0], &mut head[dst])
-        };
-        to.copy_from(from);
-        let (from, to) = if src < dst {
-            let (head, tail) = self.row_graphemes.split_at_mut(dst);
-            (&head[src], &mut tail[0])
-        } else {
-            let (head, tail) = self.row_graphemes.split_at_mut(src);
-            (&tail[0], &mut head[dst])
-        };
-        to.copy_from(from);
-    }
-
     pub(crate) fn row_content(&self, range: Range<usize>) -> DirtyRowContent {
         let clusters = self.clusters(range.clone());
         if !clusters.is_empty() {
@@ -472,32 +437,18 @@ mod tests {
     }
 
     #[test]
-    fn copied_row_carries_its_styles() {
+    fn clusters_clear_with_their_row() {
         let mut store = CellStore::new(4, 2);
-        let attrs = Attrs::with_colors(Color::Rgb(9, 9, 9), Color::Default);
-        store.write_ascii(0, b"abcd", attrs, 3);
-        store.copy_row(0, 1);
-        store.restart_row(0);
-        store.clear_range(0..4);
-        assert_eq!(store.cell(5), Cell::new('b', attrs, 3));
-    }
-
-    #[test]
-    fn clusters_travel_with_copied_rows_and_clear_with_them() {
-        let mut store = CellStore::new(4, 2);
-        store.write_ascii(0, b"abcd", Attrs::default(), 0);
-        store.join(1, '\u{301}');
-        store.join(1, '\u{323}');
-        store.copy_row(0, 1);
-        store.clear_range(0..4);
-        assert_eq!(store.cluster(1), None);
-        assert_eq!(store.cluster(5), Some(&['b', '\u{301}', '\u{323}'][..]));
+        store.write_ascii(4, b"abcd", Attrs::default(), 0);
+        store.join(5, '\u{301}');
+        store.join(5, '\u{323}');
         assert_eq!(store.cell(5).ch, 'b');
-        let row = store.row_content(4..8);
         assert_eq!(
-            row.clusters(),
+            store.row_content(4..8).clusters(),
             [crate::Cluster::new(1, &['b', '\u{301}', '\u{323}'])]
         );
+        store.clear_range(4..8);
+        assert_eq!(store.cluster(5), None);
     }
 
     #[test]

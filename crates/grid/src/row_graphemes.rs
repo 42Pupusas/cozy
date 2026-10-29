@@ -45,11 +45,6 @@ impl RowGraphemes {
         self.pool.clear();
     }
 
-    /// Become a copy of `other`, reusing this store's allocation.
-    pub fn copy_from(&mut self, other: &Self) {
-        self.pool.clone_from(&other.pool);
-    }
-
     /// Store `cluster` for column `col` of the row whose character plane is
     /// `chars`, writing the tagged offset there. `cluster` is at most
     /// [`Self::MAX_LEN`] long.

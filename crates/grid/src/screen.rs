@@ -24,15 +24,19 @@ type ReflowRow = (Vec<Cell>, bool, u16, Vec<(usize, Vec<char>)>);
 /// those compactions moving ~28x the input volume on a flood, so the ring
 /// removed them outright (and halved the allocation -- no slack needed).
 ///
-/// Rows never straddle the wrap seam (wrapping is per whole row), so any
-/// single row is always one contiguous slice; only multi-row block moves
-/// (region scrolls) walk row-by-row through [`Self::copy_row`].
+/// The ring holds row *indices* ([`Self::slots`]), not rows, so a region
+/// scroll reorders a few integers instead of copying cells. Any single row
+/// is one contiguous slice of `buf`.
 pub struct Screen {
     /// Backing store. It starts `rows` tall and grows as history fills, up
     /// to `rows + scrollback_max` ([`Self::reserve_window`]). The live
     /// window occupies the `scrollback_len + rows` physical rows starting at
     /// `head`, wrapping modulo the buffer height.
     buf: CellStore,
+    /// Ring position `p` (see [`Self::ring_pos`]) lives in `buf` row
+    /// `slots[p]`. The per-row vectors below are indexed by physical row,
+    /// so they move with their row when slots are reordered.
+    slots: Vec<u32>,
     /// Per physical row: true if the line continues (soft-wrapped) onto the
     /// next physical row. Parallel to rows in `buf`; same length as `buf/cols`.
     /// This is what lets `resize` reflow instead of clip.
@@ -139,11 +143,9 @@ impl Screen {
         let target = needed
             .max(2 * total)
             .min(usize::from(self.rows) + self.scrollback_max);
-        self.buf.rotate_rows(self.head);
-        self.wrapped.rotate_left(self.head);
-        self.blank_rows.rotate_left(self.head);
-        self.row_len.rotate_left(self.head);
+        self.slots.rotate_left(self.head);
         self.head = 0;
+        self.slots.extend(total as u32..target as u32);
         self.buf.grow(target - total);
         self.wrapped.resize(target, false);
         self.blank_rows.resize(target, false);
@@ -155,17 +157,47 @@ impl Screen {
         self.wrapped.len()
     }
 
-    /// Map an absolute window row (0 = oldest scrollback row,
-    /// `scrollback_len` = top visible row) to its physical row in the ring.
+    /// Ring position of an absolute window row (0 = oldest scrollback row,
+    /// `scrollback_len` = top visible row).
     ///
     /// `head < total` and `abs <= total` always hold, so a single conditional
     /// subtract replaces the general modulo -- this sits on every access path,
     /// and a hardware divide here would be pure waste.
     #[inline]
-    fn phys_row(&self, abs: usize) -> usize {
+    fn ring_pos(&self, abs: usize) -> usize {
         let total = self.total_rows();
         let p = self.head + abs;
         if p >= total { p - total } else { p }
+    }
+
+    /// Physical `buf` row holding absolute window row `abs`.
+    #[inline]
+    fn phys_row(&self, abs: usize) -> usize {
+        self.slots[self.ring_pos(abs)] as usize
+    }
+
+    /// Rotate window rows `[start, start + len)` up by `n`: row `start + n`
+    /// becomes `start` and the first `n` rows wrap to the end.
+    fn rotate_rows_up(&mut self, start: usize, len: usize, n: usize) {
+        let p = self.ring_pos(start);
+        if p + len <= self.total_rows() {
+            self.slots[p..p + len].rotate_left(n);
+            return;
+        }
+        // The range crosses the ring seam: rotate by three reversals.
+        self.reverse_rows(start, start + n);
+        self.reverse_rows(start + n, start + len);
+        self.reverse_rows(start, start + len);
+    }
+
+    /// Reverse the order of window rows `[from, to)`.
+    fn reverse_rows(&mut self, mut from: usize, mut to: usize) {
+        while from + 1 < to {
+            to -= 1;
+            let (a, b) = (self.ring_pos(from), self.ring_pos(to));
+            self.slots.swap(a, b);
+            from += 1;
+        }
     }
 
     /// A screen keeping up to `scrollback_limit` bytes of history. Only the
@@ -174,6 +206,7 @@ impl Screen {
         let total = usize::from(rows);
         Self {
             buf: CellStore::new(usize::from(cols), total),
+            slots: (0..total as u32).collect(),
             wrapped: vec![false; total],
             // A fresh buffer is genuinely blank, so no rows are *lazily*
             // blank -- the bits track "buf content is stale garbage", which
@@ -410,71 +443,25 @@ impl Screen {
         }
     }
 
-    /// Mark physical rows `[from, to)` as lazily blank and clear their
-    /// soft-wrap flags -- the O(rows) replacement for the O(rows*cols)
-    /// memset the scroll paths used to pay per exposed row.
-    ///
-    /// Physical-row range, no wrap handling: callers pass ranges derived
-    /// from a single row or an already-unwrapped span.
+    /// Mark physical row `phys` lazily blank and clear its soft-wrap flag --
+    /// the O(1) replacement for the O(cols) memset the scroll paths used to
+    /// pay per exposed row.
     #[inline]
-    fn mark_rows_blank(&mut self, from: usize, to: usize) {
-        for b in &mut self.blank_rows[from..to] {
-            *b = true;
-        }
-        for w in &mut self.wrapped[from..to] {
-            *w = false;
-        }
+    fn mark_row_blank(&mut self, phys: usize) {
+        self.blank_rows[phys] = true;
+        self.wrapped[phys] = false;
         // A blank row carries no reflow-trimmed tail; reset to "all content"
         // so a later wrap of this row joins seamlessly (see `row_len`).
-        let full = self.cols.max(1);
-        for l in &mut self.row_len[from..to] {
-            *l = full;
-        }
+        self.row_len[phys] = self.cols.max(1);
     }
 
-    /// Mark `count` window rows starting at absolute row `abs` lazily blank,
-    /// following the ring wrap. The ring counterpart of [`Self::mark_rows_blank`]
-    /// for callers that speak absolute window rows.
+    /// Mark `count` window rows starting at absolute row `abs` lazily blank.
     #[inline]
     fn mark_abs_rows_blank(&mut self, abs: usize, count: usize) {
-        if count == 0 {
-            return;
+        for a in abs..abs + count {
+            let phys = self.phys_row(a);
+            self.mark_row_blank(phys);
         }
-        let total = self.total_rows();
-        let start = self.phys_row(abs);
-        if count == 1 {
-            // A one-row scroll is the terminal flood hot path. Avoid forming
-            // two slices and running two iterator loops for the common case;
-            // the ring mapping already gives us the exact physical row.
-            self.blank_rows[start] = true;
-            self.wrapped[start] = false;
-            self.row_len[start] = self.cols.max(1);
-            return;
-        }
-        let first = count.min(total - start);
-        self.mark_rows_blank(start, start + first);
-        // Wrapped remainder continues at physical row 0.
-        self.mark_rows_blank(0, count - first);
-    }
-
-    /// Copy one whole window row `src_abs` -> `dst_abs` (cells + wrapped +
-    /// blank bit), each independently ring-mapped. Region scrolls and
-    /// line edits move blocks row-by-row through this so the ring seam is
-    /// handled in exactly one place.
-    #[inline]
-    fn copy_row(&mut self, src_abs: usize, dst_abs: usize) {
-        let src = self.phys_row(src_abs);
-        let dst = self.phys_row(dst_abs);
-        if src == dst {
-            return;
-        }
-        self.buf.copy_row(src, dst);
-        self.wrapped[dst] = self.wrapped[src];
-        // Blank bits travel with their rows: the bit is what makes a
-        // lazily-blank row's stale cells read as blank.
-        self.blank_rows[dst] = self.blank_rows[src];
-        // Ditto the reflow content length -- it describes this row's tail.
-        self.row_len[dst] = self.row_len[src];
     }
 
     /// Write a contiguous run of narrow printable cells on one visible row.
@@ -566,7 +553,7 @@ impl Screen {
         // first so the untouched cells read correctly afterward.
         let phys = self.phys_row(self.scrollback_len + usize::from(row));
         if col0 == 0 && usize::from(col1) >= usize::from(self.cols) - 1 {
-            self.mark_rows_blank(phys, phys + 1);
+            self.mark_row_blank(phys);
             return;
         }
         self.materialize_row(phys);
@@ -617,7 +604,7 @@ impl Screen {
             return;
         }
         let dead = self.scrollback_len;
-        self.head = self.phys_row(dead);
+        self.head = self.ring_pos(dead);
         self.scrollback_len = 0;
         // The freed rows now sit at the END of the window's ring span
         // (absolute rows [rows .. rows + dead)); mark them blank so nothing
@@ -691,7 +678,7 @@ impl Screen {
             self.reserve_window(new_base + usize::from(self.rows));
             let drop_rows = (base + n) - new_base;
 
-            self.head = self.phys_row(drop_rows);
+            self.head = self.ring_pos(drop_rows);
             self.scrollback_len = new_base;
 
             // Mark the `n` freshly-exposed rows at the bottom of the window
@@ -703,15 +690,10 @@ impl Screen {
             let out_rows = new_base + vis_rows; // window rows in use, from head
             self.mark_abs_rows_blank(out_rows - n, n);
         } else {
-            // No scrollback involvement: shift the surviving rows up within
-            // the region in place, then blank the bottom n rows. Region rows
-            // may straddle the ring seam, so move row-by-row through the
-            // seam-aware copy_row (top-to-bottom is the safe direction for
-            // an upward shift: each destination is read before overwritten).
+            // No scrollback involvement: rotate the region's rows up and
+            // blank the n that wrapped to its bottom.
             let region_abs = base + top_i;
-            for i in 0..keep {
-                self.copy_row(region_abs + n + i, region_abs + i);
-            }
+            self.rotate_rows_up(region_abs, vis_rows, n);
             self.mark_abs_rows_blank(region_abs + keep, n);
         }
 
@@ -738,17 +720,13 @@ impl Screen {
             return;
         }
 
-        let move_rows = (bot_i - top_i + 1).saturating_sub(n);
-        // Downward shift: iterate bottom-to-top so each source row is read
-        // before it is overwritten. Row-by-row through the seam-aware
-        // copy_row -- region rows may straddle the ring's wrap point.
+        let len = bot_i - top_i + 1;
+        let n = n.min(len);
+        // Rotate the region's rows down, then blank the n that wrapped to
+        // its top (lazily -- bit-set, no memset).
         let region_abs = self.scrollback_len + top_i;
-        for i in (0..move_rows).rev() {
-            self.copy_row(region_abs + i, region_abs + i + n);
-        }
-        // Blank top n rows (lazily -- bit-set, no memset).
-        let blank_n = n.min(bot_i - top_i + 1);
-        self.mark_abs_rows_blank(region_abs, blank_n);
+        self.rotate_rows_up(region_abs, len, len - n);
+        self.mark_abs_rows_blank(region_abs, n);
     }
 
     /// Insert `n` blank lines at `row`, shifting rows in `[row, bot]` down.
@@ -1064,6 +1042,7 @@ impl Screen {
         }
 
         self.buf = new_buf;
+        self.slots = (0..total as u32).collect();
         self.wrapped = new_wrapped;
         self.row_len = new_row_len;
         self.blank_rows = new_blank_rows;
@@ -1240,6 +1219,45 @@ mod tests {
         assert_eq!(history, "v defghi");
         assert_eq!(row_char(&s, 0), 'j');
         assert_eq!(row_char(&s, 1), 'k');
+    }
+
+    fn visible(s: &Screen) -> String {
+        (0..s.rows()).map(|row| row_char(s, row)).collect()
+    }
+
+    #[test]
+    fn region_scrolls_reorder_rows_at_every_ring_offset() {
+        for flood in 0..12 {
+            let mut s = Screen::with_lines(1, 4, 2);
+            for _ in 0..flood {
+                s.scroll_up(1, 0, 3);
+            }
+            for (row, ch) in (0..4).zip(['a', 'b', 'c', 'd']) {
+                fill_row(&mut s, row, ch);
+            }
+            s.scroll_up(1, 1, 3);
+            assert_eq!(visible(&s), "acd ", "after {flood} scrolls");
+            s.scroll_down(1, 0, 2);
+            assert_eq!(visible(&s), " ac ", "after {flood} scrolls");
+            s.scroll_down(2, 1, 3);
+            assert_eq!(visible(&s), "   a", "after {flood} scrolls");
+        }
+    }
+
+    #[test]
+    fn region_scroll_carries_clusters_and_wrap_flags() {
+        let mut s = Screen::with_lines(2, 3, 0);
+        fill_row(&mut s, 1, 'e');
+        s.join(0, 1, '\u{301}');
+        s.set_wrapped(1, true);
+        s.scroll_up(1, 0, 2);
+        assert_eq!(s.cluster(0, 0), Some(&['e', '\u{301}'][..]));
+        assert!(s.is_wrapped(0));
+        assert_eq!(s.cluster(0, 1), None);
+        assert!(!s.is_wrapped(1));
+        s.scroll_down(2, 0, 2);
+        assert_eq!(s.cluster(0, 2), Some(&['e', '\u{301}'][..]));
+        assert!(s.is_wrapped(2));
     }
 
     #[test]

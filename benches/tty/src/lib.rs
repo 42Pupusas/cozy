@@ -72,6 +72,11 @@ pub const CORPORA: &[Corpus] = &[
         default_n: 2000,
     },
     Corpus {
+        name: "region_scroll",
+        generate: Corpora::region_scroll,
+        default_n: 4000,
+    },
+    Corpus {
         name: "control_heavy",
         generate: Corpora::control_heavy,
         default_n: 500,
@@ -195,6 +200,19 @@ impl Corpora {
                 out.extend_from_slice(b"\x1b[3A\x1b[5C");
             }
         }
+        out
+    }
+
+    /// Scrolling inside a margin on the alternate screen, as vtebench's
+    /// `scrolling_*_region` benchmarks: `DECSTBM 2;rows`, then one short line
+    /// per scroll. Neither screen pushes these rows into history.
+    #[must_use]
+    pub fn region_scroll(_cols: u16, rows: u16, n: usize) -> Vec<u8> {
+        let mut out = format!("\x1b[?1049h\x1b[2;{rows}r\x1b[{rows};1H").into_bytes();
+        for _ in 0..n {
+            out.extend_from_slice(b"y\n");
+        }
+        out.extend_from_slice(b"\x1b[r\x1b[?1049l");
         out
     }
 

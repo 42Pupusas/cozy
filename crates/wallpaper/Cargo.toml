@@ -18,4 +18,4 @@ ixiptla-core = { workspace = true }
 # Only needed to build well-formed PNG fixtures in tests (zlib-compress raw
 # scanline bytes) -- `ixiptla-core` itself already depends on this for its
 # own IDAT inflate, so this adds nothing new to the dependency graph.
-ixchel = { path = "/home/cuarentaydos/Code/tooling/ixchel" }
+ixchel = "0.1.0"

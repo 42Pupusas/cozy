@@ -43,10 +43,9 @@
 # broken even when crates/launcher's own code is current.
 #
 # The install root is cargo's own: $CARGO_HOME/bin, falling back to the
-# ~/.cargo/bin default when CARGO_HOME is unset. On this machine CARGO_HOME is
-# /var/cache/cuarentaydos/cargo, which is exactly the path niri's config
-# spawns from -- so the default is already correct and no hardcoding is
-# needed. Override with INSTALL_ROOT=/somewhere to install elsewhere (the
+# ~/.cargo/bin default when CARGO_HOME is unset. Point the compositor's spawn
+# commands at that directory. Override with INSTALL_ROOT=/somewhere to
+# install elsewhere (the
 # binaries land in $INSTALL_ROOT/bin, matching cargo's own --root layout).
 set -eu
 

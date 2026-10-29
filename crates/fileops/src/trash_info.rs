@@ -241,13 +241,13 @@ mod tests {
     #[test]
     fn renders_exactly_what_other_tools_write() {
         let info = TrashInfo::new(
-            PathBuf::from("/home/cuarentaydos/Code/forfun/agent/crates/mcp-git/src/native.rs"),
+            PathBuf::from("/home/user/Code/project/src/native.rs"),
             sample_time(),
         );
         assert_eq!(
             info.to_file_contents(),
             "[Trash Info]\n\
-             Path=/home/cuarentaydos/Code/forfun/agent/crates/mcp-git/src/native.rs\n\
+             Path=/home/user/Code/project/src/native.rs\n\
              DeletionDate=2026-07-27T20:04:50\n"
         );
     }
@@ -256,13 +256,13 @@ mod tests {
     fn parses_a_real_file() {
         let info = TrashInfo::parse(
             "[Trash Info]\n\
-             Path=/home/cuarentaydos/.cargo/bin/monitor\n\
+             Path=/home/user/.cargo/bin/monitor\n\
              DeletionDate=2026-07-27T20:21:48\n",
         )
         .expect("valid record");
         assert_eq!(
             info.original_path,
-            PathBuf::from("/home/cuarentaydos/.cargo/bin/monitor")
+            PathBuf::from("/home/user/.cargo/bin/monitor")
         );
         assert_eq!(info.deleted_at.hour, 20);
         assert_eq!(info.deleted_at.minute, 21);

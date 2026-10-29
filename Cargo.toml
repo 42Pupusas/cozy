@@ -37,13 +37,13 @@ ququmatz      = "0.17.0"
 # Must come from the registry, not a path: quetzal-uring depends on
 # quetzalcoatl too, and a path copy resolves as a second, distinct crate.
 quetzalcoatl  = "0.15.2"
-shelby        = { package = "toml-shelby", path = "/home/cuarentaydos/Code/tooling/shelby/crates/shelby", features = ["std"] }
-json-bourne   = { path = "/home/cuarentaydos/Code/tooling/bourne/crates/bourne", features = ["derive"] }
+shelby        = { package = "toml-shelby", version = "0.1.0", features = ["std"] }
+json-bourne   = { version = "0.3.0", features = ["derive"] }
 # Zero-dependency PNG encode/decode, shared by `bins/wallpaper` (decode, for
 # loading a wallpaper image) and any future `bins/shot`-style screenshot tool
 # (encode) -- see its own doc comment for why it exists as a standalone
 # `tooling/` crate rather than something reinvented per bin.
-ixiptla-core  = { path = "/home/cuarentaydos/Code/tooling/ixiptla/crates/ixiptla-core" }
+ixiptla-core  = { package = "ixiptla-png", git = "https://github.com/42Pupusas/ixiptla" }
 
 [workspace.lints.clippy]
 # groups

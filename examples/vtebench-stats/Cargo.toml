@@ -1,0 +1,9 @@
+[package]
+name = "vtebench-stats"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "Median, 95th percentile and maximum per benchmark for two vtebench --dat files"
+
+[lints]
+workspace = true

@@ -424,6 +424,36 @@ impl PtyIoctl for RawFd {
     }
 }
 
+/// Switch a raw fd to non-blocking mode (`O_NONBLOCK`).
+pub trait NonBlocking {
+    /// # Errors
+    /// Returns [`PtyError::Exec`] with the raw errno if `fcntl(2)` fails.
+    fn set_nonblock(self) -> Result<(), PtyError>;
+}
+
+impl NonBlocking for RawFd {
+    fn set_nonblock(self) -> Result<(), PtyError> {
+        // SAFETY: `self` is a fd the caller owns; `F_GETFL` takes no third
+        // argument.
+        let flags = unsafe { Syscall::Fcntl.invoke2(self.as_usize(), FcntlCmd::GetFl as usize) }
+            .into_errno_result()
+            .map_err(PtyError::Exec)?;
+        // SAFETY: `self` is a fd the caller owns; `flags` was just read back
+        // from `F_GETFL`, so OR-ing in `O_NONBLOCK` and writing it back via
+        // `F_SETFL` is a well-formed read-modify-write.
+        let ret = unsafe {
+            Syscall::Fcntl.invoke3(
+                self.as_usize(),
+                FcntlCmd::SetFl as usize,
+                flags | OpenFlags::NONBLOCK.bits(),
+            )
+        };
+        ret.into_errno_result()
+            .map(|_| ())
+            .map_err(PtyError::Exec)
+    }
+}
+
 /// Close a raw fd via a direct syscall (no libc dependency).
 pub trait CloseFd {
     /// # Errors

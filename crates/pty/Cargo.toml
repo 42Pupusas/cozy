@@ -8,8 +8,7 @@ workspace = true
 
 [dependencies]
 ququmatz      = { workspace = true }
-quetzal-uring = { workspace = true }
-quetzalcoatl  = { workspace = true }
 
 [dev-dependencies]
+quetzalcoatl  = { workspace = true }
 waker = { path = "../waker" }

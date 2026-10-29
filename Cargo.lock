@@ -613,20 +613,9 @@ dependencies = [
 name = "pty"
 version = "0.1.0"
 dependencies = [
- "quetzal-uring",
  "quetzalcoatl",
  "ququmatz",
  "waker",
-]
-
-[[package]]
-name = "quetzal-uring"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f3c37181c9ff2f806e748eca30609290132d8c64ce8a324529cf357dff9329a"
-dependencies = [
- "quetzalcoatl",
- "ququmatz",
 ]
 
 [[package]]
@@ -649,9 +638,9 @@ dependencies = [
 
 [[package]]
 name = "ququmatz"
-version = "0.16.2"
+version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bdaa0b004e11b2f7fc896ac93258fea15b6801949ff968e347a8072311e39b3"
+checksum = "ef7acd08014e0094f429e21fe702540cc5a3afbaf1320cb1343e2439efdf5815"
 
 [[package]]
 name = "regex-automata"
@@ -955,9 +944,11 @@ dependencies = [
  "grid",
  "input",
  "platform",
+ "pty",
  "quetzalcoatl",
  "text_layout",
  "vt_parser",
+ "waker",
 ]
 
 [[package]]

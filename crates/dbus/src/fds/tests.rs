@@ -7,7 +7,7 @@
 use std::io::Read as _;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 
-use ququmatz::IoUring;
+use ququmatz::{IoUring, IoUringBuilder};
 
 use super::test_fds::{FdTestGuard, LoanedFds};
 use super::{FdError, FdPassing, SocketPair};
@@ -25,7 +25,7 @@ struct Endpoint {
 impl Endpoint {
     fn new(sock: OwnedFd, negotiated: bool) -> Self {
         let fd = DbusSys::as_uring_fd(&sock);
-        let ring = IoUring::builder(8)
+        let ring = IoUringBuilder::new(8)
             .clamp()
             .cq_entries(16)
             .build()

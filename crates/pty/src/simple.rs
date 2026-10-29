@@ -5,7 +5,7 @@
 //! spawning a PTY thread. Replaced by `Pty` + ring buffers in M5.
 
 use crate::error::PtyError;
-use crate::sys::{ChildPid, CloseFd, PtyIoctl, RawPty, Syscall, WinSize};
+use crate::sys::{ChildPid, CloseFd, NonBlocking, PtyIoctl, RawPty, Syscall, WinSize};
 use ququmatz::RawFd;
 
 /// A simple blocking-ish PTY handle for the integration prototype.
@@ -116,44 +116,16 @@ impl PtySimple {
 
 // ── raw I/O extension trait ─────────────────────────────────────────────────
 
-/// Non-blocking-mode setup and raw `read(2)`/`write(2)` on a PTY master fd.
+/// Raw `read(2)`/`write(2)` on a PTY master fd.
 ///
 /// Kept separate from [`PtyIoctl`] since these are plain I/O syscalls, not
 /// `ioctl`s — but still belong on `RawFd` rather than as free functions.
 trait PtyRawIo: Copy {
-    fn set_nonblock(self) -> Result<(), PtyError>;
     fn raw_read(self, buf: &mut [u8]) -> isize;
     fn raw_write(self, buf: &[u8]) -> isize;
 }
 
 impl PtyRawIo for RawFd {
-    fn set_nonblock(self) -> Result<(), PtyError> {
-        use crate::sys::{FcntlCmd, OpenFlags};
-
-        // SAFETY: `self` is a fd the caller owns; `F_GETFL` takes no third
-        // argument (the `0` invoke2 omits is implied).
-        let flags = unsafe { Syscall::Fcntl.invoke2(self.as_usize(), FcntlCmd::GetFl as usize) };
-        if flags < 0 {
-            // Linux errno values are always small (< 4096), well inside i32.
-            return Err(PtyError::Exec(i32::try_from(-flags).unwrap_or(i32::MAX)));
-        }
-        // SAFETY: `self` is a fd the caller owns; `flags` was just read
-        // back from `F_GETFL` above, so OR-ing in `O_NONBLOCK` and writing
-        // it back via `F_SETFL` is a well-formed read-modify-write.
-        let ret = unsafe {
-            Syscall::Fcntl.invoke3(
-                self.as_usize(),
-                FcntlCmd::SetFl as usize,
-                flags.cast_unsigned() | OpenFlags::NONBLOCK.bits(),
-            )
-        };
-        if ret < 0 {
-            // Linux errno values are always small (< 4096), well inside i32.
-            return Err(PtyError::Exec(i32::try_from(-ret).unwrap_or(i32::MAX)));
-        }
-        Ok(())
-    }
-
     fn raw_read(self, buf: &mut [u8]) -> isize {
         // SAFETY: `self` is a fd the caller owns; `buf` is a live,
         // correctly-sized slice for `read(2)` to write up to `buf.len()`

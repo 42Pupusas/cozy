@@ -114,6 +114,25 @@ impl Harness {
         }
     }
 
+    /// Collect output until `count` bytes have arrived or `deadline` passes.
+    /// Returns how many bytes arrived, so a stalled loop fails the test
+    /// instead of hanging it.
+    fn wait_byte_count(&mut self, count: usize, deadline: Instant) -> usize {
+        while self.seen.len() < count && Instant::now() < deadline {
+            let was_full = self.output.is_full();
+            match self.output.pop() {
+                Some(chunk) => {
+                    self.seen.extend_from_slice(&chunk);
+                    if was_full {
+                        self.wake.signal();
+                    }
+                }
+                None => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        self.seen.len()
+    }
+
     fn wait_exit(self) -> Result<i32, String> {
         self.run.join().expect("event loop thread panicked")
     }
@@ -217,6 +236,24 @@ fn uring_large_write_is_chunked_and_ordered_stress() {
     for iter in 0..60 {
         uring_large_write_is_chunked_and_ordered_once(iter);
     }
+}
+
+/// A write larger than every tty buffer, to a child that echoes it all
+/// back. On a blocking master fd the loop's write sleeps inside
+/// `io_uring_enter` once the slave's input queue is full, so it stops
+/// reading `cat`'s output; `cat` then blocks writing and stops reading, and
+/// both wait forever.
+#[test]
+fn uring_full_duplex_flood_does_not_deadlock() {
+    const LEN: usize = 4 << 20;
+    let mut h = Harness::spawn("/bin/sh", &["-c", "stty raw -echo; echo READY; exec cat"]);
+    h.wait_output(|o| o.windows(5).any(|w| w == b"READY"));
+    let start = h.seen.len();
+    h.send(PtyInput::Bytes(vec![b'x'; LEN].into_boxed_slice()));
+    let got = h.wait_byte_count(start + LEN, Instant::now() + Duration::from_secs(20)) - start;
+    assert!(got >= LEN, "the loop stalled after {got} of {LEN} bytes");
+    h.send(PtyInput::Quit);
+    let _ = h.wait_exit();
 }
 
 fn uring_large_write_is_chunked_and_ordered_once(iter: u32) {

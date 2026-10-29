@@ -20,7 +20,7 @@ use std::fmt;
 use std::io;
 use std::os::fd::OwnedFd;
 
-use ququmatz::{IoUring, Sqe};
+use ququmatz::{IoUring, IoUringBuilder, Sqe};
 
 use crate::message::{BodyArg, MessageType, PRELUDE_LEN, Prelude, Reply};
 use crate::session_address::SessionAddress;
@@ -186,7 +186,7 @@ impl DbusConn {
         let sock = sys::DbusSys::make_unix_socket().map_err(DbusError::Connect)?;
         let sock_fd = sys::DbusSys::as_uring_fd(&sock);
 
-        let mut ring = IoUring::builder(RING_ENTRIES)
+        let mut ring = IoUringBuilder::new(RING_ENTRIES)
             .clamp()
             .cq_entries(RING_CQ_ENTRIES)
             .build()
@@ -220,7 +220,7 @@ impl DbusConn {
     #[cfg(test)]
     pub(crate) fn over_socket(sock: OwnedFd, negotiated: bool) -> Result<Self, DbusError> {
         let sock_fd = sys::DbusSys::as_uring_fd(&sock);
-        let ring = IoUring::builder(RING_ENTRIES)
+        let ring = IoUringBuilder::new(RING_ENTRIES)
             .clamp()
             .cq_entries(RING_CQ_ENTRIES)
             .build()

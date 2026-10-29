@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use quetzalcoatl::mpsc;
 use quetzalcoatl::spsc::Producer;
 use ququmatz::types::{CqeFlags, MsgFlags, MsgHdr, PollMask, RawFd};
-use ququmatz::{IoUring, ProvidedBufferRing, Sqe};
+use ququmatz::{IoUring, IoUringBuilder, ProvidedBufferRing, Sqe};
 
 use crate::event::RawEvent;
 use crate::id::ObjectId;
@@ -513,7 +513,7 @@ impl Sender {
     /// Was a free `build_tx_ring()` function -- moved onto `Sender` since it
     /// builds the ring `Sender` owns.
     fn build_tx_ring() -> Result<IoUring, ConnError> {
-        IoUring::builder(RING_ENTRIES)
+        IoUringBuilder::new(RING_ENTRIES)
             .single_issuer()
             .defer_taskrun()
             .clamp()
@@ -657,7 +657,7 @@ impl Sender {
         Self {
             sock: RawFd::from_raw(dummy_socket().as_raw_fd() as usize),
             sock_owned: dummy_socket(),
-            ring: IoUring::builder(2).clamp().cq_entries(4).build().unwrap(),
+            ring: IoUringBuilder::new(2).clamp().cq_entries(4).build().unwrap(),
             next_id: 2,
         }
     }
@@ -721,7 +721,7 @@ impl Reader {
     /// Was a free `build_rx_ring()` function -- moved onto `Reader` since it
     /// builds the ring `Reader` owns.
     fn build_rx_ring() -> Result<IoUring, ConnError> {
-        IoUring::builder(RING_ENTRIES)
+        IoUringBuilder::new(RING_ENTRIES)
             .clamp()
             .cq_entries(RING_CQ_ENTRIES)
             .build()
@@ -950,6 +950,10 @@ impl Reader {
             if Self::errno_is_disconnect(errno) {
                 return Ok(RecvOutcome::CLOSED);
             }
+            if Self::errno_is_pool_exhausted(errno) {
+                self.arm_recv()?;
+                return Ok(RecvOutcome::default());
+            }
             return Err(ConnError::Io(io::Error::from_raw_os_error(errno)));
         }
 
@@ -1004,6 +1008,11 @@ impl Reader {
     /// its argument, and lives here (rather than on `ConnError`) because
     /// "which errnos mean the compositor went away" is knowledge the receive
     /// loop owns.
+    const fn errno_is_pool_exhausted(errno: i32) -> bool {
+        const ENOBUFS: i32 = 105;
+        errno == ENOBUFS
+    }
+
     const fn errno_is_disconnect(errno: i32) -> bool {
         // ECONNRESET: peer reset the connection (compositor killed).
         // ENOTCONN:   socket is no longer connected.
@@ -1276,6 +1285,14 @@ mod shutdown_tests {
 
     /// EOF is classified as a closed connection rather than an I/O error,
     /// so the reader returns `Ok` and the window reports no failure.
+    #[test]
+    fn running_out_of_provided_buffers_is_recoverable_and_not_a_disconnect() {
+        assert!(Reader::errno_is_pool_exhausted(105));
+        assert!(!Reader::errno_is_disconnect(105));
+        assert!(!Reader::errno_is_pool_exhausted(9));
+        assert!(!Reader::errno_is_pool_exhausted(104));
+    }
+
     #[test]
     fn a_zero_length_read_is_not_an_error_errno() {
         assert!(

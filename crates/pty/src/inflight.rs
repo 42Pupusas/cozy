@@ -19,19 +19,28 @@
 /// the buffer it wrote into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpTag {
-    /// Read from the PTY master into `read_buf`.
+    /// Multishot read from the PTY master into the read pool.
     Read,
-    /// Write to the PTY master from `write_buf`.
+    /// Write to the PTY master from the front chunk of `writes`.
     Write,
     /// Read from the `signalfd` into `signal_buf`.
     Signal,
     /// Read from the wake eventfd into `wake_buf`.
     Wake,
+    /// Wait for the PTY master to become writable after a write hit
+    /// `EAGAIN`. Owns no buffer.
+    WritePoll,
 }
 
 impl OpTag {
     /// Every tag, for iterating the outstanding set.
-    pub const ALL: [Self; 4] = [Self::Read, Self::Write, Self::Signal, Self::Wake];
+    pub const ALL: [Self; 5] = [
+        Self::Read,
+        Self::Write,
+        Self::Signal,
+        Self::Wake,
+        Self::WritePoll,
+    ];
 
     /// The `user_data` this tag travels as.
     ///
@@ -48,6 +57,7 @@ impl OpTag {
             Self::Write => 2,
             Self::Signal => 3,
             Self::Wake => 4,
+            Self::WritePoll => 5,
         }
     }
 
@@ -59,6 +69,7 @@ impl OpTag {
             2 => Some(Self::Write),
             3 => Some(Self::Signal),
             4 => Some(Self::Wake),
+            5 => Some(Self::WritePoll),
             _ => None,
         }
     }

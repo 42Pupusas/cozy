@@ -4,8 +4,8 @@
 //!
 //! The child ends its output with a marker and then sleeps. The parser thread
 //! asks the PTY loop to quit once it has parsed the marker, so these tests
-//! cover backpressure without depending on what the loop does when a child
-//! exits with output still queued (see `output_written_just_before_exit_is_not_lost`).
+//! cover backpressure on its own; `output_written_just_before_exit_is_not_lost`
+//! covers a child that exits with output still queued.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -256,7 +256,6 @@ fn a_flood_through_a_full_ring_arrives_whole_and_in_order() {
 /// must still come out, even though the PTY loop sees SIGCHLD or end-of-file
 /// while the parser ring is full and chunks are still waiting.
 #[test]
-#[ignore = "known loss: Session::event_loop stops at EOF/SIGCHLD with chunks still in `unread`"]
 fn output_written_just_before_exit_is_not_lost() {
     const LINES: usize = 60_000;
     let script = format!("seq -f 'row %06g' 1 {LINES}");

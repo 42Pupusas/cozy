@@ -26,6 +26,8 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 [[package]]
 name = "bourne-derive"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2108834c6706c31b00f1ac2a8cabc9a017d7cfe2eaebc683944e4c4046b585a"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -306,17 +308,28 @@ version = "0.1.0"
 [[package]]
 name = "ixchel"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "418a478e3a0b48a7d5430db69b78f34a4e41bc747c7845decdd7bfc0d5d3d38d"
 
 [[package]]
-name = "ixiptla-core"
+name = "ixiptla-pixel"
 version = "0.1.0"
+source = "git+https://github.com/42Pupusas/ixiptla?rev=b2ef5ff#b2ef5ff50f571d9cddbad8471a422507fa2cda9d"
+
+[[package]]
+name = "ixiptla-png"
+version = "0.1.0"
+source = "git+https://github.com/42Pupusas/ixiptla?rev=b2ef5ff#b2ef5ff50f571d9cddbad8471a422507fa2cda9d"
 dependencies = [
  "ixchel",
+ "ixiptla-pixel",
 ]
 
 [[package]]
 name = "json-bourne"
 version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5386eaf0151748ebffe018a4c07b1fed316f202a2dec7e83ff077bb048e2213"
 dependencies = [
  "bourne-derive",
 ]
@@ -331,7 +344,7 @@ version = "0.1.0"
 dependencies = [
  "config",
  "headless-stress",
- "ixiptla-core",
+ "ixiptla-png",
  "launcher",
  "platform",
  "quetzalcoatl",
@@ -727,7 +740,7 @@ dependencies = [
  "clipboard",
  "clipboard-wayland",
  "headless-stress",
- "ixiptla-core",
+ "ixiptla-png",
  "json-bourne",
  "localtime",
  "platform",
@@ -885,6 +898,8 @@ version = "0.1.0"
 [[package]]
 name = "toml-shelby"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb26b302495bb5d2374087c94e687303a980d06ec23cb733dd80b44466e1a714"
 
 [[package]]
 name = "tracing"
@@ -997,6 +1012,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vtebench-stats"
+version = "0.1.0"
+
+[[package]]
 name = "waker"
 version = "0.1.0"
 
@@ -1005,7 +1024,7 @@ name = "wallpaper"
 version = "0.1.0"
 dependencies = [
  "ixchel",
- "ixiptla-core",
+ "ixiptla-png",
 ]
 
 [[package]]

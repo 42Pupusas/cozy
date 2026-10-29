@@ -43,7 +43,7 @@ json-bourne   = { version = "0.3.0", features = ["derive"] }
 # loading a wallpaper image) and any future `bins/shot`-style screenshot tool
 # (encode) -- see its own doc comment for why it exists as a standalone
 # `tooling/` crate rather than something reinvented per bin.
-ixiptla-core  = { package = "ixiptla-png", git = "https://github.com/42Pupusas/ixiptla" }
+ixiptla-core  = { package = "ixiptla-png", git = "https://github.com/42Pupusas/ixiptla", rev = "b2ef5ff" }
 
 [workspace.lints.clippy]
 # groups

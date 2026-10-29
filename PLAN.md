@@ -51,8 +51,11 @@ Two constraints bound the goal:
 
 These rules did not change. They still hold.
 
-- **Zero external dependencies.** Justify every crate. Prefer our own tooling
-  crates. Only `divan` (in `benches/`) comes from crates.io today.
+- **No third-party runtime dependencies.** Justify every crate. Prefer our own
+  tooling crates: `ququmatz`, `quetzalcoatl`, `json-bourne`, `toml-shelby`,
+  `ixchel` and `ixiptla`. Two third-party sets remain: `syn`, `quote` and
+  `proc-macro2`, which compile `json-bourne`'s derive macro and add nothing to
+  the binaries, and `divan` (in `benches/`) with its dependencies.
 - **Rust only.** No C glue. No bindgen. No `build.rs` that calls system
   libraries.
 - **No async runtimes.** Threads communicate over ring buffers. Blocking

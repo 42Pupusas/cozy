@@ -25,6 +25,7 @@ pub mod cell_store;
 mod cluster;
 mod cursor;
 mod dirty;
+mod glyph_run;
 mod line_wrap;
 mod palette;
 mod row_graphemes;
@@ -960,6 +961,63 @@ impl Grid {
                 self.pending_wrap = self.autowrap;
             }
         }
+    }
+
+    /// Print `chars` as [`Self::print`] would one at a time, writing each
+    /// stretch of plain glyphs that fits before the right margin in one
+    /// store call. Anything that wraps, joins a cluster or is zero width
+    /// takes [`Self::print`].
+    fn print_chars(&mut self, chars: &[char]) {
+        use cluster::ClusterChar as _;
+        use text_layout::measurement::CellWidth as _;
+        let charset = if self.shifted_to_g1 {
+            self.g1_charset
+        } else {
+            self.g0_charset
+        };
+        let cols = self.active_screen().cols();
+        let mut run = glyph_run::GlyphRun::new();
+        let mut start = self.cursor.col;
+        for &raw in chars {
+            if run.is_full() {
+                self.flush_glyphs(&mut run, start);
+            }
+            let ch = charset.translate(raw);
+            let width = ch.cell_width();
+            let plain = width != 0
+                && !self.zwj_pending
+                && !self.pending_wrap
+                && !ch.is_regional_indicator()
+                && !ch.is_emoji_modifier()
+                && self.cursor.col + u16::from(width) < cols;
+            if plain {
+                if run.span() == 0 {
+                    start = self.cursor.col;
+                }
+                run.push(ch, width);
+                self.cursor.col += u16::from(width);
+            } else {
+                self.flush_glyphs(&mut run, start);
+                self.print(raw);
+            }
+        }
+        self.flush_glyphs(&mut run, start);
+    }
+
+    /// Write the glyphs gathered by [`Self::print_chars`], which already
+    /// moved the cursor past them, from column `col` of the cursor row.
+    fn flush_glyphs(&mut self, run: &mut glyph_run::GlyphRun, col: u16) {
+        let Some(last) = run.last() else {
+            return;
+        };
+        let row = self.cursor.row;
+        let attrs = self.attrs;
+        let link_id = self.active_link_id;
+        self.active_screen_mut()
+            .write_glyphs(row, col, run.glyphs(), run.span(), attrs, link_id);
+        self.dirty.mark_row(row);
+        self.last_printed = Some(last);
+        run.clear();
     }
 
     fn print(&mut self, ch: char) {
@@ -2176,6 +2234,11 @@ impl TerminalSink for Grid {
         self.print_ascii_run(bytes);
     }
 
+    fn print_chars(&mut self, chars: &[char]) {
+        self.snap_viewport_to_bottom();
+        self.print_chars(chars);
+    }
+
     fn control(&mut self, control: C0) {
         self.snap_viewport_to_bottom();
         self.control(control);
@@ -2270,6 +2333,45 @@ mod tests {
         }
         assert_eq!(events.take_title(), direct.take_title());
         assert_eq!(events.take_replies(), direct.take_replies());
+    }
+
+    /// The batched non-ASCII path must leave every cell, the cursor and the
+    /// wrap state exactly as printing one character at a time does.
+    #[test]
+    fn batched_unicode_matches_one_char_at_a_time() {
+        let cases: Vec<Vec<u8>> = vec![
+            "é中文Жж".repeat(9).into_bytes(),
+            "ab中".repeat(5).into_bytes(),
+            "\x1b[3;9H中中中\x1b[1;1Hx中\x1b[?7l中中中中中中".into(),
+            "e\u{301}\u{323}中\u{1f468}\u{200d}\u{1f469}\u{1f44b}\u{1f3fd}".into(),
+            "\u{1f1fa}\u{1f1f8}\u{1f1e9}\u{1f1ea}\u{1f1fa}".into(),
+            "\x1b(0ä\x1b(Bé\x1b[31m中\x1b[0mé\x1b[3b".into(),
+            b"\xc3\xa9\xe4\xb8\xad\xff\xe4\xb8\xc3\xa9\xf0\x9f\x98".to_vec(),
+            "\u{a1}".repeat(200).into_bytes(),
+        ];
+        for input in &cases {
+            let mut events = Grid::new(9, 4);
+            let mut direct = Grid::new(9, 4);
+            apply_str(&mut events, input);
+            apply_direct(&mut direct, input);
+            for row in 0..4 {
+                for col in 0..9 {
+                    assert_eq!(
+                        events.screen().get_cell(col, row),
+                        direct.screen().get_cell(col, row),
+                        "cell ({col}, {row}) of {:?}",
+                        String::from_utf8_lossy(input)
+                    );
+                    assert_eq!(
+                        events.screen().cluster(col, row),
+                        direct.screen().cluster(col, row)
+                    );
+                }
+            }
+            assert_eq!(events.cursor(), direct.cursor());
+            assert_eq!(events.pending_wrap, direct.pending_wrap);
+            assert_eq!(events.last_printed, direct.last_printed);
+        }
     }
 
     const CJK_ZHONG: &str = "\u{4e2d}"; // '中' (Chinese for "middle") — 2 cells wide

@@ -130,6 +130,13 @@ impl Parser {
                 }
                 continue;
             }
+            if self.state == State::Ground && bytes[i] >= 0x80 {
+                let consumed = Self::print_utf8_run(&bytes[i..], sink);
+                if consumed > 0 {
+                    i += consumed;
+                    continue;
+                }
+            }
             // ── CSI parameter-body fast path ─────────────────────────────
             // In `CsiParam` the body is a run of ASCII digits and `;`
             // separators. Neither trips an "anywhere" transition (0x30..=0x39
@@ -163,6 +170,33 @@ impl Parser {
             i += 1;
         }
     }
+
+    /// Deliver the complete, valid non-ASCII UTF-8 at the start of `bytes`,
+    /// up to [`Self::UTF8_RUN_MAX`] bytes, as one character run. Returns the
+    /// bytes consumed: 0 when `bytes` does not start with a complete valid
+    /// sequence, which the state machine then decodes byte by byte, producing
+    /// U+FFFD exactly as before. The cap bounds the rescan after each invalid
+    /// byte in binary output.
+    fn print_utf8_run(bytes: &[u8], sink: &mut impl TerminalSink) -> usize {
+        let window = &bytes[..bytes.len().min(Self::UTF8_RUN_MAX)];
+        let end = window.iter().position(|&b| b < 0x80).unwrap_or(window.len());
+        let valid = match std::str::from_utf8(&window[..end]) {
+            Ok(text) => text,
+            Err(error) => std::str::from_utf8(&window[..error.valid_up_to()]).unwrap_or_default(),
+        };
+        let mut run = ['\0'; Self::UTF8_RUN_MAX];
+        let mut len = 0;
+        for ch in valid.chars() {
+            run[len] = ch;
+            len += 1;
+        }
+        if len > 0 {
+            sink.print_chars(&run[..len]);
+        }
+        valid.len()
+    }
+
+    const UTF8_RUN_MAX: usize = 64;
 
     /// Deliver one general-path event to a direct sink.
     fn dispatch(event: TermEvent<'_>, sink: &mut impl TerminalSink) {
@@ -1108,6 +1142,48 @@ mod tests {
             }
         });
         assert_eq!(seen, vec!['🦀']);
+    }
+
+    /// Collects every printed character, from single prints and runs alike.
+    #[derive(Default)]
+    struct Printed(Vec<char>);
+
+    impl TerminalSink for Printed {
+        fn print(&mut self, ch: char) {
+            self.0.push(ch);
+        }
+        fn print_run(&mut self, bytes: &[u8]) {
+            self.0.extend(bytes.iter().map(|&b| char::from(b)));
+        }
+        fn control(&mut self, _: C0) {}
+        fn esc(&mut self, _: Option<u8>, _: u8) {}
+        fn csi(&mut self, _: CsiAction) {}
+        fn osc(&mut self, _: OscCmd<'_>) {}
+        fn dcs(&mut self, _: DcsCmd<'_>) {}
+        fn ignored(&mut self) {}
+    }
+
+    /// The UTF-8 run fast path must print exactly what byte-by-byte
+    /// decoding prints, wherever a chunk boundary falls.
+    #[test]
+    fn utf8_runs_match_bytewise_decoding_across_splits() {
+        let mut input = "é中\u{1f980}Ж".repeat(30).into_bytes();
+        input.extend_from_slice(b"\xff\xe4\xb8a\xc3\xa9\xed\xa0\x80\xc0\xaf\xf0\x9f\x98");
+        input.extend_from_slice("中".as_bytes());
+        let mut bytewise = Vec::new();
+        let mut p = Parser::new();
+        for &b in &input {
+            if let Some(TermEvent::Print(c)) = p.advance(b) {
+                bytewise.push(c);
+            }
+        }
+        for split in 0..input.len() {
+            let mut p = Parser::new();
+            let mut printed = Printed::default();
+            p.feed_to(&input[..split], &mut printed);
+            p.feed_to(&input[split..], &mut printed);
+            assert_eq!(printed.0, bytewise, "split at {split}");
+        }
     }
 
     #[test]

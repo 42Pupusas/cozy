@@ -430,6 +430,24 @@ impl Screen {
         self.all_blank = false;
     }
 
+    /// Write a run of narrow and wide glyphs in one style on visible `row`
+    /// from `col`. The caller has checked the `span` cells fit on the row.
+    pub(crate) fn write_glyphs(
+        &mut self,
+        row: u16,
+        col: u16,
+        glyphs: &[(char, u8)],
+        span: usize,
+        attrs: crate::Attrs,
+        link_id: u32,
+    ) {
+        let phys = self.phys_row(self.scrollback_len + usize::from(row));
+        self.materialize_row(phys);
+        let start = phys * usize::from(self.cols) + usize::from(col);
+        self.buf.write_glyphs(start, glyphs, span, attrs, link_id);
+        self.all_blank = false;
+    }
+
     /// If physical row `phys` is lazily blank, actually write the blanks its
     /// bit has been standing in for, and clear the bit. Called before any
     /// partial write into the row; whole-row writers clear the bit

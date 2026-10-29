@@ -18,6 +18,13 @@ pub trait TerminalSink {
     fn print(&mut self, ch: char);
     /// Receive a contiguous ground-state printable ASCII run.
     fn print_run(&mut self, bytes: &[u8]);
+    /// Receive a run of decoded printable characters, in order. Equivalent
+    /// to calling [`Self::print`] for each.
+    fn print_chars(&mut self, chars: &[char]) {
+        for &ch in chars {
+            self.print(ch);
+        }
+    }
     /// Receive a C0 control.
     fn control(&mut self, control: C0);
     /// Receive an ESC action.

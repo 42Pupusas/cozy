@@ -170,6 +170,32 @@ impl CellStore {
         self.placement[start..end].fill(Self::NARROW);
     }
 
+    /// Write narrow and wide glyphs in one style from `start`, a wide glyph
+    /// taking its lead cell and a spacer. `span` is the cells they cover.
+    pub(crate) fn write_glyphs(
+        &mut self,
+        start: usize,
+        glyphs: &[(char, u8)],
+        span: usize,
+        attrs: Attrs,
+        link_id: u32,
+    ) {
+        let id = self.intern(Style::new(attrs, link_id), start..start + span);
+        self.style_ids[start..start + span].fill(id);
+        let mut index = start;
+        for &(ch, width) in glyphs {
+            self.chars[index] = u32::from(ch);
+            if width == 2 {
+                self.placement[index] = Self::WIDE;
+                self.chars[index + 1] = u32::from(' ');
+                self.placement[index + 1] = Self::SPACER;
+            } else {
+                self.placement[index] = Self::NARROW;
+            }
+            index += usize::from(width);
+        }
+    }
+
     /// The id of `style` in the row holding `cells`, which the caller is
     /// about to overwrite.
     fn intern(&mut self, style: Style, cells: Range<usize>) -> u16 {
@@ -434,6 +460,19 @@ mod tests {
         for col in 0..8 {
             assert_eq!(store.cell(col).attrs.fg, color(9_999 * 8 + col));
         }
+    }
+
+    #[test]
+    fn write_glyphs_matches_cell_by_cell_writes() {
+        let attrs = Attrs::with_colors(Color::Indexed(2), Color::Default);
+        let mut batch = CellStore::new(5, 1);
+        batch.write_glyphs(0, &[('é', 1), ('全', 2), ('Ж', 1)], 4, attrs, 3);
+        let mut single = CellStore::new(5, 1);
+        single.set_cell(0, Cell::new('é', attrs, 3));
+        single.set_cell(1, Cell::wide_lead('全', attrs, 3));
+        single.set_cell(2, Cell::wide_spacer(attrs, 3));
+        single.set_cell(3, Cell::new('Ж', attrs, 3));
+        assert_eq!(batch.row_cells(0..5), single.row_cells(0..5));
     }
 
     #[test]

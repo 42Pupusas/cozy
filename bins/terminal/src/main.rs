@@ -268,6 +268,14 @@ enum UiEvent {
     PaletteColor(u8, (u8, u8, u8)),
 }
 
+impl UiEvent {
+    /// Only a bell can be lost without losing information: a second one
+    /// adds nothing the first did not say.
+    const fn may_be_dropped(&self) -> bool {
+        matches!(self, Self::Bell)
+    }
+}
+
 /// Stores `true` into a shared quit flag when dropped and wakes the UI loop
 /// that is parked waiting on it -- including when the stack is unwinding from
 /// a panic, not just on a normal return.
@@ -361,6 +369,20 @@ impl Cli {
             }
         }
         Self { exec: None }
+    }
+}
+
+#[cfg(test)]
+mod ui_event_tests {
+    use super::UiEvent;
+
+    #[test]
+    fn only_a_bell_may_be_dropped() {
+        assert!(UiEvent::Bell.may_be_dropped());
+        assert!(!UiEvent::Title(String::new()).may_be_dropped());
+        assert!(!UiEvent::Link(1, String::new()).may_be_dropped());
+        assert!(!UiEvent::Clipboard(String::new()).may_be_dropped());
+        assert!(!UiEvent::PaletteColor(0, (0, 0, 0)).may_be_dropped());
     }
 }
 
@@ -894,31 +916,50 @@ impl ParserSession {
         }
     }
 
-    /// Push a one-shot bell/title/link/clipboard event to the UI thread
-    /// over the SPSC `ui_events_tx` ring, waking it the same way `publish`
-    /// wakes it for a dirty snapshot. Drops the event (with a debug log,
-    /// not a panic) if the small `RING_UI_EVENTS` ring is momentarily full
-    /// -- these are advisory UI niceties (bell/title/link/clipboard), not
-    /// grid content, so an extremely rare drop under a pathological burst
-    /// is preferable to blocking the parser thread or growing the ring
-    /// unbounded.
+    /// Push a one-shot event to the UI thread over the SPSC `ui_events_tx`
+    /// ring, waking it the same way `publish` wakes it for a dirty snapshot.
+    ///
+    /// A bell is the only event that may be dropped when the ring is full.
+    /// A clipboard write, a link's URI, a title and a palette change each
+    /// carry data the UI cannot recover, so the parser thread waits for room
+    /// instead. The UI thread drains this ring on every loop iteration and
+    /// never waits on the parser thread, so the wait ends. It fails only when
+    /// the UI thread is gone.
     fn push_ui_event(&self, ev: UiEvent) {
-        if self.ui_events_tx.push(ev).is_err() {
-            tlog::trace!(Parser, "ui_events ring full, dropping a UiEvent");
+        match self.ui_events_tx.push(ev) {
+            Ok(()) => {}
+            Err(ev) if ev.may_be_dropped() => {
+                tlog::trace!(Parser, "ui_events ring full, dropping a bell");
+            }
+            Err(ev) => {
+                self.ui_wake.signal();
+                let _ = self.ui_events_tx.push_block(ev);
+            }
         }
         self.ui_wake.signal();
     }
 
     /// Push any host-bound replies the grid produced (CPR/DA) to the PTY
-    /// thread.
+    /// thread. A reply the host is waiting for is never dropped: if the input
+    /// ring is full, wait for the PTY thread to drain it. That thread drains
+    /// input on every wakeup, including while it holds output back, so the
+    /// wait ends. It fails only when the PTY thread is gone.
     fn flush_replies(&mut self) {
         let replies = self.grid.take_replies();
-        if !replies.is_empty() {
-            let _ = self
-                .reply_tx
-                .push(InputMsg::Bytes(replies.into_boxed_slice()));
-            self.pty_wake.signal();
+        if replies.is_empty() {
+            return;
         }
+        match self
+            .reply_tx
+            .push(InputMsg::Bytes(replies.into_boxed_slice()))
+        {
+            Ok(()) => {}
+            Err(reply) => {
+                self.pty_wake.signal();
+                let _ = self.reply_tx.push_block(reply);
+            }
+        }
+        self.pty_wake.signal();
     }
 
     /// Publish the current dirty snapshot to the UI ring. Never drops a

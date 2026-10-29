@@ -26,6 +26,7 @@ mod cursor;
 mod dirty;
 mod line_wrap;
 mod palette;
+mod row_styles;
 mod screen;
 mod selection;
 mod stats;

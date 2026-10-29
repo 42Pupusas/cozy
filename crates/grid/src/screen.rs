@@ -137,7 +137,7 @@ impl Screen {
     pub fn new(cols: u16, rows: u16, scrollback_max: usize) -> Self {
         let total = Self::cap_rows(usize::from(rows), scrollback_max);
         Self {
-            buf: CellStore::new(total * usize::from(cols)),
+            buf: CellStore::new(usize::from(cols), total),
             wrapped: vec![false; total],
             // A fresh buffer is genuinely blank, so no rows are *lazily*
             // blank -- the bits track "buf content is stale garbage", which
@@ -398,14 +398,12 @@ impl Screen {
     /// handled in exactly one place.
     #[inline]
     fn copy_row(&mut self, src_abs: usize, dst_abs: usize) {
-        let cols = usize::from(self.cols);
         let src = self.phys_row(src_abs);
         let dst = self.phys_row(dst_abs);
         if src == dst {
             return;
         }
-        self.buf
-            .copy_within(src * cols..(src + 1) * cols, dst * cols);
+        self.buf.copy_row(src, dst);
         self.wrapped[dst] = self.wrapped[src];
         // Blank bits travel with their rows: the bit is what makes a
         // lazily-blank row's stale cells read as blank.
@@ -448,6 +446,7 @@ impl Screen {
         // full-width write.
         if self.blank_rows[phys] {
             self.blank_rows[phys] = false;
+            self.buf.restart_row(row_start);
             if col > 0 {
                 self.buf.clear_range(row_start..row_start + col);
             }
@@ -457,8 +456,8 @@ impl Screen {
                     .clear_range(row_start + written_end..row_start + cols);
             }
         }
-        // The structure-of-arrays backing store interns the SGR/link style
-        // once, then writes compact character/style/placement planes.
+        // The backing store interns the SGR/link style in this row's table
+        // once, then writes compact character/style-id/placement planes.
         self.buf
             .write_ascii(row_start + col, &bytes[..count], attrs, link_id);
         if count > 0 {
@@ -959,7 +958,7 @@ impl Screen {
         let visible_count = m - overflow;
 
         let total = Self::cap_rows(new_rows_u, self.scrollback_max);
-        let mut new_buf = CellStore::new(total * new_cols_u);
+        let mut new_buf = CellStore::new(new_cols_u, total);
         let mut new_wrapped = vec![false; total];
         // Rows we never write below are untouched blanks: "all content".
         let mut new_row_len = vec![new_cols; total];

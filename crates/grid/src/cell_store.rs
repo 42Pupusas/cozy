@@ -1,71 +1,49 @@
 //! Columnar backing storage for terminal cells.
 //!
-//! A terminal flood changes a contiguous stream of characters while its SGR
-//! state normally stays constant for thousands of cells. Keeping the complete
-//! `Cell` value in every slot forced the hot path to write 20 bytes for every
-//! incoming ASCII byte. `CellStore` separates the rapidly-changing character
-//! plane from an interned style plane: common ASCII output writes four bytes
-//! per cell, while attributes/link/placement are reconstructed only when a
-//! consumer needs a `Cell` value (render snapshots, selection, resize).
+//! Characters, style ids and placement live in separate planes, so an ASCII
+//! flood writes a dense character plane and fills a `u16` id plane with one
+//! value. Ids index the owning row's [`RowStyles`] table, which is cleared
+//! with the row, so no style table is shared across rows or grows without
+//! bound.
 
+use std::ops::Range;
+
+use crate::row_styles::{RowStyles, Style};
 use crate::{Attrs, Cell, DirtyRowContent};
-
-/// One interned render style. Placement remains per-cell because a wide lead
-/// and its spacer share SGR/link state but have different geometry.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Style {
-    attrs: Attrs,
-    link_id: u32,
-}
-
-impl Style {
-    const DEFAULT: Self = Self {
-        attrs: Attrs::with_colors(crate::Color::Default, crate::Color::Default),
-        link_id: 0,
-    };
-
-    const fn from_cell(cell: Cell) -> Self {
-        Self {
-            attrs: cell.attrs.without_placement(),
-            link_id: cell.link_id(),
-        }
-    }
-}
 
 /// Stores cells as structure-of-arrays planes.
 ///
 /// `chars` is deliberately a `u32` plane rather than Rust `char`: this makes
 /// ASCII run writes a simple widening/store kernel and keeps the backing data
-/// plain-copyable. `style_ids` indexes the per-screen style table. Placement
-/// is a single byte plane: a cell cannot simultaneously be a wide lead and a
-/// spacer, so separate bit planes only made the ASCII writer clear redundant
-/// memory.
+/// plain-copyable. Placement is a single byte plane: a cell cannot
+/// simultaneously be a wide lead and a spacer.
+///
+/// The store is `width` cells per row. A range passed to any method lies
+/// within one row.
 pub(crate) struct CellStore {
+    width: usize,
     chars: Vec<u32>,
     style_ids: Vec<u16>,
+    row_styles: Vec<RowStyles>,
     placement: Vec<u8>,
     #[cfg(target_arch = "x86_64")]
     /// Probed once with the store, not once per short terminal-line write.
     avx2: bool,
-    styles: Vec<Style>,
-    /// The overwhelming common case is a long stream with unchanged SGR and
-    /// hyperlink state. Remember its id so an ASCII run does not linearly
-    /// search even the small style table on every wrapped row.
-    cached_style: Style,
-    cached_id: u16,
 }
 
 impl CellStore {
-    pub(crate) fn new(len: usize) -> Self {
+    pub(crate) fn new(width: usize, rows: usize) -> Self {
+        let len = width * rows;
         Self {
+            width,
             chars: vec![u32::from(' '); len],
             style_ids: vec![0; len],
+            row_styles: std::iter::repeat_with(RowStyles::default)
+                .take(rows)
+                .collect(),
             placement: vec![Self::NARROW; len],
             #[cfg(target_arch = "x86_64")]
             avx2: std::arch::is_x86_feature_detected!("avx2"),
-            styles: vec![Style::DEFAULT],
-            cached_style: Style::DEFAULT,
-            cached_id: 0,
         }
     }
 
@@ -74,21 +52,19 @@ impl CellStore {
     }
 
     pub(crate) fn cell(&self, index: usize) -> Cell {
-        let style = self.styles[usize::from(self.style_ids[index])];
+        let style = self.row_styles[index / self.width].get(self.style_ids[index]);
         let ch = char::from_u32(self.chars[index]).unwrap_or('�');
-        let mut cell = Cell::new(ch, style.attrs, style.link_id);
-        if self.placement[index] == Self::WIDE {
-            cell = Cell::wide_lead(ch, style.attrs, style.link_id);
-        } else if self.placement[index] == Self::SPACER {
-            cell = Cell::wide_spacer(style.attrs, style.link_id);
+        match self.placement[index] {
+            Self::WIDE => Cell::wide_lead(ch, style.attrs, style.link_id),
+            Self::SPACER => Cell::wide_spacer(style.attrs, style.link_id),
+            _ => Cell::new(ch, style.attrs, style.link_id),
         }
-        cell
     }
 
     pub(crate) fn set_cell(&mut self, index: usize, cell: Cell) {
-        let style_id = self.intern(Style::from_cell(cell));
         self.chars[index] = u32::from(cell.ch);
-        self.style_ids[index] = style_id;
+        self.style_ids[index] =
+            self.intern(Style::new(cell.attrs, cell.link_id()), index..index + 1);
         self.placement[index] = if cell.wide() {
             Self::WIDE
         } else if cell.spacer() {
@@ -100,26 +76,45 @@ impl CellStore {
 
     /// Fill the range with real default cells. Used only when a lazily blank
     /// row must be partially edited; normal full-width output avoids it.
-    pub(crate) fn clear_range(&mut self, range: std::ops::Range<usize>) {
+    pub(crate) fn clear_range(&mut self, range: Range<usize>) {
+        if range.len() == self.width {
+            self.row_styles[range.start / self.width].clear();
+        }
         self.chars[range.clone()].fill(u32::from(' '));
         self.style_ids[range.clone()].fill(0);
         self.placement[range].fill(Self::NARROW);
     }
 
-    /// Write a narrow ASCII run. It is the flood hot path: attributes/link
-    /// are interned once, then only character words and one uniform style-id
-    /// plane are written. The byte widening belongs to this storage owner;
-    /// its scalar implementation is intentionally simple before adding a
-    /// measured SIMD kernel over the contiguous `chars` plane.
+    /// Empty the style table of the row holding `index`. Only for a row
+    /// whose every cell is about to be cleared or overwritten.
+    pub(crate) fn restart_row(&mut self, index: usize) {
+        self.row_styles[index / self.width].clear();
+    }
+
+    /// Write a narrow ASCII run, the flood hot path: widen the bytes into
+    /// the character plane and fill the id plane with one value.
     pub(crate) fn write_ascii(&mut self, start: usize, bytes: &[u8], attrs: Attrs, link_id: u32) {
         let end = start + bytes.len();
-        let style_id = self.intern(Style {
-            attrs: attrs.without_placement(),
-            link_id,
-        });
+        let id = self.intern(Style::new(attrs, link_id), start..end);
         self.write_ascii_chars(start, bytes);
-        self.style_ids[start..end].fill(style_id);
+        self.style_ids[start..end].fill(id);
         self.placement[start..end].fill(Self::NARROW);
+    }
+
+    /// The id of `style` in the row holding `cells`, which the caller is
+    /// about to overwrite.
+    fn intern(&mut self, style: Style, cells: Range<usize>) -> u16 {
+        let row = cells.start / self.width;
+        let row_start = row * self.width;
+        // Twice the width: a rebuild keeps at most `width - 1` live entries,
+        // so it is followed by at least `width` cheap inserts.
+        let limit = (2 * self.width).min(usize::from(u16::MAX));
+        self.row_styles[row].intern(
+            style,
+            &mut self.style_ids[row_start..row_start + self.width],
+            cells.start - row_start..cells.end - row_start,
+            limit,
+        )
     }
 
     /// Widen ASCII bytes into the Unicode scalar-value plane.
@@ -245,27 +240,43 @@ impl CellStore {
         unsafe { self.write_ascii_chars_sse2(start + offset, &bytes[offset..]) };
     }
 
-    pub(crate) fn copy_within(&mut self, src: std::ops::Range<usize>, dest: usize) {
+    /// Move cells within one row; the row's style table is unchanged.
+    pub(crate) fn copy_within(&mut self, src: Range<usize>, dest: usize) {
         self.chars.copy_within(src.clone(), dest);
         self.style_ids.copy_within(src.clone(), dest);
         self.placement.copy_within(src, dest);
     }
 
-    pub(crate) fn row_content(&self, range: std::ops::Range<usize>) -> DirtyRowContent {
+    /// Copy row `src` over row `dst`, style table included.
+    pub(crate) fn copy_row(&mut self, src: usize, dst: usize) {
+        let cells = src * self.width..(src + 1) * self.width;
+        let target = dst * self.width;
+        self.chars.copy_within(cells.clone(), target);
+        self.style_ids.copy_within(cells.clone(), target);
+        self.placement.copy_within(cells, target);
+        let (from, to) = if src < dst {
+            let (head, tail) = self.row_styles.split_at_mut(dst);
+            (&head[src], &mut tail[0])
+        } else {
+            let (head, tail) = self.row_styles.split_at_mut(src);
+            (&tail[0], &mut head[dst])
+        };
+        to.copy_from(from);
+    }
+
+    pub(crate) fn row_content(&self, range: Range<usize>) -> DirtyRowContent {
         let chars = &self.chars[range.clone()];
-        let style_ids = &self.style_ids[range.clone()];
+        let ids = &self.style_ids[range.clone()];
         let placement = &self.placement[range.clone()];
 
-        // A shell normally emits an entire row under one SGR state. Snapshot
-        // materialization used to reconstruct that same style-table entry and
-        // test placement for every cell, even though ordinary ASCII output is
-        // uniformly narrow. Detect this common representation once and retain
-        // the fully general per-cell path for mixed SGR or wide-character rows.
-        if let Some(&style_id) = style_ids.first()
+        // A shell normally emits an entire row under one SGR state. Send that
+        // row as codepoints plus one style; mixed SGR or wide rows take the
+        // general per-cell path.
+        if let Some(&id) = ids.first()
             && placement.iter().all(|&value| value == Self::NARROW)
-            && style_ids.iter().all(|&value| value == style_id)
+            && ids.iter().all(|&value| value == id)
         {
-            let style = self.styles[usize::from(style_id)];
+            let style = self.row_styles[range.start / self.width].get(id);
             return DirtyRowContent::Uniform {
                 chars: chars.to_vec(),
                 attrs: style.attrs,
@@ -276,11 +287,11 @@ impl CellStore {
         DirtyRowContent::Cells(range.map(|index| self.cell(index)).collect())
     }
 
-    pub(crate) fn row_cells(&self, range: std::ops::Range<usize>) -> Vec<Cell> {
+    pub(crate) fn row_cells(&self, range: Range<usize>) -> Vec<Cell> {
         self.row_content(range).materialize_cells()
     }
 
-    pub(crate) fn cells(&self, range: std::ops::Range<usize>) -> Vec<Cell> {
+    pub(crate) fn cells(&self, range: Range<usize>) -> Vec<Cell> {
         self.row_cells(range)
     }
 
@@ -290,27 +301,6 @@ impl CellStore {
     const WIDE: u8 = 1;
     /// Second cell occupied by a double-width glyph.
     const SPACER: u8 = 2;
-
-    fn intern(&mut self, style: Style) -> u16 {
-        if style == self.cached_style {
-            return self.cached_id;
-        }
-        let id = if let Some(index) = self.styles.iter().position(|known| *known == style) {
-            u16::try_from(index).expect("style table is bounded to u16")
-        } else {
-            // A per-screen style table of 65k distinct SGR/link combinations
-            // is already pathological. Degrade to the default style rather
-            // than aliasing an unrelated one if a hostile stream reaches it.
-            let Ok(index) = u16::try_from(self.styles.len()) else {
-                return 0;
-            };
-            self.styles.push(style);
-            index
-        };
-        self.cached_style = style;
-        self.cached_id = id;
-        id
-    }
 }
 
 #[cfg(test)]
@@ -321,7 +311,7 @@ mod tests {
     #[test]
     fn ascii_widening_preserves_each_byte_across_vector_and_scalar_tails() {
         let bytes = b"0123456789abcdef0123456789abcdef!";
-        let mut store = CellStore::new(bytes.len());
+        let mut store = CellStore::new(bytes.len(), 1);
         store.write_ascii(0, bytes, Attrs::default(), 0);
         for (index, &byte) in bytes.iter().enumerate() {
             assert_eq!(store.cell(index).ch, char::from(byte));
@@ -330,7 +320,7 @@ mod tests {
 
     #[test]
     fn row_cells_preserves_uniform_ascii_style() {
-        let mut store = CellStore::new(4);
+        let mut store = CellStore::new(4, 1);
         let attrs = Attrs::with_colors(Color::Indexed(1), Color::Rgb(2, 3, 4));
         store.write_ascii(0, b"test", attrs, 7);
 
@@ -341,9 +331,51 @@ mod tests {
         assert_eq!(cells[3], Cell::new('t', attrs, 7));
     }
 
+    fn color(i: usize) -> Color {
+        let [.., r, g, b] = i.to_be_bytes();
+        Color::Rgb(r, g, b)
+    }
+
+    #[test]
+    fn more_distinct_styles_than_u16_keep_their_own_colors() {
+        let count = 80 * 1000;
+        let mut store = CellStore::new(80, 1000);
+        for i in 0..count {
+            store.write_ascii(i, b"#", Attrs::with_colors(color(i), Color::Default), 0);
+        }
+        for i in 0..count {
+            assert_eq!(store.cell(i).attrs.fg, color(i), "cell {i}");
+        }
+    }
+
+    #[test]
+    fn repainting_one_row_in_new_colors_never_corrupts_it() {
+        let mut store = CellStore::new(8, 1);
+        for frame in 0..10_000 {
+            for col in 0..8 {
+                let attrs = Attrs::with_colors(color(frame * 8 + col), Color::Default);
+                store.write_ascii(col, b"x", attrs, 0);
+            }
+        }
+        for col in 0..8 {
+            assert_eq!(store.cell(col).attrs.fg, color(9_999 * 8 + col));
+        }
+    }
+
+    #[test]
+    fn copied_row_carries_its_styles() {
+        let mut store = CellStore::new(4, 2);
+        let attrs = Attrs::with_colors(Color::Rgb(9, 9, 9), Color::Default);
+        store.write_ascii(0, b"abcd", attrs, 3);
+        store.copy_row(0, 1);
+        store.restart_row(0);
+        store.clear_range(0..4);
+        assert_eq!(store.cell(5), Cell::new('b', attrs, 3));
+    }
+
     #[test]
     fn row_cells_preserves_mixed_placement_and_styles() {
-        let mut store = CellStore::new(4);
+        let mut store = CellStore::new(4, 1);
         let attrs = Attrs::with_colors(Color::Indexed(1), Color::Rgb(2, 3, 4));
         store.set_cell(0, Cell::wide_lead('全', attrs, 7));
         store.set_cell(1, Cell::wide_spacer(attrs, 7));
